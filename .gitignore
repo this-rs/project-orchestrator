@@ -1,0 +1,20 @@
+# Rust
+/target/
+Cargo.lock
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker volumes (if running locally)
+neo4j_data/
+meilisearch_data/
+
+# OS
+.DS_Store
+Thumbs.db

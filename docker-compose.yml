@@ -1,0 +1,81 @@
+services:
+  neo4j:
+    image: neo4j:5.26.20-community
+    container_name: orchestrator-neo4j
+    ports:
+      - "7474:7474"  # HTTP Browser
+      - "7687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/orchestrator123
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - ./init/neo4j:/var/lib/neo4j/import
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - orchestrator-net
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.34.2
+    container_name: orchestrator-meilisearch
+    ports:
+      - "7700:7700"
+    environment:
+      - MEILI_MASTER_KEY=orchestrator-meili-key-change-me
+      - MEILI_ENV=development
+      - MEILI_LOG_LEVEL=INFO
+      - MEILI_MAX_INDEXING_MEMORY=512MiB
+    volumes:
+      - meilisearch_data:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - orchestrator-net
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orchestrator-server
+    ports:
+      - "8080:8080"
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=orchestrator123
+      - MEILISEARCH_URL=http://meilisearch:7700
+      - MEILISEARCH_KEY=orchestrator-meili-key-change-me
+      - RUST_LOG=info,project_orchestrator=debug
+      - WORKSPACE_PATH=/workspace
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+    volumes:
+      - ./workspace:/workspace:ro
+      - orchestrator_data:/data
+    networks:
+      - orchestrator-net
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  meilisearch_data:
+  orchestrator_data:
+
+networks:
+  orchestrator-net:
+    driver: bridge

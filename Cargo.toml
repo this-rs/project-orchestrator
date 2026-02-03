@@ -1,0 +1,74 @@
+[package]
+name = "project-orchestrator"
+version = "0.1.0"
+edition = "2021"
+description = "AI agent orchestrator with Neo4j knowledge graph, Meilisearch, and Tree-sitter parsing"
+authors = ["Elun <elun@openclaw.ai>"]
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+
+# Web framework for webhook listener
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Neo4j
+neo4rs = "0.8"
+
+# Meilisearch
+meilisearch-sdk = "0.30"
+
+# Tree-sitter
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2.5"
+glob = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP client (for CLI)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Config
+dotenvy = "0.15"
+urlencoding = "2.1.3"
+notify = { version = "8.2.0", features = ["macos_fsevent"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.14"
+
+[[bin]]
+name = "orchestrator"
+path = "src/main.rs"
+
+[[bin]]
+name = "orch"
+path = "src/cli.rs"
