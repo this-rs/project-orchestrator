@@ -164,6 +164,19 @@ impl CodeParser {
                 }
                 "struct_item" => {
                     if let Some(s) = self.extract_rust_struct(&node, source, file_path) {
+                        // Extract derive traits and create synthetic impl blocks
+                        let derives = self.extract_derive_traits(&node, source);
+                        for trait_name in derives {
+                            parsed.impl_blocks.push(ImplNode {
+                                for_type: s.name.clone(),
+                                trait_name: Some(trait_name),
+                                generics: s.generics.clone(),
+                                where_clause: None,
+                                file_path: file_path.to_string(),
+                                line_start: s.line_start,
+                                line_end: s.line_start, // Derive is a single line
+                            });
+                        }
                         parsed.symbols.push(s.name.clone());
                         parsed.structs.push(s);
                     }
@@ -176,6 +189,19 @@ impl CodeParser {
                 }
                 "enum_item" => {
                     if let Some(e) = self.extract_rust_enum(&node, source, file_path) {
+                        // Extract derive traits and create synthetic impl blocks
+                        let derives = self.extract_derive_traits(&node, source);
+                        for trait_name in derives {
+                            parsed.impl_blocks.push(ImplNode {
+                                for_type: e.name.clone(),
+                                trait_name: Some(trait_name),
+                                generics: vec![],
+                                where_clause: None,
+                                file_path: file_path.to_string(),
+                                line_start: e.line_start,
+                                line_end: e.line_start,
+                            });
+                        }
                         parsed.symbols.push(e.name.clone());
                         parsed.enums.push(e);
                     }
@@ -290,6 +316,8 @@ impl CodeParser {
             line_start: node.start_position().row as u32 + 1,
             line_end: node.end_position().row as u32 + 1,
             docstring,
+            is_external: false,
+            source: None,
         })
     }
 
@@ -658,6 +686,45 @@ impl CodeParser {
             doc_lines.reverse();
             Some(doc_lines.join("\n"))
         }
+    }
+
+    /// Extract derive trait names from a struct/enum node
+    ///
+    /// Parses attributes like `#[derive(Debug, Clone, Serialize)]`
+    /// and returns the trait names.
+    fn extract_derive_traits(&self, node: &tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut traits = Vec::new();
+
+        // Look for attribute_item siblings before this node
+        let mut prev = node.prev_sibling();
+        while let Some(sibling) = prev {
+            if sibling.kind() == "attribute_item" {
+                // Get the full attribute text
+                if let Ok(attr_text) = sibling.utf8_text(source.as_bytes()) {
+                    // Check if it's a derive attribute
+                    if attr_text.starts_with("#[derive(") {
+                        // Extract the trait names from #[derive(Trait1, Trait2, ...)]
+                        if let Some(start) = attr_text.find('(') {
+                            if let Some(end) = attr_text.rfind(')') {
+                                let traits_str = &attr_text[start + 1..end];
+                                for trait_name in traits_str.split(',') {
+                                    let name = trait_name.trim();
+                                    if !name.is_empty() {
+                                        traits.push(name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if sibling.kind() != "line_comment" && sibling.kind() != "block_comment" {
+                // Stop when we hit something other than comments or attributes
+                break;
+            }
+            prev = sibling.prev_sibling();
+        }
+
+        traits
     }
 
     /// Extract type parameters (generics) from a node

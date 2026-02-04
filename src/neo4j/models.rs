@@ -66,6 +66,12 @@ pub struct TraitNode {
     pub line_start: u32,
     pub line_end: u32,
     pub docstring: Option<String>,
+    /// Whether this trait is from an external crate (std, serde, etc.)
+    #[serde(default)]
+    pub is_external: bool,
+    /// Source crate for external traits (e.g., "std", "serde", "tokio")
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// An enum definition

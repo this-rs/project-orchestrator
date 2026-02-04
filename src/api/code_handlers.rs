@@ -776,6 +776,8 @@ pub struct TraitImplQuery {
 #[derive(Serialize)]
 pub struct TraitImplementors {
     pub trait_name: String,
+    pub is_external: bool,
+    pub source: Option<String>,
     pub implementors: Vec<TypeImplementation>,
 }
 
@@ -788,14 +790,35 @@ pub struct TypeImplementation {
 
 /// Find all types that implement a specific trait
 ///
-/// Example: `/api/code/trait-impls?trait_name=Module`
+/// Example: `/api/code/trait-impls?trait_name=Debug`
 ///
 /// Useful for understanding trait usage patterns across the codebase.
-/// Critical for Rust/Go interface exploration.
+/// Works for both local traits and external traits (std, serde, etc.)
 pub async fn find_trait_implementations(
     State(state): State<OrchestratorState>,
     Query(query): Query<TraitImplQuery>,
 ) -> Result<Json<TraitImplementors>, AppError> {
+    // First get trait info
+    let trait_q = neo4rs::query(
+        r#"
+        MATCH (t:Trait {name: $trait_name})
+        RETURN t.is_external AS is_external, t.source AS source
+        LIMIT 1
+        "#,
+    )
+    .param("trait_name", query.trait_name.clone());
+
+    let trait_rows = state.orchestrator.neo4j().execute_with_params(trait_q).await?;
+    let (is_external, source) = trait_rows
+        .first()
+        .map(|r| {
+            let ext: bool = r.get("is_external").unwrap_or(false);
+            let src: Option<String> = r.get("source").ok();
+            (ext, src)
+        })
+        .unwrap_or((false, None));
+
+    // Get implementors
     let q = neo4rs::query(
         r#"
         MATCH (i:Impl)-[:IMPLEMENTS_TRAIT]->(t:Trait {name: $trait_name})
@@ -820,6 +843,8 @@ pub async fn find_trait_implementations(
 
     Ok(Json(TraitImplementors {
         trait_name: query.trait_name,
+        is_external,
+        source,
         implementors,
     }))
 }
@@ -839,8 +864,10 @@ pub struct TypeTraits {
 #[derive(Serialize)]
 pub struct TraitInfo {
     pub name: String,
+    pub full_path: Option<String>,
     pub file_path: String,
-    pub is_local: bool,
+    pub is_external: bool,
+    pub source: Option<String>,
 }
 
 /// Find all traits implemented by a specific type
@@ -848,6 +875,7 @@ pub struct TraitInfo {
 /// Example: `/api/code/type-traits?type_name=AppState`
 ///
 /// Useful for understanding what a type can do.
+/// Returns both local traits (defined in codebase) and external traits (std, serde, etc.)
 pub async fn find_type_traits(
     State(state): State<OrchestratorState>,
     Query(query): Query<TypeTraitsQuery>,
@@ -856,7 +884,11 @@ pub async fn find_type_traits(
         r#"
         MATCH (type {name: $type_name})<-[:IMPLEMENTS_FOR]-(i:Impl)
         OPTIONAL MATCH (i)-[:IMPLEMENTS_TRAIT]->(t:Trait)
-        RETURN t.name AS trait_name, t.file_path AS file_path
+        RETURN t.name AS trait_name,
+               t.full_path AS full_path,
+               t.file_path AS file_path,
+               t.is_external AS is_external,
+               t.source AS source
         "#,
     )
     .param("type_name", query.type_name.clone());
@@ -867,11 +899,16 @@ pub async fn find_type_traits(
         .into_iter()
         .filter_map(|row| {
             let name: String = row.get("trait_name").ok()?;
+            let full_path: Option<String> = row.get("full_path").ok();
             let file_path: String = row.get("file_path").unwrap_or_default();
+            let is_external: bool = row.get("is_external").unwrap_or(false);
+            let source: Option<String> = row.get("source").ok();
             Some(TraitInfo {
                 name,
-                is_local: !file_path.is_empty(),
+                full_path,
                 file_path,
+                is_external,
+                source,
             })
         })
         .collect();

@@ -712,21 +712,177 @@ impl Neo4jClient {
 
         // Create IMPLEMENTS_TRAIT relationship if this is a trait impl
         if let Some(ref trait_name) = impl_node.trait_name {
+            // First try to link to existing local trait
             let q = query(
                 r#"
                 MATCH (i:Impl {id: $impl_id})
                 MATCH (t:Trait {name: $trait_name})
+                WHERE t.is_external IS NULL OR t.is_external = false
                 MERGE (i)-[:IMPLEMENTS_TRAIT]->(t)
+                RETURN count(*) AS linked
                 "#,
             )
-            .param("impl_id", id)
+            .param("impl_id", id.clone())
             .param("trait_name", trait_name.clone());
 
-            // Ignore error if trait not found (might be external)
-            let _ = self.graph.run(q).await;
+            let rows = self.execute_with_params(q).await?;
+            let linked: i64 = rows
+                .first()
+                .and_then(|r| r.get("linked").ok())
+                .unwrap_or(0);
+
+            // If no local trait found, create/link to external trait
+            if linked == 0 {
+                let (simple_name, source) = Self::parse_trait_path(trait_name);
+                let external_id = format!("external:trait:{}", trait_name);
+
+                let q = query(
+                    r#"
+                    MERGE (t:Trait {id: $trait_id})
+                    ON CREATE SET
+                        t.name = $name,
+                        t.full_path = $full_path,
+                        t.is_external = true,
+                        t.source = $source,
+                        t.visibility = 'public',
+                        t.generics = [],
+                        t.file_path = '',
+                        t.line_start = 0,
+                        t.line_end = 0
+                    WITH t
+                    MATCH (i:Impl {id: $impl_id})
+                    MERGE (i)-[:IMPLEMENTS_TRAIT]->(t)
+                    "#,
+                )
+                .param("trait_id", external_id)
+                .param("name", simple_name)
+                .param("full_path", trait_name.clone())
+                .param("source", source)
+                .param("impl_id", id);
+
+                let _ = self.graph.run(q).await;
+            }
         }
 
         Ok(())
+    }
+
+    /// Parse a trait path to extract the simple name and source crate
+    ///
+    /// Examples:
+    /// - "Debug" -> ("Debug", "std")
+    /// - "Clone" -> ("Clone", "std")
+    /// - "Serialize" -> ("Serialize", "serde")
+    /// - "serde::Serialize" -> ("Serialize", "serde")
+    /// - "std::fmt::Display" -> ("Display", "std")
+    /// - "tokio::io::AsyncRead" -> ("AsyncRead", "tokio")
+    fn parse_trait_path(trait_path: &str) -> (String, String) {
+        let parts: Vec<&str> = trait_path.split("::").collect();
+
+        if parts.len() == 1 {
+            // Simple name - check known trait sources
+            let name = parts[0].to_string();
+            let source = Self::get_trait_source(&name).to_string();
+            (name, source)
+        } else {
+            // Full path - first part is the crate
+            let name = parts.last().unwrap_or(&"").to_string();
+            let source = parts[0].to_string();
+            (name, source)
+        }
+    }
+
+    /// Determine the source crate for a trait name
+    fn get_trait_source(name: &str) -> &'static str {
+        // Standard library traits
+        if matches!(
+            name,
+            "Debug"
+                | "Display"
+                | "Clone"
+                | "Copy"
+                | "Default"
+                | "PartialEq"
+                | "Eq"
+                | "PartialOrd"
+                | "Ord"
+                | "Hash"
+                | "From"
+                | "Into"
+                | "TryFrom"
+                | "TryInto"
+                | "AsRef"
+                | "AsMut"
+                | "Deref"
+                | "DerefMut"
+                | "Drop"
+                | "Send"
+                | "Sync"
+                | "Sized"
+                | "Unpin"
+                | "Iterator"
+                | "IntoIterator"
+                | "ExactSizeIterator"
+                | "DoubleEndedIterator"
+                | "Extend"
+                | "FromIterator"
+                | "Read"
+                | "Write"
+                | "Seek"
+                | "BufRead"
+                | "Error"
+                | "Future"
+                | "Stream"
+                | "FnOnce"
+                | "FnMut"
+                | "Fn"
+                | "Add"
+                | "Sub"
+                | "Mul"
+                | "Div"
+                | "Rem"
+                | "Neg"
+                | "Not"
+                | "BitAnd"
+                | "BitOr"
+                | "BitXor"
+                | "Shl"
+                | "Shr"
+                | "Index"
+                | "IndexMut"
+        ) {
+            return "std";
+        }
+
+        // serde traits
+        if matches!(name, "Serialize" | "Deserialize" | "Serializer" | "Deserializer") {
+            return "serde";
+        }
+
+        // tokio/async traits
+        if matches!(
+            name,
+            "AsyncRead" | "AsyncWrite" | "AsyncSeek" | "AsyncBufRead"
+        ) {
+            return "tokio";
+        }
+
+        // anyhow/thiserror
+        if matches!(name, "Context") {
+            return "anyhow";
+        }
+
+        // tracing
+        if matches!(name, "Instrument" | "Subscriber") {
+            return "tracing";
+        }
+
+        // axum/tower
+        if matches!(name, "IntoResponse" | "FromRequest" | "FromRequestParts" | "Service" | "Layer") {
+            return "axum";
+        }
+
+        "unknown"
     }
 
     // ========================================================================

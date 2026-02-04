@@ -144,7 +144,16 @@ The knowledge graph uses these relationships:
 - `(File)-[:IMPORTS]->(File)` - File imports another file (resolved from `crate::`, `super::`, `self::`)
 - `(Function)-[:CALLS]->(Function)` - Function calls another function
 - `(Impl)-[:IMPLEMENTS_FOR]->(Struct|Enum)` - Impl block for a type
-- `(Impl)-[:IMPLEMENTS_TRAIT]->(Trait)` - Impl implements a trait
+- `(Impl)-[:IMPLEMENTS_TRAIT]->(Trait)` - Impl implements a trait (local or external)
+
+### External Traits
+External traits (from std, serde, tokio, etc.) are automatically created when:
+- A struct/enum uses `#[derive(Debug, Clone, Serialize, ...)]`
+- An explicit `impl Trait for Type` references an external trait
+
+External Trait nodes have:
+- `is_external: true`
+- `source`: The crate name (std, serde, tokio, axum, anyhow, tracing, unknown)
 
 ### Plans
 - `(Plan)-[:HAS_TASK]->(Task)` - Plan contains tasks
