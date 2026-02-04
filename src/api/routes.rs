@@ -4,6 +4,7 @@ use super::code_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::note_handlers;
 use super::project_handlers;
+use super::workspace_handlers;
 use axum::{
     routing::{get, post},
     Router,
@@ -67,7 +68,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         .route(
             "/api/plans/{plan_id}",
-            get(handlers::get_plan).patch(handlers::update_plan_status),
+            get(handlers::get_plan)
+                .patch(handlers::update_plan_status)
+                .delete(handlers::delete_plan),
         )
         .route(
             "/api/plans/{plan_id}/project",
@@ -310,6 +313,90 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .route(
             "/api/meilisearch/orphans",
             axum::routing::delete(handlers::delete_meilisearch_orphans),
+        )
+        // ====================================================================
+        // Workspaces
+        // ====================================================================
+        .route(
+            "/api/workspaces",
+            get(workspace_handlers::list_workspaces).post(workspace_handlers::create_workspace),
+        )
+        .route(
+            "/api/workspaces/{slug}",
+            get(workspace_handlers::get_workspace)
+                .patch(workspace_handlers::update_workspace)
+                .delete(workspace_handlers::delete_workspace),
+        )
+        .route(
+            "/api/workspaces/{slug}/overview",
+            get(workspace_handlers::get_workspace_overview),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects",
+            get(workspace_handlers::list_workspace_projects)
+                .post(workspace_handlers::add_project_to_workspace),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}",
+            axum::routing::delete(workspace_handlers::remove_project_from_workspace),
+        )
+        // Workspace Milestones
+        .route(
+            "/api/workspaces/{slug}/milestones",
+            get(workspace_handlers::list_workspace_milestones)
+                .post(workspace_handlers::create_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}",
+            get(workspace_handlers::get_workspace_milestone)
+                .patch(workspace_handlers::update_workspace_milestone)
+                .delete(workspace_handlers::delete_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}/tasks",
+            post(workspace_handlers::add_task_to_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}/progress",
+            get(workspace_handlers::get_workspace_milestone_progress),
+        )
+        // Resources
+        .route(
+            "/api/workspaces/{slug}/resources",
+            get(workspace_handlers::list_resources).post(workspace_handlers::create_resource),
+        )
+        .route(
+            "/api/resources/{id}",
+            get(workspace_handlers::get_resource).delete(workspace_handlers::delete_resource),
+        )
+        .route(
+            "/api/resources/{id}/projects",
+            post(workspace_handlers::link_resource_to_project),
+        )
+        // Components
+        .route(
+            "/api/workspaces/{slug}/components",
+            get(workspace_handlers::list_components).post(workspace_handlers::create_component),
+        )
+        .route(
+            "/api/components/{id}",
+            get(workspace_handlers::get_component).delete(workspace_handlers::delete_component),
+        )
+        .route(
+            "/api/components/{id}/dependencies",
+            post(workspace_handlers::add_component_dependency),
+        )
+        .route(
+            "/api/components/{id}/dependencies/{dep_id}",
+            axum::routing::delete(workspace_handlers::remove_component_dependency),
+        )
+        .route(
+            "/api/components/{id}/project",
+            axum::routing::put(workspace_handlers::map_component_to_project),
+        )
+        .route(
+            "/api/workspaces/{slug}/topology",
+            get(workspace_handlers::get_workspace_topology),
         )
         // Middleware
         .layer(TraceLayer::new_for_http())

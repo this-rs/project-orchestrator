@@ -192,6 +192,403 @@ curl http://localhost:8080/api/projects/{project_id}/roadmap
 
 ---
 
+## Workspaces
+
+Workspaces group related projects together for cross-project coordination.
+
+### GET /api/workspaces
+
+List all workspaces.
+
+**Query Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `search` | string | Search in name/description |
+| `limit` | integer | Max items |
+| `offset` | integer | Items to skip |
+| `sort_by` | string | `name` or `created_at` |
+| `sort_order` | string | `asc` or `desc` |
+
+```bash
+curl "http://localhost:8080/api/workspaces?limit=10"
+```
+
+### POST /api/workspaces
+
+Create a new workspace.
+
+```bash
+curl -X POST http://localhost:8080/api/workspaces \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "E-Commerce Platform",
+    "description": "Microservices for our e-commerce system",
+    "slug": "e-commerce-platform"
+  }'
+```
+
+**Request Body:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Workspace name |
+| `description` | string | No | Workspace description |
+| `slug` | string | No | URL-safe identifier (auto-generated) |
+
+### GET /api/workspaces/{slug}
+
+Get workspace details.
+
+```bash
+curl http://localhost:8080/api/workspaces/e-commerce-platform
+```
+
+### PATCH /api/workspaces/{slug}
+
+Update a workspace.
+
+```bash
+curl -X PATCH http://localhost:8080/api/workspaces/e-commerce-platform \
+  -H "Content-Type: application/json" \
+  -d '{"description": "Updated description"}'
+```
+
+### DELETE /api/workspaces/{slug}
+
+Delete a workspace.
+
+```bash
+curl -X DELETE http://localhost:8080/api/workspaces/e-commerce-platform
+```
+
+### GET /api/workspaces/{slug}/overview
+
+Get workspace overview with projects, milestones, resources, and components.
+
+```bash
+curl http://localhost:8080/api/workspaces/e-commerce-platform/overview
+```
+
+**Response:**
+```json
+{
+  "workspace": {...},
+  "projects": [...],
+  "milestones": [...],
+  "resources": [...],
+  "components": [...]
+}
+```
+
+### GET /api/workspaces/{slug}/projects
+
+List projects in a workspace.
+
+```bash
+curl http://localhost:8080/api/workspaces/e-commerce-platform/projects
+```
+
+### POST /api/workspaces/{slug}/projects
+
+Add a project to a workspace.
+
+```bash
+curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/projects \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "uuid"}'
+```
+
+### DELETE /api/workspaces/{slug}/projects/{project_id}
+
+Remove a project from a workspace.
+
+```bash
+curl -X DELETE http://localhost:8080/api/workspaces/e-commerce-platform/projects/{project_id}
+```
+
+---
+
+## Workspace Milestones
+
+Cross-project milestones for coordinating tasks across multiple projects.
+
+### GET /api/workspaces/{slug}/milestones
+
+List workspace milestones.
+
+```bash
+curl "http://localhost:8080/api/workspaces/e-commerce-platform/milestones?status=open"
+```
+
+### POST /api/workspaces/{slug}/milestones
+
+Create a workspace milestone.
+
+```bash
+curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/milestones \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Q1 Launch",
+    "description": "Cross-project launch milestone",
+    "target_date": "2024-03-31T00:00:00Z",
+    "tags": ["launch", "q1"]
+  }'
+```
+
+### GET /api/workspace-milestones/{milestone_id}
+
+Get workspace milestone details.
+
+```bash
+curl http://localhost:8080/api/workspace-milestones/{milestone_id}
+```
+
+### PATCH /api/workspace-milestones/{milestone_id}
+
+Update a workspace milestone.
+
+```bash
+curl -X PATCH http://localhost:8080/api/workspace-milestones/{milestone_id} \
+  -H "Content-Type: application/json" \
+  -d '{"status": "closed"}'
+```
+
+### DELETE /api/workspace-milestones/{milestone_id}
+
+Delete a workspace milestone.
+
+```bash
+curl -X DELETE http://localhost:8080/api/workspace-milestones/{milestone_id}
+```
+
+### POST /api/workspace-milestones/{milestone_id}/tasks
+
+Add a task from any project to a workspace milestone.
+
+```bash
+curl -X POST http://localhost:8080/api/workspace-milestones/{milestone_id}/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"task_id": "uuid"}'
+```
+
+### GET /api/workspace-milestones/{milestone_id}/progress
+
+Get aggregated progress across all projects.
+
+```bash
+curl http://localhost:8080/api/workspace-milestones/{milestone_id}/progress
+```
+
+**Response:**
+```json
+{
+  "total": 12,
+  "completed": 8,
+  "in_progress": 2,
+  "pending": 2,
+  "percentage": 66.7
+}
+```
+
+---
+
+## Resources
+
+Shared contracts, schemas, and specifications referenced by multiple projects.
+
+### GET /api/workspaces/{slug}/resources
+
+List resources in a workspace.
+
+```bash
+curl "http://localhost:8080/api/workspaces/e-commerce-platform/resources?resource_type=api_contract"
+```
+
+### POST /api/workspaces/{slug}/resources
+
+Create a shared resource.
+
+```bash
+curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/resources \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "User API",
+    "resource_type": "api_contract",
+    "file_path": "specs/openapi/users.yaml",
+    "format": "openapi",
+    "version": "1.0.0",
+    "description": "User service API contract"
+  }'
+```
+
+**Resource Types:** `api_contract`, `protobuf`, `graphql_schema`, `json_schema`, `database_schema`, `shared_types`, `config`, `documentation`, `other`
+
+### GET /api/resources/{resource_id}
+
+Get resource details.
+
+```bash
+curl http://localhost:8080/api/resources/{resource_id}
+```
+
+### PATCH /api/resources/{resource_id}
+
+Update a resource.
+
+```bash
+curl -X PATCH http://localhost:8080/api/resources/{resource_id} \
+  -H "Content-Type: application/json" \
+  -d '{"version": "2.0.0"}'
+```
+
+### DELETE /api/resources/{resource_id}
+
+Delete a resource.
+
+```bash
+curl -X DELETE http://localhost:8080/api/resources/{resource_id}
+```
+
+### POST /api/resources/{resource_id}/projects
+
+Link a project to a resource as implementer or consumer.
+
+```bash
+curl -X POST http://localhost:8080/api/resources/{resource_id}/projects \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "uuid",
+    "relationship": "implements"
+  }'
+```
+
+**Relationship Values:** `implements` (provider), `uses` (consumer)
+
+### GET /api/resources/{resource_id}/projects
+
+Get projects linked to a resource.
+
+```bash
+curl http://localhost:8080/api/resources/{resource_id}/projects
+```
+
+---
+
+## Components & Topology
+
+Model deployment architecture with components and their dependencies.
+
+### GET /api/workspaces/{slug}/components
+
+List components in a workspace.
+
+```bash
+curl "http://localhost:8080/api/workspaces/e-commerce-platform/components?component_type=service"
+```
+
+### POST /api/workspaces/{slug}/components
+
+Create a deployment component.
+
+```bash
+curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/components \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "API Gateway",
+    "component_type": "gateway",
+    "description": "Main entry point for all API requests",
+    "runtime": "kubernetes",
+    "config": {"port": 8080, "replicas": 3},
+    "tags": ["infrastructure", "gateway"]
+  }'
+```
+
+**Component Types:** `service`, `frontend`, `worker`, `database`, `message_queue`, `cache`, `gateway`, `external`, `other`
+
+### GET /api/components/{component_id}
+
+Get component details.
+
+```bash
+curl http://localhost:8080/api/components/{component_id}
+```
+
+### PATCH /api/components/{component_id}
+
+Update a component.
+
+```bash
+curl -X PATCH http://localhost:8080/api/components/{component_id} \
+  -H "Content-Type: application/json" \
+  -d '{"runtime": "docker"}'
+```
+
+### DELETE /api/components/{component_id}
+
+Delete a component.
+
+```bash
+curl -X DELETE http://localhost:8080/api/components/{component_id}
+```
+
+### POST /api/components/{component_id}/dependencies
+
+Add a dependency between components.
+
+```bash
+curl -X POST http://localhost:8080/api/components/{component_id}/dependencies \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depends_on_id": "uuid",
+    "protocol": "http",
+    "required": true
+  }'
+```
+
+### DELETE /api/components/{component_id}/dependencies/{dep_id}
+
+Remove a component dependency.
+
+```bash
+curl -X DELETE http://localhost:8080/api/components/{component_id}/dependencies/{dep_id}
+```
+
+### PUT /api/components/{component_id}/project
+
+Map a component to its source code project.
+
+```bash
+curl -X PUT http://localhost:8080/api/components/{component_id}/project \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "uuid"}'
+```
+
+### GET /api/workspaces/{slug}/topology
+
+Get full deployment topology graph.
+
+```bash
+curl http://localhost:8080/api/workspaces/e-commerce-platform/topology
+```
+
+**Response:**
+```json
+{
+  "components": [
+    {
+      "id": "uuid",
+      "name": "API Gateway",
+      "component_type": "gateway",
+      "project_name": "api-gateway",
+      "dependencies": [
+        {"id": "uuid", "name": "User Service", "protocol": "http", "required": true}
+      ]
+    }
+  ]
+}
+```
+
+---
+
 ## Plans
 
 ### GET /api/plans

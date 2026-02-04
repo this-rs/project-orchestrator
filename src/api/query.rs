@@ -199,26 +199,68 @@ impl<T> PaginatedResponse<T> {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // PaginationParams Tests
+    // =========================================================================
+
     #[test]
     fn test_pagination_defaults() {
         let params = PaginationParams::default();
         assert_eq!(params.limit, 50);
         assert_eq!(params.offset, 0);
         assert_eq!(params.sort_order, "desc");
+        assert!(params.sort_by.is_none());
     }
 
     #[test]
-    fn test_pagination_validation() {
-        let mut params = PaginationParams::default();
+    fn test_pagination_validation_success() {
+        let params = PaginationParams {
+            limit: 50,
+            offset: 0,
+            sort_by: Some("created_at".to_string()),
+            sort_order: "asc".to_string(),
+        };
         assert!(params.validate().is_ok());
-
-        params.limit = 150;
-        assert!(params.validate().is_err());
-
-        params.limit = 50;
-        params.sort_order = "invalid".to_string();
-        assert!(params.validate().is_err());
     }
+
+    #[test]
+    fn test_pagination_validation_limit_too_high() {
+        let params = PaginationParams {
+            limit: 150,
+            ..Default::default()
+        };
+        assert!(params.validate().is_err());
+        assert!(params.validate().unwrap_err().contains("limit"));
+    }
+
+    #[test]
+    fn test_pagination_validation_invalid_sort_order() {
+        let params = PaginationParams {
+            sort_order: "invalid".to_string(),
+            ..Default::default()
+        };
+        assert!(params.validate().is_err());
+        assert!(params.validate().unwrap_err().contains("sort_order"));
+    }
+
+    #[test]
+    fn test_pagination_validated_limit() {
+        let params = PaginationParams {
+            limit: 150,
+            ..Default::default()
+        };
+        assert_eq!(params.validated_limit(), 100);
+
+        let params2 = PaginationParams {
+            limit: 50,
+            ..Default::default()
+        };
+        assert_eq!(params2.validated_limit(), 50);
+    }
+
+    // =========================================================================
+    // StatusFilter Tests
+    // =========================================================================
 
     #[test]
     fn test_status_filter_to_vec() {
@@ -227,10 +269,60 @@ mod tests {
         };
         let vec = filter.to_vec().unwrap();
         assert_eq!(vec, vec!["pending", "in_progress", "completed"]);
-
-        let empty_filter = StatusFilter { status: None };
-        assert!(empty_filter.to_vec().is_none());
     }
+
+    #[test]
+    fn test_status_filter_to_vec_none() {
+        let filter = StatusFilter { status: None };
+        assert!(filter.to_vec().is_none());
+    }
+
+    #[test]
+    fn test_status_filter_to_vec_empty_string() {
+        let filter = StatusFilter {
+            status: Some("".to_string()),
+        };
+        let vec = filter.to_vec().unwrap();
+        assert!(vec.is_empty());
+    }
+
+    #[test]
+    fn test_status_filter_to_vec_single_value() {
+        let filter = StatusFilter {
+            status: Some("pending".to_string()),
+        };
+        let vec = filter.to_vec().unwrap();
+        assert_eq!(vec, vec!["pending"]);
+    }
+
+    // =========================================================================
+    // PriorityFilter Tests
+    // =========================================================================
+
+    #[test]
+    fn test_priority_filter_is_set() {
+        let filter = PriorityFilter {
+            priority_min: Some(1),
+            priority_max: None,
+        };
+        assert!(filter.is_set());
+
+        let filter2 = PriorityFilter {
+            priority_min: None,
+            priority_max: Some(10),
+        };
+        assert!(filter2.is_set());
+
+        let filter3 = PriorityFilter {
+            priority_min: None,
+            priority_max: None,
+        };
+        assert!(!filter3.is_set());
+    }
+
+    // =========================================================================
+    // TagsFilter Tests
+    // =========================================================================
 
     #[test]
     fn test_tags_filter_to_vec() {
@@ -242,14 +334,97 @@ mod tests {
     }
 
     #[test]
-    fn test_paginated_response() {
+    fn test_tags_filter_to_vec_none() {
+        let filter = TagsFilter { tags: None };
+        assert!(filter.to_vec().is_none());
+    }
+
+    #[test]
+    fn test_tags_filter_to_vec_with_extra_whitespace() {
+        let filter = TagsFilter {
+            tags: Some("  backend  ,  api  ,  rust  ".to_string()),
+        };
+        let vec = filter.to_vec().unwrap();
+        assert_eq!(vec, vec!["backend", "api", "rust"]);
+    }
+
+    // =========================================================================
+    // SearchFilter Tests
+    // =========================================================================
+
+    #[test]
+    fn test_search_filter_is_set() {
+        let filter = SearchFilter {
+            search: Some("query".to_string()),
+        };
+        assert!(filter.is_set());
+    }
+
+    #[test]
+    fn test_search_filter_is_not_set_when_none() {
+        let filter = SearchFilter { search: None };
+        assert!(!filter.is_set());
+    }
+
+    #[test]
+    fn test_search_filter_is_not_set_when_empty() {
+        let filter = SearchFilter {
+            search: Some("".to_string()),
+        };
+        assert!(!filter.is_set());
+    }
+
+    #[test]
+    fn test_search_filter_is_not_set_when_whitespace() {
+        let filter = SearchFilter {
+            search: Some("   ".to_string()),
+        };
+        assert!(!filter.is_set());
+    }
+
+    // =========================================================================
+    // PaginatedResponse Tests
+    // =========================================================================
+
+    #[test]
+    fn test_paginated_response_has_more() {
         let items = vec![1, 2, 3, 4, 5];
         let response = PaginatedResponse::new(items, 10, 5, 0);
         assert_eq!(response.items.len(), 5);
         assert_eq!(response.total, 10);
         assert!(response.has_more);
+    }
 
-        let response2 = PaginatedResponse::new(vec![6, 7, 8, 9, 10], 10, 5, 5);
-        assert!(!response2.has_more);
+    #[test]
+    fn test_paginated_response_no_more() {
+        let response = PaginatedResponse::new(vec![6, 7, 8, 9, 10], 10, 5, 5);
+        assert!(!response.has_more);
+    }
+
+    #[test]
+    fn test_paginated_response_empty() {
+        let response: PaginatedResponse<i32> = PaginatedResponse::empty(10, 0);
+        assert!(response.items.is_empty());
+        assert_eq!(response.total, 0);
+        assert!(!response.has_more);
+    }
+
+    #[test]
+    fn test_paginated_response_exact_boundary() {
+        // Exactly fills the page
+        let response = PaginatedResponse::new(vec![1, 2, 3, 4, 5], 5, 5, 0);
+        assert!(!response.has_more);
+    }
+
+    #[test]
+    fn test_paginated_response_serialization() {
+        let response = PaginatedResponse::new(vec!["a", "b", "c"], 10, 3, 0);
+        let json = serde_json::to_string(&response).unwrap();
+
+        assert!(json.contains("\"items\""));
+        assert!(json.contains("\"total\":10"));
+        assert!(json.contains("\"limit\":3"));
+        assert!(json.contains("\"offset\":0"));
+        assert!(json.contains("\"has_more\":true"));
     }
 }

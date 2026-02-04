@@ -76,6 +76,11 @@ impl PlanManager {
         self.neo4j.update_plan_status(plan_id, status).await
     }
 
+    /// Delete a plan and all its related data
+    pub async fn delete_plan(&self, plan_id: Uuid) -> Result<()> {
+        self.neo4j.delete_plan(plan_id).await
+    }
+
     /// Get full plan details including tasks
     pub async fn get_plan_details(&self, plan_id: Uuid) -> Result<Option<PlanDetails>> {
         let plan = match self.neo4j.get_plan(plan_id).await? {

@@ -1,6 +1,6 @@
 //! MCP Tool definitions
 //!
-//! Defines all 62 tools exposed by the MCP server.
+//! Defines all 113 tools exposed by the MCP server.
 
 use super::protocol::{InputSchema, ToolDefinition};
 use serde_json::json;
@@ -21,6 +21,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     tools.extend(sync_tools());
     tools.extend(meilisearch_tools());
     tools.extend(note_tools());
+    tools.extend(workspace_tools());
     tools
 }
 
@@ -122,7 +123,7 @@ fn project_tools() -> Vec<ToolDefinition> {
 }
 
 // ============================================================================
-// Plan Tools (8)
+// Plan Tools (9)
 // ============================================================================
 
 fn plan_tools() -> Vec<ToolDefinition> {
@@ -219,6 +220,19 @@ fn plan_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "get_critical_path".to_string(),
             description: "Get the critical path (longest dependency chain) for a plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_plan".to_string(),
+            description:
+                "Delete a plan and all its related data (tasks, steps, decisions, constraints)"
+                    .to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
@@ -1219,6 +1233,410 @@ fn note_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+// ============================================================================
+// Workspace Tools (29)
+// ============================================================================
+
+fn workspace_tools() -> Vec<ToolDefinition> {
+    vec![
+        // --- Workspace CRUD (5) ---
+        ToolDefinition {
+            name: "list_workspaces".to_string(),
+            description: "List all workspaces with optional search and pagination".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "search": {"type": "string", "description": "Search in name/description"},
+                    "limit": {"type": "integer", "description": "Max items (default 50, max 100)"},
+                    "offset": {"type": "integer", "description": "Items to skip"},
+                    "sort_by": {"type": "string", "description": "Sort field (name, created_at)"},
+                    "sort_order": {"type": "string", "description": "asc or desc"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "create_workspace".to_string(),
+            description: "Create a new workspace to group related projects".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "name": {"type": "string", "description": "Workspace name"},
+                    "slug": {"type": "string", "description": "URL-safe identifier (auto-generated if not provided)"},
+                    "description": {"type": "string", "description": "Workspace description"},
+                    "metadata": {"type": "object", "description": "Optional metadata"}
+                })),
+                required: Some(vec!["name".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_workspace".to_string(),
+            description: "Get workspace details by slug".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "update_workspace".to_string(),
+            description: "Update a workspace's name, description, or metadata".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "name": {"type": "string", "description": "New name"},
+                    "description": {"type": "string", "description": "New description"},
+                    "metadata": {"type": "object", "description": "New metadata"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_workspace".to_string(),
+            description: "Delete a workspace (does not delete associated projects)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        // --- Workspace Overview (1) ---
+        ToolDefinition {
+            name: "get_workspace_overview".to_string(),
+            description:
+                "Get workspace overview with projects, milestones, resources, and progress"
+                    .to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        // --- Workspace-Project Association (3) ---
+        ToolDefinition {
+            name: "list_workspace_projects".to_string(),
+            description: "List all projects in a workspace".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "add_project_to_workspace".to_string(),
+            description: "Add an existing project to a workspace".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "project_id": {"type": "string", "description": "Project UUID to add"}
+                })),
+                required: Some(vec!["slug".to_string(), "project_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "remove_project_from_workspace".to_string(),
+            description: "Remove a project from a workspace (does not delete the project)"
+                .to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "project_id": {"type": "string", "description": "Project UUID to remove"}
+                })),
+                required: Some(vec!["slug".to_string(), "project_id".to_string()]),
+            },
+        },
+        // --- Workspace Milestones (6) ---
+        ToolDefinition {
+            name: "list_workspace_milestones".to_string(),
+            description: "List milestones for a workspace (cross-project milestones)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "status": {"type": "string", "description": "Filter by status (open, closed)"},
+                    "limit": {"type": "integer", "description": "Max items"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "create_workspace_milestone".to_string(),
+            description: "Create a cross-project milestone in a workspace".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "title": {"type": "string", "description": "Milestone title"},
+                    "description": {"type": "string", "description": "Milestone description"},
+                    "target_date": {"type": "string", "description": "Target date (ISO 8601)"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags"}
+                })),
+                required: Some(vec!["slug".to_string(), "title".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_workspace_milestone".to_string(),
+            description: "Get workspace milestone details with linked tasks".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Workspace milestone UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "update_workspace_milestone".to_string(),
+            description: "Update a workspace milestone".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Workspace milestone UUID"},
+                    "title": {"type": "string", "description": "New title"},
+                    "description": {"type": "string", "description": "New description"},
+                    "status": {"type": "string", "description": "New status (open, closed)"},
+                    "target_date": {"type": "string", "description": "New target date"},
+                    "closed_at": {"type": "string", "description": "Closure date"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_workspace_milestone".to_string(),
+            description: "Delete a workspace milestone".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Workspace milestone UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "add_task_to_workspace_milestone".to_string(),
+            description: "Add a task from any project to a workspace milestone".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Workspace milestone UUID"},
+                    "task_id": {"type": "string", "description": "Task UUID to add"}
+                })),
+                required: Some(vec!["id".to_string(), "task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_workspace_milestone_progress".to_string(),
+            description: "Get completion progress for a workspace milestone".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Workspace milestone UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        // --- Resources (5) ---
+        ToolDefinition {
+            name: "list_resources".to_string(),
+            description: "List resources (API contracts, schemas) in a workspace".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "resource_type": {"type": "string", "description": "Filter by type (ApiContract, Protobuf, GraphqlSchema, etc.)"},
+                    "limit": {"type": "integer", "description": "Max items"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "create_resource".to_string(),
+            description: "Create a shared resource reference (API contract, schema file)"
+                .to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "name": {"type": "string", "description": "Resource name"},
+                    "resource_type": {"type": "string", "description": "Type: ApiContract, Protobuf, GraphqlSchema, JsonSchema, DatabaseSchema, SharedTypes, Config, Documentation, Other"},
+                    "file_path": {"type": "string", "description": "Path to the resource file"},
+                    "url": {"type": "string", "description": "External URL (optional)"},
+                    "format": {"type": "string", "description": "Format (openapi, protobuf, graphql)"},
+                    "version": {"type": "string", "description": "Version string"},
+                    "description": {"type": "string", "description": "Resource description"},
+                    "metadata": {"type": "object", "description": "Additional metadata"}
+                })),
+                required: Some(vec![
+                    "slug".to_string(),
+                    "name".to_string(),
+                    "resource_type".to_string(),
+                    "file_path".to_string(),
+                ]),
+            },
+        },
+        ToolDefinition {
+            name: "get_resource".to_string(),
+            description: "Get resource details".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Resource UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_resource".to_string(),
+            description: "Delete a resource".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Resource UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "link_resource_to_project".to_string(),
+            description: "Link a resource to a project (implements or uses)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Resource UUID"},
+                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "link_type": {"type": "string", "description": "Link type: implements or uses"}
+                })),
+                required: Some(vec![
+                    "id".to_string(),
+                    "project_id".to_string(),
+                    "link_type".to_string(),
+                ]),
+            },
+        },
+        // --- Components (7) ---
+        ToolDefinition {
+            name: "list_components".to_string(),
+            description: "List components (services, databases, etc.) in a workspace".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "component_type": {"type": "string", "description": "Filter by type (Service, Frontend, Worker, Database, etc.)"},
+                    "limit": {"type": "integer", "description": "Max items"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "create_component".to_string(),
+            description: "Create a component in the workspace topology".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"},
+                    "name": {"type": "string", "description": "Component name"},
+                    "component_type": {"type": "string", "description": "Type: Service, Frontend, Worker, Database, MessageQueue, Cache, Gateway, External, Other"},
+                    "description": {"type": "string", "description": "Component description"},
+                    "runtime": {"type": "string", "description": "Runtime (docker, kubernetes, lambda)"},
+                    "config": {"type": "object", "description": "Configuration (env vars, ports, etc.)"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags"}
+                })),
+                required: Some(vec![
+                    "slug".to_string(),
+                    "name".to_string(),
+                    "component_type".to_string(),
+                ]),
+            },
+        },
+        ToolDefinition {
+            name: "get_component".to_string(),
+            description: "Get component details".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Component UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_component".to_string(),
+            description: "Delete a component".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Component UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "add_component_dependency".to_string(),
+            description: "Add a dependency between components".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Source component UUID"},
+                    "depends_on_id": {"type": "string", "description": "Target component UUID"},
+                    "protocol": {"type": "string", "description": "Communication protocol (http, grpc, amqp, etc.)"},
+                    "required": {"type": "boolean", "description": "Whether dependency is required"}
+                })),
+                required: Some(vec!["id".to_string(), "depends_on_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "remove_component_dependency".to_string(),
+            description: "Remove a dependency between components".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Source component UUID"},
+                    "dep_id": {"type": "string", "description": "Target component UUID to remove"}
+                })),
+                required: Some(vec!["id".to_string(), "dep_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "map_component_to_project".to_string(),
+            description: "Map a component to a project (link source code)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Component UUID"},
+                    "project_id": {"type": "string", "description": "Project UUID"}
+                })),
+                required: Some(vec!["id".to_string(), "project_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_workspace_topology".to_string(),
+            description: "Get the full topology graph of a workspace (components and dependencies)"
+                .to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Workspace slug"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,7 +1644,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 84, "Expected 84 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 114, "Expected 114 tools, got {}", tools.len());
     }
 
     #[test]
@@ -1246,6 +1664,114 @@ mod tests {
             let json = serde_json::to_string(tool).unwrap();
             assert!(json.contains(&tool.name));
             assert!(json.contains("inputSchema"));
+        }
+    }
+
+    #[test]
+    fn test_workspace_tools_count() {
+        let tools = workspace_tools();
+        assert_eq!(
+            tools.len(),
+            29,
+            "Expected 29 workspace tools, got {}",
+            tools.len()
+        );
+    }
+
+    #[test]
+    fn test_workspace_tools_names() {
+        let tools = workspace_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Workspace management (9)
+        assert!(names.contains(&"list_workspaces"));
+        assert!(names.contains(&"create_workspace"));
+        assert!(names.contains(&"get_workspace"));
+        assert!(names.contains(&"update_workspace"));
+        assert!(names.contains(&"delete_workspace"));
+        assert!(names.contains(&"get_workspace_overview"));
+        assert!(names.contains(&"list_workspace_projects"));
+        assert!(names.contains(&"add_project_to_workspace"));
+        assert!(names.contains(&"remove_project_from_workspace"));
+
+        // Workspace milestones (7)
+        assert!(names.contains(&"list_workspace_milestones"));
+        assert!(names.contains(&"create_workspace_milestone"));
+        assert!(names.contains(&"get_workspace_milestone"));
+        assert!(names.contains(&"update_workspace_milestone"));
+        assert!(names.contains(&"delete_workspace_milestone"));
+        assert!(names.contains(&"add_task_to_workspace_milestone"));
+        assert!(names.contains(&"get_workspace_milestone_progress"));
+
+        // Resources (5)
+        assert!(names.contains(&"list_resources"));
+        assert!(names.contains(&"create_resource"));
+        assert!(names.contains(&"get_resource"));
+        assert!(names.contains(&"delete_resource"));
+        assert!(names.contains(&"link_resource_to_project"));
+
+        // Components (8)
+        assert!(names.contains(&"list_components"));
+        assert!(names.contains(&"create_component"));
+        assert!(names.contains(&"get_component"));
+        assert!(names.contains(&"delete_component"));
+        assert!(names.contains(&"add_component_dependency"));
+        assert!(names.contains(&"remove_component_dependency"));
+        assert!(names.contains(&"map_component_to_project"));
+        assert!(names.contains(&"get_workspace_topology"));
+    }
+
+    #[test]
+    fn test_workspace_tools_have_descriptions() {
+        let tools = workspace_tools();
+        for tool in &tools {
+            assert!(
+                !tool.description.is_empty(),
+                "Tool {} has empty description",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_workspace_tools_required_params() {
+        let tools = workspace_tools();
+
+        // Check create_workspace requires name
+        let create_ws = tools.iter().find(|t| t.name == "create_workspace").unwrap();
+        let required = create_ws.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"name".to_string()));
+
+        // Check get_workspace requires slug
+        let get_ws = tools.iter().find(|t| t.name == "get_workspace").unwrap();
+        let required = get_ws.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"slug".to_string()));
+
+        // Check create_resource requires slug, name, resource_type, file_path
+        let create_res = tools.iter().find(|t| t.name == "create_resource").unwrap();
+        let required = create_res.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"slug".to_string()));
+        assert!(required.contains(&"name".to_string()));
+        assert!(required.contains(&"resource_type".to_string()));
+        assert!(required.contains(&"file_path".to_string()));
+
+        // Check create_component requires slug, name, component_type
+        let create_comp = tools.iter().find(|t| t.name == "create_component").unwrap();
+        let required = create_comp.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"slug".to_string()));
+        assert!(required.contains(&"name".to_string()));
+        assert!(required.contains(&"component_type".to_string()));
+    }
+
+    #[test]
+    fn test_all_tools_have_valid_input_schema() {
+        let tools = all_tools();
+        for tool in &tools {
+            assert_eq!(
+                tool.input_schema.schema_type, "object",
+                "Tool {} input_schema type is not 'object'",
+                tool.name
+            );
         }
     }
 }

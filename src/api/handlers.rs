@@ -174,6 +174,19 @@ pub async fn update_plan_status(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Delete a plan and all its related data
+pub async fn delete_plan(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .plan_manager()
+        .delete_plan(plan_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ============================================================================
 // Tasks
 // ============================================================================

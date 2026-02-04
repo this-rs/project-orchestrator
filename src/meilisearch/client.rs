@@ -314,6 +314,42 @@ impl MeiliClient {
         Ok(results.hits.into_iter().map(|h| h.result).collect())
     }
 
+    /// Delete a decision document by ID
+    pub async fn delete_decision(&self, id: &str) -> Result<()> {
+        let index = self.client.index(index_names::DECISIONS);
+        let task = index.delete_document(id).await?;
+        task.wait_for_completion(&self.client, None, None).await?;
+        Ok(())
+    }
+
+    /// Delete all decision documents for a project
+    pub async fn delete_decisions_for_project(&self, project_slug: &str) -> Result<()> {
+        use meilisearch_sdk::documents::DocumentDeletionQuery;
+
+        let index = self.client.index(index_names::DECISIONS);
+        let mut query = DocumentDeletionQuery::new(&index);
+        let filter = format!("project_slug = \"{}\"", project_slug);
+        query.with_filter(&filter);
+
+        let task = index.delete_documents_with(&query).await?;
+        task.wait_for_completion(&self.client, None, None).await?;
+        Ok(())
+    }
+
+    /// Delete all decision documents for a task
+    pub async fn delete_decisions_for_task(&self, task_id: &str) -> Result<()> {
+        use meilisearch_sdk::documents::DocumentDeletionQuery;
+
+        let index = self.client.index(index_names::DECISIONS);
+        let mut query = DocumentDeletionQuery::new(&index);
+        let filter = format!("task_id = \"{}\"", task_id);
+        query.with_filter(&filter);
+
+        let task = index.delete_documents_with(&query).await?;
+        task.wait_for_completion(&self.client, None, None).await?;
+        Ok(())
+    }
+
     // ========================================================================
     // Note indexing
     // ========================================================================
@@ -512,5 +548,56 @@ impl MeiliClient {
         let mut hasher = Sha256::new();
         hasher.update(path.as_bytes());
         hex::encode(hasher.finalize())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_path_to_id_consistent() {
+        let path = "src/main.rs";
+        let id1 = MeiliClient::path_to_id(path);
+        let id2 = MeiliClient::path_to_id(path);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_path_to_id_different_paths() {
+        let id1 = MeiliClient::path_to_id("src/main.rs");
+        let id2 = MeiliClient::path_to_id("src/lib.rs");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_path_to_id_is_hex() {
+        let id = MeiliClient::path_to_id("test.rs");
+        // SHA256 hex is 64 characters
+        assert_eq!(id.len(), 64);
+        // All characters should be valid hex
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_path_to_id_handles_special_chars() {
+        let id = MeiliClient::path_to_id("src/path with spaces/file.rs");
+        assert_eq!(id.len(), 64);
+
+        let id2 = MeiliClient::path_to_id("src/über/файл.rs");
+        assert_eq!(id2.len(), 64);
+    }
+
+    #[test]
+    fn test_path_to_id_empty_path() {
+        let id = MeiliClient::path_to_id("");
+        assert_eq!(id.len(), 64);
+    }
+
+    #[test]
+    fn test_index_names_constants() {
+        assert_eq!(index_names::CODE, "code");
+        assert_eq!(index_names::DECISIONS, "decisions");
+        assert_eq!(index_names::NOTES, "notes");
     }
 }

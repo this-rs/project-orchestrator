@@ -364,11 +364,37 @@ impl NoteManager {
             .get_notes_for_entity(entity_type, entity_id)
             .await?;
 
-        // Get propagated notes
-        let propagated_notes = self
+        // Get propagated notes from graph traversal
+        let mut propagated_notes = self
             .neo4j
             .get_propagated_notes(entity_type, entity_id, max_depth, min_score)
             .await?;
+
+        // If entity is a Project, also get workspace-level notes
+        // These propagate from the parent workspace with a decay factor
+        if *entity_type == EntityType::Project {
+            if let Ok(project_id) = entity_id.parse::<uuid::Uuid>() {
+                const WORKSPACE_PROPAGATION_FACTOR: f64 = 0.8;
+                let workspace_notes = self
+                    .neo4j
+                    .get_workspace_notes_for_project(project_id, WORKSPACE_PROPAGATION_FACTOR)
+                    .await?;
+
+                // Filter by min_score and add to propagated notes
+                for note in workspace_notes {
+                    if note.relevance_score >= min_score {
+                        propagated_notes.push(note);
+                    }
+                }
+            }
+        }
+
+        // Sort propagated notes by relevance score (descending)
+        propagated_notes.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let total_count = direct_notes.len() + propagated_notes.len();
 
@@ -433,6 +459,7 @@ impl NoteManager {
             status: note.status.to_string(),
             importance: note.importance.to_string(),
             scope_type: match &note.scope {
+                NoteScope::Workspace => "workspace".to_string(),
                 NoteScope::Project => "project".to_string(),
                 NoteScope::Module(_) => "module".to_string(),
                 NoteScope::File(_) => "file".to_string(),
@@ -441,7 +468,7 @@ impl NoteManager {
                 NoteScope::Trait(_) => "trait".to_string(),
             },
             scope_path: match &note.scope {
-                NoteScope::Project => String::new(),
+                NoteScope::Workspace | NoteScope::Project => String::new(),
                 NoteScope::Module(p) | NoteScope::File(p) => p.clone(),
                 NoteScope::Function(n) | NoteScope::Struct(n) | NoteScope::Trait(n) => n.clone(),
             },

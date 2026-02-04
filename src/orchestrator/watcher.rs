@@ -176,17 +176,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_sync_file() {
+    fn test_should_sync_rust_files() {
         assert!(should_sync_file(Path::new("/project/src/main.rs")));
-        assert!(should_sync_file(Path::new("/project/lib/utils.ts")));
-        assert!(should_sync_file(Path::new("/project/app.py")));
+        assert!(should_sync_file(Path::new("/project/src/lib.rs")));
+        assert!(should_sync_file(Path::new("/project/tests/test.rs")));
+    }
 
+    #[test]
+    fn test_should_sync_typescript_files() {
+        assert!(should_sync_file(Path::new("/project/src/index.ts")));
+        assert!(should_sync_file(Path::new("/project/components/App.tsx")));
+    }
+
+    #[test]
+    fn test_should_sync_javascript_files() {
+        assert!(should_sync_file(Path::new("/project/lib/utils.js")));
+        assert!(should_sync_file(Path::new(
+            "/project/components/Button.jsx"
+        )));
+    }
+
+    #[test]
+    fn test_should_sync_python_files() {
+        assert!(should_sync_file(Path::new("/project/app.py")));
+        assert!(should_sync_file(Path::new("/project/src/main.py")));
+    }
+
+    #[test]
+    fn test_should_sync_go_files() {
+        assert!(should_sync_file(Path::new("/project/main.go")));
+        assert!(should_sync_file(Path::new("/project/pkg/handler.go")));
+    }
+
+    #[test]
+    fn test_should_not_sync_unsupported_extensions() {
         assert!(!should_sync_file(Path::new("/project/README.md")));
+        assert!(!should_sync_file(Path::new("/project/config.json")));
+        assert!(!should_sync_file(Path::new("/project/style.css")));
+        assert!(!should_sync_file(Path::new("/project/data.yaml")));
+        assert!(!should_sync_file(Path::new("/project/image.png")));
+    }
+
+    #[test]
+    fn test_should_not_sync_node_modules() {
         assert!(!should_sync_file(Path::new(
             "/project/node_modules/lib/index.js"
         )));
         assert!(!should_sync_file(Path::new(
+            "/project/node_modules/package/src/utils.ts"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_sync_target_directory() {
+        assert!(!should_sync_file(Path::new(
             "/project/target/debug/main.rs"
         )));
+        assert!(!should_sync_file(Path::new(
+            "/project/target/release/lib.rs"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_sync_git_directory() {
+        assert!(!should_sync_file(Path::new(
+            "/project/.git/hooks/pre-commit"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/.git/objects/pack/file.rs"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_sync_pycache() {
+        assert!(!should_sync_file(Path::new(
+            "/project/__pycache__/module.cpython-311.pyc"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/src/__pycache__/utils.py"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_sync_dist_build_directories() {
+        assert!(!should_sync_file(Path::new("/project/dist/bundle.js")));
+        assert!(!should_sync_file(Path::new("/project/build/output.js")));
+    }
+
+    #[test]
+    fn test_should_sync_empty_extension() {
+        // Files without extension should not be synced
+        assert!(!should_sync_file(Path::new("/project/Makefile")));
+        assert!(!should_sync_file(Path::new("/project/Dockerfile")));
     }
 }

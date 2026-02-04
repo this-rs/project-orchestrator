@@ -9,7 +9,7 @@ For user-facing documentation, see the `docs/` folder:
 - **[Installation Guide](docs/setup/installation.md)** — Full setup instructions
 - **[Getting Started](docs/guides/getting-started.md)** — Tutorial for new users
 - **[API Reference](docs/api/reference.md)** — REST API documentation
-- **[MCP Tools](docs/api/mcp-tools.md)** — All 84 MCP tools documented
+- **[MCP Tools](docs/api/mcp-tools.md)** — All 113 MCP tools documented
 - **Integration Guides:**
   - [Claude Code](docs/integrations/claude-code.md)
   - [OpenAI Agents](docs/integrations/openai.md)
@@ -25,7 +25,7 @@ For user-facing documentation, see the `docs/` folder:
 - Meilisearch for semantic search across code and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
-- MCP server for Claude Code integration (62 tools)
+- MCP server for Claude Code integration (113 tools)
 - File watcher for auto-syncing changes
 
 ## Build Commands
@@ -105,7 +105,7 @@ Or use command-line arguments:
 
 ### Available MCP Tools
 
-The MCP server exposes 62 tools organized by category:
+The MCP server exposes 113 tools organized by category:
 
 **Project Management (8 tools)**
 - `list_projects` - List all registered projects
@@ -183,6 +183,43 @@ The MCP server exposes 62 tools organized by category:
 - `find_trait_implementations` - Find trait implementations
 - `get_type_traits` - Get traits for a type
 
+**Workspace Management (9 tools)**
+- `list_workspaces` - List all workspaces
+- `create_workspace` - Create workspace to group projects
+- `get_workspace` - Get workspace details
+- `update_workspace` - Update workspace
+- `delete_workspace` - Delete workspace
+- `get_workspace_overview` - Overview with projects, milestones, resources
+- `list_workspace_projects` - List projects in workspace
+- `add_project_to_workspace` - Add project to workspace
+- `remove_project_from_workspace` - Remove project from workspace
+
+**Workspace Milestones (7 tools)**
+- `list_workspace_milestones` - List cross-project milestones
+- `create_workspace_milestone` - Create cross-project milestone
+- `get_workspace_milestone` - Get milestone details
+- `update_workspace_milestone` - Update milestone
+- `delete_workspace_milestone` - Delete milestone
+- `add_task_to_workspace_milestone` - Add task from any project
+- `get_workspace_milestone_progress` - Get completion progress
+
+**Resources (5 tools)**
+- `list_resources` - List shared resources (API contracts, schemas)
+- `create_resource` - Create resource reference
+- `get_resource` - Get resource details
+- `delete_resource` - Delete resource
+- `link_resource_to_project` - Link resource (implements/uses)
+
+**Components & Topology (8 tools)**
+- `list_components` - List workspace components
+- `create_component` - Create component (Service, Database, etc.)
+- `get_component` - Get component details
+- `delete_component` - Delete component
+- `add_component_dependency` - Add component dependency
+- `remove_component_dependency` - Remove dependency
+- `map_component_to_project` - Map component to project
+- `get_workspace_topology` - Get full topology graph
+
 ### Debug Logging
 
 Enable debug logging with `RUST_LOG=debug`:
@@ -216,7 +253,7 @@ docs/
 │   └── cursor.md            # Cursor IDE setup
 ├── api/
 │   ├── reference.md         # REST API documentation
-│   └── mcp-tools.md         # MCP tools reference (84 tools)
+│   └── mcp-tools.md         # MCP tools reference (113 tools)
 └── guides/
     ├── getting-started.md   # Tutorial for new users
     ├── multi-agent-workflow.md # Multi-agent coordination
@@ -228,11 +265,12 @@ src/
 │   ├── routes.rs        # Route definitions (axum)
 │   ├── handlers.rs      # Plan/Task/Decision handlers
 │   ├── code_handlers.rs # Code exploration endpoints
-│   └── note_handlers.rs # Knowledge Notes endpoints
+│   ├── note_handlers.rs # Knowledge Notes endpoints
+│   └── workspace_handlers.rs # Workspace endpoints
 ├── mcp/
 │   ├── mod.rs           # MCP module exports
 │   ├── protocol.rs      # JSON-RPC 2.0 types
-│   ├── tools.rs         # Tool definitions (84 tools)
+│   ├── tools.rs         # Tool definitions (113 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
 ├── neo4j/
@@ -371,9 +409,56 @@ See the [Knowledge Notes Guide](docs/guides/knowledge-notes.md) for detailed doc
 
 **Importance Levels:** `critical`, `high`, `medium`, `low`
 
+### Workspaces
+
+Workspaces group related projects and provide shared context (cross-project milestones, resources, components).
+
+**Workspace CRUD:**
+- `GET /api/workspaces` - List workspaces with search/pagination
+- `POST /api/workspaces` - Create workspace
+- `GET /api/workspaces/{slug}` - Get workspace by slug
+- `PATCH /api/workspaces/{slug}` - Update workspace
+- `DELETE /api/workspaces/{slug}` - Delete workspace
+- `GET /api/workspaces/{slug}/overview` - Overview with projects, milestones, resources, progress
+
+**Workspace-Project Association:**
+- `GET /api/workspaces/{slug}/projects` - List projects in workspace
+- `POST /api/workspaces/{slug}/projects` - Add project to workspace
+- `DELETE /api/workspaces/{slug}/projects/{id}` - Remove project from workspace
+
+**Workspace Milestones (cross-project):**
+- `GET /api/workspaces/{slug}/milestones` - List workspace milestones
+- `POST /api/workspaces/{slug}/milestones` - Create workspace milestone
+- `GET /api/workspace-milestones/{id}` - Get milestone with tasks
+- `PATCH /api/workspace-milestones/{id}` - Update milestone
+- `DELETE /api/workspace-milestones/{id}` - Delete milestone
+- `POST /api/workspace-milestones/{id}/tasks` - Add task from any project
+- `GET /api/workspace-milestones/{id}/progress` - Get completion progress
+
+**Resources (shared contracts/specs):**
+- `GET /api/workspaces/{slug}/resources` - List resources
+- `POST /api/workspaces/{slug}/resources` - Create resource reference
+- `GET /api/resources/{id}` - Get resource details
+- `DELETE /api/resources/{id}` - Delete resource
+- `POST /api/resources/{id}/projects` - Link project (implements/uses)
+
+**Components & Topology:**
+- `GET /api/workspaces/{slug}/components` - List components
+- `POST /api/workspaces/{slug}/components` - Create component
+- `GET /api/components/{id}` - Get component
+- `DELETE /api/components/{id}` - Delete component
+- `POST /api/components/{id}/dependencies` - Add dependency
+- `DELETE /api/components/{id}/dependencies/{dep_id}` - Remove dependency
+- `PUT /api/components/{id}/project` - Map to project
+- `GET /api/workspaces/{slug}/topology` - Full topology graph
+
+**Resource Types:** `ApiContract`, `Protobuf`, `GraphqlSchema`, `JsonSchema`, `DatabaseSchema`, `SharedTypes`, `Config`, `Documentation`, `Other`
+
+**Component Types:** `Service`, `Frontend`, `Worker`, `Database`, `MessageQueue`, `Cache`, `Gateway`, `External`, `Other`
+
 ### Query Parameters (Pagination & Filtering)
 
-List endpoints (`GET /api/plans`, `GET /api/tasks`, `GET /api/projects/{id}/releases`, `GET /api/projects/{id}/milestones`, `GET /api/projects`) support:
+List endpoints (`GET /api/plans`, `GET /api/tasks`, `GET /api/projects/{id}/releases`, `GET /api/projects/{id}/milestones`, `GET /api/projects`, `GET /api/workspaces`) support:
 
 **Pagination:**
 - `limit` - Max items per page (default: 50, max: 100)
@@ -500,11 +585,24 @@ External Trait nodes have:
 - `(Release)-[:INCLUDES_COMMIT]->(Commit)` - Commits included in a release
 - `(Milestone)-[:INCLUDES_TASK]->(Task)` - Tasks included in a milestone
 
+### Workspaces
+- `(Project)-[:BELONGS_TO_WORKSPACE]->(Workspace)` - Project is in a workspace
+- `(Workspace)-[:HAS_WORKSPACE_MILESTONE]->(WorkspaceMilestone)` - Workspace has cross-project milestones
+- `(WorkspaceMilestone)-[:INCLUDES_TASK]->(Task)` - Milestone includes tasks from any project
+- `(Workspace)-[:HAS_RESOURCE]->(Resource)` - Workspace has shared resources
+- `(Project)-[:IMPLEMENTS_RESOURCE]->(Resource)` - Project is a provider of the resource
+- `(Project)-[:USES_RESOURCE]->(Resource)` - Project consumes the resource
+- `(Workspace)-[:HAS_COMPONENT]->(Component)` - Workspace has topology components
+- `(Component)-[:MAPS_TO_PROJECT]->(Project)` - Component's source code
+- `(Component)-[:DEPENDS_ON_COMPONENT {protocol, required}]->(Component)` - Component dependencies
+
 ### Knowledge Notes
-- `(Note)-[:ABOUT]->(File|Function|Struct|Trait|Module|Project)` - Note is about an entity
-- `(Note)-[:ABOUT]->(Task|Plan)` - Note is about a task or plan
+- `(Note)-[:ATTACHED_TO]->(File|Function|Struct|Trait|Module|Project|Workspace)` - Note is attached to an entity
+- `(Note)-[:ATTACHED_TO]->(Task|Plan|Resource|Component)` - Note is attached to planning or workspace entities
 - `(Note)-[:SUPERSEDES]->(Note)` - Note replaces an older note
 - `(Note)-[:DERIVED_FROM]->(Note)` - Note extends another note
+
+Notes attached to a Workspace automatically propagate to all projects in that workspace with a relevance decay factor (0.8).
 
 Note nodes have:
 - `note_type`: guideline, gotcha, pattern, context, tip, observation, assertion

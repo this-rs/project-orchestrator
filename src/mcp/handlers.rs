@@ -54,6 +54,7 @@ impl ToolHandler {
             "unlink_plan_from_project" => self.unlink_plan_from_project(args).await,
             "get_dependency_graph" => self.get_dependency_graph(args).await,
             "get_critical_path" => self.get_critical_path(args).await,
+            "delete_plan" => self.delete_plan(args).await,
 
             // Tasks
             "list_tasks" => self.list_tasks(args).await,
@@ -145,6 +146,43 @@ impl ToolHandler {
             "get_context_notes" => self.get_context_notes(args).await,
             "get_notes_needing_review" => self.get_notes_needing_review(args).await,
             "update_staleness_scores" => self.update_staleness_scores(args).await,
+
+            // Workspaces
+            "list_workspaces" => self.list_workspaces(args).await,
+            "create_workspace" => self.create_workspace(args).await,
+            "get_workspace" => self.get_workspace(args).await,
+            "update_workspace" => self.update_workspace(args).await,
+            "delete_workspace" => self.delete_workspace(args).await,
+            "get_workspace_overview" => self.get_workspace_overview(args).await,
+            "list_workspace_projects" => self.list_workspace_projects(args).await,
+            "add_project_to_workspace" => self.add_project_to_workspace(args).await,
+            "remove_project_from_workspace" => self.remove_project_from_workspace(args).await,
+
+            // Workspace Milestones
+            "list_workspace_milestones" => self.list_workspace_milestones(args).await,
+            "create_workspace_milestone" => self.create_workspace_milestone(args).await,
+            "get_workspace_milestone" => self.get_workspace_milestone(args).await,
+            "update_workspace_milestone" => self.update_workspace_milestone(args).await,
+            "delete_workspace_milestone" => self.delete_workspace_milestone(args).await,
+            "add_task_to_workspace_milestone" => self.add_task_to_workspace_milestone(args).await,
+            "get_workspace_milestone_progress" => self.get_workspace_milestone_progress(args).await,
+
+            // Resources
+            "list_resources" => self.list_resources(args).await,
+            "create_resource" => self.create_resource(args).await,
+            "get_resource" => self.get_resource(args).await,
+            "delete_resource" => self.delete_resource(args).await,
+            "link_resource_to_project" => self.link_resource_to_project(args).await,
+
+            // Components
+            "list_components" => self.list_components(args).await,
+            "create_component" => self.create_component(args).await,
+            "get_component" => self.get_component(args).await,
+            "delete_component" => self.delete_component(args).await,
+            "add_component_dependency" => self.add_component_dependency(args).await,
+            "remove_component_dependency" => self.remove_component_dependency(args).await,
+            "map_component_to_project" => self.map_component_to_project(args).await,
+            "get_workspace_topology" => self.get_workspace_topology(args).await,
 
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
@@ -441,6 +479,16 @@ impl ToolHandler {
 
         self.neo4j().unlink_plan_from_project(plan_id).await?;
         Ok(json!({"unlinked": true}))
+    }
+
+    async fn delete_plan(&self, args: Value) -> Result<Value> {
+        let plan_id = parse_uuid(&args, "plan_id")?;
+
+        self.orchestrator
+            .plan_manager()
+            .delete_plan(plan_id)
+            .await?;
+        Ok(json!({"deleted": true}))
     }
 
     async fn get_dependency_graph(&self, args: Value) -> Result<Value> {
@@ -2111,6 +2159,752 @@ impl ToolHandler {
 
         Ok(json!({"notes_updated": count}))
     }
+
+    // ========================================================================
+    // Workspace Handlers
+    // ========================================================================
+
+    async fn list_workspaces(&self, args: Value) -> Result<Value> {
+        let search = args.get("search").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        // Get all workspaces and filter/paginate in memory
+        let all_workspaces = self.neo4j().list_workspaces().await?;
+
+        // Filter by search if provided
+        let filtered: Vec<_> = if let Some(search_term) = search {
+            let search_lower = search_term.to_lowercase();
+            all_workspaces
+                .into_iter()
+                .filter(|w| {
+                    w.name.to_lowercase().contains(&search_lower)
+                        || w.description
+                            .as_ref()
+                            .map(|d| d.to_lowercase().contains(&search_lower))
+                            .unwrap_or(false)
+                })
+                .collect()
+        } else {
+            all_workspaces
+        };
+
+        let total = filtered.len();
+        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn create_workspace(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("name is required"))?;
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slugify(name));
+        let description = args.get("description").and_then(|v| v.as_str());
+        let metadata = args
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+
+        let workspace = WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            slug,
+            description: description.map(|s| s.to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata,
+        };
+
+        self.neo4j().create_workspace(&workspace).await?;
+        Ok(serde_json::to_value(workspace)?)
+    }
+
+    async fn get_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        Ok(serde_json::to_value(workspace)?)
+    }
+
+    async fn update_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let metadata = args.get("metadata").cloned();
+
+        // Get workspace by slug first
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        self.neo4j()
+            .update_workspace(workspace.id, name, description, metadata)
+            .await?;
+
+        // Fetch updated workspace
+        let updated = self
+            .neo4j()
+            .get_workspace(workspace.id)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        Ok(serde_json::to_value(updated)?)
+    }
+
+    async fn delete_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        // Get workspace by slug first
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        self.neo4j().delete_workspace(workspace.id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn get_workspace_overview(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let projects = self.neo4j().list_workspace_projects(workspace.id).await?;
+        let milestones = self.neo4j().list_workspace_milestones(workspace.id).await?;
+        let resources = self.neo4j().list_workspace_resources(workspace.id).await?;
+        let components = self.neo4j().list_components(workspace.id).await?;
+
+        // Calculate progress from all projects' tasks
+        let mut total_tasks = 0u32;
+        let mut completed_tasks = 0u32;
+        for project in &projects {
+            let (t, c, _, _) = self.neo4j().get_project_progress(project.id).await?;
+            total_tasks += t;
+            completed_tasks += c;
+        }
+
+        Ok(json!({
+            "workspace": workspace,
+            "projects": projects,
+            "milestones": milestones,
+            "resources": resources,
+            "components": components,
+            "progress": {
+                "total_tasks": total_tasks,
+                "completed_tasks": completed_tasks,
+                "percentage": if total_tasks > 0 { (completed_tasks as f64 / total_tasks as f64 * 100.0).round() } else { 0.0 }
+            }
+        }))
+    }
+
+    async fn list_workspace_projects(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let projects = self.neo4j().list_workspace_projects(workspace.id).await?;
+        Ok(serde_json::to_value(projects)?)
+    }
+
+    async fn add_project_to_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let project_id = parse_uuid(&args, "project_id")?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        self.neo4j()
+            .add_project_to_workspace(project_id, workspace.id)
+            .await?;
+
+        Ok(json!({"added": true}))
+    }
+
+    async fn remove_project_from_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let project_id = parse_uuid(&args, "project_id")?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        self.neo4j()
+            .remove_project_from_workspace(project_id, workspace.id)
+            .await?;
+
+        Ok(json!({"removed": true}))
+    }
+
+    // ========================================================================
+    // Workspace Milestone Handlers
+    // ========================================================================
+
+    async fn list_workspace_milestones(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let status_filter = args.get("status").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        // Get all milestones and filter in memory
+        let all_milestones = self.neo4j().list_workspace_milestones(workspace.id).await?;
+
+        // Filter by status if provided
+        let filtered: Vec<_> = if let Some(status) = status_filter {
+            let status_lower = status.to_lowercase();
+            all_milestones
+                .into_iter()
+                .filter(|m| {
+                    let m_status = match m.status {
+                        MilestoneStatus::Open => "open",
+                        MilestoneStatus::Closed => "closed",
+                    };
+                    m_status == status_lower
+                })
+                .collect()
+        } else {
+            all_milestones
+        };
+
+        let total = filtered.len();
+        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn create_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("title is required"))?;
+        let description = args.get("description").and_then(|v| v.as_str());
+        let target_date = args
+            .get("target_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let milestone = WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: workspace.id,
+            title: title.to_string(),
+            description: description.map(|s| s.to_string()),
+            status: MilestoneStatus::Open,
+            target_date,
+            closed_at: None,
+            created_at: chrono::Utc::now(),
+            tags,
+        };
+
+        self.neo4j().create_workspace_milestone(&milestone).await?;
+        Ok(serde_json::to_value(milestone)?)
+    }
+
+    async fn get_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        let milestone = self
+            .neo4j()
+            .get_workspace_milestone(id)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace milestone not found"))?;
+
+        let tasks = self.neo4j().get_workspace_milestone_tasks(id).await?;
+
+        Ok(json!({
+            "milestone": milestone,
+            "tasks": tasks
+        }))
+    }
+
+    async fn update_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let status = args.get("status").and_then(|v| v.as_str()).and_then(|s| {
+            match s.to_lowercase().as_str() {
+                "open" => Some(MilestoneStatus::Open),
+                "closed" => Some(MilestoneStatus::Closed),
+                _ => None,
+            }
+        });
+        let target_date = args
+            .get("target_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        self.neo4j()
+            .update_workspace_milestone(id, title, description, status, target_date)
+            .await?;
+
+        let milestone = self
+            .neo4j()
+            .get_workspace_milestone(id)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace milestone not found"))?;
+
+        Ok(serde_json::to_value(milestone)?)
+    }
+
+    async fn delete_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        self.neo4j().delete_workspace_milestone(id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn add_task_to_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let task_id = parse_uuid(&args, "task_id")?;
+
+        self.neo4j()
+            .add_task_to_workspace_milestone(id, task_id)
+            .await?;
+
+        Ok(json!({"added": true}))
+    }
+
+    async fn get_workspace_milestone_progress(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        let (total, completed, in_progress, pending) =
+            self.neo4j().get_workspace_milestone_progress(id).await?;
+
+        let percentage = if total > 0 {
+            (completed as f64 / total as f64 * 100.0).round()
+        } else {
+            0.0
+        };
+
+        Ok(json!({
+            "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending,
+            "percentage": percentage
+        }))
+    }
+
+    // ========================================================================
+    // Resource Handlers
+    // ========================================================================
+
+    async fn list_resources(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let resource_type_filter = args.get("resource_type").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        // Get all resources and filter in memory
+        let all_resources = self.neo4j().list_workspace_resources(workspace.id).await?;
+
+        // Filter by type if provided
+        let filtered: Vec<_> = if let Some(type_str) = resource_type_filter {
+            if let Ok(rt) = type_str.parse::<ResourceType>() {
+                all_resources
+                    .into_iter()
+                    .filter(|r| r.resource_type == rt)
+                    .collect()
+            } else {
+                all_resources
+            }
+        } else {
+            all_resources
+        };
+
+        let total = filtered.len();
+        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn create_resource(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("name is required"))?;
+        let resource_type_str = args
+            .get("resource_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("resource_type is required"))?;
+        let file_path = args
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("file_path is required"))?;
+        let url = args.get("url").and_then(|v| v.as_str());
+        let format = args.get("format").and_then(|v| v.as_str());
+        let version = args.get("version").and_then(|v| v.as_str());
+        let description = args.get("description").and_then(|v| v.as_str());
+        let metadata = args
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let resource_type: ResourceType = resource_type_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid resource_type"))?;
+
+        let resource = ResourceNode {
+            id: Uuid::new_v4(),
+            workspace_id: Some(workspace.id),
+            project_id: None,
+            name: name.to_string(),
+            resource_type,
+            file_path: file_path.to_string(),
+            url: url.map(|s| s.to_string()),
+            format: format.map(|s| s.to_string()),
+            version: version.map(|s| s.to_string()),
+            description: description.map(|s| s.to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata,
+        };
+
+        self.neo4j().create_resource(&resource).await?;
+        Ok(serde_json::to_value(resource)?)
+    }
+
+    async fn get_resource(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        let resource = self
+            .neo4j()
+            .get_resource(id)
+            .await?
+            .ok_or_else(|| anyhow!("Resource not found"))?;
+
+        Ok(serde_json::to_value(resource)?)
+    }
+
+    async fn delete_resource(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        self.neo4j().delete_resource(id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn link_resource_to_project(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let project_id = parse_uuid(&args, "project_id")?;
+        let link_type = args
+            .get("link_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("link_type is required (implements or uses)"))?;
+
+        match link_type.to_lowercase().as_str() {
+            "implements" => {
+                self.neo4j()
+                    .link_project_implements_resource(project_id, id)
+                    .await?;
+            }
+            "uses" => {
+                self.neo4j()
+                    .link_project_uses_resource(project_id, id)
+                    .await?;
+            }
+            _ => return Err(anyhow!("link_type must be 'implements' or 'uses'")),
+        }
+
+        Ok(json!({"linked": true, "link_type": link_type}))
+    }
+
+    // ========================================================================
+    // Component Handlers
+    // ========================================================================
+
+    async fn list_components(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let component_type_filter = args.get("component_type").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        // Get all components and filter in memory
+        let all_components = self.neo4j().list_components(workspace.id).await?;
+
+        // Filter by type if provided
+        let filtered: Vec<_> = if let Some(type_str) = component_type_filter {
+            if let Ok(ct) = type_str.parse::<ComponentType>() {
+                all_components
+                    .into_iter()
+                    .filter(|c| c.component_type == ct)
+                    .collect()
+            } else {
+                all_components
+            }
+        } else {
+            all_components
+        };
+
+        let total = filtered.len();
+        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn create_component(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("name is required"))?;
+        let component_type_str = args
+            .get("component_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("component_type is required"))?;
+        let description = args.get("description").and_then(|v| v.as_str());
+        let runtime = args.get("runtime").and_then(|v| v.as_str());
+        let config = args
+            .get("config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let component_type: ComponentType = component_type_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid component_type"))?;
+
+        let component = ComponentNode {
+            id: Uuid::new_v4(),
+            workspace_id: workspace.id,
+            name: name.to_string(),
+            component_type,
+            description: description.map(|s| s.to_string()),
+            runtime: runtime.map(|s| s.to_string()),
+            config,
+            created_at: chrono::Utc::now(),
+            tags,
+        };
+
+        self.neo4j().create_component(&component).await?;
+        Ok(serde_json::to_value(component)?)
+    }
+
+    async fn get_component(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        let component = self
+            .neo4j()
+            .get_component(id)
+            .await?
+            .ok_or_else(|| anyhow!("Component not found"))?;
+
+        Ok(serde_json::to_value(component)?)
+    }
+
+    async fn delete_component(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        self.neo4j().delete_component(id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn add_component_dependency(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let depends_on_id = parse_uuid(&args, "depends_on_id")?;
+        let protocol = args
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let required = args
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        self.neo4j()
+            .add_component_dependency(id, depends_on_id, protocol, required)
+            .await?;
+
+        Ok(json!({"added": true}))
+    }
+
+    async fn remove_component_dependency(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let dep_id = parse_uuid(&args, "dep_id")?;
+
+        self.neo4j().remove_component_dependency(id, dep_id).await?;
+
+        Ok(json!({"removed": true}))
+    }
+
+    async fn map_component_to_project(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let project_id = parse_uuid(&args, "project_id")?;
+
+        self.neo4j()
+            .map_component_to_project(id, project_id)
+            .await?;
+
+        Ok(json!({"mapped": true}))
+    }
+
+    async fn get_workspace_topology(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let topology = self.neo4j().get_workspace_topology(workspace.id).await?;
+        Ok(serde_json::to_value(topology)?)
+    }
 }
 
 // ============================================================================
@@ -2134,4 +2928,702 @@ fn slugify(name: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Datelike;
+    use serde_json::json;
+
+    // ========================================================================
+    // Helper function tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_uuid_valid() {
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let args = json!({"id": uuid_str});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_string(), uuid_str);
+    }
+
+    #[test]
+    fn test_parse_uuid_missing_field() {
+        let args = json!({});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("id is required"));
+    }
+
+    #[test]
+    fn test_parse_uuid_invalid_format() {
+        let args = json!({"id": "not-a-uuid"});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be a valid UUID"));
+    }
+
+    #[test]
+    fn test_parse_uuid_null_value() {
+        let args = json!({"id": null});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_uuid_number_value() {
+        let args = json!({"id": 12345});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_slugify_simple() {
+        assert_eq!(slugify("My Project"), "my-project");
+    }
+
+    #[test]
+    fn test_slugify_special_chars() {
+        assert_eq!(slugify("Project @#$ Name!"), "project-name");
+    }
+
+    #[test]
+    fn test_slugify_multiple_spaces() {
+        assert_eq!(slugify("Multiple   Spaces   Here"), "multiple-spaces-here");
+    }
+
+    #[test]
+    fn test_slugify_already_slug() {
+        assert_eq!(slugify("already-a-slug"), "already-a-slug");
+    }
+
+    #[test]
+    fn test_slugify_uppercase() {
+        assert_eq!(slugify("UPPERCASE"), "uppercase");
+    }
+
+    #[test]
+    fn test_slugify_numbers() {
+        assert_eq!(slugify("Project 123"), "project-123");
+    }
+
+    #[test]
+    fn test_slugify_leading_trailing_special() {
+        assert_eq!(slugify("---Project---"), "project");
+    }
+
+    #[test]
+    fn test_slugify_empty() {
+        assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn test_slugify_unicode() {
+        // Unicode alphanumeric chars are preserved (is_alphanumeric includes Unicode letters)
+        assert_eq!(slugify("Projet été"), "projet-été");
+    }
+
+    // ========================================================================
+    // Argument extraction tests (verify parsing logic)
+    // ========================================================================
+
+    #[test]
+    fn test_workspace_args_extraction() {
+        let args = json!({
+            "name": "Test Workspace",
+            "slug": "test-workspace",
+            "description": "A test workspace",
+            "metadata": {"key": "value"}
+        });
+
+        // Test name extraction
+        let name = args.get("name").and_then(|v| v.as_str());
+        assert_eq!(name, Some("Test Workspace"));
+
+        // Test slug extraction
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slugify("Test Workspace"));
+        assert_eq!(slug, "test-workspace");
+
+        // Test description extraction
+        let description = args.get("description").and_then(|v| v.as_str());
+        assert_eq!(description, Some("A test workspace"));
+
+        // Test metadata extraction
+        let metadata = args
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        assert_eq!(metadata, json!({"key": "value"}));
+    }
+
+    #[test]
+    fn test_workspace_args_defaults() {
+        let args = json!({
+            "name": "My Workspace"
+        });
+
+        // Slug defaults to slugified name
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slugify("My Workspace"));
+        assert_eq!(slug, "my-workspace");
+
+        // Description defaults to None
+        let description = args.get("description").and_then(|v| v.as_str());
+        assert!(description.is_none());
+
+        // Metadata defaults to empty object
+        let metadata = args
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        assert_eq!(metadata, json!({}));
+    }
+
+    #[test]
+    fn test_pagination_args_extraction() {
+        let args = json!({
+            "limit": 25,
+            "offset": 10,
+            "search": "test query"
+        });
+
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let search = args.get("search").and_then(|v| v.as_str());
+
+        assert_eq!(limit, 25);
+        assert_eq!(offset, 10);
+        assert_eq!(search, Some("test query"));
+    }
+
+    #[test]
+    fn test_pagination_args_defaults() {
+        let args = json!({});
+
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let search = args.get("search").and_then(|v| v.as_str());
+
+        assert_eq!(limit, 50);
+        assert_eq!(offset, 0);
+        assert!(search.is_none());
+    }
+
+    #[test]
+    fn test_milestone_args_extraction() {
+        let args = json!({
+            "slug": "my-workspace",
+            "title": "Q1 Release",
+            "description": "First quarter release",
+            "target_date": "2024-03-31T00:00:00Z",
+            "tags": ["release", "q1"]
+        });
+
+        let slug = args.get("slug").and_then(|v| v.as_str());
+        assert_eq!(slug, Some("my-workspace"));
+
+        let title = args.get("title").and_then(|v| v.as_str());
+        assert_eq!(title, Some("Q1 Release"));
+
+        let target_date = args
+            .get("target_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        assert!(target_date.is_some());
+
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(tags, vec!["release", "q1"]);
+    }
+
+    #[test]
+    fn test_milestone_status_parsing() {
+        // Test status parsing logic
+        let parse_status = |s: &str| match s.to_lowercase().as_str() {
+            "open" => Some(MilestoneStatus::Open),
+            "closed" => Some(MilestoneStatus::Closed),
+            _ => None,
+        };
+
+        assert_eq!(parse_status("open"), Some(MilestoneStatus::Open));
+        assert_eq!(parse_status("OPEN"), Some(MilestoneStatus::Open));
+        assert_eq!(parse_status("Open"), Some(MilestoneStatus::Open));
+        assert_eq!(parse_status("closed"), Some(MilestoneStatus::Closed));
+        assert_eq!(parse_status("CLOSED"), Some(MilestoneStatus::Closed));
+        assert_eq!(parse_status("invalid"), None);
+    }
+
+    #[test]
+    fn test_resource_args_extraction() {
+        let args = json!({
+            "slug": "my-workspace",
+            "name": "User API",
+            "resource_type": "api_contract",
+            "file_path": "specs/openapi/users.yaml",
+            "url": "https://api.example.com/docs",
+            "format": "openapi",
+            "version": "1.0.0",
+            "description": "User management API",
+            "metadata": {"owner": "team-a"}
+        });
+
+        let name = args.get("name").and_then(|v| v.as_str());
+        assert_eq!(name, Some("User API"));
+
+        let resource_type_str = args.get("resource_type").and_then(|v| v.as_str());
+        assert_eq!(resource_type_str, Some("api_contract"));
+
+        let resource_type: Result<ResourceType, _> = "api_contract".parse();
+        assert!(resource_type.is_ok());
+        assert_eq!(resource_type.unwrap(), ResourceType::ApiContract);
+
+        let file_path = args.get("file_path").and_then(|v| v.as_str());
+        assert_eq!(file_path, Some("specs/openapi/users.yaml"));
+
+        let url = args.get("url").and_then(|v| v.as_str());
+        assert_eq!(url, Some("https://api.example.com/docs"));
+    }
+
+    #[test]
+    fn test_component_args_extraction() {
+        let args = json!({
+            "slug": "my-workspace",
+            "name": "API Gateway",
+            "component_type": "gateway",
+            "description": "Main API gateway",
+            "runtime": "kubernetes",
+            "config": {"replicas": 3, "port": 8080},
+            "tags": ["infrastructure", "gateway"]
+        });
+
+        let name = args.get("name").and_then(|v| v.as_str());
+        assert_eq!(name, Some("API Gateway"));
+
+        let component_type_str = args.get("component_type").and_then(|v| v.as_str());
+        assert_eq!(component_type_str, Some("gateway"));
+
+        let component_type: Result<ComponentType, _> = "gateway".parse();
+        assert!(component_type.is_ok());
+        assert_eq!(component_type.unwrap(), ComponentType::Gateway);
+
+        let runtime = args.get("runtime").and_then(|v| v.as_str());
+        assert_eq!(runtime, Some("kubernetes"));
+
+        let config = args
+            .get("config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        assert_eq!(config["replicas"], 3);
+        assert_eq!(config["port"], 8080);
+    }
+
+    #[test]
+    fn test_link_type_validation() {
+        let validate_link_type = |link_type: &str| match link_type.to_lowercase().as_str() {
+            "implements" | "uses" => true,
+            _ => false,
+        };
+
+        assert!(validate_link_type("implements"));
+        assert!(validate_link_type("IMPLEMENTS"));
+        assert!(validate_link_type("uses"));
+        assert!(validate_link_type("USES"));
+        assert!(!validate_link_type("invalid"));
+        assert!(!validate_link_type(""));
+    }
+
+    #[test]
+    fn test_dependency_args_extraction() {
+        let args = json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "depends_on_id": "660e8400-e29b-41d4-a716-446655440001",
+            "protocol": "http",
+            "required": true
+        });
+
+        let id = parse_uuid(&args, "id");
+        assert!(id.is_ok());
+
+        let depends_on_id = parse_uuid(&args, "depends_on_id");
+        assert!(depends_on_id.is_ok());
+
+        let protocol = args
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(protocol, Some("http".to_string()));
+
+        let required = args
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(required);
+    }
+
+    #[test]
+    fn test_dependency_args_defaults() {
+        let args = json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "depends_on_id": "660e8400-e29b-41d4-a716-446655440001"
+        });
+
+        let protocol = args
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert!(protocol.is_none());
+
+        let required = args
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(required); // Defaults to true
+    }
+
+    // ========================================================================
+    // Response structure tests
+    // ========================================================================
+
+    #[test]
+    fn test_paginated_response_structure() {
+        // Simulate a paginated response
+        let items = vec![json!({"id": "1", "name": "item1"})];
+        let total = 10;
+        let limit = 5;
+        let offset = 0;
+
+        let response = json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        });
+
+        assert!(response.get("items").is_some());
+        assert_eq!(response["total"], 10);
+        assert_eq!(response["limit"], 5);
+        assert_eq!(response["offset"], 0);
+    }
+
+    #[test]
+    fn test_workspace_overview_response_structure() {
+        // Simulate workspace overview response structure
+        let total_tasks = 10u32;
+        let completed_tasks = 5u32;
+
+        let response = json!({
+            "workspace": {"id": "123", "name": "Test"},
+            "projects": [],
+            "milestones": [],
+            "resources": [],
+            "components": [],
+            "progress": {
+                "total_tasks": total_tasks,
+                "completed_tasks": completed_tasks,
+                "percentage": if total_tasks > 0 {
+                    (completed_tasks as f64 / total_tasks as f64 * 100.0).round()
+                } else {
+                    0.0
+                }
+            }
+        });
+
+        assert!(response.get("workspace").is_some());
+        assert!(response.get("projects").is_some());
+        assert!(response.get("milestones").is_some());
+        assert!(response.get("resources").is_some());
+        assert!(response.get("components").is_some());
+        assert!(response.get("progress").is_some());
+        assert_eq!(response["progress"]["percentage"], 50.0);
+    }
+
+    #[test]
+    fn test_milestone_progress_response_structure() {
+        let total = 10u32;
+        let completed = 6u32;
+        let in_progress = 2u32;
+        let pending = 2u32;
+
+        let percentage = if total > 0 {
+            (completed as f64 / total as f64 * 100.0).round()
+        } else {
+            0.0
+        };
+
+        let response = json!({
+            "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending,
+            "percentage": percentage
+        });
+
+        assert_eq!(response["total"], 10);
+        assert_eq!(response["completed"], 6);
+        assert_eq!(response["in_progress"], 2);
+        assert_eq!(response["pending"], 2);
+        assert_eq!(response["percentage"], 60.0);
+    }
+
+    #[test]
+    fn test_milestone_progress_empty() {
+        let total = 0u32;
+        let completed = 0u32;
+
+        let percentage = if total > 0 {
+            (completed as f64 / total as f64 * 100.0).round()
+        } else {
+            0.0
+        };
+
+        assert_eq!(percentage, 0.0);
+    }
+
+    #[test]
+    fn test_boolean_response_structures() {
+        // Test various boolean response structures used by handlers
+        assert_eq!(json!({"deleted": true})["deleted"], true);
+        assert_eq!(json!({"added": true})["added"], true);
+        assert_eq!(json!({"removed": true})["removed"], true);
+        assert_eq!(json!({"linked": true})["linked"], true);
+        assert_eq!(json!({"mapped": true})["mapped"], true);
+        assert_eq!(json!({"updated": true})["updated"], true);
+    }
+
+    #[test]
+    fn test_link_response_with_type() {
+        let link_type = "implements";
+        let response = json!({"linked": true, "link_type": link_type});
+
+        assert_eq!(response["linked"], true);
+        assert_eq!(response["link_type"], "implements");
+    }
+
+    // ========================================================================
+    // Filter logic tests
+    // ========================================================================
+
+    #[test]
+    fn test_search_filter_logic() {
+        let workspaces = vec![
+            json!({"name": "Test Project", "description": "A test workspace"}),
+            json!({"name": "Production", "description": "Production environment"}),
+            json!({"name": "Development", "description": "Dev workspace"}),
+        ];
+
+        let search_term = "test";
+        let search_lower = search_term.to_lowercase();
+
+        let filtered: Vec<_> = workspaces
+            .into_iter()
+            .filter(|w| {
+                let name = w["name"].as_str().unwrap_or("").to_lowercase();
+                let desc = w["description"].as_str().unwrap_or("").to_lowercase();
+                name.contains(&search_lower) || desc.contains(&search_lower)
+            })
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["name"], "Test Project");
+    }
+
+    #[test]
+    fn test_search_filter_description() {
+        let workspaces = vec![
+            json!({"name": "Project A", "description": "Contains test data"}),
+            json!({"name": "Project B", "description": "Production only"}),
+        ];
+
+        let search_term = "test";
+        let search_lower = search_term.to_lowercase();
+
+        let filtered: Vec<_> = workspaces
+            .into_iter()
+            .filter(|w| {
+                let name = w["name"].as_str().unwrap_or("").to_lowercase();
+                let desc = w["description"].as_str().unwrap_or("").to_lowercase();
+                name.contains(&search_lower) || desc.contains(&search_lower)
+            })
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["name"], "Project A");
+    }
+
+    #[test]
+    fn test_type_filter_logic() {
+        // Simulating resource type filtering
+        let resources = vec![
+            (ResourceType::ApiContract, "User API"),
+            (ResourceType::Protobuf, "Events Proto"),
+            (ResourceType::ApiContract, "Order API"),
+        ];
+
+        let filter_type = ResourceType::ApiContract;
+        let filtered: Vec<_> = resources
+            .into_iter()
+            .filter(|(rt, _)| *rt == filter_type)
+            .collect();
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].1, "User API");
+        assert_eq!(filtered[1].1, "Order API");
+    }
+
+    #[test]
+    fn test_pagination_logic() {
+        let items: Vec<i32> = (1..=20).collect();
+        let limit = 5;
+        let offset = 10;
+
+        let paginated: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+
+        assert_eq!(paginated.len(), 5);
+        assert_eq!(paginated, vec![11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn test_pagination_beyond_bounds() {
+        let items: Vec<i32> = (1..=10).collect();
+        let limit = 5;
+        let offset = 8;
+
+        let paginated: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+
+        assert_eq!(paginated.len(), 2);
+        assert_eq!(paginated, vec![9, 10]);
+    }
+
+    #[test]
+    fn test_pagination_empty_offset() {
+        let items: Vec<i32> = (1..=10).collect();
+        let limit = 5;
+        let offset = 20;
+
+        let paginated: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+
+        assert!(paginated.is_empty());
+    }
+
+    // ========================================================================
+    // Date parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_date_parsing_rfc3339() {
+        let date_str = "2024-03-31T00:00:00Z";
+        let parsed = chrono::DateTime::parse_from_rfc3339(date_str);
+        assert!(parsed.is_ok());
+
+        let utc = parsed.unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(utc.year(), 2024);
+        assert_eq!(utc.month(), 3);
+        assert_eq!(utc.day(), 31);
+    }
+
+    #[test]
+    fn test_date_parsing_with_offset() {
+        let date_str = "2024-03-31T12:00:00+02:00";
+        let parsed = chrono::DateTime::parse_from_rfc3339(date_str);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_date_parsing_invalid() {
+        let date_str = "2024-03-31"; // Not RFC3339
+        let parsed = chrono::DateTime::parse_from_rfc3339(date_str);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_date_parsing_optional() {
+        let args = json!({});
+        let target_date = args
+            .get("target_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        assert!(target_date.is_none());
+    }
+
+    // ========================================================================
+    // Tags parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_tags_parsing() {
+        let args = json!({
+            "tags": ["tag1", "tag2", "tag3"]
+        });
+
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert_eq!(tags, vec!["tag1", "tag2", "tag3"]);
+    }
+
+    #[test]
+    fn test_tags_parsing_empty() {
+        let args = json!({});
+
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn test_tags_parsing_mixed_types() {
+        let args = json!({
+            "tags": ["valid", 123, "another", null]
+        });
+
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Only strings are extracted
+        assert_eq!(tags, vec!["valid", "another"]);
+    }
 }
