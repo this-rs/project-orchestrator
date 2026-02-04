@@ -253,11 +253,12 @@ async fn test_meilisearch_code_indexing() {
         id: format!("test-{}", Uuid::new_v4()),
         path: "/test/example.rs".to_string(),
         language: "rust".to_string(),
-        content: "fn hello_world() { println!(\"Hello!\"); }".to_string(),
         symbols: vec!["hello_world".to_string()],
+        docstrings: "Says hello to the world".to_string(),
+        signatures: vec!["fn hello_world()".to_string()],
         imports: vec![],
-        project_id: None,
-        project_slug: None,
+        project_id: "test-project-id".to_string(),
+        project_slug: "test-project".to_string(),
     };
 
     // Index the document

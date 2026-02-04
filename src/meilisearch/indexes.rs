@@ -2,19 +2,35 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Search result with ranking score
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit<T> {
+    pub document: T,
+    /// Ranking score from Meilisearch (0.0 to 1.0, higher is better)
+    pub score: f64,
+}
+
 /// Code document for indexing
+///
+/// Lightweight document for semantic search - does NOT store full file content.
+/// Use Neo4j for structural queries, file system for actual code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeDocument {
     pub id: String,
     pub path: String,
     pub language: String,
-    pub content: String,
+    /// Symbol names (functions, structs, traits, enums)
     pub symbols: Vec<String>,
+    /// Concatenated docstrings for semantic search
+    pub docstrings: String,
+    /// Function signatures for quick reference (e.g., "fn new(url: &str) -> Result<Self>")
+    pub signatures: Vec<String>,
+    /// Import paths
     pub imports: Vec<String>,
-    #[serde(default)]
-    pub project_id: Option<String>,
-    #[serde(default)]
-    pub project_slug: Option<String>,
+    /// Project ID (required for multi-project support)
+    pub project_id: String,
+    /// Project slug (required for filtering)
+    pub project_slug: String,
 }
 
 /// Decision document for indexing
@@ -33,31 +49,15 @@ pub struct DecisionDocument {
     pub project_slug: Option<String>,
 }
 
-/// Log document for indexing
+/// Statistics for a Meilisearch index
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogDocument {
-    pub id: String,
-    pub agent_id: String,
-    pub task_id: Option<String>,
-    pub level: String,
-    pub message: String,
-    pub timestamp: String,
-}
-
-/// Conversation document for indexing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationDocument {
-    pub id: String,
-    pub participants: Vec<String>,
-    pub content: String,
-    pub topic: Option<String>,
-    pub timestamp: String,
+pub struct IndexStats {
+    pub total_documents: usize,
+    pub is_indexing: bool,
 }
 
 /// Index names
 pub mod index_names {
     pub const CODE: &str = "code";
     pub const DECISIONS: &str = "decisions";
-    pub const LOGS: &str = "logs";
-    pub const CONVERSATIONS: &str = "conversations";
 }

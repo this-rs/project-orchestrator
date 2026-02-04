@@ -138,14 +138,17 @@ impl ContextBuilder {
 
     /// Search for similar code using Meilisearch
     async fn search_similar_code(&self, query: &str, limit: usize) -> Result<Vec<CodeReference>> {
-        let results = self.meili.search_code(query, limit, None).await?;
+        let hits = self
+            .meili
+            .search_code_with_scores(query, limit, None, None)
+            .await?;
 
-        let references = results
+        let references = hits
             .into_iter()
-            .map(|doc| CodeReference {
-                path: doc.path,
-                snippet: doc.content.chars().take(500).collect(),
-                relevance: 0.8, // TODO: Get actual relevance score
+            .map(|hit| CodeReference {
+                path: hit.document.path,
+                snippet: hit.document.docstrings.chars().take(500).collect(),
+                relevance: hit.score as f32,
             })
             .collect();
 

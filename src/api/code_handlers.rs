@@ -44,24 +44,25 @@ pub async fn search_code(
     State(state): State<OrchestratorState>,
     Query(query): Query<CodeSearchQuery>,
 ) -> Result<Json<Vec<CodeSearchResult>>, AppError> {
-    let results = state
+    let hits = state
         .orchestrator
         .meili()
-        .search_code(
+        .search_code_with_scores(
             &query.q,
             query.limit.unwrap_or(10),
             query.language.as_deref(),
+            None,
         )
         .await?;
 
-    let results: Vec<CodeSearchResult> = results
+    let results: Vec<CodeSearchResult> = hits
         .into_iter()
-        .map(|doc| CodeSearchResult {
-            path: doc.path,
-            language: doc.language,
-            snippet: doc.content.chars().take(500).collect(),
-            symbols: doc.symbols,
-            score: 0.0, // TODO: get actual score from Meilisearch
+        .map(|hit| CodeSearchResult {
+            path: hit.document.path,
+            language: hit.document.language,
+            snippet: hit.document.docstrings.chars().take(500).collect(),
+            symbols: hit.document.symbols,
+            score: hit.score,
         })
         .collect();
 
@@ -576,20 +577,20 @@ pub async fn find_similar_code(
     Json(query): Json<SimilarCodeQuery>,
 ) -> Result<Json<Vec<SimilarCode>>, AppError> {
     // Use Meilisearch to find semantically similar code
-    let results = state
+    let hits = state
         .orchestrator
         .meili()
-        .search_code(&query.snippet, query.limit.unwrap_or(5), None)
+        .search_code_with_scores(&query.snippet, query.limit.unwrap_or(5), None, None)
         .await?;
 
-    let similar: Vec<SimilarCode> = results
+    let similar: Vec<SimilarCode> = hits
         .into_iter()
-        .map(|doc| SimilarCode {
-            path: doc.path,
+        .map(|hit| SimilarCode {
+            path: hit.document.path,
             line_start: 0,
             line_end: 0,
-            snippet: doc.content.chars().take(300).collect(),
-            similarity: 0.8, // TODO: get actual similarity score
+            snippet: hit.document.docstrings.chars().take(300).collect(),
+            similarity: hit.score,
         })
         .collect();
 

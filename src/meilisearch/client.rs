@@ -25,12 +25,8 @@ impl MeiliClient {
     /// Initialize all required indexes
     async fn init_indexes(&self) -> Result<()> {
         // Create indexes if they don't exist
-        let indexes = [
-            index_names::CODE,
-            index_names::DECISIONS,
-            index_names::LOGS,
-            index_names::CONVERSATIONS,
-        ];
+        // Note: Only CODE and DECISIONS are used - LOGS and CONVERSATIONS were removed
+        let indexes = [index_names::CODE, index_names::DECISIONS];
 
         for index_name in indexes {
             let task = self
@@ -57,7 +53,13 @@ impl MeiliClient {
         let index = self.client.index(index_names::CODE);
 
         let settings = Settings::new()
-            .with_searchable_attributes(["content", "path", "symbols", "imports"])
+            .with_searchable_attributes([
+                "symbols",    // Function/struct/trait names (highest priority)
+                "docstrings", // Documentation for semantic search
+                "signatures", // Function signatures
+                "path",       // File path
+                "imports",    // Import paths
+            ])
             .with_filterable_attributes(["language", "path", "project_id", "project_slug"])
             .with_sortable_attributes(["path"]);
 
@@ -135,6 +137,20 @@ impl MeiliClient {
         language_filter: Option<&str>,
         project_slug: Option<&str>,
     ) -> Result<Vec<CodeDocument>> {
+        let hits = self
+            .search_code_with_scores(query, limit, language_filter, project_slug)
+            .await?;
+        Ok(hits.into_iter().map(|h| h.document).collect())
+    }
+
+    /// Search code with ranking scores
+    pub async fn search_code_with_scores(
+        &self,
+        query: &str,
+        limit: usize,
+        language_filter: Option<&str>,
+        project_slug: Option<&str>,
+    ) -> Result<Vec<SearchHit<CodeDocument>>> {
         let index = self.client.index(index_names::CODE);
 
         let mut filters = Vec::new();
@@ -152,14 +168,24 @@ impl MeiliClient {
         };
 
         let mut search = index.search();
-        search.with_query(query).with_limit(limit);
+        search
+            .with_query(query)
+            .with_limit(limit)
+            .with_show_ranking_score(true);
 
         if let Some(ref filter) = filter_str {
             search.with_filter(filter);
         }
 
         let results: SearchResults<CodeDocument> = search.execute().await?;
-        Ok(results.hits.into_iter().map(|h| h.result).collect())
+        Ok(results
+            .hits
+            .into_iter()
+            .map(|h| SearchHit {
+                document: h.result,
+                score: h.ranking_score.unwrap_or(0.0),
+            })
+            .collect())
     }
 
     /// Delete code document by path
@@ -169,6 +195,44 @@ impl MeiliClient {
         let task = index.delete_document(&id).await?;
         task.wait_for_completion(&self.client, None, None).await?;
         Ok(())
+    }
+
+    /// Delete all code documents for a project
+    pub async fn delete_code_for_project(&self, project_slug: &str) -> Result<()> {
+        use meilisearch_sdk::documents::DocumentDeletionQuery;
+
+        let index = self.client.index(index_names::CODE);
+        let mut query = DocumentDeletionQuery::new(&index);
+        let filter = format!("project_slug = \"{}\"", project_slug);
+        query.with_filter(&filter);
+
+        let task = index.delete_documents_with(&query).await?;
+        task.wait_for_completion(&self.client, None, None).await?;
+        Ok(())
+    }
+
+    /// Delete orphan code documents (documents without project_id or with empty project_id)
+    pub async fn delete_orphan_code_documents(&self) -> Result<()> {
+        use meilisearch_sdk::documents::DocumentDeletionQuery;
+
+        let index = self.client.index(index_names::CODE);
+        let mut query = DocumentDeletionQuery::new(&index);
+        // Delete documents where project_id is empty or not set
+        query.with_filter("project_id IS EMPTY OR project_slug IS EMPTY");
+
+        let task = index.delete_documents_with(&query).await?;
+        task.wait_for_completion(&self.client, None, None).await?;
+        Ok(())
+    }
+
+    /// Get statistics for the code index
+    pub async fn get_code_stats(&self) -> Result<IndexStats> {
+        let index = self.client.index(index_names::CODE);
+        let stats = index.get_stats().await?;
+        Ok(IndexStats {
+            total_documents: stats.number_of_documents as usize,
+            is_indexing: stats.is_indexing,
+        })
     }
 
     // ========================================================================
@@ -211,40 +275,6 @@ impl MeiliClient {
         }
 
         let results: SearchResults<DecisionDocument> = search.execute().await?;
-        Ok(results.hits.into_iter().map(|h| h.result).collect())
-    }
-
-    // ========================================================================
-    // Log indexing
-    // ========================================================================
-
-    /// Index a log document
-    pub async fn index_log(&self, doc: &LogDocument) -> Result<()> {
-        let index = self.client.index(index_names::LOGS);
-        let task = index.add_documents(&[doc], Some("id")).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
-        Ok(())
-    }
-
-    /// Search logs
-    pub async fn search_logs(
-        &self,
-        query: &str,
-        limit: usize,
-        agent_filter: Option<&str>,
-    ) -> Result<Vec<LogDocument>> {
-        let index = self.client.index(index_names::LOGS);
-
-        let filter_str: Option<String> = agent_filter.map(|agent| format!("agent_id = {}", agent));
-
-        let mut search = index.search();
-        search.with_query(query).with_limit(limit);
-
-        if let Some(ref filter) = filter_str {
-            search.with_filter(filter);
-        }
-
-        let results: SearchResults<LogDocument> = search.execute().await?;
         Ok(results.hits.into_iter().map(|h| h.result).collect())
     }
 

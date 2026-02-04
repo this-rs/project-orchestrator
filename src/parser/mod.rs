@@ -985,16 +985,77 @@ impl CodeParser {
     }
 
     /// Convert parsed file to a code document for Meilisearch
-    pub fn to_code_document(parsed: &ParsedFile, content: &str) -> CodeDocument {
+    ///
+    /// Creates a lightweight document for semantic search containing:
+    /// - Symbol names for keyword search
+    /// - Docstrings for semantic/natural language search
+    /// - Function signatures for quick reference
+    pub fn to_code_document(
+        parsed: &ParsedFile,
+        project_id: &str,
+        project_slug: &str,
+    ) -> CodeDocument {
+        // Collect all docstrings
+        let mut docstrings = Vec::new();
+
+        for func in &parsed.functions {
+            if let Some(ref doc) = func.docstring {
+                docstrings.push(doc.clone());
+            }
+        }
+        for s in &parsed.structs {
+            if let Some(ref doc) = s.docstring {
+                docstrings.push(doc.clone());
+            }
+        }
+        for t in &parsed.traits {
+            if let Some(ref doc) = t.docstring {
+                docstrings.push(doc.clone());
+            }
+        }
+        for e in &parsed.enums {
+            if let Some(ref doc) = e.docstring {
+                docstrings.push(doc.clone());
+            }
+        }
+
+        // Build function signatures
+        let signatures: Vec<String> = parsed
+            .functions
+            .iter()
+            .map(|f| {
+                let params = f
+                    .params
+                    .iter()
+                    .map(|p| {
+                        if let Some(ref t) = p.type_name {
+                            format!("{}: {}", p.name, t)
+                        } else {
+                            p.name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret = f
+                    .return_type
+                    .as_ref()
+                    .map(|r| format!(" -> {}", r))
+                    .unwrap_or_default();
+                let async_kw = if f.is_async { "async " } else { "" };
+                format!("{}fn {}({}){}", async_kw, f.name, params, ret)
+            })
+            .collect();
+
         CodeDocument {
             id: crate::meilisearch::client::MeiliClient::path_to_id(&parsed.path),
             path: parsed.path.clone(),
             language: parsed.language.clone(),
-            content: content.to_string(),
             symbols: parsed.symbols.clone(),
+            docstrings: docstrings.join("\n\n"),
+            signatures,
             imports: parsed.imports.iter().map(|i| i.path.clone()).collect(),
-            project_id: None,
-            project_slug: None,
+            project_id: project_id.to_string(),
+            project_slug: project_slug.to_string(),
         }
     }
 }

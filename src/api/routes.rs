@@ -152,6 +152,17 @@ pub fn create_router(state: OrchestratorState) -> Router {
             get(code_handlers::find_type_traits),
         )
         .route("/api/code/impl-blocks", get(code_handlers::get_impl_blocks))
+        // ====================================================================
+        // Meilisearch Maintenance
+        // ====================================================================
+        .route(
+            "/api/meilisearch/stats",
+            get(handlers::get_meilisearch_stats),
+        )
+        .route(
+            "/api/meilisearch/orphans",
+            axum::routing::delete(handlers::delete_meilisearch_orphans),
+        )
         // Middleware
         .layer(TraceLayer::new_for_http())
         .layer(cors)

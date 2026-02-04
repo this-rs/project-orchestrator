@@ -502,6 +502,52 @@ pub async fn delete_constraint(
 }
 
 // ============================================================================
+// Meilisearch maintenance
+// ============================================================================
+
+/// Response for cleanup operations
+#[derive(Serialize)]
+pub struct CleanupResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Response for index stats
+#[derive(Serialize)]
+pub struct MeiliStatsResponse {
+    pub code_documents: usize,
+    pub is_indexing: bool,
+}
+
+/// Delete orphan documents from Meilisearch (documents without project_id)
+pub async fn delete_meilisearch_orphans(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<CleanupResponse>, AppError> {
+    state
+        .orchestrator
+        .meili()
+        .delete_orphan_code_documents()
+        .await?;
+
+    Ok(Json(CleanupResponse {
+        success: true,
+        message: "Orphan documents deleted".to_string(),
+    }))
+}
+
+/// Get Meilisearch code index statistics
+pub async fn get_meilisearch_stats(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<MeiliStatsResponse>, AppError> {
+    let stats = state.orchestrator.meili().get_code_stats().await?;
+
+    Ok(Json(MeiliStatsResponse {
+        code_documents: stats.total_documents,
+        is_indexing: stats.is_indexing,
+    }))
+}
+
+// ============================================================================
 // Error handling
 // ============================================================================
 

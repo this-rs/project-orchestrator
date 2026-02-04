@@ -189,11 +189,11 @@ impl Orchestrator {
         self.store_parsed_file_for_project(&parsed, project_id)
             .await?;
 
-        // Index in Meilisearch with project association
-        let mut doc = CodeParser::to_code_document(&parsed, &content);
-        doc.project_id = project_id.map(|id| id.to_string());
-        doc.project_slug = project_slug.map(|s| s.to_string());
-        self.state.meili.index_code(&doc).await?;
+        // Index in Meilisearch only if project context is available
+        if let (Some(pid), Some(slug)) = (project_id, project_slug) {
+            let doc = CodeParser::to_code_document(&parsed, &pid.to_string(), slug);
+            self.state.meili.index_code(&doc).await?;
+        }
 
         Ok(true)
     }
