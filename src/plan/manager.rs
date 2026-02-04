@@ -83,8 +83,8 @@ impl PlanManager {
             }
         }
 
-        // TODO: Get constraints from Neo4j
-        let constraints = Vec::new();
+        // Get constraints from Neo4j
+        let constraints = self.neo4j.get_plan_constraints(plan_id).await?;
 
         Ok(Some(PlanDetails {
             plan,
@@ -195,7 +195,49 @@ impl PlanManager {
                 .unwrap_or_else(|_| chrono::Utc::now()),
         };
 
-        // Parse steps, decisions, etc.
+        // Parse steps from Neo4j nodes
+        let step_nodes: Vec<neo4rs::Node> = row.get("steps").unwrap_or_default();
+        let mut steps: Vec<StepNode> = step_nodes
+            .iter()
+            .filter_map(|node| {
+                Some(StepNode {
+                    id: node.get::<String>("id").ok()?.parse().ok()?,
+                    order: node.get::<i64>("order").ok()? as u32,
+                    description: node.get::<String>("description").ok()?,
+                    status: node
+                        .get::<String>("status")
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok())
+                        .unwrap_or(StepStatus::Pending),
+                    verification: node.get::<String>("verification").ok().filter(|s| !s.is_empty()),
+                })
+            })
+            .collect();
+        // Sort steps by order
+        steps.sort_by_key(|s| s.order);
+
+        // Parse decisions from Neo4j nodes
+        let decision_nodes: Vec<neo4rs::Node> = row.get("decisions").unwrap_or_default();
+        let decisions: Vec<DecisionNode> = decision_nodes
+            .iter()
+            .filter_map(|node| {
+                Some(DecisionNode {
+                    id: node.get::<String>("id").ok()?.parse().ok()?,
+                    description: node.get::<String>("description").ok()?,
+                    rationale: node.get::<String>("rationale").ok()?,
+                    alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
+                    chosen_option: node.get::<String>("chosen_option").ok().filter(|s| !s.is_empty()),
+                    decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
+                    decided_at: node
+                        .get::<String>("decided_at")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(chrono::Utc::now),
+                })
+            })
+            .collect();
+
+        // Parse dependencies
         let depends_on: Vec<String> = row.get("depends_on").unwrap_or_default();
         let depends_on: Vec<Uuid> = depends_on
             .into_iter()
@@ -206,8 +248,8 @@ impl PlanManager {
 
         Ok(Some(TaskDetails {
             task,
-            steps: vec![], // TODO: Parse steps
-            decisions: vec![], // TODO: Parse decisions
+            steps,
+            decisions,
             depends_on,
             modifies_files,
         }))
@@ -447,8 +489,33 @@ impl PlanManager {
                 created_at: chrono::Utc::now(),
             };
 
-            // TODO: Parse blockers
-            let blockers = Vec::new();
+            // Parse blockers from Neo4j nodes
+            let blocker_nodes: Vec<neo4rs::Node> = row.get("blockers").unwrap_or_default();
+            let blockers: Vec<TaskNode> = blocker_nodes
+                .iter()
+                .filter_map(|node| {
+                    Some(TaskNode {
+                        id: node.get::<String>("id").ok()?.parse().ok()?,
+                        title: node.get::<String>("title").ok().filter(|s| !s.is_empty()),
+                        description: node.get::<String>("description").ok()?,
+                        status: node
+                            .get::<String>("status")
+                            .ok()
+                            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok())
+                            .unwrap_or(TaskStatus::Pending),
+                        assigned_to: node.get::<String>("assigned_to").ok(),
+                        priority: node.get::<i64>("priority").ok().map(|v| v as i32),
+                        tags: node.get::<Vec<String>>("tags").unwrap_or_default(),
+                        acceptance_criteria: node.get::<Vec<String>>("acceptance_criteria").unwrap_or_default(),
+                        affected_files: node.get::<Vec<String>>("affected_files").unwrap_or_default(),
+                        estimated_complexity: node.get::<i64>("estimated_complexity").ok().filter(|&v| v > 0).map(|v| v as u32),
+                        actual_complexity: node.get::<i64>("actual_complexity").ok().filter(|&v| v > 0).map(|v| v as u32),
+                        started_at: node.get::<String>("started_at").ok().and_then(|s| s.parse().ok()),
+                        completed_at: node.get::<String>("completed_at").ok().and_then(|s| s.parse().ok()),
+                        created_at: node.get::<String>("created_at").ok().and_then(|s| s.parse().ok()).unwrap_or_else(chrono::Utc::now),
+                    })
+                })
+                .collect();
             result.push((task, blockers));
         }
 

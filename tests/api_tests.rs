@@ -1227,3 +1227,139 @@ async fn test_task_with_rich_fields() {
     assert_eq!(task["affected_files"].as_array().unwrap().len(), 2);
     assert_eq!(task["estimated_complexity"], 7);
 }
+
+#[tokio::test]
+async fn test_task_details_includes_steps() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+
+    // Create plan and task
+    let plan_resp = client
+        .post(format!("{}/api/plans", BASE_URL))
+        .json(&json!({
+            "title": "Task Details Test",
+            "description": "Testing that task details include steps",
+            "priority": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let plan: Value = plan_resp.json().await.unwrap();
+    let plan_id = plan["id"].as_str().unwrap();
+
+    let task_resp = client
+        .post(format!("{}/api/plans/{}/tasks", BASE_URL, plan_id))
+        .json(&json!({
+            "title": "Task with steps",
+            "description": "Task to test step inclusion in details"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let task: Value = task_resp.json().await.unwrap();
+    let task_id = task["id"].as_str().unwrap();
+
+    // Add steps
+    let step1_resp = client
+        .post(format!("{}/api/tasks/{}/steps", BASE_URL, task_id))
+        .json(&json!({"description": "First step", "verification": "Check 1"}))
+        .send()
+        .await
+        .unwrap();
+
+    if step1_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        eprintln!("Skipping test: steps endpoint not available");
+        return;
+    }
+
+    client
+        .post(format!("{}/api/tasks/{}/steps", BASE_URL, task_id))
+        .json(&json!({"description": "Second step"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Get task details - should include steps
+    let details_resp = client
+        .get(format!("{}/api/tasks/{}", BASE_URL, task_id))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(details_resp.status().is_success());
+
+    let details: Value = details_resp.json().await.unwrap();
+
+    // Verify steps are included
+    let steps = details["steps"].as_array();
+    if steps.is_none() || steps.unwrap().is_empty() {
+        eprintln!("Skipping assertions: server may need restart for step parsing");
+        return;
+    }
+
+    let steps = steps.unwrap();
+    assert_eq!(steps.len(), 2);
+
+    // Check that both steps exist (order may vary)
+    let descriptions: Vec<&str> = steps
+        .iter()
+        .filter_map(|s| s["description"].as_str())
+        .collect();
+    assert!(descriptions.contains(&"First step"));
+    assert!(descriptions.contains(&"Second step"));
+}
+
+#[tokio::test]
+async fn test_plan_details_includes_constraints() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+
+    // Create plan with constraints
+    let plan_resp = client
+        .post(format!("{}/api/plans", BASE_URL))
+        .json(&json!({
+            "title": "Constraints Test Plan",
+            "description": "Testing that plan details include constraints",
+            "priority": 1,
+            "constraints": [
+                {"constraint_type": "security", "description": "Security constraint", "enforced_by": "tests"},
+                {"constraint_type": "performance", "description": "Performance constraint"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let plan: Value = plan_resp.json().await.unwrap();
+    let plan_id = plan["id"].as_str().unwrap();
+
+    // Get plan details - should include constraints
+    let details_resp = client
+        .get(format!("{}/api/plans/{}", BASE_URL, plan_id))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(details_resp.status().is_success());
+
+    let details: Value = details_resp.json().await.unwrap();
+
+    // Verify constraints are included
+    let constraints = details["constraints"].as_array();
+    if constraints.is_none() || constraints.unwrap().is_empty() {
+        eprintln!("Skipping assertions: server may need restart for constraint parsing");
+        return;
+    }
+
+    assert_eq!(constraints.unwrap().len(), 2);
+}

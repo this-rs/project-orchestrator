@@ -16,8 +16,8 @@ This file provides guidance to Claude Code when working on the project-orchestra
 
 ```bash
 cargo build --release          # Build release binary
-cargo test                     # Run all tests (53 total)
-cargo test --test api_tests    # API tests only (27 tests)
+cargo test                     # Run all tests (55 total)
+cargo test --test api_tests    # API tests only (29 tests)
 cargo clippy                   # Lint
 cargo fmt                      # Format
 ```
@@ -120,9 +120,9 @@ tests/
 # Run tests
 cargo test
 
-# Expected: 53 tests passing
+# Expected: 55 tests passing
 # - 2 unit tests (watcher, slugify)
-# - 27 API tests
+# - 29 API tests
 # - 7 integration tests
 # - 17 parser tests
 ```
