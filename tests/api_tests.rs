@@ -9,6 +9,22 @@ use std::time::Duration;
 
 const BASE_URL: &str = "http://localhost:8080";
 
+/// Helper to delete a plan (for cleanup)
+async fn delete_plan(client: &Client, plan_id: &str) {
+    let _ = client
+        .delete(format!("{}/api/plans/{}", BASE_URL, plan_id))
+        .send()
+        .await;
+}
+
+/// Helper to delete a project (for cleanup)
+async fn delete_project(client: &Client, slug: &str) {
+    let _ = client
+        .delete(format!("{}/api/projects/{}", BASE_URL, slug))
+        .send()
+        .await;
+}
+
 /// Check if API is available
 async fn api_available() -> bool {
     let client = Client::new();
@@ -84,6 +100,9 @@ async fn test_create_and_get_plan() {
     let retrieved: Value = get_resp.json().await.unwrap();
     assert_eq!(retrieved["plan"]["id"], plan_id);
     assert_eq!(retrieved["plan"]["title"], "Test Plan from API");
+
+    // Cleanup
+    delete_plan(&client, plan_id).await;
 }
 
 #[tokio::test]
@@ -156,6 +175,9 @@ async fn test_add_task_to_plan() {
     assert!(task["id"].is_string());
     assert_eq!(task["description"], "Test task from API");
     assert_eq!(task["status"], "pending");
+
+    // Cleanup
+    delete_plan(&client, plan_id).await;
 }
 
 #[tokio::test]
@@ -207,6 +229,9 @@ async fn test_get_next_task() {
         next_task.is_object() && next_task["id"].is_string(),
         "Should return available task"
     );
+
+    // Cleanup
+    delete_plan(&client, plan_id).await;
 }
 
 #[tokio::test]
@@ -294,6 +319,9 @@ async fn test_wake_webhook() {
 
     let result: Value = wake_resp.json().await.unwrap();
     assert_eq!(result["acknowledged"], true);
+
+    // Cleanup
+    delete_plan(&client, plan_id).await;
 }
 
 #[tokio::test]
@@ -366,6 +394,9 @@ async fn test_add_and_search_decisions() {
 
     let results: Value = search_resp.json().await.unwrap();
     assert!(results.is_array());
+
+    // Cleanup
+    delete_plan(&client, plan_id).await;
 }
 
 // ============================================================================
@@ -868,6 +899,9 @@ async fn test_add_and_get_steps() {
     let steps: Value = get_resp.json().await.unwrap();
     assert!(steps.is_array());
     assert_eq!(steps.as_array().unwrap().len(), 2);
+
+    // Cleanup
+    delete_plan(&client, plan_id).await;
 }
 
 #[tokio::test]

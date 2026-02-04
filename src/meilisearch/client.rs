@@ -314,6 +314,42 @@ impl MeiliClient {
         Ok(results.hits.into_iter().map(|h| h.result).collect())
     }
 
+    /// Delete a decision document by ID
+    pub async fn delete_decision(&self, id: &str) -> Result<()> {
+        let index = self.client.index(index_names::DECISIONS);
+        let task = index.delete_document(id).await?;
+        task.wait_for_completion(&self.client, None, None).await?;
+        Ok(())
+    }
+
+    /// Delete all decision documents for a project
+    pub async fn delete_decisions_for_project(&self, project_slug: &str) -> Result<()> {
+        use meilisearch_sdk::documents::DocumentDeletionQuery;
+
+        let index = self.client.index(index_names::DECISIONS);
+        let mut query = DocumentDeletionQuery::new(&index);
+        let filter = format!("project_slug = \"{}\"", project_slug);
+        query.with_filter(&filter);
+
+        let task = index.delete_documents_with(&query).await?;
+        task.wait_for_completion(&self.client, None, None).await?;
+        Ok(())
+    }
+
+    /// Delete all decision documents for a task
+    pub async fn delete_decisions_for_task(&self, task_id: &str) -> Result<()> {
+        use meilisearch_sdk::documents::DocumentDeletionQuery;
+
+        let index = self.client.index(index_names::DECISIONS);
+        let mut query = DocumentDeletionQuery::new(&index);
+        let filter = format!("task_id = \"{}\"", task_id);
+        query.with_filter(&filter);
+
+        let task = index.delete_documents_with(&query).await?;
+        task.wait_for_completion(&self.client, None, None).await?;
+        Ok(())
+    }
+
     // ========================================================================
     // Note indexing
     // ========================================================================

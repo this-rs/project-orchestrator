@@ -782,9 +782,8 @@ async fn test_workspace_milestone_task_association() {
     assert_eq!(completed, 0);
     assert_eq!(in_progress, 0);
 
-    // Cleanup (note: delete_task and delete_plan don't exist, so we clean what we can)
-    // Deleting the workspace milestone and workspace will leave orphaned plan/task data
-    // but since we use unique IDs, this is acceptable for test purposes
+    // Cleanup
+    state.neo4j.delete_plan(plan.id).await.unwrap();
     state
         .neo4j
         .delete_workspace_milestone(milestone.id)

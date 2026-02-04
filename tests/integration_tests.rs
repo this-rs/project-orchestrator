@@ -100,6 +100,9 @@ async fn test_neo4j_file_operations() {
     assert_eq!(retrieved.path, file.path);
     assert_eq!(retrieved.language, file.language);
     assert_eq!(retrieved.hash, file.hash);
+
+    // Cleanup: delete the test file
+    state.neo4j.delete_file(&file.path).await.unwrap();
 }
 
 #[tokio::test]
@@ -142,6 +145,9 @@ async fn test_neo4j_plan_operations() {
     // Verify status update
     let updated = state.neo4j.get_plan(plan.id).await.unwrap().unwrap();
     assert_eq!(updated.status, PlanStatus::Approved);
+
+    // Cleanup: delete the test plan
+    state.neo4j.delete_plan(plan.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -183,6 +189,9 @@ async fn test_neo4j_task_operations() {
     // Get next available task (should be none since our task is in progress)
     let next = state.neo4j.get_next_available_task(plan.id).await.unwrap();
     assert!(next.is_none(), "No pending tasks should be available");
+
+    // Cleanup: delete the test plan (which will also delete tasks)
+    state.neo4j.delete_plan(plan.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -233,6 +242,9 @@ async fn test_neo4j_task_dependencies() {
     let next = state.neo4j.get_next_available_task(plan.id).await.unwrap();
     assert!(next.is_some(), "Task 2 should now be available");
     assert_eq!(next.unwrap().id, task2.id);
+
+    // Cleanup: delete the test plan (which will also delete tasks)
+    state.neo4j.delete_plan(plan.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -273,6 +285,9 @@ async fn test_meilisearch_code_indexing() {
 
     // Note: Search results may not include our doc immediately due to async indexing
     // In production tests, we'd wait for the task to complete
+
+    // Cleanup: delete the test document
+    state.meili.delete_code(&doc.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -314,6 +329,9 @@ async fn test_meilisearch_decision_indexing() {
         "Should search decisions: {:?}",
         results.err()
     );
+
+    // Cleanup: delete the test document
+    state.meili.delete_decision(&doc.id).await.unwrap();
 }
 
 #[tokio::test]

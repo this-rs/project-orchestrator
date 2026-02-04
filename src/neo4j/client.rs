@@ -1560,6 +1560,21 @@ impl Neo4jClient {
         Ok(paths)
     }
 
+    /// Delete a file and all its symbols
+    pub async fn delete_file(&self, path: &str) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})
+            OPTIONAL MATCH (f)-[:CONTAINS]->(symbol)
+            DETACH DELETE symbol, f
+            "#,
+        )
+        .param("path", path);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Delete files that are no longer on the filesystem
     /// Returns the number of files and symbols deleted
     pub async fn delete_stale_files(
@@ -2666,6 +2681,61 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Delete a plan and all its related data (tasks, steps, decisions, constraints)
+    pub async fn delete_plan(&self, plan_id: Uuid) -> Result<()> {
+        // Delete all steps belonging to tasks of this plan
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $id})-[:HAS_TASK]->(t:Task)-[:HAS_STEP]->(s:Step)
+            DETACH DELETE s
+            "#,
+        )
+        .param("id", plan_id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete all decisions belonging to tasks of this plan
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $id})-[:HAS_TASK]->(t:Task)-[:INFORMED_BY]->(d:Decision)
+            DETACH DELETE d
+            "#,
+        )
+        .param("id", plan_id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete all tasks belonging to this plan
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $id})-[:HAS_TASK]->(t:Task)
+            DETACH DELETE t
+            "#,
+        )
+        .param("id", plan_id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete all constraints belonging to this plan
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $id})-[:CONSTRAINED_BY]->(c:Constraint)
+            DETACH DELETE c
+            "#,
+        )
+        .param("id", plan_id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete the plan itself
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $id})
+            DETACH DELETE p
+            "#,
+        )
+        .param("id", plan_id.to_string());
+        self.graph.run(q).await?;
+
+        Ok(())
+    }
+
     // ========================================================================
     // Task operations
     // ========================================================================
@@ -3111,6 +3181,41 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Delete a task and all its related data (steps, decisions)
+    pub async fn delete_task(&self, task_id: Uuid) -> Result<()> {
+        // Delete all steps belonging to this task
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})-[:HAS_STEP]->(s:Step)
+            DETACH DELETE s
+            "#,
+        )
+        .param("id", task_id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete all decisions belonging to this task
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})-[:INFORMED_BY]->(d:Decision)
+            DETACH DELETE d
+            "#,
+        )
+        .param("id", task_id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete the task itself
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})
+            DETACH DELETE t
+            "#,
+        )
+        .param("id", task_id.to_string());
+        self.graph.run(q).await?;
+
+        Ok(())
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================
@@ -3246,6 +3351,20 @@ impl Neo4jClient {
         }
     }
 
+    /// Delete a step
+    pub async fn delete_step(&self, step_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (s:Step {id: $id})
+            DETACH DELETE s
+            "#,
+        )
+        .param("id", step_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     // ========================================================================
     // Constraint operations
     // ========================================================================
@@ -3363,6 +3482,20 @@ impl Neo4jClient {
         )
         .param("decided_by", decision.decided_by.clone())
         .param("decided_at", decision.decided_at.to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Delete a decision
+    pub async fn delete_decision(&self, decision_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (d:Decision {id: $id})
+            DETACH DELETE d
+            "#,
+        )
+        .param("id", decision_id.to_string());
 
         self.graph.run(q).await?;
         Ok(())
@@ -3574,6 +3707,20 @@ impl Neo4jClient {
         }
 
         Ok(commits)
+    }
+
+    /// Delete a commit
+    pub async fn delete_commit(&self, hash: &str) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (c:Commit {hash: $hash})
+            DETACH DELETE c
+            "#,
+        )
+        .param("hash", hash);
+
+        self.graph.run(q).await?;
+        Ok(())
     }
 
     // ========================================================================
@@ -3834,6 +3981,20 @@ impl Neo4jClient {
         }
     }
 
+    /// Delete a release
+    pub async fn delete_release(&self, release_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (r:Release {id: $id})
+            DETACH DELETE r
+            "#,
+        )
+        .param("id", release_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     // ========================================================================
     // Milestone operations
     // ========================================================================
@@ -4083,6 +4244,20 @@ impl Neo4jClient {
         } else {
             Ok((0, 0))
         }
+    }
+
+    /// Delete a milestone
+    pub async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (m:Milestone {id: $id})
+            DETACH DELETE m
+            "#,
+        )
+        .param("id", milestone_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
     }
 
     // ========================================================================

@@ -68,7 +68,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         .route(
             "/api/plans/{plan_id}",
-            get(handlers::get_plan).patch(handlers::update_plan_status),
+            get(handlers::get_plan)
+                .patch(handlers::update_plan_status)
+                .delete(handlers::delete_plan),
         )
         .route(
             "/api/plans/{plan_id}/project",
