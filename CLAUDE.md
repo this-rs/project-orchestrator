@@ -73,6 +73,7 @@ tests/
 ## Key APIs
 
 ### Plans & Tasks
+- `GET /api/plans` - List plans with pagination and filters (see Query Parameters below)
 - `POST /api/plans` - Create plan (with optional `project_id` to associate with project)
 - `GET /api/plans/{id}` - Get plan details
 - `PUT /api/plans/{id}/project` - Link plan to a project
@@ -81,6 +82,8 @@ tests/
 - `GET /api/plans/{id}/dependency-graph` - Get task dependency graph for visualization
 - `GET /api/plans/{id}/critical-path` - Get longest dependency chain
 - `POST /api/plans/{id}/tasks` - Add task (with title, priority, tags, acceptance_criteria, affected_files)
+- `GET /api/tasks` - List all tasks across plans with pagination and filters (see Query Parameters below)
+- `GET /api/tasks/{id}` - Get task details
 - `PATCH /api/tasks/{id}` - Update task
 - `POST /api/tasks/{id}/decisions` - Record decision
 
@@ -143,6 +146,51 @@ tests/
 - `GET /api/code/trait-impls?trait_name=...` - Find trait implementations
 - `GET /api/code/type-traits?type_name=...` - Find traits for a type
 - `GET /api/code/impl-blocks?type_name=...` - Get impl blocks for a type
+
+### Query Parameters (Pagination & Filtering)
+
+List endpoints (`GET /api/plans`, `GET /api/tasks`, `GET /api/projects/{id}/releases`, `GET /api/projects/{id}/milestones`, `GET /api/projects`) support:
+
+**Pagination:**
+- `limit` - Max items per page (default: 50, max: 100)
+- `offset` - Items to skip (default: 0)
+- `sort_by` - Field to sort by (e.g., "created_at", "priority", "title")
+- `sort_order` - Sort direction: "asc" or "desc" (default: "desc")
+
+**Filtering:**
+- `status` - Comma-separated status values (e.g., "pending,in_progress")
+- `priority_min` - Minimum priority (inclusive)
+- `priority_max` - Maximum priority (inclusive)
+- `search` - Search in title/description (plans, projects)
+- `tags` - Comma-separated tags (tasks only)
+- `assigned_to` - Filter by assigned agent (tasks only)
+- `plan_id` - Filter by plan ID (tasks only)
+
+**Response format (PaginatedResponse):**
+```json
+{
+  "items": [...],
+  "total": 42,
+  "limit": 50,
+  "offset": 0,
+  "has_more": false
+}
+```
+
+**Examples:**
+```bash
+# Plans paginés avec filtres
+GET /api/plans?status=draft,in_progress&priority_min=5&limit=10&offset=0
+
+# Toutes les tâches d'un agent
+GET /api/tasks?assigned_to=agent-1&status=in_progress
+
+# Milestones actifs
+GET /api/projects/{id}/milestones?status=open&limit=5
+
+# Recherche projets
+GET /api/projects?search=orchestrator&limit=10
+```
 
 ### Sync & Watch
 - `POST /api/sync` - Manual sync

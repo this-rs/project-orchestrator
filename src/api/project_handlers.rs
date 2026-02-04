@@ -1,8 +1,9 @@
 //! Project API handlers
 
+use crate::api::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::neo4j::models::ProjectNode;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -46,11 +47,36 @@ pub struct ProjectListResponse {
 // Handlers
 // ============================================================================
 
-/// List all projects
+/// Query parameters for listing projects
+#[derive(Debug, Deserialize, Default)]
+pub struct ProjectsListQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    #[serde(flatten)]
+    pub search_filter: SearchFilter,
+}
+
+/// List all projects with optional pagination and search
 pub async fn list_projects(
     State(state): State<OrchestratorState>,
-) -> Result<Json<ProjectListResponse>, AppError> {
-    let projects = state.orchestrator.neo4j().list_projects().await?;
+    Query(query): Query<ProjectsListQuery>,
+) -> Result<Json<PaginatedResponse<ProjectResponse>>, AppError> {
+    query
+        .pagination
+        .validate()
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    let (projects, total) = state
+        .orchestrator
+        .neo4j()
+        .list_projects_filtered(
+            query.search_filter.search.as_deref(),
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+            query.pagination.sort_by.as_deref(),
+            &query.pagination.sort_order,
+        )
+        .await?;
 
     let mut responses = Vec::new();
     for project in &projects {
@@ -80,10 +106,12 @@ pub async fn list_projects(
         });
     }
 
-    Ok(Json(ProjectListResponse {
-        total: responses.len(),
-        projects: responses,
-    }))
+    Ok(Json(PaginatedResponse::new(
+        responses,
+        total,
+        query.pagination.validated_limit(),
+        query.pagination.offset,
+    )))
 }
 
 /// Create a new project

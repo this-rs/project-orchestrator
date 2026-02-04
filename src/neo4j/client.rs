@@ -27,6 +27,129 @@ fn pascal_to_snake_case(s: &str) -> String {
     result
 }
 
+/// Convert snake_case to PascalCase (e.g., "in_progress" -> "InProgress")
+fn snake_to_pascal_case(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut c = word.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().chain(c).collect(),
+            }
+        })
+        .collect()
+}
+
+/// Builder for dynamic WHERE clauses in Cypher queries
+#[derive(Default)]
+pub struct WhereBuilder {
+    conditions: Vec<String>,
+}
+
+impl WhereBuilder {
+    /// Create a new empty WhereBuilder
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a status filter (converts snake_case to PascalCase for Neo4j)
+    pub fn add_status_filter(&mut self, alias: &str, statuses: Option<Vec<String>>) -> &mut Self {
+        if let Some(statuses) = statuses {
+            if !statuses.is_empty() {
+                let pascal_statuses: Vec<String> = statuses
+                    .iter()
+                    .map(|s| snake_to_pascal_case(s))
+                    .collect();
+                self.conditions.push(format!(
+                    "{}.status IN [{}]",
+                    alias,
+                    pascal_statuses
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        self
+    }
+
+    /// Add a priority range filter
+    pub fn add_priority_filter(
+        &mut self,
+        alias: &str,
+        min: Option<i32>,
+        max: Option<i32>,
+    ) -> &mut Self {
+        if let Some(min) = min {
+            self.conditions
+                .push(format!("COALESCE({}.priority, 0) >= {}", alias, min));
+        }
+        if let Some(max) = max {
+            self.conditions
+                .push(format!("COALESCE({}.priority, 0) <= {}", alias, max));
+        }
+        self
+    }
+
+    /// Add a tags filter (all specified tags must be present)
+    pub fn add_tags_filter(&mut self, alias: &str, tags: Option<Vec<String>>) -> &mut Self {
+        if let Some(tags) = tags {
+            for tag in tags {
+                self.conditions
+                    .push(format!("'{}' IN {}.tags", tag, alias));
+            }
+        }
+        self
+    }
+
+    /// Add an assigned_to filter
+    pub fn add_assigned_to_filter(&mut self, alias: &str, assigned_to: Option<&str>) -> &mut Self {
+        if let Some(assigned) = assigned_to {
+            self.conditions
+                .push(format!("{}.assigned_to = '{}'", alias, assigned));
+        }
+        self
+    }
+
+    /// Add a search filter (case-insensitive CONTAINS on title and description)
+    pub fn add_search_filter(&mut self, alias: &str, search: Option<&str>) -> &mut Self {
+        if let Some(search) = search {
+            if !search.trim().is_empty() {
+                let search_lower = search.to_lowercase();
+                self.conditions.push(format!(
+                    "(toLower({0}.title) CONTAINS '{1}' OR toLower({0}.description) CONTAINS '{1}')",
+                    alias, search_lower
+                ));
+            }
+        }
+        self
+    }
+
+    /// Build the WHERE clause (returns empty string if no conditions)
+    pub fn build(&self) -> String {
+        if self.conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", self.conditions.join(" AND "))
+        }
+    }
+
+    /// Build an AND clause to append to existing WHERE (returns empty string if no conditions)
+    pub fn build_and(&self) -> String {
+        if self.conditions.is_empty() {
+            String::new()
+        } else {
+            format!("AND {}", self.conditions.join(" AND "))
+        }
+    }
+
+    /// Check if any conditions have been added
+    pub fn has_conditions(&self) -> bool {
+        !self.conditions.is_empty()
+    }
+}
+
 impl Neo4jClient {
     /// Create a new Neo4j client
     pub async fn new(uri: &str, user: &str, password: &str) -> Result<Self> {
@@ -2808,5 +2931,341 @@ impl Neo4jClient {
         }
 
         Ok(tasks)
+    }
+
+    // ========================================================================
+    // Filtered list operations with pagination
+    // ========================================================================
+
+    /// List plans with filters and pagination
+    ///
+    /// Returns (plans, total_count)
+    pub async fn list_plans_filtered(
+        &self,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<PlanNode>, usize)> {
+        let mut where_builder = WhereBuilder::new();
+        where_builder
+            .add_status_filter("p", statuses)
+            .add_priority_filter("p", priority_min, priority_max)
+            .add_search_filter("p", search);
+
+        let where_clause = where_builder.build();
+        let order_field = match sort_by {
+            Some("priority") => "COALESCE(p.priority, 0)",
+            Some("title") => "p.title",
+            Some("status") => "p.status",
+            _ => "p.created_at",
+        };
+        let order_dir = if sort_order == "asc" { "ASC" } else { "DESC" };
+
+        // Count query
+        let count_cypher = format!("MATCH (p:Plan) {} RETURN count(p) AS total", where_clause);
+        let count_result = self.execute(&count_cypher).await?;
+        let total: i64 = count_result
+            .first()
+            .and_then(|r| r.get("total").ok())
+            .unwrap_or(0);
+
+        // Data query
+        let cypher = format!(
+            r#"
+            MATCH (p:Plan)
+            {}
+            RETURN p
+            ORDER BY {} {}
+            SKIP {}
+            LIMIT {}
+            "#,
+            where_clause, order_field, order_dir, offset, limit
+        );
+
+        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut plans = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("p")?;
+            plans.push(self.node_to_plan(&node)?);
+        }
+
+        Ok((plans, total as usize))
+    }
+
+    /// List all tasks across all plans with filters and pagination
+    ///
+    /// Returns (tasks_with_plan_info, total_count)
+    pub async fn list_all_tasks_filtered(
+        &self,
+        plan_id: Option<Uuid>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        tags: Option<Vec<String>>,
+        assigned_to: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<TaskWithPlan>, usize)> {
+        let mut where_builder = WhereBuilder::new();
+        where_builder
+            .add_status_filter("t", statuses)
+            .add_priority_filter("t", priority_min, priority_max)
+            .add_tags_filter("t", tags)
+            .add_assigned_to_filter("t", assigned_to);
+
+        // Build plan filter if specified
+        let plan_match = if let Some(pid) = plan_id {
+            format!("MATCH (p:Plan {{id: '{}'}})-[:HAS_TASK]->(t:Task)", pid)
+        } else {
+            "MATCH (p:Plan)-[:HAS_TASK]->(t:Task)".to_string()
+        };
+
+        let where_clause = where_builder.build();
+        let order_field = match sort_by {
+            Some("priority") => "COALESCE(t.priority, 0)",
+            Some("title") => "t.title",
+            Some("status") => "t.status",
+            Some("created_at") => "t.created_at",
+            Some("updated_at") => "t.updated_at",
+            _ => "COALESCE(t.priority, 0) DESC, t.created_at",
+        };
+        let order_dir = if sort_by.is_some() && sort_order == "asc" {
+            "ASC"
+        } else if sort_by.is_some() {
+            "DESC"
+        } else {
+            "" // Default ordering already includes direction
+        };
+
+        // Count query
+        let count_cypher = format!(
+            "{} {} RETURN count(t) AS total",
+            plan_match, where_clause
+        );
+        let count_result = self.execute(&count_cypher).await?;
+        let total: i64 = count_result
+            .first()
+            .and_then(|r| r.get("total").ok())
+            .unwrap_or(0);
+
+        // Data query
+        let cypher = format!(
+            r#"
+            {}
+            {}
+            RETURN t, p.id AS plan_id, p.title AS plan_title
+            ORDER BY {} {}
+            SKIP {}
+            LIMIT {}
+            "#,
+            plan_match, where_clause, order_field, order_dir, offset, limit
+        );
+
+        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut tasks = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            let plan_id_str: String = row.get("plan_id")?;
+            let plan_title: String = row.get("plan_title")?;
+            tasks.push(TaskWithPlan {
+                task: self.node_to_task(&node)?,
+                plan_id: plan_id_str.parse()?,
+                plan_title,
+            });
+        }
+
+        Ok((tasks, total as usize))
+    }
+
+    /// List project releases with filters and pagination
+    pub async fn list_releases_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<ReleaseNode>, usize)> {
+        let mut where_builder = WhereBuilder::new();
+        where_builder.add_status_filter("r", statuses);
+
+        let where_clause = where_builder.build_and();
+        let order_field = match sort_by {
+            Some("version") => "r.version",
+            Some("target_date") => "r.target_date",
+            Some("released_at") => "r.released_at",
+            Some("title") => "r.title",
+            _ => "r.created_at",
+        };
+        let order_dir = if sort_order == "asc" { "ASC" } else { "DESC" };
+
+        // Count query
+        let count_cypher = format!(
+            "MATCH (p:Project {{id: $project_id}})-[:HAS_RELEASE]->(r:Release) {} RETURN count(r) AS total",
+            if where_clause.is_empty() { "" } else { &where_clause }
+        );
+        let count_q = query(&count_cypher).param("project_id", project_id.to_string());
+        let mut count_result = self.graph.execute(count_q).await?;
+        let total: i64 = count_result
+            .next()
+            .await?
+            .and_then(|r| r.get("total").ok())
+            .unwrap_or(0);
+
+        // Data query
+        let cypher = format!(
+            r#"
+            MATCH (p:Project {{id: $project_id}})-[:HAS_RELEASE]->(r:Release)
+            {}
+            RETURN r
+            ORDER BY {} {}
+            SKIP {}
+            LIMIT {}
+            "#,
+            if where_clause.is_empty() {
+                ""
+            } else {
+                &where_clause
+            },
+            order_field,
+            order_dir,
+            offset,
+            limit
+        );
+
+        let q = query(&cypher).param("project_id", project_id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        let mut releases = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            releases.push(self.node_to_release(&node)?);
+        }
+
+        Ok((releases, total as usize))
+    }
+
+    /// List project milestones with filters and pagination
+    pub async fn list_milestones_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<MilestoneNode>, usize)> {
+        let mut where_builder = WhereBuilder::new();
+        where_builder.add_status_filter("m", statuses);
+
+        let where_clause = where_builder.build_and();
+        let order_field = match sort_by {
+            Some("title") => "m.title",
+            Some("created_at") => "m.created_at",
+            _ => "m.target_date",
+        };
+        let order_dir = if sort_order == "asc" { "ASC" } else { "DESC" };
+
+        // Count query
+        let count_cypher = format!(
+            "MATCH (p:Project {{id: $project_id}})-[:HAS_MILESTONE]->(m:Milestone) {} RETURN count(m) AS total",
+            if where_clause.is_empty() { "" } else { &where_clause }
+        );
+        let count_q = query(&count_cypher).param("project_id", project_id.to_string());
+        let mut count_result = self.graph.execute(count_q).await?;
+        let total: i64 = count_result
+            .next()
+            .await?
+            .and_then(|r| r.get("total").ok())
+            .unwrap_or(0);
+
+        // Data query
+        let cypher = format!(
+            r#"
+            MATCH (p:Project {{id: $project_id}})-[:HAS_MILESTONE]->(m:Milestone)
+            {}
+            RETURN m
+            ORDER BY {} {}
+            SKIP {}
+            LIMIT {}
+            "#,
+            if where_clause.is_empty() {
+                ""
+            } else {
+                &where_clause
+            },
+            order_field,
+            order_dir,
+            offset,
+            limit
+        );
+
+        let q = query(&cypher).param("project_id", project_id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        let mut milestones = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("m")?;
+            milestones.push(self.node_to_milestone(&node)?);
+        }
+
+        Ok((milestones, total as usize))
+    }
+
+    /// List projects with search and pagination
+    pub async fn list_projects_filtered(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<ProjectNode>, usize)> {
+        let mut where_builder = WhereBuilder::new();
+        where_builder.add_search_filter("p", search);
+
+        let where_clause = where_builder.build();
+        let order_field = match sort_by {
+            Some("created_at") => "p.created_at",
+            Some("last_synced") => "p.last_synced",
+            _ => "p.name",
+        };
+        let order_dir = if sort_order == "asc" { "ASC" } else { "DESC" };
+
+        // Count query
+        let count_cypher = format!("MATCH (p:Project) {} RETURN count(p) AS total", where_clause);
+        let count_result = self.execute(&count_cypher).await?;
+        let total: i64 = count_result
+            .first()
+            .and_then(|r| r.get("total").ok())
+            .unwrap_or(0);
+
+        // Data query
+        let cypher = format!(
+            r#"
+            MATCH (p:Project)
+            {}
+            RETURN p
+            ORDER BY {} {}
+            SKIP {}
+            LIMIT {}
+            "#,
+            where_clause, order_field, order_dir, offset, limit
+        );
+
+        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut projects = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("p")?;
+            projects.push(self.node_to_project(&node)?);
+        }
+
+        Ok((projects, total as usize))
     }
 }

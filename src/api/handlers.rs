@@ -1,13 +1,14 @@
 //! API request handlers
 
+use crate::api::{PaginatedResponse, PaginationParams, PriorityFilter, SearchFilter, StatusFilter, TagsFilter};
 use crate::neo4j::models::{
     CommitNode, ConstraintNode, DecisionNode, MilestoneNode, MilestoneStatus, PlanNode,
-    PlanStatus, ReleaseNode, ReleaseStatus, StepNode, TaskNode,
+    PlanStatus, ReleaseNode, ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
 };
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -49,16 +50,50 @@ pub async fn health() -> Json<HealthResponse> {
 // Plans
 // ============================================================================
 
-/// List all active plans
+/// Query parameters for listing plans
+#[derive(Debug, Deserialize, Default)]
+pub struct PlansListQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    #[serde(flatten)]
+    pub status_filter: StatusFilter,
+    #[serde(flatten)]
+    pub priority_filter: PriorityFilter,
+    #[serde(flatten)]
+    pub search_filter: SearchFilter,
+}
+
+/// List all plans with optional pagination and filters
 pub async fn list_plans(
     State(state): State<OrchestratorState>,
-) -> Result<Json<Vec<PlanNode>>, AppError> {
-    let plans = state
+    Query(query): Query<PlansListQuery>,
+) -> Result<Json<PaginatedResponse<PlanNode>>, AppError> {
+    query
+        .pagination
+        .validate()
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    let (plans, total) = state
         .orchestrator
-        .plan_manager()
-        .list_active_plans()
+        .neo4j()
+        .list_plans_filtered(
+            query.status_filter.to_vec(),
+            query.priority_filter.priority_min,
+            query.priority_filter.priority_max,
+            query.search_filter.search.as_deref(),
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+            query.pagination.sort_by.as_deref(),
+            &query.pagination.sort_order,
+        )
         .await?;
-    Ok(Json(plans))
+
+    Ok(Json(PaginatedResponse::new(
+        plans,
+        total,
+        query.pagination.validated_limit(),
+        query.pagination.offset,
+    )))
 }
 
 /// Create a new plan
@@ -197,6 +232,58 @@ pub async fn get_next_task(
         .get_next_available_task(plan_id)
         .await?;
     Ok(Json(task))
+}
+
+/// Query parameters for listing all tasks
+#[derive(Debug, Deserialize, Default)]
+pub struct TasksListQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    #[serde(flatten)]
+    pub status_filter: StatusFilter,
+    #[serde(flatten)]
+    pub priority_filter: PriorityFilter,
+    #[serde(flatten)]
+    pub tags_filter: TagsFilter,
+    /// Filter by plan ID
+    pub plan_id: Option<Uuid>,
+    /// Filter by assigned agent/user
+    pub assigned_to: Option<String>,
+}
+
+/// List all tasks across all plans with optional filters
+pub async fn list_all_tasks(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<TasksListQuery>,
+) -> Result<Json<PaginatedResponse<TaskWithPlan>>, AppError> {
+    query
+        .pagination
+        .validate()
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    let (tasks, total) = state
+        .orchestrator
+        .neo4j()
+        .list_all_tasks_filtered(
+            query.plan_id,
+            query.status_filter.to_vec(),
+            query.priority_filter.priority_min,
+            query.priority_filter.priority_max,
+            query.tags_filter.to_vec(),
+            query.assigned_to.as_deref(),
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+            query.pagination.sort_by.as_deref(),
+            &query.pagination.sort_order,
+        )
+        .await?;
+
+    Ok(Json(PaginatedResponse::new(
+        tasks,
+        total,
+        query.pagination.validated_limit(),
+        query.pagination.offset,
+    )))
 }
 
 // ============================================================================
@@ -708,16 +795,44 @@ pub async fn create_release(
 }
 
 /// List releases for a project
+/// Query parameters for listing releases
+#[derive(Debug, Deserialize, Default)]
+pub struct ReleasesListQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    #[serde(flatten)]
+    pub status_filter: StatusFilter,
+}
+
 pub async fn list_releases(
     State(state): State<OrchestratorState>,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Vec<ReleaseNode>>, AppError> {
-    let releases = state
+    Query(query): Query<ReleasesListQuery>,
+) -> Result<Json<PaginatedResponse<ReleaseNode>>, AppError> {
+    query
+        .pagination
+        .validate()
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    let (releases, total) = state
         .orchestrator
         .neo4j()
-        .list_project_releases(project_id)
+        .list_releases_filtered(
+            project_id,
+            query.status_filter.to_vec(),
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+            query.pagination.sort_by.as_deref(),
+            &query.pagination.sort_order,
+        )
         .await?;
-    Ok(Json(releases))
+
+    Ok(Json(PaginatedResponse::new(
+        releases,
+        total,
+        query.pagination.validated_limit(),
+        query.pagination.offset,
+    )))
 }
 
 /// Request to update a release
@@ -856,16 +971,44 @@ pub async fn create_milestone(
 }
 
 /// List milestones for a project
+/// Query parameters for listing milestones
+#[derive(Debug, Deserialize, Default)]
+pub struct MilestonesListQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    #[serde(flatten)]
+    pub status_filter: StatusFilter,
+}
+
 pub async fn list_milestones(
     State(state): State<OrchestratorState>,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Vec<MilestoneNode>>, AppError> {
-    let milestones = state
+    Query(query): Query<MilestonesListQuery>,
+) -> Result<Json<PaginatedResponse<MilestoneNode>>, AppError> {
+    query
+        .pagination
+        .validate()
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    let (milestones, total) = state
         .orchestrator
         .neo4j()
-        .list_project_milestones(project_id)
+        .list_milestones_filtered(
+            project_id,
+            query.status_filter.to_vec(),
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+            query.pagination.sort_by.as_deref(),
+            &query.pagination.sort_order,
+        )
         .await?;
-    Ok(Json(milestones))
+
+    Ok(Json(PaginatedResponse::new(
+        milestones,
+        total,
+        query.pagination.validated_limit(),
+        query.pagination.offset,
+    )))
 }
 
 /// Request to update a milestone

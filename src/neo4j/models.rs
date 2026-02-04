@@ -227,6 +227,18 @@ pub enum TaskStatus {
     Failed,
 }
 
+/// A task with its parent plan information (for global task queries)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskWithPlan {
+    /// The task itself
+    #[serde(flatten)]
+    pub task: TaskNode,
+    /// ID of the parent plan
+    pub plan_id: Uuid,
+    /// Title of the parent plan
+    pub plan_title: String,
+}
+
 /// A step within a task
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepNode {

@@ -94,7 +94,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/constraints/{constraint_id}",
             axum::routing::delete(handlers::delete_constraint),
         )
-        // Tasks
+        // Tasks (global listing)
+        .route("/api/tasks", get(handlers::list_all_tasks))
+        // Tasks (plan-scoped)
         .route("/api/plans/{plan_id}/tasks", post(handlers::add_task))
         .route(
             "/api/tasks/{task_id}",
