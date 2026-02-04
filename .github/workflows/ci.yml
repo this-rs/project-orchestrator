@@ -69,7 +69,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
   # ==========================================================================
-  # Unit Tests - Parser tests without external services
+  # Unit Tests - Library and parser tests without external services
   # ==========================================================================
   unit-tests:
     name: Unit Tests
@@ -86,6 +86,9 @@ jobs:
         with:
           shared-key: "ci-build"
           save-if: false
+
+      - name: Run unit tests (lib)
+        run: cargo test --lib
 
       - name: Run parser tests
         run: cargo test --test parser_tests
@@ -267,12 +270,13 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Generate coverage report
-        run: cargo llvm-cov --test parser_tests --lcov --output-path lcov.info
+      - name: Generate coverage report (unit tests)
+        run: cargo llvm-cov --lib --test parser_tests --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: false
           verbose: true
