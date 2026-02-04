@@ -1,6 +1,21 @@
-//! Language-specific utilities and queries
+//! Language-specific extractors for code parsing
+//!
+//! Each module implements extraction for a specific programming language.
 
-/// Tree-sitter query patterns for different languages
+pub mod rust;
+pub mod typescript;
+pub mod python;
+pub mod go;
+pub mod java;
+pub mod c;
+pub mod cpp;
+pub mod ruby;
+pub mod php;
+pub mod kotlin;
+pub mod swift;
+pub mod bash;
+
+/// Tree-sitter query patterns for different languages (kept for reference)
 pub mod queries {
     /// Rust query patterns
     pub mod rust {
@@ -43,8 +58,8 @@ pub mod queries {
                     (scoped_identifier
                         name: (identifier) @callee
                     )
-                ]
-            ) @call
+                ] @call
+            )
         "#;
     }
 

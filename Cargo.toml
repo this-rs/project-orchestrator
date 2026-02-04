@@ -31,6 +31,14 @@ tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.23"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-swift = "0.6"
+tree-sitter-bash = "0.23"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

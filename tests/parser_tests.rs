@@ -719,3 +719,372 @@ pub fn process<T: Clone + Send, U: Default>(input: T) -> U {
         "Should contain Default bound"
     );
 }
+
+// ============================================================================
+// Tests for new languages
+// ============================================================================
+
+#[test]
+fn test_parse_java() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+package com.example;
+
+import java.util.List;
+
+/**
+ * A simple calculator class
+ */
+public class Calculator {
+    private int value;
+
+    public int add(int a, int b) {
+        return a + b;
+    }
+
+    public static void main(String[] args) {
+        Calculator calc = new Calculator();
+        System.out.println(calc.add(1, 2));
+    }
+}
+"#;
+
+    let path = Path::new("Calculator.java");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse Java code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "java");
+    assert!(!parsed.structs.is_empty(), "Should find class");
+    assert!(!parsed.functions.is_empty(), "Should find methods");
+    assert!(!parsed.imports.is_empty(), "Should find imports");
+
+    // Verify class name
+    let class = &parsed.structs[0];
+    assert_eq!(class.name, "Calculator");
+}
+
+#[test]
+fn test_parse_java_interface() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+public interface Drawable {
+    void draw();
+    int getWidth();
+}
+"#;
+
+    let path = Path::new("Drawable.java");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse Java interface");
+
+    let parsed = result.unwrap();
+    assert!(!parsed.traits.is_empty(), "Should find interface");
+    assert_eq!(parsed.traits[0].name, "Drawable");
+}
+
+#[test]
+fn test_parse_java_enum() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+public enum Status {
+    PENDING,
+    ACTIVE,
+    COMPLETED
+}
+"#;
+
+    let path = Path::new("Status.java");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse Java enum");
+
+    let parsed = result.unwrap();
+    assert!(!parsed.enums.is_empty(), "Should find enum");
+    let e = &parsed.enums[0];
+    assert_eq!(e.name, "Status");
+    assert_eq!(e.variants.len(), 3);
+}
+
+#[test]
+fn test_parse_c() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+/**
+ * Calculate the sum of two integers
+ */
+int add(int a, int b) {
+    return a + b;
+}
+
+int main() {
+    Point p = {1, 2};
+    printf("%d\n", add(p.x, p.y));
+    return 0;
+}
+"#;
+
+    let path = Path::new("main.c");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse C code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "c");
+    assert!(!parsed.functions.is_empty(), "Should find functions");
+    assert!(!parsed.imports.is_empty(), "Should find includes");
+}
+
+#[test]
+fn test_parse_cpp() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+#include <iostream>
+#include <vector>
+
+using namespace std;
+
+class Calculator {
+public:
+    int add(int a, int b) {
+        return a + b;
+    }
+
+private:
+    int value;
+};
+
+template<typename T>
+T maximum(T a, T b) {
+    return (a > b) ? a : b;
+}
+
+int main() {
+    Calculator calc;
+    cout << calc.add(1, 2) << endl;
+    return 0;
+}
+"#;
+
+    let path = Path::new("main.cpp");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse C++ code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "cpp");
+    assert!(!parsed.structs.is_empty(), "Should find class");
+    assert!(!parsed.functions.is_empty(), "Should find functions");
+    assert!(!parsed.imports.is_empty(), "Should find includes/using");
+}
+
+#[test]
+fn test_parse_ruby() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+require 'json'
+
+# A simple calculator class
+class Calculator
+  def initialize
+    @value = 0
+  end
+
+  def add(a, b)
+    a + b
+  end
+
+  def self.create
+    Calculator.new
+  end
+end
+
+module Utils
+  def self.helper
+    puts "Helper"
+  end
+end
+"#;
+
+    let path = Path::new("calculator.rb");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse Ruby code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "ruby");
+    assert!(!parsed.structs.is_empty(), "Should find class");
+    assert!(!parsed.traits.is_empty(), "Should find module");
+    assert!(!parsed.functions.is_empty(), "Should find methods");
+}
+
+#[test]
+fn test_parse_php() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"<?php
+
+namespace App\Services;
+
+use App\Models\User;
+
+/**
+ * User service class
+ */
+class UserService
+{
+    private $users = [];
+
+    public function addUser(User $user): void
+    {
+        $this->users[] = $user;
+    }
+
+    public function getUsers(): array
+    {
+        return $this->users;
+    }
+}
+"#;
+
+    let path = Path::new("UserService.php");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse PHP code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "php");
+    assert!(!parsed.structs.is_empty(), "Should find class");
+    assert!(!parsed.functions.is_empty(), "Should find methods");
+}
+
+#[test]
+fn test_parse_kotlin() {
+    let mut parser = CodeParser::new().unwrap();
+
+    // Simple Kotlin code
+    let code = r#"
+package com.example
+
+class Calculator {
+    fun add(a: Int, b: Int): Int {
+        return a + b
+    }
+}
+"#;
+
+    let path = Path::new("Calculator.kt");
+    let result = parser.parse_file(path, code);
+
+    assert!(
+        result.is_ok(),
+        "Should parse Kotlin code: {:?}",
+        result.err()
+    );
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "kotlin");
+    // The parser should at least successfully parse without errors
+    // Specific symbol detection depends on tree-sitter-kotlin-ng grammar
+}
+
+#[test]
+fn test_parse_swift() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+import Foundation
+
+/// A calculator class
+class Calculator {
+    private var value: Int = 0
+
+    func add(_ a: Int, _ b: Int) -> Int {
+        return a + b
+    }
+
+    async func fetchData() -> String {
+        return "data"
+    }
+}
+
+protocol Drawable {
+    func draw()
+}
+
+struct Point {
+    var x: Int
+    var y: Int
+}
+
+enum Status {
+    case pending
+    case active
+    case done
+}
+"#;
+
+    let path = Path::new("Calculator.swift");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse Swift code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "swift");
+    assert!(!parsed.structs.is_empty(), "Should find class/struct");
+    assert!(!parsed.functions.is_empty(), "Should find functions");
+    assert!(!parsed.traits.is_empty(), "Should find protocol");
+    assert!(!parsed.imports.is_empty(), "Should find imports");
+}
+
+#[test]
+fn test_parse_bash() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+#!/bin/bash
+
+# Source configuration
+source ./config.sh
+
+# A helper function
+function greet() {
+    echo "Hello, $1!"
+}
+
+# Export environment variable
+export APP_NAME="MyApp"
+
+# Another function
+calculate() {
+    echo $(($1 + $2))
+}
+
+greet "World"
+"#;
+
+    let path = Path::new("script.sh");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse Bash code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "bash");
+    assert!(!parsed.functions.is_empty(), "Should find functions");
+}

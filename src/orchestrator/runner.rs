@@ -84,7 +84,21 @@ impl Orchestrator {
         let mut result = SyncResult::default();
         let mut synced_paths: HashSet<String> = HashSet::new();
 
-        let extensions = ["rs", "ts", "tsx", "js", "jsx", "py", "go"];
+        // All supported languages - must match SupportedLanguage::from_extension()
+        let extensions = [
+            "rs",                           // Rust
+            "ts", "tsx", "js", "jsx",       // TypeScript/JavaScript
+            "py",                           // Python
+            "go",                           // Go
+            "java",                         // Java
+            "c", "h",                       // C
+            "cpp", "cc", "cxx", "hpp", "hxx", // C++
+            "rb",                           // Ruby
+            "php",                          // PHP
+            "kt", "kts",                    // Kotlin
+            "swift",                        // Swift
+            "sh", "bash",                   // Bash
+        ];
 
         for entry in WalkDir::new(dir_path)
             .follow_links(true)

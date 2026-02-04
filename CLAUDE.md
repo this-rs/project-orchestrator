@@ -16,7 +16,7 @@ This file provides guidance to Claude Code when working on the project-orchestra
 
 ```bash
 cargo build --release          # Build release binary
-cargo test                     # Run all tests (60 total)
+cargo test                     # Run all tests (70 total)
 cargo test --test api_tests    # API tests only (29 tests)
 cargo clippy                   # Lint
 cargo fmt                      # Format
@@ -51,7 +51,9 @@ src/
 │   ├── client.rs        # Meilisearch connection
 │   └── models.rs        # Search document types
 ├── parser/
-│   └── mod.rs           # Tree-sitter code parser
+│   ├── mod.rs           # CodeParser, SupportedLanguage, dispatch
+│   ├── helpers.rs       # Shared utility functions
+│   └── languages/       # Per-language extractors (12 languages)
 ├── plan/
 │   ├── manager.rs       # Plan/Task CRUD operations
 │   └── models.rs        # Plan/Task/Decision types
@@ -63,9 +65,9 @@ src/
 └── main.rs              # CLI entry point
 
 tests/
-├── api_tests.rs         # HTTP API tests (27)
-├── integration_tests.rs # Database tests (7)
-└── parser_tests.rs      # Parser tests (17)
+├── api_tests.rs         # HTTP API tests (29)
+├── integration_tests.rs # Database tests (8)
+└── parser_tests.rs      # Parser tests (33)
 ```
 
 ## Key APIs
@@ -157,7 +159,19 @@ tests/
 2. **Error handling**: Use `anyhow::Result` and `AppError` for HTTP errors
 3. **State**: `ServerState` contains `orchestrator` and `watcher`
 4. **Tests**: All API tests require the server running on port 8080
-5. **File extensions**: Parser supports `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`
+5. **File extensions**: Parser supports 12 languages:
+   - Rust: `.rs`
+   - TypeScript/JavaScript: `.ts`, `.tsx`, `.js`, `.jsx`
+   - Python: `.py`
+   - Go: `.go`
+   - Java: `.java`
+   - C: `.c`, `.h`
+   - C++: `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`
+   - Ruby: `.rb`
+   - PHP: `.php`
+   - Kotlin: `.kt`, `.kts`
+   - Swift: `.swift`
+   - Bash: `.sh`, `.bash`
 
 ## Testing
 
@@ -168,10 +182,10 @@ tests/
 # Run tests
 cargo test
 
-# Expected: 60 tests passing
+# Expected: 70 tests passing
 # - 29 API tests
 # - 8 integration tests
-# - 23 parser tests
+# - 33 parser tests
 ```
 
 ## Neo4j Graph Relationships
@@ -237,9 +251,12 @@ Note: Full file content is NOT stored in Meilisearch. Use Neo4j for structural q
 ### Adding a new language to parser
 
 1. Add tree-sitter grammar to `Cargo.toml`
-2. Update `CodeParser::new()` in `src/parser/mod.rs`
-3. Add extraction logic in `parse_file()`
-4. Add tests in `tests/parser_tests.rs`
+2. Create extractor in `src/parser/languages/{lang}.rs`
+3. Re-export in `src/parser/languages/mod.rs`
+4. Add to `SupportedLanguage` enum in `src/parser/mod.rs`
+5. Update `from_extension()` and `tree_sitter_language()` methods
+6. Add dispatch in `parse_file()` match
+7. Add tests in `tests/parser_tests.rs`
 
 ### Modifying Neo4j schema
 
