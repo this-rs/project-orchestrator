@@ -1,6 +1,8 @@
 //! API request handlers
 
-use crate::neo4j::models::*;
+use crate::neo4j::models::{
+    CommitNode, ConstraintNode, DecisionNode, PlanNode, PlanStatus, StepNode, TaskNode,
+};
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use axum::{
@@ -578,6 +580,95 @@ pub async fn get_meilisearch_stats(
         code_documents: stats.total_documents,
         is_indexing: stats.is_indexing,
     }))
+}
+
+// ============================================================================
+// Commits
+// ============================================================================
+
+/// Request to create a commit
+#[derive(Deserialize)]
+pub struct CreateCommitRequest {
+    pub hash: String,
+    pub message: String,
+    pub author: String,
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Create a new commit
+pub async fn create_commit(
+    State(state): State<OrchestratorState>,
+    Json(req): Json<CreateCommitRequest>,
+) -> Result<Json<CommitNode>, AppError> {
+    let commit = CommitNode {
+        hash: req.hash,
+        message: req.message,
+        author: req.author,
+        timestamp: req.timestamp.unwrap_or_else(chrono::Utc::now),
+    };
+
+    state.orchestrator.neo4j().create_commit(&commit).await?;
+    Ok(Json(commit))
+}
+
+/// Request to link a commit to a task
+#[derive(Deserialize)]
+pub struct LinkCommitRequest {
+    pub commit_hash: String,
+}
+
+/// Link a commit to a task
+pub async fn link_commit_to_task(
+    State(state): State<OrchestratorState>,
+    Path(task_id): Path<Uuid>,
+    Json(req): Json<LinkCommitRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .link_commit_to_task(&req.commit_hash, task_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get commits for a task
+pub async fn get_task_commits(
+    State(state): State<OrchestratorState>,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<Vec<CommitNode>>, AppError> {
+    let commits = state
+        .orchestrator
+        .neo4j()
+        .get_task_commits(task_id)
+        .await?;
+    Ok(Json(commits))
+}
+
+/// Link a commit to a plan
+pub async fn link_commit_to_plan(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Json(req): Json<LinkCommitRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .link_commit_to_plan(&req.commit_hash, plan_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get commits for a plan
+pub async fn get_plan_commits(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<Vec<CommitNode>>, AppError> {
+    let commits = state
+        .orchestrator
+        .neo4j()
+        .get_plan_commits(plan_id)
+        .await?;
+    Ok(Json(commits))
 }
 
 // ============================================================================

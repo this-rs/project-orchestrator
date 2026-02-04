@@ -107,6 +107,16 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .route("/api/decisions/search", get(handlers::search_decisions))
         // Sync
         .route("/api/sync", post(handlers::sync_directory))
+        // Commits
+        .route("/api/commits", post(handlers::create_commit))
+        .route(
+            "/api/tasks/{task_id}/commits",
+            get(handlers::get_task_commits).post(handlers::link_commit_to_task),
+        )
+        .route(
+            "/api/plans/{plan_id}/commits",
+            get(handlers::get_plan_commits).post(handlers::link_commit_to_plan),
+        )
         // Webhooks
         .route("/api/wake", post(handlers::wake))
         .route("/hooks/wake", post(handlers::wake)) // Alias for compatibility
