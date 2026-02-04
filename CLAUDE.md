@@ -9,12 +9,13 @@ For user-facing documentation, see the `docs/` folder:
 - **[Installation Guide](docs/setup/installation.md)** — Full setup instructions
 - **[Getting Started](docs/guides/getting-started.md)** — Tutorial for new users
 - **[API Reference](docs/api/reference.md)** — REST API documentation
-- **[MCP Tools](docs/api/mcp-tools.md)** — All 62 MCP tools documented
+- **[MCP Tools](docs/api/mcp-tools.md)** — All 84 MCP tools documented
 - **Integration Guides:**
   - [Claude Code](docs/integrations/claude-code.md)
   - [OpenAI Agents](docs/integrations/openai.md)
   - [Cursor](docs/integrations/cursor.md)
 - **[Multi-Agent Workflows](docs/guides/multi-agent-workflow.md)** — Advanced coordination
+- **[Knowledge Notes](docs/guides/knowledge-notes.md)** — Contextual knowledge capture system
 
 ## Project Overview
 
@@ -215,21 +216,23 @@ docs/
 │   └── cursor.md            # Cursor IDE setup
 ├── api/
 │   ├── reference.md         # REST API documentation
-│   └── mcp-tools.md         # MCP tools reference (62 tools)
+│   └── mcp-tools.md         # MCP tools reference (84 tools)
 └── guides/
     ├── getting-started.md   # Tutorial for new users
-    └── multi-agent-workflow.md # Multi-agent coordination
+    ├── multi-agent-workflow.md # Multi-agent coordination
+    └── knowledge-notes.md   # Knowledge Notes system guide
 
 src/
 ├── api/
 │   ├── mod.rs           # API module exports
 │   ├── routes.rs        # Route definitions (axum)
 │   ├── handlers.rs      # Plan/Task/Decision handlers
-│   └── code_handlers.rs # Code exploration endpoints
+│   ├── code_handlers.rs # Code exploration endpoints
+│   └── note_handlers.rs # Knowledge Notes endpoints
 ├── mcp/
 │   ├── mod.rs           # MCP module exports
 │   ├── protocol.rs      # JSON-RPC 2.0 types
-│   ├── tools.rs         # Tool definitions (62 tools)
+│   ├── tools.rs         # Tool definitions (84 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
 ├── neo4j/
@@ -238,6 +241,12 @@ src/
 ├── meilisearch/
 │   ├── client.rs        # Meilisearch connection
 │   └── models.rs        # Search document types
+├── notes/
+│   ├── mod.rs           # Notes module exports
+│   ├── models.rs        # Note types (NoteType, NoteStatus, etc.)
+│   ├── manager.rs       # NoteManager CRUD operations
+│   ├── lifecycle.rs     # Staleness calculation, obsolescence detection
+│   └── hashing.rs       # Semantic hashing for code anchors
 ├── parser/
 │   ├── mod.rs           # CodeParser, SupportedLanguage, dispatch
 │   ├── helpers.rs       # Shared utility functions
@@ -247,7 +256,7 @@ src/
 │   └── models.rs        # Plan/Task/Decision types
 ├── orchestrator/
 │   ├── runner.rs        # Main orchestrator logic
-│   ├── context.rs       # Agent context builder
+│   ├── context.rs       # Agent context builder (includes notes)
 │   └── watcher.rs       # File watcher for auto-sync
 ├── bin/
 │   └── mcp_server.rs    # MCP server binary
@@ -336,6 +345,31 @@ tests/
 - `GET /api/code/trait-impls?trait_name=...` - Find trait implementations
 - `GET /api/code/type-traits?type_name=...` - Find traits for a type
 - `GET /api/code/impl-blocks?type_name=...` - Get impl blocks for a type
+
+### Knowledge Notes
+See the [Knowledge Notes Guide](docs/guides/knowledge-notes.md) for detailed documentation.
+
+- `GET /api/notes` - List notes with filters (project_id, note_type, status, importance, tags)
+- `POST /api/notes` - Create note (project_id, note_type, content, importance, tags)
+- `GET /api/notes/{id}` - Get note details
+- `PATCH /api/notes/{id}` - Update note (content, importance, status, tags)
+- `DELETE /api/notes/{id}` - Delete note
+- `GET /api/notes/search?q=...` - Semantic search across notes
+- `GET /api/notes/context` - Get notes for entity (direct + propagated via graph)
+- `GET /api/notes/needs-review` - List stale/needs_review notes
+- `POST /api/notes/update-staleness` - Recalculate staleness scores
+- `POST /api/notes/{id}/confirm` - Confirm note validity (reset staleness)
+- `POST /api/notes/{id}/invalidate` - Mark note as obsolete
+- `POST /api/notes/{id}/supersede` - Replace with new note
+- `POST /api/notes/{id}/links` - Link note to entity
+- `DELETE /api/notes/{id}/links/{type}/{entity}` - Unlink note from entity
+- `GET /api/projects/{id}/notes` - List notes for a project
+
+**Note Types:** `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion`
+
+**Note Status:** `active`, `needs_review`, `stale`, `obsolete`, `archived`
+
+**Importance Levels:** `critical`, `high`, `medium`, `low`
 
 ### Query Parameters (Pagination & Filtering)
 
@@ -466,9 +500,22 @@ External Trait nodes have:
 - `(Release)-[:INCLUDES_COMMIT]->(Commit)` - Commits included in a release
 - `(Milestone)-[:INCLUDES_TASK]->(Task)` - Tasks included in a milestone
 
+### Knowledge Notes
+- `(Note)-[:ABOUT]->(File|Function|Struct|Trait|Module|Project)` - Note is about an entity
+- `(Note)-[:ABOUT]->(Task|Plan)` - Note is about a task or plan
+- `(Note)-[:SUPERSEDES]->(Note)` - Note replaces an older note
+- `(Note)-[:DERIVED_FROM]->(Note)` - Note extends another note
+
+Note nodes have:
+- `note_type`: guideline, gotcha, pattern, context, tip, observation, assertion
+- `status`: active, needs_review, stale, obsolete, archived
+- `importance`: critical, high, medium, low
+- `staleness_score`: 0.0 - 1.0 (auto-calculated based on time decay)
+- `scope_type`, `scope_path`: hierarchical scope (project, module, file, function)
+
 ## Meilisearch Indexing
 
-The `code` index stores:
+### Code Index (`code`)
 - `symbols` - Function/struct/trait names (highest search priority)
 - `docstrings` - Documentation strings for semantic search
 - `signatures` - Function signatures
@@ -477,6 +524,14 @@ The `code` index stores:
 - `project_id`, `project_slug` - Required for project scoping
 
 Note: Full file content is NOT stored in Meilisearch. Use Neo4j for structural queries.
+
+### Notes Index (`notes`)
+- `content` - Note text (highest search priority)
+- `tags` - Categorization tags
+- `scope_path` - Entity scope path
+- `anchor_entities` - Linked entities
+- `note_type`, `status`, `importance` - Filterable attributes
+- `staleness_score`, `created_at` - Sortable attributes
 
 ## Common Tasks
 

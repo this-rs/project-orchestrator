@@ -900,6 +900,218 @@ curl "http://localhost:8080/api/code/impl-blocks?type_name=Orchestrator"
 
 ---
 
+## Notes
+
+Knowledge Notes capture contextual knowledge about your codebase. See the [Knowledge Notes Guide](../guides/knowledge-notes.md) for detailed usage.
+
+### GET /api/notes
+
+List notes with filters and pagination.
+
+**Query Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `project_id` | string | Filter by project UUID |
+| `note_type` | string | `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion` |
+| `status` | string | Comma-separated: `active,needs_review,stale,obsolete,archived` |
+| `importance` | string | `critical`, `high`, `medium`, `low` |
+| `tags` | string | Comma-separated tags |
+| `search` | string | Search in content |
+| `min_staleness` | number | Min staleness score (0.0-1.0) |
+| `max_staleness` | number | Max staleness score (0.0-1.0) |
+| `limit` | integer | Max items (default 50) |
+| `offset` | integer | Items to skip |
+
+```bash
+curl "http://localhost:8080/api/notes?note_type=guideline&status=active&limit=20"
+```
+
+### POST /api/notes
+
+Create a new note.
+
+```bash
+curl -X POST http://localhost:8080/api/notes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "uuid",
+    "note_type": "gotcha",
+    "content": "Do not use unwrap() in async contexts",
+    "importance": "high",
+    "tags": ["async", "error-handling"]
+  }'
+```
+
+**Note Types:** `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion`
+
+**Importance Levels:** `critical`, `high`, `medium`, `low`
+
+### GET /api/notes/{note_id}
+
+Get note details.
+
+```bash
+curl http://localhost:8080/api/notes/{note_id}
+```
+
+### PATCH /api/notes/{note_id}
+
+Update a note.
+
+```bash
+curl -X PATCH http://localhost:8080/api/notes/{note_id} \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "Updated content",
+    "importance": "critical"
+  }'
+```
+
+**Updatable Fields:** `content`, `importance`, `status`, `tags`
+
+### DELETE /api/notes/{note_id}
+
+Delete a note.
+
+```bash
+curl -X DELETE http://localhost:8080/api/notes/{note_id}
+```
+
+### GET /api/notes/search
+
+Semantic search across notes.
+
+```bash
+curl "http://localhost:8080/api/notes/search?q=error+handling&limit=10"
+```
+
+**Response:**
+```json
+{
+  "hits": [
+    {
+      "id": "uuid",
+      "content": "Always wrap errors with context...",
+      "note_type": "guideline",
+      "importance": "high",
+      "score": 0.95
+    }
+  ]
+}
+```
+
+### GET /api/notes/context
+
+Get contextual notes for an entity (direct + propagated through graph).
+
+```bash
+curl "http://localhost:8080/api/notes/context?entity_type=file&entity_id=src/auth/jwt.rs&max_depth=2"
+```
+
+**Response:**
+```json
+{
+  "direct_notes": [
+    {
+      "id": "uuid",
+      "note_type": "guideline",
+      "content": "All JWT operations must use configured secret",
+      "importance": "high",
+      "relevance_score": 1.0
+    }
+  ],
+  "propagated_notes": [
+    {
+      "note": {...},
+      "source_entity": "src/auth/mod.rs",
+      "relevance_score": 0.7,
+      "propagation_path": ["CONTAINS", "auth/mod.rs"]
+    }
+  ]
+}
+```
+
+### GET /api/notes/needs-review
+
+Get notes needing human review (stale or needs_review status).
+
+```bash
+curl http://localhost:8080/api/notes/needs-review
+```
+
+### POST /api/notes/update-staleness
+
+Recalculate staleness scores for all notes.
+
+```bash
+curl -X POST http://localhost:8080/api/notes/update-staleness
+```
+
+### POST /api/notes/{note_id}/confirm
+
+Confirm a note is still valid (resets staleness).
+
+```bash
+curl -X POST http://localhost:8080/api/notes/{note_id}/confirm
+```
+
+### POST /api/notes/{note_id}/invalidate
+
+Mark a note as obsolete.
+
+```bash
+curl -X POST http://localhost:8080/api/notes/{note_id}/invalidate \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Auth system was refactored to OAuth"}'
+```
+
+### POST /api/notes/{note_id}/supersede
+
+Replace a note with a new one (preserves history).
+
+```bash
+curl -X POST http://localhost:8080/api/notes/{note_id}/supersede \
+  -H "Content-Type: application/json" \
+  -d '{
+    "note_type": "guideline",
+    "content": "Use OAuth tokens instead of JWT",
+    "importance": "high"
+  }'
+```
+
+### POST /api/notes/{note_id}/links
+
+Link a note to a code entity.
+
+```bash
+curl -X POST http://localhost:8080/api/notes/{note_id}/links \
+  -H "Content-Type: application/json" \
+  -d '{
+    "entity_type": "function",
+    "entity_id": "validate_user"
+  }'
+```
+
+**Entity Types:** `file`, `function`, `struct`, `trait`, `module`, `task`, `plan`
+
+### DELETE /api/notes/{note_id}/links/{entity_type}/{entity_id}
+
+Remove a link between a note and entity.
+
+```bash
+curl -X DELETE http://localhost:8080/api/notes/{note_id}/links/file/src%2Fauth.rs
+```
+
+### GET /api/projects/{project_id}/notes
+
+List notes for a specific project.
+
+```bash
+curl "http://localhost:8080/api/projects/{project_id}/notes?status=active"
+```
+
+---
+
 ## Sync & Watch
 
 ### POST /api/sync

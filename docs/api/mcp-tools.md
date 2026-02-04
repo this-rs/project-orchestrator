@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete documentation for all 62 MCP tools exposed by Project Orchestrator.
+Complete documentation for all 84 MCP tools exposed by Project Orchestrator.
 
 ---
 
@@ -13,12 +13,14 @@ Complete documentation for all 62 MCP tools exposed by Project Orchestrator.
 | [Task Management](#task-management-12-tools) | `list_tasks`, `create_task`, `get_task`, `update_task`, `get_next_task`, `add_task_dependencies`, `remove_task_dependency`, `get_task_blockers`, `get_tasks_blocked_by`, `get_task_context`, `get_task_prompt`, `add_decision` |
 | [Step Management](#step-management-4-tools) | `list_steps`, `create_step`, `update_step`, `get_step_progress` |
 | [Constraint Management](#constraint-management-3-tools) | `list_constraints`, `add_constraint`, `delete_constraint` |
-| [Release Management](#release-management-5-tools) | `list_releases`, `create_release`, `get_release`, `update_release`, `add_task_to_release` |
-| [Milestone Management](#milestone-management-5-tools) | `list_milestones`, `create_milestone`, `get_milestone`, `update_milestone`, `get_milestone_progress` |
-| [Commit Tracking](#commit-tracking-4-tools) | `create_commit`, `link_commit_to_task`, `link_commit_to_plan`, `get_task_commits` |
-| [Code Exploration](#code-exploration-10-tools) | `search_code`, `search_project_code`, `get_file_symbols`, `find_references`, `get_file_dependencies`, `get_call_graph`, `analyze_impact`, `get_architecture`, `find_similar_code`, `find_trait_implementations` |
+| [Release Management](#release-management-6-tools) | `list_releases`, `create_release`, `get_release`, `update_release`, `add_task_to_release`, `add_commit_to_release` |
+| [Milestone Management](#milestone-management-6-tools) | `list_milestones`, `create_milestone`, `get_milestone`, `update_milestone`, `get_milestone_progress`, `add_task_to_milestone` |
+| [Commit Tracking](#commit-tracking-5-tools) | `create_commit`, `link_commit_to_task`, `link_commit_to_plan`, `get_task_commits`, `get_plan_commits` |
+| [Code Exploration](#code-exploration-13-tools) | `search_code`, `search_project_code`, `get_file_symbols`, `find_references`, `get_file_dependencies`, `get_call_graph`, `analyze_impact`, `get_architecture`, `find_similar_code`, `find_trait_implementations`, `find_type_traits`, `get_impl_blocks` |
+| [Knowledge Notes](#knowledge-notes-14-tools) | `list_notes`, `create_note`, `get_note`, `update_note`, `delete_note`, `search_notes`, `confirm_note`, `invalidate_note`, `supersede_note`, `link_note_to_entity`, `unlink_note_from_entity`, `get_context_notes`, `get_notes_needing_review`, `update_staleness_scores` |
 | [Decision Search](#decision-search-1-tool) | `search_decisions` |
 | [Sync & Watch](#sync--watch-4-tools) | `sync_directory`, `start_watch`, `stop_watch`, `watch_status` |
+| [Meilisearch Admin](#meilisearch-admin-2-tools) | `get_meilisearch_stats`, `delete_meilisearch_orphans` |
 
 ---
 
@@ -1131,4 +1133,298 @@ Get file watcher status.
 **Example:**
 ```
 Is the file watcher running?
+```
+
+---
+
+## Knowledge Notes (14 tools)
+
+Knowledge Notes capture contextual knowledge about your codebase - guidelines, gotchas, patterns, and tips that propagate through the code graph.
+
+See the [Knowledge Notes Guide](../guides/knowledge-notes.md) for detailed usage instructions.
+
+### list_notes
+
+List notes with optional filters and pagination.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | string | No | Filter by project UUID |
+| `note_type` | string | No | Filter by type: `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion` |
+| `status` | string | No | Comma-separated: `active,needs_review,stale,obsolete,archived` |
+| `importance` | string | No | `critical`, `high`, `medium`, `low` |
+| `tags` | string | No | Comma-separated tags |
+| `min_staleness` | number | No | Minimum staleness score (0.0-1.0) |
+| `max_staleness` | number | No | Maximum staleness score (0.0-1.0) |
+| `search` | string | No | Search in content |
+| `limit` | integer | No | Max items (default 50) |
+| `offset` | integer | No | Items to skip |
+
+**Example:**
+```
+List all active guideline notes for project my-app
+```
+
+---
+
+### create_note
+
+Create a new knowledge note.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | string | **Yes** | Project UUID |
+| `note_type` | string | **Yes** | `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion` |
+| `content` | string | **Yes** | Note content |
+| `importance` | string | No | `critical`, `high`, `medium`, `low` (default: medium) |
+| `tags` | array | No | Tags for categorization |
+| `scope` | object | No | Scope: `{type: "file", path: "src/auth.rs"}` |
+| `anchors` | array | No | Initial anchors to code entities |
+
+**Example:**
+```
+Create a gotcha note: "Don't use unwrap() in async contexts - it will panic the runtime"
+```
+
+---
+
+### get_note
+
+Get a note by ID.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `note_id` | string | **Yes** | Note UUID |
+
+**Example:**
+```
+Get details for note abc-123
+```
+
+---
+
+### update_note
+
+Update a note's content, importance, status, or tags.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `note_id` | string | **Yes** | Note UUID |
+| `content` | string | No | New content |
+| `importance` | string | No | New importance level |
+| `status` | string | No | New status |
+| `tags` | array | No | New tags |
+
+**Example:**
+```
+Update note abc-123 to importance critical
+```
+
+---
+
+### delete_note
+
+Delete a note.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `note_id` | string | **Yes** | Note UUID |
+
+**Example:**
+```
+Delete note abc-123
+```
+
+---
+
+### search_notes
+
+Search notes using semantic search.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query` | string | **Yes** | Search query |
+| `project_slug` | string | No | Filter by project slug |
+| `note_type` | string | No | Filter by note type |
+| `status` | string | No | Filter by status |
+| `importance` | string | No | Filter by importance |
+| `limit` | integer | No | Max results (default 20) |
+
+**Example:**
+```
+Search for notes about error handling
+```
+
+---
+
+### confirm_note
+
+Confirm a note is still valid (resets staleness score).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `note_id` | string | **Yes** | Note UUID |
+
+**Example:**
+```
+Confirm that note abc-123 is still valid
+```
+
+---
+
+### invalidate_note
+
+Mark a note as obsolete with a reason.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `note_id` | string | **Yes** | Note UUID |
+| `reason` | string | **Yes** | Reason for invalidation |
+
+**Example:**
+```
+Invalidate note abc-123 because the auth system was refactored
+```
+
+---
+
+### supersede_note
+
+Replace an old note with a new one (preserves history).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `old_note_id` | string | **Yes** | ID of note to supersede |
+| `project_id` | string | **Yes** | Project UUID |
+| `note_type` | string | **Yes** | Type of new note |
+| `content` | string | **Yes** | Content of new note |
+| `importance` | string | No | Importance of new note |
+| `tags` | array | No | Tags for new note |
+
+**Example:**
+```
+Supersede note abc-123 with updated guidance about OAuth tokens
+```
+
+---
+
+### link_note_to_entity
+
+Link a note to a code entity (file, function, struct, etc.).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `note_id` | string | **Yes** | Note UUID |
+| `entity_type` | string | **Yes** | `file`, `function`, `struct`, `trait`, `task`, `plan`, etc. |
+| `entity_id` | string | **Yes** | Entity ID (file path or UUID) |
+
+**Example:**
+```
+Link note abc-123 to the validate_user function
+```
+
+---
+
+### unlink_note_from_entity
+
+Remove a link between a note and an entity.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `note_id` | string | **Yes** | Note UUID |
+| `entity_type` | string | **Yes** | Entity type |
+| `entity_id` | string | **Yes** | Entity ID |
+
+**Example:**
+```
+Unlink note abc-123 from file src/auth.rs
+```
+
+---
+
+### get_context_notes
+
+Get contextual notes for an entity (direct + propagated through graph).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `entity_type` | string | **Yes** | `file`, `function`, `struct`, `task`, etc. |
+| `entity_id` | string | **Yes** | Entity ID |
+| `max_depth` | integer | No | Max traversal depth (default 3) |
+| `min_score` | number | No | Min relevance score (default 0.1) |
+
+**Returns:** Direct notes and propagated notes with relevance scores.
+
+**Example:**
+```
+Get all relevant notes for file src/auth/jwt.rs
+```
+
+---
+
+### get_notes_needing_review
+
+Get notes that need human review (stale or needs_review status).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | string | No | Optional project UUID filter |
+
+**Example:**
+```
+What notes need review?
+```
+
+---
+
+### update_staleness_scores
+
+Update staleness scores for all notes based on time decay.
+
+**Parameters:** None
+
+**Example:**
+```
+Recalculate staleness scores for all notes
+```
+
+---
+
+## Meilisearch Admin (2 tools)
+
+### get_meilisearch_stats
+
+Get Meilisearch code index statistics.
+
+**Parameters:** None
+
+**Example:**
+```
+Show Meilisearch index stats
+```
+
+---
+
+### delete_meilisearch_orphans
+
+Delete documents without project_id from Meilisearch.
+
+**Parameters:** None
+
+**Example:**
+```
+Clean up orphaned documents in Meilisearch
 ```
