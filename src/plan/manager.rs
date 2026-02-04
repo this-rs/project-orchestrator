@@ -283,15 +283,15 @@ impl PlanManager {
         }))
     }
 
-    /// Update task status
+    /// Update task fields
     pub async fn update_task(&self, task_id: Uuid, req: UpdateTaskRequest) -> Result<()> {
-        if let Some(status) = req.status {
+        // Handle status change separately (has side effects like timestamps)
+        if let Some(status) = req.status.clone() {
             self.neo4j.update_task_status(task_id, status).await?;
         }
 
-        if let Some(agent_id) = req.assigned_to {
-            self.neo4j.assign_task(task_id, &agent_id).await?;
-        }
+        // Update all other fields via the full update method
+        self.neo4j.update_task(task_id, &req).await?;
 
         Ok(())
     }
