@@ -749,6 +749,8 @@ impl Neo4jClient {
                         t.file_path = '',
                         t.line_start = 0,
                         t.line_end = 0
+                    ON MATCH SET
+                        t.source = CASE WHEN t.source = 'unknown' THEN $source ELSE t.source END
                     WITH t
                     MATCH (i:Impl {id: $impl_id})
                     MERGE (i)-[:IMPLEMENTS_TRAIT]->(t)
