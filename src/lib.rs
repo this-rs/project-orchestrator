@@ -5,8 +5,10 @@
 //! - Meilisearch for fast semantic search
 //! - Tree-sitter for precise code parsing
 //! - Plan management for coordinated multi-agent development
+//! - MCP server for Claude Code integration
 
 pub mod api;
+pub mod mcp;
 pub mod meilisearch;
 pub mod neo4j;
 pub mod orchestrator;

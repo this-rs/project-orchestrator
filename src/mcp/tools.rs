@@ -1,0 +1,923 @@
+//! MCP Tool definitions
+//!
+//! Defines all 62 tools exposed by the MCP server.
+
+use super::protocol::{InputSchema, ToolDefinition};
+use serde_json::json;
+
+/// Generate all tool definitions
+pub fn all_tools() -> Vec<ToolDefinition> {
+    let mut tools = Vec::new();
+    tools.extend(project_tools());
+    tools.extend(plan_tools());
+    tools.extend(task_tools());
+    tools.extend(step_tools());
+    tools.extend(constraint_tools());
+    tools.extend(release_tools());
+    tools.extend(milestone_tools());
+    tools.extend(commit_tools());
+    tools.extend(code_tools());
+    tools.extend(decision_tools());
+    tools.extend(sync_tools());
+    tools
+}
+
+// ============================================================================
+// Project Tools (6)
+// ============================================================================
+
+fn project_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_projects".to_string(),
+            description: "List all projects with optional search and pagination".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "search": {"type": "string", "description": "Search in name/description"},
+                    "limit": {"type": "integer", "description": "Max items (default 50, max 100)"},
+                    "offset": {"type": "integer", "description": "Items to skip"},
+                    "sort_by": {"type": "string", "description": "Sort field (name, created_at)"},
+                    "sort_order": {"type": "string", "description": "asc or desc"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "create_project".to_string(),
+            description: "Create a new project to track a codebase".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "name": {"type": "string", "description": "Project name"},
+                    "root_path": {"type": "string", "description": "Path to codebase root"},
+                    "slug": {"type": "string", "description": "URL-safe identifier (auto-generated if not provided)"},
+                    "description": {"type": "string", "description": "Project description"}
+                })),
+                required: Some(vec!["name".to_string(), "root_path".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_project".to_string(),
+            description: "Get project details by slug".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Project slug"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_project".to_string(),
+            description: "Delete a project and all associated data".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Project slug"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "sync_project".to_string(),
+            description: "Sync a project's codebase (parse files, update graph)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "slug": {"type": "string", "description": "Project slug"}
+                })),
+                required: Some(vec!["slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_project_roadmap".to_string(),
+            description: "Get aggregated roadmap view with milestones, releases, and progress".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Project UUID"}
+                })),
+                required: Some(vec!["project_id".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Plan Tools (8)
+// ============================================================================
+
+fn plan_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_plans".to_string(),
+            description: "List plans with optional filters and pagination".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "status": {"type": "string", "description": "Filter by status (comma-separated: draft,approved,in_progress,completed,cancelled)"},
+                    "priority_min": {"type": "integer", "description": "Minimum priority"},
+                    "priority_max": {"type": "integer", "description": "Maximum priority"},
+                    "search": {"type": "string", "description": "Search in title/description"},
+                    "limit": {"type": "integer", "description": "Max items (default 50)"},
+                    "offset": {"type": "integer", "description": "Items to skip"},
+                    "sort_by": {"type": "string", "description": "Sort field (created_at, priority, title)"},
+                    "sort_order": {"type": "string", "description": "asc or desc"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "create_plan".to_string(),
+            description: "Create a new development plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "title": {"type": "string", "description": "Plan title"},
+                    "description": {"type": "string", "description": "Plan description"},
+                    "priority": {"type": "integer", "description": "Priority (higher = more important)"},
+                    "project_id": {"type": "string", "description": "Optional project UUID to link"}
+                })),
+                required: Some(vec!["title".to_string(), "description".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_plan".to_string(),
+            description: "Get plan details including tasks, constraints, and decisions".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "update_plan_status".to_string(),
+            description: "Update a plan's status".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "status": {"type": "string", "description": "New status (draft, approved, in_progress, completed, cancelled)"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "status".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "link_plan_to_project".to_string(),
+            description: "Link a plan to a project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "project_id": {"type": "string", "description": "Project UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "project_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "unlink_plan_from_project".to_string(),
+            description: "Unlink a plan from its project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_dependency_graph".to_string(),
+            description: "Get the task dependency graph for a plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_critical_path".to_string(),
+            description: "Get the critical path (longest dependency chain) for a plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Task Tools (12)
+// ============================================================================
+
+fn task_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_tasks".to_string(),
+            description: "List all tasks across plans with filters".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Filter by plan UUID"},
+                    "status": {"type": "string", "description": "Filter by status (comma-separated: pending,in_progress,blocked,completed,failed)"},
+                    "priority_min": {"type": "integer", "description": "Minimum priority"},
+                    "priority_max": {"type": "integer", "description": "Maximum priority"},
+                    "tags": {"type": "string", "description": "Filter by tags (comma-separated)"},
+                    "assigned_to": {"type": "string", "description": "Filter by assignee"},
+                    "limit": {"type": "integer", "description": "Max items (default 50)"},
+                    "offset": {"type": "integer", "description": "Items to skip"},
+                    "sort_by": {"type": "string", "description": "Sort field"},
+                    "sort_order": {"type": "string", "description": "asc or desc"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "create_task".to_string(),
+            description: "Add a new task to a plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "description": {"type": "string", "description": "Task description"},
+                    "title": {"type": "string", "description": "Short title"},
+                    "priority": {"type": "integer", "description": "Priority (higher = more important)"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
+                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Conditions for completion"},
+                    "affected_files": {"type": "array", "items": {"type": "string"}, "description": "Files to be modified"},
+                    "dependencies": {"type": "array", "items": {"type": "string"}, "description": "Task UUIDs this depends on"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "description".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_task".to_string(),
+            description: "Get task details including steps and decisions".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "update_task".to_string(),
+            description: "Update a task's status, assignee, or other fields".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"},
+                    "status": {"type": "string", "description": "New status (pending, in_progress, blocked, completed, failed)"},
+                    "assigned_to": {"type": "string", "description": "Assignee name"},
+                    "priority": {"type": "integer", "description": "New priority"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags"}
+                })),
+                required: Some(vec!["task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_next_task".to_string(),
+            description: "Get the next available task from a plan (unblocked, highest priority)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "add_task_dependencies".to_string(),
+            description: "Add dependencies to a task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"},
+                    "dependency_ids": {"type": "array", "items": {"type": "string"}, "description": "Task UUIDs to depend on"}
+                })),
+                required: Some(vec!["task_id".to_string(), "dependency_ids".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "remove_task_dependency".to_string(),
+            description: "Remove a dependency from a task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"},
+                    "dependency_id": {"type": "string", "description": "Dependency task UUID to remove"}
+                })),
+                required: Some(vec!["task_id".to_string(), "dependency_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_task_blockers".to_string(),
+            description: "Get tasks that are blocking this task (uncompleted dependencies)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_tasks_blocked_by".to_string(),
+            description: "Get tasks that are blocked by this task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_task_context".to_string(),
+            description: "Get full context for a task (for agent execution)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_task_prompt".to_string(),
+            description: "Get generated prompt for a task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "add_decision".to_string(),
+            description: "Record an architectural decision for a task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"},
+                    "description": {"type": "string", "description": "Decision description"},
+                    "rationale": {"type": "string", "description": "Why this decision was made"},
+                    "alternatives": {"type": "array", "items": {"type": "string"}, "description": "Alternatives considered"},
+                    "chosen_option": {"type": "string", "description": "The chosen option"}
+                })),
+                required: Some(vec!["task_id".to_string(), "description".to_string(), "rationale".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Step Tools (4)
+// ============================================================================
+
+fn step_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_steps".to_string(),
+            description: "List all steps for a task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "create_step".to_string(),
+            description: "Add a step to a task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"},
+                    "description": {"type": "string", "description": "Step description"},
+                    "verification": {"type": "string", "description": "How to verify completion"}
+                })),
+                required: Some(vec!["task_id".to_string(), "description".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "update_step".to_string(),
+            description: "Update a step's status".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "step_id": {"type": "string", "description": "Step UUID"},
+                    "status": {"type": "string", "description": "New status (pending, in_progress, completed, skipped)"}
+                })),
+                required: Some(vec!["step_id".to_string(), "status".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_step_progress".to_string(),
+            description: "Get step completion progress for a task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["task_id".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Constraint Tools (3)
+// ============================================================================
+
+fn constraint_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_constraints".to_string(),
+            description: "List constraints for a plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "add_constraint".to_string(),
+            description: "Add a constraint to a plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "constraint_type": {"type": "string", "description": "Type (performance, security, style, compatibility, other)"},
+                    "description": {"type": "string", "description": "Constraint description"},
+                    "severity": {"type": "string", "description": "Severity (low, medium, high, critical)"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "constraint_type".to_string(), "description".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_constraint".to_string(),
+            description: "Delete a constraint".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "constraint_id": {"type": "string", "description": "Constraint UUID"}
+                })),
+                required: Some(vec!["constraint_id".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Release Tools (5)
+// ============================================================================
+
+fn release_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_releases".to_string(),
+            description: "List releases for a project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "status": {"type": "string", "description": "Filter by status"},
+                    "limit": {"type": "integer", "description": "Max items"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: Some(vec!["project_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "create_release".to_string(),
+            description: "Create a new release for a project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "version": {"type": "string", "description": "Version string (e.g., 1.0.0)"},
+                    "title": {"type": "string", "description": "Release title"},
+                    "description": {"type": "string", "description": "Release notes"},
+                    "target_date": {"type": "string", "description": "Target date (ISO 8601)"}
+                })),
+                required: Some(vec!["project_id".to_string(), "version".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_release".to_string(),
+            description: "Get release details with tasks and commits".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "release_id": {"type": "string", "description": "Release UUID"}
+                })),
+                required: Some(vec!["release_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "update_release".to_string(),
+            description: "Update a release".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "release_id": {"type": "string", "description": "Release UUID"},
+                    "status": {"type": "string", "description": "New status (planned, in_progress, released, cancelled)"},
+                    "target_date": {"type": "string", "description": "New target date"},
+                    "released_at": {"type": "string", "description": "Actual release date"},
+                    "title": {"type": "string", "description": "New title"},
+                    "description": {"type": "string", "description": "New description"}
+                })),
+                required: Some(vec!["release_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "add_task_to_release".to_string(),
+            description: "Add a task to a release".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "release_id": {"type": "string", "description": "Release UUID"},
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["release_id".to_string(), "task_id".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Milestone Tools (5)
+// ============================================================================
+
+fn milestone_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_milestones".to_string(),
+            description: "List milestones for a project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "status": {"type": "string", "description": "Filter by status (open, closed)"},
+                    "limit": {"type": "integer", "description": "Max items"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: Some(vec!["project_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "create_milestone".to_string(),
+            description: "Create a new milestone for a project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "title": {"type": "string", "description": "Milestone title"},
+                    "description": {"type": "string", "description": "Milestone description"},
+                    "target_date": {"type": "string", "description": "Target date (ISO 8601)"}
+                })),
+                required: Some(vec!["project_id".to_string(), "title".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_milestone".to_string(),
+            description: "Get milestone details with tasks".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "milestone_id": {"type": "string", "description": "Milestone UUID"}
+                })),
+                required: Some(vec!["milestone_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "update_milestone".to_string(),
+            description: "Update a milestone".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "milestone_id": {"type": "string", "description": "Milestone UUID"},
+                    "status": {"type": "string", "description": "New status (open, closed)"},
+                    "target_date": {"type": "string", "description": "New target date"},
+                    "closed_at": {"type": "string", "description": "Closure date"},
+                    "title": {"type": "string", "description": "New title"},
+                    "description": {"type": "string", "description": "New description"}
+                })),
+                required: Some(vec!["milestone_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_milestone_progress".to_string(),
+            description: "Get milestone completion progress".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "milestone_id": {"type": "string", "description": "Milestone UUID"}
+                })),
+                required: Some(vec!["milestone_id".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Commit Tools (4)
+// ============================================================================
+
+fn commit_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "create_commit".to_string(),
+            description: "Register a git commit".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "sha": {"type": "string", "description": "Commit SHA"},
+                    "message": {"type": "string", "description": "Commit message"},
+                    "author": {"type": "string", "description": "Author name"},
+                    "files_changed": {"type": "array", "items": {"type": "string"}, "description": "Files changed"}
+                })),
+                required: Some(vec!["sha".to_string(), "message".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "link_commit_to_task".to_string(),
+            description: "Link a commit to a task (RESOLVED_BY relationship)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"},
+                    "commit_sha": {"type": "string", "description": "Commit SHA"}
+                })),
+                required: Some(vec!["task_id".to_string(), "commit_sha".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "link_commit_to_plan".to_string(),
+            description: "Link a commit to a plan (RESULTED_IN relationship)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "commit_sha": {"type": "string", "description": "Commit SHA"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "commit_sha".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_task_commits".to_string(),
+            description: "Get commits linked to a task".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["task_id".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Code Exploration Tools (10)
+// ============================================================================
+
+fn code_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "search_code".to_string(),
+            description: "Search code semantically across all projects".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "query": {"type": "string", "description": "Search query"},
+                    "limit": {"type": "integer", "description": "Max results (default 10)"},
+                    "language": {"type": "string", "description": "Filter by language"}
+                })),
+                required: Some(vec!["query".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "search_project_code".to_string(),
+            description: "Search code within a specific project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Project slug"},
+                    "query": {"type": "string", "description": "Search query"},
+                    "limit": {"type": "integer", "description": "Max results"},
+                    "language": {"type": "string", "description": "Filter by language"}
+                })),
+                required: Some(vec!["project_slug".to_string(), "query".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_file_symbols".to_string(),
+            description: "Get all symbols (functions, structs, traits) in a file".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "file_path": {"type": "string", "description": "File path"}
+                })),
+                required: Some(vec!["file_path".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "find_references".to_string(),
+            description: "Find all references to a symbol".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "symbol": {"type": "string", "description": "Symbol name"},
+                    "limit": {"type": "integer", "description": "Max results"}
+                })),
+                required: Some(vec!["symbol".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_file_dependencies".to_string(),
+            description: "Get file imports and files that depend on it".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "file_path": {"type": "string", "description": "File path"}
+                })),
+                required: Some(vec!["file_path".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_call_graph".to_string(),
+            description: "Get the call graph for a function".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "function": {"type": "string", "description": "Function name"},
+                    "limit": {"type": "integer", "description": "Max depth/results"}
+                })),
+                required: Some(vec!["function".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "analyze_impact".to_string(),
+            description: "Analyze the impact of changing a file or symbol".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "target": {"type": "string", "description": "File path or symbol name"}
+                })),
+                required: Some(vec!["target".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_architecture".to_string(),
+            description: "Get codebase architecture overview (most connected files)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "find_similar_code".to_string(),
+            description: "Find code similar to a given snippet".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "code_snippet": {"type": "string", "description": "Code to find similar matches for"},
+                    "limit": {"type": "integer", "description": "Max results"}
+                })),
+                required: Some(vec!["code_snippet".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "find_trait_implementations".to_string(),
+            description: "Find all implementations of a trait".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "trait_name": {"type": "string", "description": "Trait name"},
+                    "limit": {"type": "integer", "description": "Max results"}
+                })),
+                required: Some(vec!["trait_name".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Decision Tools (1)
+// ============================================================================
+
+fn decision_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "search_decisions".to_string(),
+            description: "Search architectural decisions".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "query": {"type": "string", "description": "Search query"},
+                    "limit": {"type": "integer", "description": "Max results"}
+                })),
+                required: Some(vec!["query".to_string()]),
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Sync & Watch Tools (4)
+// ============================================================================
+
+fn sync_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "sync_directory".to_string(),
+            description: "Manually sync a directory to the knowledge graph".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "path": {"type": "string", "description": "Directory path"},
+                    "project_id": {"type": "string", "description": "Optional project UUID"}
+                })),
+                required: Some(vec!["path".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "start_watch".to_string(),
+            description: "Start auto-sync file watcher".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "path": {"type": "string", "description": "Directory to watch"},
+                    "project_id": {"type": "string", "description": "Optional project UUID"}
+                })),
+                required: Some(vec!["path".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "stop_watch".to_string(),
+            description: "Stop the file watcher".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "watch_status".to_string(),
+            description: "Get file watcher status".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_tools_count() {
+        let tools = all_tools();
+        assert_eq!(tools.len(), 62, "Expected 62 tools, got {}", tools.len());
+    }
+
+    #[test]
+    fn test_tool_names_unique() {
+        let tools = all_tools();
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let original_len = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), original_len, "Tool names must be unique");
+    }
+
+    #[test]
+    fn test_tool_serialization() {
+        let tools = all_tools();
+        for tool in &tools {
+            let json = serde_json::to_string(tool).unwrap();
+            assert!(json.contains(&tool.name));
+            assert!(json.contains("inputSchema"));
+        }
+    }
+}

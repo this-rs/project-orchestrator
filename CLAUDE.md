@@ -10,6 +10,7 @@ This file provides guidance to Claude Code when working on the project-orchestra
 - Meilisearch for semantic search across code and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
+- MCP server for Claude Code integration (62 tools)
 - File watcher for auto-syncing changes
 
 ## Build Commands
@@ -35,6 +36,159 @@ docker compose up -d neo4j meilisearch
 RUST_LOG=debug ./target/release/orchestrator serve
 ```
 
+## MCP Server (Claude Code Integration)
+
+The project-orchestrator can run as an MCP (Model Context Protocol) server, exposing all orchestrator functionality as tools for Claude Code.
+
+### Building the MCP Server
+
+```bash
+cargo build --release --bin mcp_server
+```
+
+The binary will be at `./target/release/mcp_server`.
+
+### Configuring Claude Code
+
+Add to your Claude Code MCP settings (`~/.claude/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "project-orchestrator": {
+      "command": "/path/to/mcp_server",
+      "env": {
+        "NEO4J_URI": "bolt://localhost:7687",
+        "NEO4J_USER": "neo4j",
+        "NEO4J_PASSWORD": "your-password",
+        "MEILISEARCH_URL": "http://localhost:7700",
+        "MEILISEARCH_KEY": "your-meilisearch-key"
+      }
+    }
+  }
+}
+```
+
+Or use command-line arguments:
+
+```json
+{
+  "mcpServers": {
+    "project-orchestrator": {
+      "command": "/path/to/mcp_server",
+      "args": [
+        "--neo4j-uri", "bolt://localhost:7687",
+        "--neo4j-user", "neo4j",
+        "--neo4j-password", "your-password",
+        "--meilisearch-url", "http://localhost:7700",
+        "--meilisearch-key", "your-key"
+      ]
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+The MCP server exposes 62 tools organized by category:
+
+**Project Management (8 tools)**
+- `list_projects` - List all registered projects
+- `get_project` - Get project details by slug
+- `register_project` - Register a new project
+- `sync_project` - Sync project files to knowledge graph
+- `search_code` - Semantic search across code
+- `get_project_stats` - Get project statistics
+- `get_roadmap` - Get project roadmap with milestones/releases
+- `unregister_project` - Remove a project
+
+**Plan Management (12 tools)**
+- `list_plans` - List all plans with filtering
+- `create_plan` - Create a new plan
+- `get_plan` - Get plan details
+- `update_plan` - Update plan status/details
+- `link_plan_to_project` - Associate plan with project
+- `get_plan_context` - Get rich context for agent work
+- `get_dependency_graph` - Get task dependency visualization
+- `get_critical_path` - Find longest dependency chain
+- `add_constraint` - Add plan constraint
+- `list_constraints` - List plan constraints
+- `remove_constraint` - Remove a constraint
+- `generate_prompt` - Generate agent prompt with context
+
+**Task Management (16 tools)**
+- `list_tasks` - List tasks with filtering
+- `create_task` - Create a new task
+- `get_task` - Get task details
+- `update_task` - Update task
+- `get_next_task` - Get next available task
+- `add_task_dependencies` - Add dependencies to task
+- `remove_task_dependency` - Remove a dependency
+- `get_task_blockers` - Get blocking tasks
+- `get_blocked_tasks` - Get tasks blocked by this one
+- `create_step` - Add step to task
+- `list_steps` - List task steps
+- `update_step` - Update step status
+- `get_step_progress` - Get step completion progress
+- `record_decision` - Record a decision
+- `list_decisions` - List decisions for a task
+- `assign_task` - Assign task to agent
+
+**Commit Tracking (5 tools)**
+- `create_commit` - Register a commit
+- `link_commit_to_task` - Link commit to task
+- `link_commit_to_plan` - Link commit to plan
+- `get_task_commits` - Get commits for task
+- `get_plan_commits` - Get commits for plan
+
+**Release Management (6 tools)**
+- `create_release` - Create a release
+- `list_releases` - List project releases
+- `get_release` - Get release details
+- `update_release` - Update release
+- `add_task_to_release` - Add task to release
+- `add_commit_to_release` - Add commit to release
+
+**Milestone Management (6 tools)**
+- `create_milestone` - Create a milestone
+- `list_milestones` - List project milestones
+- `get_milestone` - Get milestone details
+- `update_milestone` - Update milestone
+- `add_task_to_milestone` - Add task to milestone
+- `get_milestone_progress` - Get completion progress
+
+**Code Exploration (9 tools)**
+- `get_file_symbols` - Get symbols in a file
+- `find_symbol_references` - Find references to a symbol
+- `get_file_dependencies` - Get file imports/dependents
+- `get_call_graph` - Get function call graph
+- `analyze_impact` - Analyze change impact
+- `get_codebase_overview` - Get architecture overview
+- `find_similar_code` - Find similar code snippets
+- `find_trait_implementations` - Find trait implementations
+- `get_type_traits` - Get traits for a type
+
+### Debug Logging
+
+Enable debug logging with `RUST_LOG=debug`:
+
+```json
+{
+  "mcpServers": {
+    "project-orchestrator": {
+      "command": "/path/to/mcp_server",
+      "env": {
+        "RUST_LOG": "debug",
+        "NEO4J_URI": "bolt://localhost:7687",
+        ...
+      }
+    }
+  }
+}
+```
+
+Logs are written to stderr (stdout is reserved for MCP protocol).
+
 ## Project Structure
 
 ```
@@ -44,6 +198,12 @@ src/
 │   ├── routes.rs        # Route definitions (axum)
 │   ├── handlers.rs      # Plan/Task/Decision handlers
 │   └── code_handlers.rs # Code exploration endpoints
+├── mcp/
+│   ├── mod.rs           # MCP module exports
+│   ├── protocol.rs      # JSON-RPC 2.0 types
+│   ├── tools.rs         # Tool definitions (62 tools)
+│   ├── handlers.rs      # Tool implementations
+│   └── server.rs        # MCP server (stdio)
 ├── neo4j/
 │   ├── client.rs        # Neo4j connection and queries
 │   └── models.rs        # Graph node types
@@ -61,6 +221,8 @@ src/
 │   ├── runner.rs        # Main orchestrator logic
 │   ├── context.rs       # Agent context builder
 │   └── watcher.rs       # File watcher for auto-sync
+├── bin/
+│   └── mcp_server.rs    # MCP server binary
 ├── lib.rs               # Library exports
 └── main.rs              # CLI entry point
 

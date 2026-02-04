@@ -80,3 +80,7 @@ path = "src/main.rs"
 [[bin]]
 name = "orch"
 path = "src/cli.rs"
+
+[[bin]]
+name = "mcp_server"
+path = "src/bin/mcp_server.rs"
