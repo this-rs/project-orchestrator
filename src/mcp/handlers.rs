@@ -54,6 +54,7 @@ impl ToolHandler {
             "unlink_plan_from_project" => self.unlink_plan_from_project(args).await,
             "get_dependency_graph" => self.get_dependency_graph(args).await,
             "get_critical_path" => self.get_critical_path(args).await,
+            "delete_plan" => self.delete_plan(args).await,
 
             // Tasks
             "list_tasks" => self.list_tasks(args).await,
@@ -478,6 +479,16 @@ impl ToolHandler {
 
         self.neo4j().unlink_plan_from_project(plan_id).await?;
         Ok(json!({"unlinked": true}))
+    }
+
+    async fn delete_plan(&self, args: Value) -> Result<Value> {
+        let plan_id = parse_uuid(&args, "plan_id")?;
+
+        self.orchestrator
+            .plan_manager()
+            .delete_plan(plan_id)
+            .await?;
+        Ok(json!({"deleted": true}))
     }
 
     async fn get_dependency_graph(&self, args: Value) -> Result<Value> {

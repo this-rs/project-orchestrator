@@ -123,7 +123,7 @@ fn project_tools() -> Vec<ToolDefinition> {
 }
 
 // ============================================================================
-// Plan Tools (8)
+// Plan Tools (9)
 // ============================================================================
 
 fn plan_tools() -> Vec<ToolDefinition> {
@@ -220,6 +220,19 @@ fn plan_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "get_critical_path".to_string(),
             description: "Get the critical path (longest dependency chain) for a plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_plan".to_string(),
+            description:
+                "Delete a plan and all its related data (tasks, steps, decisions, constraints)"
+                    .to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
@@ -1631,7 +1644,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 113, "Expected 113 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 114, "Expected 114 tools, got {}", tools.len());
     }
 
     #[test]
