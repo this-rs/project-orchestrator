@@ -13,7 +13,11 @@ use uuid::Uuid;
 #[command(about = "CLI for Project Orchestrator")]
 struct Cli {
     /// Orchestrator server URL
-    #[arg(long, env = "ORCHESTRATOR_URL", default_value = "http://localhost:8080")]
+    #[arg(
+        long,
+        env = "ORCHESTRATOR_URL",
+        default_value = "http://localhost:8080"
+    )]
     server: String,
 
     #[command(subcommand)]
@@ -277,12 +281,13 @@ async fn handle_plan(client: &Client, server: &str, action: PlanAction) -> Resul
 
 async fn handle_task(client: &Client, server: &str, action: TaskAction) -> Result<()> {
     match action {
-        TaskAction::Add { plan, desc, depends } => {
-            let depends_on: Option<Vec<Uuid>> = depends.map(|d| {
-                d.split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect()
-            });
+        TaskAction::Add {
+            plan,
+            desc,
+            depends,
+        } => {
+            let depends_on: Option<Vec<Uuid>> =
+                depends.map(|d| d.split(',').filter_map(|s| s.trim().parse().ok()).collect());
 
             let body = serde_json::json!({
                 "description": desc,

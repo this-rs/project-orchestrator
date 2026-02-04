@@ -25,10 +25,7 @@ pub struct Orchestrator {
 impl Orchestrator {
     /// Create a new orchestrator
     pub async fn new(state: AppState) -> Result<Self> {
-        let plan_manager = Arc::new(PlanManager::new(
-            state.neo4j.clone(),
-            state.meili.clone(),
-        ));
+        let plan_manager = Arc::new(PlanManager::new(state.neo4j.clone(), state.meili.clone()));
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
@@ -170,7 +167,8 @@ impl Orchestrator {
         };
 
         // Store in Neo4j with project association
-        self.store_parsed_file_for_project(&parsed, project_id).await?;
+        self.store_parsed_file_for_project(&parsed, project_id)
+            .await?;
 
         // Index in Meilisearch with project association
         let mut doc = CodeParser::to_code_document(&parsed, &content);

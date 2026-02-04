@@ -122,7 +122,10 @@ impl Neo4jClient {
         .param("name", project.name.clone())
         .param("slug", project.slug.clone())
         .param("root_path", project.root_path.clone())
-        .param("description", project.description.clone().unwrap_or_default())
+        .param(
+            "description",
+            project.description.clone().unwrap_or_default(),
+        )
         .param("created_at", project.created_at.to_rfc3339());
 
         self.graph.run(q).await?;
@@ -281,7 +284,10 @@ impl Neo4jClient {
         .param("language", file.language.clone())
         .param("hash", file.hash.clone())
         .param("last_parsed", file.last_parsed.to_rfc3339())
-        .param("project_id", file.project_id.map(|id| id.to_string()).unwrap_or_default());
+        .param(
+            "project_id",
+            file.project_id.map(|id| id.to_string()).unwrap_or_default(),
+        );
 
         self.graph.run(q).await?;
 
@@ -564,9 +570,15 @@ impl Neo4jClient {
         )
         .param("id", id.clone())
         .param("for_type", impl_node.for_type.clone())
-        .param("trait_name", impl_node.trait_name.clone().unwrap_or_default())
+        .param(
+            "trait_name",
+            impl_node.trait_name.clone().unwrap_or_default(),
+        )
         .param("generics", impl_node.generics.clone())
-        .param("where_clause", impl_node.where_clause.clone().unwrap_or_default())
+        .param(
+            "where_clause",
+            impl_node.where_clause.clone().unwrap_or_default(),
+        )
         .param("file_path", impl_node.file_path.clone())
         .param("line_start", impl_node.line_start as i64)
         .param("line_end", impl_node.line_end as i64);
@@ -682,11 +694,7 @@ impl Neo4jClient {
     // ========================================================================
 
     /// Create a CALLS relationship between functions
-    pub async fn create_call_relationship(
-        &self,
-        caller_id: &str,
-        callee_name: &str,
-    ) -> Result<()> {
+    pub async fn create_call_relationship(&self, caller_id: &str, callee_name: &str) -> Result<()> {
         // Try to find the callee function by name
         let q = query(
             r#"
@@ -855,7 +863,10 @@ impl Neo4jClient {
         .param("created_at", plan.created_at.to_rfc3339())
         .param("created_by", plan.created_by.clone())
         .param("priority", plan.priority as i64)
-        .param("project_id", plan.project_id.map(|id| id.to_string()).unwrap_or_default());
+        .param(
+            "project_id",
+            plan.project_id.map(|id| id.to_string()).unwrap_or_default(),
+        );
 
         self.graph.run(q).await?;
 
@@ -913,10 +924,13 @@ impl Neo4jClient {
                 .unwrap_or_else(|_| chrono::Utc::now()),
             created_by: node.get("created_by")?,
             priority: node.get::<i64>("priority")? as i32,
-            project_id: node
-                .get::<String>("project_id")
-                .ok()
-                .and_then(|s| if s.is_empty() { None } else { s.parse().ok() }),
+            project_id: node.get::<String>("project_id").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
         })
     }
 
@@ -1013,7 +1027,10 @@ impl Neo4jClient {
         .param("tags", task.tags.clone())
         .param("acceptance_criteria", task.acceptance_criteria.clone())
         .param("affected_files", task.affected_files.clone())
-        .param("estimated_complexity", task.estimated_complexity.map(|c| c as i64).unwrap_or(0))
+        .param(
+            "estimated_complexity",
+            task.estimated_complexity.map(|c| c as i64).unwrap_or(0),
+        )
         .param("created_at", task.created_at.to_rfc3339());
 
         self.graph.run(q).await?;
@@ -1058,8 +1075,16 @@ impl Neo4jClient {
             tags: node.get("tags").unwrap_or_default(),
             acceptance_criteria: node.get("acceptance_criteria").unwrap_or_default(),
             affected_files: node.get("affected_files").unwrap_or_default(),
-            estimated_complexity: node.get::<i64>("estimated_complexity").ok().filter(|&v| v > 0).map(|v| v as u32),
-            actual_complexity: node.get::<i64>("actual_complexity").ok().filter(|&v| v > 0).map(|v| v as u32),
+            estimated_complexity: node
+                .get::<i64>("estimated_complexity")
+                .ok()
+                .filter(|&v| v > 0)
+                .map(|v| v as u32),
+            actual_complexity: node
+                .get::<i64>("actual_complexity")
+                .ok()
+                .filter(|&v| v > 0)
+                .map(|v| v as u32),
             started_at: node
                 .get::<String>("started_at")
                 .ok()
@@ -1184,7 +1209,11 @@ impl Neo4jClient {
     }
 
     /// Update a task with new values
-    pub async fn update_task(&self, task_id: Uuid, updates: &crate::plan::models::UpdateTaskRequest) -> Result<()> {
+    pub async fn update_task(
+        &self,
+        task_id: Uuid,
+        updates: &crate::plan::models::UpdateTaskRequest,
+    ) -> Result<()> {
         let mut set_clauses = Vec::new();
 
         if updates.title.is_some() {
@@ -1216,10 +1245,7 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        let cypher = format!(
-            "MATCH (t:Task {{id: $id}}) SET {}",
-            set_clauses.join(", ")
-        );
+        let cypher = format!("MATCH (t:Task {{id: $id}}) SET {}", set_clauses.join(", "));
 
         let mut q = query(&cypher).param("id", task_id.to_string());
 
@@ -1276,7 +1302,10 @@ impl Neo4jClient {
         .param("order", step.order as i64)
         .param("description", step.description.clone())
         .param("status", format!("{:?}", step.status))
-        .param("verification", step.verification.clone().unwrap_or_default());
+        .param(
+            "verification",
+            step.verification.clone().unwrap_or_default(),
+        );
 
         self.graph.run(q).await?;
         Ok(())
@@ -1307,7 +1336,10 @@ impl Neo4jClient {
                     node.get::<String>("status")?.to_lowercase()
                 ))
                 .unwrap_or(StepStatus::Pending),
-                verification: node.get::<String>("verification").ok().filter(|s| !s.is_empty()),
+                verification: node
+                    .get::<String>("verification")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
             });
         }
 
@@ -1355,7 +1387,11 @@ impl Neo4jClient {
     // ========================================================================
 
     /// Create a constraint for a plan
-    pub async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {
+    pub async fn create_constraint(
+        &self,
+        plan_id: Uuid,
+        constraint: &ConstraintNode,
+    ) -> Result<()> {
         let q = query(
             r#"
             MATCH (p:Plan {id: $plan_id})
@@ -1370,9 +1406,15 @@ impl Neo4jClient {
         )
         .param("plan_id", plan_id.to_string())
         .param("id", constraint.id.to_string())
-        .param("constraint_type", format!("{:?}", constraint.constraint_type))
+        .param(
+            "constraint_type",
+            format!("{:?}", constraint.constraint_type),
+        )
         .param("description", constraint.description.clone())
-        .param("enforced_by", constraint.enforced_by.clone().unwrap_or_default());
+        .param(
+            "enforced_by",
+            constraint.enforced_by.clone().unwrap_or_default(),
+        );
 
         self.graph.run(q).await?;
         Ok(())
@@ -1401,7 +1443,10 @@ impl Neo4jClient {
                 ))
                 .unwrap_or(ConstraintType::Other),
                 description: node.get("description")?,
-                enforced_by: node.get::<String>("enforced_by").ok().filter(|s| !s.is_empty()),
+                enforced_by: node
+                    .get::<String>("enforced_by")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
             });
         }
 

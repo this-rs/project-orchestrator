@@ -183,7 +183,11 @@ pub async fn delete_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    state.orchestrator.neo4j().delete_project(project.id).await?;
+    state
+        .orchestrator
+        .neo4j()
+        .delete_project(project.id)
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

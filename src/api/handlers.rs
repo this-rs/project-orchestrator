@@ -50,7 +50,11 @@ pub async fn health() -> Json<HealthResponse> {
 pub async fn list_plans(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<Vec<PlanNode>>, AppError> {
-    let plans = state.orchestrator.plan_manager().list_active_plans().await?;
+    let plans = state
+        .orchestrator
+        .plan_manager()
+        .list_active_plans()
+        .await?;
     Ok(Json(plans))
 }
 
@@ -110,7 +114,11 @@ pub async fn add_task(
     Path(plan_id): Path<Uuid>,
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<Json<TaskNode>, AppError> {
-    let task = state.orchestrator.plan_manager().add_task(plan_id, req).await?;
+    let task = state
+        .orchestrator
+        .plan_manager()
+        .add_task(plan_id, req)
+        .await?;
     Ok(Json(task))
 }
 
@@ -134,7 +142,11 @@ pub async fn update_task(
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
-    state.orchestrator.plan_manager().update_task(task_id, req).await?;
+    state
+        .orchestrator
+        .plan_manager()
+        .update_task(task_id, req)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -183,7 +195,10 @@ pub async fn get_task_prompt(
         .context_builder()
         .build_context(task_id, plan_id)
         .await?;
-    let prompt = state.orchestrator.context_builder().generate_prompt(&context);
+    let prompt = state
+        .orchestrator
+        .context_builder()
+        .generate_prompt(&context);
     Ok(Json(PromptResponse { prompt }))
 }
 
@@ -323,7 +338,10 @@ pub async fn start_watch(
     let paths = watcher.watched_paths().await;
     Ok(Json(WatchStatusResponse {
         running: true,
-        watched_paths: paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+        watched_paths: paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
     }))
 }
 
@@ -349,7 +367,10 @@ pub async fn watch_status(
 
     Ok(Json(WatchStatusResponse {
         running: !paths.is_empty(),
-        watched_paths: paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+        watched_paths: paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
     }))
 }
 

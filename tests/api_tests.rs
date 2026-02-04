@@ -654,7 +654,10 @@ async fn test_project_not_found() {
     let client = Client::new();
 
     let resp = client
-        .get(format!("{}/api/projects/nonexistent-project-slug", BASE_URL))
+        .get(format!(
+            "{}/api/projects/nonexistent-project-slug",
+            BASE_URL
+        ))
         .send()
         .await
         .unwrap();

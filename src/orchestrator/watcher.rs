@@ -75,9 +75,7 @@ impl FileWatcher {
                 move |res: Result<Event, notify::Error>| {
                     if let Ok(event) = res {
                         for path in event.paths {
-                            let _ = rt.block_on(async {
-                                event_tx_clone.send(path).await
-                            });
+                            let _ = rt.block_on(async { event_tx_clone.send(path).await });
                         }
                     }
                 },
@@ -184,7 +182,11 @@ mod tests {
         assert!(should_sync_file(Path::new("/project/app.py")));
 
         assert!(!should_sync_file(Path::new("/project/README.md")));
-        assert!(!should_sync_file(Path::new("/project/node_modules/lib/index.js")));
-        assert!(!should_sync_file(Path::new("/project/target/debug/main.rs")));
+        assert!(!should_sync_file(Path::new(
+            "/project/node_modules/lib/index.js"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/target/debug/main.rs"
+        )));
     }
 }

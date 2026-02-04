@@ -13,7 +13,8 @@ pub struct MeiliClient {
 impl MeiliClient {
     /// Create a new Meilisearch client
     pub async fn new(url: &str, api_key: &str) -> Result<Self> {
-        let client = Client::new(url, Some(api_key)).context("Failed to create Meilisearch client")?;
+        let client =
+            Client::new(url, Some(api_key)).context("Failed to create Meilisearch client")?;
 
         let meili = Self { client };
         meili.init_indexes().await?;
@@ -72,7 +73,13 @@ impl MeiliClient {
 
         let settings = Settings::new()
             .with_searchable_attributes(["description", "rationale", "tags"])
-            .with_filterable_attributes(["task_id", "agent", "timestamp", "project_id", "project_slug"])
+            .with_filterable_attributes([
+                "task_id",
+                "agent",
+                "timestamp",
+                "project_id",
+                "project_slug",
+            ])
             .with_sortable_attributes(["timestamp"]);
 
         let task = index.set_settings(&settings).await?;
@@ -116,7 +123,8 @@ impl MeiliClient {
         limit: usize,
         language_filter: Option<&str>,
     ) -> Result<Vec<CodeDocument>> {
-        self.search_code_in_project(query, limit, language_filter, None).await
+        self.search_code_in_project(query, limit, language_filter, None)
+            .await
     }
 
     /// Search code within a specific project

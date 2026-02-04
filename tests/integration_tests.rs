@@ -41,9 +41,13 @@ async fn backends_available() -> bool {
     }
 
     // Check Neo4j (try to connect)
-    let neo4j_ok = neo4rs::Graph::new(&config.neo4j_uri, &config.neo4j_user, &config.neo4j_password)
-        .await
-        .is_ok();
+    let neo4j_ok = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .is_ok();
 
     if !neo4j_ok {
         eprintln!("Neo4j not available at {}", config.neo4j_uri);

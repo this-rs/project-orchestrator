@@ -159,7 +159,10 @@ impl PlanManager {
 
         let task = TaskNode {
             id: task_node.get::<String>("id")?.parse()?,
-            title: task_node.get::<String>("title").ok().filter(|s| !s.is_empty()),
+            title: task_node
+                .get::<String>("title")
+                .ok()
+                .filter(|s| !s.is_empty()),
             description: task_node.get("description")?,
             status: serde_json::from_str(&format!(
                 "\"{}\"",
@@ -207,9 +210,14 @@ impl PlanManager {
                     status: node
                         .get::<String>("status")
                         .ok()
-                        .and_then(|s| serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok())
+                        .and_then(|s| {
+                            serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok()
+                        })
                         .unwrap_or(StepStatus::Pending),
-                    verification: node.get::<String>("verification").ok().filter(|s| !s.is_empty()),
+                    verification: node
+                        .get::<String>("verification")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
                 })
             })
             .collect();
@@ -226,7 +234,10 @@ impl PlanManager {
                     description: node.get::<String>("description").ok()?,
                     rationale: node.get::<String>("rationale").ok()?,
                     alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
-                    chosen_option: node.get::<String>("chosen_option").ok().filter(|s| !s.is_empty()),
+                    chosen_option: node
+                        .get::<String>("chosen_option")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
                     decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
                     decided_at: node
                         .get::<String>("decided_at")
@@ -381,10 +392,7 @@ impl PlanManager {
                 alternatives: vec![],
                 chosen_option: None,
                 decided_by: doc.agent,
-                decided_at: doc
-                    .timestamp
-                    .parse()
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+                decided_at: doc.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
             })
             .collect();
 
@@ -456,7 +464,10 @@ impl PlanManager {
     }
 
     /// Find blocked tasks in a plan
-    pub async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
+    pub async fn find_blocked_tasks(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
         let q = neo4rs::query(
             r#"
             MATCH (p:Plan {id: $plan_id})-[:HAS_TASK]->(t:Task {status: 'Pending'})
@@ -474,7 +485,10 @@ impl PlanManager {
             let task_node: neo4rs::Node = row.get("t")?;
             let task = TaskNode {
                 id: task_node.get::<String>("id")?.parse()?,
-                title: task_node.get::<String>("title").ok().filter(|s| !s.is_empty()),
+                title: task_node
+                    .get::<String>("title")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
                 description: task_node.get("description")?,
                 status: TaskStatus::Pending,
                 assigned_to: None,
@@ -501,18 +515,42 @@ impl PlanManager {
                         status: node
                             .get::<String>("status")
                             .ok()
-                            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok())
+                            .and_then(|s| {
+                                serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok()
+                            })
                             .unwrap_or(TaskStatus::Pending),
                         assigned_to: node.get::<String>("assigned_to").ok(),
                         priority: node.get::<i64>("priority").ok().map(|v| v as i32),
                         tags: node.get::<Vec<String>>("tags").unwrap_or_default(),
-                        acceptance_criteria: node.get::<Vec<String>>("acceptance_criteria").unwrap_or_default(),
-                        affected_files: node.get::<Vec<String>>("affected_files").unwrap_or_default(),
-                        estimated_complexity: node.get::<i64>("estimated_complexity").ok().filter(|&v| v > 0).map(|v| v as u32),
-                        actual_complexity: node.get::<i64>("actual_complexity").ok().filter(|&v| v > 0).map(|v| v as u32),
-                        started_at: node.get::<String>("started_at").ok().and_then(|s| s.parse().ok()),
-                        completed_at: node.get::<String>("completed_at").ok().and_then(|s| s.parse().ok()),
-                        created_at: node.get::<String>("created_at").ok().and_then(|s| s.parse().ok()).unwrap_or_else(chrono::Utc::now),
+                        acceptance_criteria: node
+                            .get::<Vec<String>>("acceptance_criteria")
+                            .unwrap_or_default(),
+                        affected_files: node
+                            .get::<Vec<String>>("affected_files")
+                            .unwrap_or_default(),
+                        estimated_complexity: node
+                            .get::<i64>("estimated_complexity")
+                            .ok()
+                            .filter(|&v| v > 0)
+                            .map(|v| v as u32),
+                        actual_complexity: node
+                            .get::<i64>("actual_complexity")
+                            .ok()
+                            .filter(|&v| v > 0)
+                            .map(|v| v as u32),
+                        started_at: node
+                            .get::<String>("started_at")
+                            .ok()
+                            .and_then(|s| s.parse().ok()),
+                        completed_at: node
+                            .get::<String>("completed_at")
+                            .ok()
+                            .and_then(|s| s.parse().ok()),
+                        created_at: node
+                            .get::<String>("created_at")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or_else(chrono::Utc::now),
                     })
                 })
                 .collect();

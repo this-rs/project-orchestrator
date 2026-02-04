@@ -47,7 +47,11 @@ pub async fn search_code(
     let results = state
         .orchestrator
         .meili()
-        .search_code(&query.q, query.limit.unwrap_or(10), query.language.as_deref())
+        .search_code(
+            &query.q,
+            query.limit.unwrap_or(10),
+            query.language.as_deref(),
+        )
         .await?;
 
     let results: Vec<CodeSearchResult> = results
@@ -236,7 +240,11 @@ pub async fn get_file_dependencies(
         .to_string();
 
     // Get files that depend on this file
-    let dependents = state.orchestrator.neo4j().find_dependent_files(&file_path, 3).await?;
+    let dependents = state
+        .orchestrator
+        .neo4j()
+        .find_dependent_files(&file_path, 3)
+        .await?;
 
     // Get files this file imports
     let q = neo4rs::query(
@@ -394,12 +402,24 @@ pub async fn analyze_impact(
     let target_type = query.target_type.as_deref().unwrap_or("file");
 
     let (directly_affected, transitively_affected) = if target_type == "file" {
-        let direct = state.orchestrator.neo4j().find_dependent_files(&query.target, 1).await?;
-        let transitive = state.orchestrator.neo4j().find_dependent_files(&query.target, 3).await?;
+        let direct = state
+            .orchestrator
+            .neo4j()
+            .find_dependent_files(&query.target, 1)
+            .await?;
+        let transitive = state
+            .orchestrator
+            .neo4j()
+            .find_dependent_files(&query.target, 3)
+            .await?;
         (direct, transitive)
     } else {
         // Function impact
-        let callers = state.orchestrator.neo4j().find_callers(&query.target).await?;
+        let callers = state
+            .orchestrator
+            .neo4j()
+            .find_callers(&query.target)
+            .await?;
         let direct: Vec<String> = callers.iter().map(|f| f.file_path.clone()).collect();
         (direct.clone(), direct)
     };
@@ -422,7 +442,12 @@ pub async fn analyze_impact(
     let suggestion = format!(
         "Run tests in: {}. Consider reviewing: {}",
         test_files.join(", "),
-        directly_affected.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+        directly_affected
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     Ok(Json(ImpactAnalysis {

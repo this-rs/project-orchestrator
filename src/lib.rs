@@ -41,7 +41,8 @@ impl Config {
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            neo4j_uri: std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into()),
+            neo4j_uri: std::env::var("NEO4J_URI")
+                .unwrap_or_else(|_| "bolt://localhost:7687".into()),
             neo4j_user: std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
             neo4j_password: std::env::var("NEO4J_PASSWORD")
                 .unwrap_or_else(|_| "orchestrator123".into()),

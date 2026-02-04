@@ -46,9 +46,10 @@ async fn main() -> Result<()> {
 
     // Initialize tracing
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "info,project_orchestrator=debug,tower_http=debug".into()
-        }))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,project_orchestrator=debug,tower_http=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -62,9 +63,7 @@ async fn main() -> Result<()> {
             config.server_port = port;
             run_server(config).await
         }
-        Commands::Sync { path } => {
-            run_sync(config, &path).await
-        }
+        Commands::Sync { path } => run_sync(config, &path).await,
     }
 }
 
@@ -114,7 +113,9 @@ async fn run_sync(config: Config, path: &str) -> Result<()> {
     let orchestrator = Orchestrator::new(state).await?;
 
     // Run sync
-    let result = orchestrator.sync_directory(std::path::Path::new(path)).await?;
+    let result = orchestrator
+        .sync_directory(std::path::Path::new(path))
+        .await?;
 
     tracing::info!(
         "Sync complete: {} files synced, {} skipped, {} errors",

@@ -45,12 +45,18 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         // ====================================================================
         // Plans (global or legacy)
-        .route("/api/plans", get(handlers::list_plans).post(handlers::create_plan))
+        .route(
+            "/api/plans",
+            get(handlers::list_plans).post(handlers::create_plan),
+        )
         .route(
             "/api/plans/{plan_id}",
             get(handlers::get_plan).patch(handlers::update_plan_status),
         )
-        .route("/api/plans/{plan_id}/next-task", get(handlers::get_next_task))
+        .route(
+            "/api/plans/{plan_id}/next-task",
+            get(handlers::get_next_task),
+        )
         // Constraints
         .route(
             "/api/plans/{plan_id}/constraints",
@@ -75,7 +81,10 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/tasks/{task_id}/steps/progress",
             get(handlers::get_step_progress),
         )
-        .route("/api/steps/{step_id}", axum::routing::patch(handlers::update_step))
+        .route(
+            "/api/steps/{step_id}",
+            axum::routing::patch(handlers::update_step),
+        )
         // Context
         .route(
             "/api/plans/{plan_id}/tasks/{task_id}/context",
@@ -86,7 +95,10 @@ pub fn create_router(state: OrchestratorState) -> Router {
             get(handlers::get_task_prompt),
         )
         // Decisions
-        .route("/api/tasks/{task_id}/decisions", post(handlers::add_decision))
+        .route(
+            "/api/tasks/{task_id}/decisions",
+            post(handlers::add_decision),
+        )
         .route("/api/decisions/search", get(handlers::search_decisions))
         // Sync
         .route("/api/sync", post(handlers::sync_directory))
@@ -96,29 +108,49 @@ pub fn create_router(state: OrchestratorState) -> Router {
         // ====================================================================
         // File Watcher (auto-sync on file changes)
         // ====================================================================
-        .route("/api/watch", get(handlers::watch_status).post(handlers::start_watch).delete(handlers::stop_watch))
+        .route(
+            "/api/watch",
+            get(handlers::watch_status)
+                .post(handlers::start_watch)
+                .delete(handlers::stop_watch),
+        )
         // ====================================================================
         // Code Exploration (Graph + Search powered)
         // ====================================================================
         // Search code semantically (Meilisearch)
         .route("/api/code/search", get(code_handlers::search_code))
         // Get symbols in a file (Neo4j)
-        .route("/api/code/symbols/{file_path}", get(code_handlers::get_file_symbols))
+        .route(
+            "/api/code/symbols/{file_path}",
+            get(code_handlers::get_file_symbols),
+        )
         // Find all references to a symbol
         .route("/api/code/references", get(code_handlers::find_references))
         // Get file dependencies (imports + dependents)
-        .route("/api/code/dependencies/{file_path}", get(code_handlers::get_file_dependencies))
+        .route(
+            "/api/code/dependencies/{file_path}",
+            get(code_handlers::get_file_dependencies),
+        )
         // Get call graph for a function
         .route("/api/code/callgraph", get(code_handlers::get_call_graph))
         // Analyze impact of changes
         .route("/api/code/impact", get(code_handlers::analyze_impact))
         // Get architecture overview
-        .route("/api/code/architecture", get(code_handlers::get_architecture))
+        .route(
+            "/api/code/architecture",
+            get(code_handlers::get_architecture),
+        )
         // Find similar code (POST because of body)
         .route("/api/code/similar", post(code_handlers::find_similar_code))
         // Trait implementation exploration
-        .route("/api/code/trait-impls", get(code_handlers::find_trait_implementations))
-        .route("/api/code/type-traits", get(code_handlers::find_type_traits))
+        .route(
+            "/api/code/trait-impls",
+            get(code_handlers::find_trait_implementations),
+        )
+        .route(
+            "/api/code/type-traits",
+            get(code_handlers::find_type_traits),
+        )
         .route("/api/code/impl-blocks", get(code_handlers::get_impl_blocks))
         // Middleware
         .layer(TraceLayer::new_for_http())

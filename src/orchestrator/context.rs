@@ -163,7 +163,8 @@ impl ContextBuilder {
         if !context.constraints.is_empty() {
             prompt.push_str("## Constraints\n");
             for constraint in &context.constraints {
-                prompt.push_str(&format!("- [{}] {}\n",
+                prompt.push_str(&format!(
+                    "- [{}] {}\n",
                     format!("{:?}", constraint.constraint_type),
                     constraint.description
                 ));
@@ -179,7 +180,12 @@ impl ContextBuilder {
                     StepStatus::Completed => "[x]",
                     _ => "[ ]",
                 };
-                prompt.push_str(&format!("{} {}. {}\n", status, step.order + 1, step.description));
+                prompt.push_str(&format!(
+                    "{} {}. {}\n",
+                    status,
+                    step.order + 1,
+                    step.description
+                ));
                 if let Some(ref verification) = step.verification {
                     prompt.push_str(&format!("   Verification: {}\n", verification));
                 }
@@ -191,7 +197,10 @@ impl ContextBuilder {
         if !context.decisions.is_empty() {
             prompt.push_str("## Decisions Already Made\n");
             for decision in &context.decisions {
-                prompt.push_str(&format!("- **{}**: {}\n", decision.description, decision.rationale));
+                prompt.push_str(&format!(
+                    "- **{}**: {}\n",
+                    decision.description, decision.rationale
+                ));
             }
             prompt.push('\n');
         }
@@ -219,7 +228,10 @@ impl ContextBuilder {
         if !context.similar_code.is_empty() {
             prompt.push_str("## Similar Code (for reference)\n");
             for code_ref in &context.similar_code {
-                prompt.push_str(&format!("### {}\n```\n{}\n```\n\n", code_ref.path, code_ref.snippet));
+                prompt.push_str(&format!(
+                    "### {}\n```\n{}\n```\n\n",
+                    code_ref.path, code_ref.snippet
+                ));
             }
         }
 
