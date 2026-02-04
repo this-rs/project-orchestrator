@@ -153,6 +153,10 @@ pub struct AgentContext {
 
     /// Related past decisions for context
     pub related_decisions: Vec<DecisionNode>,
+
+    /// Contextual notes (guidelines, gotchas, patterns) for the task
+    #[serde(default)]
+    pub notes: Vec<ContextNote>,
 }
 
 /// Context about a file to be modified
@@ -166,6 +170,28 @@ pub struct FileContext {
     pub dependent_files: Vec<String>,
     /// Files this file imports
     pub dependencies: Vec<String>,
+    /// Notes directly attached to this file or its entities
+    #[serde(default)]
+    pub notes: Vec<ContextNote>,
+}
+
+/// A note surfaced in context for an agent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextNote {
+    /// Note ID
+    pub id: Uuid,
+    /// Type of note (guideline, gotcha, pattern, etc.)
+    pub note_type: String,
+    /// Content of the note
+    pub content: String,
+    /// Importance level
+    pub importance: String,
+    /// Source entity the note is attached to
+    pub source_entity: String,
+    /// Whether this note was propagated (vs directly attached)
+    pub propagated: bool,
+    /// Relevance score (1.0 = direct, < 1.0 = propagated)
+    pub relevance_score: f64,
 }
 
 /// Reference to similar code

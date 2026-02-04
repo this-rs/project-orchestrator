@@ -1,6 +1,7 @@
 //! Main orchestrator runner
 
 use crate::neo4j::models::*;
+use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
@@ -21,6 +22,8 @@ pub struct Orchestrator {
     plan_manager: Arc<PlanManager>,
     context_builder: Arc<ContextBuilder>,
     parser: Arc<RwLock<CodeParser>>,
+    note_manager: Arc<NoteManager>,
+    note_lifecycle: Arc<NoteLifecycleManager>,
 }
 
 impl Orchestrator {
@@ -35,12 +38,16 @@ impl Orchestrator {
         ));
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
+        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
+        let note_lifecycle = Arc::new(NoteLifecycleManager::new());
 
         Ok(Self {
             state,
             plan_manager,
             context_builder,
             parser,
+            note_manager,
+            note_lifecycle,
         })
     }
 
@@ -62,6 +69,16 @@ impl Orchestrator {
     /// Get the Meilisearch client
     pub fn meili(&self) -> &crate::meilisearch::client::MeiliClient {
         &self.state.meili
+    }
+
+    /// Get the note manager
+    pub fn note_manager(&self) -> &Arc<NoteManager> {
+        &self.note_manager
+    }
+
+    /// Get the note lifecycle manager
+    pub fn note_lifecycle(&self) -> &Arc<NoteLifecycleManager> {
+        &self.note_lifecycle
     }
 
     // ========================================================================
@@ -209,7 +226,281 @@ impl Orchestrator {
             self.state.meili.index_code(&doc).await?;
         }
 
+        // Verify notes attached to this file
+        self.verify_notes_for_file(&path_str, &parsed, &content)
+            .await?;
+
         Ok(true)
+    }
+
+    /// Verify notes attached to a file after it has been modified
+    ///
+    /// This checks if any notes anchored to entities in this file need
+    /// status updates due to code changes.
+    async fn verify_notes_for_file(
+        &self,
+        file_path: &str,
+        parsed: &ParsedFile,
+        source: &str,
+    ) -> Result<()> {
+        // Get all notes attached to this file
+        let notes = self
+            .state
+            .neo4j
+            .get_notes_for_entity(&EntityType::File, file_path)
+            .await?;
+
+        if notes.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "Verifying {} notes for file: {}",
+            notes.len(),
+            file_path
+        );
+
+        // Create FileInfo from parsed data
+        let file_info = NoteLifecycleManager::create_file_info(parsed, source);
+
+        // Verify each note's anchors
+        let results = self.note_lifecycle.verify_notes_for_file(&notes, &file_info);
+
+        // Process verification results
+        for result in results {
+            if !result.all_valid {
+                if let Some(update) = result.suggested_update {
+                    // Update note status
+                    self.state
+                        .neo4j
+                        .update_note(
+                            result.note_id,
+                            None,
+                            None,
+                            Some(update.new_status.clone()),
+                            None,
+                            None,
+                        )
+                        .await?;
+
+                    // Update Meilisearch index
+                    self.state
+                        .meili
+                        .update_note_status(&result.note_id.to_string(), &update.new_status.to_string())
+                        .await?;
+
+                    tracing::info!(
+                        "Note {} status changed to {:?}: {}",
+                        result.note_id,
+                        update.new_status,
+                        update.reason
+                    );
+                }
+            }
+        }
+
+        // Also verify notes attached to functions/structs in this file
+        self.verify_notes_for_file_symbols(file_path, &file_info)
+            .await?;
+
+        // Verify assertion notes
+        self.verify_assertions_for_file(file_path, &file_info)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Verify assertion notes that apply to a file
+    async fn verify_assertions_for_file(
+        &self,
+        file_path: &str,
+        file_info: &crate::notes::FileInfo,
+    ) -> Result<()> {
+        use crate::notes::{NoteStatus, NoteType, ViolationAction};
+
+        // Get all assertion notes that might apply to this file
+        let notes = self
+            .state
+            .neo4j
+            .get_notes_for_entity(&EntityType::File, file_path)
+            .await?;
+
+        let assertion_notes: Vec<_> = notes
+            .into_iter()
+            .filter(|n| n.note_type == NoteType::Assertion)
+            .collect();
+
+        if assertion_notes.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "Verifying {} assertion notes for file: {}",
+            assertion_notes.len(),
+            file_path
+        );
+
+        // Verify each assertion
+        let results = self
+            .note_lifecycle
+            .verify_assertions_for_file(&assertion_notes, file_info);
+
+        for result in results {
+            if !result.passed {
+                // Find the note to get the violation action
+                let note = assertion_notes.iter().find(|n| n.id == result.note_id);
+
+                if let Some(note) = note {
+                    if let Some(ref rule) = note.assertion_rule {
+                        match rule.on_violation {
+                            ViolationAction::Warn => {
+                                tracing::warn!(
+                                    "Assertion failed (warning): note {} - {}",
+                                    result.note_id,
+                                    result.message
+                                );
+                            }
+                            ViolationAction::FlagNote | ViolationAction::Block => {
+                                // Update note status to needs_review
+                                self.state
+                                    .neo4j
+                                    .update_note(
+                                        result.note_id,
+                                        None,
+                                        None,
+                                        Some(NoteStatus::NeedsReview),
+                                        None,
+                                        None,
+                                    )
+                                    .await?;
+
+                                self.state
+                                    .meili
+                                    .update_note_status(&result.note_id.to_string(), "needs_review")
+                                    .await?;
+
+                                tracing::warn!(
+                                    "Assertion failed: note {} flagged for review - {}",
+                                    result.note_id,
+                                    result.message
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    "Assertion passed: note {} - {}",
+                    result.note_id,
+                    result.message
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify notes attached to symbols (functions, structs) within a file
+    async fn verify_notes_for_file_symbols(
+        &self,
+        file_path: &str,
+        file_info: &crate::notes::FileInfo,
+    ) -> Result<()> {
+        // Verify notes attached to functions
+        for func in &file_info.functions {
+            let func_id = format!("{}::{}", file_path, func.name);
+            let notes = self
+                .state
+                .neo4j
+                .get_notes_for_entity(&EntityType::Function, &func_id)
+                .await?;
+
+            if notes.is_empty() {
+                continue;
+            }
+
+            let results = self.note_lifecycle.verify_notes_for_file(&notes, file_info);
+
+            for result in results {
+                if !result.all_valid {
+                    if let Some(update) = result.suggested_update {
+                        self.state
+                            .neo4j
+                            .update_note(
+                                result.note_id,
+                                None,
+                                None,
+                                Some(update.new_status.clone()),
+                                None,
+                                None,
+                            )
+                            .await?;
+
+                        self.state
+                            .meili
+                            .update_note_status(&result.note_id.to_string(), &update.new_status.to_string())
+                            .await?;
+
+                        tracing::info!(
+                            "Note {} (on {}) status changed to {:?}: {}",
+                            result.note_id,
+                            func.name,
+                            update.new_status,
+                            update.reason
+                        );
+                    }
+                }
+            }
+        }
+
+        // Verify notes attached to structs
+        for s in &file_info.structs {
+            let struct_id = format!("{}::{}", file_path, s.name);
+            let notes = self
+                .state
+                .neo4j
+                .get_notes_for_entity(&EntityType::Struct, &struct_id)
+                .await?;
+
+            if notes.is_empty() {
+                continue;
+            }
+
+            let results = self.note_lifecycle.verify_notes_for_file(&notes, file_info);
+
+            for result in results {
+                if !result.all_valid {
+                    if let Some(update) = result.suggested_update {
+                        self.state
+                            .neo4j
+                            .update_note(
+                                result.note_id,
+                                None,
+                                None,
+                                Some(update.new_status.clone()),
+                                None,
+                                None,
+                            )
+                            .await?;
+
+                        self.state
+                            .meili
+                            .update_note_status(&result.note_id.to_string(), &update.new_status.to_string())
+                            .await?;
+
+                        tracing::info!(
+                            "Note {} (on {}) status changed to {:?}: {}",
+                            result.note_id,
+                            s.name,
+                            update.new_status,
+                            update.reason
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Store a parsed file in Neo4j with project association

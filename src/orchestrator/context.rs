@@ -3,6 +3,7 @@
 use crate::meilisearch::client::MeiliClient;
 use crate::neo4j::client::Neo4jClient;
 use crate::neo4j::models::*;
+use crate::notes::{EntityType, NoteManager, Note};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
 use anyhow::Result;
@@ -14,6 +15,7 @@ pub struct ContextBuilder {
     neo4j: Arc<Neo4jClient>,
     meili: Arc<MeiliClient>,
     plan_manager: Arc<PlanManager>,
+    note_manager: Arc<NoteManager>,
 }
 
 impl ContextBuilder {
@@ -23,10 +25,12 @@ impl ContextBuilder {
         meili: Arc<MeiliClient>,
         plan_manager: Arc<PlanManager>,
     ) -> Self {
+        let note_manager = Arc::new(NoteManager::new(neo4j.clone(), meili.clone()));
         Self {
             neo4j,
             meili,
             plan_manager,
+            note_manager,
         }
     }
 
@@ -46,10 +50,10 @@ impl ContextBuilder {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Plan not found"))?;
 
-        // Get file contexts for modified files
+        // Get file contexts for modified files (including notes)
         let mut target_files = Vec::new();
         for file_path in &task_details.modifies_files {
-            let file_context = self.get_file_context(file_path).await?;
+            let file_context = self.get_file_context_with_notes(file_path).await?;
             target_files.push(file_context);
         }
 
@@ -64,6 +68,26 @@ impl ContextBuilder {
             .search_decisions(&task_details.task.description, 5)
             .await?;
 
+        // Get notes for the task
+        let task_notes = self.get_notes_for_entity(
+            &EntityType::Task,
+            &task_id.to_string(),
+        ).await?;
+
+        // Get notes for the plan
+        let plan_notes = self.get_notes_for_entity(
+            &EntityType::Plan,
+            &plan_id.to_string(),
+        ).await?;
+
+        // Combine all notes
+        let mut all_notes = task_notes;
+        all_notes.extend(plan_notes);
+
+        // Deduplicate notes by ID
+        all_notes.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap_or(std::cmp::Ordering::Equal));
+        all_notes.dedup_by_key(|n| n.id);
+
         Ok(AgentContext {
             task: task_details.task,
             steps: task_details.steps,
@@ -72,6 +96,7 @@ impl ContextBuilder {
             target_files,
             similar_code,
             related_decisions,
+            notes: all_notes,
         })
     }
 
@@ -95,7 +120,73 @@ impl ContextBuilder {
             symbols,
             dependent_files,
             dependencies,
+            notes: Vec::new(),
         })
+    }
+
+    /// Get file context with attached notes
+    pub async fn get_file_context_with_notes(&self, file_path: &str) -> Result<FileContext> {
+        let mut context = self.get_file_context(file_path).await?;
+
+        // Get notes for this file
+        context.notes = self.get_notes_for_entity(&EntityType::File, file_path).await?;
+
+        Ok(context)
+    }
+
+    /// Get notes for an entity (direct + propagated)
+    async fn get_notes_for_entity(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Vec<ContextNote>> {
+        // Get contextual notes (direct + propagated)
+        let note_context = self
+            .note_manager
+            .get_context_notes(entity_type, entity_id, 2, 0.2)
+            .await?;
+
+        let mut context_notes = Vec::new();
+
+        // Convert direct notes
+        for note in note_context.direct_notes {
+            context_notes.push(self.note_to_context_note(&note, false, 1.0));
+        }
+
+        // Convert propagated notes
+        for prop_note in note_context.propagated_notes {
+            context_notes.push(ContextNote {
+                id: prop_note.note.id,
+                note_type: prop_note.note.note_type.to_string(),
+                content: prop_note.note.content.clone(),
+                importance: prop_note.note.importance.to_string(),
+                source_entity: prop_note.source_entity,
+                propagated: true,
+                relevance_score: prop_note.relevance_score,
+            });
+        }
+
+        Ok(context_notes)
+    }
+
+    /// Convert a Note to ContextNote
+    fn note_to_context_note(&self, note: &Note, propagated: bool, relevance: f64) -> ContextNote {
+        ContextNote {
+            id: note.id,
+            note_type: note.note_type.to_string(),
+            content: note.content.clone(),
+            importance: note.importance.to_string(),
+            source_entity: match &note.scope {
+                crate::notes::NoteScope::Project => "project".to_string(),
+                crate::notes::NoteScope::Module(m) => format!("module:{}", m),
+                crate::notes::NoteScope::File(f) => format!("file:{}", f),
+                crate::notes::NoteScope::Function(f) => format!("function:{}", f),
+                crate::notes::NoteScope::Struct(s) => format!("struct:{}", s),
+                crate::notes::NoteScope::Trait(t) => format!("trait:{}", t),
+            },
+            propagated,
+            relevance_score: relevance,
+        }
     }
 
     /// Get symbols defined in a file
@@ -248,6 +339,88 @@ impl ContextBuilder {
                 ));
             }
             prompt.push('\n');
+        }
+
+        // Knowledge Notes (guidelines, gotchas, patterns)
+        if !context.notes.is_empty() {
+            prompt.push_str("## Knowledge Notes\n");
+            prompt.push_str("The following notes contain important context, guidelines, and gotchas:\n\n");
+
+            // Group by importance
+            let critical: Vec<_> = context.notes.iter().filter(|n| n.importance == "critical").collect();
+            let high: Vec<_> = context.notes.iter().filter(|n| n.importance == "high").collect();
+            let other: Vec<_> = context.notes.iter().filter(|n| n.importance != "critical" && n.importance != "high").collect();
+
+            if !critical.is_empty() {
+                prompt.push_str("### Critical\n");
+                for note in critical {
+                    let source = if note.propagated {
+                        format!(" (via {})", note.source_entity)
+                    } else {
+                        String::new()
+                    };
+                    prompt.push_str(&format!(
+                        "- **[{}]{}** {}\n",
+                        note.note_type,
+                        source,
+                        note.content
+                    ));
+                }
+                prompt.push('\n');
+            }
+
+            if !high.is_empty() {
+                prompt.push_str("### Important\n");
+                for note in high {
+                    let source = if note.propagated {
+                        format!(" (via {})", note.source_entity)
+                    } else {
+                        String::new()
+                    };
+                    prompt.push_str(&format!(
+                        "- **[{}]{}** {}\n",
+                        note.note_type,
+                        source,
+                        note.content
+                    ));
+                }
+                prompt.push('\n');
+            }
+
+            if !other.is_empty() {
+                prompt.push_str("### Other Notes\n");
+                for note in other {
+                    let source = if note.propagated {
+                        format!(" (via {})", note.source_entity)
+                    } else {
+                        String::new()
+                    };
+                    prompt.push_str(&format!(
+                        "- [{}]{} {}\n",
+                        note.note_type,
+                        source,
+                        note.content
+                    ));
+                }
+                prompt.push('\n');
+            }
+        }
+
+        // File-specific notes
+        let files_with_notes: Vec<_> = context.target_files.iter().filter(|f| !f.notes.is_empty()).collect();
+        if !files_with_notes.is_empty() {
+            prompt.push_str("## File-Specific Notes\n");
+            for file in files_with_notes {
+                prompt.push_str(&format!("### {}\n", file.path));
+                for note in &file.notes {
+                    prompt.push_str(&format!(
+                        "- [{}] {}\n",
+                        note.note_type,
+                        note.content
+                    ));
+                }
+                prompt.push('\n');
+            }
         }
 
         // Instructions

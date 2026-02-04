@@ -2,6 +2,7 @@
 
 use super::code_handlers;
 use super::handlers::{self, OrchestratorState};
+use super::note_handlers;
 use super::project_handlers;
 use axum::{
     routing::{get, post},
@@ -235,6 +236,73 @@ pub fn create_router(state: OrchestratorState) -> Router {
             get(code_handlers::find_type_traits),
         )
         .route("/api/code/impl-blocks", get(code_handlers::get_impl_blocks))
+        // ====================================================================
+        // Knowledge Notes
+        // ====================================================================
+        // Notes CRUD
+        .route(
+            "/api/notes",
+            get(note_handlers::list_notes).post(note_handlers::create_note),
+        )
+        .route(
+            "/api/notes/{note_id}",
+            get(note_handlers::get_note)
+                .patch(note_handlers::update_note)
+                .delete(note_handlers::delete_note),
+        )
+        // Notes search
+        .route("/api/notes/search", get(note_handlers::search_notes))
+        // Notes needing review
+        .route(
+            "/api/notes/needs-review",
+            get(note_handlers::get_notes_needing_review),
+        )
+        // Update staleness scores
+        .route(
+            "/api/notes/update-staleness",
+            post(note_handlers::update_staleness_scores),
+        )
+        // Notes for a project
+        .route(
+            "/api/projects/{project_id}/notes",
+            get(note_handlers::list_project_notes),
+        )
+        // Note lifecycle operations
+        .route(
+            "/api/notes/{note_id}/confirm",
+            post(note_handlers::confirm_note),
+        )
+        .route(
+            "/api/notes/{note_id}/invalidate",
+            post(note_handlers::invalidate_note),
+        )
+        .route(
+            "/api/notes/{note_id}/supersede",
+            post(note_handlers::supersede_note),
+        )
+        // Note linking
+        .route(
+            "/api/notes/{note_id}/links",
+            post(note_handlers::link_note_to_entity),
+        )
+        .route(
+            "/api/notes/{note_id}/links/{entity_type}/{entity_id}",
+            axum::routing::delete(note_handlers::unlink_note_from_entity),
+        )
+        // Context notes (direct + propagated)
+        .route(
+            "/api/notes/context",
+            get(note_handlers::get_context_notes),
+        )
+        .route(
+            "/api/notes/propagated",
+            get(note_handlers::get_propagated_notes),
+        )
+        // Entity notes (direct only)
+        .route(
+            "/api/entities/{entity_type}/{entity_id}/notes",
+            get(note_handlers::get_entity_notes),
+        )
         // ====================================================================
         // Meilisearch Maintenance
         // ====================================================================

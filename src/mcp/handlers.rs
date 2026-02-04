@@ -120,6 +120,22 @@ impl ToolHandler {
             "stop_watch" => self.stop_watch(args).await,
             "watch_status" => self.watch_status(args).await,
 
+            // Notes
+            "list_notes" => self.list_notes(args).await,
+            "create_note" => self.create_note(args).await,
+            "get_note" => self.get_note(args).await,
+            "update_note" => self.update_note(args).await,
+            "delete_note" => self.delete_note(args).await,
+            "search_notes" => self.search_notes(args).await,
+            "confirm_note" => self.confirm_note(args).await,
+            "invalidate_note" => self.invalidate_note(args).await,
+            "supersede_note" => self.supersede_note(args).await,
+            "link_note_to_entity" => self.link_note_to_entity(args).await,
+            "unlink_note_from_entity" => self.unlink_note_from_entity(args).await,
+            "get_context_notes" => self.get_context_notes(args).await,
+            "get_notes_needing_review" => self.get_notes_needing_review(args).await,
+            "update_staleness_scores" => self.update_staleness_scores(args).await,
+
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -1566,6 +1582,391 @@ impl ToolHandler {
 
     async fn watch_status(&self, _args: Value) -> Result<Value> {
         Ok(json!({"message": "Use HTTP API GET /api/watch to get watcher status"}))
+    }
+
+    // ========================================================================
+    // Note Handlers
+    // ========================================================================
+
+    async fn list_notes(&self, args: Value) -> Result<Value> {
+        use crate::notes::{NoteFilters, NoteImportance, NoteStatus, NoteType};
+
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
+        let filters = NoteFilters {
+            note_type: args
+                .get("note_type")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<NoteType>().ok())
+                .map(|t| vec![t]),
+            status: args
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
+                        .collect()
+                }),
+            importance: args
+                .get("importance")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<NoteImportance>().ok())
+                .map(|i| vec![i]),
+            min_staleness: args.get("min_staleness").and_then(|v| v.as_f64()),
+            max_staleness: args.get("max_staleness").and_then(|v| v.as_f64()),
+            tags: args.get("tags").and_then(|v| v.as_str()).map(|t| {
+                t.split(',').map(|s| s.trim().to_string()).collect()
+            }),
+            search: args.get("search").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            limit: args.get("limit").and_then(|v| v.as_i64()),
+            offset: args.get("offset").and_then(|v| v.as_i64()),
+            scope_type: None,
+            sort_by: None,
+            sort_order: None,
+        };
+
+        let (notes, total) = self
+            .orchestrator
+            .note_manager()
+            .list_notes(project_id, &filters)
+            .await?;
+
+        Ok(json!({
+            "items": notes,
+            "total": total,
+            "limit": filters.limit.unwrap_or(50),
+            "offset": filters.offset.unwrap_or(0)
+        }))
+    }
+
+    async fn create_note(&self, args: Value) -> Result<Value> {
+        use crate::notes::{CreateNoteRequest, NoteImportance, NoteType};
+
+        let project_id = parse_uuid(&args, "project_id")?;
+        let note_type: NoteType = args
+            .get("note_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("note_type is required"))?
+            .parse()
+            .map_err(|_| anyhow!("Invalid note_type"))?;
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("content is required"))?
+            .to_string();
+        let importance = args
+            .get("importance")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<NoteImportance>().ok());
+        let tags = args.get("tags").and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+        });
+
+        let request = CreateNoteRequest {
+            project_id,
+            note_type,
+            content,
+            importance,
+            scope: None,
+            tags,
+            anchors: None,
+            assertion_rule: None,
+        };
+
+        let note = self
+            .orchestrator
+            .note_manager()
+            .create_note(request, "mcp")
+            .await?;
+
+        Ok(serde_json::to_value(note)?)
+    }
+
+    async fn get_note(&self, args: Value) -> Result<Value> {
+        let note_id = parse_uuid(&args, "note_id")?;
+
+        let note = self
+            .orchestrator
+            .note_manager()
+            .get_note(note_id)
+            .await?
+            .ok_or_else(|| anyhow!("Note not found"))?;
+
+        Ok(serde_json::to_value(note)?)
+    }
+
+    async fn update_note(&self, args: Value) -> Result<Value> {
+        use crate::notes::{NoteImportance, NoteStatus, UpdateNoteRequest};
+
+        let note_id = parse_uuid(&args, "note_id")?;
+
+        let request = UpdateNoteRequest {
+            content: args.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            importance: args
+                .get("importance")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<NoteImportance>().ok()),
+            status: args
+                .get("status")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<NoteStatus>().ok()),
+            tags: args.get("tags").and_then(|v| {
+                v.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+            }),
+        };
+
+        let note = self
+            .orchestrator
+            .note_manager()
+            .update_note(note_id, request)
+            .await?
+            .ok_or_else(|| anyhow!("Note not found"))?;
+
+        Ok(serde_json::to_value(note)?)
+    }
+
+    async fn delete_note(&self, args: Value) -> Result<Value> {
+        let note_id = parse_uuid(&args, "note_id")?;
+
+        let deleted = self
+            .orchestrator
+            .note_manager()
+            .delete_note(note_id)
+            .await?;
+
+        Ok(json!({"deleted": deleted}))
+    }
+
+    async fn search_notes(&self, args: Value) -> Result<Value> {
+        use crate::notes::{NoteFilters, NoteImportance, NoteStatus, NoteType};
+
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("query is required"))?;
+
+        let filters = NoteFilters {
+            note_type: args
+                .get("note_type")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<NoteType>().ok())
+                .map(|t| vec![t]),
+            status: args
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
+                        .collect()
+                }),
+            importance: args
+                .get("importance")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<NoteImportance>().ok())
+                .map(|i| vec![i]),
+            search: args.get("project_slug").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            limit: args.get("limit").and_then(|v| v.as_i64()),
+            ..Default::default()
+        };
+
+        let hits = self
+            .orchestrator
+            .note_manager()
+            .search_notes(query, &filters)
+            .await?;
+
+        Ok(serde_json::to_value(hits)?)
+    }
+
+    async fn confirm_note(&self, args: Value) -> Result<Value> {
+        let note_id = parse_uuid(&args, "note_id")?;
+
+        let note = self
+            .orchestrator
+            .note_manager()
+            .confirm_note(note_id, "mcp")
+            .await?
+            .ok_or_else(|| anyhow!("Note not found"))?;
+
+        Ok(serde_json::to_value(note)?)
+    }
+
+    async fn invalidate_note(&self, args: Value) -> Result<Value> {
+        let note_id = parse_uuid(&args, "note_id")?;
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("reason is required"))?;
+
+        let note = self
+            .orchestrator
+            .note_manager()
+            .invalidate_note(note_id, reason, "mcp")
+            .await?
+            .ok_or_else(|| anyhow!("Note not found"))?;
+
+        Ok(serde_json::to_value(note)?)
+    }
+
+    async fn supersede_note(&self, args: Value) -> Result<Value> {
+        use crate::notes::{CreateNoteRequest, NoteImportance, NoteType};
+
+        let old_note_id = parse_uuid(&args, "old_note_id")?;
+        let project_id = parse_uuid(&args, "project_id")?;
+        let note_type: NoteType = args
+            .get("note_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("note_type is required"))?
+            .parse()
+            .map_err(|_| anyhow!("Invalid note_type"))?;
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("content is required"))?
+            .to_string();
+        let importance = args
+            .get("importance")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<NoteImportance>().ok());
+        let tags = args.get("tags").and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+        });
+
+        let request = CreateNoteRequest {
+            project_id,
+            note_type,
+            content,
+            importance,
+            scope: None,
+            tags,
+            anchors: None,
+            assertion_rule: None,
+        };
+
+        let new_note = self
+            .orchestrator
+            .note_manager()
+            .supersede_note(old_note_id, request, "mcp")
+            .await?;
+
+        Ok(serde_json::to_value(new_note)?)
+    }
+
+    async fn link_note_to_entity(&self, args: Value) -> Result<Value> {
+        use crate::notes::{EntityType, LinkNoteRequest};
+
+        let note_id = parse_uuid(&args, "note_id")?;
+        let entity_type: EntityType = args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_type is required"))?
+            .parse()
+            .map_err(|_| anyhow!("Invalid entity_type"))?;
+        let entity_id = args
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_id is required"))?
+            .to_string();
+
+        let request = LinkNoteRequest {
+            entity_type,
+            entity_id,
+        };
+
+        self.orchestrator
+            .note_manager()
+            .link_note_to_entity(note_id, &request)
+            .await?;
+
+        Ok(json!({"linked": true}))
+    }
+
+    async fn unlink_note_from_entity(&self, args: Value) -> Result<Value> {
+        use crate::notes::EntityType;
+
+        let note_id = parse_uuid(&args, "note_id")?;
+        let entity_type: EntityType = args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_type is required"))?
+            .parse()
+            .map_err(|_| anyhow!("Invalid entity_type"))?;
+        let entity_id = args
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_id is required"))?;
+
+        self.orchestrator
+            .note_manager()
+            .unlink_note_from_entity(note_id, &entity_type, entity_id)
+            .await?;
+
+        Ok(json!({"unlinked": true}))
+    }
+
+    async fn get_context_notes(&self, args: Value) -> Result<Value> {
+        use crate::notes::EntityType;
+
+        let entity_type: EntityType = args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_type is required"))?
+            .parse()
+            .map_err(|_| anyhow!("Invalid entity_type"))?;
+        let entity_id = args
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_id is required"))?;
+        let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+        let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.1);
+
+        let response = self
+            .orchestrator
+            .note_manager()
+            .get_context_notes(&entity_type, entity_id, max_depth, min_score)
+            .await?;
+
+        Ok(serde_json::to_value(response)?)
+    }
+
+    async fn get_notes_needing_review(&self, args: Value) -> Result<Value> {
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
+        let notes = self
+            .orchestrator
+            .note_manager()
+            .get_notes_needing_review(project_id)
+            .await?;
+
+        Ok(serde_json::to_value(notes)?)
+    }
+
+    async fn update_staleness_scores(&self, _args: Value) -> Result<Value> {
+        let count = self
+            .orchestrator
+            .note_manager()
+            .update_staleness_scores()
+            .await?;
+
+        Ok(json!({"notes_updated": count}))
     }
 }
 

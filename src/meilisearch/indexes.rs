@@ -49,6 +49,39 @@ pub struct DecisionDocument {
     pub project_slug: Option<String>,
 }
 
+/// Knowledge Note document for indexing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteDocument {
+    /// Unique identifier (UUID)
+    pub id: String,
+    /// Project ID (UUID)
+    pub project_id: String,
+    /// Project slug for filtering
+    pub project_slug: String,
+    /// Type of note (guideline, gotcha, pattern, context, tip, observation, assertion)
+    pub note_type: String,
+    /// Status (active, needs_review, stale, obsolete, archived)
+    pub status: String,
+    /// Importance level (low, medium, high, critical)
+    pub importance: String,
+    /// Scope type (project, module, file, function, struct, trait)
+    pub scope_type: String,
+    /// Scope path (e.g., "src/auth/jwt.rs::validate_token")
+    pub scope_path: String,
+    /// The full content/text of the note (main searchable field)
+    pub content: String,
+    /// Tags for categorization and search
+    pub tags: Vec<String>,
+    /// Entity identifiers this note is attached to
+    pub anchor_entities: Vec<String>,
+    /// Unix timestamp for creation
+    pub created_at: i64,
+    /// Who created the note
+    pub created_by: String,
+    /// Staleness score (0.0 - 1.0)
+    pub staleness_score: f64,
+}
+
 /// Statistics for a Meilisearch index
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStats {
@@ -60,4 +93,5 @@ pub struct IndexStats {
 pub mod index_names {
     pub const CODE: &str = "code";
     pub const DECISIONS: &str = "decisions";
+    pub const NOTES: &str = "notes";
 }

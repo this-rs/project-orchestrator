@@ -19,6 +19,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     tools.extend(code_tools());
     tools.extend(decision_tools());
     tools.extend(sync_tools());
+    tools.extend(note_tools());
     tools
 }
 
@@ -891,6 +892,204 @@ fn sync_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+// ============================================================================
+// Knowledge Notes Tools (14)
+// ============================================================================
+
+fn note_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_notes".to_string(),
+            description: "List notes with optional filters and pagination".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Filter by project UUID"},
+                    "note_type": {"type": "string", "description": "Filter by type (guideline, gotcha, pattern, context, tip, observation, assertion)"},
+                    "status": {"type": "string", "description": "Filter by status (comma-separated: active,needs_review,stale,obsolete,archived)"},
+                    "importance": {"type": "string", "description": "Filter by importance (critical, high, medium, low)"},
+                    "min_staleness": {"type": "number", "description": "Minimum staleness score (0.0-1.0)"},
+                    "max_staleness": {"type": "number", "description": "Maximum staleness score (0.0-1.0)"},
+                    "tags": {"type": "string", "description": "Filter by tags (comma-separated)"},
+                    "search": {"type": "string", "description": "Search in content"},
+                    "limit": {"type": "integer", "description": "Max items (default 50)"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "create_note".to_string(),
+            description: "Create a new knowledge note".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Project UUID (required)"},
+                    "note_type": {"type": "string", "description": "Type: guideline, gotcha, pattern, context, tip, observation, assertion"},
+                    "content": {"type": "string", "description": "Note content"},
+                    "importance": {"type": "string", "description": "Importance: critical, high, medium, low"},
+                    "scope": {"type": "object", "description": "Scope (project, module, file, function, struct, trait)"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
+                    "anchors": {"type": "array", "description": "Initial anchors to code entities"}
+                })),
+                required: Some(vec!["project_id".to_string(), "note_type".to_string(), "content".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_note".to_string(),
+            description: "Get a note by ID".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_id": {"type": "string", "description": "Note UUID"}
+                })),
+                required: Some(vec!["note_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "update_note".to_string(),
+            description: "Update a note's content, importance, status, or tags".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_id": {"type": "string", "description": "Note UUID"},
+                    "content": {"type": "string", "description": "New content"},
+                    "importance": {"type": "string", "description": "New importance level"},
+                    "status": {"type": "string", "description": "New status"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags"}
+                })),
+                required: Some(vec!["note_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_note".to_string(),
+            description: "Delete a note".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_id": {"type": "string", "description": "Note UUID"}
+                })),
+                required: Some(vec!["note_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "search_notes".to_string(),
+            description: "Search notes using semantic search".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "query": {"type": "string", "description": "Search query"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"},
+                    "note_type": {"type": "string", "description": "Filter by note type"},
+                    "status": {"type": "string", "description": "Filter by status"},
+                    "importance": {"type": "string", "description": "Filter by importance"},
+                    "limit": {"type": "integer", "description": "Max results (default 20)"}
+                })),
+                required: Some(vec!["query".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "confirm_note".to_string(),
+            description: "Confirm a note is still valid (resets staleness)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_id": {"type": "string", "description": "Note UUID"}
+                })),
+                required: Some(vec!["note_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "invalidate_note".to_string(),
+            description: "Mark a note as obsolete with a reason".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_id": {"type": "string", "description": "Note UUID"},
+                    "reason": {"type": "string", "description": "Reason for invalidation"}
+                })),
+                required: Some(vec!["note_id".to_string(), "reason".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "supersede_note".to_string(),
+            description: "Replace an old note with a new one".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "old_note_id": {"type": "string", "description": "ID of note to supersede"},
+                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "note_type": {"type": "string", "description": "Type of new note"},
+                    "content": {"type": "string", "description": "Content of new note"},
+                    "importance": {"type": "string", "description": "Importance of new note"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for new note"}
+                })),
+                required: Some(vec!["old_note_id".to_string(), "project_id".to_string(), "note_type".to_string(), "content".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "link_note_to_entity".to_string(),
+            description: "Link a note to a code entity (file, function, struct, etc.)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_id": {"type": "string", "description": "Note UUID"},
+                    "entity_type": {"type": "string", "description": "Entity type: file, function, struct, trait, task, plan, etc."},
+                    "entity_id": {"type": "string", "description": "Entity ID (file path or UUID)"}
+                })),
+                required: Some(vec!["note_id".to_string(), "entity_type".to_string(), "entity_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "unlink_note_from_entity".to_string(),
+            description: "Remove a link between a note and an entity".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_id": {"type": "string", "description": "Note UUID"},
+                    "entity_type": {"type": "string", "description": "Entity type"},
+                    "entity_id": {"type": "string", "description": "Entity ID"}
+                })),
+                required: Some(vec!["note_id".to_string(), "entity_type".to_string(), "entity_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_context_notes".to_string(),
+            description: "Get contextual notes for an entity (direct + propagated through graph)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "entity_type": {"type": "string", "description": "Entity type: file, function, struct, task, etc."},
+                    "entity_id": {"type": "string", "description": "Entity ID"},
+                    "max_depth": {"type": "integer", "description": "Max traversal depth (default 3)"},
+                    "min_score": {"type": "number", "description": "Min relevance score (default 0.1)"}
+                })),
+                required: Some(vec!["entity_type".to_string(), "entity_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_notes_needing_review".to_string(),
+            description: "Get notes that need human review (stale or needs_review status)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Optional project UUID filter"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "update_staleness_scores".to_string(),
+            description: "Update staleness scores for all notes based on time decay".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,7 +1097,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 62, "Expected 62 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 76, "Expected 76 tools, got {}", tools.len());
     }
 
     #[test]

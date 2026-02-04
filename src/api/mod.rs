@@ -2,6 +2,7 @@
 
 pub mod code_handlers;
 pub mod handlers;
+pub mod note_handlers;
 pub mod project_handlers;
 pub mod query;
 pub mod routes;
