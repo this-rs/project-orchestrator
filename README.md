@@ -109,7 +109,7 @@ That's it! Your AI agents now have shared context.
 | [Installation](docs/setup/installation.md) | Full setup instructions and configuration |
 | [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
 | [API Reference](docs/api/reference.md) | Complete REST API documentation |
-| [MCP Tools](docs/api/mcp-tools.md) | All 62 MCP tools with examples |
+| [MCP Tools](docs/api/mcp-tools.md) | All 84 MCP tools with examples |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
 
 ---
@@ -125,7 +125,7 @@ That's it! Your AI agents now have shared context.
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  PROJECT ORCHESTRATOR                        │
-│                    (62 MCP Tools)                           │
+│                    (84 MCP Tools)                           │
 └─────────────────────────────┬───────────────────────────────┘
                               │
         ┌─────────────────────┼─────────────────────┐
