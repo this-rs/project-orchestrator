@@ -43,6 +43,16 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/projects/{slug}/code/search",
             get(project_handlers::search_project_code),
         )
+        // Releases (by project_id)
+        .route(
+            "/api/projects/{project_id}/releases",
+            get(handlers::list_releases).post(handlers::create_release),
+        )
+        // Milestones (by project_id)
+        .route(
+            "/api/projects/{project_id}/milestones",
+            get(handlers::list_milestones).post(handlers::create_milestone),
+        )
         // ====================================================================
         // Plans (global or legacy)
         .route(
@@ -107,6 +117,32 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .route("/api/decisions/search", get(handlers::search_decisions))
         // Sync
         .route("/api/sync", post(handlers::sync_directory))
+        // Releases
+        .route(
+            "/api/releases/{release_id}",
+            get(handlers::get_release).patch(handlers::update_release),
+        )
+        .route(
+            "/api/releases/{release_id}/tasks",
+            post(handlers::add_task_to_release),
+        )
+        .route(
+            "/api/releases/{release_id}/commits",
+            post(handlers::add_commit_to_release),
+        )
+        // Milestones
+        .route(
+            "/api/milestones/{milestone_id}",
+            get(handlers::get_milestone).patch(handlers::update_milestone),
+        )
+        .route(
+            "/api/milestones/{milestone_id}/tasks",
+            post(handlers::add_task_to_milestone),
+        )
+        .route(
+            "/api/milestones/{milestone_id}/progress",
+            get(handlers::get_milestone_progress),
+        )
         // Commits
         .route("/api/commits", post(handlers::create_commit))
         .route(

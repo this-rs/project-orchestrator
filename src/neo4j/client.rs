@@ -2043,4 +2043,483 @@ impl Neo4jClient {
 
         Ok(commits)
     }
+
+    // ========================================================================
+    // Release operations
+    // ========================================================================
+
+    /// Create a release
+    pub async fn create_release(&self, release: &ReleaseNode) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})
+            CREATE (r:Release {
+                id: $id,
+                version: $version,
+                title: $title,
+                description: $description,
+                status: $status,
+                target_date: $target_date,
+                released_at: $released_at,
+                created_at: datetime($created_at),
+                project_id: $project_id
+            })
+            CREATE (p)-[:HAS_RELEASE]->(r)
+            "#,
+        )
+        .param("id", release.id.to_string())
+        .param("version", release.version.clone())
+        .param("title", release.title.clone().unwrap_or_default())
+        .param("description", release.description.clone().unwrap_or_default())
+        .param("status", format!("{:?}", release.status))
+        .param("project_id", release.project_id.to_string())
+        .param(
+            "target_date",
+            release.target_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        )
+        .param(
+            "released_at",
+            release.released_at.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        )
+        .param("created_at", release.created_at.to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get a release by ID
+    pub async fn get_release(&self, id: Uuid) -> Result<Option<ReleaseNode>> {
+        let q = query(
+            r#"
+            MATCH (r:Release {id: $id})
+            RETURN r
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            Ok(Some(self.node_to_release(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Helper to convert Neo4j node to ReleaseNode
+    fn node_to_release(&self, node: &neo4rs::Node) -> Result<ReleaseNode> {
+        Ok(ReleaseNode {
+            id: node.get::<String>("id")?.parse()?,
+            version: node.get("version")?,
+            title: node.get::<String>("title").ok().filter(|s| !s.is_empty()),
+            description: node.get::<String>("description").ok().filter(|s| !s.is_empty()),
+            status: serde_json::from_str(&format!(
+                "\"{}\"",
+                node.get::<String>("status")?.to_lowercase()
+            ))
+            .unwrap_or(ReleaseStatus::Planned),
+            target_date: node
+                .get::<String>("target_date")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            released_at: node
+                .get::<String>("released_at")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            project_id: node.get::<String>("project_id")?.parse()?,
+        })
+    }
+
+    /// List releases for a project
+    pub async fn list_project_releases(&self, project_id: Uuid) -> Result<Vec<ReleaseNode>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:HAS_RELEASE]->(r:Release)
+            RETURN r
+            ORDER BY r.created_at DESC
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut releases = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            releases.push(self.node_to_release(&node)?);
+        }
+
+        Ok(releases)
+    }
+
+    /// Update a release
+    pub async fn update_release(
+        &self,
+        id: Uuid,
+        status: Option<ReleaseStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        released_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        let mut set_clauses = Vec::new();
+
+        if status.is_some() {
+            set_clauses.push("r.status = $status");
+        }
+        if target_date.is_some() {
+            set_clauses.push("r.target_date = $target_date");
+        }
+        if released_at.is_some() {
+            set_clauses.push("r.released_at = $released_at");
+        }
+        if title.is_some() {
+            set_clauses.push("r.title = $title");
+        }
+        if description.is_some() {
+            set_clauses.push("r.description = $description");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        let cypher = format!("MATCH (r:Release {{id: $id}}) SET {}", set_clauses.join(", "));
+
+        let mut q = query(&cypher).param("id", id.to_string());
+
+        if let Some(ref s) = status {
+            q = q.param("status", format!("{:?}", s));
+        }
+        if let Some(d) = target_date {
+            q = q.param("target_date", d.to_rfc3339());
+        }
+        if let Some(d) = released_at {
+            q = q.param("released_at", d.to_rfc3339());
+        }
+        if let Some(ref t) = title {
+            q = q.param("title", t.clone());
+        }
+        if let Some(ref d) = description {
+            q = q.param("description", d.clone());
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Add a task to a release
+    pub async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (r:Release {id: $release_id})
+            MATCH (t:Task {id: $task_id})
+            MERGE (r)-[:INCLUDES_TASK]->(t)
+            "#,
+        )
+        .param("release_id", release_id.to_string())
+        .param("task_id", task_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Add a commit to a release
+    pub async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (r:Release {id: $release_id})
+            MATCH (c:Commit {hash: $hash})
+            MERGE (r)-[:INCLUDES_COMMIT]->(c)
+            "#,
+        )
+        .param("release_id", release_id.to_string())
+        .param("hash", commit_hash);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get release details with tasks and commits
+    pub async fn get_release_details(
+        &self,
+        release_id: Uuid,
+    ) -> Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>> {
+        let q = query(
+            r#"
+            MATCH (r:Release {id: $id})
+            OPTIONAL MATCH (r)-[:INCLUDES_TASK]->(t:Task)
+            OPTIONAL MATCH (r)-[:INCLUDES_COMMIT]->(c:Commit)
+            RETURN r,
+                   collect(DISTINCT t) AS tasks,
+                   collect(DISTINCT c) AS commits
+            "#,
+        )
+        .param("id", release_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            let release_node: neo4rs::Node = row.get("r")?;
+            let release = self.node_to_release(&release_node)?;
+
+            let task_nodes: Vec<neo4rs::Node> = row.get("tasks").unwrap_or_default();
+            let tasks: Vec<TaskNode> = task_nodes
+                .iter()
+                .filter_map(|n| self.node_to_task(n).ok())
+                .collect();
+
+            let commit_nodes: Vec<neo4rs::Node> = row.get("commits").unwrap_or_default();
+            let commits: Vec<CommitNode> = commit_nodes
+                .iter()
+                .filter_map(|n| self.node_to_commit(n).ok())
+                .collect();
+
+            Ok(Some((release, tasks, commits)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ========================================================================
+    // Milestone operations
+    // ========================================================================
+
+    /// Create a milestone
+    pub async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})
+            CREATE (m:Milestone {
+                id: $id,
+                title: $title,
+                description: $description,
+                status: $status,
+                target_date: $target_date,
+                closed_at: $closed_at,
+                created_at: datetime($created_at),
+                project_id: $project_id
+            })
+            CREATE (p)-[:HAS_MILESTONE]->(m)
+            "#,
+        )
+        .param("id", milestone.id.to_string())
+        .param("title", milestone.title.clone())
+        .param("description", milestone.description.clone().unwrap_or_default())
+        .param("status", format!("{:?}", milestone.status))
+        .param("project_id", milestone.project_id.to_string())
+        .param(
+            "target_date",
+            milestone.target_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        )
+        .param(
+            "closed_at",
+            milestone.closed_at.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        )
+        .param("created_at", milestone.created_at.to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get a milestone by ID
+    pub async fn get_milestone(&self, id: Uuid) -> Result<Option<MilestoneNode>> {
+        let q = query(
+            r#"
+            MATCH (m:Milestone {id: $id})
+            RETURN m
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("m")?;
+            Ok(Some(self.node_to_milestone(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Helper to convert Neo4j node to MilestoneNode
+    fn node_to_milestone(&self, node: &neo4rs::Node) -> Result<MilestoneNode> {
+        Ok(MilestoneNode {
+            id: node.get::<String>("id")?.parse()?,
+            title: node.get("title")?,
+            description: node.get::<String>("description").ok().filter(|s| !s.is_empty()),
+            status: serde_json::from_str(&format!(
+                "\"{}\"",
+                node.get::<String>("status")?.to_lowercase()
+            ))
+            .unwrap_or(MilestoneStatus::Open),
+            target_date: node
+                .get::<String>("target_date")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            closed_at: node
+                .get::<String>("closed_at")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            project_id: node.get::<String>("project_id")?.parse()?,
+        })
+    }
+
+    /// List milestones for a project
+    pub async fn list_project_milestones(&self, project_id: Uuid) -> Result<Vec<MilestoneNode>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:HAS_MILESTONE]->(m:Milestone)
+            RETURN m
+            ORDER BY m.target_date ASC, m.created_at ASC
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut milestones = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("m")?;
+            milestones.push(self.node_to_milestone(&node)?);
+        }
+
+        Ok(milestones)
+    }
+
+    /// Update a milestone
+    pub async fn update_milestone(
+        &self,
+        id: Uuid,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        closed_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        let mut set_clauses = Vec::new();
+
+        if status.is_some() {
+            set_clauses.push("m.status = $status");
+        }
+        if target_date.is_some() {
+            set_clauses.push("m.target_date = $target_date");
+        }
+        if closed_at.is_some() {
+            set_clauses.push("m.closed_at = $closed_at");
+        }
+        if title.is_some() {
+            set_clauses.push("m.title = $title");
+        }
+        if description.is_some() {
+            set_clauses.push("m.description = $description");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        let cypher = format!("MATCH (m:Milestone {{id: $id}}) SET {}", set_clauses.join(", "));
+
+        let mut q = query(&cypher).param("id", id.to_string());
+
+        if let Some(ref s) = status {
+            q = q.param("status", format!("{:?}", s));
+        }
+        if let Some(d) = target_date {
+            q = q.param("target_date", d.to_rfc3339());
+        }
+        if let Some(d) = closed_at {
+            q = q.param("closed_at", d.to_rfc3339());
+        }
+        if let Some(ref t) = title {
+            q = q.param("title", t.clone());
+        }
+        if let Some(ref d) = description {
+            q = q.param("description", d.clone());
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Add a task to a milestone
+    pub async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (m:Milestone {id: $milestone_id})
+            MATCH (t:Task {id: $task_id})
+            MERGE (m)-[:INCLUDES_TASK]->(t)
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string())
+        .param("task_id", task_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get milestone details with tasks
+    pub async fn get_milestone_details(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Option<(MilestoneNode, Vec<TaskNode>)>> {
+        let q = query(
+            r#"
+            MATCH (m:Milestone {id: $id})
+            OPTIONAL MATCH (m)-[:INCLUDES_TASK]->(t:Task)
+            RETURN m, collect(DISTINCT t) AS tasks
+            "#,
+        )
+        .param("id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            let milestone_node: neo4rs::Node = row.get("m")?;
+            let milestone = self.node_to_milestone(&milestone_node)?;
+
+            let task_nodes: Vec<neo4rs::Node> = row.get("tasks").unwrap_or_default();
+            let tasks: Vec<TaskNode> = task_nodes
+                .iter()
+                .filter_map(|n| self.node_to_task(n).ok())
+                .collect();
+
+            Ok(Some((milestone, tasks)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get milestone progress (completed tasks / total tasks)
+    pub async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32)> {
+        let q = query(
+            r#"
+            MATCH (m:Milestone {id: $id})-[:INCLUDES_TASK]->(t:Task)
+            RETURN count(t) AS total,
+                   sum(CASE WHEN t.status = 'Completed' THEN 1 ELSE 0 END) AS completed
+            "#,
+        )
+        .param("id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total").unwrap_or(0);
+            let completed: i64 = row.get("completed").unwrap_or(0);
+            Ok((completed as u32, total as u32))
+        } else {
+            Ok((0, 0))
+        }
+    }
 }

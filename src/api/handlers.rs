@@ -1,7 +1,8 @@
 //! API request handlers
 
 use crate::neo4j::models::{
-    CommitNode, ConstraintNode, DecisionNode, PlanNode, PlanStatus, StepNode, TaskNode,
+    CommitNode, ConstraintNode, DecisionNode, MilestoneNode, MilestoneStatus, PlanNode,
+    PlanStatus, ReleaseNode, ReleaseStatus, StepNode, TaskNode,
 };
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
@@ -669,6 +670,310 @@ pub async fn get_plan_commits(
         .get_plan_commits(plan_id)
         .await?;
     Ok(Json(commits))
+}
+
+// ============================================================================
+// Releases
+// ============================================================================
+
+/// Request to create a release
+#[derive(Deserialize)]
+pub struct CreateReleaseRequest {
+    pub version: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub target_date: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Create a release for a project
+pub async fn create_release(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+    Json(req): Json<CreateReleaseRequest>,
+) -> Result<Json<ReleaseNode>, AppError> {
+    let release = ReleaseNode {
+        id: Uuid::new_v4(),
+        version: req.version,
+        title: req.title,
+        description: req.description,
+        status: ReleaseStatus::Planned,
+        target_date: req.target_date,
+        released_at: None,
+        created_at: chrono::Utc::now(),
+        project_id,
+    };
+
+    state.orchestrator.neo4j().create_release(&release).await?;
+    Ok(Json(release))
+}
+
+/// List releases for a project
+pub async fn list_releases(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<Vec<ReleaseNode>>, AppError> {
+    let releases = state
+        .orchestrator
+        .neo4j()
+        .list_project_releases(project_id)
+        .await?;
+    Ok(Json(releases))
+}
+
+/// Request to update a release
+#[derive(Deserialize)]
+pub struct UpdateReleaseRequest {
+    pub status: Option<ReleaseStatus>,
+    pub target_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub released_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Update a release
+pub async fn update_release(
+    State(state): State<OrchestratorState>,
+    Path(release_id): Path<Uuid>,
+    Json(req): Json<UpdateReleaseRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .update_release(
+            release_id,
+            req.status,
+            req.target_date,
+            req.released_at,
+            req.title,
+            req.description,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Request to add a task to a release
+#[derive(Deserialize)]
+pub struct AddTaskToReleaseRequest {
+    pub task_id: Uuid,
+}
+
+/// Add a task to a release
+pub async fn add_task_to_release(
+    State(state): State<OrchestratorState>,
+    Path(release_id): Path<Uuid>,
+    Json(req): Json<AddTaskToReleaseRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .add_task_to_release(release_id, req.task_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Request to add a commit to a release
+#[derive(Deserialize)]
+pub struct AddCommitToReleaseRequest {
+    pub commit_hash: String,
+}
+
+/// Add a commit to a release
+pub async fn add_commit_to_release(
+    State(state): State<OrchestratorState>,
+    Path(release_id): Path<Uuid>,
+    Json(req): Json<AddCommitToReleaseRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .add_commit_to_release(release_id, &req.commit_hash)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Release details response
+#[derive(Serialize)]
+pub struct ReleaseDetailsResponse {
+    pub release: ReleaseNode,
+    pub tasks: Vec<TaskNode>,
+    pub commits: Vec<CommitNode>,
+}
+
+/// Get release details
+pub async fn get_release(
+    State(state): State<OrchestratorState>,
+    Path(release_id): Path<Uuid>,
+) -> Result<Json<ReleaseDetailsResponse>, AppError> {
+    let details = state
+        .orchestrator
+        .neo4j()
+        .get_release_details(release_id)
+        .await?
+        .ok_or(AppError::NotFound("Release not found".into()))?;
+
+    Ok(Json(ReleaseDetailsResponse {
+        release: details.0,
+        tasks: details.1,
+        commits: details.2,
+    }))
+}
+
+// ============================================================================
+// Milestones
+// ============================================================================
+
+/// Request to create a milestone
+#[derive(Deserialize)]
+pub struct CreateMilestoneRequest {
+    pub title: String,
+    pub description: Option<String>,
+    pub target_date: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Create a milestone for a project
+pub async fn create_milestone(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+    Json(req): Json<CreateMilestoneRequest>,
+) -> Result<Json<MilestoneNode>, AppError> {
+    let milestone = MilestoneNode {
+        id: Uuid::new_v4(),
+        title: req.title,
+        description: req.description,
+        status: MilestoneStatus::Open,
+        target_date: req.target_date,
+        closed_at: None,
+        created_at: chrono::Utc::now(),
+        project_id,
+    };
+
+    state
+        .orchestrator
+        .neo4j()
+        .create_milestone(&milestone)
+        .await?;
+    Ok(Json(milestone))
+}
+
+/// List milestones for a project
+pub async fn list_milestones(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<Vec<MilestoneNode>>, AppError> {
+    let milestones = state
+        .orchestrator
+        .neo4j()
+        .list_project_milestones(project_id)
+        .await?;
+    Ok(Json(milestones))
+}
+
+/// Request to update a milestone
+#[derive(Deserialize)]
+pub struct UpdateMilestoneRequest {
+    pub status: Option<MilestoneStatus>,
+    pub target_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub closed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Update a milestone
+pub async fn update_milestone(
+    State(state): State<OrchestratorState>,
+    Path(milestone_id): Path<Uuid>,
+    Json(req): Json<UpdateMilestoneRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .update_milestone(
+            milestone_id,
+            req.status,
+            req.target_date,
+            req.closed_at,
+            req.title,
+            req.description,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Request to add a task to a milestone
+#[derive(Deserialize)]
+pub struct AddTaskToMilestoneRequest {
+    pub task_id: Uuid,
+}
+
+/// Add a task to a milestone
+pub async fn add_task_to_milestone(
+    State(state): State<OrchestratorState>,
+    Path(milestone_id): Path<Uuid>,
+    Json(req): Json<AddTaskToMilestoneRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .add_task_to_milestone(milestone_id, req.task_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Milestone details response
+#[derive(Serialize)]
+pub struct MilestoneDetailsResponse {
+    pub milestone: MilestoneNode,
+    pub tasks: Vec<TaskNode>,
+}
+
+/// Get milestone details
+pub async fn get_milestone(
+    State(state): State<OrchestratorState>,
+    Path(milestone_id): Path<Uuid>,
+) -> Result<Json<MilestoneDetailsResponse>, AppError> {
+    let details = state
+        .orchestrator
+        .neo4j()
+        .get_milestone_details(milestone_id)
+        .await?
+        .ok_or(AppError::NotFound("Milestone not found".into()))?;
+
+    Ok(Json(MilestoneDetailsResponse {
+        milestone: details.0,
+        tasks: details.1,
+    }))
+}
+
+/// Milestone progress response
+#[derive(Serialize)]
+pub struct MilestoneProgressResponse {
+    pub completed: u32,
+    pub total: u32,
+    pub percentage: f32,
+}
+
+/// Get milestone progress
+pub async fn get_milestone_progress(
+    State(state): State<OrchestratorState>,
+    Path(milestone_id): Path<Uuid>,
+) -> Result<Json<MilestoneProgressResponse>, AppError> {
+    let (completed, total) = state
+        .orchestrator
+        .neo4j()
+        .get_milestone_progress(milestone_id)
+        .await?;
+
+    let percentage = if total > 0 {
+        (completed as f32 / total as f32) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(Json(MilestoneProgressResponse {
+        completed,
+        total,
+        percentage,
+    }))
 }
 
 // ============================================================================

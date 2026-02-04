@@ -304,6 +304,57 @@ pub struct CommitNode {
 }
 
 // ============================================================================
+// Release and Milestone Nodes
+// ============================================================================
+
+/// A release/version of the project
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseNode {
+    pub id: Uuid,
+    /// Version string (e.g., "1.0.0", "2.0.0-beta")
+    pub version: String,
+    /// Human-readable title (e.g., "Initial Release")
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub status: ReleaseStatus,
+    pub target_date: Option<DateTime<Utc>>,
+    pub released_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub project_id: Uuid,
+}
+
+/// Status of a release
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseStatus {
+    Planned,
+    InProgress,
+    Released,
+    Cancelled,
+}
+
+/// A milestone in the roadmap
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MilestoneNode {
+    pub id: Uuid,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: MilestoneStatus,
+    pub target_date: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub project_id: Uuid,
+}
+
+/// Status of a milestone
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MilestoneStatus {
+    Open,
+    Closed,
+}
+
+// ============================================================================
 // Relationship types
 // ============================================================================
 
