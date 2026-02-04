@@ -66,10 +66,11 @@ impl FromStr for NoteType {
 }
 
 /// Lifecycle status of a note
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum NoteStatus {
     /// Note is valid and active
+    #[default]
     Active,
     /// Code changed, note needs human review
     NeedsReview,
@@ -108,17 +109,12 @@ impl FromStr for NoteStatus {
     }
 }
 
-impl Default for NoteStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
-
 /// Importance level of a note
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum NoteImportance {
     Low,
+    #[default]
     Medium,
     High,
     Critical,
@@ -168,12 +164,6 @@ impl FromStr for NoteImportance {
             "critical" => Ok(Self::Critical),
             _ => Err(format!("Unknown importance level: {}", s)),
         }
-    }
-}
-
-impl Default for NoteImportance {
-    fn default() -> Self {
-        Self::Medium
     }
 }
 
@@ -430,21 +420,16 @@ pub enum AssertionCheckType {
 }
 
 /// Action to take when an assertion is violated
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ViolationAction {
     /// Just warn, don't change note status
     Warn,
     /// Flag the note as needing review
+    #[default]
     FlagNote,
     /// Block (mark note as needs_review and log warning)
     Block,
-}
-
-impl Default for ViolationAction {
-    fn default() -> Self {
-        Self::FlagNote
-    }
 }
 
 /// A verifiable assertion rule

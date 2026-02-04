@@ -142,20 +142,15 @@ pub struct ImportNode {
 }
 
 /// Visibility level
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
     Public,
+    #[default]
     Private,
     Crate,
     Super,
     InPath(String),
-}
-
-impl Default for Visibility {
-    fn default() -> Self {
-        Self::Private
-    }
 }
 
 // ============================================================================

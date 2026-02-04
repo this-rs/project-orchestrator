@@ -266,7 +266,7 @@ impl MeiliClient {
         let index = self.client.index(index_names::CODE);
         let stats = index.get_stats().await?;
         Ok(IndexStats {
-            total_documents: stats.number_of_documents as usize,
+            total_documents: stats.number_of_documents,
             is_indexing: stats.is_indexing,
         })
     }
@@ -462,7 +462,7 @@ impl MeiliClient {
         let index = self.client.index(index_names::NOTES);
         let stats = index.get_stats().await?;
         Ok(IndexStats {
-            total_documents: stats.number_of_documents as usize,
+            total_documents: stats.number_of_documents,
             is_indexing: stats.is_indexing,
         })
     }
