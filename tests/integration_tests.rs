@@ -315,3 +315,72 @@ async fn test_meilisearch_decision_indexing() {
         results.err()
     );
 }
+
+#[tokio::test]
+async fn test_neo4j_stale_file_cleanup() {
+    if !backends_available().await {
+        eprintln!("Skipping test: backends not available");
+        return;
+    }
+
+    let config = test_config();
+    let state = AppState::new(config).await.unwrap();
+
+    // Create a test project
+    let project_id = Uuid::new_v4();
+    let project = project_orchestrator::neo4j::models::ProjectNode {
+        id: project_id,
+        name: format!("Cleanup Test Project {}", project_id),
+        slug: format!("cleanup-test-{}", project_id),
+        root_path: "/tmp/test-cleanup".to_string(),
+        description: Some("Project for testing stale file cleanup".to_string()),
+        created_at: chrono::Utc::now(),
+        last_synced: None,
+    };
+    state.neo4j.create_project(&project).await.unwrap();
+
+    // Create some file nodes belonging to this project
+    let file1_path = format!("/tmp/test-cleanup/file1_{}.rs", Uuid::new_v4());
+    let file2_path = format!("/tmp/test-cleanup/file2_{}.rs", Uuid::new_v4());
+    let file3_path = format!("/tmp/test-cleanup/file3_{}.rs", Uuid::new_v4());
+
+    for path in [&file1_path, &file2_path, &file3_path] {
+        let file = FileNode {
+            path: path.clone(),
+            language: "rust".to_string(),
+            hash: "test-hash".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project_id),
+        };
+        state.neo4j.upsert_file(&file).await.unwrap();
+        state
+            .neo4j
+            .link_file_to_project(path, project_id)
+            .await
+            .unwrap();
+    }
+
+    // Verify all 3 files exist
+    let paths_before = state.neo4j.get_project_file_paths(project_id).await.unwrap();
+    assert_eq!(paths_before.len(), 3, "Should have 3 files before cleanup");
+
+    // Now simulate a sync where only file1 and file2 exist (file3 was deleted)
+    let valid_paths = vec![file1_path.clone(), file2_path.clone()];
+    let (files_deleted, _symbols_deleted) = state
+        .neo4j
+        .delete_stale_files(project_id, &valid_paths)
+        .await
+        .unwrap();
+
+    assert_eq!(files_deleted, 1, "Should delete 1 stale file");
+
+    // Verify only 2 files remain
+    let paths_after = state.neo4j.get_project_file_paths(project_id).await.unwrap();
+    assert_eq!(paths_after.len(), 2, "Should have 2 files after cleanup");
+    assert!(paths_after.contains(&file1_path), "file1 should still exist");
+    assert!(paths_after.contains(&file2_path), "file2 should still exist");
+    assert!(!paths_after.contains(&file3_path), "file3 should be deleted");
+
+    // Cleanup: delete the test project
+    state.neo4j.delete_project(project_id).await.unwrap();
+}

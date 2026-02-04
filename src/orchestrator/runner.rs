@@ -6,6 +6,7 @@ use crate::plan::models::*;
 use crate::plan::PlanManager;
 use crate::AppState;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -81,6 +82,7 @@ impl Orchestrator {
     ) -> Result<SyncResult> {
         let project_slug = project_slug.map(|s| s.to_string());
         let mut result = SyncResult::default();
+        let mut synced_paths: HashSet<String> = HashSet::new();
 
         let extensions = ["rs", "ts", "tsx", "js", "jsx", "py", "go"];
 
@@ -110,6 +112,9 @@ impl Orchestrator {
                 continue;
             }
 
+            // Track the path for cleanup
+            synced_paths.insert(path_str.to_string());
+
             match self
                 .sync_file_for_project(path, project_id, project_slug.as_deref())
                 .await
@@ -124,6 +129,20 @@ impl Orchestrator {
                 Err(e) => {
                     tracing::warn!("Failed to sync {}: {}", path.display(), e);
                     result.errors += 1;
+                }
+            }
+        }
+
+        // Clean up stale files if we have a project_id
+        if let Some(pid) = project_id {
+            let valid_paths: Vec<String> = synced_paths.into_iter().collect();
+            match self.neo4j().delete_stale_files(pid, &valid_paths).await {
+                Ok((files_deleted, symbols_deleted)) => {
+                    result.files_deleted = files_deleted;
+                    result.symbols_deleted = symbols_deleted;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to clean up stale files: {}", e);
                 }
             }
         }
@@ -363,5 +382,7 @@ impl Orchestrator {
 pub struct SyncResult {
     pub files_synced: usize,
     pub files_skipped: usize,
+    pub files_deleted: usize,
+    pub symbols_deleted: usize,
     pub errors: usize,
 }

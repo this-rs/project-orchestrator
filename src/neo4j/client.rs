@@ -269,6 +269,100 @@ impl Neo4jClient {
     // File operations
     // ========================================================================
 
+    /// Get all file paths for a project
+    pub async fn get_project_file_paths(&self, project_id: Uuid) -> Result<Vec<String>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            RETURN f.path AS path
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut paths = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(path) = row.get::<String>("path") {
+                paths.push(path);
+            }
+        }
+
+        Ok(paths)
+    }
+
+    /// Delete files that are no longer on the filesystem
+    /// Returns the number of files and symbols deleted
+    pub async fn delete_stale_files(
+        &self,
+        project_id: Uuid,
+        valid_paths: &[String],
+    ) -> Result<(usize, usize)> {
+        // First, count what we're about to delete
+        let count_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE NOT f.path IN $valid_paths
+            OPTIONAL MATCH (f)-[:CONTAINS]->(symbol)
+            RETURN count(DISTINCT f) AS file_count, count(DISTINCT symbol) AS symbol_count
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("valid_paths", valid_paths.to_vec());
+
+        let mut result = self.graph.execute(count_q).await?;
+        let (file_count, symbol_count) = if let Some(row) = result.next().await? {
+            let files: i64 = row.get("file_count").unwrap_or(0);
+            let symbols: i64 = row.get("symbol_count").unwrap_or(0);
+            (files as usize, symbols as usize)
+        } else {
+            (0, 0)
+        };
+
+        if file_count == 0 {
+            return Ok((0, 0));
+        }
+
+        // Delete the stale files and their symbols
+        let delete_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE NOT f.path IN $valid_paths
+            OPTIONAL MATCH (f)-[:CONTAINS]->(symbol)
+            DETACH DELETE symbol, f
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("valid_paths", valid_paths.to_vec());
+
+        self.graph.run(delete_q).await?;
+
+        tracing::info!(
+            "Cleaned up {} stale files and {} symbols for project {}",
+            file_count,
+            symbol_count,
+            project_id
+        );
+
+        Ok((file_count, symbol_count))
+    }
+
+    /// Link a file to a project (create CONTAINS relationship)
+    pub async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})
+            MATCH (f:File {path: $file_path})
+            MERGE (p)-[:CONTAINS]->(f)
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("file_path", file_path);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Create or update a file node
     pub async fn upsert_file(&self, file: &FileNode) -> Result<()> {
         let q = query(
