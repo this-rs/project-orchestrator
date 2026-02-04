@@ -226,12 +226,15 @@ impl CodeParser {
         // Extract docstring (look for preceding doc comments)
         let docstring = self.get_preceding_docstring(node, source);
 
+        // Extract generics
+        let generics = self.extract_rust_type_parameters(node, source);
+
         Some(FunctionNode {
             name,
             visibility,
             params,
             return_type,
-            generics: vec![], // TODO: extract generics
+            generics,
             is_async,
             is_unsafe,
             complexity: self.calculate_complexity(node),
@@ -253,11 +256,12 @@ impl CodeParser {
 
         let visibility = self.get_rust_visibility(node, source);
         let docstring = self.get_preceding_docstring(node, source);
+        let generics = self.extract_rust_type_parameters(node, source);
 
         Some(StructNode {
             name,
             visibility,
-            generics: vec![], // TODO: extract generics
+            generics,
             file_path: file_path.to_string(),
             line_start: node.start_position().row as u32 + 1,
             line_end: node.end_position().row as u32 + 1,
@@ -276,11 +280,12 @@ impl CodeParser {
 
         let visibility = self.get_rust_visibility(node, source);
         let docstring = self.get_preceding_docstring(node, source);
+        let generics = self.extract_rust_type_parameters(node, source);
 
         Some(TraitNode {
             name,
             visibility,
-            generics: vec![],
+            generics,
             file_path: file_path.to_string(),
             line_start: node.start_position().row as u32 + 1,
             line_end: node.end_position().row as u32 + 1,
@@ -359,11 +364,14 @@ impl CodeParser {
         let trait_name = self.get_rust_impl_trait(node, source);
 
         if let Some(for_type) = for_type {
+            // Extract generics from impl block
+            let generics = self.extract_rust_type_parameters(node, source);
+
             // Create ImplNode
             let impl_node = ImplNode {
                 for_type: for_type.clone(),
                 trait_name: trait_name.clone(),
-                generics: vec![], // TODO: extract generics
+                generics,
                 where_clause: None, // TODO: extract where clause
                 file_path: file_path.to_string(),
                 line_start: node.start_position().row as u32 + 1,
@@ -396,49 +404,79 @@ impl CodeParser {
     }
 
     /// Extract the type being implemented in an impl block
+    /// For `impl Type`, returns Type
+    /// For `impl Trait for Type`, returns Type (the type after "for")
     fn get_rust_impl_type(&self, node: &tree_sitter::Node, source: &str) -> Option<String> {
-        // Look for type_identifier in the impl item
-        for child in node.children(&mut node.walk()) {
-            match child.kind() {
-                "type_identifier" => {
-                    return child.utf8_text(source.as_bytes()).ok().map(|s| s.to_string());
-                }
-                "generic_type" => {
-                    // e.g., Vec<T> - get the base type
-                    if let Some(name) = child.child_by_field_name("type") {
-                        return name.utf8_text(source.as_bytes()).ok().map(|s| s.to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Extract the trait being implemented in an impl block
-    fn get_rust_impl_trait(&self, node: &tree_sitter::Node, source: &str) -> Option<String> {
-        // Look for "impl Trait for Type" pattern
-        let mut found_trait = None;
         let mut found_for = false;
+        let mut first_type: Option<String> = None;
 
         for child in node.children(&mut node.walk()) {
             if child.kind() == "for" {
                 found_for = true;
-                break;
+                continue;
             }
-            if child.kind() == "type_identifier" || child.kind() == "generic_type" {
-                if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                    found_trait = Some(text.to_string());
+
+            // Skip type_parameters, impl keyword, etc.
+            if child.kind() != "type_identifier" && child.kind() != "generic_type" {
+                continue;
+            }
+
+            let type_name = match child.kind() {
+                "type_identifier" => child
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string()),
+                "generic_type" => child
+                    .child_by_field_name("type")
+                    .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    .map(|s| s.to_string()),
+                _ => None,
+            };
+
+            if let Some(name) = type_name {
+                if found_for {
+                    // This is the type after "for" keyword
+                    return Some(name);
+                } else if first_type.is_none() {
+                    first_type = Some(name);
                 }
             }
         }
 
-        // If we found "for", the first type was the trait
-        if found_for {
-            found_trait
-        } else {
-            None
+        // If no "for" was found, the first type is the impl type
+        first_type
+    }
+
+    /// Extract the trait being implemented in an impl block
+    /// For `impl Trait for Type`, returns Some(Trait)
+    /// For `impl Type`, returns None
+    fn get_rust_impl_trait(&self, node: &tree_sitter::Node, source: &str) -> Option<String> {
+        // First check if there's a "for" keyword (indicates trait impl)
+        let has_for = node.children(&mut node.walk()).any(|c| c.kind() == "for");
+        if !has_for {
+            return None;
         }
+
+        // The trait is the type BEFORE the "for" keyword
+        for child in node.children(&mut node.walk()) {
+            if child.kind() == "for" {
+                break;
+            }
+            if child.kind() == "type_identifier" {
+                return child
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string());
+            }
+            if child.kind() == "generic_type" {
+                return child
+                    .child_by_field_name("type")
+                    .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    .map(|s| s.to_string());
+            }
+        }
+
+        None
     }
 
     /// Extract function calls from a function body
@@ -467,7 +505,10 @@ impl CodeParser {
                 // Get the function being called
                 if let Some(func) = node.child_by_field_name("function") {
                     let callee_name = match func.kind() {
-                        "identifier" => func.utf8_text(source.as_bytes()).ok().map(|s| s.to_string()),
+                        "identifier" => func
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(|s| s.to_string()),
                         "field_expression" => {
                             // e.g., self.method() or obj.method()
                             func.child_by_field_name("field")
@@ -476,7 +517,9 @@ impl CodeParser {
                         }
                         "scoped_identifier" => {
                             // e.g., Module::function()
-                            func.utf8_text(source.as_bytes()).ok().map(|s| s.to_string())
+                            func.utf8_text(source.as_bytes())
+                                .ok()
+                                .map(|s| s.to_string())
                         }
                         _ => None,
                     };
@@ -533,9 +576,11 @@ impl CodeParser {
                     "pub" => Visibility::Public,
                     s if s.starts_with("pub(crate)") => Visibility::Crate,
                     s if s.starts_with("pub(super)") => Visibility::Super,
-                    s if s.starts_with("pub(in") => {
-                        Visibility::InPath(s.trim_start_matches("pub(in ").trim_end_matches(')').to_string())
-                    }
+                    s if s.starts_with("pub(in") => Visibility::InPath(
+                        s.trim_start_matches("pub(in ")
+                            .trim_end_matches(')')
+                            .to_string(),
+                    ),
                     _ => Visibility::Private,
                 };
             }
@@ -615,6 +660,64 @@ impl CodeParser {
         }
     }
 
+    /// Extract type parameters (generics) from a node
+    /// Works for struct_item, trait_item, function_item, impl_item
+    fn extract_rust_type_parameters(&self, node: &tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut generics = Vec::new();
+
+        // Try to find type_parameters by field name first, then by iterating children
+        let type_params_node = node.child_by_field_name("type_parameters").or_else(|| {
+            // For impl blocks and some items, type_parameters is a direct child
+            node.children(&mut node.walk())
+                .find(|c| c.kind() == "type_parameters")
+        });
+
+        if let Some(type_params) = type_params_node {
+            self.extract_generics_from_type_parameters(&type_params, source, &mut generics);
+        }
+
+        generics
+    }
+
+    /// Extract individual type parameters from a type_parameters node
+    fn extract_generics_from_type_parameters(
+        &self,
+        type_params: &tree_sitter::Node,
+        source: &str,
+        generics: &mut Vec<String>,
+    ) {
+        for param in type_params.children(&mut type_params.walk()) {
+            match param.kind() {
+                // Type parameter wrapper: contains the actual type_identifier or constraints
+                "type_parameter" => {
+                    // Get the full text of the type parameter (may include bounds)
+                    if let Ok(full) = param.utf8_text(source.as_bytes()) {
+                        generics.push(full.to_string());
+                    }
+                }
+                // Constrained type parameter: T: Clone, T: 'a + Clone
+                "constrained_type_parameter" => {
+                    if let Ok(full) = param.utf8_text(source.as_bytes()) {
+                        generics.push(full.to_string());
+                    }
+                }
+                // Lifetime parameter wrapper: 'a (contains lifetime node)
+                "lifetime_parameter" => {
+                    if let Ok(name) = param.utf8_text(source.as_bytes()) {
+                        generics.push(name.to_string());
+                    }
+                }
+                // const generic: const N: usize
+                "const_parameter" => {
+                    if let Ok(text) = param.utf8_text(source.as_bytes()) {
+                        generics.push(text.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn calculate_complexity(&self, node: &tree_sitter::Node) -> u32 {
         // Simple cyclomatic complexity approximation
         let mut complexity = 1u32;
@@ -676,9 +779,7 @@ impl CodeParser {
                             params: vec![],
                             return_type: None,
                             generics: vec![],
-                            is_async: node
-                                .children(&mut node.walk())
-                                .any(|c| c.kind() == "async"),
+                            is_async: node.children(&mut node.walk()).any(|c| c.kind() == "async"),
                             is_unsafe: false,
                             complexity: self.calculate_complexity(&node),
                             file_path: file_path.to_string(),
@@ -743,9 +844,8 @@ impl CodeParser {
                 "function_definition" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
-                            let is_async = node
-                                .children(&mut node.walk())
-                                .any(|c| c.kind() == "async");
+                            let is_async =
+                                node.children(&mut node.walk()).any(|c| c.kind() == "async");
                             parsed.symbols.push(name.to_string());
                             parsed.functions.push(FunctionNode {
                                 name: name.to_string(),
@@ -817,7 +917,12 @@ impl CodeParser {
                 "function_declaration" | "method_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
-                            let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                            let visibility = if name
+                                .chars()
+                                .next()
+                                .map(|c| c.is_uppercase())
+                                .unwrap_or(false)
+                            {
                                 Visibility::Public
                             } else {
                                 Visibility::Private
@@ -887,11 +992,7 @@ impl CodeParser {
             language: parsed.language.clone(),
             content: content.to_string(),
             symbols: parsed.symbols.clone(),
-            imports: parsed
-                .imports
-                .iter()
-                .map(|i| i.path.clone())
-                .collect(),
+            imports: parsed.imports.iter().map(|i| i.path.clone()).collect(),
             project_id: None,
             project_slug: None,
         }

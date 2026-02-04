@@ -309,11 +309,11 @@ curl -X POST http://localhost:8080/api/wake \
 ./target/release/orchestrator serve &
 cargo test
 
-# Expected: 55 tests passing
+# Expected: 61 tests passing
 # - 2 unit tests (watcher, slugify)
 # - 29 API tests
 # - 7 integration tests
-# - 17 parser tests
+# - 23 parser tests
 
 # Run specific test suites
 cargo test --test parser_tests      # Code parsing

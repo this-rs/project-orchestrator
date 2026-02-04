@@ -120,11 +120,11 @@ tests/
 # Run tests
 cargo test
 
-# Expected: 55 tests passing
+# Expected: 61 tests passing
 # - 2 unit tests (watcher, slugify)
 # - 29 API tests
 # - 7 integration tests
-# - 17 parser tests
+# - 23 parser tests
 ```
 
 ## Common Tasks
