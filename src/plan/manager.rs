@@ -184,6 +184,14 @@ impl PlanManager {
                 .ok()
                 .filter(|&v| v > 0)
                 .map(|v| v as u32),
+            created_at: task_node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: task_node
+                .get::<String>("updated_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             started_at: task_node
                 .get::<String>("started_at")
                 .ok()
@@ -192,10 +200,6 @@ impl PlanManager {
                 .get::<String>("completed_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),
-            created_at: task_node
-                .get::<String>("created_at")?
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
         };
 
         // Parse steps from Neo4j nodes
@@ -218,6 +222,19 @@ impl PlanManager {
                         .get::<String>("verification")
                         .ok()
                         .filter(|s| !s.is_empty()),
+                    created_at: node
+                        .get::<String>("created_at")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(chrono::Utc::now),
+                    updated_at: node
+                        .get::<String>("updated_at")
+                        .ok()
+                        .and_then(|s| s.parse().ok()),
+                    completed_at: node
+                        .get::<String>("completed_at")
+                        .ok()
+                        .and_then(|s| s.parse().ok()),
                 })
             })
             .collect();
@@ -498,9 +515,17 @@ impl PlanManager {
                 affected_files: task_node.get("affected_files").unwrap_or_default(),
                 estimated_complexity: None,
                 actual_complexity: None,
+                created_at: task_node
+                    .get::<String>("created_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+                updated_at: task_node
+                    .get::<String>("updated_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
                 started_at: None,
                 completed_at: None,
-                created_at: chrono::Utc::now(),
             };
 
             // Parse blockers from Neo4j nodes
@@ -551,6 +576,10 @@ impl PlanManager {
                             .ok()
                             .and_then(|s| s.parse().ok())
                             .unwrap_or_else(chrono::Utc::now),
+                        updated_at: node
+                            .get::<String>("updated_at")
+                            .ok()
+                            .and_then(|s| s.parse().ok()),
                     })
                 })
                 .collect();

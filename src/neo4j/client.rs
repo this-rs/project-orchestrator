@@ -1094,6 +1094,7 @@ impl Neo4jClient {
 
     /// Create a task for a plan
     pub async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> Result<()> {
+        let now = task.created_at.to_rfc3339();
         let q = query(
             r#"
             MATCH (p:Plan {id: $plan_id})
@@ -1107,7 +1108,8 @@ impl Neo4jClient {
                 acceptance_criteria: $acceptance_criteria,
                 affected_files: $affected_files,
                 estimated_complexity: $estimated_complexity,
-                created_at: datetime($created_at)
+                created_at: datetime($created_at),
+                updated_at: datetime($updated_at)
             })
             CREATE (p)-[:HAS_TASK]->(t)
             "#,
@@ -1125,7 +1127,8 @@ impl Neo4jClient {
             "estimated_complexity",
             task.estimated_complexity.map(|c| c as i64).unwrap_or(0),
         )
-        .param("created_at", task.created_at.to_rfc3339());
+        .param("created_at", now.clone())
+        .param("updated_at", now);
 
         self.graph.run(q).await?;
         Ok(())
@@ -1179,6 +1182,14 @@ impl Neo4jClient {
                 .ok()
                 .filter(|&v| v > 0)
                 .map(|v| v as u32),
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: node
+                .get::<String>("updated_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             started_at: node
                 .get::<String>("started_at")
                 .ok()
@@ -1187,10 +1198,6 @@ impl Neo4jClient {
                 .get::<String>("completed_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),
-            created_at: node
-                .get::<String>("created_at")?
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
         })
     }
 
@@ -1201,19 +1208,24 @@ impl Neo4jClient {
             TaskStatus::InProgress => query(
                 r#"
                 MATCH (t:Task {id: $id})
-                SET t.status = $status, t.started_at = datetime($now)
+                SET t.status = $status,
+                    t.started_at = datetime($now),
+                    t.updated_at = datetime($now)
                 "#,
             ),
             TaskStatus::Completed | TaskStatus::Failed => query(
                 r#"
                 MATCH (t:Task {id: $id})
-                SET t.status = $status, t.completed_at = datetime($now)
+                SET t.status = $status,
+                    t.completed_at = datetime($now),
+                    t.updated_at = datetime($now)
                 "#,
             ),
             _ => query(
                 r#"
                 MATCH (t:Task {id: $id})
-                SET t.status = $status
+                SET t.status = $status,
+                    t.updated_at = datetime($now)
                 "#,
             ),
         }
@@ -1339,9 +1351,14 @@ impl Neo4jClient {
             return Ok(());
         }
 
+        // Always update updated_at
+        set_clauses.push("t.updated_at = datetime($updated_at)");
+
         let cypher = format!("MATCH (t:Task {{id: $id}}) SET {}", set_clauses.join(", "));
 
-        let mut q = query(&cypher).param("id", task_id.to_string());
+        let mut q = query(&cypher)
+            .param("id", task_id.to_string())
+            .param("updated_at", chrono::Utc::now().to_rfc3339());
 
         if let Some(ref title) = updates.title {
             q = q.param("title", title.clone());
@@ -1378,6 +1395,7 @@ impl Neo4jClient {
 
     /// Create a step for a task
     pub async fn create_step(&self, task_id: Uuid, step: &StepNode) -> Result<()> {
+        let now = step.created_at.to_rfc3339();
         let q = query(
             r#"
             MATCH (t:Task {id: $task_id})
@@ -1386,7 +1404,9 @@ impl Neo4jClient {
                 order: $order,
                 description: $description,
                 status: $status,
-                verification: $verification
+                verification: $verification,
+                created_at: datetime($created_at),
+                updated_at: datetime($updated_at)
             })
             CREATE (t)-[:HAS_STEP]->(s)
             "#,
@@ -1399,7 +1419,9 @@ impl Neo4jClient {
         .param(
             "verification",
             step.verification.clone().unwrap_or_default(),
-        );
+        )
+        .param("created_at", now.clone())
+        .param("updated_at", now);
 
         self.graph.run(q).await?;
         Ok(())
@@ -1434,6 +1456,19 @@ impl Neo4jClient {
                     .get::<String>("verification")
                     .ok()
                     .filter(|s| !s.is_empty()),
+                created_at: node
+                    .get::<String>("created_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+                updated_at: node
+                    .get::<String>("updated_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                completed_at: node
+                    .get::<String>("completed_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
             });
         }
 
@@ -1442,14 +1477,27 @@ impl Neo4jClient {
 
     /// Update step status
     pub async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
-        let q = query(
-            r#"
-            MATCH (s:Step {id: $id})
-            SET s.status = $status
-            "#,
-        )
+        let now = chrono::Utc::now().to_rfc3339();
+        let q = match status {
+            StepStatus::Completed | StepStatus::Skipped => query(
+                r#"
+                MATCH (s:Step {id: $id})
+                SET s.status = $status,
+                    s.completed_at = datetime($now),
+                    s.updated_at = datetime($now)
+                "#,
+            ),
+            _ => query(
+                r#"
+                MATCH (s:Step {id: $id})
+                SET s.status = $status,
+                    s.updated_at = datetime($now)
+                "#,
+            ),
+        }
         .param("id", step_id.to_string())
-        .param("status", format!("{:?}", status));
+        .param("status", format!("{:?}", status))
+        .param("now", now);
 
         self.graph.run(q).await?;
         Ok(())

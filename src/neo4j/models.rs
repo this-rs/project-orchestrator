@@ -204,9 +204,10 @@ pub struct TaskNode {
     pub affected_files: Vec<String>,
     pub estimated_complexity: Option<u32>,
     pub actual_complexity: Option<u32>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
 }
 
 /// Status of a task
@@ -228,6 +229,9 @@ pub struct StepNode {
     pub description: String,
     pub status: StepStatus,
     pub verification: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 /// Status of a step

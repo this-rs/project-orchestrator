@@ -213,6 +213,7 @@ impl PlanNode {
 impl TaskNode {
     /// Create a new task node with minimal fields
     pub fn new(description: String) -> Self {
+        let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             title: None,
@@ -225,9 +226,10 @@ impl TaskNode {
             affected_files: vec![],
             estimated_complexity: None,
             actual_complexity: None,
+            created_at: now,
+            updated_at: Some(now),
             started_at: None,
             completed_at: None,
-            created_at: Utc::now(),
         }
     }
 
@@ -241,6 +243,7 @@ impl TaskNode {
         affected_files: Vec<String>,
         estimated_complexity: Option<u32>,
     ) -> Self {
+        let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             title,
@@ -253,9 +256,10 @@ impl TaskNode {
             affected_files,
             estimated_complexity,
             actual_complexity: None,
+            created_at: now,
+            updated_at: Some(now),
             started_at: None,
             completed_at: None,
-            created_at: Utc::now(),
         }
     }
 
@@ -268,12 +272,16 @@ impl TaskNode {
 impl StepNode {
     /// Create a new step node
     pub fn new(order: u32, description: String, verification: Option<String>) -> Self {
+        let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             order,
             description,
             status: StepStatus::Pending,
             verification,
+            created_at: now,
+            updated_at: Some(now),
+            completed_at: None,
         }
     }
 }
