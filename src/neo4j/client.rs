@@ -935,9 +935,9 @@ impl Neo4jClient {
             MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)
             RETURN
                 count(t) AS total,
-                sum(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) AS completed,
-                sum(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) AS in_progress,
-                sum(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) AS pending
+                sum(CASE WHEN t.status = 'Completed' THEN 1 ELSE 0 END) AS completed,
+                sum(CASE WHEN t.status = 'InProgress' THEN 1 ELSE 0 END) AS in_progress,
+                sum(CASE WHEN t.status = 'Pending' THEN 1 ELSE 0 END) AS pending
             "#,
         )
         .param("milestone_id", milestone_id.to_string());

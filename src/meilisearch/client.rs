@@ -514,3 +514,54 @@ impl MeiliClient {
         hex::encode(hasher.finalize())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_path_to_id_consistent() {
+        let path = "src/main.rs";
+        let id1 = MeiliClient::path_to_id(path);
+        let id2 = MeiliClient::path_to_id(path);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_path_to_id_different_paths() {
+        let id1 = MeiliClient::path_to_id("src/main.rs");
+        let id2 = MeiliClient::path_to_id("src/lib.rs");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_path_to_id_is_hex() {
+        let id = MeiliClient::path_to_id("test.rs");
+        // SHA256 hex is 64 characters
+        assert_eq!(id.len(), 64);
+        // All characters should be valid hex
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_path_to_id_handles_special_chars() {
+        let id = MeiliClient::path_to_id("src/path with spaces/file.rs");
+        assert_eq!(id.len(), 64);
+
+        let id2 = MeiliClient::path_to_id("src/über/файл.rs");
+        assert_eq!(id2.len(), 64);
+    }
+
+    #[test]
+    fn test_path_to_id_empty_path() {
+        let id = MeiliClient::path_to_id("");
+        assert_eq!(id.len(), 64);
+    }
+
+    #[test]
+    fn test_index_names_constants() {
+        assert_eq!(index_names::CODE, "code");
+        assert_eq!(index_names::DECISIONS, "decisions");
+        assert_eq!(index_names::NOTES, "notes");
+    }
+}

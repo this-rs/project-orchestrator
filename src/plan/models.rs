@@ -349,3 +349,411 @@ impl ConstraintNode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // PlanNode Tests
+    // =========================================================================
+
+    #[test]
+    fn test_plan_node_new() {
+        let plan = PlanNode::new(
+            "Test Plan".to_string(),
+            "A test plan description".to_string(),
+            "test-user".to_string(),
+            5,
+        );
+
+        assert_eq!(plan.title, "Test Plan");
+        assert_eq!(plan.description, "A test plan description");
+        assert_eq!(plan.created_by, "test-user");
+        assert_eq!(plan.priority, 5);
+        assert_eq!(plan.status, PlanStatus::Draft);
+        assert!(plan.project_id.is_none());
+    }
+
+    #[test]
+    fn test_plan_node_new_for_project() {
+        let project_id = Uuid::new_v4();
+        let plan = PlanNode::new_for_project(
+            "Project Plan".to_string(),
+            "Plan linked to project".to_string(),
+            "architect".to_string(),
+            10,
+            project_id,
+        );
+
+        assert_eq!(plan.title, "Project Plan");
+        assert_eq!(plan.priority, 10);
+        assert_eq!(plan.project_id, Some(project_id));
+    }
+
+    #[test]
+    fn test_plan_node_serialization() {
+        let plan = PlanNode::new(
+            "Serialize Test".to_string(),
+            "Description".to_string(),
+            "user".to_string(),
+            3,
+        );
+
+        let json = serde_json::to_string(&plan).unwrap();
+        let deserialized: PlanNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(plan.id, deserialized.id);
+        assert_eq!(plan.title, deserialized.title);
+        assert_eq!(plan.status, deserialized.status);
+    }
+
+    // =========================================================================
+    // TaskNode Tests
+    // =========================================================================
+
+    #[test]
+    fn test_task_node_new_minimal() {
+        let task = TaskNode::new("Implement feature".to_string());
+
+        assert_eq!(task.description, "Implement feature");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.title.is_none());
+        assert!(task.assigned_to.is_none());
+        assert!(task.priority.is_none());
+        assert!(task.tags.is_empty());
+        assert!(task.acceptance_criteria.is_empty());
+        assert!(task.affected_files.is_empty());
+    }
+
+    #[test]
+    fn test_task_node_new_full() {
+        let task = TaskNode::new_full(
+            Some("Feature X".to_string()),
+            "Implement feature X with tests".to_string(),
+            Some(8),
+            vec!["backend".to_string(), "api".to_string()],
+            vec!["Tests pass".to_string(), "No regressions".to_string()],
+            vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+            Some(5),
+        );
+
+        assert_eq!(task.title, Some("Feature X".to_string()));
+        assert_eq!(task.priority, Some(8));
+        assert_eq!(task.tags.len(), 2);
+        assert!(task.tags.contains(&"backend".to_string()));
+        assert_eq!(task.acceptance_criteria.len(), 2);
+        assert_eq!(task.affected_files.len(), 2);
+        assert_eq!(task.estimated_complexity, Some(5));
+    }
+
+    #[test]
+    fn test_task_node_is_available_when_pending_and_unassigned() {
+        let task = TaskNode::new("Available task".to_string());
+        assert!(task.is_available());
+    }
+
+    #[test]
+    fn test_task_node_not_available_when_assigned() {
+        let mut task = TaskNode::new("Assigned task".to_string());
+        task.assigned_to = Some("agent-1".to_string());
+        assert!(!task.is_available());
+    }
+
+    #[test]
+    fn test_task_node_not_available_when_in_progress() {
+        let mut task = TaskNode::new("In progress task".to_string());
+        task.status = TaskStatus::InProgress;
+        assert!(!task.is_available());
+    }
+
+    #[test]
+    fn test_task_node_not_available_when_completed() {
+        let mut task = TaskNode::new("Completed task".to_string());
+        task.status = TaskStatus::Completed;
+        assert!(!task.is_available());
+    }
+
+    #[test]
+    fn test_task_node_serialization() {
+        let task = TaskNode::new_full(
+            Some("Test".to_string()),
+            "Description".to_string(),
+            Some(5),
+            vec!["tag".to_string()],
+            vec!["criterion".to_string()],
+            vec!["file.rs".to_string()],
+            Some(3),
+        );
+
+        let json = serde_json::to_string(&task).unwrap();
+        let deserialized: TaskNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(task.id, deserialized.id);
+        assert_eq!(task.tags, deserialized.tags);
+        assert_eq!(task.estimated_complexity, deserialized.estimated_complexity);
+    }
+
+    // =========================================================================
+    // StepNode Tests
+    // =========================================================================
+
+    #[test]
+    fn test_step_node_new() {
+        let step = StepNode::new(
+            0,
+            "First step".to_string(),
+            Some("Check file exists".to_string()),
+        );
+
+        assert_eq!(step.order, 0);
+        assert_eq!(step.description, "First step");
+        assert_eq!(step.status, StepStatus::Pending);
+        assert_eq!(step.verification, Some("Check file exists".to_string()));
+        assert!(step.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_step_node_without_verification() {
+        let step = StepNode::new(1, "Second step".to_string(), None);
+
+        assert_eq!(step.order, 1);
+        assert!(step.verification.is_none());
+    }
+
+    #[test]
+    fn test_step_node_serialization() {
+        let step = StepNode::new(
+            2,
+            "Step description".to_string(),
+            Some("Verify".to_string()),
+        );
+
+        let json = serde_json::to_string(&step).unwrap();
+        let deserialized: StepNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(step.id, deserialized.id);
+        assert_eq!(step.order, deserialized.order);
+        assert_eq!(step.verification, deserialized.verification);
+    }
+
+    // =========================================================================
+    // DecisionNode Tests
+    // =========================================================================
+
+    #[test]
+    fn test_decision_node_new() {
+        let decision = DecisionNode::new(
+            "Use async/await".to_string(),
+            "Better for I/O operations".to_string(),
+            vec!["threads".to_string(), "callbacks".to_string()],
+            "architect".to_string(),
+        );
+
+        assert_eq!(decision.description, "Use async/await");
+        assert_eq!(decision.rationale, "Better for I/O operations");
+        assert_eq!(decision.alternatives.len(), 2);
+        assert!(decision.alternatives.contains(&"threads".to_string()));
+        assert!(decision.chosen_option.is_none());
+        assert_eq!(decision.decided_by, "architect");
+    }
+
+    #[test]
+    fn test_decision_node_empty_alternatives() {
+        let decision = DecisionNode::new(
+            "Simple decision".to_string(),
+            "No alternatives needed".to_string(),
+            vec![],
+            "user".to_string(),
+        );
+
+        assert!(decision.alternatives.is_empty());
+    }
+
+    #[test]
+    fn test_decision_node_serialization() {
+        let decision = DecisionNode::new(
+            "Decision".to_string(),
+            "Rationale".to_string(),
+            vec!["alt1".to_string()],
+            "decider".to_string(),
+        );
+
+        let json = serde_json::to_string(&decision).unwrap();
+        let deserialized: DecisionNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decision.id, deserialized.id);
+        assert_eq!(decision.alternatives, deserialized.alternatives);
+    }
+
+    // =========================================================================
+    // ConstraintNode Tests
+    // =========================================================================
+
+    #[test]
+    fn test_constraint_node_new_with_enforced_by() {
+        let constraint = ConstraintNode::new(
+            ConstraintType::Security,
+            "Must sanitize user input".to_string(),
+            Some("clippy::security".to_string()),
+        );
+
+        assert_eq!(constraint.constraint_type, ConstraintType::Security);
+        assert_eq!(constraint.description, "Must sanitize user input");
+        assert_eq!(constraint.enforced_by, Some("clippy::security".to_string()));
+    }
+
+    #[test]
+    fn test_constraint_node_new_without_enforced_by() {
+        let constraint = ConstraintNode::new(
+            ConstraintType::Performance,
+            "Response time under 100ms".to_string(),
+            None,
+        );
+
+        assert_eq!(constraint.constraint_type, ConstraintType::Performance);
+        assert!(constraint.enforced_by.is_none());
+    }
+
+    #[test]
+    fn test_constraint_node_all_types() {
+        let types = vec![
+            ConstraintType::Security,
+            ConstraintType::Performance,
+            ConstraintType::Style,
+            ConstraintType::Compatibility,
+            ConstraintType::Other,
+        ];
+
+        for constraint_type in types {
+            let constraint = ConstraintNode::new(constraint_type.clone(), "test".to_string(), None);
+            assert_eq!(constraint.constraint_type, constraint_type);
+        }
+    }
+
+    #[test]
+    fn test_constraint_node_serialization() {
+        let constraint = ConstraintNode::new(
+            ConstraintType::Style,
+            "Follow Rust conventions".to_string(),
+            Some("rustfmt".to_string()),
+        );
+
+        let json = serde_json::to_string(&constraint).unwrap();
+        let deserialized: ConstraintNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(constraint.id, deserialized.id);
+        assert_eq!(constraint.constraint_type, deserialized.constraint_type);
+    }
+
+    // =========================================================================
+    // DTO Serialization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_create_plan_request_serialization() {
+        let request = CreatePlanRequest {
+            title: "New Plan".to_string(),
+            description: "Plan description".to_string(),
+            priority: Some(5),
+            constraints: None,
+            project_id: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let deserialized: CreatePlanRequest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(request.title, deserialized.title);
+        assert_eq!(request.priority, deserialized.priority);
+    }
+
+    #[test]
+    fn test_create_task_request_serialization() {
+        let request = CreateTaskRequest {
+            title: Some("Task Title".to_string()),
+            description: "Task description".to_string(),
+            priority: Some(8),
+            tags: Some(vec!["backend".to_string()]),
+            acceptance_criteria: Some(vec!["Tests pass".to_string()]),
+            affected_files: Some(vec!["src/main.rs".to_string()]),
+            depends_on: None,
+            steps: None,
+            estimated_complexity: Some(4),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let deserialized: CreateTaskRequest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(request.title, deserialized.title);
+        assert_eq!(request.tags, deserialized.tags);
+    }
+
+    #[test]
+    fn test_update_task_request_partial() {
+        // Test that UpdateTaskRequest works with partial fields
+        let request = UpdateTaskRequest {
+            status: Some(TaskStatus::InProgress),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let deserialized: UpdateTaskRequest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.status, Some(TaskStatus::InProgress));
+        assert!(deserialized.title.is_none());
+        assert!(deserialized.assigned_to.is_none());
+    }
+
+    #[test]
+    fn test_agent_context_serialization() {
+        let context = AgentContext {
+            task: TaskNode::new("Test task".to_string()),
+            steps: vec![StepNode::new(0, "Step 1".to_string(), None)],
+            constraints: vec![],
+            decisions: vec![],
+            target_files: vec![],
+            similar_code: vec![],
+            related_decisions: vec![],
+            notes: vec![],
+        };
+
+        let json = serde_json::to_string(&context).unwrap();
+        let deserialized: AgentContext = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(context.task.id, deserialized.task.id);
+        assert_eq!(context.steps.len(), deserialized.steps.len());
+    }
+
+    #[test]
+    fn test_file_context_serialization() {
+        let context = FileContext {
+            path: "src/test.rs".to_string(),
+            language: "rust".to_string(),
+            symbols: vec!["func1".to_string(), "Struct1".to_string()],
+            dependent_files: vec!["src/other.rs".to_string()],
+            dependencies: vec!["src/lib.rs".to_string()],
+            notes: vec![],
+        };
+
+        let json = serde_json::to_string(&context).unwrap();
+        let deserialized: FileContext = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(context.path, deserialized.path);
+        assert_eq!(context.symbols, deserialized.symbols);
+    }
+
+    #[test]
+    fn test_code_reference_serialization() {
+        let reference = CodeReference {
+            path: "src/example.rs".to_string(),
+            snippet: "fn example() {}".to_string(),
+            relevance: 0.85,
+        };
+
+        let json = serde_json::to_string(&reference).unwrap();
+        let deserialized: CodeReference = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(reference.path, deserialized.path);
+        assert!((reference.relevance - deserialized.relevance).abs() < 0.001);
+    }
+}
