@@ -188,6 +188,12 @@ impl Neo4jClient {
             "CREATE CONSTRAINT agent_id IF NOT EXISTS FOR (a:Agent) REQUIRE a.id IS UNIQUE",
             // Knowledge Note constraints
             "CREATE CONSTRAINT note_id IF NOT EXISTS FOR (n:Note) REQUIRE n.id IS UNIQUE",
+            // Workspace constraints
+            "CREATE CONSTRAINT workspace_id IF NOT EXISTS FOR (w:Workspace) REQUIRE w.id IS UNIQUE",
+            "CREATE CONSTRAINT workspace_slug IF NOT EXISTS FOR (w:Workspace) REQUIRE w.slug IS UNIQUE",
+            "CREATE CONSTRAINT workspace_milestone_id IF NOT EXISTS FOR (wm:WorkspaceMilestone) REQUIRE wm.id IS UNIQUE",
+            "CREATE CONSTRAINT resource_id IF NOT EXISTS FOR (r:Resource) REQUIRE r.id IS UNIQUE",
+            "CREATE CONSTRAINT component_id IF NOT EXISTS FOR (c:Component) REQUIRE c.id IS UNIQUE",
         ];
 
         let indexes = vec![
@@ -211,6 +217,15 @@ impl Neo4jClient {
             "CREATE INDEX note_type IF NOT EXISTS FOR (n:Note) ON (n.note_type)",
             "CREATE INDEX note_importance IF NOT EXISTS FOR (n:Note) ON (n.importance)",
             "CREATE INDEX note_staleness IF NOT EXISTS FOR (n:Note) ON (n.staleness_score)",
+            // Workspace indexes
+            "CREATE INDEX workspace_name IF NOT EXISTS FOR (w:Workspace) ON (w.name)",
+            "CREATE INDEX ws_milestone_workspace IF NOT EXISTS FOR (wm:WorkspaceMilestone) ON (wm.workspace_id)",
+            "CREATE INDEX ws_milestone_status IF NOT EXISTS FOR (wm:WorkspaceMilestone) ON (wm.status)",
+            "CREATE INDEX resource_workspace IF NOT EXISTS FOR (r:Resource) ON (r.workspace_id)",
+            "CREATE INDEX resource_project IF NOT EXISTS FOR (r:Resource) ON (r.project_id)",
+            "CREATE INDEX resource_type IF NOT EXISTS FOR (r:Resource) ON (r.resource_type)",
+            "CREATE INDEX component_workspace IF NOT EXISTS FOR (c:Component) ON (c.workspace_id)",
+            "CREATE INDEX component_type IF NOT EXISTS FOR (c:Component) ON (c.component_type)",
         ];
 
         for constraint in constraints {
@@ -410,6 +425,1112 @@ impl Neo4jClient {
                 .get::<String>("last_synced")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+        })
+    }
+
+    // ========================================================================
+    // Workspace operations
+    // ========================================================================
+
+    /// Create a new workspace
+    pub async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()> {
+        let q = query(
+            r#"
+            CREATE (w:Workspace {
+                id: $id,
+                name: $name,
+                slug: $slug,
+                description: $description,
+                created_at: datetime($created_at),
+                metadata: $metadata
+            })
+            "#,
+        )
+        .param("id", workspace.id.to_string())
+        .param("name", workspace.name.clone())
+        .param("slug", workspace.slug.clone())
+        .param(
+            "description",
+            workspace.description.clone().unwrap_or_default(),
+        )
+        .param("created_at", workspace.created_at.to_rfc3339())
+        .param("metadata", workspace.metadata.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get a workspace by ID
+    pub async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceNode>> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $id})
+            RETURN w
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("w")?;
+            Ok(Some(self.node_to_workspace(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a workspace by slug
+    pub async fn get_workspace_by_slug(&self, slug: &str) -> Result<Option<WorkspaceNode>> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {slug: $slug})
+            RETURN w
+            "#,
+        )
+        .param("slug", slug);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("w")?;
+            Ok(Some(self.node_to_workspace(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List all workspaces
+    pub async fn list_workspaces(&self) -> Result<Vec<WorkspaceNode>> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace)
+            RETURN w
+            ORDER BY w.name
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut workspaces = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("w")?;
+            workspaces.push(self.node_to_workspace(&node)?);
+        }
+
+        Ok(workspaces)
+    }
+
+    /// Update a workspace
+    pub async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let mut set_clauses = vec!["w.updated_at = datetime($now)".to_string()];
+
+        if name.is_some() {
+            set_clauses.push("w.name = $name".to_string());
+        }
+        if description.is_some() {
+            set_clauses.push("w.description = $description".to_string());
+        }
+        if metadata.is_some() {
+            set_clauses.push("w.metadata = $metadata".to_string());
+        }
+
+        let cypher = format!(
+            r#"
+            MATCH (w:Workspace {{id: $id}})
+            SET {}
+            "#,
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher)
+            .param("id", id.to_string())
+            .param("now", chrono::Utc::now().to_rfc3339());
+
+        if let Some(n) = name {
+            q = q.param("name", n);
+        }
+        if let Some(d) = description {
+            q = q.param("description", d);
+        }
+        if let Some(m) = metadata {
+            q = q.param("metadata", m.to_string());
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Delete a workspace and all its data
+    pub async fn delete_workspace(&self, id: Uuid) -> Result<()> {
+        // Delete workspace milestones
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $id})-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone)
+            DETACH DELETE wm
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete resources owned by workspace
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $id})-[:HAS_RESOURCE]->(r:Resource)
+            DETACH DELETE r
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete components
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $id})-[:HAS_COMPONENT]->(c:Component)
+            DETACH DELETE c
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Remove workspace association from projects (don't delete projects)
+        let q = query(
+            r#"
+            MATCH (p:Project)-[r:BELONGS_TO_WORKSPACE]->(w:Workspace {id: $id})
+            DELETE r
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete the workspace itself
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $id})
+            DETACH DELETE w
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        Ok(())
+    }
+
+    /// Add a project to a workspace
+    pub async fn add_project_to_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})
+            MATCH (p:Project {id: $project_id})
+            MERGE (p)-[:BELONGS_TO_WORKSPACE]->(w)
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string())
+        .param("project_id", project_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Remove a project from a workspace
+    pub async fn remove_project_from_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[r:BELONGS_TO_WORKSPACE]->(w:Workspace {id: $workspace_id})
+            DELETE r
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string())
+        .param("project_id", project_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// List all projects in a workspace
+    pub async fn list_workspace_projects(&self, workspace_id: Uuid) -> Result<Vec<ProjectNode>> {
+        let q = query(
+            r#"
+            MATCH (p:Project)-[:BELONGS_TO_WORKSPACE]->(w:Workspace {id: $workspace_id})
+            RETURN p
+            ORDER BY p.name
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut projects = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("p")?;
+            projects.push(self.node_to_project(&node)?);
+        }
+
+        Ok(projects)
+    }
+
+    /// Get the workspace a project belongs to
+    pub async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:BELONGS_TO_WORKSPACE]->(w:Workspace)
+            RETURN w
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("w")?;
+            Ok(Some(self.node_to_workspace(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Helper to convert Neo4j node to WorkspaceNode
+    fn node_to_workspace(&self, node: &neo4rs::Node) -> Result<WorkspaceNode> {
+        let metadata_str: String = node.get("metadata").unwrap_or_else(|_| "{}".to_string());
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({}));
+
+        Ok(WorkspaceNode {
+            id: node.get::<String>("id")?.parse()?,
+            name: node.get("name")?,
+            slug: node.get("slug")?,
+            description: node.get("description").ok(),
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: node
+                .get::<String>("updated_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            metadata,
+        })
+    }
+
+    // ========================================================================
+    // Workspace Milestone operations
+    // ========================================================================
+
+    /// Create a workspace milestone
+    pub async fn create_workspace_milestone(
+        &self,
+        milestone: &WorkspaceMilestoneNode,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})
+            CREATE (wm:WorkspaceMilestone {
+                id: $id,
+                workspace_id: $workspace_id,
+                title: $title,
+                description: $description,
+                status: $status,
+                target_date: $target_date,
+                created_at: datetime($created_at),
+                tags: $tags
+            })
+            CREATE (w)-[:HAS_WORKSPACE_MILESTONE]->(wm)
+            "#,
+        )
+        .param("id", milestone.id.to_string())
+        .param("workspace_id", milestone.workspace_id.to_string())
+        .param("title", milestone.title.clone())
+        .param(
+            "description",
+            milestone.description.clone().unwrap_or_default(),
+        )
+        .param("status", format!("{:?}", milestone.status))
+        .param(
+            "target_date",
+            milestone
+                .target_date
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
+        )
+        .param("created_at", milestone.created_at.to_rfc3339())
+        .param("tags", milestone.tags.clone());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get a workspace milestone by ID
+    pub async fn get_workspace_milestone(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<WorkspaceMilestoneNode>> {
+        let q = query(
+            r#"
+            MATCH (wm:WorkspaceMilestone {id: $id})
+            RETURN wm
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("wm")?;
+            Ok(Some(self.node_to_workspace_milestone(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List workspace milestones
+    pub async fn list_workspace_milestones(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<WorkspaceMilestoneNode>> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone)
+            RETURN wm
+            ORDER BY wm.target_date, wm.title
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut milestones = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("wm")?;
+            milestones.push(self.node_to_workspace_milestone(&node)?);
+        }
+
+        Ok(milestones)
+    }
+
+    /// Update a workspace milestone
+    pub async fn update_workspace_milestone(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        let mut set_clauses = Vec::new();
+
+        if title.is_some() {
+            set_clauses.push("wm.title = $title".to_string());
+        }
+        if description.is_some() {
+            set_clauses.push("wm.description = $description".to_string());
+        }
+        if status.is_some() {
+            set_clauses.push("wm.status = $status".to_string());
+        }
+        if target_date.is_some() {
+            set_clauses.push("wm.target_date = $target_date".to_string());
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        let cypher = format!(
+            r#"
+            MATCH (wm:WorkspaceMilestone {{id: $id}})
+            SET {}
+            "#,
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher).param("id", id.to_string());
+
+        if let Some(t) = title {
+            q = q.param("title", t);
+        }
+        if let Some(d) = description {
+            q = q.param("description", d);
+        }
+        if let Some(s) = status {
+            q = q.param("status", format!("{:?}", s));
+        }
+        if let Some(td) = target_date {
+            q = q.param("target_date", td.to_rfc3339());
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Delete a workspace milestone
+    pub async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (wm:WorkspaceMilestone {id: $id})
+            DETACH DELETE wm
+            "#,
+        )
+        .param("id", id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Add a task to a workspace milestone
+    pub async fn add_task_to_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (wm:WorkspaceMilestone {id: $milestone_id})
+            MATCH (t:Task {id: $task_id})
+            MERGE (wm)-[:INCLUDES_TASK]->(t)
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string())
+        .param("task_id", task_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Remove a task from a workspace milestone
+    pub async fn remove_task_from_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[r:INCLUDES_TASK]->(t:Task {id: $task_id})
+            DELETE r
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string())
+        .param("task_id", task_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get workspace milestone progress
+    pub async fn get_workspace_milestone_progress(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<(u32, u32, u32, u32)> {
+        let q = query(
+            r#"
+            MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)
+            RETURN
+                count(t) AS total,
+                sum(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                sum(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) AS in_progress,
+                sum(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) AS pending
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total").unwrap_or(0);
+            let completed: i64 = row.get("completed").unwrap_or(0);
+            let in_progress: i64 = row.get("in_progress").unwrap_or(0);
+            let pending: i64 = row.get("pending").unwrap_or(0);
+            Ok((
+                total as u32,
+                completed as u32,
+                in_progress as u32,
+                pending as u32,
+            ))
+        } else {
+            Ok((0, 0, 0, 0))
+        }
+    }
+
+    /// Get tasks linked to a workspace milestone
+    pub async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>> {
+        let q = query(
+            r#"
+            MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)
+            RETURN t
+            ORDER BY t.priority DESC, t.created_at
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            tasks.push(self.node_to_task(&node)?);
+        }
+        Ok(tasks)
+    }
+
+    /// Helper to convert Neo4j node to WorkspaceMilestoneNode
+    fn node_to_workspace_milestone(&self, node: &neo4rs::Node) -> Result<WorkspaceMilestoneNode> {
+        let status_str: String = node.get("status").unwrap_or_else(|_| "Open".to_string());
+        let status = match status_str.to_lowercase().as_str() {
+            "closed" => MilestoneStatus::Closed,
+            _ => MilestoneStatus::Open,
+        };
+
+        let tags: Vec<String> = node.get("tags").unwrap_or_else(|_| vec![]);
+
+        Ok(WorkspaceMilestoneNode {
+            id: node.get::<String>("id")?.parse()?,
+            workspace_id: node.get::<String>("workspace_id")?.parse()?,
+            title: node.get("title")?,
+            description: node.get("description").ok(),
+            status,
+            target_date: node
+                .get::<String>("target_date")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            closed_at: node
+                .get::<String>("closed_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            tags,
+        })
+    }
+
+    // ========================================================================
+    // Resource operations
+    // ========================================================================
+
+    /// Create a resource
+    pub async fn create_resource(&self, resource: &ResourceNode) -> Result<()> {
+        let q = query(
+            r#"
+            CREATE (r:Resource {
+                id: $id,
+                workspace_id: $workspace_id,
+                project_id: $project_id,
+                name: $name,
+                resource_type: $resource_type,
+                file_path: $file_path,
+                url: $url,
+                format: $format,
+                version: $version,
+                description: $description,
+                created_at: datetime($created_at),
+                metadata: $metadata
+            })
+            "#,
+        )
+        .param("id", resource.id.to_string())
+        .param(
+            "workspace_id",
+            resource
+                .workspace_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "project_id",
+            resource
+                .project_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        )
+        .param("name", resource.name.clone())
+        .param("resource_type", format!("{:?}", resource.resource_type))
+        .param("file_path", resource.file_path.clone())
+        .param("url", resource.url.clone().unwrap_or_default())
+        .param("format", resource.format.clone().unwrap_or_default())
+        .param("version", resource.version.clone().unwrap_or_default())
+        .param(
+            "description",
+            resource.description.clone().unwrap_or_default(),
+        )
+        .param("created_at", resource.created_at.to_rfc3339())
+        .param("metadata", resource.metadata.to_string());
+
+        self.graph.run(q).await?;
+
+        // Link to workspace if specified
+        if let Some(workspace_id) = resource.workspace_id {
+            let link_q = query(
+                r#"
+                MATCH (w:Workspace {id: $workspace_id})
+                MATCH (r:Resource {id: $resource_id})
+                MERGE (w)-[:HAS_RESOURCE]->(r)
+                "#,
+            )
+            .param("workspace_id", workspace_id.to_string())
+            .param("resource_id", resource.id.to_string());
+            self.graph.run(link_q).await?;
+        }
+
+        // Link to project if specified
+        if let Some(project_id) = resource.project_id {
+            let link_q = query(
+                r#"
+                MATCH (p:Project {id: $project_id})
+                MATCH (r:Resource {id: $resource_id})
+                MERGE (p)-[:HAS_RESOURCE]->(r)
+                "#,
+            )
+            .param("project_id", project_id.to_string())
+            .param("resource_id", resource.id.to_string());
+            self.graph.run(link_q).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get a resource by ID
+    pub async fn get_resource(&self, id: Uuid) -> Result<Option<ResourceNode>> {
+        let q = query(
+            r#"
+            MATCH (r:Resource {id: $id})
+            RETURN r
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            Ok(Some(self.node_to_resource(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List workspace resources
+    pub async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})-[:HAS_RESOURCE]->(r:Resource)
+            RETURN r
+            ORDER BY r.name
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut resources = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            resources.push(self.node_to_resource(&node)?);
+        }
+
+        Ok(resources)
+    }
+
+    /// Delete a resource
+    pub async fn delete_resource(&self, id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (r:Resource {id: $id})
+            DETACH DELETE r
+            "#,
+        )
+        .param("id", id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Link a project as implementing a resource
+    pub async fn link_project_implements_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})
+            MATCH (r:Resource {id: $resource_id})
+            MERGE (p)-[:IMPLEMENTS_RESOURCE]->(r)
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("resource_id", resource_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Link a project as using a resource
+    pub async fn link_project_uses_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})
+            MATCH (r:Resource {id: $resource_id})
+            MERGE (p)-[:USES_RESOURCE]->(r)
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("resource_id", resource_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get projects that implement a resource
+    pub async fn get_resource_implementers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>> {
+        let q = query(
+            r#"
+            MATCH (p:Project)-[:IMPLEMENTS_RESOURCE]->(r:Resource {id: $resource_id})
+            RETURN p
+            "#,
+        )
+        .param("resource_id", resource_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut projects = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("p")?;
+            projects.push(self.node_to_project(&node)?);
+        }
+
+        Ok(projects)
+    }
+
+    /// Get projects that use a resource
+    pub async fn get_resource_consumers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>> {
+        let q = query(
+            r#"
+            MATCH (p:Project)-[:USES_RESOURCE]->(r:Resource {id: $resource_id})
+            RETURN p
+            "#,
+        )
+        .param("resource_id", resource_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut projects = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("p")?;
+            projects.push(self.node_to_project(&node)?);
+        }
+
+        Ok(projects)
+    }
+
+    /// Helper to convert Neo4j node to ResourceNode
+    fn node_to_resource(&self, node: &neo4rs::Node) -> Result<ResourceNode> {
+        let type_str: String = node
+            .get("resource_type")
+            .unwrap_or_else(|_| "Other".to_string());
+        let resource_type = match type_str.to_lowercase().as_str() {
+            "apicontract" | "api_contract" => ResourceType::ApiContract,
+            "protobuf" => ResourceType::Protobuf,
+            "graphqlschema" | "graphql_schema" => ResourceType::GraphqlSchema,
+            "jsonschema" | "json_schema" => ResourceType::JsonSchema,
+            "databaseschema" | "database_schema" => ResourceType::DatabaseSchema,
+            "sharedtypes" | "shared_types" => ResourceType::SharedTypes,
+            "config" => ResourceType::Config,
+            "documentation" => ResourceType::Documentation,
+            _ => ResourceType::Other,
+        };
+
+        let metadata_str: String = node.get("metadata").unwrap_or_else(|_| "{}".to_string());
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({}));
+
+        Ok(ResourceNode {
+            id: node.get::<String>("id")?.parse()?,
+            workspace_id: node
+                .get::<String>("workspace_id")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            project_id: node
+                .get::<String>("project_id")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            name: node.get("name")?,
+            resource_type,
+            file_path: node.get("file_path")?,
+            url: node.get("url").ok(),
+            format: node.get("format").ok(),
+            version: node.get("version").ok(),
+            description: node.get("description").ok(),
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: node
+                .get::<String>("updated_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            metadata,
+        })
+    }
+
+    // ========================================================================
+    // Component operations (Topology)
+    // ========================================================================
+
+    /// Create a component
+    pub async fn create_component(&self, component: &ComponentNode) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})
+            CREATE (c:Component {
+                id: $id,
+                workspace_id: $workspace_id,
+                name: $name,
+                component_type: $component_type,
+                description: $description,
+                runtime: $runtime,
+                config: $config,
+                created_at: datetime($created_at),
+                tags: $tags
+            })
+            CREATE (w)-[:HAS_COMPONENT]->(c)
+            "#,
+        )
+        .param("id", component.id.to_string())
+        .param("workspace_id", component.workspace_id.to_string())
+        .param("name", component.name.clone())
+        .param("component_type", format!("{:?}", component.component_type))
+        .param(
+            "description",
+            component.description.clone().unwrap_or_default(),
+        )
+        .param("runtime", component.runtime.clone().unwrap_or_default())
+        .param("config", component.config.to_string())
+        .param("created_at", component.created_at.to_rfc3339())
+        .param("tags", component.tags.clone());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get a component by ID
+    pub async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>> {
+        let q = query(
+            r#"
+            MATCH (c:Component {id: $id})
+            RETURN c
+            "#,
+        )
+        .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("c")?;
+            Ok(Some(self.node_to_component(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List components in a workspace
+    pub async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})-[:HAS_COMPONENT]->(c:Component)
+            RETURN c
+            ORDER BY c.name
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut components = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("c")?;
+            components.push(self.node_to_component(&node)?);
+        }
+
+        Ok(components)
+    }
+
+    /// Delete a component
+    pub async fn delete_component(&self, id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (c:Component {id: $id})
+            DETACH DELETE c
+            "#,
+        )
+        .param("id", id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Add a dependency between components
+    pub async fn add_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+        protocol: Option<String>,
+        required: bool,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (c1:Component {id: $component_id})
+            MATCH (c2:Component {id: $depends_on_id})
+            MERGE (c1)-[r:DEPENDS_ON_COMPONENT]->(c2)
+            SET r.protocol = $protocol, r.required = $required
+            "#,
+        )
+        .param("component_id", component_id.to_string())
+        .param("depends_on_id", depends_on_id.to_string())
+        .param("protocol", protocol.unwrap_or_default())
+        .param("required", required);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Remove a dependency between components
+    pub async fn remove_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (c1:Component {id: $component_id})-[r:DEPENDS_ON_COMPONENT]->(c2:Component {id: $depends_on_id})
+            DELETE r
+            "#,
+        )
+        .param("component_id", component_id.to_string())
+        .param("depends_on_id", depends_on_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Map a component to a project
+    pub async fn map_component_to_project(
+        &self,
+        component_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (c:Component {id: $component_id})
+            MATCH (p:Project {id: $project_id})
+            MERGE (c)-[:MAPS_TO_PROJECT]->(p)
+            "#,
+        )
+        .param("component_id", component_id.to_string())
+        .param("project_id", project_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get the workspace topology (all components with their dependencies)
+    pub async fn get_workspace_topology(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>> {
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})-[:HAS_COMPONENT]->(c:Component)
+            OPTIONAL MATCH (c)-[:MAPS_TO_PROJECT]->(p:Project)
+            OPTIONAL MATCH (c)-[d:DEPENDS_ON_COMPONENT]->(dep:Component)
+            RETURN c, p.name AS project_name,
+                   collect({dep_id: dep.id, protocol: d.protocol, required: d.required}) AS dependencies
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut topology = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("c")?;
+            let component = self.node_to_component(&node)?;
+            let project_name: Option<String> = row.get("project_name").ok();
+
+            // Parse dependencies
+            let deps_raw: Vec<serde_json::Value> =
+                row.get("dependencies").unwrap_or_else(|_| vec![]);
+            let mut dependencies = Vec::new();
+            for dep in deps_raw {
+                if let Some(dep_id_str) = dep.get("dep_id").and_then(|v| v.as_str()) {
+                    if let Ok(dep_id) = dep_id_str.parse::<Uuid>() {
+                        dependencies.push(ComponentDependency {
+                            from_id: component.id,
+                            to_id: dep_id,
+                            protocol: dep
+                                .get("protocol")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            required: dep
+                                .get("required")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true),
+                        });
+                    }
+                }
+            }
+
+            topology.push((component, project_name, dependencies));
+        }
+
+        Ok(topology)
+    }
+
+    /// Helper to convert Neo4j node to ComponentNode
+    fn node_to_component(&self, node: &neo4rs::Node) -> Result<ComponentNode> {
+        let type_str: String = node
+            .get("component_type")
+            .unwrap_or_else(|_| "Other".to_string());
+        let component_type = match type_str.to_lowercase().as_str() {
+            "service" => ComponentType::Service,
+            "frontend" => ComponentType::Frontend,
+            "worker" => ComponentType::Worker,
+            "database" => ComponentType::Database,
+            "messagequeue" | "message_queue" => ComponentType::MessageQueue,
+            "cache" => ComponentType::Cache,
+            "gateway" => ComponentType::Gateway,
+            "external" => ComponentType::External,
+            _ => ComponentType::Other,
+        };
+
+        let config_str: String = node.get("config").unwrap_or_else(|_| "{}".to_string());
+        let config: serde_json::Value =
+            serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
+
+        let tags: Vec<String> = node.get("tags").unwrap_or_else(|_| vec![]);
+
+        Ok(ComponentNode {
+            id: node.get::<String>("id")?.parse()?,
+            workspace_id: node.get::<String>("workspace_id")?.parse()?,
+            name: node.get("name")?,
+            component_type,
+            description: node.get("description").ok(),
+            runtime: node.get("runtime").ok(),
+            config,
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            tags,
         })
     }
 
@@ -3737,6 +4858,10 @@ impl Neo4jClient {
             EntityType::Plan => "Plan",
             EntityType::Commit => "Commit",
             EntityType::Decision => "Decision",
+            EntityType::Workspace => "Workspace",
+            EntityType::WorkspaceMilestone => "WorkspaceMilestone",
+            EntityType::Resource => "Resource",
+            EntityType::Component => "Component",
         };
 
         // Determine the match field based on entity type
@@ -3788,6 +4913,10 @@ impl Neo4jClient {
             EntityType::Plan => "Plan",
             EntityType::Commit => "Commit",
             EntityType::Decision => "Decision",
+            EntityType::Workspace => "Workspace",
+            EntityType::WorkspaceMilestone => "WorkspaceMilestone",
+            EntityType::Resource => "Resource",
+            EntityType::Component => "Component",
         };
 
         let (match_field, match_value) = match entity_type {
@@ -3831,6 +4960,10 @@ impl Neo4jClient {
             EntityType::Plan => "Plan",
             EntityType::Commit => "Commit",
             EntityType::Decision => "Decision",
+            EntityType::Workspace => "Workspace",
+            EntityType::WorkspaceMilestone => "WorkspaceMilestone",
+            EntityType::Resource => "Resource",
+            EntityType::Component => "Component",
         };
 
         let (match_field, match_value) = match entity_type {
@@ -3883,6 +5016,10 @@ impl Neo4jClient {
             EntityType::Plan => "Plan",
             EntityType::Commit => "Commit",
             EntityType::Decision => "Decision",
+            EntityType::Workspace => "Workspace",
+            EntityType::WorkspaceMilestone => "WorkspaceMilestone",
+            EntityType::Resource => "Resource",
+            EntityType::Component => "Component",
         };
 
         let (match_field, match_value) = match entity_type {
@@ -3942,6 +5079,44 @@ impl Neo4jClient {
         }
 
         Ok(propagated_notes)
+    }
+
+    /// Get workspace-level notes for a project (propagated from parent workspace)
+    /// These are notes attached to the workspace that should propagate to all projects in it
+    pub async fn get_workspace_notes_for_project(
+        &self,
+        project_id: Uuid,
+        propagation_factor: f64,
+    ) -> Result<Vec<PropagatedNote>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:BELONGS_TO_WORKSPACE]->(w:Workspace)
+            MATCH (n:Note)-[:ATTACHED_TO]->(w)
+            WHERE n.status IN ['active', 'needs_review']
+            RETURN n, w.name AS workspace_name
+            ORDER BY n.importance DESC, n.created_at DESC
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut workspace_notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            let workspace_name: String = row.get("workspace_name").unwrap_or_default();
+            let note = self.node_to_note(&node)?;
+
+            workspace_notes.push(PropagatedNote {
+                note,
+                relevance_score: propagation_factor,
+                source_entity: format!("workspace:{}", workspace_name),
+                propagation_path: vec![format!("workspace:{}", workspace_name)],
+                distance: 1, // One hop: project -> workspace
+            });
+        }
+
+        Ok(workspace_notes)
     }
 
     /// Mark a note as superseded by another
@@ -4115,6 +5290,7 @@ impl Neo4jClient {
     // Helper function to convert Note scope to type string
     fn scope_type_string(&self, scope: &NoteScope) -> String {
         match scope {
+            NoteScope::Workspace => "workspace".to_string(),
             NoteScope::Project => "project".to_string(),
             NoteScope::Module(_) => "module".to_string(),
             NoteScope::File(_) => "file".to_string(),
@@ -4127,7 +5303,7 @@ impl Neo4jClient {
     // Helper function to convert Note scope to path string
     fn scope_path_string(&self, scope: &NoteScope) -> String {
         match scope {
-            NoteScope::Project => String::new(),
+            NoteScope::Workspace | NoteScope::Project => String::new(),
             NoteScope::Module(path) => path.clone(),
             NoteScope::File(path) => path.clone(),
             NoteScope::Function(name) => name.clone(),

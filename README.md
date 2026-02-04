@@ -17,7 +17,8 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 - **Semantic Code Search** — Find code by meaning, not just keywords, powered by Meilisearch
 - **Plan & Task Management** — Structured workflows with dependencies, steps, and progress tracking
 - **Multi-Language Parsing** — Tree-sitter support for Rust, TypeScript, Python, Go, and 8 more languages
-- **MCP Integration** — 84 tools available for Claude Code, OpenAI Agents, and Cursor
+- **Multi-Project Workspaces** — Group related projects with shared context, contracts, and milestones
+- **MCP Integration** — 113 tools available for Claude Code, OpenAI Agents, and Cursor
 - **Auto-Sync** — File watcher keeps the knowledge base updated as you code
 
 ---
@@ -60,7 +61,8 @@ Add to your MCP configuration (e.g., `~/.claude/mcp.json`):
 # - create_project: Register your codebase
 # - sync_project: Parse and index your code
 # - create_plan: Start a development plan
-# - And 59 more tools...
+# - create_workspace: Group related projects
+# - And 108 more tools...
 ```
 
 That's it! Your AI agents now have shared context.
@@ -100,6 +102,13 @@ That's it! Your AI agents now have shared context.
 "What tasks are blocking the release?"
 ```
 
+### Coordinate Multiple Projects
+```
+"Create a workspace for our microservices"
+"Add the API contract shared by all services"
+"What's the cross-project milestone progress?"
+```
+
 ---
 
 ## Documentation
@@ -109,7 +118,8 @@ That's it! Your AI agents now have shared context.
 | [Installation](docs/setup/installation.md) | Full setup instructions and configuration |
 | [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
 | [API Reference](docs/api/reference.md) | Complete REST API documentation |
-| [MCP Tools](docs/api/mcp-tools.md) | All 84 MCP tools with examples |
+| [MCP Tools](docs/api/mcp-tools.md) | All 113 MCP tools with examples |
+| [Workspaces](docs/guides/workspaces.md) | Multi-project coordination |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
 
 ---
@@ -125,7 +135,7 @@ That's it! Your AI agents now have shared context.
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  PROJECT ORCHESTRATOR                        │
-│                    (84 MCP Tools)                           │
+│                   (113 MCP Tools)                           │
 └─────────────────────────────┬───────────────────────────────┘
                               │
         ┌─────────────────────┼─────────────────────┐

@@ -181,6 +181,7 @@ impl ContextBuilder {
             content: note.content.clone(),
             importance: note.importance.to_string(),
             source_entity: match &note.scope {
+                crate::notes::NoteScope::Workspace => "workspace".to_string(),
                 crate::notes::NoteScope::Project => "project".to_string(),
                 crate::notes::NoteScope::Module(m) => format!("module:{}", m),
                 crate::notes::NoteScope::File(f) => format!("file:{}", f),

@@ -183,6 +183,11 @@ pub enum EntityType {
     Plan,
     Commit,
     Decision,
+    // Workspace-related entities
+    Workspace,
+    WorkspaceMilestone,
+    Resource,
+    Component,
 }
 
 impl fmt::Display for EntityType {
@@ -200,6 +205,10 @@ impl fmt::Display for EntityType {
             Self::Plan => write!(f, "plan"),
             Self::Commit => write!(f, "commit"),
             Self::Decision => write!(f, "decision"),
+            Self::Workspace => write!(f, "workspace"),
+            Self::WorkspaceMilestone => write!(f, "workspace_milestone"),
+            Self::Resource => write!(f, "resource"),
+            Self::Component => write!(f, "component"),
         }
     }
 }
@@ -208,7 +217,7 @@ impl FromStr for EntityType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        match s.to_lowercase().replace("_", "").as_str() {
             "project" => Ok(Self::Project),
             "file" => Ok(Self::File),
             "module" => Ok(Self::Module),
@@ -221,6 +230,10 @@ impl FromStr for EntityType {
             "plan" => Ok(Self::Plan),
             "commit" => Ok(Self::Commit),
             "decision" => Ok(Self::Decision),
+            "workspace" => Ok(Self::Workspace),
+            "workspacemilestone" => Ok(Self::WorkspaceMilestone),
+            "resource" => Ok(Self::Resource),
+            "component" => Ok(Self::Component),
             _ => Err(format!("Unknown entity type: {}", s)),
         }
     }
@@ -234,6 +247,8 @@ impl FromStr for EntityType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "path", rename_all = "snake_case")]
 pub enum NoteScope {
+    /// Applies to an entire workspace (propagates to all projects)
+    Workspace,
     /// Applies to the entire project
     Project,
     /// Applies to a specific module
@@ -250,8 +265,10 @@ pub enum NoteScope {
 
 impl NoteScope {
     /// Get the scope level (higher = more specific)
-    pub fn specificity(&self) -> u8 {
+    /// Lower numbers are broader scope (workspace = -1, project = 0)
+    pub fn specificity(&self) -> i8 {
         match self {
+            Self::Workspace => -1, // Broadest scope
             Self::Project => 0,
             Self::Module(_) => 1,
             Self::File(_) => 2,
@@ -263,6 +280,7 @@ impl NoteScope {
 impl fmt::Display for NoteScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Workspace => write!(f, "workspace"),
             Self::Project => write!(f, "project"),
             Self::Module(path) => write!(f, "module:{}", path),
             Self::File(path) => write!(f, "file:{}", path),

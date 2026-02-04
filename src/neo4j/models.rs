@@ -21,6 +21,25 @@ pub struct ProjectNode {
 }
 
 // ============================================================================
+// Workspace Node (multi-project grouping)
+// ============================================================================
+
+/// A workspace that groups related projects together
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceNode {
+    pub id: Uuid,
+    pub name: String,
+    /// URL-safe unique identifier
+    pub slug: String,
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Extensible metadata as JSON
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+// ============================================================================
 // Code Structure Nodes (from Tree-sitter)
 // ============================================================================
 
@@ -362,6 +381,179 @@ pub enum MilestoneStatus {
 }
 
 // ============================================================================
+// Workspace Milestone Node (cross-project coordination)
+// ============================================================================
+
+/// A milestone that spans multiple projects in a workspace
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceMilestoneNode {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: MilestoneStatus,
+    pub target_date: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+// ============================================================================
+// Resource Node (shared contracts/specs)
+// ============================================================================
+
+/// Type of shared resource
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceType {
+    /// OpenAPI, Swagger, RAML
+    ApiContract,
+    /// Protocol buffers
+    Protobuf,
+    /// GraphQL schema
+    GraphqlSchema,
+    /// JSON Schema
+    JsonSchema,
+    /// Database migrations, DDL
+    DatabaseSchema,
+    /// Shared type definitions
+    SharedTypes,
+    /// Configuration files
+    Config,
+    /// Technical documentation
+    Documentation,
+    /// Other resource type
+    Other,
+}
+
+impl std::str::FromStr for ResourceType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().replace("_", "").as_str() {
+            "apicontract" | "api_contract" => Ok(ResourceType::ApiContract),
+            "protobuf" => Ok(ResourceType::Protobuf),
+            "graphqlschema" | "graphql_schema" | "graphql" => Ok(ResourceType::GraphqlSchema),
+            "jsonschema" | "json_schema" => Ok(ResourceType::JsonSchema),
+            "databaseschema" | "database_schema" | "database" => Ok(ResourceType::DatabaseSchema),
+            "sharedtypes" | "shared_types" => Ok(ResourceType::SharedTypes),
+            "config" => Ok(ResourceType::Config),
+            "documentation" | "docs" => Ok(ResourceType::Documentation),
+            "other" => Ok(ResourceType::Other),
+            _ => Err(format!("Unknown ResourceType: {}", s)),
+        }
+    }
+}
+
+/// A shared resource (contract, spec, schema) referenced by file path
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceNode {
+    pub id: Uuid,
+    /// Workspace that owns this resource (if workspace-level)
+    pub workspace_id: Option<Uuid>,
+    /// Project that owns this resource (if project-level)
+    pub project_id: Option<Uuid>,
+    pub name: String,
+    pub resource_type: ResourceType,
+    /// Path to the spec file
+    pub file_path: String,
+    /// External URL (optional)
+    pub url: Option<String>,
+    /// Format hint (e.g., "openapi", "protobuf", "graphql")
+    pub format: Option<String>,
+    /// Version of the resource
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Extensible metadata as JSON
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+// ============================================================================
+// Component Node (deployment topology)
+// ============================================================================
+
+/// Type of deployment component
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentType {
+    /// Backend service/API
+    Service,
+    /// Frontend application
+    Frontend,
+    /// Background worker
+    Worker,
+    /// Database
+    Database,
+    /// Message queue (RabbitMQ, Kafka, etc.)
+    MessageQueue,
+    /// Cache (Redis, Memcached, etc.)
+    Cache,
+    /// API Gateway / Load balancer
+    Gateway,
+    /// External service (third-party)
+    External,
+    /// Other component type
+    Other,
+}
+
+impl std::str::FromStr for ComponentType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().replace("_", "").as_str() {
+            "service" => Ok(ComponentType::Service),
+            "frontend" => Ok(ComponentType::Frontend),
+            "worker" => Ok(ComponentType::Worker),
+            "database" | "db" => Ok(ComponentType::Database),
+            "messagequeue" | "message_queue" | "queue" => Ok(ComponentType::MessageQueue),
+            "cache" => Ok(ComponentType::Cache),
+            "gateway" | "apigateway" | "api_gateway" => Ok(ComponentType::Gateway),
+            "external" => Ok(ComponentType::External),
+            "other" => Ok(ComponentType::Other),
+            _ => Err(format!("Unknown ComponentType: {}", s)),
+        }
+    }
+}
+
+/// A component in the deployment topology
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentNode {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub name: String,
+    pub component_type: ComponentType,
+    pub description: Option<String>,
+    /// Runtime environment (e.g., "docker", "kubernetes", "lambda")
+    pub runtime: Option<String>,
+    /// Configuration (env vars, ports, etc.) as JSON
+    #[serde(default)]
+    pub config: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// A dependency between components
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentDependency {
+    pub from_id: Uuid,
+    pub to_id: Uuid,
+    /// Communication protocol (e.g., "http", "grpc", "amqp", "tcp")
+    pub protocol: Option<String>,
+    /// Whether this dependency is required for the component to function
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// ============================================================================
 // Relationship types
 // ============================================================================
 
@@ -398,4 +590,26 @@ pub enum RelationType {
     Executed,
     Made,
     ResultedIn,
+
+    // Workspace relationships
+    /// Project belongs to a workspace
+    BelongsToWorkspace,
+    /// Workspace has a workspace-level milestone
+    HasWorkspaceMilestone,
+    /// Workspace milestone includes a task (from any project)
+    IncludesTask,
+    /// Workspace milestone includes a project milestone
+    IncludesProjectMilestone,
+    /// Workspace or project has a resource
+    HasResource,
+    /// Project implements (provides) a resource/contract
+    ImplementsResource,
+    /// Project uses (consumes) a resource/contract
+    UsesResource,
+    /// Workspace has a deployment component
+    HasComponent,
+    /// Component depends on another component
+    DependsOnComponent,
+    /// Component maps to a project (source code)
+    MapsToProject,
 }

@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete documentation for all 84 MCP tools exposed by Project Orchestrator.
+Complete documentation for all 113 MCP tools exposed by Project Orchestrator.
 
 ---
 
@@ -9,6 +9,10 @@ Complete documentation for all 84 MCP tools exposed by Project Orchestrator.
 | Category | Tools |
 |----------|-------|
 | [Project Management](#project-management-6-tools) | `list_projects`, `create_project`, `get_project`, `delete_project`, `sync_project`, `get_project_roadmap` |
+| [Workspace Management](#workspace-management-9-tools) | `list_workspaces`, `create_workspace`, `get_workspace`, `update_workspace`, `delete_workspace`, `get_workspace_overview`, `get_workspace_context`, `add_project_to_workspace`, `remove_project_from_workspace` |
+| [Workspace Milestones](#workspace-milestones-6-tools) | `list_workspace_milestones`, `create_workspace_milestone`, `get_workspace_milestone`, `update_workspace_milestone`, `add_task_to_workspace_milestone`, `get_workspace_milestone_progress` |
+| [Resources](#resources-6-tools) | `list_resources`, `create_resource`, `get_resource`, `update_resource`, `delete_resource`, `link_resource_to_project` |
+| [Components & Topology](#components--topology-8-tools) | `list_components`, `create_component`, `get_component`, `update_component`, `delete_component`, `add_component_dependency`, `map_component_to_project`, `get_workspace_topology` |
 | [Plan Management](#plan-management-8-tools) | `list_plans`, `create_plan`, `get_plan`, `update_plan_status`, `link_plan_to_project`, `unlink_plan_from_project`, `get_dependency_graph`, `get_critical_path` |
 | [Task Management](#task-management-12-tools) | `list_tasks`, `create_task`, `get_task`, `update_task`, `get_next_task`, `add_task_dependencies`, `remove_task_dependency`, `get_task_blockers`, `get_tasks_blocked_by`, `get_task_context`, `get_task_prompt`, `add_decision` |
 | [Step Management](#step-management-4-tools) | `list_steps`, `create_step`, `update_step`, `get_step_progress` |
@@ -125,6 +129,551 @@ Get aggregated roadmap view with milestones, releases, and progress.
 **Example:**
 ```
 Show me the roadmap for project abc-123
+```
+
+---
+
+## Workspace Management (9 tools)
+
+Workspaces group related projects together, enabling shared context, cross-project milestones, and deployment topology modeling.
+
+See the [Workspaces Guide](../guides/workspaces.md) for detailed usage instructions.
+
+### list_workspaces
+
+List all workspaces with optional search and pagination.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `search` | string | No | Search in name/description |
+| `limit` | integer | No | Max items (default 50, max 100) |
+| `offset` | integer | No | Items to skip |
+| `sort_by` | string | No | `name` or `created_at` |
+| `sort_order` | string | No | `asc` or `desc` |
+
+**Example:**
+```
+List all workspaces containing "microservices"
+```
+
+---
+
+### create_workspace
+
+Create a new workspace to group related projects.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | **Yes** | Workspace name |
+| `slug` | string | No | URL-safe identifier (auto-generated) |
+| `description` | string | No | Workspace description |
+
+**Example:**
+```
+Create a workspace named "E-Commerce Platform" for our API and frontend projects
+```
+
+---
+
+### get_workspace
+
+Get workspace details by slug.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `slug` | string | **Yes** | Workspace slug |
+
+**Example:**
+```
+Get details for workspace "e-commerce-platform"
+```
+
+---
+
+### update_workspace
+
+Update a workspace's details.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `slug` | string | **Yes** | Workspace slug |
+| `name` | string | No | New name |
+| `description` | string | No | New description |
+
+**Example:**
+```
+Update workspace description to include new scope
+```
+
+---
+
+### delete_workspace
+
+Delete a workspace and remove project associations.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `slug` | string | **Yes** | Workspace slug |
+
+**Example:**
+```
+Delete workspace "old-project-group"
+```
+
+---
+
+### get_workspace_overview
+
+Get a comprehensive overview of the workspace including projects, milestones, resources, and components.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `slug` | string | **Yes** | Workspace slug |
+
+**Returns:** Projects, milestones, resources, components, and progress stats.
+
+**Example:**
+```
+Show me the overview for workspace "e-commerce-platform"
+```
+
+---
+
+### get_workspace_context
+
+Get rich context for agents working on workspace-level tasks.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `slug` | string | **Yes** | Workspace slug |
+
+**Returns:** Full context including projects, resources, topology, and notes.
+
+**Example:**
+```
+Get workspace context for coordinated development
+```
+
+---
+
+### add_project_to_workspace
+
+Add an existing project to a workspace.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+| `project_id` | string | **Yes** | Project UUID to add |
+
+**Example:**
+```
+Add the "api-service" project to workspace "e-commerce-platform"
+```
+
+---
+
+### remove_project_from_workspace
+
+Remove a project from a workspace.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+| `project_id` | string | **Yes** | Project UUID to remove |
+
+**Example:**
+```
+Remove project "legacy-api" from workspace
+```
+
+---
+
+## Workspace Milestones (6 tools)
+
+Workspace milestones coordinate tasks across multiple projects within a workspace.
+
+### list_workspace_milestones
+
+List milestones for a workspace.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+| `status` | string | No | `open` or `closed` |
+| `limit` | integer | No | Max items |
+| `offset` | integer | No | Items to skip |
+
+**Example:**
+```
+List open workspace milestones for "e-commerce-platform"
+```
+
+---
+
+### create_workspace_milestone
+
+Create a cross-project milestone in a workspace.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+| `title` | string | **Yes** | Milestone title |
+| `description` | string | No | Milestone description |
+| `target_date` | string | No | Target date (ISO 8601) |
+| `tags` | array | No | Tags for categorization |
+
+**Example:**
+```
+Create milestone "Q1 Launch" with target March 31st
+```
+
+---
+
+### get_workspace_milestone
+
+Get workspace milestone details with associated tasks.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `milestone_id` | string | **Yes** | Milestone UUID |
+
+**Example:**
+```
+Get details for workspace milestone xyz-789
+```
+
+---
+
+### update_workspace_milestone
+
+Update a workspace milestone.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `milestone_id` | string | **Yes** | Milestone UUID |
+| `title` | string | No | New title |
+| `description` | string | No | New description |
+| `status` | string | No | `open` or `closed` |
+| `target_date` | string | No | New target date |
+
+**Example:**
+```
+Close workspace milestone "Q1 Launch"
+```
+
+---
+
+### add_task_to_workspace_milestone
+
+Add a task from any project to a workspace milestone.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `milestone_id` | string | **Yes** | Milestone UUID |
+| `task_id` | string | **Yes** | Task UUID (from any project) |
+
+**Example:**
+```
+Add the API authentication task to the Q1 Launch milestone
+```
+
+---
+
+### get_workspace_milestone_progress
+
+Get aggregated progress across all projects for a workspace milestone.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `milestone_id` | string | **Yes** | Milestone UUID |
+
+**Returns:** `{total: N, completed: M, in_progress: P, pending: Q, by_project: {...}}`
+
+**Example:**
+```
+What's the progress on workspace milestone "Q1 Launch"?
+```
+
+---
+
+## Resources (6 tools)
+
+Resources are shared contracts, schemas, or specifications referenced by multiple projects.
+
+### list_resources
+
+List resources in a workspace.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+| `resource_type` | string | No | Filter by type: `api_contract`, `protobuf`, `graphql_schema`, `json_schema`, `database_schema`, `shared_types`, `config`, `documentation`, `other` |
+| `limit` | integer | No | Max items |
+| `offset` | integer | No | Items to skip |
+
+**Example:**
+```
+List all API contracts in workspace "e-commerce-platform"
+```
+
+---
+
+### create_resource
+
+Create a shared resource in a workspace.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+| `name` | string | **Yes** | Resource name |
+| `resource_type` | string | **Yes** | Resource type (see list_resources) |
+| `file_path` | string | **Yes** | Path to the spec file |
+| `url` | string | No | External URL |
+| `format` | string | No | Format: `openapi`, `protobuf`, `graphql` |
+| `version` | string | No | Version string |
+| `description` | string | No | Resource description |
+
+**Example:**
+```
+Create an API contract "User Service API" pointing to openapi/users.yaml
+```
+
+---
+
+### get_resource
+
+Get resource details.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `resource_id` | string | **Yes** | Resource UUID |
+
+**Example:**
+```
+Get details for resource xyz-789
+```
+
+---
+
+### update_resource
+
+Update a resource.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `resource_id` | string | **Yes** | Resource UUID |
+| `name` | string | No | New name |
+| `file_path` | string | No | New file path |
+| `version` | string | No | New version |
+| `description` | string | No | New description |
+
+**Example:**
+```
+Update resource version to 2.0.0
+```
+
+---
+
+### delete_resource
+
+Delete a resource.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `resource_id` | string | **Yes** | Resource UUID |
+
+**Example:**
+```
+Delete deprecated resource xyz-789
+```
+
+---
+
+### link_resource_to_project
+
+Link a resource to a project as implementer or consumer.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `resource_id` | string | **Yes** | Resource UUID |
+| `project_id` | string | **Yes** | Project UUID |
+| `relationship` | string | **Yes** | `implements` (provider) or `uses` (consumer) |
+
+**Example:**
+```
+Link api-service as implementer of "User Service API" contract
+```
+
+---
+
+## Components & Topology (8 tools)
+
+Components model the deployment topology of your system.
+
+### list_components
+
+List components in a workspace.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+| `component_type` | string | No | Filter by type: `service`, `frontend`, `worker`, `database`, `message_queue`, `cache`, `gateway`, `external`, `other` |
+| `limit` | integer | No | Max items |
+| `offset` | integer | No | Items to skip |
+
+**Example:**
+```
+List all services in workspace "e-commerce-platform"
+```
+
+---
+
+### create_component
+
+Create a deployment component.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+| `name` | string | **Yes** | Component name |
+| `component_type` | string | **Yes** | Component type (see list_components) |
+| `description` | string | No | Component description |
+| `runtime` | string | No | Runtime: `docker`, `kubernetes`, `lambda` |
+| `config` | object | No | Configuration (ports, env vars) |
+| `tags` | array | No | Tags for categorization |
+
+**Example:**
+```
+Create a service component "API Gateway" running on Kubernetes
+```
+
+---
+
+### get_component
+
+Get component details.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `component_id` | string | **Yes** | Component UUID |
+
+**Example:**
+```
+Get details for component xyz-789
+```
+
+---
+
+### update_component
+
+Update a component.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `component_id` | string | **Yes** | Component UUID |
+| `name` | string | No | New name |
+| `description` | string | No | New description |
+| `runtime` | string | No | New runtime |
+| `config` | object | No | New configuration |
+
+**Example:**
+```
+Update component runtime to kubernetes
+```
+
+---
+
+### delete_component
+
+Delete a component.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `component_id` | string | **Yes** | Component UUID |
+
+**Example:**
+```
+Delete component xyz-789
+```
+
+---
+
+### add_component_dependency
+
+Add a dependency between components.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `component_id` | string | **Yes** | Component UUID |
+| `depends_on_id` | string | **Yes** | UUID of component this depends on |
+| `protocol` | string | No | Protocol: `http`, `grpc`, `amqp`, `redis` |
+| `required` | boolean | No | Whether dependency is required (default: true) |
+
+**Example:**
+```
+API Gateway depends on User Service via gRPC
+```
+
+---
+
+### map_component_to_project
+
+Map a component to its source code project.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `component_id` | string | **Yes** | Component UUID |
+| `project_id` | string | **Yes** | Project UUID |
+
+**Example:**
+```
+Map "User Service" component to project "user-api"
+```
+
+---
+
+### get_workspace_topology
+
+Get the full deployment topology graph for a workspace.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `workspace_slug` | string | **Yes** | Workspace slug |
+
+**Returns:** All components with dependencies, protocols, and mapped projects.
+
+**Example:**
+```
+Show the deployment topology for workspace "e-commerce-platform"
 ```
 
 ---

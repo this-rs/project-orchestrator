@@ -146,6 +146,43 @@ impl ToolHandler {
             "get_notes_needing_review" => self.get_notes_needing_review(args).await,
             "update_staleness_scores" => self.update_staleness_scores(args).await,
 
+            // Workspaces
+            "list_workspaces" => self.list_workspaces(args).await,
+            "create_workspace" => self.create_workspace(args).await,
+            "get_workspace" => self.get_workspace(args).await,
+            "update_workspace" => self.update_workspace(args).await,
+            "delete_workspace" => self.delete_workspace(args).await,
+            "get_workspace_overview" => self.get_workspace_overview(args).await,
+            "list_workspace_projects" => self.list_workspace_projects(args).await,
+            "add_project_to_workspace" => self.add_project_to_workspace(args).await,
+            "remove_project_from_workspace" => self.remove_project_from_workspace(args).await,
+
+            // Workspace Milestones
+            "list_workspace_milestones" => self.list_workspace_milestones(args).await,
+            "create_workspace_milestone" => self.create_workspace_milestone(args).await,
+            "get_workspace_milestone" => self.get_workspace_milestone(args).await,
+            "update_workspace_milestone" => self.update_workspace_milestone(args).await,
+            "delete_workspace_milestone" => self.delete_workspace_milestone(args).await,
+            "add_task_to_workspace_milestone" => self.add_task_to_workspace_milestone(args).await,
+            "get_workspace_milestone_progress" => self.get_workspace_milestone_progress(args).await,
+
+            // Resources
+            "list_resources" => self.list_resources(args).await,
+            "create_resource" => self.create_resource(args).await,
+            "get_resource" => self.get_resource(args).await,
+            "delete_resource" => self.delete_resource(args).await,
+            "link_resource_to_project" => self.link_resource_to_project(args).await,
+
+            // Components
+            "list_components" => self.list_components(args).await,
+            "create_component" => self.create_component(args).await,
+            "get_component" => self.get_component(args).await,
+            "delete_component" => self.delete_component(args).await,
+            "add_component_dependency" => self.add_component_dependency(args).await,
+            "remove_component_dependency" => self.remove_component_dependency(args).await,
+            "map_component_to_project" => self.map_component_to_project(args).await,
+            "get_workspace_topology" => self.get_workspace_topology(args).await,
+
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -2110,6 +2147,752 @@ impl ToolHandler {
             .await?;
 
         Ok(json!({"notes_updated": count}))
+    }
+
+    // ========================================================================
+    // Workspace Handlers
+    // ========================================================================
+
+    async fn list_workspaces(&self, args: Value) -> Result<Value> {
+        let search = args.get("search").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        // Get all workspaces and filter/paginate in memory
+        let all_workspaces = self.neo4j().list_workspaces().await?;
+
+        // Filter by search if provided
+        let filtered: Vec<_> = if let Some(search_term) = search {
+            let search_lower = search_term.to_lowercase();
+            all_workspaces
+                .into_iter()
+                .filter(|w| {
+                    w.name.to_lowercase().contains(&search_lower)
+                        || w.description
+                            .as_ref()
+                            .map(|d| d.to_lowercase().contains(&search_lower))
+                            .unwrap_or(false)
+                })
+                .collect()
+        } else {
+            all_workspaces
+        };
+
+        let total = filtered.len();
+        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn create_workspace(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("name is required"))?;
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slugify(name));
+        let description = args.get("description").and_then(|v| v.as_str());
+        let metadata = args
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+
+        let workspace = WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            slug,
+            description: description.map(|s| s.to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata,
+        };
+
+        self.neo4j().create_workspace(&workspace).await?;
+        Ok(serde_json::to_value(workspace)?)
+    }
+
+    async fn get_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        Ok(serde_json::to_value(workspace)?)
+    }
+
+    async fn update_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let metadata = args.get("metadata").cloned();
+
+        // Get workspace by slug first
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        self.neo4j()
+            .update_workspace(workspace.id, name, description, metadata)
+            .await?;
+
+        // Fetch updated workspace
+        let updated = self
+            .neo4j()
+            .get_workspace(workspace.id)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        Ok(serde_json::to_value(updated)?)
+    }
+
+    async fn delete_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        // Get workspace by slug first
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        self.neo4j().delete_workspace(workspace.id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn get_workspace_overview(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let projects = self.neo4j().list_workspace_projects(workspace.id).await?;
+        let milestones = self.neo4j().list_workspace_milestones(workspace.id).await?;
+        let resources = self.neo4j().list_workspace_resources(workspace.id).await?;
+        let components = self.neo4j().list_components(workspace.id).await?;
+
+        // Calculate progress from all projects' tasks
+        let mut total_tasks = 0u32;
+        let mut completed_tasks = 0u32;
+        for project in &projects {
+            let (t, c, _, _) = self.neo4j().get_project_progress(project.id).await?;
+            total_tasks += t;
+            completed_tasks += c;
+        }
+
+        Ok(json!({
+            "workspace": workspace,
+            "projects": projects,
+            "milestones": milestones,
+            "resources": resources,
+            "components": components,
+            "progress": {
+                "total_tasks": total_tasks,
+                "completed_tasks": completed_tasks,
+                "percentage": if total_tasks > 0 { (completed_tasks as f64 / total_tasks as f64 * 100.0).round() } else { 0.0 }
+            }
+        }))
+    }
+
+    async fn list_workspace_projects(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let projects = self.neo4j().list_workspace_projects(workspace.id).await?;
+        Ok(serde_json::to_value(projects)?)
+    }
+
+    async fn add_project_to_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let project_id = parse_uuid(&args, "project_id")?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        self.neo4j()
+            .add_project_to_workspace(project_id, workspace.id)
+            .await?;
+
+        Ok(json!({"added": true}))
+    }
+
+    async fn remove_project_from_workspace(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let project_id = parse_uuid(&args, "project_id")?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        self.neo4j()
+            .remove_project_from_workspace(project_id, workspace.id)
+            .await?;
+
+        Ok(json!({"removed": true}))
+    }
+
+    // ========================================================================
+    // Workspace Milestone Handlers
+    // ========================================================================
+
+    async fn list_workspace_milestones(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let status_filter = args.get("status").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        // Get all milestones and filter in memory
+        let all_milestones = self.neo4j().list_workspace_milestones(workspace.id).await?;
+
+        // Filter by status if provided
+        let filtered: Vec<_> = if let Some(status) = status_filter {
+            let status_lower = status.to_lowercase();
+            all_milestones
+                .into_iter()
+                .filter(|m| {
+                    let m_status = match m.status {
+                        MilestoneStatus::Open => "open",
+                        MilestoneStatus::Closed => "closed",
+                    };
+                    m_status == status_lower
+                })
+                .collect()
+        } else {
+            all_milestones
+        };
+
+        let total = filtered.len();
+        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn create_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("title is required"))?;
+        let description = args.get("description").and_then(|v| v.as_str());
+        let target_date = args
+            .get("target_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let milestone = WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: workspace.id,
+            title: title.to_string(),
+            description: description.map(|s| s.to_string()),
+            status: MilestoneStatus::Open,
+            target_date,
+            closed_at: None,
+            created_at: chrono::Utc::now(),
+            tags,
+        };
+
+        self.neo4j().create_workspace_milestone(&milestone).await?;
+        Ok(serde_json::to_value(milestone)?)
+    }
+
+    async fn get_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        let milestone = self
+            .neo4j()
+            .get_workspace_milestone(id)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace milestone not found"))?;
+
+        let tasks = self.neo4j().get_workspace_milestone_tasks(id).await?;
+
+        Ok(json!({
+            "milestone": milestone,
+            "tasks": tasks
+        }))
+    }
+
+    async fn update_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let status = args.get("status").and_then(|v| v.as_str()).and_then(|s| {
+            match s.to_lowercase().as_str() {
+                "open" => Some(MilestoneStatus::Open),
+                "closed" => Some(MilestoneStatus::Closed),
+                _ => None,
+            }
+        });
+        let target_date = args
+            .get("target_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        self.neo4j()
+            .update_workspace_milestone(id, title, description, status, target_date)
+            .await?;
+
+        let milestone = self
+            .neo4j()
+            .get_workspace_milestone(id)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace milestone not found"))?;
+
+        Ok(serde_json::to_value(milestone)?)
+    }
+
+    async fn delete_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        self.neo4j().delete_workspace_milestone(id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn add_task_to_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let task_id = parse_uuid(&args, "task_id")?;
+
+        self.neo4j()
+            .add_task_to_workspace_milestone(id, task_id)
+            .await?;
+
+        Ok(json!({"added": true}))
+    }
+
+    async fn get_workspace_milestone_progress(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        let (total, completed, in_progress, pending) =
+            self.neo4j().get_workspace_milestone_progress(id).await?;
+
+        let percentage = if total > 0 {
+            (completed as f64 / total as f64 * 100.0).round()
+        } else {
+            0.0
+        };
+
+        Ok(json!({
+            "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending,
+            "percentage": percentage
+        }))
+    }
+
+    // ========================================================================
+    // Resource Handlers
+    // ========================================================================
+
+    async fn list_resources(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let resource_type_filter = args.get("resource_type").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        // Get all resources and filter in memory
+        let all_resources = self.neo4j().list_workspace_resources(workspace.id).await?;
+
+        // Filter by type if provided
+        let filtered: Vec<_> = if let Some(type_str) = resource_type_filter {
+            if let Ok(rt) = type_str.parse::<ResourceType>() {
+                all_resources
+                    .into_iter()
+                    .filter(|r| r.resource_type == rt)
+                    .collect()
+            } else {
+                all_resources
+            }
+        } else {
+            all_resources
+        };
+
+        let total = filtered.len();
+        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn create_resource(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("name is required"))?;
+        let resource_type_str = args
+            .get("resource_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("resource_type is required"))?;
+        let file_path = args
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("file_path is required"))?;
+        let url = args.get("url").and_then(|v| v.as_str());
+        let format = args.get("format").and_then(|v| v.as_str());
+        let version = args.get("version").and_then(|v| v.as_str());
+        let description = args.get("description").and_then(|v| v.as_str());
+        let metadata = args
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let resource_type: ResourceType = resource_type_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid resource_type"))?;
+
+        let resource = ResourceNode {
+            id: Uuid::new_v4(),
+            workspace_id: Some(workspace.id),
+            project_id: None,
+            name: name.to_string(),
+            resource_type,
+            file_path: file_path.to_string(),
+            url: url.map(|s| s.to_string()),
+            format: format.map(|s| s.to_string()),
+            version: version.map(|s| s.to_string()),
+            description: description.map(|s| s.to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata,
+        };
+
+        self.neo4j().create_resource(&resource).await?;
+        Ok(serde_json::to_value(resource)?)
+    }
+
+    async fn get_resource(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        let resource = self
+            .neo4j()
+            .get_resource(id)
+            .await?
+            .ok_or_else(|| anyhow!("Resource not found"))?;
+
+        Ok(serde_json::to_value(resource)?)
+    }
+
+    async fn delete_resource(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        self.neo4j().delete_resource(id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn link_resource_to_project(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let project_id = parse_uuid(&args, "project_id")?;
+        let link_type = args
+            .get("link_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("link_type is required (implements or uses)"))?;
+
+        match link_type.to_lowercase().as_str() {
+            "implements" => {
+                self.neo4j()
+                    .link_project_implements_resource(project_id, id)
+                    .await?;
+            }
+            "uses" => {
+                self.neo4j()
+                    .link_project_uses_resource(project_id, id)
+                    .await?;
+            }
+            _ => return Err(anyhow!("link_type must be 'implements' or 'uses'")),
+        }
+
+        Ok(json!({"linked": true, "link_type": link_type}))
+    }
+
+    // ========================================================================
+    // Component Handlers
+    // ========================================================================
+
+    async fn list_components(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let component_type_filter = args.get("component_type").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        // Get all components and filter in memory
+        let all_components = self.neo4j().list_components(workspace.id).await?;
+
+        // Filter by type if provided
+        let filtered: Vec<_> = if let Some(type_str) = component_type_filter {
+            if let Ok(ct) = type_str.parse::<ComponentType>() {
+                all_components
+                    .into_iter()
+                    .filter(|c| c.component_type == ct)
+                    .collect()
+            } else {
+                all_components
+            }
+        } else {
+            all_components
+        };
+
+        let total = filtered.len();
+        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn create_component(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("name is required"))?;
+        let component_type_str = args
+            .get("component_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("component_type is required"))?;
+        let description = args.get("description").and_then(|v| v.as_str());
+        let runtime = args.get("runtime").and_then(|v| v.as_str());
+        let config = args
+            .get("config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let component_type: ComponentType = component_type_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid component_type"))?;
+
+        let component = ComponentNode {
+            id: Uuid::new_v4(),
+            workspace_id: workspace.id,
+            name: name.to_string(),
+            component_type,
+            description: description.map(|s| s.to_string()),
+            runtime: runtime.map(|s| s.to_string()),
+            config,
+            created_at: chrono::Utc::now(),
+            tags,
+        };
+
+        self.neo4j().create_component(&component).await?;
+        Ok(serde_json::to_value(component)?)
+    }
+
+    async fn get_component(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        let component = self
+            .neo4j()
+            .get_component(id)
+            .await?
+            .ok_or_else(|| anyhow!("Component not found"))?;
+
+        Ok(serde_json::to_value(component)?)
+    }
+
+    async fn delete_component(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+
+        self.neo4j().delete_component(id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn add_component_dependency(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let depends_on_id = parse_uuid(&args, "depends_on_id")?;
+        let protocol = args
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let required = args
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        self.neo4j()
+            .add_component_dependency(id, depends_on_id, protocol, required)
+            .await?;
+
+        Ok(json!({"added": true}))
+    }
+
+    async fn remove_component_dependency(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let dep_id = parse_uuid(&args, "dep_id")?;
+
+        self.neo4j().remove_component_dependency(id, dep_id).await?;
+
+        Ok(json!({"removed": true}))
+    }
+
+    async fn map_component_to_project(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let project_id = parse_uuid(&args, "project_id")?;
+
+        self.neo4j()
+            .map_component_to_project(id, project_id)
+            .await?;
+
+        Ok(json!({"mapped": true}))
+    }
+
+    async fn get_workspace_topology(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found"))?;
+
+        let topology = self.neo4j().get_workspace_topology(workspace.id).await?;
+        Ok(serde_json::to_value(topology)?)
     }
 }
 
