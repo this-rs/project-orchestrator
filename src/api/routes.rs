@@ -72,6 +72,14 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/plans/{plan_id}/next-task",
             get(handlers::get_next_task),
         )
+        .route(
+            "/api/plans/{plan_id}/dependency-graph",
+            get(handlers::get_plan_dependency_graph),
+        )
+        .route(
+            "/api/plans/{plan_id}/critical-path",
+            get(handlers::get_plan_critical_path),
+        )
         // Constraints
         .route(
             "/api/plans/{plan_id}/constraints",
@@ -86,6 +94,23 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .route(
             "/api/tasks/{task_id}",
             get(handlers::get_task).patch(handlers::update_task),
+        )
+        // Task dependencies
+        .route(
+            "/api/tasks/{task_id}/dependencies",
+            post(handlers::add_task_dependencies),
+        )
+        .route(
+            "/api/tasks/{task_id}/dependencies/{dep_id}",
+            axum::routing::delete(handlers::remove_task_dependency),
+        )
+        .route(
+            "/api/tasks/{task_id}/blockers",
+            get(handlers::get_task_blockers),
+        )
+        .route(
+            "/api/tasks/{task_id}/blocking",
+            get(handlers::get_tasks_blocked_by),
         )
         // Steps
         .route(

@@ -977,6 +977,147 @@ pub async fn get_milestone_progress(
 }
 
 // ============================================================================
+// Task Dependencies
+// ============================================================================
+
+/// Request to add dependencies to a task
+#[derive(Deserialize)]
+pub struct AddDependenciesRequest {
+    pub depends_on: Vec<Uuid>,
+}
+
+/// Add dependencies to a task
+pub async fn add_task_dependencies(
+    State(state): State<OrchestratorState>,
+    Path(task_id): Path<Uuid>,
+    Json(req): Json<AddDependenciesRequest>,
+) -> Result<StatusCode, AppError> {
+    for dep_id in req.depends_on {
+        state
+            .orchestrator
+            .neo4j()
+            .add_task_dependency(task_id, dep_id)
+            .await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove a dependency from a task
+pub async fn remove_task_dependency(
+    State(state): State<OrchestratorState>,
+    Path((task_id, dep_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .remove_task_dependency(task_id, dep_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get tasks that block this task (uncompleted dependencies)
+pub async fn get_task_blockers(
+    State(state): State<OrchestratorState>,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<Vec<TaskNode>>, AppError> {
+    let blockers = state
+        .orchestrator
+        .neo4j()
+        .get_task_blockers(task_id)
+        .await?;
+    Ok(Json(blockers))
+}
+
+/// Get tasks blocked by this task
+pub async fn get_tasks_blocked_by(
+    State(state): State<OrchestratorState>,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<Vec<TaskNode>>, AppError> {
+    let blocked = state
+        .orchestrator
+        .neo4j()
+        .get_tasks_blocked_by(task_id)
+        .await?;
+    Ok(Json(blocked))
+}
+
+/// Dependency graph node for visualization
+#[derive(Serialize)]
+pub struct DependencyGraphNode {
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub description: String,
+    pub status: String,
+    pub priority: Option<i32>,
+}
+
+/// Dependency graph edge
+#[derive(Serialize)]
+pub struct DependencyGraphEdge {
+    pub from: Uuid,
+    pub to: Uuid,
+}
+
+/// Dependency graph response
+#[derive(Serialize)]
+pub struct DependencyGraphResponse {
+    pub nodes: Vec<DependencyGraphNode>,
+    pub edges: Vec<DependencyGraphEdge>,
+}
+
+/// Get dependency graph for a plan
+pub async fn get_plan_dependency_graph(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<DependencyGraphResponse>, AppError> {
+    let (tasks, edges) = state
+        .orchestrator
+        .neo4j()
+        .get_plan_dependency_graph(plan_id)
+        .await?;
+
+    let nodes: Vec<DependencyGraphNode> = tasks
+        .into_iter()
+        .map(|t| DependencyGraphNode {
+            id: t.id,
+            title: t.title,
+            description: t.description,
+            status: format!("{:?}", t.status),
+            priority: t.priority,
+        })
+        .collect();
+
+    let edges: Vec<DependencyGraphEdge> = edges
+        .into_iter()
+        .map(|(from, to)| DependencyGraphEdge { from, to })
+        .collect();
+
+    Ok(Json(DependencyGraphResponse { nodes, edges }))
+}
+
+/// Critical path response
+#[derive(Serialize)]
+pub struct CriticalPathResponse {
+    pub tasks: Vec<TaskNode>,
+    pub length: usize,
+}
+
+/// Get critical path for a plan
+pub async fn get_plan_critical_path(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<CriticalPathResponse>, AppError> {
+    let tasks = state
+        .orchestrator
+        .neo4j()
+        .get_plan_critical_path(plan_id)
+        .await?;
+
+    let length = tasks.len();
+    Ok(Json(CriticalPathResponse { tasks, length }))
+}
+
+// ============================================================================
 // Error handling
 // ============================================================================
 

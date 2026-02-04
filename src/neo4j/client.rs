@@ -1460,6 +1460,150 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Remove task dependency
+    pub async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $task_id})-[r:DEPENDS_ON]->(dep:Task {id: $depends_on_id})
+            DELETE r
+            "#,
+        )
+        .param("task_id", task_id.to_string())
+        .param("depends_on_id", depends_on_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get tasks that block this task (dependencies that are not completed)
+    pub async fn get_task_blockers(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $task_id})-[:DEPENDS_ON]->(blocker:Task)
+            WHERE blocker.status <> 'Completed'
+            RETURN blocker
+            ORDER BY COALESCE(blocker.priority, 0) DESC
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("blocker")?;
+            tasks.push(self.node_to_task(&node)?);
+        }
+
+        Ok(tasks)
+    }
+
+    /// Get tasks blocked by this task (tasks depending on this one)
+    pub async fn get_tasks_blocked_by(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
+        let q = query(
+            r#"
+            MATCH (blocked:Task)-[:DEPENDS_ON]->(t:Task {id: $task_id})
+            RETURN blocked
+            ORDER BY COALESCE(blocked.priority, 0) DESC
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("blocked")?;
+            tasks.push(self.node_to_task(&node)?);
+        }
+
+        Ok(tasks)
+    }
+
+    /// Get all dependencies for a task (all tasks it depends on, regardless of status)
+    pub async fn get_task_dependencies(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $task_id})-[:DEPENDS_ON]->(dep:Task)
+            RETURN dep
+            ORDER BY COALESCE(dep.priority, 0) DESC
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("dep")?;
+            tasks.push(self.node_to_task(&node)?);
+        }
+
+        Ok(tasks)
+    }
+
+    /// Get dependency graph for a plan (all tasks and their dependencies)
+    pub async fn get_plan_dependency_graph(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)> {
+        // Get all tasks in the plan
+        let tasks = self.get_plan_tasks(plan_id).await?;
+
+        // Get all DEPENDS_ON edges between tasks in this plan
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $plan_id})-[:HAS_TASK]->(t:Task)-[:DEPENDS_ON]->(dep:Task)<-[:HAS_TASK]-(p)
+            RETURN t.id AS from_id, dep.id AS to_id
+            "#,
+        )
+        .param("plan_id", plan_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let from_id: String = row.get("from_id")?;
+            let to_id: String = row.get("to_id")?;
+            if let (Ok(from), Ok(to)) = (from_id.parse::<Uuid>(), to_id.parse::<Uuid>()) {
+                edges.push((from, to));
+            }
+        }
+
+        Ok((tasks, edges))
+    }
+
+    /// Find critical path in a plan (longest chain of dependencies)
+    pub async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>> {
+        // Get all paths from tasks with no incoming deps to tasks with no outgoing deps
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $plan_id})-[:HAS_TASK]->(start:Task)
+            WHERE NOT EXISTS { MATCH (start)-[:DEPENDS_ON]->(:Task) }
+            MATCH (p)-[:HAS_TASK]->(end:Task)
+            WHERE NOT EXISTS { MATCH (:Task)-[:DEPENDS_ON]->(end) }
+            MATCH path = (start)<-[:DEPENDS_ON*0..]-(end)
+            WHERE ALL(node IN nodes(path) WHERE (p)-[:HAS_TASK]->(node))
+            WITH path, length(path) AS pathLength
+            ORDER BY pathLength DESC
+            LIMIT 1
+            UNWIND nodes(path) AS task
+            RETURN DISTINCT task
+            "#,
+        )
+        .param("plan_id", plan_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("task")?;
+            tasks.push(self.node_to_task(&node)?);
+        }
+
+        Ok(tasks)
+    }
+
     /// Get next available task (no unfinished dependencies)
     pub async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>> {
         let q = query(
