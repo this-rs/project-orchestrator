@@ -375,10 +375,7 @@ impl ToolHandler {
             .get("description")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("description is required"))?;
-        let priority = args
-            .get("priority")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i32;
+        let priority = args.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let project_id = args
             .get("project_id")
             .and_then(|v| v.as_str())
@@ -642,24 +639,30 @@ impl ToolHandler {
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         });
-        let acceptance_criteria =
-            args.get("acceptance_criteria")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                });
-        let affected_files = args.get("affected_files").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        });
-        let depends_on = args.get("dependencies").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
-                .collect()
-        });
+        let acceptance_criteria = args
+            .get("acceptance_criteria")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
+        let affected_files = args
+            .get("affected_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
+        let depends_on = args
+            .get("dependencies")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                    .collect()
+            });
 
         let req = CreateTaskRequest {
             description: description.to_string(),
@@ -803,7 +806,10 @@ impl ToolHandler {
             .context_builder()
             .build_context(task_id, plan_id)
             .await?;
-        let prompt = self.orchestrator.context_builder().generate_prompt(&context);
+        let prompt = self
+            .orchestrator
+            .context_builder()
+            .generate_prompt(&context);
 
         Ok(json!({"prompt": prompt}))
     }
@@ -818,11 +824,14 @@ impl ToolHandler {
             .get("rationale")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("rationale is required"))?;
-        let alternatives = args.get("alternatives").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        });
+        let alternatives = args
+            .get("alternatives")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
         let chosen_option = args
             .get("chosen_option")
             .and_then(|v| v.as_str())
@@ -1056,7 +1065,14 @@ impl ToolHandler {
             .map(|s| s.to_string());
 
         self.neo4j()
-            .update_release(release_id, status, target_date, released_at, title, description)
+            .update_release(
+                release_id,
+                status,
+                target_date,
+                released_at,
+                title,
+                description,
+            )
             .await?;
         Ok(json!({"updated": true}))
     }
@@ -1183,7 +1199,14 @@ impl ToolHandler {
             .map(|s| s.to_string());
 
         self.neo4j()
-            .update_milestone(milestone_id, status, target_date, closed_at, title, description)
+            .update_milestone(
+                milestone_id,
+                status,
+                target_date,
+                closed_at,
+                title,
+                description,
+            )
             .await?;
         Ok(json!({"updated": true}))
     }
@@ -1715,14 +1738,11 @@ impl ToolHandler {
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<NoteType>().ok())
                 .map(|t| vec![t]),
-            status: args
-                .get("status")
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    s.split(',')
-                        .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
-                        .collect()
-                }),
+            status: args.get("status").and_then(|v| v.as_str()).map(|s| {
+                s.split(',')
+                    .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
+                    .collect()
+            }),
             importance: args
                 .get("importance")
                 .and_then(|v| v.as_str())
@@ -1730,10 +1750,14 @@ impl ToolHandler {
                 .map(|i| vec![i]),
             min_staleness: args.get("min_staleness").and_then(|v| v.as_f64()),
             max_staleness: args.get("max_staleness").and_then(|v| v.as_f64()),
-            tags: args.get("tags").and_then(|v| v.as_str()).map(|t| {
-                t.split(',').map(|s| s.trim().to_string()).collect()
-            }),
-            search: args.get("search").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            tags: args
+                .get("tags")
+                .and_then(|v| v.as_str())
+                .map(|t| t.split(',').map(|s| s.trim().to_string()).collect()),
+            search: args
+                .get("search")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             limit: args.get("limit").and_then(|v| v.as_i64()),
             offset: args.get("offset").and_then(|v| v.as_i64()),
             scope_type: None,
@@ -1821,7 +1845,10 @@ impl ToolHandler {
         let note_id = parse_uuid(&args, "note_id")?;
 
         let request = UpdateNoteRequest {
-            content: args.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            content: args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             importance: args
                 .get("importance")
                 .and_then(|v| v.as_str())
@@ -1875,20 +1902,20 @@ impl ToolHandler {
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<NoteType>().ok())
                 .map(|t| vec![t]),
-            status: args
-                .get("status")
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    s.split(',')
-                        .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
-                        .collect()
-                }),
+            status: args.get("status").and_then(|v| v.as_str()).map(|s| {
+                s.split(',')
+                    .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
+                    .collect()
+            }),
             importance: args
                 .get("importance")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<NoteImportance>().ok())
                 .map(|i| vec![i]),
-            search: args.get("project_slug").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            search: args
+                .get("project_slug")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             limit: args.get("limit").and_then(|v| v.as_i64()),
             ..Default::default()
         };
@@ -2046,7 +2073,10 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("entity_id is required"))?;
         let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
-        let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.1);
+        let min_score = args
+            .get("min_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.1);
 
         let response = self
             .orchestrator

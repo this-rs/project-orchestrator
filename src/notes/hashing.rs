@@ -117,10 +117,7 @@ pub fn hash_struct_signature(
 }
 
 /// Hash a file structure (list of symbols + imports)
-pub fn hash_file_structure(
-    symbols: &[String],
-    imports: &[String],
-) -> String {
+pub fn hash_file_structure(symbols: &[String], imports: &[String]) -> String {
     let mut hasher = Sha256::new();
 
     // Sorted symbols

@@ -177,7 +177,11 @@ fn extract_interface(node: &tree_sitter::Node, source: &str, file_path: &str) ->
     })
 }
 
-fn extract_type_alias(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<StructNode> {
+fn extract_type_alias(
+    node: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+) -> Option<StructNode> {
     let name = get_field_text(node, "name", source)?;
     let docstring = get_jsdoc(node, source);
     let generics = extract_ts_type_parameters(node, source);

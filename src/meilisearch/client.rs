@@ -25,7 +25,11 @@ impl MeiliClient {
     /// Initialize all required indexes
     async fn init_indexes(&self) -> Result<()> {
         // Create indexes if they don't exist
-        let indexes = [index_names::CODE, index_names::DECISIONS, index_names::NOTES];
+        let indexes = [
+            index_names::CODE,
+            index_names::DECISIONS,
+            index_names::NOTES,
+        ];
 
         for index_name in indexes {
             let task = self
@@ -98,9 +102,9 @@ impl MeiliClient {
 
         let settings = Settings::new()
             .with_searchable_attributes([
-                "content",        // Main note content (highest priority)
-                "tags",           // Tags for categorization
-                "scope_path",     // Scope path (e.g., function name)
+                "content",         // Main note content (highest priority)
+                "tags",            // Tags for categorization
+                "scope_path",      // Scope path (e.g., function name)
                 "anchor_entities", // Linked entities
             ])
             .with_filterable_attributes([
@@ -262,7 +266,7 @@ impl MeiliClient {
         let index = self.client.index(index_names::CODE);
         let stats = index.get_stats().await?;
         Ok(IndexStats {
-            total_documents: stats.number_of_documents as usize,
+            total_documents: stats.number_of_documents,
             is_indexing: stats.is_indexing,
         })
     }
@@ -458,7 +462,7 @@ impl MeiliClient {
         let index = self.client.index(index_names::NOTES);
         let stats = index.get_stats().await?;
         Ok(IndexStats {
-            total_documents: stats.number_of_documents as usize,
+            total_documents: stats.number_of_documents,
             is_indexing: stats.is_indexing,
         })
     }

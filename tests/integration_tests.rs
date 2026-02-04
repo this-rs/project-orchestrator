@@ -4,7 +4,6 @@
 //! Run with: cargo test --test integration_tests
 
 use project_orchestrator::neo4j::models::*;
-use project_orchestrator::plan::models::*;
 use project_orchestrator::{AppState, Config};
 use std::time::Duration;
 use uuid::Uuid;
@@ -362,7 +361,11 @@ async fn test_neo4j_stale_file_cleanup() {
     }
 
     // Verify all 3 files exist
-    let paths_before = state.neo4j.get_project_file_paths(project_id).await.unwrap();
+    let paths_before = state
+        .neo4j
+        .get_project_file_paths(project_id)
+        .await
+        .unwrap();
     assert_eq!(paths_before.len(), 3, "Should have 3 files before cleanup");
 
     // Now simulate a sync where only file1 and file2 exist (file3 was deleted)
@@ -376,11 +379,24 @@ async fn test_neo4j_stale_file_cleanup() {
     assert_eq!(files_deleted, 1, "Should delete 1 stale file");
 
     // Verify only 2 files remain
-    let paths_after = state.neo4j.get_project_file_paths(project_id).await.unwrap();
+    let paths_after = state
+        .neo4j
+        .get_project_file_paths(project_id)
+        .await
+        .unwrap();
     assert_eq!(paths_after.len(), 2, "Should have 2 files after cleanup");
-    assert!(paths_after.contains(&file1_path), "file1 should still exist");
-    assert!(paths_after.contains(&file2_path), "file2 should still exist");
-    assert!(!paths_after.contains(&file3_path), "file3 should be deleted");
+    assert!(
+        paths_after.contains(&file1_path),
+        "file1 should still exist"
+    );
+    assert!(
+        paths_after.contains(&file2_path),
+        "file2 should still exist"
+    );
+    assert!(
+        !paths_after.contains(&file3_path),
+        "file3 should be deleted"
+    );
 
     // Cleanup: delete the test project
     state.neo4j.delete_project(project_id).await.unwrap();

@@ -94,7 +94,8 @@ fn project_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "get_project_roadmap".to_string(),
-            description: "Get aggregated roadmap view with milestones, releases, and progress".to_string(),
+            description: "Get aggregated roadmap view with milestones, releases, and progress"
+                .to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
@@ -301,7 +302,8 @@ fn task_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "get_next_task".to_string(),
-            description: "Get the next available task from a plan (unblocked, highest priority)".to_string(),
+            description: "Get the next available task from a plan (unblocked, highest priority)"
+                .to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
@@ -336,7 +338,8 @@ fn task_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "get_task_blockers".to_string(),
-            description: "Get tasks that are blocking this task (uncompleted dependencies)".to_string(),
+            description: "Get tasks that are blocking this task (uncompleted dependencies)"
+                .to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
@@ -392,7 +395,11 @@ fn task_tools() -> Vec<ToolDefinition> {
                     "alternatives": {"type": "array", "items": {"type": "string"}, "description": "Alternatives considered"},
                     "chosen_option": {"type": "string", "description": "The chosen option"}
                 })),
-                required: Some(vec!["task_id".to_string(), "description".to_string(), "rationale".to_string()]),
+                required: Some(vec![
+                    "task_id".to_string(),
+                    "description".to_string(),
+                    "rationale".to_string(),
+                ]),
             },
         },
     ]
@@ -482,7 +489,11 @@ fn constraint_tools() -> Vec<ToolDefinition> {
                     "description": {"type": "string", "description": "Constraint description"},
                     "severity": {"type": "string", "description": "Severity (low, medium, high, critical)"}
                 })),
-                required: Some(vec!["plan_id".to_string(), "constraint_type".to_string(), "description".to_string()]),
+                required: Some(vec![
+                    "plan_id".to_string(),
+                    "constraint_type".to_string(),
+                    "description".to_string(),
+                ]),
             },
         },
         ToolDefinition {
@@ -899,20 +910,18 @@ fn code_tools() -> Vec<ToolDefinition> {
 // ============================================================================
 
 fn decision_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "search_decisions".to_string(),
-            description: "Search architectural decisions".to_string(),
-            input_schema: InputSchema {
-                schema_type: "object".to_string(),
-                properties: Some(json!({
-                    "query": {"type": "string", "description": "Search query"},
-                    "limit": {"type": "integer", "description": "Max results"}
-                })),
-                required: Some(vec!["query".to_string()]),
-            },
+    vec![ToolDefinition {
+        name: "search_decisions".to_string(),
+        description: "Search architectural decisions".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "query": {"type": "string", "description": "Search query"},
+                "limit": {"type": "integer", "description": "Max results"}
+            })),
+            required: Some(vec!["query".to_string()]),
         },
-    ]
+    }]
 }
 
 // ============================================================================
@@ -1033,7 +1042,11 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
                     "anchors": {"type": "array", "description": "Initial anchors to code entities"}
                 })),
-                required: Some(vec!["project_id".to_string(), "note_type".to_string(), "content".to_string()]),
+                required: Some(vec![
+                    "project_id".to_string(),
+                    "note_type".to_string(),
+                    "content".to_string(),
+                ]),
             },
         },
         ToolDefinition {
@@ -1125,7 +1138,12 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "importance": {"type": "string", "description": "Importance of new note"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for new note"}
                 })),
-                required: Some(vec!["old_note_id".to_string(), "project_id".to_string(), "note_type".to_string(), "content".to_string()]),
+                required: Some(vec![
+                    "old_note_id".to_string(),
+                    "project_id".to_string(),
+                    "note_type".to_string(),
+                    "content".to_string(),
+                ]),
             },
         },
         ToolDefinition {
@@ -1138,7 +1156,11 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "entity_type": {"type": "string", "description": "Entity type: file, function, struct, trait, task, plan, etc."},
                     "entity_id": {"type": "string", "description": "Entity ID (file path or UUID)"}
                 })),
-                required: Some(vec!["note_id".to_string(), "entity_type".to_string(), "entity_id".to_string()]),
+                required: Some(vec![
+                    "note_id".to_string(),
+                    "entity_type".to_string(),
+                    "entity_id".to_string(),
+                ]),
             },
         },
         ToolDefinition {
@@ -1151,12 +1173,17 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "entity_type": {"type": "string", "description": "Entity type"},
                     "entity_id": {"type": "string", "description": "Entity ID"}
                 })),
-                required: Some(vec!["note_id".to_string(), "entity_type".to_string(), "entity_id".to_string()]),
+                required: Some(vec![
+                    "note_id".to_string(),
+                    "entity_type".to_string(),
+                    "entity_id".to_string(),
+                ]),
             },
         },
         ToolDefinition {
             name: "get_context_notes".to_string(),
-            description: "Get contextual notes for an entity (direct + propagated through graph)".to_string(),
+            description: "Get contextual notes for an entity (direct + propagated through graph)"
+                .to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
@@ -1170,7 +1197,8 @@ fn note_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "get_notes_needing_review".to_string(),
-            description: "Get notes that need human review (stale or needs_review status)".to_string(),
+            description: "Get notes that need human review (stale or needs_review status)"
+                .to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({

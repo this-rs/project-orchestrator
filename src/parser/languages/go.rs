@@ -62,7 +62,12 @@ fn extract_function(
     let name = get_field_text(node, "name", source)?;
 
     // Go visibility: uppercase first letter = public
-    let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+    let visibility = if name
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+    {
         Visibility::Public
     } else {
         Visibility::Private
@@ -100,7 +105,12 @@ fn extract_function(
 fn extract_method(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<FunctionNode> {
     let name = get_field_text(node, "name", source)?;
 
-    let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+    let visibility = if name
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+    {
         Visibility::Public
     } else {
         Visibility::Private
@@ -151,12 +161,16 @@ fn extract_type_declaration(
             let name = get_field_text(&child, "name", source);
 
             if let Some(name) = name {
-                let visibility =
-                    if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
-                        Visibility::Public
-                    } else {
-                        Visibility::Private
-                    };
+                let visibility = if name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
 
                 let docstring = get_go_doc(node, source);
                 let generics = extract_go_type_params(&child, source);
@@ -282,20 +296,18 @@ fn extract_go_params(node: &tree_sitter::Node, source: &str) -> Vec<Parameter> {
     for child in node.children(&mut node.walk()) {
         if child.kind() == "parameter_declaration" {
             // Go can have multiple names with same type: a, b int
-            let type_node = child
-                .children(&mut child.walk())
-                .find(|c| {
-                    c.kind() == "type_identifier"
-                        || c.kind() == "pointer_type"
-                        || c.kind() == "slice_type"
-                        || c.kind() == "map_type"
-                        || c.kind() == "channel_type"
-                        || c.kind() == "qualified_type"
-                        || c.kind() == "array_type"
-                        || c.kind() == "function_type"
-                        || c.kind() == "struct_type"
-                        || c.kind() == "interface_type"
-                });
+            let type_node = child.children(&mut child.walk()).find(|c| {
+                c.kind() == "type_identifier"
+                    || c.kind() == "pointer_type"
+                    || c.kind() == "slice_type"
+                    || c.kind() == "map_type"
+                    || c.kind() == "channel_type"
+                    || c.kind() == "qualified_type"
+                    || c.kind() == "array_type"
+                    || c.kind() == "function_type"
+                    || c.kind() == "struct_type"
+                    || c.kind() == "interface_type"
+            });
 
             let type_name = type_node
                 .and_then(|t| get_text(&t, source))

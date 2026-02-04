@@ -61,10 +61,7 @@ pub async fn list_projects(
     State(state): State<OrchestratorState>,
     Query(query): Query<ProjectsListQuery>,
 ) -> Result<Json<PaginatedResponse<ProjectResponse>>, AppError> {
-    query
-        .pagination
-        .validate()
-        .map_err(|e| AppError::BadRequest(e))?;
+    query.pagination.validate().map_err(AppError::BadRequest)?;
 
     let (projects, total) = state
         .orchestrator

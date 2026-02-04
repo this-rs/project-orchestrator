@@ -135,11 +135,7 @@ impl NoteManager {
     // ========================================================================
 
     /// Link a note to an entity
-    pub async fn link_note_to_entity(
-        &self,
-        note_id: Uuid,
-        entity: &LinkNoteRequest,
-    ) -> Result<()> {
+    pub async fn link_note_to_entity(&self, note_id: Uuid, entity: &LinkNoteRequest) -> Result<()> {
         self.neo4j
             .link_note_to_entity(note_id, &entity.entity_type, &entity.entity_id, None, None)
             .await
@@ -202,14 +198,7 @@ impl NoteManager {
     ) -> Result<Option<Note>> {
         let updated = self
             .neo4j
-            .update_note(
-                note_id,
-                None,
-                None,
-                Some(NoteStatus::Obsolete),
-                None,
-                None,
-            )
+            .update_note(note_id, None, None, Some(NoteStatus::Obsolete), None, None)
             .await?;
 
         // Update Meilisearch
@@ -253,10 +242,7 @@ impl NoteManager {
     }
 
     /// Get notes that need review
-    pub async fn get_notes_needing_review(
-        &self,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<Note>> {
+    pub async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
         self.neo4j.get_notes_needing_review(project_id).await
     }
 
@@ -334,11 +320,7 @@ impl NoteManager {
             // For now, we'll search by entity_id across different types
             let mut all_notes = Vec::new();
 
-            for entity_type in [
-                EntityType::Task,
-                EntityType::Plan,
-                EntityType::Project,
-            ] {
+            for entity_type in [EntityType::Task, EntityType::Plan, EntityType::Project] {
                 let notes = self
                     .neo4j
                     .get_notes_for_entity(&entity_type, &uuid.to_string())
@@ -377,7 +359,10 @@ impl NoteManager {
         min_score: f64,
     ) -> Result<NoteContextResponse> {
         // Get direct notes
-        let direct_notes = self.neo4j.get_notes_for_entity(entity_type, entity_id).await?;
+        let direct_notes = self
+            .neo4j
+            .get_notes_for_entity(entity_type, entity_id)
+            .await?;
 
         // Get propagated notes
         let propagated_notes = self
@@ -430,7 +415,11 @@ impl NoteManager {
         };
 
         // Get anchor entity IDs
-        let anchors = self.neo4j.get_note_anchors(note.id).await.unwrap_or_default();
+        let anchors = self
+            .neo4j
+            .get_note_anchors(note.id)
+            .await
+            .unwrap_or_default();
         let anchor_entities: Vec<String> = anchors
             .iter()
             .map(|a| format!("{}:{}", a.entity_type, a.entity_id))
@@ -468,8 +457,6 @@ impl NoteManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_note_manager_new() {
         // This is a compile-time test to ensure the struct is properly defined

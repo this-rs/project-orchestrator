@@ -124,7 +124,11 @@ pub async fn get_file_symbols(
     )
     .param("path", file_path.clone());
 
-    let file_rows = state.orchestrator.neo4j().execute_with_params(file_q).await?;
+    let file_rows = state
+        .orchestrator
+        .neo4j()
+        .execute_with_params(file_q)
+        .await?;
 
     if file_rows.is_empty() {
         return Err(AppError::NotFound(format!("File not found: {}", file_path)));
@@ -142,7 +146,11 @@ pub async fn get_file_symbols(
     )
     .param("path", file_path.clone());
 
-    let func_rows = state.orchestrator.neo4j().execute_with_params(func_q).await?;
+    let func_rows = state
+        .orchestrator
+        .neo4j()
+        .execute_with_params(func_q)
+        .await?;
     let functions: Vec<FunctionSummary> = func_rows
         .iter()
         .filter_map(|row| {
@@ -193,7 +201,11 @@ pub async fn get_file_symbols(
     )
     .param("path", file_path.clone());
 
-    let struct_rows = state.orchestrator.neo4j().execute_with_params(struct_q).await?;
+    let struct_rows = state
+        .orchestrator
+        .neo4j()
+        .execute_with_params(struct_q)
+        .await?;
     let structs: Vec<StructSummary> = struct_rows
         .iter()
         .filter_map(|row| {
@@ -223,7 +235,11 @@ pub async fn get_file_symbols(
     )
     .param("path", file_path.clone());
 
-    let import_rows = state.orchestrator.neo4j().execute_with_params(import_q).await?;
+    let import_rows = state
+        .orchestrator
+        .neo4j()
+        .execute_with_params(import_q)
+        .await?;
     let imports: Vec<String> = import_rows
         .iter()
         .filter_map(|row| row.get("path").ok())
@@ -355,10 +371,9 @@ pub async fn find_references(
 
     let rows = state.orchestrator.neo4j().execute_with_params(q).await?;
     for row in rows {
-        if let (Ok(file_path), Ok(context)) = (
-            row.get::<String>("file_path"),
-            row.get::<String>("context"),
-        ) {
+        if let (Ok(file_path), Ok(context)) =
+            (row.get::<String>("file_path"), row.get::<String>("context"))
+        {
             references.push(SymbolReference {
                 file_path,
                 line: 0,
@@ -808,7 +823,11 @@ pub async fn find_trait_implementations(
     )
     .param("trait_name", query.trait_name.clone());
 
-    let trait_rows = state.orchestrator.neo4j().execute_with_params(trait_q).await?;
+    let trait_rows = state
+        .orchestrator
+        .neo4j()
+        .execute_with_params(trait_q)
+        .await?;
     let (is_external, source) = trait_rows
         .first()
         .map(|r| {

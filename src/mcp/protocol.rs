@@ -80,22 +80,34 @@ impl JsonRpcError {
 
     /// Invalid request (-32600)
     pub fn invalid_request(details: impl Into<String>) -> Self {
-        Self::new(INVALID_REQUEST, format!("Invalid request: {}", details.into()))
+        Self::new(
+            INVALID_REQUEST,
+            format!("Invalid request: {}", details.into()),
+        )
     }
 
     /// Method not found (-32601)
     pub fn method_not_found(method: impl Into<String>) -> Self {
-        Self::new(METHOD_NOT_FOUND, format!("Method not found: {}", method.into()))
+        Self::new(
+            METHOD_NOT_FOUND,
+            format!("Method not found: {}", method.into()),
+        )
     }
 
     /// Invalid params (-32602)
     pub fn invalid_params(details: impl Into<String>) -> Self {
-        Self::new(INVALID_PARAMS, format!("Invalid params: {}", details.into()))
+        Self::new(
+            INVALID_PARAMS,
+            format!("Invalid params: {}", details.into()),
+        )
     }
 
     /// Internal error (-32603)
     pub fn internal_error(details: impl Into<String>) -> Self {
-        Self::new(INTERNAL_ERROR, format!("Internal error: {}", details.into()))
+        Self::new(
+            INTERNAL_ERROR,
+            format!("Internal error: {}", details.into()),
+        )
     }
 }
 
@@ -261,10 +273,8 @@ mod tests {
 
     #[test]
     fn test_serialize_success_response() {
-        let resp = JsonRpcResponse::success(
-            Value::Number(1.into()),
-            serde_json::json!({"status": "ok"}),
-        );
+        let resp =
+            JsonRpcResponse::success(Value::Number(1.into()), serde_json::json!({"status": "ok"}));
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"result\""));
         assert!(!json.contains("\"error\""));

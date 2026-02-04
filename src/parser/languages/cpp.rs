@@ -467,11 +467,7 @@ fn extract_template_params(node: &tree_sitter::Node, source: &str) -> Vec<String
                         params.push(name);
                     } else if let Some(text) = get_text(&child, source) {
                         // Extract just the parameter name
-                        let name = text
-                            .split_whitespace()
-                            .last()
-                            .unwrap_or(&text)
-                            .to_string();
+                        let name = text.split_whitespace().last().unwrap_or(text).to_string();
                         params.push(name);
                     }
                 }

@@ -69,7 +69,11 @@ struct Args {
     meilisearch_url: String,
 
     /// Meilisearch API key
-    #[arg(long, env = "MEILISEARCH_KEY", default_value = "orchestrator-meili-key-change-me")]
+    #[arg(
+        long,
+        env = "MEILISEARCH_KEY",
+        default_value = "orchestrator-meili-key-change-me"
+    )]
     meilisearch_key: String,
 }
 

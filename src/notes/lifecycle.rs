@@ -135,7 +135,8 @@ impl NoteLifecycleManager {
     /// Convert a FunctionNode to FunctionInfo, extracting body from source
     fn function_node_to_info(func: &FunctionNode, source: &str) -> FunctionInfo {
         // Extract function body from source using line numbers
-        let body = Self::extract_function_body(source, func.line_start as usize, func.line_end as usize);
+        let body =
+            Self::extract_function_body(source, func.line_start as usize, func.line_end as usize);
 
         let params = func
             .params
@@ -239,7 +240,11 @@ impl NoteLifecycleManager {
         file_info: &FileInfo,
     ) -> AnchorCheckResult {
         // Find the function by name
-        if let Some(func) = file_info.functions.iter().find(|f| f.name == anchor.entity_id) {
+        if let Some(func) = file_info
+            .functions
+            .iter()
+            .find(|f| f.name == anchor.entity_id)
+        {
             // Function found - check if it changed
             let new_sig_hash = hash_function_signature(
                 &func.name,
@@ -319,10 +324,8 @@ impl NoteLifecycleManager {
     fn verify_file_anchor(&self, anchor: &NoteAnchor, file_info: &FileInfo) -> AnchorCheckResult {
         // File exists (we're verifying against its info)
         // Check structure hash if available
-        let new_structure_hash = super::hashing::hash_file_structure(
-            &file_info.symbols,
-            &file_info.imports,
-        );
+        let new_structure_hash =
+            super::hashing::hash_file_structure(&file_info.symbols, &file_info.imports);
 
         if anchor.signature_hash.as_ref() == Some(&new_structure_hash) {
             AnchorCheckResult {
@@ -347,7 +350,11 @@ impl NoteLifecycleManager {
 
     /// Verify a struct anchor
     fn verify_struct_anchor(&self, anchor: &NoteAnchor, file_info: &FileInfo) -> AnchorCheckResult {
-        if let Some(s) = file_info.structs.iter().find(|s| s.name == anchor.entity_id) {
+        if let Some(s) = file_info
+            .structs
+            .iter()
+            .find(|s| s.name == anchor.entity_id)
+        {
             let new_hash = super::hashing::hash_struct_signature(&s.name, &s.fields, &s.generics);
 
             if anchor.signature_hash.as_ref() == Some(&new_hash) {
@@ -730,23 +737,19 @@ mod tests {
     fn create_test_file_info() -> FileInfo {
         FileInfo {
             path: "test.rs".to_string(),
-            functions: vec![
-                FunctionInfo {
-                    name: "test_func".to_string(),
-                    params: vec![("x".to_string(), Some("i32".to_string()))],
-                    return_type: Some("String".to_string()),
-                    is_async: false,
-                    is_unsafe: false,
-                    body: "let result = x.to_string(); result".to_string(),
-                },
-            ],
-            structs: vec![
-                StructInfo {
-                    name: "TestStruct".to_string(),
-                    fields: vec![("field1".to_string(), "String".to_string(), true)],
-                    generics: vec![],
-                },
-            ],
+            functions: vec![FunctionInfo {
+                name: "test_func".to_string(),
+                params: vec![("x".to_string(), Some("i32".to_string()))],
+                return_type: Some("String".to_string()),
+                is_async: false,
+                is_unsafe: false,
+                body: "let result = x.to_string(); result".to_string(),
+            }],
+            structs: vec![StructInfo {
+                name: "TestStruct".to_string(),
+                fields: vec![("field1".to_string(), "String".to_string(), true)],
+                generics: vec![],
+            }],
             symbols: vec!["test_func".to_string(), "TestStruct".to_string()],
             imports: vec!["std::string::String".to_string()],
         }

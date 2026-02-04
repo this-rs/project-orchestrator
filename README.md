@@ -4,6 +4,8 @@
 
 Project Orchestrator gives your AI agents a shared brain. Instead of each agent starting from scratch, they share code understanding, plans, decisions, and progress through a central knowledge base.
 
+[![CI](https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/this-rs/project-orchestrator/branch/main/graph/badge.svg)](https://codecov.io/gh/this-rs/project-orchestrator)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
 
@@ -15,7 +17,7 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 - **Semantic Code Search** — Find code by meaning, not just keywords, powered by Meilisearch
 - **Plan & Task Management** — Structured workflows with dependencies, steps, and progress tracking
 - **Multi-Language Parsing** — Tree-sitter support for Rust, TypeScript, Python, Go, and 8 more languages
-- **MCP Integration** — 62 tools available for Claude Code, OpenAI Agents, and Cursor
+- **MCP Integration** — 84 tools available for Claude Code, OpenAI Agents, and Cursor
 - **Auto-Sync** — File watcher keeps the knowledge base updated as you code
 
 ---
@@ -107,7 +109,7 @@ That's it! Your AI agents now have shared context.
 | [Installation](docs/setup/installation.md) | Full setup instructions and configuration |
 | [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
 | [API Reference](docs/api/reference.md) | Complete REST API documentation |
-| [MCP Tools](docs/api/mcp-tools.md) | All 62 MCP tools with examples |
+| [MCP Tools](docs/api/mcp-tools.md) | All 84 MCP tools with examples |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
 
 ---
@@ -123,7 +125,7 @@ That's it! Your AI agents now have shared context.
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  PROJECT ORCHESTRATOR                        │
-│                    (62 MCP Tools)                           │
+│                    (84 MCP Tools)                           │
 └─────────────────────────────┬───────────────────────────────┘
                               │
         ┌─────────────────────┼─────────────────────┐

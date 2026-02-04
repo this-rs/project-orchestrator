@@ -1043,7 +1043,11 @@ enum Status {
     let path = Path::new("Calculator.swift");
     let result = parser.parse_file(path, code);
 
-    assert!(result.is_ok(), "Should parse Swift code: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Should parse Swift code: {:?}",
+        result.err()
+    );
 
     let parsed = result.unwrap();
     assert_eq!(parsed.language, "swift");

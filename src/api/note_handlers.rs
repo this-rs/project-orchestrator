@@ -3,9 +3,9 @@
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::notes::{
-    CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, NoteContextResponse,
-    NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus, NoteType, Note,
-    PropagatedNote, UpdateNoteRequest,
+    CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note, NoteContextResponse,
+    NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus, NoteType, PropagatedNote,
+    UpdateNoteRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -44,14 +44,11 @@ impl NotesListQuery {
                 .as_ref()
                 .and_then(|s| s.parse::<NoteType>().ok())
                 .map(|t| vec![t]),
-            status: self
-                .status
-                .as_ref()
-                .map(|s| {
-                    s.split(',')
-                        .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
-                        .collect()
-                }),
+            status: self.status.as_ref().map(|s| {
+                s.split(',')
+                    .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
+                    .collect()
+            }),
             importance: self
                 .importance
                 .as_ref()
@@ -59,11 +56,10 @@ impl NotesListQuery {
                 .map(|i| vec![i]),
             min_staleness: self.min_staleness,
             max_staleness: self.max_staleness,
-            tags: self.tags.as_ref().map(|t| {
-                t.split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect()
-            }),
+            tags: self
+                .tags
+                .as_ref()
+                .map(|t| t.split(',').map(|s| s.trim().to_string()).collect()),
             search: self.search_filter.search.clone(),
             limit: Some(self.pagination.validated_limit() as i64),
             offset: Some(self.pagination.offset as i64),
@@ -142,10 +138,7 @@ pub async fn list_notes(
     State(state): State<OrchestratorState>,
     Query(query): Query<NotesListQuery>,
 ) -> Result<Json<PaginatedResponse<Note>>, AppError> {
-    query
-        .pagination
-        .validate()
-        .map_err(|e| AppError::BadRequest(e))?;
+    query.pagination.validate().map_err(AppError::BadRequest)?;
 
     let filters = query.to_note_filters();
     let (notes, total) = state
@@ -168,10 +161,7 @@ pub async fn list_project_notes(
     Path(project_id): Path<Uuid>,
     Query(query): Query<NotesListQuery>,
 ) -> Result<Json<PaginatedResponse<Note>>, AppError> {
-    query
-        .pagination
-        .validate()
-        .map_err(|e| AppError::BadRequest(e))?;
+    query.pagination.validate().map_err(AppError::BadRequest)?;
 
     let filters = query.to_note_filters();
     let (notes, total) = state
@@ -280,14 +270,11 @@ pub async fn search_notes(
             .as_ref()
             .and_then(|s| s.parse::<NoteType>().ok())
             .map(|t| vec![t]),
-        status: query
-            .status
-            .as_ref()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
-                    .collect()
-            }),
+        status: query.status.as_ref().map(|s| {
+            s.split(',')
+                .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
+                .collect()
+        }),
         importance: query
             .importance
             .as_ref()
@@ -431,7 +418,9 @@ pub async fn update_staleness_scores(
         .update_staleness_scores()
         .await?;
 
-    Ok(Json(StalenessUpdateResponse { notes_updated: count }))
+    Ok(Json(StalenessUpdateResponse {
+        notes_updated: count,
+    }))
 }
 
 /// Get contextual notes for an entity (direct + propagated)

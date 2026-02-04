@@ -152,7 +152,7 @@ pub struct SearchFilter {
 impl SearchFilter {
     /// Check if search filter is set
     pub fn is_set(&self) -> bool {
-        self.search.as_ref().map_or(false, |s| !s.trim().is_empty())
+        self.search.as_ref().is_some_and(|s| !s.trim().is_empty())
     }
 }
 

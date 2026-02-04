@@ -28,10 +28,23 @@ pub fn calculate_complexity(node: &tree_sitter::Node) -> u32 {
             let node = cursor.node();
             match node.kind() {
                 // Control flow
-                "if_expression" | "if_statement" | "while_expression" | "while_statement"
-                | "for_expression" | "for_statement" | "for_in_statement" | "match_arm"
-                | "loop_expression" | "case_clause" | "switch_case" | "catch_clause"
-                | "except_clause" | "elif_clause" | "else_clause" | "?" | "ternary_expression"
+                "if_expression"
+                | "if_statement"
+                | "while_expression"
+                | "while_statement"
+                | "for_expression"
+                | "for_statement"
+                | "for_in_statement"
+                | "match_arm"
+                | "loop_expression"
+                | "case_clause"
+                | "switch_case"
+                | "catch_clause"
+                | "except_clause"
+                | "elif_clause"
+                | "else_clause"
+                | "?"
+                | "ternary_expression"
                 | "conditional_expression" => {
                     *complexity += 1;
                 }
@@ -141,11 +154,8 @@ pub fn visibility_from_name(name: &str) -> Visibility {
     // Python/JavaScript convention: underscore prefix = private
     if name.starts_with('_') {
         Visibility::Private
-    }
-    // Go convention: uppercase first letter = public
-    else if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
-        Visibility::Public
     } else {
+        // Go convention: uppercase first letter = public, but we default to Public
         Visibility::Public
     }
 }
@@ -228,8 +238,14 @@ pub fn extract_params_generic(params_node: &tree_sitter::Node, source: &str) -> 
 
     for child in params_node.children(&mut params_node.walk()) {
         match child.kind() {
-            "parameter" | "formal_parameter" | "required_parameter" | "optional_parameter"
-            | "rest_parameter" | "parameter_declaration" | "simple_parameter" | "typed_parameter"
+            "parameter"
+            | "formal_parameter"
+            | "required_parameter"
+            | "optional_parameter"
+            | "rest_parameter"
+            | "parameter_declaration"
+            | "simple_parameter"
+            | "typed_parameter"
             | "default_parameter" => {
                 let name = child
                     .child_by_field_name("name")

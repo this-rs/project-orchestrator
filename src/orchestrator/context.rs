@@ -3,7 +3,7 @@
 use crate::meilisearch::client::MeiliClient;
 use crate::neo4j::client::Neo4jClient;
 use crate::neo4j::models::*;
-use crate::notes::{EntityType, NoteManager, Note};
+use crate::notes::{EntityType, Note, NoteManager};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
 use anyhow::Result;
@@ -69,23 +69,25 @@ impl ContextBuilder {
             .await?;
 
         // Get notes for the task
-        let task_notes = self.get_notes_for_entity(
-            &EntityType::Task,
-            &task_id.to_string(),
-        ).await?;
+        let task_notes = self
+            .get_notes_for_entity(&EntityType::Task, &task_id.to_string())
+            .await?;
 
         // Get notes for the plan
-        let plan_notes = self.get_notes_for_entity(
-            &EntityType::Plan,
-            &plan_id.to_string(),
-        ).await?;
+        let plan_notes = self
+            .get_notes_for_entity(&EntityType::Plan, &plan_id.to_string())
+            .await?;
 
         // Combine all notes
         let mut all_notes = task_notes;
         all_notes.extend(plan_notes);
 
         // Deduplicate notes by ID
-        all_notes.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap_or(std::cmp::Ordering::Equal));
+        all_notes.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         all_notes.dedup_by_key(|n| n.id);
 
         Ok(AgentContext {
@@ -129,7 +131,9 @@ impl ContextBuilder {
         let mut context = self.get_file_context(file_path).await?;
 
         // Get notes for this file
-        context.notes = self.get_notes_for_entity(&EntityType::File, file_path).await?;
+        context.notes = self
+            .get_notes_for_entity(&EntityType::File, file_path)
+            .await?;
 
         Ok(context)
     }
@@ -258,9 +262,8 @@ impl ContextBuilder {
             prompt.push_str("## Constraints\n");
             for constraint in &context.constraints {
                 prompt.push_str(&format!(
-                    "- [{}] {}\n",
-                    format!("{:?}", constraint.constraint_type),
-                    constraint.description
+                    "- [{:?}] {}\n",
+                    constraint.constraint_type, constraint.description
                 ));
             }
             prompt.push('\n');
@@ -344,12 +347,26 @@ impl ContextBuilder {
         // Knowledge Notes (guidelines, gotchas, patterns)
         if !context.notes.is_empty() {
             prompt.push_str("## Knowledge Notes\n");
-            prompt.push_str("The following notes contain important context, guidelines, and gotchas:\n\n");
+            prompt.push_str(
+                "The following notes contain important context, guidelines, and gotchas:\n\n",
+            );
 
             // Group by importance
-            let critical: Vec<_> = context.notes.iter().filter(|n| n.importance == "critical").collect();
-            let high: Vec<_> = context.notes.iter().filter(|n| n.importance == "high").collect();
-            let other: Vec<_> = context.notes.iter().filter(|n| n.importance != "critical" && n.importance != "high").collect();
+            let critical: Vec<_> = context
+                .notes
+                .iter()
+                .filter(|n| n.importance == "critical")
+                .collect();
+            let high: Vec<_> = context
+                .notes
+                .iter()
+                .filter(|n| n.importance == "high")
+                .collect();
+            let other: Vec<_> = context
+                .notes
+                .iter()
+                .filter(|n| n.importance != "critical" && n.importance != "high")
+                .collect();
 
             if !critical.is_empty() {
                 prompt.push_str("### Critical\n");
@@ -361,9 +378,7 @@ impl ContextBuilder {
                     };
                     prompt.push_str(&format!(
                         "- **[{}]{}** {}\n",
-                        note.note_type,
-                        source,
-                        note.content
+                        note.note_type, source, note.content
                     ));
                 }
                 prompt.push('\n');
@@ -379,9 +394,7 @@ impl ContextBuilder {
                     };
                     prompt.push_str(&format!(
                         "- **[{}]{}** {}\n",
-                        note.note_type,
-                        source,
-                        note.content
+                        note.note_type, source, note.content
                     ));
                 }
                 prompt.push('\n');
@@ -397,9 +410,7 @@ impl ContextBuilder {
                     };
                     prompt.push_str(&format!(
                         "- [{}]{} {}\n",
-                        note.note_type,
-                        source,
-                        note.content
+                        note.note_type, source, note.content
                     ));
                 }
                 prompt.push('\n');
@@ -407,17 +418,17 @@ impl ContextBuilder {
         }
 
         // File-specific notes
-        let files_with_notes: Vec<_> = context.target_files.iter().filter(|f| !f.notes.is_empty()).collect();
+        let files_with_notes: Vec<_> = context
+            .target_files
+            .iter()
+            .filter(|f| !f.notes.is_empty())
+            .collect();
         if !files_with_notes.is_empty() {
             prompt.push_str("## File-Specific Notes\n");
             for file in files_with_notes {
                 prompt.push_str(&format!("### {}\n", file.path));
                 for note in &file.notes {
-                    prompt.push_str(&format!(
-                        "- [{}] {}\n",
-                        note.note_type,
-                        note.content
-                    ));
+                    prompt.push_str(&format!("- [{}] {}\n", note.note_type, note.content));
                 }
                 prompt.push('\n');
             }

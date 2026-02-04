@@ -1,0 +1,278 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ==========================================================================
+  # Build - Compile once, share artifacts and cache
+  # ==========================================================================
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-build"
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            target/release/orchestrator
+            target/release/mcp_server
+          retention-days: 1
+
+  # ==========================================================================
+  # Lint & Format - Fast feedback on code quality
+  # ==========================================================================
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-build"
+          save-if: false
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+  # ==========================================================================
+  # Unit Tests - Parser tests without external services
+  # ==========================================================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-build"
+          save-if: false
+
+      - name: Run parser tests
+        run: cargo test --test parser_tests
+
+  # ==========================================================================
+  # Integration Tests - Requires Neo4j and Meilisearch
+  # ==========================================================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    services:
+      neo4j:
+        image: neo4j:5
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_PLUGINS: '["apoc"]'
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 30s
+
+      meilisearch:
+        image: getmeili/meilisearch:v1.6
+        env:
+          MEILI_MASTER_KEY: test-master-key
+          MEILI_NO_ANALYTICS: true
+        ports:
+          - 7700:7700
+        options: >-
+          --health-cmd "curl -sf http://localhost:7700/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-build"
+          save-if: false
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for Neo4j..."
+          timeout 60 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
+          echo "Waiting for Meilisearch..."
+          timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
+          echo "All services are ready!"
+
+      - name: Run integration tests
+        env:
+          NEO4J_URI: bolt://localhost:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
+          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_KEY: test-master-key
+        run: cargo test --test integration_tests
+
+  # ==========================================================================
+  # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
+  # ==========================================================================
+  api-tests:
+    name: API Tests
+    runs-on: ubuntu-latest
+    needs: [build, lint, unit-tests]
+    services:
+      neo4j:
+        image: neo4j:5
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_PLUGINS: '["apoc"]'
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 30s
+
+      meilisearch:
+        image: getmeili/meilisearch:v1.6
+        env:
+          MEILI_MASTER_KEY: test-master-key
+          MEILI_NO_ANALYTICS: true
+        ports:
+          - 7700:7700
+        options: >-
+          --health-cmd "curl -sf http://localhost:7700/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-build"
+          save-if: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: target/release/
+
+      - name: Make binaries executable
+        run: chmod +x target/release/orchestrator target/release/mcp_server
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for Neo4j..."
+          timeout 60 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
+          echo "Waiting for Meilisearch..."
+          timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
+          echo "All services are ready!"
+
+      - name: Start server in background
+        env:
+          NEO4J_URI: bolt://localhost:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
+          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_KEY: test-master-key
+          RUST_LOG: info
+        run: |
+          ./target/release/orchestrator serve --port 8080 &
+          echo "Waiting for server to start..."
+          timeout 30 bash -c 'until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done'
+          echo "Server is ready!"
+
+      - name: Run API tests
+        env:
+          NEO4J_URI: bolt://localhost:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
+          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_KEY: test-master-key
+        run: cargo test --test api_tests
+
+  # ==========================================================================
+  # Code Coverage - Generate and upload coverage report
+  # ==========================================================================
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-build"
+          save-if: false
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --test parser_tests --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          verbose: true

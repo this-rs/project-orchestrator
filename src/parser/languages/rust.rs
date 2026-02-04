@@ -511,7 +511,9 @@ fn extract_rust_type_parameters(node: &tree_sitter::Node, source: &str) -> Vec<S
     if let Some(type_params) = type_params_node {
         for param in type_params.children(&mut type_params.walk()) {
             match param.kind() {
-                "type_parameter" | "constrained_type_parameter" | "lifetime_parameter"
+                "type_parameter"
+                | "constrained_type_parameter"
+                | "lifetime_parameter"
                 | "const_parameter" => {
                     if let Some(text) = get_text(&param, source) {
                         generics.push(text.to_string());

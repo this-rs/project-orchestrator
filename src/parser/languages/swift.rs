@@ -244,10 +244,7 @@ fn extract_extension(
 
 fn extract_import(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<ImportNode> {
     let text = get_text(node, source)?;
-    let path = text
-        .trim_start_matches("import ")
-        .trim()
-        .to_string();
+    let path = text.trim_start_matches("import ").trim().to_string();
 
     Some(ImportNode {
         path,
