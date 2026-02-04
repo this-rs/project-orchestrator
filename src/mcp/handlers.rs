@@ -43,6 +43,7 @@ impl ToolHandler {
             "delete_project" => self.delete_project(args).await,
             "sync_project" => self.sync_project(args).await,
             "get_project_roadmap" => self.get_project_roadmap(args).await,
+            "list_project_plans" => self.list_project_plans(args).await,
 
             // Plans
             "list_plans" => self.list_plans(args).await,
@@ -85,6 +86,7 @@ impl ToolHandler {
             "get_release" => self.get_release(args).await,
             "update_release" => self.update_release(args).await,
             "add_task_to_release" => self.add_task_to_release(args).await,
+            "add_commit_to_release" => self.add_commit_to_release(args).await,
 
             // Milestones
             "list_milestones" => self.list_milestones(args).await,
@@ -92,12 +94,14 @@ impl ToolHandler {
             "get_milestone" => self.get_milestone(args).await,
             "update_milestone" => self.update_milestone(args).await,
             "get_milestone_progress" => self.get_milestone_progress(args).await,
+            "add_task_to_milestone" => self.add_task_to_milestone(args).await,
 
             // Commits
             "create_commit" => self.create_commit(args).await,
             "link_commit_to_task" => self.link_commit_to_task(args).await,
             "link_commit_to_plan" => self.link_commit_to_plan(args).await,
             "get_task_commits" => self.get_task_commits(args).await,
+            "get_plan_commits" => self.get_plan_commits(args).await,
 
             // Code
             "search_code" => self.search_code(args).await,
@@ -110,6 +114,8 @@ impl ToolHandler {
             "get_architecture" => self.get_architecture(args).await,
             "find_similar_code" => self.find_similar_code(args).await,
             "find_trait_implementations" => self.find_trait_implementations(args).await,
+            "find_type_traits" => self.find_type_traits(args).await,
+            "get_impl_blocks" => self.get_impl_blocks(args).await,
 
             // Decisions
             "search_decisions" => self.search_decisions(args).await,
@@ -119,6 +125,10 @@ impl ToolHandler {
             "start_watch" => self.start_watch(args).await,
             "stop_watch" => self.stop_watch(args).await,
             "watch_status" => self.watch_status(args).await,
+
+            // Meilisearch
+            "get_meilisearch_stats" => self.get_meilisearch_stats(args).await,
+            "delete_meilisearch_orphans" => self.delete_meilisearch_orphans(args).await,
 
             // Notes
             "list_notes" => self.list_notes(args).await,
@@ -272,6 +282,39 @@ impl ToolHandler {
                 "in_progress": in_progress,
                 "pending": pending
             }
+        }))
+    }
+
+    async fn list_project_plans(&self, args: Value) -> Result<Value> {
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("project_slug is required"))?;
+        let status = args
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        // Get project by slug
+        let project = self
+            .neo4j()
+            .get_project_by_slug(project_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project not found: {}", project_slug))?;
+
+        // List plans for this project
+        let (plans, total) = self
+            .neo4j()
+            .list_plans_for_project(project.id, status, limit, offset)
+            .await?;
+
+        Ok(json!({
+            "items": plans,
+            "total": total,
+            "limit": limit,
+            "offset": offset
         }))
     }
 
@@ -1028,6 +1071,19 @@ impl ToolHandler {
         Ok(json!({"added": true}))
     }
 
+    async fn add_commit_to_release(&self, args: Value) -> Result<Value> {
+        let release_id = parse_uuid(&args, "release_id")?;
+        let commit_sha = args
+            .get("commit_sha")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("commit_sha is required"))?;
+
+        self.neo4j()
+            .add_commit_to_release(release_id, commit_sha)
+            .await?;
+        Ok(json!({"added": true}))
+    }
+
     // ========================================================================
     // Milestone Handlers
     // ========================================================================
@@ -1149,6 +1205,16 @@ impl ToolHandler {
         }))
     }
 
+    async fn add_task_to_milestone(&self, args: Value) -> Result<Value> {
+        let milestone_id = parse_uuid(&args, "milestone_id")?;
+        let task_id = parse_uuid(&args, "task_id")?;
+
+        self.neo4j()
+            .add_task_to_milestone(milestone_id, task_id)
+            .await?;
+        Ok(json!({"added": true}))
+    }
+
     // ========================================================================
     // Commit Handlers
     // ========================================================================
@@ -1208,6 +1274,13 @@ impl ToolHandler {
         let task_id = parse_uuid(&args, "task_id")?;
 
         let commits = self.neo4j().get_task_commits(task_id).await?;
+        Ok(serde_json::to_value(commits)?)
+    }
+
+    async fn get_plan_commits(&self, args: Value) -> Result<Value> {
+        let plan_id = parse_uuid(&args, "plan_id")?;
+
+        let commits = self.neo4j().get_plan_commits(plan_id).await?;
         Ok(serde_json::to_value(commits)?)
     }
 
@@ -1528,6 +1601,32 @@ impl ToolHandler {
         }))
     }
 
+    async fn find_type_traits(&self, args: Value) -> Result<Value> {
+        let type_name = args
+            .get("type_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("type_name is required"))?;
+
+        let traits = self.neo4j().get_type_traits(type_name).await?;
+        Ok(json!({
+            "type_name": type_name,
+            "traits": traits
+        }))
+    }
+
+    async fn get_impl_blocks(&self, args: Value) -> Result<Value> {
+        let type_name = args
+            .get("type_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("type_name is required"))?;
+
+        let impl_blocks = self.neo4j().get_impl_blocks(type_name).await?;
+        Ok(json!({
+            "type_name": type_name,
+            "impl_blocks": impl_blocks
+        }))
+    }
+
     // ========================================================================
     // Decision Handlers
     // ========================================================================
@@ -1582,6 +1681,20 @@ impl ToolHandler {
 
     async fn watch_status(&self, _args: Value) -> Result<Value> {
         Ok(json!({"message": "Use HTTP API GET /api/watch to get watcher status"}))
+    }
+
+    // ========================================================================
+    // Meilisearch Handlers
+    // ========================================================================
+
+    async fn get_meilisearch_stats(&self, _args: Value) -> Result<Value> {
+        let stats = self.meili().get_code_stats().await?;
+        Ok(serde_json::to_value(stats)?)
+    }
+
+    async fn delete_meilisearch_orphans(&self, _args: Value) -> Result<Value> {
+        self.meili().delete_orphan_code_documents().await?;
+        Ok(json!({"deleted": true}))
     }
 
     // ========================================================================

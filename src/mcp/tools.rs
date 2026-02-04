@@ -19,6 +19,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     tools.extend(code_tools());
     tools.extend(decision_tools());
     tools.extend(sync_tools());
+    tools.extend(meilisearch_tools());
     tools.extend(note_tools());
     tools
 }
@@ -100,6 +101,20 @@ fn project_tools() -> Vec<ToolDefinition> {
                     "project_id": {"type": "string", "description": "Project UUID"}
                 })),
                 required: Some(vec!["project_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "list_project_plans".to_string(),
+            description: "List all plans for a specific project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Project slug"},
+                    "status": {"type": "string", "description": "Filter by status"},
+                    "limit": {"type": "integer", "description": "Max items"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: Some(vec!["project_slug".to_string()]),
             },
         },
     ]
@@ -558,6 +573,18 @@ fn release_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["release_id".to_string(), "task_id".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "add_commit_to_release".to_string(),
+            description: "Add a commit to a release".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "release_id": {"type": "string", "description": "Release UUID"},
+                    "commit_sha": {"type": "string", "description": "Commit SHA"}
+                })),
+                required: Some(vec!["release_id".to_string(), "commit_sha".to_string()]),
+            },
+        },
     ]
 }
 
@@ -633,6 +660,18 @@ fn milestone_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["milestone_id".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "add_task_to_milestone".to_string(),
+            description: "Add a task to a milestone".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "milestone_id": {"type": "string", "description": "Milestone UUID"},
+                    "task_id": {"type": "string", "description": "Task UUID"}
+                })),
+                required: Some(vec!["milestone_id".to_string(), "task_id".to_string()]),
+            },
+        },
     ]
 }
 
@@ -689,6 +728,17 @@ fn commit_tools() -> Vec<ToolDefinition> {
                     "task_id": {"type": "string", "description": "Task UUID"}
                 })),
                 required: Some(vec!["task_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_plan_commits".to_string(),
+            description: "Get commits linked to a plan".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string()]),
             },
         },
     ]
@@ -817,6 +867,30 @@ fn code_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["trait_name".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "find_type_traits".to_string(),
+            description: "Find all traits implemented by a type".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "type_name": {"type": "string", "description": "Type name (struct/enum)"},
+                    "limit": {"type": "integer", "description": "Max results"}
+                })),
+                required: Some(vec!["type_name".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_impl_blocks".to_string(),
+            description: "Get all impl blocks for a type".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "type_name": {"type": "string", "description": "Type name (struct/enum)"},
+                    "limit": {"type": "integer", "description": "Max results"}
+                })),
+                required: Some(vec!["type_name".to_string()]),
+            },
+        },
     ]
 }
 
@@ -883,6 +957,33 @@ fn sync_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "watch_status".to_string(),
             description: "Get file watcher status".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
+    ]
+}
+
+// ============================================================================
+// Meilisearch Maintenance Tools (2)
+// ============================================================================
+
+fn meilisearch_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "get_meilisearch_stats".to_string(),
+            description: "Get Meilisearch code index statistics".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "delete_meilisearch_orphans".to_string(),
+            description: "Delete documents without project_id from Meilisearch".to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({})),
@@ -1097,7 +1198,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 76, "Expected 76 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 84, "Expected 84 tools, got {}", tools.len());
     }
 
     #[test]

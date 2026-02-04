@@ -1239,6 +1239,44 @@ impl Neo4jClient {
         Ok(traits)
     }
 
+    /// Get all impl blocks for a type
+    pub async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (type {name: $type_name})<-[:IMPLEMENTS_FOR]-(i:Impl)
+            OPTIONAL MATCH (i)-[:IMPLEMENTS_TRAIT]->(t:Trait)
+            RETURN i.id AS impl_id,
+                   i.file_path AS file_path,
+                   i.start_line AS start_line,
+                   i.end_line AS end_line,
+                   t.name AS trait_name,
+                   t.is_external AS is_external
+            "#,
+        )
+        .param("type_name", type_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut impl_blocks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let file_path: String = row.get("file_path").unwrap_or_default();
+            let start_line: i64 = row.get("start_line").unwrap_or(0);
+            let end_line: i64 = row.get("end_line").unwrap_or(0);
+            let trait_name: Option<String> = row.get("trait_name").ok();
+            let is_external: bool = row.get("is_external").unwrap_or(false);
+
+            impl_blocks.push(serde_json::json!({
+                "file_path": file_path,
+                "start_line": start_line,
+                "end_line": end_line,
+                "trait_name": trait_name,
+                "is_external": is_external
+            }));
+        }
+
+        Ok(impl_blocks)
+    }
+
     // ========================================================================
     // Plan operations
     // ========================================================================
@@ -1380,6 +1418,84 @@ impl Neo4jClient {
         }
 
         Ok(plans)
+    }
+
+    /// List plans for a project with filters
+    pub async fn list_plans_for_project(
+        &self,
+        project_id: Uuid,
+        status_filter: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PlanNode>, usize)> {
+        // Build status filter
+        let status_clause = if let Some(statuses) = &status_filter {
+            if !statuses.is_empty() {
+                let status_list: Vec<String> = statuses
+                    .iter()
+                    .map(|s| {
+                        // Convert to PascalCase for enum matching
+                        let pascal = match s.to_lowercase().as_str() {
+                            "draft" => "Draft",
+                            "approved" => "Approved",
+                            "in_progress" => "InProgress",
+                            "completed" => "Completed",
+                            "cancelled" => "Cancelled",
+                            _ => s.as_str(),
+                        };
+                        format!("'{}'", pascal)
+                    })
+                    .collect();
+                format!("AND p.status IN [{}]", status_list.join(", "))
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        // Count total
+        let count_q = query(&format!(
+            r#"
+            MATCH (project:Project {{id: $project_id}})-[:HAS_PLAN]->(p:Plan)
+            WHERE true {}
+            RETURN count(p) AS total
+            "#,
+            status_clause
+        ))
+        .param("project_id", project_id.to_string());
+
+        let count_rows = self.execute_with_params(count_q).await?;
+        let total: i64 = count_rows
+            .first()
+            .and_then(|r| r.get("total").ok())
+            .unwrap_or(0);
+
+        // Get plans
+        let q = query(&format!(
+            r#"
+            MATCH (project:Project {{id: $project_id}})-[:HAS_PLAN]->(p:Plan)
+            WHERE true {}
+            RETURN p
+            ORDER BY p.priority DESC, p.created_at DESC
+            SKIP $offset
+            LIMIT $limit
+            "#,
+            status_clause
+        ))
+        .param("project_id", project_id.to_string())
+        .param("offset", offset as i64)
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut plans = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("p")?;
+            plans.push(self.node_to_plan(&node)?);
+        }
+
+        Ok((plans, total as usize))
     }
 
     /// Update plan status
