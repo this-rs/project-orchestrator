@@ -115,34 +115,126 @@ pub async fn get_file_symbols(
         .map_err(|e| AppError::BadRequest(e.to_string()))?
         .to_string();
 
-    // Query Neo4j for all symbols in this file
-    let q = neo4rs::query(
+    // First, get the file language
+    let file_q = neo4rs::query(
         r#"
         MATCH (f:File {path: $path})
-        OPTIONAL MATCH (f)-[:CONTAINS]->(func:Function)
-        OPTIONAL MATCH (f)-[:CONTAINS]->(s:Struct)
-        RETURN f.language AS language,
-               collect(DISTINCT func) AS functions,
-               collect(DISTINCT s) AS structs
+        RETURN f.language AS language
         "#,
     )
     .param("path", file_path.clone());
 
-    let rows = state.orchestrator.neo4j().execute_with_params(q).await?;
+    let file_rows = state.orchestrator.neo4j().execute_with_params(file_q).await?;
 
-    if rows.is_empty() {
+    if file_rows.is_empty() {
         return Err(AppError::NotFound(format!("File not found: {}", file_path)));
     }
 
-    // Parse results (simplified - would need proper deserialization)
-    let language: String = rows[0].get("language").unwrap_or_default();
+    let language: String = file_rows[0].get("language").unwrap_or_default();
+
+    // Query functions separately to avoid cartesian products
+    let func_q = neo4rs::query(
+        r#"
+        MATCH (f:File {path: $path})-[:CONTAINS]->(func:Function)
+        RETURN func
+        ORDER BY func.line_start
+        "#,
+    )
+    .param("path", file_path.clone());
+
+    let func_rows = state.orchestrator.neo4j().execute_with_params(func_q).await?;
+    let functions: Vec<FunctionSummary> = func_rows
+        .iter()
+        .filter_map(|row| {
+            let node: neo4rs::Node = row.get("func").ok()?;
+            let name: String = node.get("name").ok()?;
+            let is_async: bool = node.get("is_async").unwrap_or(false);
+            let visibility: String = node.get("visibility").unwrap_or_default();
+            let is_public = visibility == "public";
+            let line: i64 = node.get("line_start").unwrap_or(0);
+            let complexity: i64 = node.get("complexity").unwrap_or(1);
+            let docstring: Option<String> = node.get("docstring").ok();
+
+            // Build signature from params and return type
+            let params: Vec<String> = node.get("params").unwrap_or_default();
+            let return_type: String = node.get("return_type").unwrap_or_default();
+            let async_prefix = if is_async { "async " } else { "" };
+            let signature = format!(
+                "{}fn {}({}){}",
+                async_prefix,
+                name,
+                params.join(", "),
+                if return_type.is_empty() {
+                    String::new()
+                } else {
+                    format!(" -> {}", return_type)
+                }
+            );
+
+            Some(FunctionSummary {
+                name,
+                signature,
+                line: line as u32,
+                is_async,
+                is_public,
+                complexity: complexity as u32,
+                docstring,
+            })
+        })
+        .collect();
+
+    // Query structs separately
+    let struct_q = neo4rs::query(
+        r#"
+        MATCH (f:File {path: $path})-[:CONTAINS]->(s:Struct)
+        RETURN s
+        ORDER BY s.line_start
+        "#,
+    )
+    .param("path", file_path.clone());
+
+    let struct_rows = state.orchestrator.neo4j().execute_with_params(struct_q).await?;
+    let structs: Vec<StructSummary> = struct_rows
+        .iter()
+        .filter_map(|row| {
+            let node: neo4rs::Node = row.get("s").ok()?;
+            let name: String = node.get("name").ok()?;
+            let visibility: String = node.get("visibility").unwrap_or_default();
+            let is_public = visibility == "public";
+            let line: i64 = node.get("line_start").unwrap_or(0);
+            let docstring: Option<String> = node.get("docstring").ok();
+
+            Some(StructSummary {
+                name,
+                line: line as u32,
+                is_public,
+                docstring,
+            })
+        })
+        .collect();
+
+    // Query imports separately
+    let import_q = neo4rs::query(
+        r#"
+        MATCH (f:File {path: $path})-[:CONTAINS]->(i:Import)
+        RETURN i.path AS path
+        ORDER BY i.line
+        "#,
+    )
+    .param("path", file_path.clone());
+
+    let import_rows = state.orchestrator.neo4j().execute_with_params(import_q).await?;
+    let imports: Vec<String> = import_rows
+        .iter()
+        .filter_map(|row| row.get("path").ok())
+        .collect();
 
     Ok(Json(FileSymbols {
         path: file_path,
         language,
-        functions: vec![], // TODO: deserialize from Neo4j nodes
-        structs: vec![],
-        imports: vec![],
+        functions,
+        structs,
+        imports,
     }))
 }
 
@@ -176,33 +268,107 @@ pub async fn find_references(
     State(state): State<OrchestratorState>,
     Query(query): Query<FindReferencesQuery>,
 ) -> Result<Json<Vec<SymbolReference>>, AppError> {
+    let limit = query.limit.unwrap_or(20);
+    let mut references = Vec::new();
+
+    // Find function callers
     let q = neo4rs::query(
         r#"
         MATCH (f:Function {name: $name})
         OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
-        RETURN f.file_path AS defined_in, f.line_start AS defined_line,
-               collect({
-                   file: caller.file_path,
-                   line: caller.line_start,
-                   name: caller.name
-               }) AS callers
-        UNION
-        MATCH (s:Struct {name: $name})
-        OPTIONAL MATCH (user:Function)-[:USES_TYPE]->(s)
-        RETURN s.file_path AS defined_in, s.line_start AS defined_line,
-               collect({
-                   file: user.file_path,
-                   line: user.line_start,
-                   name: user.name
-               }) AS callers
+        WHERE caller IS NOT NULL
+        RETURN 'call' AS ref_type,
+               caller.file_path AS file_path,
+               caller.line_start AS line,
+               caller.name AS context
+        LIMIT $limit
         "#,
     )
-    .param("name", query.symbol.clone());
+    .param("name", query.symbol.clone())
+    .param("limit", limit as i64);
 
-    let _rows = state.orchestrator.neo4j().execute_with_params(q).await?;
+    let rows = state.orchestrator.neo4j().execute_with_params(q).await?;
+    for row in rows {
+        if let (Ok(file_path), Ok(line), Ok(context)) = (
+            row.get::<String>("file_path"),
+            row.get::<i64>("line"),
+            row.get::<String>("context"),
+        ) {
+            references.push(SymbolReference {
+                file_path,
+                line: line as u32,
+                context: format!("called from {}", context),
+                reference_type: "call".to_string(),
+            });
+        }
+    }
 
-    // TODO: parse rows into SymbolReference
-    Ok(Json(vec![]))
+    // Find struct usages (via imports or type references)
+    let q = neo4rs::query(
+        r#"
+        MATCH (s:Struct {name: $name})
+        OPTIONAL MATCH (i:Import)-[:IMPORTS_SYMBOL]->(s)
+        WHERE i IS NOT NULL
+        RETURN 'import' AS ref_type,
+               i.file_path AS file_path,
+               i.line AS line,
+               i.path AS context
+        LIMIT $limit
+        "#,
+    )
+    .param("name", query.symbol.clone())
+    .param("limit", limit as i64);
+
+    let rows = state.orchestrator.neo4j().execute_with_params(q).await?;
+    for row in rows {
+        if let (Ok(file_path), Ok(line), Ok(context)) = (
+            row.get::<String>("file_path"),
+            row.get::<i64>("line"),
+            row.get::<String>("context"),
+        ) {
+            references.push(SymbolReference {
+                file_path,
+                line: line as u32,
+                context: format!("imported via {}", context),
+                reference_type: "import".to_string(),
+            });
+        }
+    }
+
+    // Find files that import the symbol's module
+    let q = neo4rs::query(
+        r#"
+        MATCH (s {name: $name})
+        WHERE s:Function OR s:Struct OR s:Trait OR s:Enum
+        MATCH (f:File {path: s.file_path})
+        OPTIONAL MATCH (importer:File)-[:IMPORTS]->(f)
+        WHERE importer IS NOT NULL
+        RETURN 'file_import' AS ref_type,
+               importer.path AS file_path,
+               0 AS line,
+               f.path AS context
+        LIMIT $limit
+        "#,
+    )
+    .param("name", query.symbol.clone())
+    .param("limit", limit as i64);
+
+    let rows = state.orchestrator.neo4j().execute_with_params(q).await?;
+    for row in rows {
+        if let (Ok(file_path), Ok(context)) = (
+            row.get::<String>("file_path"),
+            row.get::<String>("context"),
+        ) {
+            references.push(SymbolReference {
+                file_path,
+                line: 0,
+                context: format!("imports module {}", context),
+                reference_type: "file_import".to_string(),
+            });
+        }
+    }
+
+    Ok(Json(references))
 }
 
 // ============================================================================

@@ -239,9 +239,19 @@ impl Orchestrator {
             self.state.neo4j.upsert_impl(impl_block).await?;
         }
 
-        // Store imports
+        // Store imports and create File→IMPORTS→File relationships
         for import in &parsed.imports {
             self.state.neo4j.upsert_import(import).await?;
+
+            // Try to resolve import to a file path and create relationship
+            if let Some(target_file) = self.resolve_rust_import(&import.path, &parsed.path) {
+                // Only create relationship if target file exists in our graph
+                self.state
+                    .neo4j
+                    .create_import_relationship(&parsed.path, &target_file, &import.path)
+                    .await
+                    .ok(); // Ignore errors (target file might not exist yet)
+            }
         }
 
         // Store function call relationships
@@ -253,6 +263,120 @@ impl Orchestrator {
         }
 
         Ok(())
+    }
+
+    /// Resolve a Rust import path to an actual file path
+    ///
+    /// Examples:
+    /// - `crate::neo4j::client` → `src/neo4j/client.rs` or `src/neo4j/client/mod.rs`
+    /// - `super::models` → parent_dir/models.rs
+    /// - `self::utils` → current_dir/utils.rs
+    /// - External crates (std::, serde::) → None
+    fn resolve_rust_import(&self, import_path: &str, source_file: &str) -> Option<String> {
+        // Skip external crates (no :: prefix or starts with known external)
+        let path = import_path.split("::").collect::<Vec<_>>();
+        if path.is_empty() {
+            return None;
+        }
+
+        let first = path[0];
+
+        // External crates - skip
+        if !matches!(first, "crate" | "super" | "self") {
+            return None;
+        }
+
+        // Get the source file's directory
+        let source_path = Path::new(source_file);
+        let source_dir = source_path.parent()?;
+
+        // Find the project root (where src/ is)
+        let mut project_root = source_dir;
+        while !project_root.join("Cargo.toml").exists() {
+            project_root = project_root.parent()?;
+            // Safety limit
+            if project_root.as_os_str().is_empty() {
+                return None;
+            }
+        }
+
+        let src_dir = project_root.join("src");
+
+        // Build the target path based on import type
+        let target_path = match first {
+            "crate" => {
+                // crate::foo::bar → src/foo/bar.rs or src/foo/bar/mod.rs
+                if path.len() < 2 {
+                    return None;
+                }
+                let module_path = &path[1..path.len().saturating_sub(1)]; // Exclude the final item (might be a type)
+                if module_path.is_empty() {
+                    return None;
+                }
+                let mut target = src_dir.clone();
+                for part in module_path {
+                    target = target.join(part);
+                }
+                target
+            }
+            "super" => {
+                // super::foo → ../foo.rs relative to current file
+                let mut target = source_dir.to_path_buf();
+                for part in &path[1..path.len().saturating_sub(1)] {
+                    if *part == "super" {
+                        target = target.parent()?.to_path_buf();
+                    } else {
+                        target = target.join(part);
+                    }
+                }
+                target
+            }
+            "self" => {
+                // self::foo → ./foo.rs relative to current file's module
+                let mut target = source_dir.to_path_buf();
+                for part in &path[1..path.len().saturating_sub(1)] {
+                    target = target.join(part);
+                }
+                target
+            }
+            _ => return None,
+        };
+
+        // Try .rs file first, then mod.rs
+        let rs_file = target_path.with_extension("rs");
+        if rs_file.exists() {
+            return Some(rs_file.to_string_lossy().to_string());
+        }
+
+        let mod_file = target_path.join("mod.rs");
+        if mod_file.exists() {
+            return Some(mod_file.to_string_lossy().to_string());
+        }
+
+        // Also try without removing the last segment (in case it's a module not a type)
+        let full_path = match first {
+            "crate" => {
+                let module_path = &path[1..];
+                let mut target = src_dir;
+                for part in module_path {
+                    target = target.join(part);
+                }
+                target
+            }
+            _ => return None,
+        };
+
+        let rs_file = full_path.with_extension("rs");
+        if rs_file.exists() {
+            return Some(rs_file.to_string_lossy().to_string());
+        }
+
+        let mod_file = full_path.join("mod.rs");
+        if mod_file.exists() {
+            return Some(mod_file.to_string_lossy().to_string());
+        }
+
+        None
     }
 
     // ========================================================================

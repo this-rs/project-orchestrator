@@ -155,17 +155,28 @@ Constraint types: `performance`, `security`, `compatibility`, `style`, `testing`
 ### Code Exploration
 
 ```bash
-# Search code semantically
+# Search code semantically (returns ranked results with scores)
 curl "http://localhost:8080/api/code/search?q=error+handling&limit=10"
+# Returns: [{path, language, snippet, symbols, score}, ...]
 
-# Get symbols in a file
+# Get symbols in a file (functions with signatures, structs, imports)
 curl "http://localhost:8080/api/code/symbols/src%2Flib.rs"
+# Returns: {path, language, functions: [{name, signature, line, is_async, is_public, complexity, docstring}], structs, imports}
 
-# Analyze change impact
+# Analyze change impact (uses IMPORTS relationships)
 curl "http://localhost:8080/api/code/impact?target=src/main.rs&target_type=file"
+# Returns: {directly_affected, transitively_affected, test_files_affected, risk_level, suggestion}
 
-# View architecture overview
+# View architecture overview (shows most imported files)
 curl http://localhost:8080/api/code/architecture
+# Returns: {total_files, languages, most_connected, orphan_files}
+
+# Get file dependencies
+curl "http://localhost:8080/api/code/dependencies/src%2Flib.rs"
+# Returns: {imports: [{path, language}], imported_by, impact_radius}
+
+# Find symbol references
+curl "http://localhost:8080/api/code/references?symbol=AppState&limit=20"
 
 # Find types implementing a trait
 curl "http://localhost:8080/api/code/trait-impls?trait_name=Module"
@@ -175,9 +186,11 @@ curl "http://localhost:8080/api/code/type-traits?type_name=AppState"
 
 # Get impl blocks for a type
 curl "http://localhost:8080/api/code/impl-blocks?type_name=Orchestrator"
+# Returns: {impl_blocks: [{file_path, line_start, line_end, trait_name, methods}]}
 
 # Get function call graph
 curl "http://localhost:8080/api/code/callgraph?function=main&depth=2&direction=both"
+# Returns: {name, file_path, line, callers, callees}
 
 # Find similar code
 curl -X POST http://localhost:8080/api/code/similar \
@@ -309,8 +322,7 @@ curl -X POST http://localhost:8080/api/wake \
 ./target/release/orchestrator serve &
 cargo test
 
-# Expected: 62 tests passing
-# - 2 unit tests (watcher, slugify)
+# Expected: 60 tests passing
 # - 29 API tests
 # - 8 integration tests
 # - 23 parser tests
@@ -395,6 +407,12 @@ The Tree-sitter parser extracts code structure from:
 | GET | `/api/code/trait-impls` | Find trait implementations |
 | GET | `/api/code/type-traits` | Find type's traits |
 | GET | `/api/code/impl-blocks` | Get impl blocks |
+
+### Meilisearch Maintenance
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/meilisearch/stats` | Get code index statistics |
+| DELETE | `/api/meilisearch/orphans` | Delete documents without project_id |
 
 ### Other
 | Method | Endpoint | Description |

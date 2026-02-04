@@ -16,7 +16,7 @@ This file provides guidance to Claude Code when working on the project-orchestra
 
 ```bash
 cargo build --release          # Build release binary
-cargo test                     # Run all tests (55 total)
+cargo test                     # Run all tests (60 total)
 cargo test --test api_tests    # API tests only (29 tests)
 cargo clippy                   # Lint
 cargo fmt                      # Format
@@ -90,10 +90,14 @@ tests/
 - `DELETE /api/constraints/{id}` - Remove constraint
 
 ### Code Exploration
-- `GET /api/code/search?q=...` - Semantic search
-- `GET /api/code/symbols/{path}` - File symbols
-- `GET /api/code/impact?target=...` - Change impact analysis
-- `GET /api/code/architecture` - Codebase overview
+- `GET /api/code/search?q=...` - Semantic search (with ranking scores)
+- `GET /api/code/symbols/{path}` - File symbols (functions, structs, imports with details)
+- `GET /api/code/references?symbol=...` - Find all references to a symbol
+- `GET /api/code/dependencies/{path}` - File imports and dependents
+- `GET /api/code/callgraph?function=...` - Function call graph
+- `GET /api/code/impact?target=...` - Change impact analysis (uses IMPORTS relationships)
+- `GET /api/code/architecture` - Codebase overview (most connected files)
+- `GET /api/code/similar` - Find similar code (POST with snippet)
 - `GET /api/code/trait-impls?trait_name=...` - Find trait implementations
 - `GET /api/code/type-traits?type_name=...` - Find traits for a type
 - `GET /api/code/impl-blocks?type_name=...` - Get impl blocks for a type
@@ -124,12 +128,42 @@ tests/
 # Run tests
 cargo test
 
-# Expected: 62 tests passing
-# - 2 unit tests (watcher, slugify)
+# Expected: 60 tests passing
 # - 29 API tests
 # - 8 integration tests
 # - 23 parser tests
 ```
+
+## Neo4j Graph Relationships
+
+The knowledge graph uses these relationships:
+
+### Code Structure
+- `(Project)-[:CONTAINS]->(File)` - Project contains files
+- `(File)-[:CONTAINS]->(Function|Struct|Trait|Enum|Import)` - File contains symbols
+- `(File)-[:IMPORTS]->(File)` - File imports another file (resolved from `crate::`, `super::`, `self::`)
+- `(Function)-[:CALLS]->(Function)` - Function calls another function
+- `(Impl)-[:IMPLEMENTS_FOR]->(Struct|Enum)` - Impl block for a type
+- `(Impl)-[:IMPLEMENTS_TRAIT]->(Trait)` - Impl implements a trait
+
+### Plans
+- `(Plan)-[:HAS_TASK]->(Task)` - Plan contains tasks
+- `(Task)-[:HAS_STEP]->(Step)` - Task has steps
+- `(Task)-[:DEPENDS_ON]->(Task)` - Task dependencies
+- `(Plan)-[:CONSTRAINED_BY]->(Constraint)` - Plan constraints
+- `(Task)-[:MADE]->(Decision)` - Decisions made during task
+
+## Meilisearch Indexing
+
+The `code` index stores:
+- `symbols` - Function/struct/trait names (highest search priority)
+- `docstrings` - Documentation strings for semantic search
+- `signatures` - Function signatures
+- `path` - File path
+- `imports` - Import paths
+- `project_id`, `project_slug` - Required for project scoping
+
+Note: Full file content is NOT stored in Meilisearch. Use Neo4j for structural queries.
 
 ## Common Tasks
 
