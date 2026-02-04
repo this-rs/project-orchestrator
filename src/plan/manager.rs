@@ -27,12 +27,22 @@ impl PlanManager {
 
     /// Create a new plan
     pub async fn create_plan(&self, req: CreatePlanRequest, created_by: &str) -> Result<PlanNode> {
-        let plan = PlanNode::new(
-            req.title,
-            req.description,
-            created_by.to_string(),
-            req.priority.unwrap_or(0),
-        );
+        let plan = if let Some(project_id) = req.project_id {
+            PlanNode::new_for_project(
+                req.title,
+                req.description,
+                created_by.to_string(),
+                req.priority.unwrap_or(0),
+                project_id,
+            )
+        } else {
+            PlanNode::new(
+                req.title,
+                req.description,
+                created_by.to_string(),
+                req.priority.unwrap_or(0),
+            )
+        };
 
         self.neo4j.create_plan(&plan).await?;
 

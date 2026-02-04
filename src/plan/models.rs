@@ -15,6 +15,8 @@ pub struct CreatePlanRequest {
     pub description: String,
     pub priority: Option<i32>,
     pub constraints: Option<Vec<CreateConstraintRequest>>,
+    /// Optional project ID to associate the plan with
+    pub project_id: Option<Uuid>,
 }
 
 /// Request to create a new task

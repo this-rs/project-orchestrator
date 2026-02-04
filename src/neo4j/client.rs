@@ -1246,6 +1246,38 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Link a plan to a project (creates HAS_PLAN relationship)
+    pub async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (project:Project {id: $project_id})
+            MATCH (plan:Plan {id: $plan_id})
+            SET plan.project_id = $project_id
+            MERGE (project)-[:HAS_PLAN]->(plan)
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("plan_id", plan_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Unlink a plan from its project
+    pub async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (project:Project)-[r:HAS_PLAN]->(plan:Plan {id: $plan_id})
+            DELETE r
+            SET plan.project_id = null
+            "#,
+        )
+        .param("plan_id", plan_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     // ========================================================================
     // Task operations
     // ========================================================================

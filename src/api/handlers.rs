@@ -91,6 +91,39 @@ pub struct UpdatePlanStatusRequest {
     pub status: PlanStatus,
 }
 
+/// Request to link a plan to a project
+#[derive(Deserialize)]
+pub struct LinkPlanToProjectRequest {
+    pub project_id: Uuid,
+}
+
+/// Link a plan to a project
+pub async fn link_plan_to_project(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Json(req): Json<LinkPlanToProjectRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .link_plan_to_project(plan_id, req.project_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Unlink a plan from its project
+pub async fn unlink_plan_from_project(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .unlink_plan_from_project(plan_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn update_plan_status(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,

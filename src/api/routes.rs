@@ -54,6 +54,11 @@ pub fn create_router(state: OrchestratorState) -> Router {
             get(handlers::get_plan).patch(handlers::update_plan_status),
         )
         .route(
+            "/api/plans/{plan_id}/project",
+            axum::routing::put(handlers::link_plan_to_project)
+                .delete(handlers::unlink_plan_from_project),
+        )
+        .route(
             "/api/plans/{plan_id}/next-task",
             get(handlers::get_next_task),
         )
