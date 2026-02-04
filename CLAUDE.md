@@ -103,6 +103,10 @@ tests/
 - `POST /api/watch` - Start auto-sync
 - `DELETE /api/watch` - Stop auto-sync
 
+### Meilisearch Maintenance
+- `GET /api/meilisearch/stats` - Get code index statistics
+- `DELETE /api/meilisearch/orphans` - Delete documents without project_id
+
 ## Development Guidelines
 
 1. **Axum 0.8 syntax**: Routes use `{param}` not `:param`
