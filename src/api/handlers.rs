@@ -1118,6 +1118,134 @@ pub async fn get_plan_critical_path(
 }
 
 // ============================================================================
+// Roadmap
+// ============================================================================
+
+/// Milestone with tasks for roadmap view
+#[derive(Serialize)]
+pub struct RoadmapMilestone {
+    pub milestone: MilestoneNode,
+    pub tasks: Vec<TaskNode>,
+    pub progress: MilestoneProgressResponse,
+}
+
+/// Release with tasks and commits for roadmap view
+#[derive(Serialize)]
+pub struct RoadmapRelease {
+    pub release: ReleaseNode,
+    pub tasks: Vec<TaskNode>,
+    pub commits: Vec<CommitNode>,
+}
+
+/// Project progress stats
+#[derive(Serialize)]
+pub struct ProjectProgress {
+    pub total_tasks: u32,
+    pub completed_tasks: u32,
+    pub in_progress_tasks: u32,
+    pub pending_tasks: u32,
+    pub percentage: f32,
+}
+
+/// Roadmap response
+#[derive(Serialize)]
+pub struct RoadmapResponse {
+    pub milestones: Vec<RoadmapMilestone>,
+    pub releases: Vec<RoadmapRelease>,
+    pub progress: ProjectProgress,
+    pub dependency_graph: DependencyGraphResponse,
+}
+
+/// Get project roadmap
+pub async fn get_project_roadmap(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<RoadmapResponse>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    // Get milestones with their tasks and progress
+    let milestone_nodes = neo4j.list_project_milestones(project_id).await?;
+    let mut milestones = Vec::new();
+    for m in milestone_nodes {
+        let tasks = neo4j.get_milestone_tasks(m.id).await?;
+        let (completed, total) = neo4j.get_milestone_progress(m.id).await?;
+        let percentage = if total > 0 {
+            (completed as f32 / total as f32) * 100.0
+        } else {
+            0.0
+        };
+        milestones.push(RoadmapMilestone {
+            milestone: m,
+            tasks,
+            progress: MilestoneProgressResponse {
+                completed,
+                total,
+                percentage,
+            },
+        });
+    }
+
+    // Get releases with their tasks and commits
+    let release_nodes = neo4j.list_project_releases(project_id).await?;
+    let mut releases = Vec::new();
+    for r in release_nodes {
+        let details = neo4j.get_release_details(r.id).await?;
+        if let Some((release, tasks, commits)) = details {
+            releases.push(RoadmapRelease {
+                release,
+                tasks,
+                commits,
+            });
+        }
+    }
+
+    // Get project progress
+    let (total, completed, in_progress, pending) =
+        neo4j.get_project_progress(project_id).await?;
+    let percentage = if total > 0 {
+        (completed as f32 / total as f32) * 100.0
+    } else {
+        0.0
+    };
+    let progress = ProjectProgress {
+        total_tasks: total,
+        completed_tasks: completed,
+        in_progress_tasks: in_progress,
+        pending_tasks: pending,
+        percentage,
+    };
+
+    // Get dependency graph for all tasks in the project
+    let all_tasks = neo4j.get_project_tasks(project_id).await?;
+    let edges = neo4j.get_project_task_dependencies(project_id).await?;
+
+    let nodes: Vec<DependencyGraphNode> = all_tasks
+        .into_iter()
+        .map(|t| DependencyGraphNode {
+            id: t.id,
+            title: t.title,
+            description: t.description,
+            status: format!("{:?}", t.status),
+            priority: t.priority,
+        })
+        .collect();
+
+    let edges: Vec<DependencyGraphEdge> = edges
+        .into_iter()
+        .map(|(from, to)| DependencyGraphEdge { from, to })
+        .collect();
+
+    let dependency_graph = DependencyGraphResponse { nodes, edges };
+
+    Ok(Json(RoadmapResponse {
+        milestones,
+        releases,
+        progress,
+        dependency_graph,
+    }))
+}
+
+// ============================================================================
 // Error handling
 // ============================================================================
 

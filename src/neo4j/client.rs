@@ -2666,4 +2666,131 @@ impl Neo4jClient {
             Ok((0, 0))
         }
     }
+
+    // ========================================================================
+    // Roadmap operations
+    // ========================================================================
+
+    /// Get tasks for a milestone
+    pub async fn get_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>> {
+        let q = query(
+            r#"
+            MATCH (m:Milestone {id: $id})-[:INCLUDES_TASK]->(t:Task)
+            RETURN t
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            "#,
+        )
+        .param("id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            tasks.push(self.node_to_task(&node)?);
+        }
+
+        Ok(tasks)
+    }
+
+    /// Get tasks for a release
+    pub async fn get_release_tasks(&self, release_id: Uuid) -> Result<Vec<TaskNode>> {
+        let q = query(
+            r#"
+            MATCH (r:Release {id: $id})-[:INCLUDES_TASK]->(t:Task)
+            RETURN t
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            "#,
+        )
+        .param("id", release_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            tasks.push(self.node_to_task(&node)?);
+        }
+
+        Ok(tasks)
+    }
+
+    /// Get project progress stats
+    pub async fn get_project_progress(
+        &self,
+        project_id: Uuid,
+    ) -> Result<(u32, u32, u32, u32)> {
+        // Count tasks across all plans for this project
+        let q = query(
+            r#"
+            MATCH (project:Project {id: $project_id})-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)
+            RETURN
+                count(t) AS total,
+                sum(CASE WHEN t.status = 'Completed' THEN 1 ELSE 0 END) AS completed,
+                sum(CASE WHEN t.status = 'InProgress' THEN 1 ELSE 0 END) AS in_progress,
+                sum(CASE WHEN t.status = 'Pending' THEN 1 ELSE 0 END) AS pending
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total").unwrap_or(0);
+            let completed: i64 = row.get("completed").unwrap_or(0);
+            let in_progress: i64 = row.get("in_progress").unwrap_or(0);
+            let pending: i64 = row.get("pending").unwrap_or(0);
+            Ok((total as u32, completed as u32, in_progress as u32, pending as u32))
+        } else {
+            Ok((0, 0, 0, 0))
+        }
+    }
+
+    /// Get all task dependencies for a project (across all plans)
+    pub async fn get_project_task_dependencies(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, Uuid)>> {
+        let q = query(
+            r#"
+            MATCH (project:Project {id: $project_id})-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)-[:DEPENDS_ON]->(dep:Task)<-[:HAS_TASK]-(p2:Plan)<-[:HAS_PLAN]-(project)
+            RETURN t.id AS from_id, dep.id AS to_id
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let from_id: String = row.get("from_id")?;
+            let to_id: String = row.get("to_id")?;
+            if let (Ok(from), Ok(to)) = (from_id.parse::<Uuid>(), to_id.parse::<Uuid>()) {
+                edges.push((from, to));
+            }
+        }
+
+        Ok(edges)
+    }
+
+    /// Get all tasks for a project (across all plans)
+    pub async fn get_project_tasks(&self, project_id: Uuid) -> Result<Vec<TaskNode>> {
+        let q = query(
+            r#"
+            MATCH (project:Project {id: $project_id})-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)
+            RETURN t
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            tasks.push(self.node_to_task(&node)?);
+        }
+
+        Ok(tasks)
+    }
 }

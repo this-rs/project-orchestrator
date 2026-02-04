@@ -53,6 +53,11 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/projects/{project_id}/milestones",
             get(handlers::list_milestones).post(handlers::create_milestone),
         )
+        // Roadmap (aggregated view)
+        .route(
+            "/api/projects/{project_id}/roadmap",
+            get(handlers::get_project_roadmap),
+        )
         // ====================================================================
         // Plans (global or legacy)
         .route(
