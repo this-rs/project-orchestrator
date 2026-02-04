@@ -2,18 +2,18 @@
 //!
 //! Each module implements extraction for a specific programming language.
 
-pub mod rust;
-pub mod typescript;
-pub mod python;
-pub mod go;
-pub mod java;
+pub mod bash;
 pub mod c;
 pub mod cpp;
-pub mod ruby;
-pub mod php;
+pub mod go;
+pub mod java;
 pub mod kotlin;
+pub mod php;
+pub mod python;
+pub mod ruby;
+pub mod rust;
 pub mod swift;
-pub mod bash;
+pub mod typescript;
 
 /// Tree-sitter query patterns for different languages (kept for reference)
 pub mod queries {

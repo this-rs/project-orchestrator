@@ -273,11 +273,7 @@ fn extract_import_from(
     })
 }
 
-fn extract_py_params(
-    node: &tree_sitter::Node,
-    source: &str,
-    inside_class: bool,
-) -> Vec<Parameter> {
+fn extract_py_params(node: &tree_sitter::Node, source: &str, inside_class: bool) -> Vec<Parameter> {
     let mut params = Vec::new();
     let mut is_first = true;
 

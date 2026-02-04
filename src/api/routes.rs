@@ -290,10 +290,7 @@ pub fn create_router(state: OrchestratorState) -> Router {
             axum::routing::delete(note_handlers::unlink_note_from_entity),
         )
         // Context notes (direct + propagated)
-        .route(
-            "/api/notes/context",
-            get(note_handlers::get_context_notes),
-        )
+        .route("/api/notes/context", get(note_handlers::get_context_notes))
         .route(
             "/api/notes/propagated",
             get(note_handlers::get_propagated_notes),

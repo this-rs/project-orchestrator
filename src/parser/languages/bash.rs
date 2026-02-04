@@ -66,7 +66,7 @@ fn extract_function(
     Some(FunctionNode {
         name,
         visibility: Visibility::Public, // Shell functions are always "public"
-        params: vec![], // Bash uses $1, $2, etc.
+        params: vec![],                 // Bash uses $1, $2, etc.
         return_type: None,
         generics: vec![],
         is_async: false,
@@ -105,11 +105,7 @@ fn extract_source(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
     })
 }
 
-fn extract_variable(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-) -> Option<StructNode> {
+fn extract_variable(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<StructNode> {
     let name = get_field_text(node, "name", source)?;
     let docstring = get_bash_doc(node, source);
 

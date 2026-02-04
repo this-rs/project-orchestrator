@@ -165,7 +165,9 @@ impl McpServer {
         let result = InitializeResult {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
-                tools: ToolsCapability { list_changed: false },
+                tools: ToolsCapability {
+                    list_changed: false,
+                },
             },
             server_info: ServerInfo {
                 name: SERVER_NAME.to_string(),
@@ -198,7 +200,7 @@ impl McpServer {
             .as_ref()
             .ok_or_else(|| JsonRpcError::invalid_params("params required"))?
             .clone()
-            .pipe(|v| serde_json::from_value(v))
+            .pipe(serde_json::from_value)
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
 
         info!("Tool call: {}", params.name);
@@ -210,7 +212,9 @@ impl McpServer {
             .await;
 
         let tool_result = match result {
-            Ok(value) => ToolCallResult::success(serde_json::to_string_pretty(&value).unwrap_or_default()),
+            Ok(value) => {
+                ToolCallResult::success(serde_json::to_string_pretty(&value).unwrap_or_default())
+            }
             Err(e) => {
                 error!("Tool error: {}", e);
                 ToolCallResult::error(e.to_string())

@@ -139,9 +139,8 @@ fn extract_function_declaration(
 
     let visibility = if has_storage_class(node, source, "static") {
         Visibility::Private
-    } else if has_storage_class(node, source, "extern") {
-        Visibility::Public
     } else {
+        // In C, non-static functions are effectively public (extern is default)
         Visibility::Public
     };
 
@@ -292,7 +291,12 @@ fn extract_include(node: &tree_sitter::Node, source: &str, file_path: &str) -> O
     let path = node
         .child_by_field_name("path")
         .and_then(|p| get_text(&p, source))
-        .map(|s| s.trim_matches('"').trim_matches('<').trim_matches('>').to_string())?;
+        .map(|s| {
+            s.trim_matches('"')
+                .trim_matches('<')
+                .trim_matches('>')
+                .to_string()
+        })?;
 
     Some(ImportNode {
         path,

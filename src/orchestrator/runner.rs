@@ -103,18 +103,18 @@ impl Orchestrator {
 
         // All supported languages - must match SupportedLanguage::from_extension()
         let extensions = [
-            "rs",                           // Rust
-            "ts", "tsx", "js", "jsx",       // TypeScript/JavaScript
-            "py",                           // Python
-            "go",                           // Go
-            "java",                         // Java
-            "c", "h",                       // C
+            "rs", // Rust
+            "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
+            "py",   // Python
+            "go",   // Go
+            "java", // Java
+            "c", "h", // C
             "cpp", "cc", "cxx", "hpp", "hxx", // C++
-            "rb",                           // Ruby
-            "php",                          // PHP
-            "kt", "kts",                    // Kotlin
-            "swift",                        // Swift
-            "sh", "bash",                   // Bash
+            "rb",  // Ruby
+            "php", // PHP
+            "kt", "kts",   // Kotlin
+            "swift", // Swift
+            "sh", "bash", // Bash
         ];
 
         for entry in WalkDir::new(dir_path)
@@ -254,17 +254,15 @@ impl Orchestrator {
             return Ok(());
         }
 
-        tracing::debug!(
-            "Verifying {} notes for file: {}",
-            notes.len(),
-            file_path
-        );
+        tracing::debug!("Verifying {} notes for file: {}", notes.len(), file_path);
 
         // Create FileInfo from parsed data
         let file_info = NoteLifecycleManager::create_file_info(parsed, source);
 
         // Verify each note's anchors
-        let results = self.note_lifecycle.verify_notes_for_file(&notes, &file_info);
+        let results = self
+            .note_lifecycle
+            .verify_notes_for_file(&notes, &file_info);
 
         // Process verification results
         for result in results {
@@ -277,7 +275,7 @@ impl Orchestrator {
                             result.note_id,
                             None,
                             None,
-                            Some(update.new_status.clone()),
+                            Some(update.new_status),
                             None,
                             None,
                         )
@@ -286,7 +284,10 @@ impl Orchestrator {
                     // Update Meilisearch index
                     self.state
                         .meili
-                        .update_note_status(&result.note_id.to_string(), &update.new_status.to_string())
+                        .update_note_status(
+                            &result.note_id.to_string(),
+                            &update.new_status.to_string(),
+                        )
                         .await?;
 
                     tracing::info!(
@@ -430,7 +431,7 @@ impl Orchestrator {
                                 result.note_id,
                                 None,
                                 None,
-                                Some(update.new_status.clone()),
+                                Some(update.new_status),
                                 None,
                                 None,
                             )
@@ -438,7 +439,10 @@ impl Orchestrator {
 
                         self.state
                             .meili
-                            .update_note_status(&result.note_id.to_string(), &update.new_status.to_string())
+                            .update_note_status(
+                                &result.note_id.to_string(),
+                                &update.new_status.to_string(),
+                            )
                             .await?;
 
                         tracing::info!(
@@ -477,7 +481,7 @@ impl Orchestrator {
                                 result.note_id,
                                 None,
                                 None,
-                                Some(update.new_status.clone()),
+                                Some(update.new_status),
                                 None,
                                 None,
                             )
@@ -485,7 +489,10 @@ impl Orchestrator {
 
                         self.state
                             .meili
-                            .update_note_status(&result.note_id.to_string(), &update.new_status.to_string())
+                            .update_note_status(
+                                &result.note_id.to_string(),
+                                &update.new_status.to_string(),
+                            )
                             .await?;
 
                         tracing::info!(

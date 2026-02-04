@@ -200,7 +200,7 @@ async fn handle_plan(client: &Client, server: &str, action: PlanAction) -> Resul
                 .json()
                 .await?;
 
-            println!("{:<36} {:<12} {:<5} {}", "ID", "STATUS", "PRI", "TITLE");
+            println!("{:<36} {:<12} {:<5} TITLE", "ID", "STATUS", "PRI");
             println!("{}", "-".repeat(80));
             for plan in resp {
                 println!(

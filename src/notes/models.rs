@@ -391,7 +391,11 @@ impl NoteChange {
     }
 
     /// Create a change with details
-    pub fn with_details(change_type: ChangeType, actor: String, details: serde_json::Value) -> Self {
+    pub fn with_details(
+        change_type: ChangeType,
+        actor: String,
+        details: serde_json::Value,
+    ) -> Self {
         Self {
             timestamp: Utc::now(),
             change_type,
@@ -555,12 +559,7 @@ pub struct Note {
 
 impl Note {
     /// Create a new note with minimal fields
-    pub fn new(
-        project_id: Uuid,
-        note_type: NoteType,
-        content: String,
-        created_by: String,
-    ) -> Self {
+    pub fn new(project_id: Uuid, note_type: NoteType, content: String, created_by: String) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -622,7 +621,8 @@ impl Note {
     /// Add an anchor to this note
     pub fn add_anchor(&mut self, anchor: NoteAnchor, actor: &str) {
         self.anchors.push(anchor);
-        self.changes.push(NoteChange::new(ChangeType::AnchorAdded, actor.to_string()));
+        self.changes
+            .push(NoteChange::new(ChangeType::AnchorAdded, actor.to_string()));
     }
 
     /// Confirm this note is still valid
@@ -631,7 +631,10 @@ impl Note {
         self.last_confirmed_at = Some(now);
         self.last_confirmed_by = Some(confirmed_by.to_string());
         self.staleness_score = 0.0;
-        self.changes.push(NoteChange::new(ChangeType::Confirmed, confirmed_by.to_string()));
+        self.changes.push(NoteChange::new(
+            ChangeType::Confirmed,
+            confirmed_by.to_string(),
+        ));
     }
 
     /// Check if the note is active and not stale
@@ -647,11 +650,11 @@ impl Note {
     /// Get the base decay days for staleness calculation
     pub fn base_decay_days(&self) -> f64 {
         match self.note_type {
-            NoteType::Context => 30.0,      // Expires quickly
-            NoteType::Tip => 90.0,          // Medium expiry
+            NoteType::Context => 30.0, // Expires quickly
+            NoteType::Tip => 90.0,     // Medium expiry
             NoteType::Observation => 90.0,
             NoteType::Gotcha => 180.0,
-            NoteType::Guideline => 365.0,   // Stable for a long time
+            NoteType::Guideline => 365.0, // Stable for a long time
             NoteType::Pattern => 365.0,
             NoteType::Assertion => f64::MAX, // Never stale (verified by code)
         }
@@ -887,8 +890,14 @@ mod tests {
     #[test]
     fn test_note_scope_specificity() {
         assert!(NoteScope::Project.specificity() < NoteScope::Module("foo".into()).specificity());
-        assert!(NoteScope::Module("foo".into()).specificity() < NoteScope::File("bar".into()).specificity());
-        assert!(NoteScope::File("bar".into()).specificity() < NoteScope::Function("baz".into()).specificity());
+        assert!(
+            NoteScope::Module("foo".into()).specificity()
+                < NoteScope::File("bar".into()).specificity()
+        );
+        assert!(
+            NoteScope::File("bar".into()).specificity()
+                < NoteScope::Function("baz".into()).specificity()
+        );
     }
 
     #[test]
@@ -919,9 +928,24 @@ mod tests {
 
     #[test]
     fn test_base_decay_days() {
-        let context_note = Note::new(Uuid::new_v4(), NoteType::Context, "temp".into(), "user".into());
-        let guideline_note = Note::new(Uuid::new_v4(), NoteType::Guideline, "stable".into(), "user".into());
-        let assertion_note = Note::new(Uuid::new_v4(), NoteType::Assertion, "rule".into(), "user".into());
+        let context_note = Note::new(
+            Uuid::new_v4(),
+            NoteType::Context,
+            "temp".into(),
+            "user".into(),
+        );
+        let guideline_note = Note::new(
+            Uuid::new_v4(),
+            NoteType::Guideline,
+            "stable".into(),
+            "user".into(),
+        );
+        let assertion_note = Note::new(
+            Uuid::new_v4(),
+            NoteType::Assertion,
+            "rule".into(),
+            "user".into(),
+        );
 
         assert!(context_note.base_decay_days() < guideline_note.base_decay_days());
         assert!(guideline_note.base_decay_days() < assertion_note.base_decay_days());

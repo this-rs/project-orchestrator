@@ -60,10 +60,8 @@ impl WhereBuilder {
     pub fn add_status_filter(&mut self, alias: &str, statuses: Option<Vec<String>>) -> &mut Self {
         if let Some(statuses) = statuses {
             if !statuses.is_empty() {
-                let pascal_statuses: Vec<String> = statuses
-                    .iter()
-                    .map(|s| snake_to_pascal_case(s))
-                    .collect();
+                let pascal_statuses: Vec<String> =
+                    statuses.iter().map(|s| snake_to_pascal_case(s)).collect();
                 self.conditions.push(format!(
                     "{}.status IN [{}]",
                     alias,
@@ -100,8 +98,7 @@ impl WhereBuilder {
     pub fn add_tags_filter(&mut self, alias: &str, tags: Option<Vec<String>>) -> &mut Self {
         if let Some(tags) = tags {
             for tag in tags {
-                self.conditions
-                    .push(format!("'{}' IN {}.tags", tag, alias));
+                self.conditions.push(format!("'{}' IN {}.tags", tag, alias));
             }
         }
         self
@@ -877,10 +874,7 @@ impl Neo4jClient {
             .param("trait_name", trait_name.clone());
 
             let rows = self.execute_with_params(q).await?;
-            let linked: i64 = rows
-                .first()
-                .and_then(|r| r.get("linked").ok())
-                .unwrap_or(0);
+            let linked: i64 = rows.first().and_then(|r| r.get("linked").ok()).unwrap_or(0);
 
             // If no local trait found, create/link to external trait
             if linked == 0 {
@@ -1008,7 +1002,10 @@ impl Neo4jClient {
         }
 
         // serde traits
-        if matches!(name, "Serialize" | "Deserialize" | "Serializer" | "Deserializer") {
+        if matches!(
+            name,
+            "Serialize" | "Deserialize" | "Serializer" | "Deserializer"
+        ) {
             return "serde";
         }
 
@@ -1031,7 +1028,10 @@ impl Neo4jClient {
         }
 
         // axum/tower
-        if matches!(name, "IntoResponse" | "FromRequest" | "FromRequestParts" | "Service" | "Layer") {
+        if matches!(
+            name,
+            "IntoResponse" | "FromRequest" | "FromRequestParts" | "Service" | "Layer"
+        ) {
             return "axum";
         }
 
@@ -2481,16 +2481,25 @@ impl Neo4jClient {
         .param("id", release.id.to_string())
         .param("version", release.version.clone())
         .param("title", release.title.clone().unwrap_or_default())
-        .param("description", release.description.clone().unwrap_or_default())
+        .param(
+            "description",
+            release.description.clone().unwrap_or_default(),
+        )
         .param("status", format!("{:?}", release.status))
         .param("project_id", release.project_id.to_string())
         .param(
             "target_date",
-            release.target_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+            release
+                .target_date
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
         )
         .param(
             "released_at",
-            release.released_at.map(|d| d.to_rfc3339()).unwrap_or_default(),
+            release
+                .released_at
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
         )
         .param("created_at", release.created_at.to_rfc3339());
 
@@ -2523,7 +2532,10 @@ impl Neo4jClient {
             id: node.get::<String>("id")?.parse()?,
             version: node.get("version")?,
             title: node.get::<String>("title").ok().filter(|s| !s.is_empty()),
-            description: node.get::<String>("description").ok().filter(|s| !s.is_empty()),
+            description: node
+                .get::<String>("description")
+                .ok()
+                .filter(|s| !s.is_empty()),
             status: serde_json::from_str(&format!(
                 "\"{}\"",
                 pascal_to_snake_case(&node.get::<String>("status")?)
@@ -2601,7 +2613,10 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        let cypher = format!("MATCH (r:Release {{id: $id}}) SET {}", set_clauses.join(", "));
+        let cypher = format!(
+            "MATCH (r:Release {{id: $id}}) SET {}",
+            set_clauses.join(", ")
+        );
 
         let mut q = query(&cypher).param("id", id.to_string());
 
@@ -2722,16 +2737,25 @@ impl Neo4jClient {
         )
         .param("id", milestone.id.to_string())
         .param("title", milestone.title.clone())
-        .param("description", milestone.description.clone().unwrap_or_default())
+        .param(
+            "description",
+            milestone.description.clone().unwrap_or_default(),
+        )
         .param("status", format!("{:?}", milestone.status))
         .param("project_id", milestone.project_id.to_string())
         .param(
             "target_date",
-            milestone.target_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+            milestone
+                .target_date
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
         )
         .param(
             "closed_at",
-            milestone.closed_at.map(|d| d.to_rfc3339()).unwrap_or_default(),
+            milestone
+                .closed_at
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
         )
         .param("created_at", milestone.created_at.to_rfc3339());
 
@@ -2763,7 +2787,10 @@ impl Neo4jClient {
         Ok(MilestoneNode {
             id: node.get::<String>("id")?.parse()?,
             title: node.get("title")?,
-            description: node.get::<String>("description").ok().filter(|s| !s.is_empty()),
+            description: node
+                .get::<String>("description")
+                .ok()
+                .filter(|s| !s.is_empty()),
             status: serde_json::from_str(&format!(
                 "\"{}\"",
                 pascal_to_snake_case(&node.get::<String>("status")?)
@@ -2841,7 +2868,10 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        let cypher = format!("MATCH (m:Milestone {{id: $id}}) SET {}", set_clauses.join(", "));
+        let cypher = format!(
+            "MATCH (m:Milestone {{id: $id}}) SET {}",
+            set_clauses.join(", ")
+        );
 
         let mut q = query(&cypher).param("id", id.to_string());
 
@@ -2983,10 +3013,7 @@ impl Neo4jClient {
     }
 
     /// Get project progress stats
-    pub async fn get_project_progress(
-        &self,
-        project_id: Uuid,
-    ) -> Result<(u32, u32, u32, u32)> {
+    pub async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)> {
         // Count tasks across all plans for this project
         let q = query(
             r#"
@@ -3006,7 +3033,12 @@ impl Neo4jClient {
             let completed: i64 = row.get("completed").unwrap_or(0);
             let in_progress: i64 = row.get("in_progress").unwrap_or(0);
             let pending: i64 = row.get("pending").unwrap_or(0);
-            Ok((total as u32, completed as u32, in_progress as u32, pending as u32))
+            Ok((
+                total as u32,
+                completed as u32,
+                in_progress as u32,
+                pending as u32,
+            ))
         } else {
             Ok((0, 0, 0, 0))
         }
@@ -3068,6 +3100,7 @@ impl Neo4jClient {
     /// List plans with filters and pagination
     ///
     /// Returns (plans, total_count)
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_plans_filtered(
         &self,
         statuses: Option<Vec<String>>,
@@ -3128,6 +3161,7 @@ impl Neo4jClient {
     /// List all tasks across all plans with filters and pagination
     ///
     /// Returns (tasks_with_plan_info, total_count)
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_all_tasks_filtered(
         &self,
         plan_id: Option<Uuid>,
@@ -3173,10 +3207,7 @@ impl Neo4jClient {
         };
 
         // Count query
-        let count_cypher = format!(
-            "{} {} RETURN count(t) AS total",
-            plan_match, where_clause
-        );
+        let count_cypher = format!("{} {} RETURN count(t) AS total", plan_match, where_clause);
         let count_result = self.execute(&count_cypher).await?;
         let total: i64 = count_result
             .first()
@@ -3367,7 +3398,10 @@ impl Neo4jClient {
         let order_dir = if sort_order == "asc" { "ASC" } else { "DESC" };
 
         // Count query
-        let count_cypher = format!("MATCH (p:Project) {} RETURN count(p) AS total", where_clause);
+        let count_cypher = format!(
+            "MATCH (p:Project) {} RETURN count(p) AS total",
+            where_clause
+        );
         let count_result = self.execute(&count_cypher).await?;
         let total: i64 = count_result
             .first()
@@ -4104,7 +4138,9 @@ impl Neo4jClient {
 
     // Helper function to convert Neo4j node to Note
     fn node_to_note(&self, node: &neo4rs::Node) -> Result<Note> {
-        let scope_type: String = node.get("scope_type").unwrap_or_else(|_| "project".to_string());
+        let scope_type: String = node
+            .get("scope_type")
+            .unwrap_or_else(|_| "project".to_string());
         let scope_path: String = node.get("scope_path").unwrap_or_default();
 
         let scope = match scope_type.as_str() {
@@ -4118,11 +4154,14 @@ impl Neo4jClient {
 
         let note_type_str: String = node.get("note_type")?;
         let status_str: String = node.get("status")?;
-        let importance_str: String = node.get("importance").unwrap_or_else(|_| "medium".to_string());
+        let importance_str: String = node
+            .get("importance")
+            .unwrap_or_else(|_| "medium".to_string());
 
-        let changes_json: String = node.get("changes_json").unwrap_or_else(|_| "[]".to_string());
-        let changes: Vec<NoteChange> =
-            serde_json::from_str(&changes_json).unwrap_or_default();
+        let changes_json: String = node
+            .get("changes_json")
+            .unwrap_or_else(|_| "[]".to_string());
+        let changes: Vec<NoteChange> = serde_json::from_str(&changes_json).unwrap_or_default();
 
         let assertion_rule_json: String = node
             .get("assertion_rule_json")

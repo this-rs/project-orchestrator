@@ -1,9 +1,11 @@
 //! API request handlers
 
-use crate::api::{PaginatedResponse, PaginationParams, PriorityFilter, SearchFilter, StatusFilter, TagsFilter};
+use crate::api::{
+    PaginatedResponse, PaginationParams, PriorityFilter, SearchFilter, StatusFilter, TagsFilter,
+};
 use crate::neo4j::models::{
-    CommitNode, ConstraintNode, DecisionNode, MilestoneNode, MilestoneStatus, PlanNode,
-    PlanStatus, ReleaseNode, ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
+    CommitNode, ConstraintNode, DecisionNode, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus,
+    ReleaseNode, ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
 };
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
@@ -68,10 +70,7 @@ pub async fn list_plans(
     State(state): State<OrchestratorState>,
     Query(query): Query<PlansListQuery>,
 ) -> Result<Json<PaginatedResponse<PlanNode>>, AppError> {
-    query
-        .pagination
-        .validate()
-        .map_err(|e| AppError::BadRequest(e))?;
+    query.pagination.validate().map_err(AppError::BadRequest)?;
 
     let (plans, total) = state
         .orchestrator
@@ -256,10 +255,7 @@ pub async fn list_all_tasks(
     State(state): State<OrchestratorState>,
     Query(query): Query<TasksListQuery>,
 ) -> Result<Json<PaginatedResponse<TaskWithPlan>>, AppError> {
-    query
-        .pagination
-        .validate()
-        .map_err(|e| AppError::BadRequest(e))?;
+    query.pagination.validate().map_err(AppError::BadRequest)?;
 
     let (tasks, total) = state
         .orchestrator
@@ -724,11 +720,7 @@ pub async fn get_task_commits(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
 ) -> Result<Json<Vec<CommitNode>>, AppError> {
-    let commits = state
-        .orchestrator
-        .neo4j()
-        .get_task_commits(task_id)
-        .await?;
+    let commits = state.orchestrator.neo4j().get_task_commits(task_id).await?;
     Ok(Json(commits))
 }
 
@@ -751,11 +743,7 @@ pub async fn get_plan_commits(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,
 ) -> Result<Json<Vec<CommitNode>>, AppError> {
-    let commits = state
-        .orchestrator
-        .neo4j()
-        .get_plan_commits(plan_id)
-        .await?;
+    let commits = state.orchestrator.neo4j().get_plan_commits(plan_id).await?;
     Ok(Json(commits))
 }
 
@@ -809,10 +797,7 @@ pub async fn list_releases(
     Path(project_id): Path<Uuid>,
     Query(query): Query<ReleasesListQuery>,
 ) -> Result<Json<PaginatedResponse<ReleaseNode>>, AppError> {
-    query
-        .pagination
-        .validate()
-        .map_err(|e| AppError::BadRequest(e))?;
+    query.pagination.validate().map_err(AppError::BadRequest)?;
 
     let (releases, total) = state
         .orchestrator
@@ -985,10 +970,7 @@ pub async fn list_milestones(
     Path(project_id): Path<Uuid>,
     Query(query): Query<MilestonesListQuery>,
 ) -> Result<Json<PaginatedResponse<MilestoneNode>>, AppError> {
-    query
-        .pagination
-        .validate()
-        .map_err(|e| AppError::BadRequest(e))?;
+    query.pagination.validate().map_err(AppError::BadRequest)?;
 
     let (milestones, total) = state
         .orchestrator
@@ -1343,8 +1325,7 @@ pub async fn get_project_roadmap(
     }
 
     // Get project progress
-    let (total, completed, in_progress, pending) =
-        neo4j.get_project_progress(project_id).await?;
+    let (total, completed, in_progress, pending) = neo4j.get_project_progress(project_id).await?;
     let percentage = if total > 0 {
         (completed as f32 / total as f32) * 100.0
     } else {
