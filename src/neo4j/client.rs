@@ -11,6 +11,22 @@ pub struct Neo4jClient {
     graph: Arc<Graph>,
 }
 
+/// Convert PascalCase to snake_case (e.g., "InProgress" -> "in_progress")
+fn pascal_to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_ascii_lowercase());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 impl Neo4jClient {
     /// Create a new Neo4j client
     pub async fn new(uri: &str, user: &str, password: &str) -> Result<Self> {
@@ -1167,7 +1183,7 @@ impl Neo4jClient {
             description: node.get("description")?,
             status: serde_json::from_str(&format!(
                 "\"{}\"",
-                node.get::<String>("status")?.to_lowercase()
+                pascal_to_snake_case(&node.get::<String>("status")?)
             ))
             .unwrap_or(PlanStatus::Draft),
             created_at: node
@@ -1354,7 +1370,7 @@ impl Neo4jClient {
             description: node.get("description")?,
             status: serde_json::from_str(&format!(
                 "\"{}\"",
-                node.get::<String>("status")?.to_lowercase()
+                pascal_to_snake_case(&node.get::<String>("status")?)
             ))
             .unwrap_or(TaskStatus::Pending),
             assigned_to: node.get("assigned_to").ok(),
@@ -1783,7 +1799,7 @@ impl Neo4jClient {
                 description: node.get("description")?,
                 status: serde_json::from_str(&format!(
                     "\"{}\"",
-                    node.get::<String>("status")?.to_lowercase()
+                    pascal_to_snake_case(&node.get::<String>("status")?)
                 ))
                 .unwrap_or(StepStatus::Pending),
                 verification: node
@@ -2259,7 +2275,7 @@ impl Neo4jClient {
             description: node.get::<String>("description").ok().filter(|s| !s.is_empty()),
             status: serde_json::from_str(&format!(
                 "\"{}\"",
-                node.get::<String>("status")?.to_lowercase()
+                pascal_to_snake_case(&node.get::<String>("status")?)
             ))
             .unwrap_or(ReleaseStatus::Planned),
             target_date: node
@@ -2499,7 +2515,7 @@ impl Neo4jClient {
             description: node.get::<String>("description").ok().filter(|s| !s.is_empty()),
             status: serde_json::from_str(&format!(
                 "\"{}\"",
-                node.get::<String>("status")?.to_lowercase()
+                pascal_to_snake_case(&node.get::<String>("status")?)
             ))
             .unwrap_or(MilestoneStatus::Open),
             target_date: node
