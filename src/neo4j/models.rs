@@ -613,3 +613,241 @@ pub enum RelationType {
     /// Component maps to a project (source code)
     MapsToProject,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_workspace_node_serialization() {
+        let workspace = WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: "Test Workspace".to_string(),
+            slug: "test-workspace".to_string(),
+            description: Some("A test workspace".to_string()),
+            created_at: Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({"key": "value"}),
+        };
+
+        let json = serde_json::to_string(&workspace).unwrap();
+        let deserialized: WorkspaceNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(workspace.id, deserialized.id);
+        assert_eq!(workspace.name, deserialized.name);
+        assert_eq!(workspace.slug, deserialized.slug);
+        assert_eq!(workspace.description, deserialized.description);
+    }
+
+    #[test]
+    fn test_workspace_milestone_node_serialization() {
+        let milestone = WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            title: "Q1 Launch".to_string(),
+            description: Some("Cross-project milestone".to_string()),
+            status: MilestoneStatus::Open,
+            target_date: Some(Utc::now()),
+            closed_at: None,
+            created_at: Utc::now(),
+            tags: vec!["launch".to_string(), "q1".to_string()],
+        };
+
+        let json = serde_json::to_string(&milestone).unwrap();
+        let deserialized: WorkspaceMilestoneNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(milestone.id, deserialized.id);
+        assert_eq!(milestone.title, deserialized.title);
+        assert_eq!(milestone.tags, deserialized.tags);
+    }
+
+    #[test]
+    fn test_resource_node_serialization() {
+        let resource = ResourceNode {
+            id: Uuid::new_v4(),
+            workspace_id: Some(Uuid::new_v4()),
+            project_id: None,
+            name: "User API".to_string(),
+            resource_type: ResourceType::ApiContract,
+            file_path: "specs/openapi/users.yaml".to_string(),
+            url: Some("https://api.example.com/spec".to_string()),
+            format: Some("openapi".to_string()),
+            version: Some("1.0.0".to_string()),
+            description: Some("User service contract".to_string()),
+            created_at: Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+
+        let json = serde_json::to_string(&resource).unwrap();
+        let deserialized: ResourceNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(resource.id, deserialized.id);
+        assert_eq!(resource.name, deserialized.name);
+        assert_eq!(resource.resource_type, deserialized.resource_type);
+        assert_eq!(resource.file_path, deserialized.file_path);
+    }
+
+    #[test]
+    fn test_component_node_serialization() {
+        let component = ComponentNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            name: "API Gateway".to_string(),
+            component_type: ComponentType::Gateway,
+            description: Some("Main entry point".to_string()),
+            runtime: Some("kubernetes".to_string()),
+            config: serde_json::json!({"port": 8080, "replicas": 3}),
+            created_at: Utc::now(),
+            tags: vec!["infrastructure".to_string()],
+        };
+
+        let json = serde_json::to_string(&component).unwrap();
+        let deserialized: ComponentNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(component.id, deserialized.id);
+        assert_eq!(component.name, deserialized.name);
+        assert_eq!(component.component_type, deserialized.component_type);
+        assert_eq!(component.runtime, deserialized.runtime);
+    }
+
+    #[test]
+    fn test_resource_type_from_str() {
+        assert_eq!(
+            "api_contract".parse::<ResourceType>().unwrap(),
+            ResourceType::ApiContract
+        );
+        assert_eq!(
+            "apicontract".parse::<ResourceType>().unwrap(),
+            ResourceType::ApiContract
+        );
+        assert_eq!(
+            "protobuf".parse::<ResourceType>().unwrap(),
+            ResourceType::Protobuf
+        );
+        assert_eq!(
+            "graphql_schema".parse::<ResourceType>().unwrap(),
+            ResourceType::GraphqlSchema
+        );
+        assert_eq!(
+            "graphql".parse::<ResourceType>().unwrap(),
+            ResourceType::GraphqlSchema
+        );
+        assert_eq!(
+            "json_schema".parse::<ResourceType>().unwrap(),
+            ResourceType::JsonSchema
+        );
+        assert_eq!(
+            "database_schema".parse::<ResourceType>().unwrap(),
+            ResourceType::DatabaseSchema
+        );
+        assert_eq!(
+            "database".parse::<ResourceType>().unwrap(),
+            ResourceType::DatabaseSchema
+        );
+        assert_eq!(
+            "shared_types".parse::<ResourceType>().unwrap(),
+            ResourceType::SharedTypes
+        );
+        assert_eq!(
+            "config".parse::<ResourceType>().unwrap(),
+            ResourceType::Config
+        );
+        assert_eq!(
+            "documentation".parse::<ResourceType>().unwrap(),
+            ResourceType::Documentation
+        );
+        assert_eq!(
+            "docs".parse::<ResourceType>().unwrap(),
+            ResourceType::Documentation
+        );
+        assert_eq!(
+            "other".parse::<ResourceType>().unwrap(),
+            ResourceType::Other
+        );
+
+        // Test invalid
+        assert!("invalid".parse::<ResourceType>().is_err());
+    }
+
+    #[test]
+    fn test_component_type_from_str() {
+        assert_eq!(
+            "service".parse::<ComponentType>().unwrap(),
+            ComponentType::Service
+        );
+        assert_eq!(
+            "frontend".parse::<ComponentType>().unwrap(),
+            ComponentType::Frontend
+        );
+        assert_eq!(
+            "worker".parse::<ComponentType>().unwrap(),
+            ComponentType::Worker
+        );
+        assert_eq!(
+            "database".parse::<ComponentType>().unwrap(),
+            ComponentType::Database
+        );
+        assert_eq!(
+            "db".parse::<ComponentType>().unwrap(),
+            ComponentType::Database
+        );
+        assert_eq!(
+            "message_queue".parse::<ComponentType>().unwrap(),
+            ComponentType::MessageQueue
+        );
+        assert_eq!(
+            "queue".parse::<ComponentType>().unwrap(),
+            ComponentType::MessageQueue
+        );
+        assert_eq!(
+            "cache".parse::<ComponentType>().unwrap(),
+            ComponentType::Cache
+        );
+        assert_eq!(
+            "gateway".parse::<ComponentType>().unwrap(),
+            ComponentType::Gateway
+        );
+        assert_eq!(
+            "api_gateway".parse::<ComponentType>().unwrap(),
+            ComponentType::Gateway
+        );
+        assert_eq!(
+            "external".parse::<ComponentType>().unwrap(),
+            ComponentType::External
+        );
+        assert_eq!(
+            "other".parse::<ComponentType>().unwrap(),
+            ComponentType::Other
+        );
+
+        // Test invalid
+        assert!("invalid".parse::<ComponentType>().is_err());
+    }
+
+    #[test]
+    fn test_component_dependency_serialization() {
+        let dep = ComponentDependency {
+            from_id: Uuid::new_v4(),
+            to_id: Uuid::new_v4(),
+            protocol: Some("http".to_string()),
+            required: true,
+        };
+
+        let json = serde_json::to_string(&dep).unwrap();
+        let deserialized: ComponentDependency = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(dep.from_id, deserialized.from_id);
+        assert_eq!(dep.to_id, deserialized.to_id);
+        assert_eq!(dep.protocol, deserialized.protocol);
+        assert_eq!(dep.required, deserialized.required);
+    }
+
+    #[test]
+    fn test_component_dependency_default_required() {
+        // Test that required defaults to true when not specified
+        let json = r#"{"from_id":"00000000-0000-0000-0000-000000000001","to_id":"00000000-0000-0000-0000-000000000002","protocol":"grpc"}"#;
+        let dep: ComponentDependency = serde_json::from_str(json).unwrap();
+        assert!(dep.required);
+    }
+}

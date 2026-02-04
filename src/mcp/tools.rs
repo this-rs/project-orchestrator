@@ -1653,4 +1653,112 @@ mod tests {
             assert!(json.contains("inputSchema"));
         }
     }
+
+    #[test]
+    fn test_workspace_tools_count() {
+        let tools = workspace_tools();
+        assert_eq!(
+            tools.len(),
+            29,
+            "Expected 29 workspace tools, got {}",
+            tools.len()
+        );
+    }
+
+    #[test]
+    fn test_workspace_tools_names() {
+        let tools = workspace_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Workspace management (9)
+        assert!(names.contains(&"list_workspaces"));
+        assert!(names.contains(&"create_workspace"));
+        assert!(names.contains(&"get_workspace"));
+        assert!(names.contains(&"update_workspace"));
+        assert!(names.contains(&"delete_workspace"));
+        assert!(names.contains(&"get_workspace_overview"));
+        assert!(names.contains(&"list_workspace_projects"));
+        assert!(names.contains(&"add_project_to_workspace"));
+        assert!(names.contains(&"remove_project_from_workspace"));
+
+        // Workspace milestones (7)
+        assert!(names.contains(&"list_workspace_milestones"));
+        assert!(names.contains(&"create_workspace_milestone"));
+        assert!(names.contains(&"get_workspace_milestone"));
+        assert!(names.contains(&"update_workspace_milestone"));
+        assert!(names.contains(&"delete_workspace_milestone"));
+        assert!(names.contains(&"add_task_to_workspace_milestone"));
+        assert!(names.contains(&"get_workspace_milestone_progress"));
+
+        // Resources (5)
+        assert!(names.contains(&"list_resources"));
+        assert!(names.contains(&"create_resource"));
+        assert!(names.contains(&"get_resource"));
+        assert!(names.contains(&"delete_resource"));
+        assert!(names.contains(&"link_resource_to_project"));
+
+        // Components (8)
+        assert!(names.contains(&"list_components"));
+        assert!(names.contains(&"create_component"));
+        assert!(names.contains(&"get_component"));
+        assert!(names.contains(&"delete_component"));
+        assert!(names.contains(&"add_component_dependency"));
+        assert!(names.contains(&"remove_component_dependency"));
+        assert!(names.contains(&"map_component_to_project"));
+        assert!(names.contains(&"get_workspace_topology"));
+    }
+
+    #[test]
+    fn test_workspace_tools_have_descriptions() {
+        let tools = workspace_tools();
+        for tool in &tools {
+            assert!(
+                !tool.description.is_empty(),
+                "Tool {} has empty description",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_workspace_tools_required_params() {
+        let tools = workspace_tools();
+
+        // Check create_workspace requires name
+        let create_ws = tools.iter().find(|t| t.name == "create_workspace").unwrap();
+        let required = create_ws.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"name".to_string()));
+
+        // Check get_workspace requires slug
+        let get_ws = tools.iter().find(|t| t.name == "get_workspace").unwrap();
+        let required = get_ws.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"slug".to_string()));
+
+        // Check create_resource requires slug, name, resource_type, file_path
+        let create_res = tools.iter().find(|t| t.name == "create_resource").unwrap();
+        let required = create_res.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"slug".to_string()));
+        assert!(required.contains(&"name".to_string()));
+        assert!(required.contains(&"resource_type".to_string()));
+        assert!(required.contains(&"file_path".to_string()));
+
+        // Check create_component requires slug, name, component_type
+        let create_comp = tools.iter().find(|t| t.name == "create_component").unwrap();
+        let required = create_comp.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"slug".to_string()));
+        assert!(required.contains(&"name".to_string()));
+        assert!(required.contains(&"component_type".to_string()));
+    }
+
+    #[test]
+    fn test_all_tools_have_valid_input_schema() {
+        let tools = all_tools();
+        for tool in &tools {
+            assert_eq!(
+                tool.input_schema.schema_type, "object",
+                "Tool {} input_schema type is not 'object'",
+                tool.name
+            );
+        }
+    }
 }

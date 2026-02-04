@@ -1678,3 +1678,1174 @@ async fn test_pagination_validation() {
         assert!(error["error"].as_str().unwrap().contains("sort_order"));
     }
 }
+
+// ============================================================================
+// Workspace API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_workspace_crud() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let unique_name = format!("Test Workspace {}", uuid::Uuid::new_v4());
+    let unique_slug = format!("test-workspace-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let create_resp = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": unique_name,
+            "slug": unique_slug,
+            "description": "A test workspace for API tests"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        create_resp.status().is_success(),
+        "Create workspace failed: {}",
+        create_resp.status()
+    );
+
+    let workspace: Value = create_resp.json().await.unwrap();
+    assert_eq!(workspace["name"], unique_name);
+    assert_eq!(workspace["slug"], unique_slug);
+    assert!(workspace["id"].is_string());
+
+    // Get workspace by slug
+    let get_resp = client
+        .get(format!("{}/api/workspaces/{}", BASE_URL, unique_slug))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(get_resp.status().is_success());
+    let fetched: Value = get_resp.json().await.unwrap();
+    assert_eq!(fetched["name"], unique_name);
+
+    // Update workspace
+    let update_resp = client
+        .patch(format!("{}/api/workspaces/{}", BASE_URL, unique_slug))
+        .json(&json!({
+            "description": "Updated description"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(update_resp.status().is_success());
+    let updated: Value = update_resp.json().await.unwrap();
+    assert_eq!(updated["description"], "Updated description");
+
+    // Delete workspace
+    let delete_resp = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, unique_slug))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(delete_resp.status().is_success());
+
+    // Verify deleted
+    let get_deleted = client
+        .get(format!("{}/api/workspaces/{}", BASE_URL, unique_slug))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(get_deleted.status(), 404);
+}
+
+#[tokio::test]
+async fn test_list_workspaces() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+
+    // Create a workspace first
+    let unique_slug = format!("test-list-ws-{}", uuid::Uuid::new_v4());
+    let _create = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "List Test Workspace",
+            "slug": unique_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // List workspaces
+    let resp = client
+        .get(format!("{}/api/workspaces", BASE_URL))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let result: Value = resp.json().await.unwrap();
+    assert!(result["items"].is_array());
+    assert!(result["total"].is_number());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, unique_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_workspace_overview() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let unique_slug = format!("test-overview-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Overview Test Workspace",
+            "slug": unique_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Get overview
+    let resp = client
+        .get(format!(
+            "{}/api/workspaces/{}/overview",
+            BASE_URL, unique_slug
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let overview: Value = resp.json().await.unwrap();
+    assert!(overview["workspace"].is_object());
+    assert!(overview["projects"].is_array());
+    assert!(overview["milestones"].is_array());
+    assert!(overview["resources"].is_array());
+    assert!(overview["components"].is_array());
+    assert!(overview["progress"].is_object());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, unique_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_workspace_project_association() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-proj-assoc-{}", uuid::Uuid::new_v4());
+    let proj_slug = format!("test-project-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Project Association Test",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create project
+    let proj_resp = client
+        .post(format!("{}/api/projects", BASE_URL))
+        .json(&json!({
+            "name": "Test Project for Workspace",
+            "slug": proj_slug,
+            "root_path": "/tmp/test-project"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let project: Value = proj_resp.json().await.unwrap();
+    let project_id = project["id"].as_str().unwrap();
+
+    // Add project to workspace
+    let add_resp = client
+        .post(format!("{}/api/workspaces/{}/projects", BASE_URL, ws_slug))
+        .json(&json!({
+            "project_id": project_id
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(add_resp.status().is_success());
+
+    // List workspace projects
+    let list_resp = client
+        .get(format!("{}/api/workspaces/{}/projects", BASE_URL, ws_slug))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(list_resp.status().is_success());
+    let projects: Value = list_resp.json().await.unwrap();
+    assert!(projects.as_array().unwrap().len() >= 1);
+
+    // Remove project from workspace
+    let remove_resp = client
+        .delete(format!(
+            "{}/api/workspaces/{}/projects/{}",
+            BASE_URL, ws_slug, project_id
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(remove_resp.status().is_success());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{}/api/projects/{}", BASE_URL, proj_slug))
+        .send()
+        .await;
+}
+
+// ============================================================================
+// Workspace Milestone API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_workspace_milestone_crud() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-ms-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Milestone Test Workspace",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create workspace milestone
+    let create_resp = client
+        .post(format!(
+            "{}/api/workspaces/{}/milestones",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "title": "Q1 Release",
+            "description": "First quarter release milestone",
+            "tags": ["release", "q1"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        create_resp.status().is_success(),
+        "Create milestone failed: {}",
+        create_resp.status()
+    );
+
+    let milestone: Value = create_resp.json().await.unwrap();
+    let milestone_id = milestone["id"].as_str().unwrap();
+    assert_eq!(milestone["title"], "Q1 Release");
+
+    // Get milestone
+    let get_resp = client
+        .get(format!(
+            "{}/api/workspace-milestones/{}",
+            BASE_URL, milestone_id
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(get_resp.status().is_success());
+    let fetched: Value = get_resp.json().await.unwrap();
+    assert!(fetched["milestone"].is_object());
+    assert!(fetched["tasks"].is_array());
+
+    // Update milestone
+    let update_resp = client
+        .patch(format!(
+            "{}/api/workspace-milestones/{}",
+            BASE_URL, milestone_id
+        ))
+        .json(&json!({
+            "title": "Q1 Release - Updated",
+            "status": "closed"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(update_resp.status().is_success());
+    let updated: Value = update_resp.json().await.unwrap();
+    assert_eq!(updated["title"], "Q1 Release - Updated");
+    assert_eq!(updated["status"], "Closed");
+
+    // Delete milestone
+    let delete_resp = client
+        .delete(format!(
+            "{}/api/workspace-milestones/{}",
+            BASE_URL, milestone_id
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(delete_resp.status().is_success());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_workspace_milestone_progress() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-ms-progress-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Milestone Progress Test",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create milestone
+    let ms_resp = client
+        .post(format!(
+            "{}/api/workspaces/{}/milestones",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "title": "Progress Test Milestone"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let milestone: Value = ms_resp.json().await.unwrap();
+    let milestone_id = milestone["id"].as_str().unwrap();
+
+    // Get progress
+    let progress_resp = client
+        .get(format!(
+            "{}/api/workspace-milestones/{}/progress",
+            BASE_URL, milestone_id
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(progress_resp.status().is_success());
+    let progress: Value = progress_resp.json().await.unwrap();
+    assert!(progress["total"].is_number());
+    assert!(progress["completed"].is_number());
+    assert!(progress["percentage"].is_number());
+
+    // Clean up
+    let _ = client
+        .delete(format!(
+            "{}/api/workspace-milestones/{}",
+            BASE_URL, milestone_id
+        ))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+// ============================================================================
+// Resource API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_resource_crud() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-res-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Resource Test Workspace",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create resource
+    let create_resp = client
+        .post(format!("{}/api/workspaces/{}/resources", BASE_URL, ws_slug))
+        .json(&json!({
+            "name": "User API",
+            "resource_type": "api_contract",
+            "file_path": "specs/openapi/users.yaml",
+            "format": "openapi",
+            "description": "User management API contract"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        create_resp.status().is_success(),
+        "Create resource failed: {}",
+        create_resp.status()
+    );
+
+    let resource: Value = create_resp.json().await.unwrap();
+    let resource_id = resource["id"].as_str().unwrap();
+    assert_eq!(resource["name"], "User API");
+    assert_eq!(resource["resource_type"], "ApiContract");
+
+    // Get resource
+    let get_resp = client
+        .get(format!("{}/api/resources/{}", BASE_URL, resource_id))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(get_resp.status().is_success());
+
+    // List resources
+    let list_resp = client
+        .get(format!("{}/api/workspaces/{}/resources", BASE_URL, ws_slug))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(list_resp.status().is_success());
+    let resources: Value = list_resp.json().await.unwrap();
+    assert!(resources["items"].is_array());
+
+    // Delete resource
+    let delete_resp = client
+        .delete(format!("{}/api/resources/{}", BASE_URL, resource_id))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(delete_resp.status().is_success());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_resource_project_linking() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-res-link-{}", uuid::Uuid::new_v4());
+    let proj_slug = format!("test-proj-res-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Resource Linking Test",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create project
+    let proj_resp = client
+        .post(format!("{}/api/projects", BASE_URL))
+        .json(&json!({
+            "name": "Resource Link Project",
+            "slug": proj_slug,
+            "root_path": "/tmp/test-project"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let project: Value = proj_resp.json().await.unwrap();
+    let project_id = project["id"].as_str().unwrap();
+
+    // Create resource
+    let res_resp = client
+        .post(format!("{}/api/workspaces/{}/resources", BASE_URL, ws_slug))
+        .json(&json!({
+            "name": "Order API",
+            "resource_type": "api_contract",
+            "file_path": "specs/orders.yaml"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let resource: Value = res_resp.json().await.unwrap();
+    let resource_id = resource["id"].as_str().unwrap();
+
+    // Link project as implementer
+    let link_resp = client
+        .post(format!(
+            "{}/api/resources/{}/projects",
+            BASE_URL, resource_id
+        ))
+        .json(&json!({
+            "project_id": project_id,
+            "link_type": "implements"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(link_resp.status().is_success());
+    let link_result: Value = link_resp.json().await.unwrap();
+    assert_eq!(link_result["linked"], true);
+
+    // Get linked projects
+    let linked_resp = client
+        .get(format!(
+            "{}/api/resources/{}/projects",
+            BASE_URL, resource_id
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(linked_resp.status().is_success());
+    let linked: Value = linked_resp.json().await.unwrap();
+    assert!(linked["implementers"].is_array());
+    assert!(linked["consumers"].is_array());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/resources/{}", BASE_URL, resource_id))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{}/api/projects/{}", BASE_URL, proj_slug))
+        .send()
+        .await;
+}
+
+// ============================================================================
+// Component API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_component_crud() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-comp-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Component Test Workspace",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create component
+    let create_resp = client
+        .post(format!(
+            "{}/api/workspaces/{}/components",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "name": "API Gateway",
+            "component_type": "gateway",
+            "description": "Main API gateway",
+            "runtime": "kubernetes",
+            "tags": ["infrastructure"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        create_resp.status().is_success(),
+        "Create component failed: {}",
+        create_resp.status()
+    );
+
+    let component: Value = create_resp.json().await.unwrap();
+    let component_id = component["id"].as_str().unwrap();
+    assert_eq!(component["name"], "API Gateway");
+    assert_eq!(component["component_type"], "Gateway");
+
+    // Get component
+    let get_resp = client
+        .get(format!("{}/api/components/{}", BASE_URL, component_id))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(get_resp.status().is_success());
+
+    // List components
+    let list_resp = client
+        .get(format!(
+            "{}/api/workspaces/{}/components",
+            BASE_URL, ws_slug
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(list_resp.status().is_success());
+    let components: Value = list_resp.json().await.unwrap();
+    assert!(components["items"].is_array());
+
+    // Delete component
+    let delete_resp = client
+        .delete(format!("{}/api/components/{}", BASE_URL, component_id))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(delete_resp.status().is_success());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_component_dependencies() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-comp-deps-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Component Deps Test",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create first component (database)
+    let db_resp = client
+        .post(format!(
+            "{}/api/workspaces/{}/components",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "name": "PostgreSQL",
+            "component_type": "database"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let db: Value = db_resp.json().await.unwrap();
+    let db_id = db["id"].as_str().unwrap();
+
+    // Create second component (service)
+    let svc_resp = client
+        .post(format!(
+            "{}/api/workspaces/{}/components",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "name": "User Service",
+            "component_type": "service"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let svc: Value = svc_resp.json().await.unwrap();
+    let svc_id = svc["id"].as_str().unwrap();
+
+    // Add dependency: service depends on database
+    let dep_resp = client
+        .post(format!(
+            "{}/api/components/{}/dependencies",
+            BASE_URL, svc_id
+        ))
+        .json(&json!({
+            "depends_on_id": db_id,
+            "protocol": "postgres",
+            "required": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(dep_resp.status().is_success());
+
+    // Remove dependency
+    let remove_dep = client
+        .delete(format!(
+            "{}/api/components/{}/dependencies/{}",
+            BASE_URL, svc_id, db_id
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(remove_dep.status().is_success());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/components/{}", BASE_URL, svc_id))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{}/api/components/{}", BASE_URL, db_id))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_workspace_topology() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-topo-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Topology Test Workspace",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create a component
+    let _ = client
+        .post(format!(
+            "{}/api/workspaces/{}/components",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "name": "Test Service",
+            "component_type": "service"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Get topology
+    let topo_resp = client
+        .get(format!("{}/api/workspaces/{}/topology", BASE_URL, ws_slug))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(topo_resp.status().is_success());
+    let topology: Value = topo_resp.json().await.unwrap();
+    assert!(topology["components"].is_array());
+    assert!(topology["dependencies"].is_array());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_component_project_mapping() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-comp-map-{}", uuid::Uuid::new_v4());
+    let proj_slug = format!("test-proj-map-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Component Mapping Test",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create project
+    let proj_resp = client
+        .post(format!("{}/api/projects", BASE_URL))
+        .json(&json!({
+            "name": "Mapped Project",
+            "slug": proj_slug,
+            "root_path": "/tmp/test-mapped"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let project: Value = proj_resp.json().await.unwrap();
+    let project_id = project["id"].as_str().unwrap();
+
+    // Create component
+    let comp_resp = client
+        .post(format!(
+            "{}/api/workspaces/{}/components",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "name": "Mapped Service",
+            "component_type": "service"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let component: Value = comp_resp.json().await.unwrap();
+    let component_id = component["id"].as_str().unwrap();
+
+    // Map component to project
+    let map_resp = client
+        .put(format!(
+            "{}/api/components/{}/project",
+            BASE_URL, component_id
+        ))
+        .json(&json!({
+            "project_id": project_id
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(map_resp.status().is_success());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/components/{}", BASE_URL, component_id))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{}/api/projects/{}", BASE_URL, proj_slug))
+        .send()
+        .await;
+}
+
+// ============================================================================
+// Workspace Search and Filter Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_workspace_list_with_search() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let unique_id = uuid::Uuid::new_v4();
+    let ws_slug = format!("searchable-workspace-{}", unique_id);
+
+    // Create workspace with unique name
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": format!("Searchable Workspace {}", unique_id),
+            "slug": ws_slug,
+            "description": "A workspace for search testing"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Search by name
+    let search_resp = client
+        .get(format!("{}/api/workspaces?search=Searchable", BASE_URL))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(search_resp.status().is_success());
+    let results: Value = search_resp.json().await.unwrap();
+    assert!(results["items"].as_array().unwrap().len() >= 1);
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_workspace_list_pagination() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+
+    // Test pagination parameters
+    let resp = client
+        .get(format!("{}/api/workspaces?limit=5&offset=0", BASE_URL))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let result: Value = resp.json().await.unwrap();
+    assert!(result["items"].is_array());
+    assert!(result["total"].is_number());
+    assert_eq!(result["limit"], 5);
+    assert_eq!(result["offset"], 0);
+}
+
+#[tokio::test]
+async fn test_workspace_milestone_list_with_status_filter() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-ms-filter-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Milestone Filter Test",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create open milestone
+    let _ = client
+        .post(format!(
+            "{}/api/workspaces/{}/milestones",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "title": "Open Milestone"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // List milestones with status filter
+    let filter_resp = client
+        .get(format!(
+            "{}/api/workspaces/{}/milestones?status=open",
+            BASE_URL, ws_slug
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(filter_resp.status().is_success());
+    let results: Value = filter_resp.json().await.unwrap();
+    assert!(results["items"].is_array());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_resource_list_with_type_filter() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-res-filter-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Resource Filter Test",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create api_contract resource
+    let _ = client
+        .post(format!("{}/api/workspaces/{}/resources", BASE_URL, ws_slug))
+        .json(&json!({
+            "name": "API Contract Resource",
+            "resource_type": "api_contract",
+            "file_path": "specs/api.yaml"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // List resources with type filter
+    let filter_resp = client
+        .get(format!(
+            "{}/api/workspaces/{}/resources?resource_type=api_contract",
+            BASE_URL, ws_slug
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(filter_resp.status().is_success());
+    let results: Value = filter_resp.json().await.unwrap();
+    assert!(results["items"].is_array());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_component_list_with_type_filter() {
+    if !api_available().await {
+        eprintln!("Skipping test: API not available");
+        return;
+    }
+
+    let client = Client::new();
+    let ws_slug = format!("test-comp-filter-{}", uuid::Uuid::new_v4());
+
+    // Create workspace
+    let _ = client
+        .post(format!("{}/api/workspaces", BASE_URL))
+        .json(&json!({
+            "name": "Component Filter Test",
+            "slug": ws_slug
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Create service component
+    let _ = client
+        .post(format!(
+            "{}/api/workspaces/{}/components",
+            BASE_URL, ws_slug
+        ))
+        .json(&json!({
+            "name": "Filter Test Service",
+            "component_type": "service"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // List components with type filter
+    let filter_resp = client
+        .get(format!(
+            "{}/api/workspaces/{}/components?component_type=service",
+            BASE_URL, ws_slug
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(filter_resp.status().is_success());
+    let results: Value = filter_resp.json().await.unwrap();
+    assert!(results["items"].is_array());
+
+    // Clean up
+    let _ = client
+        .delete(format!("{}/api/workspaces/{}", BASE_URL, ws_slug))
+        .send()
+        .await;
+}

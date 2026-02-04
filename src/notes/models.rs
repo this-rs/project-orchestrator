@@ -953,4 +953,51 @@ mod tests {
         assert!(context_note.base_decay_days() < guideline_note.base_decay_days());
         assert!(guideline_note.base_decay_days() < assertion_note.base_decay_days());
     }
+
+    #[test]
+    fn test_entity_type_workspace_variants_display() {
+        assert_eq!(EntityType::Workspace.to_string(), "workspace");
+        assert_eq!(
+            EntityType::WorkspaceMilestone.to_string(),
+            "workspace_milestone"
+        );
+        assert_eq!(EntityType::Resource.to_string(), "resource");
+        assert_eq!(EntityType::Component.to_string(), "component");
+    }
+
+    #[test]
+    fn test_entity_type_workspace_variants_from_str() {
+        assert_eq!(
+            EntityType::from_str("workspace").unwrap(),
+            EntityType::Workspace
+        );
+        assert_eq!(
+            EntityType::from_str("workspacemilestone").unwrap(),
+            EntityType::WorkspaceMilestone
+        );
+        assert_eq!(
+            EntityType::from_str("resource").unwrap(),
+            EntityType::Resource
+        );
+        assert_eq!(
+            EntityType::from_str("component").unwrap(),
+            EntityType::Component
+        );
+    }
+
+    #[test]
+    fn test_note_scope_workspace_specificity() {
+        // Workspace is the broadest scope (specificity -1)
+        assert_eq!(NoteScope::Workspace.specificity(), -1);
+        // Workspace should be less specific than Project
+        assert!(NoteScope::Workspace.specificity() < NoteScope::Project.specificity());
+        // Workspace should be less specific than all other scopes
+        assert!(NoteScope::Workspace.specificity() < NoteScope::Module("m".into()).specificity());
+        assert!(NoteScope::Workspace.specificity() < NoteScope::File("f".into()).specificity());
+    }
+
+    #[test]
+    fn test_note_scope_workspace_display() {
+        assert_eq!(NoteScope::Workspace.to_string(), "workspace");
+    }
 }

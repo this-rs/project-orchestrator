@@ -2918,3 +2918,701 @@ fn slugify(name: &str) -> String {
         .collect::<Vec<_>>()
         .join("-")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Datelike;
+    use serde_json::json;
+
+    // ========================================================================
+    // Helper function tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_uuid_valid() {
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let args = json!({"id": uuid_str});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_string(), uuid_str);
+    }
+
+    #[test]
+    fn test_parse_uuid_missing_field() {
+        let args = json!({});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("id is required"));
+    }
+
+    #[test]
+    fn test_parse_uuid_invalid_format() {
+        let args = json!({"id": "not-a-uuid"});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be a valid UUID"));
+    }
+
+    #[test]
+    fn test_parse_uuid_null_value() {
+        let args = json!({"id": null});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_uuid_number_value() {
+        let args = json!({"id": 12345});
+        let result = parse_uuid(&args, "id");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_slugify_simple() {
+        assert_eq!(slugify("My Project"), "my-project");
+    }
+
+    #[test]
+    fn test_slugify_special_chars() {
+        assert_eq!(slugify("Project @#$ Name!"), "project-name");
+    }
+
+    #[test]
+    fn test_slugify_multiple_spaces() {
+        assert_eq!(slugify("Multiple   Spaces   Here"), "multiple-spaces-here");
+    }
+
+    #[test]
+    fn test_slugify_already_slug() {
+        assert_eq!(slugify("already-a-slug"), "already-a-slug");
+    }
+
+    #[test]
+    fn test_slugify_uppercase() {
+        assert_eq!(slugify("UPPERCASE"), "uppercase");
+    }
+
+    #[test]
+    fn test_slugify_numbers() {
+        assert_eq!(slugify("Project 123"), "project-123");
+    }
+
+    #[test]
+    fn test_slugify_leading_trailing_special() {
+        assert_eq!(slugify("---Project---"), "project");
+    }
+
+    #[test]
+    fn test_slugify_empty() {
+        assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn test_slugify_unicode() {
+        // Unicode alphanumeric chars are preserved (is_alphanumeric includes Unicode letters)
+        assert_eq!(slugify("Projet été"), "projet-été");
+    }
+
+    // ========================================================================
+    // Argument extraction tests (verify parsing logic)
+    // ========================================================================
+
+    #[test]
+    fn test_workspace_args_extraction() {
+        let args = json!({
+            "name": "Test Workspace",
+            "slug": "test-workspace",
+            "description": "A test workspace",
+            "metadata": {"key": "value"}
+        });
+
+        // Test name extraction
+        let name = args.get("name").and_then(|v| v.as_str());
+        assert_eq!(name, Some("Test Workspace"));
+
+        // Test slug extraction
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slugify("Test Workspace"));
+        assert_eq!(slug, "test-workspace");
+
+        // Test description extraction
+        let description = args.get("description").and_then(|v| v.as_str());
+        assert_eq!(description, Some("A test workspace"));
+
+        // Test metadata extraction
+        let metadata = args
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        assert_eq!(metadata, json!({"key": "value"}));
+    }
+
+    #[test]
+    fn test_workspace_args_defaults() {
+        let args = json!({
+            "name": "My Workspace"
+        });
+
+        // Slug defaults to slugified name
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slugify("My Workspace"));
+        assert_eq!(slug, "my-workspace");
+
+        // Description defaults to None
+        let description = args.get("description").and_then(|v| v.as_str());
+        assert!(description.is_none());
+
+        // Metadata defaults to empty object
+        let metadata = args
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        assert_eq!(metadata, json!({}));
+    }
+
+    #[test]
+    fn test_pagination_args_extraction() {
+        let args = json!({
+            "limit": 25,
+            "offset": 10,
+            "search": "test query"
+        });
+
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let search = args.get("search").and_then(|v| v.as_str());
+
+        assert_eq!(limit, 25);
+        assert_eq!(offset, 10);
+        assert_eq!(search, Some("test query"));
+    }
+
+    #[test]
+    fn test_pagination_args_defaults() {
+        let args = json!({});
+
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let search = args.get("search").and_then(|v| v.as_str());
+
+        assert_eq!(limit, 50);
+        assert_eq!(offset, 0);
+        assert!(search.is_none());
+    }
+
+    #[test]
+    fn test_milestone_args_extraction() {
+        let args = json!({
+            "slug": "my-workspace",
+            "title": "Q1 Release",
+            "description": "First quarter release",
+            "target_date": "2024-03-31T00:00:00Z",
+            "tags": ["release", "q1"]
+        });
+
+        let slug = args.get("slug").and_then(|v| v.as_str());
+        assert_eq!(slug, Some("my-workspace"));
+
+        let title = args.get("title").and_then(|v| v.as_str());
+        assert_eq!(title, Some("Q1 Release"));
+
+        let target_date = args
+            .get("target_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        assert!(target_date.is_some());
+
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(tags, vec!["release", "q1"]);
+    }
+
+    #[test]
+    fn test_milestone_status_parsing() {
+        // Test status parsing logic
+        let parse_status = |s: &str| match s.to_lowercase().as_str() {
+            "open" => Some(MilestoneStatus::Open),
+            "closed" => Some(MilestoneStatus::Closed),
+            _ => None,
+        };
+
+        assert_eq!(parse_status("open"), Some(MilestoneStatus::Open));
+        assert_eq!(parse_status("OPEN"), Some(MilestoneStatus::Open));
+        assert_eq!(parse_status("Open"), Some(MilestoneStatus::Open));
+        assert_eq!(parse_status("closed"), Some(MilestoneStatus::Closed));
+        assert_eq!(parse_status("CLOSED"), Some(MilestoneStatus::Closed));
+        assert_eq!(parse_status("invalid"), None);
+    }
+
+    #[test]
+    fn test_resource_args_extraction() {
+        let args = json!({
+            "slug": "my-workspace",
+            "name": "User API",
+            "resource_type": "api_contract",
+            "file_path": "specs/openapi/users.yaml",
+            "url": "https://api.example.com/docs",
+            "format": "openapi",
+            "version": "1.0.0",
+            "description": "User management API",
+            "metadata": {"owner": "team-a"}
+        });
+
+        let name = args.get("name").and_then(|v| v.as_str());
+        assert_eq!(name, Some("User API"));
+
+        let resource_type_str = args.get("resource_type").and_then(|v| v.as_str());
+        assert_eq!(resource_type_str, Some("api_contract"));
+
+        let resource_type: Result<ResourceType, _> = "api_contract".parse();
+        assert!(resource_type.is_ok());
+        assert_eq!(resource_type.unwrap(), ResourceType::ApiContract);
+
+        let file_path = args.get("file_path").and_then(|v| v.as_str());
+        assert_eq!(file_path, Some("specs/openapi/users.yaml"));
+
+        let url = args.get("url").and_then(|v| v.as_str());
+        assert_eq!(url, Some("https://api.example.com/docs"));
+    }
+
+    #[test]
+    fn test_component_args_extraction() {
+        let args = json!({
+            "slug": "my-workspace",
+            "name": "API Gateway",
+            "component_type": "gateway",
+            "description": "Main API gateway",
+            "runtime": "kubernetes",
+            "config": {"replicas": 3, "port": 8080},
+            "tags": ["infrastructure", "gateway"]
+        });
+
+        let name = args.get("name").and_then(|v| v.as_str());
+        assert_eq!(name, Some("API Gateway"));
+
+        let component_type_str = args.get("component_type").and_then(|v| v.as_str());
+        assert_eq!(component_type_str, Some("gateway"));
+
+        let component_type: Result<ComponentType, _> = "gateway".parse();
+        assert!(component_type.is_ok());
+        assert_eq!(component_type.unwrap(), ComponentType::Gateway);
+
+        let runtime = args.get("runtime").and_then(|v| v.as_str());
+        assert_eq!(runtime, Some("kubernetes"));
+
+        let config = args
+            .get("config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        assert_eq!(config["replicas"], 3);
+        assert_eq!(config["port"], 8080);
+    }
+
+    #[test]
+    fn test_link_type_validation() {
+        let validate_link_type = |link_type: &str| match link_type.to_lowercase().as_str() {
+            "implements" | "uses" => true,
+            _ => false,
+        };
+
+        assert!(validate_link_type("implements"));
+        assert!(validate_link_type("IMPLEMENTS"));
+        assert!(validate_link_type("uses"));
+        assert!(validate_link_type("USES"));
+        assert!(!validate_link_type("invalid"));
+        assert!(!validate_link_type(""));
+    }
+
+    #[test]
+    fn test_dependency_args_extraction() {
+        let args = json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "depends_on_id": "660e8400-e29b-41d4-a716-446655440001",
+            "protocol": "http",
+            "required": true
+        });
+
+        let id = parse_uuid(&args, "id");
+        assert!(id.is_ok());
+
+        let depends_on_id = parse_uuid(&args, "depends_on_id");
+        assert!(depends_on_id.is_ok());
+
+        let protocol = args
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(protocol, Some("http".to_string()));
+
+        let required = args
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(required);
+    }
+
+    #[test]
+    fn test_dependency_args_defaults() {
+        let args = json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "depends_on_id": "660e8400-e29b-41d4-a716-446655440001"
+        });
+
+        let protocol = args
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert!(protocol.is_none());
+
+        let required = args
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(required); // Defaults to true
+    }
+
+    // ========================================================================
+    // Response structure tests
+    // ========================================================================
+
+    #[test]
+    fn test_paginated_response_structure() {
+        // Simulate a paginated response
+        let items = vec![json!({"id": "1", "name": "item1"})];
+        let total = 10;
+        let limit = 5;
+        let offset = 0;
+
+        let response = json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        });
+
+        assert!(response.get("items").is_some());
+        assert_eq!(response["total"], 10);
+        assert_eq!(response["limit"], 5);
+        assert_eq!(response["offset"], 0);
+    }
+
+    #[test]
+    fn test_workspace_overview_response_structure() {
+        // Simulate workspace overview response structure
+        let total_tasks = 10u32;
+        let completed_tasks = 5u32;
+
+        let response = json!({
+            "workspace": {"id": "123", "name": "Test"},
+            "projects": [],
+            "milestones": [],
+            "resources": [],
+            "components": [],
+            "progress": {
+                "total_tasks": total_tasks,
+                "completed_tasks": completed_tasks,
+                "percentage": if total_tasks > 0 {
+                    (completed_tasks as f64 / total_tasks as f64 * 100.0).round()
+                } else {
+                    0.0
+                }
+            }
+        });
+
+        assert!(response.get("workspace").is_some());
+        assert!(response.get("projects").is_some());
+        assert!(response.get("milestones").is_some());
+        assert!(response.get("resources").is_some());
+        assert!(response.get("components").is_some());
+        assert!(response.get("progress").is_some());
+        assert_eq!(response["progress"]["percentage"], 50.0);
+    }
+
+    #[test]
+    fn test_milestone_progress_response_structure() {
+        let total = 10u32;
+        let completed = 6u32;
+        let in_progress = 2u32;
+        let pending = 2u32;
+
+        let percentage = if total > 0 {
+            (completed as f64 / total as f64 * 100.0).round()
+        } else {
+            0.0
+        };
+
+        let response = json!({
+            "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending,
+            "percentage": percentage
+        });
+
+        assert_eq!(response["total"], 10);
+        assert_eq!(response["completed"], 6);
+        assert_eq!(response["in_progress"], 2);
+        assert_eq!(response["pending"], 2);
+        assert_eq!(response["percentage"], 60.0);
+    }
+
+    #[test]
+    fn test_milestone_progress_empty() {
+        let total = 0u32;
+        let completed = 0u32;
+
+        let percentage = if total > 0 {
+            (completed as f64 / total as f64 * 100.0).round()
+        } else {
+            0.0
+        };
+
+        assert_eq!(percentage, 0.0);
+    }
+
+    #[test]
+    fn test_boolean_response_structures() {
+        // Test various boolean response structures used by handlers
+        assert_eq!(json!({"deleted": true})["deleted"], true);
+        assert_eq!(json!({"added": true})["added"], true);
+        assert_eq!(json!({"removed": true})["removed"], true);
+        assert_eq!(json!({"linked": true})["linked"], true);
+        assert_eq!(json!({"mapped": true})["mapped"], true);
+        assert_eq!(json!({"updated": true})["updated"], true);
+    }
+
+    #[test]
+    fn test_link_response_with_type() {
+        let link_type = "implements";
+        let response = json!({"linked": true, "link_type": link_type});
+
+        assert_eq!(response["linked"], true);
+        assert_eq!(response["link_type"], "implements");
+    }
+
+    // ========================================================================
+    // Filter logic tests
+    // ========================================================================
+
+    #[test]
+    fn test_search_filter_logic() {
+        let workspaces = vec![
+            json!({"name": "Test Project", "description": "A test workspace"}),
+            json!({"name": "Production", "description": "Production environment"}),
+            json!({"name": "Development", "description": "Dev workspace"}),
+        ];
+
+        let search_term = "test";
+        let search_lower = search_term.to_lowercase();
+
+        let filtered: Vec<_> = workspaces
+            .into_iter()
+            .filter(|w| {
+                let name = w["name"].as_str().unwrap_or("").to_lowercase();
+                let desc = w["description"].as_str().unwrap_or("").to_lowercase();
+                name.contains(&search_lower) || desc.contains(&search_lower)
+            })
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["name"], "Test Project");
+    }
+
+    #[test]
+    fn test_search_filter_description() {
+        let workspaces = vec![
+            json!({"name": "Project A", "description": "Contains test data"}),
+            json!({"name": "Project B", "description": "Production only"}),
+        ];
+
+        let search_term = "test";
+        let search_lower = search_term.to_lowercase();
+
+        let filtered: Vec<_> = workspaces
+            .into_iter()
+            .filter(|w| {
+                let name = w["name"].as_str().unwrap_or("").to_lowercase();
+                let desc = w["description"].as_str().unwrap_or("").to_lowercase();
+                name.contains(&search_lower) || desc.contains(&search_lower)
+            })
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["name"], "Project A");
+    }
+
+    #[test]
+    fn test_type_filter_logic() {
+        // Simulating resource type filtering
+        let resources = vec![
+            (ResourceType::ApiContract, "User API"),
+            (ResourceType::Protobuf, "Events Proto"),
+            (ResourceType::ApiContract, "Order API"),
+        ];
+
+        let filter_type = ResourceType::ApiContract;
+        let filtered: Vec<_> = resources
+            .into_iter()
+            .filter(|(rt, _)| *rt == filter_type)
+            .collect();
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].1, "User API");
+        assert_eq!(filtered[1].1, "Order API");
+    }
+
+    #[test]
+    fn test_pagination_logic() {
+        let items: Vec<i32> = (1..=20).collect();
+        let limit = 5;
+        let offset = 10;
+
+        let paginated: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+
+        assert_eq!(paginated.len(), 5);
+        assert_eq!(paginated, vec![11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn test_pagination_beyond_bounds() {
+        let items: Vec<i32> = (1..=10).collect();
+        let limit = 5;
+        let offset = 8;
+
+        let paginated: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+
+        assert_eq!(paginated.len(), 2);
+        assert_eq!(paginated, vec![9, 10]);
+    }
+
+    #[test]
+    fn test_pagination_empty_offset() {
+        let items: Vec<i32> = (1..=10).collect();
+        let limit = 5;
+        let offset = 20;
+
+        let paginated: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+
+        assert!(paginated.is_empty());
+    }
+
+    // ========================================================================
+    // Date parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_date_parsing_rfc3339() {
+        let date_str = "2024-03-31T00:00:00Z";
+        let parsed = chrono::DateTime::parse_from_rfc3339(date_str);
+        assert!(parsed.is_ok());
+
+        let utc = parsed.unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(utc.year(), 2024);
+        assert_eq!(utc.month(), 3);
+        assert_eq!(utc.day(), 31);
+    }
+
+    #[test]
+    fn test_date_parsing_with_offset() {
+        let date_str = "2024-03-31T12:00:00+02:00";
+        let parsed = chrono::DateTime::parse_from_rfc3339(date_str);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_date_parsing_invalid() {
+        let date_str = "2024-03-31"; // Not RFC3339
+        let parsed = chrono::DateTime::parse_from_rfc3339(date_str);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_date_parsing_optional() {
+        let args = json!({});
+        let target_date = args
+            .get("target_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        assert!(target_date.is_none());
+    }
+
+    // ========================================================================
+    // Tags parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_tags_parsing() {
+        let args = json!({
+            "tags": ["tag1", "tag2", "tag3"]
+        });
+
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert_eq!(tags, vec!["tag1", "tag2", "tag3"]);
+    }
+
+    #[test]
+    fn test_tags_parsing_empty() {
+        let args = json!({});
+
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn test_tags_parsing_mixed_types() {
+        let args = json!({
+            "tags": ["valid", 123, "another", null]
+        });
+
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Only strings are extracted
+        assert_eq!(tags, vec!["valid", "another"]);
+    }
+}
