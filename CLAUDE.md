@@ -2,6 +2,20 @@
 
 This file provides guidance to Claude Code when working on the project-orchestrator skill.
 
+## Documentation
+
+For user-facing documentation, see the `docs/` folder:
+
+- **[Installation Guide](docs/setup/installation.md)** — Full setup instructions
+- **[Getting Started](docs/guides/getting-started.md)** — Tutorial for new users
+- **[API Reference](docs/api/reference.md)** — REST API documentation
+- **[MCP Tools](docs/api/mcp-tools.md)** — All 62 MCP tools documented
+- **Integration Guides:**
+  - [Claude Code](docs/integrations/claude-code.md)
+  - [OpenAI Agents](docs/integrations/openai.md)
+  - [Cursor](docs/integrations/cursor.md)
+- **[Multi-Agent Workflows](docs/guides/multi-agent-workflow.md)** — Advanced coordination
+
 ## Project Overview
 
 **Project Orchestrator** is a Rust-based service that coordinates AI coding agents on complex projects. It provides:
@@ -192,6 +206,20 @@ Logs are written to stderr (stdout is reserved for MCP protocol).
 ## Project Structure
 
 ```
+docs/
+├── setup/
+│   └── installation.md      # Installation and configuration
+├── integrations/
+│   ├── claude-code.md       # Claude Code MCP setup
+│   ├── openai.md            # OpenAI Agents SDK setup
+│   └── cursor.md            # Cursor IDE setup
+├── api/
+│   ├── reference.md         # REST API documentation
+│   └── mcp-tools.md         # MCP tools reference (62 tools)
+└── guides/
+    ├── getting-started.md   # Tutorial for new users
+    └── multi-agent-workflow.md # Multi-agent coordination
+
 src/
 ├── api/
 │   ├── mod.rs           # API module exports

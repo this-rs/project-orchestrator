@@ -2,171 +2,130 @@
 
 Guidelines for AI agents working with Project Orchestrator.
 
-## Workflow
+> **Detailed guides available:**
+> - [Getting Started Tutorial](docs/guides/getting-started.md)
+> - [Multi-Agent Workflow Guide](docs/guides/multi-agent-workflow.md)
+> - [MCP Tools Reference](docs/api/mcp-tools.md)
 
-### 1. Récupérer le plan et la tâche
+---
+
+## Quick Start Workflow
+
+### 1. Get your task
 
 ```bash
-# Récupérer le plan complet (1 call)
-GET /api/plans/{plan_id}
-
-# Ou juste la prochaine tâche disponible
+# Get the next available task (unblocked, highest priority)
 GET /api/plans/{plan_id}/next-task
 ```
 
-### 2. Marquer la tâche comme "in_progress"
+### 2. Claim it
 
 ```bash
 PATCH /api/tasks/{task_id}
 {"status": "in_progress", "assigned_to": "agent-id"}
 ```
 
-### 3. Suivre les steps
+### 3. Work through steps
 
-Pour chaque step de la tâche :
-1. Lire la description et le critère de vérification
-2. Effectuer le travail
-3. Marquer le step comme complété
+For each step in the task:
+1. Read the description
+2. Do the work
+3. Mark step completed: `PATCH /api/steps/{step_id} {"status": "completed"}`
+
+### 4. Record decisions
+
+When you make important choices:
 
 ```bash
-PATCH /api/steps/{step_id}
-{"status": "completed"}
+POST /api/tasks/{task_id}/decisions
+{
+  "description": "Use JWT instead of sessions",
+  "rationale": "Better for stateless API",
+  "alternatives": ["Sessions", "OAuth"],
+  "chosen_option": "JWT with refresh tokens"
+}
 ```
 
-### 4. Respecter les constraints
+### 5. Commit your changes
 
-Avant de valider le travail, vérifier que toutes les constraints du plan sont respectées :
-- `style` → Lancer les linters (ex: `cargo clippy`, `eslint`)
-- `testing` → Lancer les tests (ex: `cargo test`)
-- `security` → Vérifier les vulnérabilités
-- `compatibility` → Vérifier la rétro-compatibilité
-
-### 5. Commit des changements
-
-**IMPORTANT : Toujours commiter à la fin de chaque tâche complétée.**
-
-Format du commit :
+Format:
 ```
-<type>(<scope>): <description courte>
+<type>(<scope>): <description>
 
 <Task title>
 
 Changes:
-- <changement 1>
-- <changement 2>
-
-Tests:
-- <test ajouté/modifié>
-
-Files modified:
-- <fichier 1>
-- <fichier 2>
+- <change 1>
+- <change 2>
 
 Co-Authored-By: <Agent Name> <email>
 ```
 
-Types de commit :
-- `feat` : Nouvelle fonctionnalité
-- `fix` : Correction de bug
-- `refactor` : Refactoring sans changement de comportement
-- `docs` : Documentation
-- `test` : Ajout/modification de tests
-- `chore` : Maintenance, dépendances
+Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`
 
-### 6. Marquer la tâche comme complétée
+### 6. Mark complete
 
 ```bash
 PATCH /api/tasks/{task_id}
 {"status": "completed"}
 ```
 
-### 7. Reporter via webhook (optionnel)
+---
 
+## Checklist Before Completion
+
+- [ ] All steps completed
+- [ ] Tests pass
+- [ ] Constraints respected (clippy, tests, etc.)
+- [ ] Changes committed
+- [ ] Task marked as `completed`
+
+---
+
+## Getting Help
+
+### Search for code patterns
 ```bash
-POST /api/wake
-{
-  "task_id": "uuid",
-  "success": true,
-  "summary": "Description du travail effectué",
-  "files_modified": ["src/file1.rs", "src/file2.rs"]
-}
-```
-
-## Récupérer du contexte additionnel
-
-### Contexte code
-
-```bash
-# Recherche sémantique
 GET /api/code/search?q=error+handling&limit=10
-
-# Symboles d'un fichier
-GET /api/code/symbols/{path}
-
-# Dépendances
-GET /api/code/dependencies/{path}
-
-# Impact d'une modification
-GET /api/code/impact?target={path}&target_type=file
 ```
 
-### Décisions passées
-
+### Check impact before changes
 ```bash
-# Rechercher des décisions similaires
-GET /api/decisions/search?q=authentication&limit=5
+GET /api/code/impact?target=src/models/user.rs
 ```
 
-### Enregistrer une décision
-
-Quand vous prenez une décision architecturale importante :
-
+### Find past decisions
 ```bash
-POST /api/tasks/{task_id}/decisions
-{
-  "description": "Utiliser JWT au lieu des sessions",
-  "rationale": "Meilleur pour une API stateless",
-  "alternatives": ["Sessions", "OAuth"],
-  "chosen_option": "JWT avec refresh tokens"
-}
+GET /api/decisions/search?q=authentication
 ```
 
-## Bonnes pratiques
+---
 
-### Code
+## If Something Goes Wrong
 
-1. **Lire avant d'écrire** - Toujours lire les fichiers existants avant de les modifier
-2. **Tests** - Ajouter des tests pour chaque nouvelle fonctionnalité
-3. **Petit commits** - Un commit par tâche, pas de commits géants
-4. **Documentation** - Mettre à jour README/CLAUDE.md si nécessaire
+**Do NOT mark task as `completed`.**
 
-### Communication
-
-1. **Steps** - Mettre à jour le statut des steps au fur et à mesure
-2. **Décisions** - Enregistrer les décisions importantes dans l'API
-3. **Blocages** - Si bloqué, marquer la tâche comme `blocked` et expliquer
-
-### Gestion des erreurs
-
-Si une tâche échoue :
-1. Ne PAS marquer comme `completed`
-2. Marquer comme `failed` avec un message explicatif
-3. Reporter via webhook avec `success: false`
+Instead:
+1. Mark as `failed` with explanation
+2. Or mark as `blocked` if waiting on something
 
 ```bash
+PATCH /api/tasks/{task_id}
+{"status": "failed"}
+
 POST /api/wake
 {
   "task_id": "uuid",
   "success": false,
-  "summary": "Échec: tests ne passent pas après modification de X"
+  "summary": "Tests failing after X modification"
 }
 ```
 
-## Checklist avant de terminer une tâche
+---
 
-- [ ] Tous les steps sont complétés
-- [ ] Les tests passent
-- [ ] Les constraints sont respectées (clippy, tests, etc.)
-- [ ] Les fichiers modifiés sont commités
-- [ ] Le commit suit le format standard
-- [ ] La tâche est marquée comme `completed`
+## Full Documentation
+
+- [Getting Started](docs/guides/getting-started.md) — Complete tutorial
+- [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) — Coordinating multiple agents
+- [API Reference](docs/api/reference.md) — All REST endpoints
+- [MCP Tools](docs/api/mcp-tools.md) — 62 tools documented
