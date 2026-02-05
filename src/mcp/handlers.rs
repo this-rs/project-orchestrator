@@ -146,6 +146,9 @@ impl ToolHandler {
             "get_context_notes" => self.get_context_notes(args).await,
             "get_notes_needing_review" => self.get_notes_needing_review(args).await,
             "update_staleness_scores" => self.update_staleness_scores(args).await,
+            "list_project_notes" => self.list_project_notes(args).await,
+            "get_propagated_notes" => self.get_propagated_notes(args).await,
+            "get_entity_notes" => self.get_entity_notes(args).await,
 
             // Workspaces
             "list_workspaces" => self.list_workspaces(args).await,
@@ -2158,6 +2161,79 @@ impl ToolHandler {
             .await?;
 
         Ok(json!({"notes_updated": count}))
+    }
+
+    async fn list_project_notes(&self, args: Value) -> Result<Value> {
+        let project_id = parse_uuid(&args, "project_id")?;
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+        let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        let filters = crate::notes::NoteFilters {
+            limit: Some(limit),
+            offset: Some(offset),
+            ..Default::default()
+        };
+
+        let (notes, total) = self
+            .orchestrator
+            .note_manager()
+            .list_project_notes(project_id, &filters)
+            .await?;
+
+        Ok(json!({
+            "items": notes,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn get_propagated_notes(&self, args: Value) -> Result<Value> {
+        let entity_type_str = args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_type is required"))?;
+        let entity_id = args
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_id is required"))?;
+        let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+        let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.1);
+
+        let entity_type: crate::notes::EntityType = entity_type_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid entity type: {}", entity_type_str))?;
+
+        let notes = self
+            .orchestrator
+            .note_manager()
+            .get_propagated_notes(&entity_type, entity_id, max_depth, min_score)
+            .await?;
+
+        Ok(serde_json::to_value(notes)?)
+    }
+
+    async fn get_entity_notes(&self, args: Value) -> Result<Value> {
+        let entity_type_str = args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_type is required"))?;
+        let entity_id = args
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_id is required"))?;
+
+        let entity_type: crate::notes::EntityType = entity_type_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid entity type: {}", entity_type_str))?;
+
+        let notes = self
+            .orchestrator
+            .neo4j()
+            .get_notes_for_entity(&entity_type, entity_id)
+            .await?;
+
+        Ok(serde_json::to_value(notes)?)
     }
 
     // ========================================================================

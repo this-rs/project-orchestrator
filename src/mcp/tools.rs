@@ -1230,6 +1230,48 @@ fn note_tools() -> Vec<ToolDefinition> {
                 required: None,
             },
         },
+        ToolDefinition {
+            name: "list_project_notes".to_string(),
+            description: "List notes for a specific project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "note_type": {"type": "string", "description": "Filter by type"},
+                    "status": {"type": "string", "description": "Filter by status"},
+                    "importance": {"type": "string", "description": "Filter by importance"},
+                    "limit": {"type": "integer", "description": "Max items (default 50)"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: Some(vec!["project_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_propagated_notes".to_string(),
+            description: "Get notes propagated through the graph (not directly attached)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "entity_type": {"type": "string", "description": "Entity type: file, function, struct, task, etc."},
+                    "entity_id": {"type": "string", "description": "Entity ID"},
+                    "max_depth": {"type": "integer", "description": "Max traversal depth (default 3)"},
+                    "min_score": {"type": "number", "description": "Min relevance score (default 0.1)"}
+                })),
+                required: Some(vec!["entity_type".to_string(), "entity_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_entity_notes".to_string(),
+            description: "Get notes directly attached to an entity".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "entity_type": {"type": "string", "description": "Entity type: file, function, struct, trait, task, plan, etc."},
+                    "entity_id": {"type": "string", "description": "Entity ID (file path or UUID)"}
+                })),
+                required: Some(vec!["entity_type".to_string(), "entity_id".to_string()]),
+            },
+        },
     ]
 }
 
@@ -1644,7 +1686,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 114, "Expected 114 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 117, "Expected 117 tools, got {}", tools.len());
     }
 
     #[test]
