@@ -31,7 +31,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         .route(
             "/api/projects/{slug}",
-            get(project_handlers::get_project).delete(project_handlers::delete_project),
+            get(project_handlers::get_project)
+                .patch(project_handlers::update_project)
+                .delete(project_handlers::delete_project),
         )
         .route(
             "/api/projects/{slug}/sync",
@@ -96,7 +98,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         .route(
             "/api/constraints/{constraint_id}",
-            axum::routing::delete(handlers::delete_constraint),
+            get(handlers::get_constraint)
+                .patch(handlers::update_constraint)
+                .delete(handlers::delete_constraint),
         )
         // Tasks (global listing)
         .route("/api/tasks", get(handlers::list_all_tasks))
@@ -104,7 +108,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .route("/api/plans/{plan_id}/tasks", post(handlers::add_task))
         .route(
             "/api/tasks/{task_id}",
-            get(handlers::get_task).patch(handlers::update_task),
+            get(handlers::get_task)
+                .patch(handlers::update_task)
+                .delete(handlers::delete_task),
         )
         // Task dependencies
         .route(
@@ -134,7 +140,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         .route(
             "/api/steps/{step_id}",
-            axum::routing::patch(handlers::update_step),
+            get(handlers::get_step)
+                .patch(handlers::update_step)
+                .delete(handlers::delete_step),
         )
         // Context
         .route(
@@ -150,13 +158,21 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/tasks/{task_id}/decisions",
             post(handlers::add_decision),
         )
+        .route(
+            "/api/decisions/{decision_id}",
+            get(handlers::get_decision)
+                .patch(handlers::update_decision)
+                .delete(handlers::delete_decision),
+        )
         .route("/api/decisions/search", get(handlers::search_decisions))
         // Sync
         .route("/api/sync", post(handlers::sync_directory))
         // Releases
         .route(
             "/api/releases/{release_id}",
-            get(handlers::get_release).patch(handlers::update_release),
+            get(handlers::get_release)
+                .patch(handlers::update_release)
+                .delete(handlers::delete_release),
         )
         .route(
             "/api/releases/{release_id}/tasks",
@@ -169,7 +185,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         // Milestones
         .route(
             "/api/milestones/{milestone_id}",
-            get(handlers::get_milestone).patch(handlers::update_milestone),
+            get(handlers::get_milestone)
+                .patch(handlers::update_milestone)
+                .delete(handlers::delete_milestone),
         )
         .route(
             "/api/milestones/{milestone_id}/tasks",
@@ -367,7 +385,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         .route(
             "/api/resources/{id}",
-            get(workspace_handlers::get_resource).delete(workspace_handlers::delete_resource),
+            get(workspace_handlers::get_resource)
+                .patch(workspace_handlers::update_resource)
+                .delete(workspace_handlers::delete_resource),
         )
         .route(
             "/api/resources/{id}/projects",
@@ -380,7 +400,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         .route(
             "/api/components/{id}",
-            get(workspace_handlers::get_component).delete(workspace_handlers::delete_component),
+            get(workspace_handlers::get_component)
+                .patch(workspace_handlers::update_component)
+                .delete(workspace_handlers::delete_component),
         )
         .route(
             "/api/components/{id}/dependencies",

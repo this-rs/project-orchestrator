@@ -852,6 +852,42 @@ pub async fn get_resource(
     Ok(Json(ResourceResponse::from(resource)))
 }
 
+/// Request to update a resource
+#[derive(Deserialize)]
+pub struct UpdateResourceRequest {
+    pub name: Option<String>,
+    pub file_path: Option<String>,
+    pub url: Option<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Update resource
+pub async fn update_resource(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateResourceRequest>,
+) -> Result<StatusCode, AppError> {
+    let id: Uuid = id
+        .parse()
+        .map_err(|_| AppError::BadRequest("Invalid resource ID".to_string()))?;
+
+    state
+        .orchestrator
+        .neo4j()
+        .update_resource(
+            id,
+            req.name,
+            req.file_path,
+            req.url,
+            req.version,
+            req.description,
+        )
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Delete resource
 pub async fn delete_resource(
     State(state): State<OrchestratorState>,
@@ -1004,6 +1040,42 @@ pub async fn get_component(
     Ok(Json(ComponentResponse::from(component)))
 }
 
+/// Request to update a component
+#[derive(Deserialize)]
+pub struct UpdateComponentRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub runtime: Option<String>,
+    pub config: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
+}
+
+/// Update component
+pub async fn update_component(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateComponentRequest>,
+) -> Result<StatusCode, AppError> {
+    let id: Uuid = id
+        .parse()
+        .map_err(|_| AppError::BadRequest("Invalid component ID".to_string()))?;
+
+    state
+        .orchestrator
+        .neo4j()
+        .update_component(
+            id,
+            req.name,
+            req.description,
+            req.runtime,
+            req.config,
+            req.tags,
+        )
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Delete component
 pub async fn delete_component(
     State(state): State<OrchestratorState>,
@@ -1123,4 +1195,79 @@ pub async fn get_workspace_topology(
         .collect();
 
     Ok(Json(TopologyResponse { components }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_resource_request_all_fields() {
+        let json = r#"{"name":"API v2","file_path":"/api.yaml","url":"https://x.com","version":"2.0","description":"Updated"}"#;
+        let req: UpdateResourceRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, Some("API v2".to_string()));
+        assert_eq!(req.file_path, Some("/api.yaml".to_string()));
+        assert_eq!(req.url, Some("https://x.com".to_string()));
+        assert_eq!(req.version, Some("2.0".to_string()));
+        assert_eq!(req.description, Some("Updated".to_string()));
+    }
+
+    #[test]
+    fn test_update_resource_request_empty() {
+        let json = r#"{}"#;
+        let req: UpdateResourceRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, None);
+        assert_eq!(req.file_path, None);
+        assert_eq!(req.url, None);
+        assert_eq!(req.version, None);
+        assert_eq!(req.description, None);
+    }
+
+    #[test]
+    fn test_update_resource_request_partial() {
+        let json = r#"{"version":"3.0"}"#;
+        let req: UpdateResourceRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.version, Some("3.0".to_string()));
+        assert_eq!(req.name, None);
+    }
+
+    #[test]
+    fn test_update_component_request_all_fields() {
+        let json = r#"{"name":"Auth","description":"Auth service","runtime":"rust","config":{"port":8080},"tags":["auth","core"]}"#;
+        let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, Some("Auth".to_string()));
+        assert_eq!(req.description, Some("Auth service".to_string()));
+        assert_eq!(req.runtime, Some("rust".to_string()));
+        assert!(req.config.is_some());
+        assert_eq!(req.config.as_ref().unwrap()["port"], 8080);
+        assert_eq!(req.tags, Some(vec!["auth".to_string(), "core".to_string()]));
+    }
+
+    #[test]
+    fn test_update_component_request_empty() {
+        let json = r#"{}"#;
+        let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, None);
+        assert_eq!(req.description, None);
+        assert_eq!(req.runtime, None);
+        assert_eq!(req.config, None);
+        assert_eq!(req.tags, None);
+    }
+
+    #[test]
+    fn test_update_component_request_with_json_config() {
+        let json = r#"{"config":{"workers":4,"timeout":30,"nested":{"key":"val"}}}"#;
+        let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
+        let config = req.config.unwrap();
+        assert_eq!(config["workers"], 4);
+        assert_eq!(config["timeout"], 30);
+        assert_eq!(config["nested"]["key"], "val");
+    }
+
+    #[test]
+    fn test_update_component_request_empty_tags() {
+        let json = r#"{"tags":[]}"#;
+        let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.tags, Some(vec![]));
+    }
 }

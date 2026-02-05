@@ -196,6 +196,36 @@ pub async fn get_project(
     }))
 }
 
+/// Request to update a project
+#[derive(Deserialize)]
+pub struct UpdateProjectRequest {
+    pub name: Option<String>,
+    pub description: Option<Option<String>>,
+    pub root_path: Option<String>,
+}
+
+/// Update a project
+pub async fn update_project(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+    Json(req): Json<UpdateProjectRequest>,
+) -> Result<StatusCode, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
+
+    state
+        .orchestrator
+        .neo4j()
+        .update_project(project.id, req.name, req.description, req.root_path)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Delete a project
 pub async fn delete_project(
     State(state): State<OrchestratorState>,
@@ -338,5 +368,49 @@ mod tests {
         assert_eq!(slugify("Test  Project!"), "test-project");
         assert_eq!(slugify("embryon-neural"), "embryon-neural");
         assert_eq!(slugify("Project 123"), "project-123");
+    }
+
+    #[test]
+    fn test_update_project_request_all_fields() {
+        let json = r#"{"name":"New Name","description":"New desc","root_path":"/new"}"#;
+        let req: UpdateProjectRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, Some("New Name".to_string()));
+        assert_eq!(req.description, Some(Some("New desc".to_string())));
+        assert_eq!(req.root_path, Some("/new".to_string()));
+    }
+
+    #[test]
+    fn test_update_project_request_empty() {
+        let json = r#"{}"#;
+        let req: UpdateProjectRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, None);
+        assert_eq!(req.description, None);
+        assert_eq!(req.root_path, None);
+    }
+
+    #[test]
+    fn test_update_project_request_null_description() {
+        // With default serde, null on Option<Option<String>> deserializes to None (absent)
+        // To distinguish "field absent" from "field = null", a custom deserializer is needed
+        let json = r#"{"description":null}"#;
+        let req: UpdateProjectRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.description, None);
+    }
+
+    #[test]
+    fn test_update_project_request_explicit_description() {
+        // Explicit string value -> Some(Some("..."))
+        let json = r#"{"description":"hello"}"#;
+        let req: UpdateProjectRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.description, Some(Some("hello".to_string())));
+    }
+
+    #[test]
+    fn test_update_project_request_only_name() {
+        let json = r#"{"name":"Renamed"}"#;
+        let req: UpdateProjectRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, Some("Renamed".to_string()));
+        assert_eq!(req.description, None);
+        assert_eq!(req.root_path, None);
     }
 }

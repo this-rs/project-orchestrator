@@ -219,6 +219,19 @@ pub async fn get_task(
     Ok(Json(details))
 }
 
+/// Delete a task and all its related data
+pub async fn delete_task(
+    State(state): State<OrchestratorState>,
+    Path(task_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .plan_manager()
+        .delete_task(task_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Update task status
 pub async fn update_task(
     State(state): State<OrchestratorState>,
@@ -350,6 +363,60 @@ pub async fn add_decision(
         .add_decision(task_id, req, "agent")
         .await?;
     Ok(Json(decision))
+}
+
+/// Get a single decision by ID
+pub async fn get_decision(
+    State(state): State<OrchestratorState>,
+    Path(decision_id): Path<Uuid>,
+) -> Result<Json<DecisionNode>, AppError> {
+    let decision = state
+        .orchestrator
+        .neo4j()
+        .get_decision(decision_id)
+        .await?
+        .ok_or(AppError::NotFound("Decision not found".into()))?;
+    Ok(Json(decision))
+}
+
+/// Request to update a decision
+#[derive(Deserialize)]
+pub struct UpdateDecisionRequest {
+    pub description: Option<String>,
+    pub rationale: Option<String>,
+    pub chosen_option: Option<String>,
+}
+
+/// Update a decision
+pub async fn update_decision(
+    State(state): State<OrchestratorState>,
+    Path(decision_id): Path<Uuid>,
+    Json(req): Json<UpdateDecisionRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .update_decision(
+            decision_id,
+            req.description,
+            req.rationale,
+            req.chosen_option,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete a decision
+pub async fn delete_decision(
+    State(state): State<OrchestratorState>,
+    Path(decision_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .delete_decision(decision_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Search decisions
@@ -539,6 +606,29 @@ pub async fn get_task_steps(
     Ok(Json(steps))
 }
 
+/// Get a single step by ID
+pub async fn get_step(
+    State(state): State<OrchestratorState>,
+    Path(step_id): Path<Uuid>,
+) -> Result<Json<StepNode>, AppError> {
+    let step = state
+        .orchestrator
+        .neo4j()
+        .get_step(step_id)
+        .await?
+        .ok_or(AppError::NotFound("Step not found".into()))?;
+    Ok(Json(step))
+}
+
+/// Delete a step
+pub async fn delete_step(
+    State(state): State<OrchestratorState>,
+    Path(step_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state.orchestrator.neo4j().delete_step(step_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Update a step
 pub async fn update_step(
     State(state): State<OrchestratorState>,
@@ -618,6 +708,47 @@ pub async fn get_plan_constraints(
         .get_plan_constraints(plan_id)
         .await?;
     Ok(Json(constraints))
+}
+
+/// Get a single constraint by ID
+pub async fn get_constraint(
+    State(state): State<OrchestratorState>,
+    Path(constraint_id): Path<Uuid>,
+) -> Result<Json<ConstraintNode>, AppError> {
+    let constraint = state
+        .orchestrator
+        .neo4j()
+        .get_constraint(constraint_id)
+        .await?
+        .ok_or(AppError::NotFound("Constraint not found".into()))?;
+    Ok(Json(constraint))
+}
+
+/// Request to update a constraint
+#[derive(Deserialize)]
+pub struct UpdateConstraintRequest {
+    pub description: Option<String>,
+    pub constraint_type: Option<crate::neo4j::models::ConstraintType>,
+    pub enforced_by: Option<String>,
+}
+
+/// Update a constraint
+pub async fn update_constraint(
+    State(state): State<OrchestratorState>,
+    Path(constraint_id): Path<Uuid>,
+    Json(req): Json<UpdateConstraintRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .update_constraint(
+            constraint_id,
+            req.description,
+            req.constraint_type,
+            req.enforced_by,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Delete a constraint
@@ -864,6 +995,19 @@ pub async fn update_release(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Delete a release
+pub async fn delete_release(
+    State(state): State<OrchestratorState>,
+    Path(release_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .delete_release(release_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Request to add a task to a release
 #[derive(Deserialize)]
 pub struct AddTaskToReleaseRequest {
@@ -1033,6 +1177,19 @@ pub async fn update_milestone(
             req.title,
             req.description,
         )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete a milestone
+pub async fn delete_milestone(
+    State(state): State<OrchestratorState>,
+    Path(milestone_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .delete_milestone(milestone_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1412,5 +1569,71 @@ impl IntoResponse for AppError {
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         AppError::Internal(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_decision_request_all_fields() {
+        let json = r#"{"description":"new desc","rationale":"new reason","chosen_option":"B"}"#;
+        let req: UpdateDecisionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.description, Some("new desc".to_string()));
+        assert_eq!(req.rationale, Some("new reason".to_string()));
+        assert_eq!(req.chosen_option, Some("B".to_string()));
+    }
+
+    #[test]
+    fn test_update_decision_request_partial() {
+        let json = r#"{"description":"only desc"}"#;
+        let req: UpdateDecisionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.description, Some("only desc".to_string()));
+        assert_eq!(req.rationale, None);
+        assert_eq!(req.chosen_option, None);
+    }
+
+    #[test]
+    fn test_update_decision_request_empty() {
+        let json = r#"{}"#;
+        let req: UpdateDecisionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.description, None);
+        assert_eq!(req.rationale, None);
+        assert_eq!(req.chosen_option, None);
+    }
+
+    #[test]
+    fn test_update_constraint_request_with_enum() {
+        let json = r#"{"constraint_type":"performance","description":"Must be fast"}"#;
+        let req: UpdateConstraintRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.constraint_type,
+            Some(crate::neo4j::models::ConstraintType::Performance)
+        );
+        assert_eq!(req.description, Some("Must be fast".to_string()));
+        assert_eq!(req.enforced_by, None);
+    }
+
+    #[test]
+    fn test_update_constraint_request_all_enum_variants() {
+        for variant in ["performance", "security", "style", "compatibility", "other"] {
+            let json = format!(r#"{{"constraint_type":"{}"}}"#, variant);
+            let req: UpdateConstraintRequest = serde_json::from_str(&json).unwrap();
+            assert!(
+                req.constraint_type.is_some(),
+                "Failed to parse constraint_type: {}",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_constraint_request_empty() {
+        let json = r#"{}"#;
+        let req: UpdateConstraintRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.description, None);
+        assert_eq!(req.constraint_type, None);
+        assert_eq!(req.enforced_by, None);
     }
 }

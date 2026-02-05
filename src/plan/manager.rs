@@ -311,6 +311,11 @@ impl PlanManager {
         Ok(())
     }
 
+    /// Delete a task and all its related data (steps, decisions)
+    pub async fn delete_task(&self, task_id: Uuid) -> Result<()> {
+        self.neo4j.delete_task(task_id).await
+    }
+
     /// Get next available task from a plan
     pub async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>> {
         self.neo4j.get_next_available_task(plan_id).await
