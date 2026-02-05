@@ -45,6 +45,8 @@ impl ToolHandler {
             "get_project_roadmap" => self.get_project_roadmap(args).await,
             "list_project_plans" => self.list_project_plans(args).await,
 
+            "update_project" => self.update_project(args).await,
+
             // Plans
             "list_plans" => self.list_plans(args).await,
             "create_plan" => self.create_plan(args).await,
@@ -61,6 +63,7 @@ impl ToolHandler {
             "create_task" => self.create_task(args).await,
             "get_task" => self.get_task(args).await,
             "update_task" => self.update_task(args).await,
+            "delete_task" => self.delete_task(args).await,
             "get_next_task" => self.get_next_task(args).await,
             "add_task_dependencies" => self.add_task_dependencies(args).await,
             "remove_task_dependency" => self.remove_task_dependency(args).await,
@@ -73,12 +76,16 @@ impl ToolHandler {
             // Steps
             "list_steps" => self.list_steps(args).await,
             "create_step" => self.create_step(args).await,
+            "get_step" => self.get_step(args).await,
+            "delete_step" => self.delete_step_handler(args).await,
             "update_step" => self.update_step(args).await,
             "get_step_progress" => self.get_step_progress(args).await,
 
             // Constraints
             "list_constraints" => self.list_constraints(args).await,
             "add_constraint" => self.add_constraint(args).await,
+            "get_constraint" => self.get_constraint(args).await,
+            "update_constraint" => self.update_constraint(args).await,
             "delete_constraint" => self.delete_constraint(args).await,
 
             // Releases
@@ -86,6 +93,7 @@ impl ToolHandler {
             "create_release" => self.create_release(args).await,
             "get_release" => self.get_release(args).await,
             "update_release" => self.update_release(args).await,
+            "delete_release" => self.delete_release(args).await,
             "add_task_to_release" => self.add_task_to_release(args).await,
             "add_commit_to_release" => self.add_commit_to_release(args).await,
 
@@ -94,6 +102,7 @@ impl ToolHandler {
             "create_milestone" => self.create_milestone(args).await,
             "get_milestone" => self.get_milestone(args).await,
             "update_milestone" => self.update_milestone(args).await,
+            "delete_milestone" => self.delete_milestone(args).await,
             "get_milestone_progress" => self.get_milestone_progress(args).await,
             "add_task_to_milestone" => self.add_task_to_milestone(args).await,
 
@@ -119,6 +128,9 @@ impl ToolHandler {
             "get_impl_blocks" => self.get_impl_blocks(args).await,
 
             // Decisions
+            "get_decision" => self.get_decision(args).await,
+            "update_decision" => self.update_decision(args).await,
+            "delete_decision" => self.delete_decision(args).await,
             "search_decisions" => self.search_decisions(args).await,
 
             // Sync
@@ -146,6 +158,9 @@ impl ToolHandler {
             "get_context_notes" => self.get_context_notes(args).await,
             "get_notes_needing_review" => self.get_notes_needing_review(args).await,
             "update_staleness_scores" => self.update_staleness_scores(args).await,
+            "list_project_notes" => self.list_project_notes(args).await,
+            "get_propagated_notes" => self.get_propagated_notes(args).await,
+            "get_entity_notes" => self.get_entity_notes(args).await,
 
             // Workspaces
             "list_workspaces" => self.list_workspaces(args).await,
@@ -171,6 +186,7 @@ impl ToolHandler {
             "list_resources" => self.list_resources(args).await,
             "create_resource" => self.create_resource(args).await,
             "get_resource" => self.get_resource(args).await,
+            "update_resource" => self.update_resource(args).await,
             "delete_resource" => self.delete_resource(args).await,
             "link_resource_to_project" => self.link_resource_to_project(args).await,
 
@@ -178,6 +194,7 @@ impl ToolHandler {
             "list_components" => self.list_components(args).await,
             "create_component" => self.create_component(args).await,
             "get_component" => self.get_component(args).await,
+            "update_component" => self.update_component(args).await,
             "delete_component" => self.delete_component(args).await,
             "add_component_dependency" => self.add_component_dependency(args).await,
             "remove_component_dependency" => self.remove_component_dependency(args).await,
@@ -258,6 +275,36 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
 
         Ok(serde_json::to_value(project)?)
+    }
+
+    async fn update_project(&self, args: Value) -> Result<Value> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"))?;
+
+        let project = self
+            .neo4j()
+            .get_project_by_slug(slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
+
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = args
+            .get("description")
+            .map(|v| v.as_str().map(|s| s.to_string()));
+        let root_path = args
+            .get("root_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        self.neo4j()
+            .update_project(project.id, name, description, root_path)
+            .await?;
+        Ok(json!({"updated": true}))
     }
 
     async fn delete_project(&self, args: Value) -> Result<Value> {
@@ -743,6 +790,15 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("Task not found"))?;
 
         Ok(serde_json::to_value(details)?)
+    }
+
+    async fn delete_task(&self, args: Value) -> Result<Value> {
+        let task_id = parse_uuid(&args, "task_id")?;
+        self.orchestrator
+            .plan_manager()
+            .delete_task(task_id)
+            .await?;
+        Ok(json!({"deleted": true}))
     }
 
     async fn update_task(&self, args: Value) -> Result<Value> {
@@ -2160,6 +2216,82 @@ impl ToolHandler {
         Ok(json!({"notes_updated": count}))
     }
 
+    async fn list_project_notes(&self, args: Value) -> Result<Value> {
+        let project_id = parse_uuid(&args, "project_id")?;
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+        let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        let filters = crate::notes::NoteFilters {
+            limit: Some(limit),
+            offset: Some(offset),
+            ..Default::default()
+        };
+
+        let (notes, total) = self
+            .orchestrator
+            .note_manager()
+            .list_project_notes(project_id, &filters)
+            .await?;
+
+        Ok(json!({
+            "items": notes,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn get_propagated_notes(&self, args: Value) -> Result<Value> {
+        let entity_type_str = args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_type is required"))?;
+        let entity_id = args
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_id is required"))?;
+        let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+        let min_score = args
+            .get("min_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.1);
+
+        let entity_type: crate::notes::EntityType = entity_type_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid entity type: {}", entity_type_str))?;
+
+        let notes = self
+            .orchestrator
+            .note_manager()
+            .get_propagated_notes(&entity_type, entity_id, max_depth, min_score)
+            .await?;
+
+        Ok(serde_json::to_value(notes)?)
+    }
+
+    async fn get_entity_notes(&self, args: Value) -> Result<Value> {
+        let entity_type_str = args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_type is required"))?;
+        let entity_id = args
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_id is required"))?;
+
+        let entity_type: crate::notes::EntityType = entity_type_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid entity type: {}", entity_type_str))?;
+
+        let notes = self
+            .orchestrator
+            .neo4j()
+            .get_notes_for_entity(&entity_type, entity_id)
+            .await?;
+
+        Ok(serde_json::to_value(notes)?)
+    }
+
     // ========================================================================
     // Workspace Handlers
     // ========================================================================
@@ -2905,6 +3037,163 @@ impl ToolHandler {
         let topology = self.neo4j().get_workspace_topology(workspace.id).await?;
         Ok(serde_json::to_value(topology)?)
     }
+
+    // ========================================================================
+    // Additional CRUD Handlers (get_step, delete_step, decisions, constraints,
+    // delete_release, delete_milestone, update_resource, update_component)
+    // ========================================================================
+
+    async fn get_step(&self, args: Value) -> Result<Value> {
+        let step_id = parse_uuid(&args, "step_id")?;
+        let step = self
+            .neo4j()
+            .get_step(step_id)
+            .await?
+            .ok_or_else(|| anyhow!("Step not found"))?;
+        Ok(serde_json::to_value(step)?)
+    }
+
+    async fn delete_step_handler(&self, args: Value) -> Result<Value> {
+        let step_id = parse_uuid(&args, "step_id")?;
+        self.neo4j().delete_step(step_id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn get_constraint(&self, args: Value) -> Result<Value> {
+        let constraint_id = parse_uuid(&args, "constraint_id")?;
+        let constraint = self
+            .neo4j()
+            .get_constraint(constraint_id)
+            .await?
+            .ok_or_else(|| anyhow!("Constraint not found"))?;
+        Ok(serde_json::to_value(constraint)?)
+    }
+
+    async fn update_constraint(&self, args: Value) -> Result<Value> {
+        let constraint_id = parse_uuid(&args, "constraint_id")?;
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let constraint_type = args
+            .get("constraint_type")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+        let enforced_by = args
+            .get("enforced_by")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        self.neo4j()
+            .update_constraint(constraint_id, description, constraint_type, enforced_by)
+            .await?;
+        Ok(json!({"updated": true}))
+    }
+
+    async fn delete_release(&self, args: Value) -> Result<Value> {
+        let release_id = parse_uuid(&args, "release_id")?;
+        self.neo4j().delete_release(release_id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn delete_milestone(&self, args: Value) -> Result<Value> {
+        let milestone_id = parse_uuid(&args, "milestone_id")?;
+        self.neo4j().delete_milestone(milestone_id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn get_decision(&self, args: Value) -> Result<Value> {
+        let decision_id = parse_uuid(&args, "decision_id")?;
+        let decision = self
+            .neo4j()
+            .get_decision(decision_id)
+            .await?
+            .ok_or_else(|| anyhow!("Decision not found"))?;
+        Ok(serde_json::to_value(decision)?)
+    }
+
+    async fn update_decision(&self, args: Value) -> Result<Value> {
+        let decision_id = parse_uuid(&args, "decision_id")?;
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let rationale = args
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let chosen_option = args
+            .get("chosen_option")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        self.neo4j()
+            .update_decision(decision_id, description, rationale, chosen_option)
+            .await?;
+        Ok(json!({"updated": true}))
+    }
+
+    async fn delete_decision(&self, args: Value) -> Result<Value> {
+        let decision_id = parse_uuid(&args, "decision_id")?;
+        self.neo4j().delete_decision(decision_id).await?;
+        Ok(json!({"deleted": true}))
+    }
+
+    async fn update_resource(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let file_path = args
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let version = args
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        self.neo4j()
+            .update_resource(id, name, file_path, url, version, description)
+            .await?;
+        Ok(json!({"updated": true}))
+    }
+
+    async fn update_component(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let runtime = args
+            .get("runtime")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let config = args.get("config").cloned();
+        let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        });
+
+        self.neo4j()
+            .update_component(id, name, description, runtime, config, tags)
+            .await?;
+        Ok(json!({"updated": true}))
+    }
 }
 
 // ============================================================================
@@ -3625,5 +3914,269 @@ mod tests {
 
         // Only strings are extracted
         assert_eq!(tags, vec!["valid", "another"]);
+    }
+
+    // ========================================================================
+    // New CRUD handler arg extraction tests
+    // ========================================================================
+
+    #[test]
+    fn test_update_project_args_extraction() {
+        let args = json!({
+            "slug": "my-project",
+            "name": "New Name",
+            "description": "New desc",
+            "root_path": "/new/path"
+        });
+
+        let slug = args.get("slug").and_then(|v| v.as_str());
+        assert_eq!(slug, Some("my-project"));
+
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(name, Some("New Name".to_string()));
+
+        let description = args
+            .get("description")
+            .map(|v| v.as_str().map(|s| s.to_string()));
+        assert_eq!(description, Some(Some("New desc".to_string())));
+
+        let root_path = args
+            .get("root_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(root_path, Some("/new/path".to_string()));
+    }
+
+    #[test]
+    fn test_update_project_args_partial() {
+        // Only slug, all others missing
+        let args = json!({"slug": "my-project"});
+
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(name, None);
+
+        let description = args
+            .get("description")
+            .map(|v| v.as_str().map(|s| s.to_string()));
+        assert_eq!(description, None);
+
+        let root_path = args
+            .get("root_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(root_path, None);
+    }
+
+    #[test]
+    fn test_update_project_args_null_description() {
+        // Explicit null description (to clear it)
+        let args = json!({
+            "slug": "my-project",
+            "description": null
+        });
+
+        let description = args
+            .get("description")
+            .map(|v| v.as_str().map(|s| s.to_string()));
+        // description key exists but value is null -> Some(None)
+        assert_eq!(description, Some(None));
+    }
+
+    #[test]
+    fn test_update_constraint_args_with_enum() {
+        let args = json!({
+            "constraint_id": "550e8400-e29b-41d4-a716-446655440000",
+            "description": "Must be fast",
+            "constraint_type": "performance",
+            "enforced_by": "benchmark"
+        });
+
+        let constraint_id = parse_uuid(&args, "constraint_id");
+        assert!(constraint_id.is_ok());
+
+        let constraint_type: Option<crate::neo4j::models::ConstraintType> = args
+            .get("constraint_type")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+        assert!(constraint_type.is_some());
+
+        let enforced_by = args
+            .get("enforced_by")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(enforced_by, Some("benchmark".to_string()));
+    }
+
+    #[test]
+    fn test_update_constraint_args_invalid_enum() {
+        let args = json!({
+            "constraint_id": "550e8400-e29b-41d4-a716-446655440000",
+            "constraint_type": "invalid_type"
+        });
+
+        let constraint_type: Option<crate::neo4j::models::ConstraintType> = args
+            .get("constraint_type")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+        // Invalid enum variant -> None (graceful)
+        assert!(constraint_type.is_none());
+    }
+
+    #[test]
+    fn test_update_decision_args_extraction() {
+        let args = json!({
+            "decision_id": "550e8400-e29b-41d4-a716-446655440000",
+            "description": "Updated desc",
+            "rationale": "New rationale",
+            "chosen_option": "Option B"
+        });
+
+        let decision_id = parse_uuid(&args, "decision_id");
+        assert!(decision_id.is_ok());
+
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(description, Some("Updated desc".to_string()));
+
+        let rationale = args
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(rationale, Some("New rationale".to_string()));
+
+        let chosen_option = args
+            .get("chosen_option")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(chosen_option, Some("Option B".to_string()));
+    }
+
+    #[test]
+    fn test_update_resource_args_extraction() {
+        let args = json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "API v2",
+            "file_path": "/api/v2.yaml",
+            "url": "https://example.com/api",
+            "version": "2.0.0",
+            "description": "Updated API contract"
+        });
+
+        let id = parse_uuid(&args, "id");
+        assert!(id.is_ok());
+
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(name, Some("API v2".to_string()));
+
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(url, Some("https://example.com/api".to_string()));
+
+        let version = args
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(version, Some("2.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_update_component_args_with_config_and_tags() {
+        let args = json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "Auth Service",
+            "runtime": "rust",
+            "config": {"port": 8080, "workers": 4},
+            "tags": ["auth", "core", "security"]
+        });
+
+        let id = parse_uuid(&args, "id");
+        assert!(id.is_ok());
+
+        let config = args.get("config").cloned();
+        assert!(config.is_some());
+        assert_eq!(config.as_ref().unwrap()["port"], 8080);
+
+        let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        });
+        assert_eq!(
+            tags,
+            Some(vec![
+                "auth".to_string(),
+                "core".to_string(),
+                "security".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_update_component_args_partial() {
+        let args = json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "New Name"
+        });
+
+        let config = args.get("config").cloned();
+        assert!(config.is_none());
+
+        let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        });
+        assert!(tags.is_none());
+
+        let runtime = args
+            .get("runtime")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert!(runtime.is_none());
+    }
+
+    #[test]
+    fn test_delete_handlers_uuid_parsing() {
+        // All delete handlers just need a valid UUID
+        let args = json!({"task_id": "550e8400-e29b-41d4-a716-446655440000"});
+        assert!(parse_uuid(&args, "task_id").is_ok());
+
+        let args = json!({"step_id": "550e8400-e29b-41d4-a716-446655440000"});
+        assert!(parse_uuid(&args, "step_id").is_ok());
+
+        let args = json!({"release_id": "550e8400-e29b-41d4-a716-446655440000"});
+        assert!(parse_uuid(&args, "release_id").is_ok());
+
+        let args = json!({"milestone_id": "550e8400-e29b-41d4-a716-446655440000"});
+        assert!(parse_uuid(&args, "milestone_id").is_ok());
+
+        let args = json!({"decision_id": "550e8400-e29b-41d4-a716-446655440000"});
+        assert!(parse_uuid(&args, "decision_id").is_ok());
+
+        let args = json!({"constraint_id": "550e8400-e29b-41d4-a716-446655440000"});
+        assert!(parse_uuid(&args, "constraint_id").is_ok());
+    }
+
+    #[test]
+    fn test_delete_handlers_missing_uuid() {
+        assert!(parse_uuid(&json!({}), "task_id").is_err());
+        assert!(parse_uuid(&json!({}), "step_id").is_err());
+        assert!(parse_uuid(&json!({}), "release_id").is_err());
+        assert!(parse_uuid(&json!({}), "milestone_id").is_err());
+        assert!(parse_uuid(&json!({}), "decision_id").is_err());
+        assert!(parse_uuid(&json!({}), "constraint_id").is_err());
     }
 }

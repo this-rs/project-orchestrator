@@ -354,6 +354,51 @@ impl Neo4jClient {
         Ok(projects)
     }
 
+    /// Update project fields (name, description, root_path)
+    pub async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        root_path: Option<String>,
+    ) -> Result<()> {
+        let mut set_clauses = vec![];
+
+        if name.is_some() {
+            set_clauses.push("p.name = $name");
+        }
+        if description.is_some() {
+            set_clauses.push("p.description = $description");
+        }
+        if root_path.is_some() {
+            set_clauses.push("p.root_path = $root_path");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        let cypher = format!(
+            "MATCH (p:Project {{id: $id}}) SET {}",
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher).param("id", id.to_string());
+
+        if let Some(name) = name {
+            q = q.param("name", name);
+        }
+        if let Some(desc) = description {
+            q = q.param("description", desc.unwrap_or_default());
+        }
+        if let Some(root_path) = root_path {
+            q = q.param("root_path", root_path);
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Update project last_synced timestamp
     pub async fn update_project_synced(&self, id: Uuid) -> Result<()> {
         let q = query(
@@ -1137,6 +1182,63 @@ impl Neo4jClient {
         Ok(resources)
     }
 
+    /// Update a resource
+    pub async fn update_resource(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        file_path: Option<String>,
+        url: Option<String>,
+        version: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        let mut set_clauses = vec![];
+        if name.is_some() {
+            set_clauses.push("r.name = $name");
+        }
+        if file_path.is_some() {
+            set_clauses.push("r.file_path = $file_path");
+        }
+        if url.is_some() {
+            set_clauses.push("r.url = $url");
+        }
+        if version.is_some() {
+            set_clauses.push("r.version = $version");
+        }
+        if description.is_some() {
+            set_clauses.push("r.description = $description");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        let cypher = format!(
+            "MATCH (r:Resource {{id: $id}}) SET {}",
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher).param("id", id.to_string());
+        if let Some(name) = name {
+            q = q.param("name", name);
+        }
+        if let Some(file_path) = file_path {
+            q = q.param("file_path", file_path);
+        }
+        if let Some(url) = url {
+            q = q.param("url", url);
+        }
+        if let Some(version) = version {
+            q = q.param("version", version);
+        }
+        if let Some(description) = description {
+            q = q.param("description", description);
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Delete a resource
     pub async fn delete_resource(&self, id: Uuid) -> Result<()> {
         let q = query(
@@ -1362,6 +1464,63 @@ impl Neo4jClient {
         }
 
         Ok(components)
+    }
+
+    /// Update a component
+    pub async fn update_component(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        runtime: Option<String>,
+        config: Option<serde_json::Value>,
+        tags: Option<Vec<String>>,
+    ) -> Result<()> {
+        let mut set_clauses = vec![];
+        if name.is_some() {
+            set_clauses.push("c.name = $name");
+        }
+        if description.is_some() {
+            set_clauses.push("c.description = $description");
+        }
+        if runtime.is_some() {
+            set_clauses.push("c.runtime = $runtime");
+        }
+        if config.is_some() {
+            set_clauses.push("c.config = $config");
+        }
+        if tags.is_some() {
+            set_clauses.push("c.tags = $tags");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        let cypher = format!(
+            "MATCH (c:Component {{id: $id}}) SET {}",
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher).param("id", id.to_string());
+        if let Some(name) = name {
+            q = q.param("name", name);
+        }
+        if let Some(description) = description {
+            q = q.param("description", description);
+        }
+        if let Some(runtime) = runtime {
+            q = q.param("runtime", runtime);
+        }
+        if let Some(config) = config {
+            q = q.param("config", config.to_string());
+        }
+        if let Some(tags) = tags {
+            q = q.param("tags", tags);
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
     }
 
     /// Delete a component
@@ -3351,6 +3510,51 @@ impl Neo4jClient {
         }
     }
 
+    /// Get a single step by ID
+    pub async fn get_step(&self, step_id: Uuid) -> Result<Option<StepNode>> {
+        let q = query(
+            r#"
+            MATCH (s:Step {id: $id})
+            RETURN s
+            "#,
+        )
+        .param("id", step_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            Ok(Some(StepNode {
+                id: node.get::<String>("id")?.parse()?,
+                order: node.get::<i64>("order")? as u32,
+                description: node.get("description")?,
+                status: serde_json::from_str(&format!(
+                    "\"{}\"",
+                    pascal_to_snake_case(&node.get::<String>("status")?)
+                ))
+                .unwrap_or(StepStatus::Pending),
+                verification: node
+                    .get::<String>("verification")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                created_at: node
+                    .get::<String>("created_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+                updated_at: node
+                    .get::<String>("updated_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                completed_at: node
+                    .get::<String>("completed_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Delete a step
     pub async fn delete_step(&self, step_id: Uuid) -> Result<()> {
         let q = query(
@@ -3436,6 +3640,80 @@ impl Neo4jClient {
         Ok(constraints)
     }
 
+    /// Get a single constraint by ID
+    pub async fn get_constraint(&self, constraint_id: Uuid) -> Result<Option<ConstraintNode>> {
+        let q = query(
+            r#"
+            MATCH (c:Constraint {id: $id})
+            RETURN c
+            "#,
+        )
+        .param("id", constraint_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("c")?;
+            Ok(Some(ConstraintNode {
+                id: node.get::<String>("id")?.parse()?,
+                constraint_type: serde_json::from_str(&format!(
+                    "\"{}\"",
+                    node.get::<String>("constraint_type")?.to_lowercase()
+                ))
+                .unwrap_or(ConstraintType::Other),
+                description: node.get("description")?,
+                enforced_by: node
+                    .get::<String>("enforced_by")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update a constraint
+    pub async fn update_constraint(
+        &self,
+        constraint_id: Uuid,
+        description: Option<String>,
+        constraint_type: Option<ConstraintType>,
+        enforced_by: Option<String>,
+    ) -> Result<()> {
+        let mut set_clauses = vec![];
+        if description.is_some() {
+            set_clauses.push("c.description = $description");
+        }
+        if constraint_type.is_some() {
+            set_clauses.push("c.constraint_type = $constraint_type");
+        }
+        if enforced_by.is_some() {
+            set_clauses.push("c.enforced_by = $enforced_by");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        let cypher = format!(
+            "MATCH (c:Constraint {{id: $id}}) SET {}",
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher).param("id", constraint_id.to_string());
+        if let Some(description) = description {
+            q = q.param("description", description);
+        }
+        if let Some(constraint_type) = constraint_type {
+            q = q.param("constraint_type", format!("{:?}", constraint_type));
+        }
+        if let Some(enforced_by) = enforced_by {
+            q = q.param("enforced_by", enforced_by);
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Delete a constraint
     pub async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()> {
         let q = query(
@@ -3482,6 +3760,83 @@ impl Neo4jClient {
         )
         .param("decided_by", decision.decided_by.clone())
         .param("decided_at", decision.decided_at.to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get a single decision by ID
+    pub async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>> {
+        let q = query(
+            r#"
+            MATCH (d:Decision {id: $id})
+            RETURN d
+            "#,
+        )
+        .param("id", decision_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            Ok(Some(DecisionNode {
+                id: node.get::<String>("id")?.parse()?,
+                description: node.get("description")?,
+                rationale: node.get("rationale")?,
+                alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
+                chosen_option: node
+                    .get::<String>("chosen_option")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
+                decided_at: node
+                    .get::<String>("decided_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update a decision
+    pub async fn update_decision(
+        &self,
+        decision_id: Uuid,
+        description: Option<String>,
+        rationale: Option<String>,
+        chosen_option: Option<String>,
+    ) -> Result<()> {
+        let mut set_clauses = vec![];
+        if description.is_some() {
+            set_clauses.push("d.description = $description");
+        }
+        if rationale.is_some() {
+            set_clauses.push("d.rationale = $rationale");
+        }
+        if chosen_option.is_some() {
+            set_clauses.push("d.chosen_option = $chosen_option");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        let cypher = format!(
+            "MATCH (d:Decision {{id: $id}}) SET {}",
+            set_clauses.join(", ")
+        );
+
+        let mut q = query(&cypher).param("id", decision_id.to_string());
+        if let Some(description) = description {
+            q = q.param("description", description);
+        }
+        if let Some(rationale) = rationale {
+            q = q.param("rationale", rationale);
+        }
+        if let Some(chosen_option) = chosen_option {
+            q = q.param("chosen_option", chosen_option);
+        }
 
         self.graph.run(q).await?;
         Ok(())
