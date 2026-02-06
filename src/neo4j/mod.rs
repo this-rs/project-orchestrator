@@ -8,3 +8,6 @@ pub mod traits;
 pub use client::Neo4jClient;
 pub use models::*;
 pub use traits::GraphStore;
+
+#[cfg(test)]
+pub(crate) mod mock;

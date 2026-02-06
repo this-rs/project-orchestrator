@@ -16,6 +16,9 @@ pub mod orchestrator;
 pub mod parser;
 pub mod plan;
 
+#[cfg(test)]
+pub(crate) mod test_helpers;
+
 use anyhow::Result;
 use std::sync::Arc;
 
