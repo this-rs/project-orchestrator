@@ -148,6 +148,7 @@ fn plan_tools() -> Vec<ToolDefinition> {
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Filter by project UUID"},
                     "status": {"type": "string", "description": "Filter by status (comma-separated: draft,approved,in_progress,completed,cancelled)"},
                     "priority_min": {"type": "integer", "description": "Minimum priority"},
                     "priority_max": {"type": "integer", "description": "Maximum priority"},
@@ -1409,7 +1410,7 @@ fn note_tools() -> Vec<ToolDefinition> {
 }
 
 // ============================================================================
-// Workspace Tools (29)
+// Workspace Tools (30)
 // ============================================================================
 
 fn workspace_tools() -> Vec<ToolDefinition> {
@@ -1531,7 +1532,21 @@ fn workspace_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["slug".to_string(), "project_id".to_string()]),
             },
         },
-        // --- Workspace Milestones (6) ---
+        // --- Workspace Milestones (7) ---
+        ToolDefinition {
+            name: "list_all_workspace_milestones".to_string(),
+            description: "List all workspace milestones across all workspaces with optional filters and pagination".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "workspace_id": {"type": "string", "description": "Filter by workspace UUID"},
+                    "status": {"type": "string", "description": "Filter by status (open, closed)"},
+                    "limit": {"type": "integer", "description": "Max items (default 50)"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: None,
+            },
+        },
         ToolDefinition {
             name: "list_workspace_milestones".to_string(),
             description: "List milestones for a workspace (cross-project milestones)".to_string(),
@@ -1853,7 +1868,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 130, "Expected 130 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 131, "Expected 131 tools, got {}", tools.len());
     }
 
     #[test]
@@ -1881,8 +1896,8 @@ mod tests {
         let tools = workspace_tools();
         assert_eq!(
             tools.len(),
-            31,
-            "Expected 31 workspace tools, got {}",
+            32,
+            "Expected 32 workspace tools, got {}",
             tools.len()
         );
     }

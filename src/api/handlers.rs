@@ -63,6 +63,8 @@ pub struct PlansListQuery {
     pub priority_filter: PriorityFilter,
     #[serde(flatten)]
     pub search_filter: SearchFilter,
+    /// Filter by project UUID
+    pub project_id: Option<String>,
 }
 
 /// List all plans with optional pagination and filters
@@ -72,10 +74,21 @@ pub async fn list_plans(
 ) -> Result<Json<PaginatedResponse<PlanNode>>, AppError> {
     query.pagination.validate().map_err(AppError::BadRequest)?;
 
+    let project_id = query
+        .project_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            uuid::Uuid::parse_str(s)
+                .map_err(|_| AppError::BadRequest("Invalid project_id UUID".to_string()))
+        })
+        .transpose()?;
+
     let (plans, total) = state
         .orchestrator
         .neo4j()
         .list_plans_filtered(
+            project_id,
             query.status_filter.to_vec(),
             query.priority_filter.priority_min,
             query.priority_filter.priority_max,
@@ -1635,5 +1648,40 @@ mod tests {
         assert_eq!(req.description, None);
         assert_eq!(req.constraint_type, None);
         assert_eq!(req.enforced_by, None);
+    }
+
+    #[test]
+    fn test_plans_list_query_defaults() {
+        let json = r#"{}"#;
+        let query: PlansListQuery = serde_json::from_str(json).unwrap();
+        assert!(query.project_id.is_none());
+        assert!(query.status_filter.status.is_none());
+        assert!(query.search_filter.search.is_none());
+    }
+
+    #[test]
+    fn test_plans_list_query_with_project_id() {
+        let json = r#"{"project_id":"e83b0663-9600-450d-9f63-234e857394df"}"#;
+        let query: PlansListQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            query.project_id,
+            Some("e83b0663-9600-450d-9f63-234e857394df".to_string())
+        );
+    }
+
+    #[test]
+    fn test_plans_list_query_with_all_filters() {
+        let json = r#"{"project_id":"e83b0663-9600-450d-9f63-234e857394df","status":"draft,in_progress","priority_min":"5","search":"auth"}"#;
+        let query: PlansListQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            query.project_id,
+            Some("e83b0663-9600-450d-9f63-234e857394df".to_string())
+        );
+        assert_eq!(
+            query.status_filter.status,
+            Some("draft,in_progress".to_string())
+        );
+        assert_eq!(query.priority_filter.priority_min, Some(5));
+        assert_eq!(query.search_filter.search, Some("auth".to_string()));
     }
 }
