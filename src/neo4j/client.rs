@@ -5,6 +5,7 @@ use crate::notes::{
     EntityType, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance, NoteScope, NoteStatus,
     NoteType, PropagatedNote,
 };
+use crate::plan::models::TaskDetails;
 use anyhow::{Context, Result};
 use neo4rs::{query, Graph, Query};
 use std::sync::Arc;
@@ -243,8 +244,8 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// Execute a raw Cypher query
-    pub async fn execute(&self, cypher: &str) -> Result<Vec<neo4rs::Row>> {
+    /// Execute a raw Cypher query (internal use only)
+    pub(crate) async fn execute(&self, cypher: &str) -> Result<Vec<neo4rs::Row>> {
         let mut result = self.graph.execute(query(cypher)).await?;
         let mut rows = Vec::new();
         while let Some(row) = result.next().await? {
@@ -253,8 +254,8 @@ impl Neo4jClient {
         Ok(rows)
     }
 
-    /// Execute a parameterized Cypher query
-    pub async fn execute_with_params(&self, q: Query) -> Result<Vec<neo4rs::Row>> {
+    /// Execute a parameterized Cypher query (internal use only)
+    pub(crate) async fn execute_with_params(&self, q: Query) -> Result<Vec<neo4rs::Row>> {
         let mut result = self.graph.execute(q).await?;
         let mut rows = Vec::new();
         while let Some(row) = result.next().await? {
@@ -2711,6 +2712,588 @@ impl Neo4jClient {
     }
 
     // ========================================================================
+    // Code exploration queries (encapsulated from handlers)
+    // ========================================================================
+
+    /// Get the language of a file by path
+    pub async fn get_file_language(&self, path: &str) -> Result<Option<String>> {
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})
+            RETURN f.language AS language
+            "#,
+        )
+        .param("path", path);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get("language").ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get function summaries for a file
+    pub async fn get_file_functions_summary(&self, path: &str) -> Result<Vec<FunctionSummaryNode>> {
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})-[:CONTAINS]->(func:Function)
+            RETURN func
+            ORDER BY func.line_start
+            "#,
+        )
+        .param("path", path);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut functions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("func")?;
+            let name: String = node.get("name")?;
+            let is_async: bool = node.get("is_async").unwrap_or(false);
+            let visibility: String = node.get("visibility").unwrap_or_default();
+            let is_public = visibility == "public";
+            let line: i64 = node.get("line_start").unwrap_or(0);
+            let complexity: i64 = node.get("complexity").unwrap_or(1);
+            let docstring: Option<String> = node.get("docstring").ok();
+            let params: Vec<String> = node.get("params").unwrap_or_default();
+            let return_type: String = node.get("return_type").unwrap_or_default();
+            let async_prefix = if is_async { "async " } else { "" };
+            let signature = format!(
+                "{}fn {}({}){}",
+                async_prefix,
+                name,
+                params.join(", "),
+                if return_type.is_empty() {
+                    String::new()
+                } else {
+                    format!(" -> {}", return_type)
+                }
+            );
+
+            functions.push(FunctionSummaryNode {
+                name,
+                signature,
+                line: line as u32,
+                is_async,
+                is_public,
+                complexity: complexity as u32,
+                docstring,
+            });
+        }
+
+        Ok(functions)
+    }
+
+    /// Get struct summaries for a file
+    pub async fn get_file_structs_summary(&self, path: &str) -> Result<Vec<StructSummaryNode>> {
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})-[:CONTAINS]->(s:Struct)
+            RETURN s
+            ORDER BY s.line_start
+            "#,
+        )
+        .param("path", path);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut structs = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            let name: String = node.get("name")?;
+            let visibility: String = node.get("visibility").unwrap_or_default();
+            let is_public = visibility == "public";
+            let line: i64 = node.get("line_start").unwrap_or(0);
+            let docstring: Option<String> = node.get("docstring").ok();
+
+            structs.push(StructSummaryNode {
+                name,
+                line: line as u32,
+                is_public,
+                docstring,
+            });
+        }
+
+        Ok(structs)
+    }
+
+    /// Get import paths for a file
+    pub async fn get_file_import_paths_list(&self, path: &str) -> Result<Vec<String>> {
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})-[:CONTAINS]->(i:Import)
+            RETURN i.path AS path
+            ORDER BY i.line
+            "#,
+        )
+        .param("path", path);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut imports = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(p) = row.get::<String>("path") {
+                imports.push(p);
+            }
+        }
+
+        Ok(imports)
+    }
+
+    /// Find references to a symbol (function callers, struct importers, file importers)
+    pub async fn find_symbol_references(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolReferenceNode>> {
+        let mut references = Vec::new();
+        let limit_i64 = limit as i64;
+
+        // Find function callers
+        let q = query(
+            r#"
+            MATCH (f:Function {name: $name})
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+            WHERE caller IS NOT NULL
+            RETURN 'call' AS ref_type,
+                   caller.file_path AS file_path,
+                   caller.line_start AS line,
+                   caller.name AS context
+            LIMIT $limit
+            "#,
+        )
+        .param("name", symbol)
+        .param("limit", limit_i64);
+
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            if let (Ok(file_path), Ok(line), Ok(context)) = (
+                row.get::<String>("file_path"),
+                row.get::<i64>("line"),
+                row.get::<String>("context"),
+            ) {
+                references.push(SymbolReferenceNode {
+                    file_path,
+                    line: line as u32,
+                    context: format!("called from {}", context),
+                    reference_type: "call".to_string(),
+                });
+            }
+        }
+
+        // Find struct import usages
+        let q = query(
+            r#"
+            MATCH (s:Struct {name: $name})
+            OPTIONAL MATCH (i:Import)-[:IMPORTS_SYMBOL]->(s)
+            WHERE i IS NOT NULL
+            RETURN 'import' AS ref_type,
+                   i.file_path AS file_path,
+                   i.line AS line,
+                   i.path AS context
+            LIMIT $limit
+            "#,
+        )
+        .param("name", symbol)
+        .param("limit", limit_i64);
+
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            if let (Ok(file_path), Ok(line), Ok(context)) = (
+                row.get::<String>("file_path"),
+                row.get::<i64>("line"),
+                row.get::<String>("context"),
+            ) {
+                references.push(SymbolReferenceNode {
+                    file_path,
+                    line: line as u32,
+                    context: format!("imported via {}", context),
+                    reference_type: "import".to_string(),
+                });
+            }
+        }
+
+        // Find files importing the symbol's module
+        let q = query(
+            r#"
+            MATCH (s {name: $name})
+            WHERE s:Function OR s:Struct OR s:Trait OR s:Enum
+            MATCH (f:File {path: s.file_path})
+            OPTIONAL MATCH (importer:File)-[:IMPORTS]->(f)
+            WHERE importer IS NOT NULL
+            RETURN 'file_import' AS ref_type,
+                   importer.path AS file_path,
+                   0 AS line,
+                   f.path AS context
+            LIMIT $limit
+            "#,
+        )
+        .param("name", symbol)
+        .param("limit", limit_i64);
+
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            if let (Ok(file_path), Ok(context)) =
+                (row.get::<String>("file_path"), row.get::<String>("context"))
+            {
+                references.push(SymbolReferenceNode {
+                    file_path,
+                    line: 0,
+                    context: format!("imports module {}", context),
+                    reference_type: "file_import".to_string(),
+                });
+            }
+        }
+
+        Ok(references)
+    }
+
+    /// Get files directly imported by a file
+    pub async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>> {
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})-[:IMPORTS]->(imported:File)
+            RETURN imported.path AS path, imported.language AS language
+            "#,
+        )
+        .param("path", path);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut imports = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(p) = row.get::<String>("path") {
+                imports.push(FileImportNode {
+                    path: p,
+                    language: row.get("language").unwrap_or_default(),
+                });
+            }
+        }
+
+        Ok(imports)
+    }
+
+    /// Get callers chain for a function name (by name, variable depth)
+    pub async fn get_function_callers_by_name(
+        &self,
+        function_name: &str,
+        depth: u32,
+    ) -> Result<Vec<String>> {
+        let q = query(&format!(
+            r#"
+            MATCH (f:Function {{name: $name}})
+            MATCH (caller:Function)-[:CALLS*1..{}]->(f)
+            RETURN DISTINCT caller.name AS name, caller.file_path AS file
+            "#,
+            depth
+        ))
+        .param("name", function_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut callers = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(name) = row.get::<String>("name") {
+                callers.push(name);
+            }
+        }
+
+        Ok(callers)
+    }
+
+    /// Get callees chain for a function name (by name, variable depth)
+    pub async fn get_function_callees_by_name(
+        &self,
+        function_name: &str,
+        depth: u32,
+    ) -> Result<Vec<String>> {
+        let q = query(&format!(
+            r#"
+            MATCH (f:Function {{name: $name}})
+            MATCH (f)-[:CALLS*1..{}]->(callee:Function)
+            RETURN DISTINCT callee.name AS name, callee.file_path AS file
+            "#,
+            depth
+        ))
+        .param("name", function_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut callees = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(name) = row.get::<String>("name") {
+                callees.push(name);
+            }
+        }
+
+        Ok(callees)
+    }
+
+    /// Get language statistics across all files
+    pub async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>> {
+        let q = query(
+            r#"
+            MATCH (f:File)
+            RETURN f.language AS language, count(f) AS count
+            ORDER BY count DESC
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut stats = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(language), Ok(count)) =
+                (row.get::<String>("language"), row.get::<i64>("count"))
+            {
+                stats.push(LanguageStatsNode {
+                    language,
+                    file_count: count as usize,
+                });
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Get most connected files (highest in-degree from imports)
+    pub async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>> {
+        let q = query(
+            r#"
+            MATCH (f:File)<-[:IMPORTS]-(importer:File)
+            RETURN f.path AS path, count(importer) AS imports
+            ORDER BY imports DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut paths = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(path) = row.get::<String>("path") {
+                paths.push(path);
+            }
+        }
+
+        Ok(paths)
+    }
+
+    /// Get most connected files with import/dependent counts
+    pub async fn get_most_connected_files_detailed(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>> {
+        let q = query(
+            r#"
+            MATCH (f:File)
+            OPTIONAL MATCH (f)-[:IMPORTS]->(imported:File)
+            OPTIONAL MATCH (dependent:File)-[:IMPORTS]->(f)
+            WITH f, count(DISTINCT imported) AS imports, count(DISTINCT dependent) AS dependents
+            RETURN f.path AS path, imports, dependents, imports + dependents AS connections
+            ORDER BY connections DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut files = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(path) = row.get::<String>("path") {
+                files.push(ConnectedFileNode {
+                    path,
+                    imports: row.get("imports").unwrap_or(0),
+                    dependents: row.get("dependents").unwrap_or(0),
+                });
+            }
+        }
+
+        Ok(files)
+    }
+
+    /// Get aggregated symbol names for a file (functions, structs, traits, enums)
+    pub async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})
+            OPTIONAL MATCH (f)-[:CONTAINS]->(func:Function)
+            OPTIONAL MATCH (f)-[:CONTAINS]->(st:Struct)
+            OPTIONAL MATCH (f)-[:CONTAINS]->(tr:Trait)
+            OPTIONAL MATCH (f)-[:CONTAINS]->(en:Enum)
+            RETURN
+                collect(DISTINCT func.name) AS functions,
+                collect(DISTINCT st.name) AS structs,
+                collect(DISTINCT tr.name) AS traits,
+                collect(DISTINCT en.name) AS enums
+            "#,
+        )
+        .param("path", path);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(FileSymbolNamesNode {
+                functions: row.get("functions").unwrap_or_default(),
+                structs: row.get("structs").unwrap_or_default(),
+                traits: row.get("traits").unwrap_or_default(),
+                enums: row.get("enums").unwrap_or_default(),
+            })
+        } else {
+            anyhow::bail!("File not found: {}", path)
+        }
+    }
+
+    /// Get the number of callers for a function by name
+    pub async fn get_function_caller_count(&self, function_name: &str) -> Result<i64> {
+        let q = query(
+            r#"
+            MATCH (f:Function {name: $name})
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+            RETURN count(caller) AS caller_count
+            "#,
+        )
+        .param("name", function_name);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get("caller_count").unwrap_or(0))
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get trait info (is_external, source)
+    pub async fn get_trait_info(&self, trait_name: &str) -> Result<Option<TraitInfoNode>> {
+        let q = query(
+            r#"
+            MATCH (t:Trait {name: $trait_name})
+            RETURN t.is_external AS is_external, t.source AS source
+            LIMIT 1
+            "#,
+        )
+        .param("trait_name", trait_name);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(Some(TraitInfoNode {
+                is_external: row.get("is_external").unwrap_or(false),
+                source: row.get("source").ok(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get trait implementors with file locations
+    pub async fn get_trait_implementors_detailed(
+        &self,
+        trait_name: &str,
+    ) -> Result<Vec<TraitImplementorNode>> {
+        let q = query(
+            r#"
+            MATCH (i:Impl)-[:IMPLEMENTS_TRAIT]->(t:Trait {name: $trait_name})
+            MATCH (i)-[:IMPLEMENTS_FOR]->(type)
+            RETURN type.name AS type_name, i.file_path AS file_path, i.line_start AS line
+            "#,
+        )
+        .param("trait_name", trait_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut implementors = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(type_name), Ok(file_path)) = (
+                row.get::<String>("type_name"),
+                row.get::<String>("file_path"),
+            ) {
+                implementors.push(TraitImplementorNode {
+                    type_name,
+                    file_path,
+                    line: row.get::<i64>("line").unwrap_or(0) as u32,
+                });
+            }
+        }
+
+        Ok(implementors)
+    }
+
+    /// Get all traits implemented by a type, with details
+    pub async fn get_type_trait_implementations(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<TypeTraitInfoNode>> {
+        let q = query(
+            r#"
+            MATCH (type {name: $type_name})<-[:IMPLEMENTS_FOR]-(i:Impl)
+            OPTIONAL MATCH (i)-[:IMPLEMENTS_TRAIT]->(t:Trait)
+            RETURN t.name AS trait_name,
+                   t.full_path AS full_path,
+                   t.file_path AS file_path,
+                   t.is_external AS is_external,
+                   t.source AS source
+            "#,
+        )
+        .param("type_name", type_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut traits = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(name) = row.get::<String>("trait_name") {
+                traits.push(TypeTraitInfoNode {
+                    name,
+                    full_path: row.get("full_path").ok(),
+                    file_path: row.get::<String>("file_path").unwrap_or_default(),
+                    is_external: row.get("is_external").unwrap_or(false),
+                    source: row.get("source").ok(),
+                });
+            }
+        }
+
+        Ok(traits)
+    }
+
+    /// Get all impl blocks for a type with methods
+    pub async fn get_type_impl_blocks_detailed(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<ImplBlockDetailNode>> {
+        let q = query(
+            r#"
+            MATCH (type {name: $type_name})<-[:IMPLEMENTS_FOR]-(i:Impl)
+            OPTIONAL MATCH (i:Impl)-[:IMPLEMENTS_TRAIT]->(t:Trait)
+            OPTIONAL MATCH (f:File {path: i.file_path})-[:CONTAINS]->(func:Function)
+            WHERE func.line_start >= i.line_start AND func.line_end <= i.line_end
+            RETURN i.file_path AS file_path, i.line_start AS line_start, i.line_end AS line_end,
+                   i.trait_name AS trait_name, collect(func.name) AS methods
+            "#,
+        )
+        .param("type_name", type_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut blocks = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(file_path) = row.get::<String>("file_path") {
+                let trait_name: Option<String> = row.get("trait_name").ok();
+                let trait_name = trait_name.filter(|s| !s.is_empty());
+                blocks.push(ImplBlockDetailNode {
+                    file_path,
+                    line_start: row.get::<i64>("line_start").unwrap_or(0) as u32,
+                    line_end: row.get::<i64>("line_end").unwrap_or(0) as u32,
+                    trait_name,
+                    methods: row.get("methods").unwrap_or_default(),
+                });
+            }
+        }
+
+        Ok(blocks)
+    }
+
+    // ========================================================================
     // Plan operations
     // ========================================================================
 
@@ -3144,6 +3727,178 @@ impl Neo4jClient {
                 .ok()
                 .and_then(|s| s.parse().ok()),
         })
+    }
+
+    /// Convert a Neo4j Node to a StepNode
+    fn node_to_step(&self, node: &neo4rs::Node) -> Option<StepNode> {
+        Some(StepNode {
+            id: node.get::<String>("id").ok()?.parse().ok()?,
+            order: node.get::<i64>("order").ok()? as u32,
+            description: node.get::<String>("description").ok()?,
+            status: node
+                .get::<String>("status")
+                .ok()
+                .and_then(|s| serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok())
+                .unwrap_or(StepStatus::Pending),
+            verification: node
+                .get::<String>("verification")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            created_at: node
+                .get::<String>("created_at")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(chrono::Utc::now),
+            updated_at: node
+                .get::<String>("updated_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            completed_at: node
+                .get::<String>("completed_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+        })
+    }
+
+    /// Convert a Neo4j Node to a DecisionNode
+    fn node_to_decision(&self, node: &neo4rs::Node) -> Option<DecisionNode> {
+        Some(DecisionNode {
+            id: node.get::<String>("id").ok()?.parse().ok()?,
+            description: node.get::<String>("description").ok()?,
+            rationale: node.get::<String>("rationale").ok()?,
+            alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
+            chosen_option: node
+                .get::<String>("chosen_option")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
+            decided_at: node
+                .get::<String>("decided_at")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(chrono::Utc::now),
+        })
+    }
+
+    /// Get full task details including steps, decisions, dependencies, and modified files
+    pub async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})
+            OPTIONAL MATCH (t)-[:HAS_STEP]->(s:Step)
+            OPTIONAL MATCH (t)-[:INFORMED_BY]->(d:Decision)
+            OPTIONAL MATCH (t)-[:DEPENDS_ON]->(dep:Task)
+            OPTIONAL MATCH (t)-[:MODIFIES]->(f:File)
+            RETURN t,
+                   collect(DISTINCT s) AS steps,
+                   collect(DISTINCT d) AS decisions,
+                   collect(DISTINCT dep.id) AS depends_on,
+                   collect(DISTINCT f.path) AS files
+            "#,
+        )
+        .param("id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        let row = match result.next().await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let task_node: neo4rs::Node = row.get("t")?;
+        let task = self.node_to_task(&task_node)?;
+
+        // Parse steps
+        let step_nodes: Vec<neo4rs::Node> = row.get("steps").unwrap_or_default();
+        let mut steps: Vec<StepNode> = step_nodes
+            .iter()
+            .filter_map(|n| self.node_to_step(n))
+            .collect();
+        steps.sort_by_key(|s| s.order);
+
+        // Parse decisions
+        let decision_nodes: Vec<neo4rs::Node> = row.get("decisions").unwrap_or_default();
+        let decisions: Vec<DecisionNode> = decision_nodes
+            .iter()
+            .filter_map(|n| self.node_to_decision(n))
+            .collect();
+
+        // Parse dependencies
+        let depends_on_strs: Vec<String> = row.get("depends_on").unwrap_or_default();
+        let depends_on: Vec<Uuid> = depends_on_strs
+            .into_iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        let modifies_files: Vec<String> = row.get("files").unwrap_or_default();
+
+        Ok(Some(TaskDetails {
+            task,
+            steps,
+            decisions,
+            depends_on,
+            modifies_files,
+        }))
+    }
+
+    /// Analyze the impact of a task on the codebase (files it modifies + their dependents)
+    pub async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})-[:MODIFIES]->(f:File)
+            OPTIONAL MATCH (f)<-[:IMPORTS*1..3]-(dependent:File)
+            RETURN f.path AS file, collect(DISTINCT dependent.path) AS dependents
+            "#,
+        )
+        .param("id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut impacted = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let file: String = row.get("file")?;
+            impacted.push(file);
+            let dependents: Vec<String> = row.get("dependents").unwrap_or_default();
+            impacted.extend(dependents);
+        }
+
+        impacted.sort();
+        impacted.dedup();
+        Ok(impacted)
+    }
+
+    /// Find pending tasks in a plan that are blocked by uncompleted dependencies
+    pub async fn find_blocked_tasks(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $plan_id})-[:HAS_TASK]->(t:Task {status: 'Pending'})
+            MATCH (t)-[:DEPENDS_ON]->(blocker:Task)
+            WHERE blocker.status <> 'Completed'
+            RETURN t, collect(blocker) AS blockers
+            "#,
+        )
+        .param("plan_id", plan_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut blocked = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let task_node: neo4rs::Node = row.get("t")?;
+            let task = self.node_to_task(&task_node)?;
+
+            let blocker_nodes: Vec<neo4rs::Node> = row.get("blockers").unwrap_or_default();
+            let blockers: Vec<TaskNode> = blocker_nodes
+                .iter()
+                .filter_map(|n| self.node_to_task(n).ok())
+                .collect();
+
+            blocked.push((task, blockers));
+        }
+
+        Ok(blocked)
     }
 
     /// Update task status

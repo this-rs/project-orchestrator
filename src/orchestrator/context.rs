@@ -1,8 +1,8 @@
 //! Context builder for agent tasks
 
-use crate::meilisearch::client::MeiliClient;
-use crate::neo4j::client::Neo4jClient;
+use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
+use crate::neo4j::GraphStore;
 use crate::notes::{EntityType, Note, NoteManager};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 /// Builder for creating rich agent context
 pub struct ContextBuilder {
-    neo4j: Arc<Neo4jClient>,
-    meili: Arc<MeiliClient>,
+    neo4j: Arc<dyn GraphStore>,
+    meili: Arc<dyn SearchStore>,
     plan_manager: Arc<PlanManager>,
     note_manager: Arc<NoteManager>,
 }
@@ -21,11 +21,11 @@ pub struct ContextBuilder {
 impl ContextBuilder {
     /// Create a new context builder
     pub fn new(
-        neo4j: Arc<Neo4jClient>,
-        meili: Arc<MeiliClient>,
+        neo4j: Arc<dyn GraphStore>,
+        meili: Arc<dyn SearchStore>,
         plan_manager: Arc<PlanManager>,
+        note_manager: Arc<NoteManager>,
     ) -> Self {
-        let note_manager = Arc::new(NoteManager::new(neo4j.clone(), meili.clone()));
         Self {
             neo4j,
             meili,
@@ -196,40 +196,19 @@ impl ContextBuilder {
 
     /// Get symbols defined in a file
     async fn get_file_symbols(&self, file_path: &str) -> Result<Vec<String>> {
-        let q = neo4rs::query(
-            r#"
-            MATCH (f:File {path: $path})-[:CONTAINS]->(entity)
-            RETURN entity.name AS name
-            "#,
-        )
-        .param("path", file_path);
-
-        let rows = self.neo4j.execute_with_params(q).await?;
-        let symbols: Vec<String> = rows
-            .into_iter()
-            .filter_map(|r| r.get("name").ok())
-            .collect();
-
+        let names = self.neo4j.get_file_symbol_names(file_path).await?;
+        let mut symbols = Vec::new();
+        symbols.extend(names.functions);
+        symbols.extend(names.structs);
+        symbols.extend(names.traits);
+        symbols.extend(names.enums);
         Ok(symbols)
     }
 
     /// Get imports for a file
     async fn get_file_imports(&self, file_path: &str) -> Result<Vec<String>> {
-        let q = neo4rs::query(
-            r#"
-            MATCH (f:File {path: $path})-[:IMPORTS]->(imported:File)
-            RETURN imported.path AS path
-            "#,
-        )
-        .param("path", file_path);
-
-        let rows = self.neo4j.execute_with_params(q).await?;
-        let imports: Vec<String> = rows
-            .into_iter()
-            .filter_map(|r| r.get("path").ok())
-            .collect();
-
-        Ok(imports)
+        let imports = self.neo4j.get_file_direct_imports(file_path).await?;
+        Ok(imports.into_iter().map(|i| i.path).collect())
     }
 
     /// Search for similar code using Meilisearch

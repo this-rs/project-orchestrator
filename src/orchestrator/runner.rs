@@ -31,14 +31,16 @@ impl Orchestrator {
     pub async fn new(state: AppState) -> Result<Self> {
         let plan_manager = Arc::new(PlanManager::new(state.neo4j.clone(), state.meili.clone()));
 
+        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
+
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
             state.meili.clone(),
             plan_manager.clone(),
+            note_manager.clone(),
         ));
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
-        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
 
         Ok(Self {
@@ -61,14 +63,14 @@ impl Orchestrator {
         &self.context_builder
     }
 
-    /// Get the Neo4j client
-    pub fn neo4j(&self) -> &crate::neo4j::client::Neo4jClient {
-        &self.state.neo4j
+    /// Get the graph store
+    pub fn neo4j(&self) -> &dyn crate::neo4j::GraphStore {
+        self.state.neo4j.as_ref()
     }
 
-    /// Get the Meilisearch client
-    pub fn meili(&self) -> &crate::meilisearch::client::MeiliClient {
-        &self.state.meili
+    /// Get the search store
+    pub fn meili(&self) -> &dyn crate::meilisearch::SearchStore {
+        self.state.meili.as_ref()
     }
 
     /// Get the note manager

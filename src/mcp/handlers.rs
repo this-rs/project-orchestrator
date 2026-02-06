@@ -2,13 +2,12 @@
 //!
 //! Implements the actual logic for each MCP tool.
 
-use crate::meilisearch::MeiliClient;
+use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
-use crate::neo4j::Neo4jClient;
+use crate::neo4j::GraphStore;
 use crate::orchestrator::Orchestrator;
 use crate::plan::models::*;
 use anyhow::{anyhow, Result};
-use neo4rs;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -23,11 +22,11 @@ impl ToolHandler {
         Self { orchestrator }
     }
 
-    fn neo4j(&self) -> &Neo4jClient {
+    fn neo4j(&self) -> &dyn GraphStore {
         self.orchestrator.neo4j()
     }
 
-    fn meili(&self) -> &MeiliClient {
+    fn meili(&self) -> &dyn SearchStore {
         self.orchestrator.meili()
     }
 
@@ -1465,37 +1464,14 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("file_path is required"))?;
 
-        // Get all symbols in the file
-        let q = neo4rs::query(
-            r#"
-            MATCH (f:File {path: $path})
-            OPTIONAL MATCH (f)-[:CONTAINS]->(func:Function)
-            OPTIONAL MATCH (f)-[:CONTAINS]->(st:Struct)
-            OPTIONAL MATCH (f)-[:CONTAINS]->(tr:Trait)
-            OPTIONAL MATCH (f)-[:CONTAINS]->(en:Enum)
-            RETURN
-                collect(DISTINCT func.name) AS functions,
-                collect(DISTINCT st.name) AS structs,
-                collect(DISTINCT tr.name) AS traits,
-                collect(DISTINCT en.name) AS enums
-            "#,
-        )
-        .param("path", file_path.to_string());
-
-        let rows = self.neo4j().execute_with_params(q).await?;
-        let row = rows.first().ok_or_else(|| anyhow!("File not found"))?;
-
-        let functions: Vec<String> = row.get("functions").unwrap_or_default();
-        let structs: Vec<String> = row.get("structs").unwrap_or_default();
-        let traits: Vec<String> = row.get("traits").unwrap_or_default();
-        let enums: Vec<String> = row.get("enums").unwrap_or_default();
+        let symbols = self.neo4j().get_file_symbol_names(file_path).await?;
 
         Ok(json!({
             "file_path": file_path,
-            "functions": functions,
-            "structs": structs,
-            "traits": traits,
-            "enums": enums
+            "functions": symbols.functions,
+            "structs": symbols.structs,
+            "traits": symbols.traits,
+            "enums": symbols.enums
         }))
     }
 
@@ -1504,40 +1480,18 @@ impl ToolHandler {
             .get("symbol")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("symbol is required"))?;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20);
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
-        // Find files that reference this symbol (functions, structs, traits)
-        let q = neo4rs::query(&format!(
-            r#"
-            MATCH (s)
-            WHERE (s:Function OR s:Struct OR s:Trait OR s:Enum) AND s.name = $name
-            OPTIONAL MATCH (caller:Function)-[:CALLS]->(s)
-            OPTIONAL MATCH (f:File)-[:CONTAINS]->(s)
-            RETURN DISTINCT
-                s.name AS name,
-                labels(s)[0] AS type,
-                s.file_path AS definition_file,
-                collect(DISTINCT caller.name)[0..{}] AS callers,
-                f.path AS file_path
-            "#,
-            limit
-        ))
-        .param("name", symbol.to_string());
-
-        let rows = self.neo4j().execute_with_params(q).await?;
-        let references: Vec<Value> = rows
+        let refs = self.neo4j().find_symbol_references(symbol, limit).await?;
+        let references: Vec<Value> = refs
             .into_iter()
-            .filter_map(|row| {
-                let name: String = row.get("name").ok()?;
-                let symbol_type: String = row.get("type").ok()?;
-                let def_file: String = row.get("definition_file").ok().unwrap_or_default();
-                let callers: Vec<String> = row.get("callers").ok().unwrap_or_default();
-                Some(json!({
-                    "name": name,
-                    "type": symbol_type,
-                    "definition_file": def_file,
-                    "callers": callers
-                }))
+            .map(|r| {
+                json!({
+                    "file_path": r.file_path,
+                    "line": r.line,
+                    "context": r.context,
+                    "type": r.reference_type
+                })
             })
             .collect();
 
@@ -1557,19 +1511,8 @@ impl ToolHandler {
         let dependents = self.neo4j().find_dependent_files(file_path, 3).await?;
 
         // Get files this file imports
-        let q = neo4rs::query(
-            r#"
-            MATCH (f:File {path: $path})-[:IMPORTS]->(imported:File)
-            RETURN imported.path AS path
-            "#,
-        )
-        .param("path", file_path.to_string());
-
-        let rows = self.neo4j().execute_with_params(q).await?;
-        let imports: Vec<String> = rows
-            .into_iter()
-            .filter_map(|row| row.get("path").ok())
-            .collect();
+        let direct_imports = self.neo4j().get_file_direct_imports(file_path).await?;
+        let imports: Vec<String> = direct_imports.into_iter().map(|i| i.path).collect();
 
         Ok(json!({
             "imports": imports,
@@ -1584,39 +1527,14 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("function is required"))?;
         let depth = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
 
-        // Find functions that call this function
-        let q = neo4rs::query(&format!(
-            r#"
-            MATCH (f:Function {{name: $name}})
-            MATCH (caller:Function)-[:CALLS*1..{}]->(f)
-            RETURN DISTINCT caller.name AS name
-            "#,
-            depth
-        ))
-        .param("name", function.to_string());
-
-        let rows = self.neo4j().execute_with_params(q).await?;
-        let callers: Vec<String> = rows
-            .into_iter()
-            .filter_map(|r| r.get::<String>("name").ok())
-            .collect();
-
-        // Find functions this function calls
-        let q = neo4rs::query(&format!(
-            r#"
-            MATCH (f:Function {{name: $name}})
-            MATCH (f)-[:CALLS*1..{}]->(callee:Function)
-            RETURN DISTINCT callee.name AS name
-            "#,
-            depth
-        ))
-        .param("name", function.to_string());
-
-        let rows = self.neo4j().execute_with_params(q).await?;
-        let callees: Vec<String> = rows
-            .into_iter()
-            .filter_map(|r| r.get::<String>("name").ok())
-            .collect();
+        let callers = self
+            .neo4j()
+            .get_function_callers_by_name(function, depth)
+            .await?;
+        let callees = self
+            .neo4j()
+            .get_function_callees_by_name(function, depth)
+            .await?;
 
         Ok(json!({
             "function": function,
@@ -1635,20 +1553,7 @@ impl ToolHandler {
         let dependents = self.neo4j().find_dependent_files(target, 3).await?;
 
         // If target is a function, find callers
-        let q = neo4rs::query(
-            r#"
-            MATCH (f:Function {name: $name})
-            OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
-            RETURN count(caller) AS caller_count, f.file_path AS file_path
-            "#,
-        )
-        .param("name", target.to_string());
-
-        let rows = self.neo4j().execute_with_params(q).await?;
-        let caller_count: i64 = rows
-            .first()
-            .and_then(|r| r.get("caller_count").ok())
-            .unwrap_or(0);
+        let caller_count = self.neo4j().get_function_caller_count(target).await?;
 
         Ok(json!({
             "target": target,
@@ -1659,47 +1564,16 @@ impl ToolHandler {
     }
 
     async fn get_architecture(&self, _args: Value) -> Result<Value> {
-        // Get file count by language
-        let q = neo4rs::query(
-            r#"
-            MATCH (f:File)
-            RETURN f.language AS language, count(f) AS count
-            ORDER BY count DESC
-            "#,
-        );
-
-        let rows = self.neo4j().execute_with_params(q).await?;
-        let languages: Vec<Value> = rows
+        let lang_stats = self.neo4j().get_language_stats().await?;
+        let languages: Vec<Value> = lang_stats
             .into_iter()
-            .filter_map(|r| {
-                let lang: String = r.get("language").ok()?;
-                let count: i64 = r.get("count").ok()?;
-                Some(json!({"language": lang, "file_count": count}))
-            })
+            .map(|s| json!({"language": s.language, "file_count": s.file_count}))
             .collect();
 
-        // Get most connected files (highest import relationships)
-        let q = neo4rs::query(
-            r#"
-            MATCH (f:File)
-            OPTIONAL MATCH (f)-[:IMPORTS]->(imported:File)
-            OPTIONAL MATCH (dependent:File)-[:IMPORTS]->(f)
-            WITH f, count(DISTINCT imported) AS imports, count(DISTINCT dependent) AS dependents
-            RETURN f.path AS path, imports, dependents, imports + dependents AS connections
-            ORDER BY connections DESC
-            LIMIT 10
-            "#,
-        );
-
-        let rows = self.neo4j().execute_with_params(q).await?;
-        let key_files: Vec<Value> = rows
+        let connected = self.neo4j().get_most_connected_files_detailed(10).await?;
+        let key_files: Vec<Value> = connected
             .into_iter()
-            .filter_map(|r| {
-                let path: String = r.get("path").ok()?;
-                let imports: i64 = r.get("imports").ok().unwrap_or(0);
-                let dependents: i64 = r.get("dependents").ok().unwrap_or(0);
-                Some(json!({"path": path, "imports": imports, "dependents": dependents}))
-            })
+            .map(|f| json!({"path": f.path, "imports": f.imports, "dependents": f.dependents}))
             .collect();
 
         Ok(json!({
@@ -4447,5 +4321,334 @@ mod tests {
             .ok_or_else(|| anyhow!("slug is required"));
         assert!(slug.is_err());
         assert!(slug.unwrap_err().to_string().contains("slug is required"));
+    }
+
+    // ========================================================================
+    // Async integration tests (mock backends)
+    // ========================================================================
+
+    use crate::orchestrator::Orchestrator;
+    use crate::test_helpers::mock_app_state;
+
+    async fn create_handler() -> ToolHandler {
+        let state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    // -- Basic tool routing -------------------------------------------------
+
+    #[tokio::test]
+    async fn test_unknown_tool() {
+        let handler = create_handler().await;
+        let result = handler.handle("nonexistent_tool", None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown tool: nonexistent_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_list_plans_empty() {
+        let handler = create_handler().await;
+        let result = handler.handle("list_plans", Some(json!({}))).await.unwrap();
+        assert!(result.is_object());
+        let items = result.get("items").unwrap().as_array().unwrap();
+        assert!(items.is_empty());
+        assert_eq!(result.get("total").unwrap().as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_plan() {
+        let handler = create_handler().await;
+
+        // Create a plan
+        let create_result = handler
+            .handle(
+                "create_plan",
+                Some(json!({
+                    "title": "Integration Test Plan",
+                    "description": "Testing plan creation via MCP handler"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(create_result.is_object());
+        let plan_id = create_result.get("id").unwrap().as_str().unwrap();
+        assert!(!plan_id.is_empty());
+        assert_eq!(
+            create_result.get("title").unwrap().as_str().unwrap(),
+            "Integration Test Plan"
+        );
+
+        // Get the plan back
+        let get_result = handler
+            .handle("get_plan", Some(json!({"plan_id": plan_id})))
+            .await
+            .unwrap();
+
+        assert!(get_result.is_object());
+        let plan = get_result.get("plan").unwrap();
+        assert_eq!(
+            plan.get("title").unwrap().as_str().unwrap(),
+            "Integration Test Plan"
+        );
+    }
+
+    // -- Project tools ------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_project() {
+        let handler = create_handler().await;
+
+        let result = handler
+            .handle(
+                "create_project",
+                Some(json!({
+                    "name": "My Test Project",
+                    "slug": "my-test-project",
+                    "root_path": "/tmp/my-test-project"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_object());
+        assert_eq!(
+            result.get("name").unwrap().as_str().unwrap(),
+            "My Test Project"
+        );
+        assert_eq!(
+            result.get("slug").unwrap().as_str().unwrap(),
+            "my-test-project"
+        );
+        assert_eq!(
+            result.get("root_path").unwrap().as_str().unwrap(),
+            "/tmp/my-test-project"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_project_not_found() {
+        let handler = create_handler().await;
+
+        let result = handler
+            .handle("get_project", Some(json!({"slug": "nonexistent"})))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Project not found"));
+    }
+
+    // -- Task tools ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_task() {
+        let handler = create_handler().await;
+
+        // Create plan first
+        let plan = handler
+            .handle(
+                "create_plan",
+                Some(json!({
+                    "title": "Plan for Tasks",
+                    "description": "Plan to hold tasks"
+                })),
+            )
+            .await
+            .unwrap();
+        let plan_id = plan.get("id").unwrap().as_str().unwrap();
+
+        // Create task
+        let task = handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": plan_id,
+                    "title": "First Task",
+                    "description": "Implement feature X"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(task.is_object());
+        assert_eq!(task.get("title").unwrap().as_str().unwrap(), "First Task");
+        assert_eq!(
+            task.get("description").unwrap().as_str().unwrap(),
+            "Implement feature X"
+        );
+        assert_eq!(task.get("status").unwrap().as_str().unwrap(), "pending");
+    }
+
+    #[tokio::test]
+    async fn test_get_next_task() {
+        let handler = create_handler().await;
+
+        // Create plan
+        let plan = handler
+            .handle(
+                "create_plan",
+                Some(json!({
+                    "title": "Plan with Tasks",
+                    "description": "Plan for next-task test"
+                })),
+            )
+            .await
+            .unwrap();
+        let plan_id = plan.get("id").unwrap().as_str().unwrap();
+
+        // Create two tasks
+        handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": plan_id,
+                    "title": "Task A",
+                    "description": "First task"
+                })),
+            )
+            .await
+            .unwrap();
+
+        handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": plan_id,
+                    "title": "Task B",
+                    "description": "Second task"
+                })),
+            )
+            .await
+            .unwrap();
+
+        // Get next task — should return one of the pending tasks
+        let next = handler
+            .handle("get_next_task", Some(json!({"plan_id": plan_id})))
+            .await
+            .unwrap();
+
+        // get_next_task returns a task or null
+        assert!(next.is_object() || next.is_null());
+        if next.is_object() {
+            assert_eq!(next.get("status").unwrap().as_str().unwrap(), "pending");
+        }
+    }
+
+    // -- Step tools ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_and_list_steps() {
+        let handler = create_handler().await;
+
+        // Create plan + task
+        let plan = handler
+            .handle(
+                "create_plan",
+                Some(json!({
+                    "title": "Step Test Plan",
+                    "description": "Plan for step tests"
+                })),
+            )
+            .await
+            .unwrap();
+        let plan_id = plan.get("id").unwrap().as_str().unwrap();
+
+        let task = handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": plan_id,
+                    "title": "Task with Steps",
+                    "description": "A task that has steps"
+                })),
+            )
+            .await
+            .unwrap();
+        let task_id = task.get("id").unwrap().as_str().unwrap();
+
+        // Create two steps
+        let step1 = handler
+            .handle(
+                "create_step",
+                Some(json!({
+                    "task_id": task_id,
+                    "description": "Step one: setup"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            step1.get("description").unwrap().as_str().unwrap(),
+            "Step one: setup"
+        );
+        assert_eq!(step1.get("order").unwrap().as_u64().unwrap(), 0);
+
+        let step2 = handler
+            .handle(
+                "create_step",
+                Some(json!({
+                    "task_id": task_id,
+                    "description": "Step two: implement"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(step2.get("order").unwrap().as_u64().unwrap(), 1);
+
+        // List steps
+        let steps = handler
+            .handle("list_steps", Some(json!({"task_id": task_id})))
+            .await
+            .unwrap();
+
+        let steps_arr = steps.as_array().unwrap();
+        assert_eq!(steps_arr.len(), 2);
+    }
+
+    // -- Error handling -----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_missing_required_arg() {
+        let handler = create_handler().await;
+
+        // create_plan requires "title" and "description"
+        let result = handler
+            .handle("create_plan", Some(json!({"title": "No desc"})))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("description is required"));
+
+        // create_task requires "plan_id" and "description"
+        let result = handler
+            .handle(
+                "create_task",
+                Some(json!({"description": "Missing plan_id"})),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("plan_id is required"));
+
+        // create_project requires "name" and "root_path"
+        let result = handler
+            .handle("create_project", Some(json!({"name": "test"})))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("root_path is required"));
     }
 }
