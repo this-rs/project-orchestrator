@@ -174,6 +174,7 @@ impl ToolHandler {
             "remove_project_from_workspace" => self.remove_project_from_workspace(args).await,
 
             // Workspace Milestones
+            "list_all_workspace_milestones" => self.list_all_workspace_milestones(args).await,
             "list_workspace_milestones" => self.list_workspace_milestones(args).await,
             "create_workspace_milestone" => self.create_workspace_milestone(args).await,
             "get_workspace_milestone" => self.get_workspace_milestone(args).await,
@@ -408,6 +409,12 @@ impl ToolHandler {
     // ========================================================================
 
     async fn list_plans(&self, args: Value) -> Result<Value> {
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| anyhow!("Invalid project_id UUID"))?;
         let status = args
             .get("status")
             .and_then(|v| v.as_str())
@@ -432,6 +439,7 @@ impl ToolHandler {
         let (plans, total) = self
             .neo4j()
             .list_plans_filtered(
+                project_id,
                 status,
                 priority_min,
                 priority_max,
@@ -2500,7 +2508,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
         self.neo4j()
-            .add_project_to_workspace(project_id, workspace.id)
+            .add_project_to_workspace(workspace.id, project_id)
             .await?;
 
         Ok(json!({"added": true}))
@@ -2520,7 +2528,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
         self.neo4j()
-            .remove_project_from_workspace(project_id, workspace.id)
+            .remove_project_from_workspace(workspace.id, project_id)
             .await?;
 
         Ok(json!({"removed": true}))
@@ -2529,6 +2537,48 @@ impl ToolHandler {
     // ========================================================================
     // Workspace Milestone Handlers
     // ========================================================================
+
+    async fn list_all_workspace_milestones(&self, args: Value) -> Result<Value> {
+        let workspace_id = args
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| anyhow!("Invalid workspace_id UUID"))?;
+        let status_filter = args.get("status").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let total = self
+            .neo4j()
+            .count_all_workspace_milestones(workspace_id, status_filter)
+            .await?;
+
+        let results = self
+            .neo4j()
+            .list_all_workspace_milestones_filtered(workspace_id, status_filter, limit, offset)
+            .await?;
+
+        let items: Vec<Value> = results
+            .into_iter()
+            .map(|(m, wid, wname, wslug)| {
+                let mut v = serde_json::to_value(&m).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("workspace_id".to_string(), json!(wid));
+                    obj.insert("workspace_name".to_string(), json!(wname));
+                    obj.insert("workspace_slug".to_string(), json!(wslug));
+                }
+                v
+            })
+            .collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
 
     async fn list_workspace_milestones(&self, args: Value) -> Result<Value> {
         let slug = args
@@ -2545,28 +2595,10 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        // Get all milestones and filter in memory
-        let all_milestones = self.neo4j().list_workspace_milestones(workspace.id).await?;
-
-        // Filter by status if provided
-        let filtered: Vec<_> = if let Some(status) = status_filter {
-            let status_lower = status.to_lowercase();
-            all_milestones
-                .into_iter()
-                .filter(|m| {
-                    let m_status = match m.status {
-                        MilestoneStatus::Open => "open",
-                        MilestoneStatus::Closed => "closed",
-                    };
-                    m_status == status_lower
-                })
-                .collect()
-        } else {
-            all_milestones
-        };
-
-        let total = filtered.len();
-        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+        let (items, total) = self
+            .neo4j()
+            .list_workspace_milestones_filtered(workspace.id, status_filter, limit, offset)
+            .await?;
 
         Ok(json!({
             "items": items,
