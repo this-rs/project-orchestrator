@@ -174,6 +174,7 @@ impl ToolHandler {
             "remove_project_from_workspace" => self.remove_project_from_workspace(args).await,
 
             // Workspace Milestones
+            "list_all_workspace_milestones" => self.list_all_workspace_milestones(args).await,
             "list_workspace_milestones" => self.list_workspace_milestones(args).await,
             "create_workspace_milestone" => self.create_workspace_milestone(args).await,
             "get_workspace_milestone" => self.get_workspace_milestone(args).await,
@@ -408,6 +409,12 @@ impl ToolHandler {
     // ========================================================================
 
     async fn list_plans(&self, args: Value) -> Result<Value> {
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| anyhow!("Invalid project_id UUID"))?;
         let status = args
             .get("status")
             .and_then(|v| v.as_str())
@@ -432,6 +439,7 @@ impl ToolHandler {
         let (plans, total) = self
             .neo4j()
             .list_plans_filtered(
+                project_id,
                 status,
                 priority_min,
                 priority_max,
@@ -2500,7 +2508,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
         self.neo4j()
-            .add_project_to_workspace(project_id, workspace.id)
+            .add_project_to_workspace(workspace.id, project_id)
             .await?;
 
         Ok(json!({"added": true}))
@@ -2520,7 +2528,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
         self.neo4j()
-            .remove_project_from_workspace(project_id, workspace.id)
+            .remove_project_from_workspace(workspace.id, project_id)
             .await?;
 
         Ok(json!({"removed": true}))
@@ -2529,6 +2537,48 @@ impl ToolHandler {
     // ========================================================================
     // Workspace Milestone Handlers
     // ========================================================================
+
+    async fn list_all_workspace_milestones(&self, args: Value) -> Result<Value> {
+        let workspace_id = args
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| anyhow!("Invalid workspace_id UUID"))?;
+        let status_filter = args.get("status").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let total = self
+            .neo4j()
+            .count_all_workspace_milestones(workspace_id, status_filter)
+            .await?;
+
+        let results = self
+            .neo4j()
+            .list_all_workspace_milestones_filtered(workspace_id, status_filter, limit, offset)
+            .await?;
+
+        let items: Vec<Value> = results
+            .into_iter()
+            .map(|(m, wid, wname, wslug)| {
+                let mut v = serde_json::to_value(&m).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("workspace_id".to_string(), json!(wid));
+                    obj.insert("workspace_name".to_string(), json!(wname));
+                    obj.insert("workspace_slug".to_string(), json!(wslug));
+                }
+                v
+            })
+            .collect();
+
+        Ok(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
 
     async fn list_workspace_milestones(&self, args: Value) -> Result<Value> {
         let slug = args
@@ -2545,28 +2595,10 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        // Get all milestones and filter in memory
-        let all_milestones = self.neo4j().list_workspace_milestones(workspace.id).await?;
-
-        // Filter by status if provided
-        let filtered: Vec<_> = if let Some(status) = status_filter {
-            let status_lower = status.to_lowercase();
-            all_milestones
-                .into_iter()
-                .filter(|m| {
-                    let m_status = match m.status {
-                        MilestoneStatus::Open => "open",
-                        MilestoneStatus::Closed => "closed",
-                    };
-                    m_status == status_lower
-                })
-                .collect()
-        } else {
-            all_milestones
-        };
-
-        let total = filtered.len();
-        let items: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+        let (items, total) = self
+            .neo4j()
+            .list_workspace_milestones_filtered(workspace.id, status_filter, limit, offset)
+            .await?;
 
         Ok(json!({
             "items": items,
@@ -4178,5 +4210,242 @@ mod tests {
         assert!(parse_uuid(&json!({}), "milestone_id").is_err());
         assert!(parse_uuid(&json!({}), "decision_id").is_err());
         assert!(parse_uuid(&json!({}), "constraint_id").is_err());
+    }
+
+    // ========================================================================
+    // list_all_workspace_milestones argument extraction tests
+    // ========================================================================
+
+    #[test]
+    fn test_list_all_workspace_milestones_args_full() {
+        let args = json!({
+            "workspace_id": "b37351e3-6c90-4a53-bc4f-8cbd024cecb7",
+            "status": "open",
+            "limit": 25,
+            "offset": 10
+        });
+
+        let workspace_id = args
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .unwrap();
+        assert!(workspace_id.is_some());
+        assert_eq!(
+            workspace_id.unwrap().to_string(),
+            "b37351e3-6c90-4a53-bc4f-8cbd024cecb7"
+        );
+
+        let status_filter = args.get("status").and_then(|v| v.as_str());
+        assert_eq!(status_filter, Some("open"));
+
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        assert_eq!(limit, 25);
+
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_args_defaults() {
+        let args = json!({});
+
+        let workspace_id = args
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .unwrap();
+        assert!(workspace_id.is_none());
+
+        let status_filter = args.get("status").and_then(|v| v.as_str());
+        assert!(status_filter.is_none());
+
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        assert_eq!(limit, 50);
+
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_args_invalid_uuid() {
+        let args = json!({
+            "workspace_id": "not-a-uuid"
+        });
+
+        let result = args
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_args_status_only() {
+        let args = json!({
+            "status": "closed"
+        });
+
+        let workspace_id = args
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .unwrap();
+        assert!(workspace_id.is_none());
+
+        let status_filter = args.get("status").and_then(|v| v.as_str());
+        assert_eq!(status_filter, Some("closed"));
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_response_structure() {
+        let items = vec![json!({
+            "id": "test-id",
+            "title": "Milestone 1",
+            "workspace_id": "ws-1",
+            "workspace_name": "Workspace One",
+            "workspace_slug": "workspace-one"
+        })];
+        let total = 1usize;
+        let limit = 50usize;
+        let offset = 0usize;
+
+        let response = json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        });
+
+        assert!(response["items"].is_array());
+        assert_eq!(response["items"].as_array().unwrap().len(), 1);
+        assert_eq!(response["total"], 1);
+        assert_eq!(response["limit"], 50);
+        assert_eq!(response["offset"], 0);
+        assert_eq!(response["items"][0]["workspace_slug"], "workspace-one");
+    }
+
+    // ========================================================================
+    // list_plans project_id argument extraction tests
+    // ========================================================================
+
+    #[test]
+    fn test_list_plans_args_with_project_id() {
+        let args = json!({
+            "project_id": "e83b0663-9600-450d-9f63-234e857394df",
+            "status": "draft,in_progress",
+            "limit": 10,
+            "offset": 0
+        });
+
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .unwrap();
+        assert!(project_id.is_some());
+        assert_eq!(
+            project_id.unwrap().to_string(),
+            "e83b0663-9600-450d-9f63-234e857394df"
+        );
+
+        let status = args.get("status").and_then(|v| v.as_str()).map(|s| {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            status,
+            Some(vec!["draft".to_string(), "in_progress".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_list_plans_args_without_project_id() {
+        let args = json!({
+            "status": "completed"
+        });
+
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose()
+            .unwrap();
+        assert!(project_id.is_none());
+    }
+
+    #[test]
+    fn test_list_plans_args_invalid_project_id() {
+        let args = json!({
+            "project_id": "invalid-uuid"
+        });
+
+        let result = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(Uuid::parse_str)
+            .transpose();
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // list_workspace_milestones (per-workspace) argument extraction tests
+    // ========================================================================
+
+    #[test]
+    fn test_list_workspace_milestones_args_full() {
+        let args = json!({
+            "slug": "my-workspace",
+            "status": "open",
+            "limit": 20,
+            "offset": 5
+        });
+
+        let slug = args.get("slug").and_then(|v| v.as_str());
+        assert_eq!(slug, Some("my-workspace"));
+
+        let status_filter = args.get("status").and_then(|v| v.as_str());
+        assert_eq!(status_filter, Some("open"));
+
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        assert_eq!(limit, 20);
+
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        assert_eq!(offset, 5);
+    }
+
+    #[test]
+    fn test_list_workspace_milestones_args_slug_only() {
+        let args = json!({
+            "slug": "prod-workspace"
+        });
+
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"));
+        assert!(slug.is_ok());
+        assert_eq!(slug.unwrap(), "prod-workspace");
+
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        assert_eq!(limit, 50);
+    }
+
+    #[test]
+    fn test_list_workspace_milestones_args_missing_slug() {
+        let args = json!({});
+
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("slug is required"));
+        assert!(slug.is_err());
+        assert!(slug.unwrap_err().to_string().contains("slug is required"));
     }
 }

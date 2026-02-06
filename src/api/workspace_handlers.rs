@@ -1,6 +1,6 @@
 //! Workspace API handlers
 
-use crate::api::{PaginatedResponse, PaginationParams};
+use crate::api::{PaginatedResponse, PaginationParams, StatusFilter};
 use crate::neo4j::models::*;
 use axum::{
     extract::{Path, Query, State},
@@ -556,11 +556,23 @@ pub async fn remove_project_from_workspace(
 // Workspace Milestone Handlers
 // ============================================================================
 
-/// List workspace milestones
+/// Query parameters for listing workspace milestones
+#[derive(Debug, Deserialize, Default)]
+pub struct WorkspaceMilestonesListQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    #[serde(flatten)]
+    pub status_filter: StatusFilter,
+}
+
+/// List workspace milestones with pagination and status filter
 pub async fn list_workspace_milestones(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
-) -> Result<Json<Vec<WorkspaceMilestoneResponse>>, AppError> {
+    Query(query): Query<WorkspaceMilestonesListQuery>,
+) -> Result<Json<PaginatedResponse<WorkspaceMilestoneResponse>>, AppError> {
+    query.pagination.validate().map_err(AppError::BadRequest)?;
+
     let workspace = state
         .orchestrator
         .neo4j()
@@ -568,18 +580,30 @@ pub async fn list_workspace_milestones(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
-    let milestones = state
+    let status_str = query.status_filter.status.as_deref();
+
+    let (milestones, total) = state
         .orchestrator
         .neo4j()
-        .list_workspace_milestones(workspace.id)
+        .list_workspace_milestones_filtered(
+            workspace.id,
+            status_str,
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+        )
         .await?;
 
-    Ok(Json(
-        milestones
-            .into_iter()
-            .map(WorkspaceMilestoneResponse::from)
-            .collect(),
-    ))
+    let items: Vec<WorkspaceMilestoneResponse> = milestones
+        .into_iter()
+        .map(WorkspaceMilestoneResponse::from)
+        .collect();
+
+    Ok(Json(PaginatedResponse::new(
+        items,
+        total,
+        query.pagination.validated_limit(),
+        query.pagination.offset,
+    )))
 }
 
 /// Create workspace milestone
@@ -754,6 +778,84 @@ pub async fn get_workspace_milestone_progress(
         pending,
         percentage,
     }))
+}
+
+// ============================================================================
+// Global Workspace Milestones
+// ============================================================================
+
+/// Response for workspace milestone with workspace info
+#[derive(Serialize)]
+pub struct WorkspaceMilestoneWithWorkspace {
+    #[serde(flatten)]
+    pub milestone: WorkspaceMilestoneResponse,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub workspace_slug: String,
+}
+
+/// Query params for global workspace milestones listing
+#[derive(Debug, Deserialize, Default)]
+pub struct AllWorkspaceMilestonesQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    #[serde(flatten)]
+    pub status_filter: StatusFilter,
+    pub workspace_id: Option<String>,
+}
+
+/// List all workspace milestones across all workspaces
+pub async fn list_all_workspace_milestones(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<AllWorkspaceMilestonesQuery>,
+) -> Result<Json<PaginatedResponse<WorkspaceMilestoneWithWorkspace>>, AppError> {
+    query.pagination.validate().map_err(AppError::BadRequest)?;
+
+    let workspace_id = query
+        .workspace_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            uuid::Uuid::parse_str(s)
+                .map_err(|_| AppError::BadRequest("Invalid workspace_id UUID".to_string()))
+        })
+        .transpose()?;
+
+    let status_str = query.status_filter.status.as_deref();
+
+    let total = state
+        .orchestrator
+        .neo4j()
+        .count_all_workspace_milestones(workspace_id, status_str)
+        .await?;
+
+    let results = state
+        .orchestrator
+        .neo4j()
+        .list_all_workspace_milestones_filtered(
+            workspace_id,
+            status_str,
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+        )
+        .await?;
+
+    let items: Vec<WorkspaceMilestoneWithWorkspace> = results
+        .into_iter()
+        .map(|(m, wid, wname, wslug)| WorkspaceMilestoneWithWorkspace {
+            milestone: WorkspaceMilestoneResponse::from(m),
+            workspace_id: wid,
+            workspace_name: wname,
+            workspace_slug: wslug,
+        })
+        .collect();
+
+    Ok(Json(PaginatedResponse::new(
+        items,
+        total,
+        query.pagination.validated_limit(),
+        query.pagination.offset,
+    )))
 }
 
 // ============================================================================
@@ -1269,5 +1371,153 @@ mod tests {
         let json = r#"{"tags":[]}"#;
         let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.tags, Some(vec![]));
+    }
+
+    #[test]
+    fn test_workspace_milestones_list_query_defaults() {
+        let json = r#"{}"#;
+        let query: WorkspaceMilestonesListQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.pagination.limit, 50);
+        assert_eq!(query.pagination.offset, 0);
+        assert!(query.status_filter.status.is_none());
+    }
+
+    #[test]
+    fn test_workspace_milestones_list_query_with_status() {
+        let json = r#"{"status":"open","limit":"10"}"#;
+        let query: WorkspaceMilestonesListQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.status_filter.status, Some("open".to_string()));
+        assert_eq!(query.pagination.limit, 10);
+    }
+
+    #[test]
+    fn test_all_workspace_milestones_query_defaults() {
+        let json = r#"{}"#;
+        let query: AllWorkspaceMilestonesQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.pagination.limit, 50);
+        assert!(query.status_filter.status.is_none());
+        assert!(query.workspace_id.is_none());
+    }
+
+    #[test]
+    fn test_all_workspace_milestones_query_with_filters() {
+        let json = r#"{"status":"open","workspace_id":"b37351e3-6c90-4a53-bc4f-8cbd024cecb7","limit":"5"}"#;
+        let query: AllWorkspaceMilestonesQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.status_filter.status, Some("open".to_string()));
+        assert_eq!(
+            query.workspace_id,
+            Some("b37351e3-6c90-4a53-bc4f-8cbd024cecb7".to_string())
+        );
+        assert_eq!(query.pagination.limit, 5);
+    }
+
+    #[test]
+    fn test_workspace_milestone_with_workspace_serialization() {
+        let resp = WorkspaceMilestoneWithWorkspace {
+            milestone: WorkspaceMilestoneResponse {
+                id: "test-id".to_string(),
+                workspace_id: "ws-id".to_string(),
+                title: "Test".to_string(),
+                description: None,
+                status: "Open".to_string(),
+                target_date: None,
+                closed_at: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                tags: vec![],
+            },
+            workspace_id: "ws-uuid".to_string(),
+            workspace_name: "My Workspace".to_string(),
+            workspace_slug: "my-workspace".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["title"], "Test");
+        assert_eq!(json["workspace_name"], "My Workspace");
+        assert_eq!(json["workspace_slug"], "my-workspace");
+    }
+
+    #[test]
+    fn test_workspace_milestone_with_workspace_flatten() {
+        // Verify flatten merges milestone fields into top-level
+        let resp = WorkspaceMilestoneWithWorkspace {
+            milestone: WorkspaceMilestoneResponse {
+                id: "m-123".to_string(),
+                workspace_id: "ws-inner".to_string(),
+                title: "Cross-project milestone".to_string(),
+                description: Some("Important milestone".to_string()),
+                status: "Open".to_string(),
+                target_date: Some("2026-06-01T00:00:00Z".to_string()),
+                closed_at: None,
+                created_at: "2026-01-15T10:00:00Z".to_string(),
+                tags: vec!["release".to_string(), "q2".to_string()],
+            },
+            workspace_id: "ws-outer".to_string(),
+            workspace_name: "Production".to_string(),
+            workspace_slug: "production".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+
+        // Flattened milestone fields
+        assert_eq!(json["id"], "m-123");
+        assert_eq!(json["title"], "Cross-project milestone");
+        assert_eq!(json["description"], "Important milestone");
+        assert_eq!(json["status"], "Open");
+        assert_eq!(json["target_date"], "2026-06-01T00:00:00Z");
+        assert!(json["closed_at"].is_null());
+        assert_eq!(json["created_at"], "2026-01-15T10:00:00Z");
+        assert_eq!(json["tags"], serde_json::json!(["release", "q2"]));
+
+        // Extra workspace fields
+        assert_eq!(json["workspace_id"], "ws-outer");
+        assert_eq!(json["workspace_name"], "Production");
+        assert_eq!(json["workspace_slug"], "production");
+    }
+
+    #[test]
+    fn test_all_workspace_milestones_query_workspace_id_validation() {
+        // Valid UUID workspace_id
+        let json = r#"{"workspace_id":"b37351e3-6c90-4a53-bc4f-8cbd024cecb7"}"#;
+        let query: AllWorkspaceMilestonesQuery = serde_json::from_str(json).unwrap();
+        let parsed = query
+            .workspace_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap().is_ok());
+    }
+
+    #[test]
+    fn test_all_workspace_milestones_query_invalid_workspace_id() {
+        let json = r#"{"workspace_id":"not-a-uuid"}"#;
+        let query: AllWorkspaceMilestonesQuery = serde_json::from_str(json).unwrap();
+        let parsed = query
+            .workspace_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap().is_err());
+    }
+
+    #[test]
+    fn test_all_workspace_milestones_query_empty_workspace_id() {
+        let json = r#"{"workspace_id":""}"#;
+        let query: AllWorkspaceMilestonesQuery = serde_json::from_str(json).unwrap();
+        // Empty string should be filtered out
+        let parsed = query
+            .workspace_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_workspace_milestones_list_query_pagination_values() {
+        let json = r#"{"limit":"25","offset":"10","status":"closed"}"#;
+        let query: WorkspaceMilestonesListQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.pagination.limit, 25);
+        assert_eq!(query.pagination.offset, 10);
+        assert_eq!(query.status_filter.status, Some("closed".to_string()));
     }
 }

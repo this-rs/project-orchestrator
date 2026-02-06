@@ -148,6 +148,7 @@ fn plan_tools() -> Vec<ToolDefinition> {
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Filter by project UUID"},
                     "status": {"type": "string", "description": "Filter by status (comma-separated: draft,approved,in_progress,completed,cancelled)"},
                     "priority_min": {"type": "integer", "description": "Minimum priority"},
                     "priority_max": {"type": "integer", "description": "Maximum priority"},
@@ -1409,7 +1410,7 @@ fn note_tools() -> Vec<ToolDefinition> {
 }
 
 // ============================================================================
-// Workspace Tools (29)
+// Workspace Tools (30)
 // ============================================================================
 
 fn workspace_tools() -> Vec<ToolDefinition> {
@@ -1531,7 +1532,21 @@ fn workspace_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["slug".to_string(), "project_id".to_string()]),
             },
         },
-        // --- Workspace Milestones (6) ---
+        // --- Workspace Milestones (7) ---
+        ToolDefinition {
+            name: "list_all_workspace_milestones".to_string(),
+            description: "List all workspace milestones across all workspaces with optional filters and pagination".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "workspace_id": {"type": "string", "description": "Filter by workspace UUID"},
+                    "status": {"type": "string", "description": "Filter by status (open, closed)"},
+                    "limit": {"type": "integer", "description": "Max items (default 50)"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: None,
+            },
+        },
         ToolDefinition {
             name: "list_workspace_milestones".to_string(),
             description: "List milestones for a workspace (cross-project milestones)".to_string(),
@@ -1853,7 +1868,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 130, "Expected 130 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 131, "Expected 131 tools, got {}", tools.len());
     }
 
     #[test]
@@ -1881,8 +1896,8 @@ mod tests {
         let tools = workspace_tools();
         assert_eq!(
             tools.len(),
-            31,
-            "Expected 31 workspace tools, got {}",
+            32,
+            "Expected 32 workspace tools, got {}",
             tools.len()
         );
     }
@@ -2146,5 +2161,80 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"update_resource"));
         assert!(names.contains(&"update_component"));
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_tool_exists() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "list_all_workspace_milestones");
+        assert!(
+            tool.is_some(),
+            "list_all_workspace_milestones tool must exist"
+        );
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_tool_properties() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "list_all_workspace_milestones")
+            .unwrap();
+
+        let props = tool.input_schema.properties.as_ref().unwrap();
+        assert!(props.get("workspace_id").is_some());
+        assert!(props.get("status").is_some());
+        assert!(props.get("limit").is_some());
+        assert!(props.get("offset").is_some());
+
+        // No required params - all optional
+        assert!(tool.input_schema.required.is_none());
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_in_workspace_tools() {
+        let tools = workspace_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"list_all_workspace_milestones"),
+            "list_all_workspace_milestones should be in workspace tools"
+        );
+    }
+
+    #[test]
+    fn test_list_plans_tool_has_project_id() {
+        let tools = all_tools();
+        let tool = tools.iter().find(|t| t.name == "list_plans").unwrap();
+
+        let props = tool.input_schema.properties.as_ref().unwrap();
+        assert!(
+            props.get("project_id").is_some(),
+            "list_plans tool must have project_id parameter"
+        );
+
+        // project_id should be a string type
+        let project_id_schema = props.get("project_id").unwrap();
+        assert_eq!(project_id_schema["type"], "string");
+    }
+
+    #[test]
+    fn test_list_workspace_milestones_tool_has_pagination() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "list_workspace_milestones")
+            .unwrap();
+
+        let props = tool.input_schema.properties.as_ref().unwrap();
+        assert!(props.get("slug").is_some());
+        assert!(props.get("status").is_some());
+        assert!(props.get("limit").is_some());
+        assert!(props.get("offset").is_some());
+
+        // slug is required
+        let required = tool.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"slug".to_string()));
     }
 }

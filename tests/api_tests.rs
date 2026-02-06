@@ -2756,8 +2756,15 @@ async fn test_workspace_milestone_list_with_status_filter() {
 
     assert!(filter_resp.status().is_success());
     let results: Value = filter_resp.json().await.unwrap();
-    // API returns array directly, not paginated
-    assert!(results.is_array());
+    // API returns paginated response
+    assert!(
+        results.get("items").is_some(),
+        "Expected paginated response with 'items' field"
+    );
+    assert!(results["items"].is_array());
+    assert!(results["total"].is_number());
+    assert!(results["has_more"].is_boolean());
+    assert!(results["items"].as_array().unwrap().len() >= 1);
 
     // Clean up
     let _ = client

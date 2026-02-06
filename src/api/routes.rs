@@ -365,6 +365,10 @@ pub fn create_router(state: OrchestratorState) -> Router {
                 .post(workspace_handlers::create_workspace_milestone),
         )
         .route(
+            "/api/workspace-milestones",
+            get(workspace_handlers::list_all_workspace_milestones),
+        )
+        .route(
             "/api/workspace-milestones/{id}",
             get(workspace_handlers::get_workspace_milestone)
                 .patch(workspace_handlers::update_workspace_milestone)
