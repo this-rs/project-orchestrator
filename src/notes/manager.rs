@@ -4,21 +4,22 @@
 //! including linking notes to entities and managing note lifecycle.
 
 use super::models::*;
-use crate::meilisearch::{client::MeiliClient, indexes::NoteDocument};
-use crate::neo4j::client::Neo4jClient;
+use crate::meilisearch::indexes::NoteDocument;
+use crate::meilisearch::SearchStore;
+use crate::neo4j::GraphStore;
 use anyhow::Result;
 use std::sync::Arc;
 use uuid::Uuid;
 
 /// Manager for Knowledge Notes operations
 pub struct NoteManager {
-    neo4j: Arc<Neo4jClient>,
-    meilisearch: Arc<MeiliClient>,
+    neo4j: Arc<dyn GraphStore>,
+    meilisearch: Arc<dyn SearchStore>,
 }
 
 impl NoteManager {
     /// Create a new NoteManager
-    pub fn new(neo4j: Arc<Neo4jClient>, meilisearch: Arc<MeiliClient>) -> Self {
+    pub fn new(neo4j: Arc<dyn GraphStore>, meilisearch: Arc<dyn SearchStore>) -> Self {
         Self { neo4j, meilisearch }
     }
 

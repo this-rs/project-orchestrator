@@ -2,9 +2,9 @@
 //!
 //! Implements the actual logic for each MCP tool.
 
-use crate::meilisearch::MeiliClient;
+use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
-use crate::neo4j::Neo4jClient;
+use crate::neo4j::GraphStore;
 use crate::orchestrator::Orchestrator;
 use crate::plan::models::*;
 use anyhow::{anyhow, Result};
@@ -22,11 +22,11 @@ impl ToolHandler {
         Self { orchestrator }
     }
 
-    fn neo4j(&self) -> &Neo4jClient {
+    fn neo4j(&self) -> &dyn GraphStore {
         self.orchestrator.neo4j()
     }
 
-    fn meili(&self) -> &MeiliClient {
+    fn meili(&self) -> &dyn SearchStore {
         self.orchestrator.meili()
     }
 

@@ -22,8 +22,8 @@ use std::sync::Arc;
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
-    pub neo4j: Arc<neo4j::client::Neo4jClient>,
-    pub meili: Arc<meilisearch::client::MeiliClient>,
+    pub neo4j: Arc<dyn neo4j::GraphStore>,
+    pub meili: Arc<dyn meilisearch::SearchStore>,
     pub parser: Arc<parser::CodeParser>,
     pub config: Arc<Config>,
 }

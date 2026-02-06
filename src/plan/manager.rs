@@ -1,23 +1,23 @@
 //! Plan management operations
 
 use super::models::*;
-use crate::meilisearch::client::MeiliClient;
 use crate::meilisearch::indexes::DecisionDocument;
-use crate::neo4j::client::Neo4jClient;
+use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
+use crate::neo4j::GraphStore;
 use anyhow::Result;
 use std::sync::Arc;
 use uuid::Uuid;
 
 /// Manager for plan operations
 pub struct PlanManager {
-    neo4j: Arc<Neo4jClient>,
-    meili: Arc<MeiliClient>,
+    neo4j: Arc<dyn GraphStore>,
+    meili: Arc<dyn SearchStore>,
 }
 
 impl PlanManager {
     /// Create a new plan manager
-    pub fn new(neo4j: Arc<Neo4jClient>, meili: Arc<MeiliClient>) -> Self {
+    pub fn new(neo4j: Arc<dyn GraphStore>, meili: Arc<dyn SearchStore>) -> Self {
         Self { neo4j, meili }
     }
 

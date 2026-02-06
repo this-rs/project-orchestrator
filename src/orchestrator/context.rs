@@ -1,8 +1,8 @@
 //! Context builder for agent tasks
 
-use crate::meilisearch::client::MeiliClient;
-use crate::neo4j::client::Neo4jClient;
+use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
+use crate::neo4j::GraphStore;
 use crate::notes::{EntityType, Note, NoteManager};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 /// Builder for creating rich agent context
 pub struct ContextBuilder {
-    neo4j: Arc<Neo4jClient>,
-    meili: Arc<MeiliClient>,
+    neo4j: Arc<dyn GraphStore>,
+    meili: Arc<dyn SearchStore>,
     plan_manager: Arc<PlanManager>,
     note_manager: Arc<NoteManager>,
 }
@@ -21,8 +21,8 @@ pub struct ContextBuilder {
 impl ContextBuilder {
     /// Create a new context builder
     pub fn new(
-        neo4j: Arc<Neo4jClient>,
-        meili: Arc<MeiliClient>,
+        neo4j: Arc<dyn GraphStore>,
+        meili: Arc<dyn SearchStore>,
         plan_manager: Arc<PlanManager>,
         note_manager: Arc<NoteManager>,
     ) -> Self {
