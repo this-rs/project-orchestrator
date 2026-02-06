@@ -67,11 +67,7 @@ pub trait SearchStore: Send + Sync {
     async fn index_decision(&self, doc: &DecisionDocument) -> Result<()>;
 
     /// Search decisions
-    async fn search_decisions(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<DecisionDocument>>;
+    async fn search_decisions(&self, query: &str, limit: usize) -> Result<Vec<DecisionDocument>>;
 
     /// Search decisions within a specific project
     async fn search_decisions_in_project(

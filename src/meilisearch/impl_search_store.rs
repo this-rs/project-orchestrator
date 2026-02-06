@@ -79,11 +79,7 @@ impl SearchStore for MeiliClient {
         self.index_decision(doc).await
     }
 
-    async fn search_decisions(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<DecisionDocument>> {
+    async fn search_decisions(&self, query: &str, limit: usize) -> Result<Vec<DecisionDocument>> {
         self.search_decisions(query, limit).await
     }
 

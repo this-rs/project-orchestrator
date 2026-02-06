@@ -35,10 +35,7 @@ pub fn mock_app_state() -> AppState {
 }
 
 /// Create a mock AppState with pre-seeded backends
-pub fn mock_app_state_with(
-    graph: MockGraphStore,
-    search: MockSearchStore,
-) -> AppState {
+pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> AppState {
     AppState {
         neo4j: Arc::new(graph),
         meili: Arc::new(search),
@@ -154,10 +151,7 @@ pub fn test_decision(description: &str, rationale: &str) -> DecisionNode {
 }
 
 /// Create a test constraint
-pub fn test_constraint(
-    constraint_type: ConstraintType,
-    description: &str,
-) -> ConstraintNode {
+pub fn test_constraint(constraint_type: ConstraintType, description: &str) -> ConstraintNode {
     ConstraintNode {
         id: Uuid::new_v4(),
         constraint_type,

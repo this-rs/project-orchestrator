@@ -267,12 +267,7 @@ impl MockGraphStore {
 // Helper: paginate a Vec
 // ============================================================================
 fn paginate<T: Clone>(items: &[T], limit: usize, offset: usize) -> Vec<T> {
-    items
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .cloned()
-        .collect()
+    items.iter().skip(offset).take(limit).cloned().collect()
 }
 
 // ============================================================================
@@ -415,11 +410,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn add_project_to_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<()> {
+    async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()> {
         self.workspace_projects
             .write()
             .await
@@ -465,10 +456,7 @@ impl GraphStore for MockGraphStore {
     // Workspace Milestone operations
     // ========================================================================
 
-    async fn create_workspace_milestone(
-        &self,
-        milestone: &WorkspaceMilestoneNode,
-    ) -> Result<()> {
+    async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()> {
         let ms_id = milestone.id;
         let ws_id = milestone.workspace_id;
         self.workspace_milestones
@@ -484,10 +472,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn get_workspace_milestone(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<WorkspaceMilestoneNode>> {
+    async fn get_workspace_milestone(&self, id: Uuid) -> Result<Option<WorkspaceMilestoneNode>> {
         Ok(self.workspace_milestones.read().await.get(&id).cloned())
     }
 
@@ -717,10 +702,7 @@ impl GraphStore for MockGraphStore {
                 .or_default()
                 .push(rid);
         }
-        self.resources
-            .write()
-            .await
-            .insert(rid, resource.clone());
+        self.resources.write().await.insert(rid, resource.clone());
         Ok(())
     }
 
@@ -795,11 +777,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn link_project_uses_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> Result<()> {
+    async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()> {
         self.resource_consumers
             .write()
             .await
@@ -842,10 +820,7 @@ impl GraphStore for MockGraphStore {
             .entry(ws_id)
             .or_default()
             .push(cid);
-        self.components
-            .write()
-            .await
-            .insert(cid, component.clone());
+        self.components.write().await.insert(cid, component.clone());
         Ok(())
     }
 
@@ -945,11 +920,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn map_component_to_project(
-        &self,
-        component_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<()> {
+    async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()> {
         self.component_projects
             .write()
             .await
@@ -1072,10 +1043,7 @@ impl GraphStore for MockGraphStore {
         let pf = self.project_files.read().await;
         let files = self.files.read().await;
         let paths = pf.get(&project_id).cloned().unwrap_or_default();
-        Ok(paths
-            .iter()
-            .filter_map(|p| files.get(p).cloned())
-            .collect())
+        Ok(paths.iter().filter_map(|p| files.get(p).cloned()).collect())
     }
 
     // ========================================================================
@@ -1257,7 +1225,12 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn get_file_language(&self, path: &str) -> Result<Option<String>> {
-        Ok(self.files.read().await.get(path).map(|f| f.language.clone()))
+        Ok(self
+            .files
+            .read()
+            .await
+            .get(path)
+            .map(|f| f.language.clone()))
     }
 
     async fn get_file_functions_summary(&self, path: &str) -> Result<Vec<FunctionSummaryNode>> {
@@ -1742,10 +1715,7 @@ impl GraphStore for MockGraphStore {
         let pt = self.plan_tasks.read().await;
         let tasks = self.tasks.read().await;
         let ids = pt.get(&plan_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| tasks.get(id).cloned())
-            .collect())
+        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
     }
 
     async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>> {
@@ -1810,10 +1780,7 @@ impl GraphStore for MockGraphStore {
         Ok(impacted)
     }
 
-    async fn find_blocked_tasks(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
+    async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
         let task_ids = self
             .plan_tasks
             .read()
@@ -2139,10 +2106,8 @@ impl GraphStore for MockGraphStore {
         let ts = self.task_steps.read().await;
         let steps = self.steps.read().await;
         let ids = ts.get(&task_id).cloned().unwrap_or_default();
-        let mut result: Vec<StepNode> = ids
-            .iter()
-            .filter_map(|id| steps.get(id).cloned())
-            .collect();
+        let mut result: Vec<StepNode> =
+            ids.iter().filter_map(|id| steps.get(id).cloned()).collect();
         result.sort_by_key(|s| s.order);
         Ok(result)
     }
@@ -2185,11 +2150,7 @@ impl GraphStore for MockGraphStore {
     // Constraint operations
     // ========================================================================
 
-    async fn create_constraint(
-        &self,
-        plan_id: Uuid,
-        constraint: &ConstraintNode,
-    ) -> Result<()> {
+    async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {
         let cid = constraint.id;
         self.plan_constraints
             .write()
@@ -2260,10 +2221,7 @@ impl GraphStore for MockGraphStore {
             .entry(task_id)
             .or_default()
             .push(did);
-        self.decisions
-            .write()
-            .await
-            .insert(did, decision.clone());
+        self.decisions.write().await.insert(did, decision.clone());
         Ok(())
     }
 
@@ -2320,10 +2278,7 @@ impl GraphStore for MockGraphStore {
         let cr = self.call_relationships.read().await;
         let functions = self.functions.read().await;
         // Extract function name from id
-        let func_name = function_id
-            .rsplit("::")
-            .next()
-            .unwrap_or(function_id);
+        let func_name = function_id.rsplit("::").next().unwrap_or(function_id);
         let mut callers = Vec::new();
         for (caller_id, callees) in cr.iter() {
             if callees.contains(&func_name.to_string()) {
@@ -2535,12 +2490,7 @@ impl GraphStore for MockGraphStore {
 
     async fn delete_release(&self, release_id: Uuid) -> Result<()> {
         if let Some(r) = self.releases.write().await.remove(&release_id) {
-            if let Some(ids) = self
-                .project_releases
-                .write()
-                .await
-                .get_mut(&r.project_id)
-            {
+            if let Some(ids) = self.project_releases.write().await.get_mut(&r.project_id) {
                 ids.retain(|id| *id != release_id);
             }
         }
@@ -2562,10 +2512,7 @@ impl GraphStore for MockGraphStore {
             .entry(pid)
             .or_default()
             .push(mid);
-        self.milestones
-            .write()
-            .await
-            .insert(mid, milestone.clone());
+        self.milestones.write().await.insert(mid, milestone.clone());
         Ok(())
     }
 
@@ -2646,12 +2593,7 @@ impl GraphStore for MockGraphStore {
 
     async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {
         if let Some(m) = self.milestones.write().await.remove(&milestone_id) {
-            if let Some(ids) = self
-                .project_milestones
-                .write()
-                .await
-                .get_mut(&m.project_id)
-            {
+            if let Some(ids) = self.project_milestones.write().await.get_mut(&m.project_id) {
                 ids.retain(|id| *id != milestone_id);
             }
         }
@@ -2663,20 +2605,14 @@ impl GraphStore for MockGraphStore {
         let mt = self.milestone_tasks.read().await;
         let tasks = self.tasks.read().await;
         let ids = mt.get(&milestone_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| tasks.get(id).cloned())
-            .collect())
+        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
     }
 
     async fn get_release_tasks(&self, release_id: Uuid) -> Result<Vec<TaskNode>> {
         let rt = self.release_tasks.read().await;
         let tasks = self.tasks.read().await;
         let ids = rt.get(&release_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| tasks.get(id).cloned())
-            .collect())
+        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
     }
 
     // ========================================================================
@@ -2701,10 +2637,7 @@ impl GraphStore for MockGraphStore {
         Ok((total, completed, in_progress, pending))
     }
 
-    async fn get_project_task_dependencies(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(Uuid, Uuid)>> {
+    async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>> {
         let plan_ids = self
             .project_plans
             .read()

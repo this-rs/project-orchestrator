@@ -79,11 +79,7 @@ pub trait GraphStore: Send + Sync {
     async fn delete_workspace(&self, id: Uuid) -> Result<()>;
 
     /// Add a project to a workspace
-    async fn add_project_to_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<()>;
+    async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()>;
 
     /// Remove a project from a workspace
     async fn remove_project_from_workspace(
@@ -103,16 +99,10 @@ pub trait GraphStore: Send + Sync {
     // ========================================================================
 
     /// Create a workspace milestone
-    async fn create_workspace_milestone(
-        &self,
-        milestone: &WorkspaceMilestoneNode,
-    ) -> Result<()>;
+    async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()>;
 
     /// Get a workspace milestone by ID
-    async fn get_workspace_milestone(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<WorkspaceMilestoneNode>>;
+    async fn get_workspace_milestone(&self, id: Uuid) -> Result<Option<WorkspaceMilestoneNode>>;
 
     /// List workspace milestones (unpaginated, used internally)
     async fn list_workspace_milestones(
@@ -220,11 +210,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<()>;
 
     /// Link a project as using a resource
-    async fn link_project_uses_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> Result<()>;
+    async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()>;
 
     /// Get projects that implement a resource
     async fn get_resource_implementers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
@@ -276,11 +262,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<()>;
 
     /// Map a component to a project
-    async fn map_component_to_project(
-        &self,
-        component_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<()>;
+    async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()>;
 
     /// Get the workspace topology (all components with their dependencies)
     async fn get_workspace_topology(
@@ -358,11 +340,8 @@ pub trait GraphStore: Send + Sync {
     async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>>;
 
     /// Create a USES_TYPE relationship from a function to a type
-    async fn create_uses_type_relationship(
-        &self,
-        function_id: &str,
-        type_name: &str,
-    ) -> Result<()>;
+    async fn create_uses_type_relationship(&self, function_id: &str, type_name: &str)
+        -> Result<()>;
 
     /// Find types that implement a specific trait
     async fn find_trait_implementors(&self, trait_name: &str) -> Result<Vec<String>>;
@@ -506,10 +485,7 @@ pub trait GraphStore: Send + Sync {
     async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>>;
 
     /// Find pending tasks in a plan that are blocked by uncompleted dependencies
-    async fn find_blocked_tasks(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>>;
+    async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>>;
 
     /// Update task status
     async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()>;
@@ -548,11 +524,7 @@ pub trait GraphStore: Send + Sync {
     async fn get_task(&self, task_id: Uuid) -> Result<Option<TaskNode>>;
 
     /// Update a task with new values
-    async fn update_task(
-        &self,
-        task_id: Uuid,
-        updates: &UpdateTaskRequest,
-    ) -> Result<()>;
+    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()>;
 
     /// Delete a task and all its related data (steps, decisions)
     async fn delete_task(&self, task_id: Uuid) -> Result<()>;
@@ -584,11 +556,7 @@ pub trait GraphStore: Send + Sync {
     // ========================================================================
 
     /// Create a constraint for a plan
-    async fn create_constraint(
-        &self,
-        plan_id: Uuid,
-        constraint: &ConstraintNode,
-    ) -> Result<()>;
+    async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()>;
 
     /// Get constraints for a plan
     async fn get_plan_constraints(&self, plan_id: Uuid) -> Result<Vec<ConstraintNode>>;
@@ -764,10 +732,7 @@ pub trait GraphStore: Send + Sync {
     async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)>;
 
     /// Get all task dependencies for a project (across all plans)
-    async fn get_project_task_dependencies(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(Uuid, Uuid)>>;
+    async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>>;
 
     /// Get all tasks for a project (across all plans)
     async fn get_project_tasks(&self, project_id: Uuid) -> Result<Vec<TaskNode>>;

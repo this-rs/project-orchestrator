@@ -4391,7 +4391,10 @@ mod tests {
 
         assert!(get_result.is_object());
         let plan = get_result.get("plan").unwrap();
-        assert_eq!(plan.get("title").unwrap().as_str().unwrap(), "Integration Test Plan");
+        assert_eq!(
+            plan.get("title").unwrap().as_str().unwrap(),
+            "Integration Test Plan"
+        );
     }
 
     // -- Project tools ------------------------------------------------------
@@ -4413,8 +4416,14 @@ mod tests {
             .unwrap();
 
         assert!(result.is_object());
-        assert_eq!(result.get("name").unwrap().as_str().unwrap(), "My Test Project");
-        assert_eq!(result.get("slug").unwrap().as_str().unwrap(), "my-test-project");
+        assert_eq!(
+            result.get("name").unwrap().as_str().unwrap(),
+            "My Test Project"
+        );
+        assert_eq!(
+            result.get("slug").unwrap().as_str().unwrap(),
+            "my-test-project"
+        );
         assert_eq!(
             result.get("root_path").unwrap().as_str().unwrap(),
             "/tmp/my-test-project"

@@ -179,7 +179,11 @@ impl SearchStore for MockSearchStore {
             })
             .collect();
         // Sort by descending score for consistent ordering
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         Ok(results)
     }
@@ -224,11 +228,7 @@ impl SearchStore for MockSearchStore {
         Ok(())
     }
 
-    async fn search_decisions(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<DecisionDocument>> {
+    async fn search_decisions(&self, query: &str, limit: usize) -> Result<Vec<DecisionDocument>> {
         let docs = self.decision_documents.read().await;
         let results: Vec<DecisionDocument> = docs
             .iter()
@@ -402,7 +402,11 @@ impl SearchStore for MockSearchStore {
                 }
             })
             .collect();
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         Ok(results)
     }
@@ -702,10 +706,7 @@ mod tests {
             .index_decision(&sample_decision_doc("d1", "task-99"))
             .await
             .unwrap();
-        store
-            .delete_decisions_for_task("task-99")
-            .await
-            .unwrap();
+        store.delete_decisions_for_task("task-99").await.unwrap();
 
         let results = store.search_decisions("async", 10).await.unwrap();
         assert!(results.is_empty());
@@ -832,10 +833,7 @@ mod tests {
     #[tokio::test]
     async fn test_index_notes_batch() {
         let store = MockSearchStore::new();
-        let docs = vec![
-            sample_note_doc("n1", "proj"),
-            sample_note_doc("n2", "proj"),
-        ];
+        let docs = vec![sample_note_doc("n1", "proj"), sample_note_doc("n2", "proj")];
         store.index_notes_batch(&docs).await.unwrap();
 
         let stats = store.get_notes_stats().await.unwrap();

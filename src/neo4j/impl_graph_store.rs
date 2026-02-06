@@ -284,10 +284,7 @@ impl GraphStore for Neo4jClient {
         self.get_resource_implementers(resource_id).await
     }
 
-    async fn get_resource_consumers(
-        &self,
-        resource_id: Uuid,
-    ) -> anyhow::Result<Vec<ProjectNode>> {
+    async fn get_resource_consumers(&self, resource_id: Uuid) -> anyhow::Result<Vec<ProjectNode>> {
         self.get_resource_consumers(resource_id).await
     }
 
@@ -380,11 +377,7 @@ impl GraphStore for Neo4jClient {
         self.delete_stale_files(project_id, valid_paths).await
     }
 
-    async fn link_file_to_project(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> anyhow::Result<()> {
         self.link_file_to_project(file_path, project_id).await
     }
 
@@ -494,10 +487,7 @@ impl GraphStore for Neo4jClient {
         self.get_file_functions_summary(path).await
     }
 
-    async fn get_file_structs_summary(
-        &self,
-        path: &str,
-    ) -> anyhow::Result<Vec<StructSummaryNode>> {
+    async fn get_file_structs_summary(&self, path: &str) -> anyhow::Result<Vec<StructSummaryNode>> {
         self.get_file_structs_summary(path).await
     }
 
@@ -618,11 +608,7 @@ impl GraphStore for Neo4jClient {
         self.update_plan_status(id, status).await
     }
 
-    async fn link_plan_to_project(
-        &self,
-        plan_id: Uuid,
-        project_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> anyhow::Result<()> {
         self.link_plan_to_project(plan_id, project_id).await
     }
 
@@ -664,11 +650,7 @@ impl GraphStore for Neo4jClient {
         self.find_blocked_tasks(plan_id).await
     }
 
-    async fn update_task_status(
-        &self,
-        task_id: Uuid,
-        status: TaskStatus,
-    ) -> anyhow::Result<()> {
+    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> anyhow::Result<()> {
         self.update_task_status(task_id, status).await
     }
 
@@ -676,11 +658,7 @@ impl GraphStore for Neo4jClient {
         self.assign_task(task_id, agent_id).await
     }
 
-    async fn add_task_dependency(
-        &self,
-        task_id: Uuid,
-        depends_on_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> anyhow::Result<()> {
         self.add_task_dependency(task_id, depends_on_id).await
     }
 
@@ -715,10 +693,7 @@ impl GraphStore for Neo4jClient {
         self.get_plan_critical_path(plan_id).await
     }
 
-    async fn get_next_available_task(
-        &self,
-        plan_id: Uuid,
-    ) -> anyhow::Result<Option<TaskNode>> {
+    async fn get_next_available_task(&self, plan_id: Uuid) -> anyhow::Result<Option<TaskNode>> {
         self.get_next_available_task(plan_id).await
     }
 
@@ -726,11 +701,7 @@ impl GraphStore for Neo4jClient {
         self.get_task(task_id).await
     }
 
-    async fn update_task(
-        &self,
-        task_id: Uuid,
-        updates: &UpdateTaskRequest,
-    ) -> anyhow::Result<()> {
+    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> anyhow::Result<()> {
         self.update_task(task_id, updates).await
     }
 
@@ -750,11 +721,7 @@ impl GraphStore for Neo4jClient {
         self.get_task_steps(task_id).await
     }
 
-    async fn update_step_status(
-        &self,
-        step_id: Uuid,
-        status: StepStatus,
-    ) -> anyhow::Result<()> {
+    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> anyhow::Result<()> {
         self.update_step_status(step_id, status).await
     }
 
@@ -782,17 +749,11 @@ impl GraphStore for Neo4jClient {
         self.create_constraint(plan_id, constraint).await
     }
 
-    async fn get_plan_constraints(
-        &self,
-        plan_id: Uuid,
-    ) -> anyhow::Result<Vec<ConstraintNode>> {
+    async fn get_plan_constraints(&self, plan_id: Uuid) -> anyhow::Result<Vec<ConstraintNode>> {
         self.get_plan_constraints(plan_id).await
     }
 
-    async fn get_constraint(
-        &self,
-        constraint_id: Uuid,
-    ) -> anyhow::Result<Option<ConstraintNode>> {
+    async fn get_constraint(&self, constraint_id: Uuid) -> anyhow::Result<Option<ConstraintNode>> {
         self.get_constraint(constraint_id).await
     }
 
@@ -815,18 +776,11 @@ impl GraphStore for Neo4jClient {
     // Decision operations
     // ========================================================================
 
-    async fn create_decision(
-        &self,
-        task_id: Uuid,
-        decision: &DecisionNode,
-    ) -> anyhow::Result<()> {
+    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> anyhow::Result<()> {
         self.create_decision(task_id, decision).await
     }
 
-    async fn get_decision(
-        &self,
-        decision_id: Uuid,
-    ) -> anyhow::Result<Option<DecisionNode>> {
+    async fn get_decision(&self, decision_id: Uuid) -> anyhow::Result<Option<DecisionNode>> {
         self.get_decision(decision_id).await
     }
 
@@ -865,11 +819,7 @@ impl GraphStore for Neo4jClient {
     // Task-file linking
     // ========================================================================
 
-    async fn link_task_to_files(
-        &self,
-        task_id: Uuid,
-        file_paths: &[String],
-    ) -> anyhow::Result<()> {
+    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> anyhow::Result<()> {
         self.link_task_to_files(task_id, file_paths).await
     }
 
@@ -885,19 +835,11 @@ impl GraphStore for Neo4jClient {
         self.get_commit(hash).await
     }
 
-    async fn link_commit_to_task(
-        &self,
-        commit_hash: &str,
-        task_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> anyhow::Result<()> {
         self.link_commit_to_task(commit_hash, task_id).await
     }
 
-    async fn link_commit_to_plan(
-        &self,
-        commit_hash: &str,
-        plan_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> anyhow::Result<()> {
         self.link_commit_to_plan(commit_hash, plan_id).await
     }
 
@@ -925,10 +867,7 @@ impl GraphStore for Neo4jClient {
         self.get_release(id).await
     }
 
-    async fn list_project_releases(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<ReleaseNode>> {
+    async fn list_project_releases(&self, project_id: Uuid) -> anyhow::Result<Vec<ReleaseNode>> {
         self.list_project_releases(project_id).await
     }
 
@@ -945,11 +884,7 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
-    async fn add_task_to_release(
-        &self,
-        release_id: Uuid,
-        task_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> anyhow::Result<()> {
         self.add_task_to_release(release_id, task_id).await
     }
 
@@ -1004,11 +939,7 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
-    async fn add_task_to_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> anyhow::Result<()> {
         self.add_task_to_milestone(milestone_id, task_id).await
     }
 
@@ -1019,10 +950,7 @@ impl GraphStore for Neo4jClient {
         self.get_milestone_details(milestone_id).await
     }
 
-    async fn get_milestone_progress(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<(u32, u32)> {
+    async fn get_milestone_progress(&self, milestone_id: Uuid) -> anyhow::Result<(u32, u32)> {
         self.get_milestone_progress(milestone_id).await
     }
 
@@ -1030,10 +958,7 @@ impl GraphStore for Neo4jClient {
         self.delete_milestone(milestone_id).await
     }
 
-    async fn get_milestone_tasks(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<Vec<TaskNode>> {
+    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
         self.get_milestone_tasks(milestone_id).await
     }
 
@@ -1045,10 +970,7 @@ impl GraphStore for Neo4jClient {
     // Project stats
     // ========================================================================
 
-    async fn get_project_progress(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<(u32, u32, u32, u32)> {
+    async fn get_project_progress(&self, project_id: Uuid) -> anyhow::Result<(u32, u32, u32, u32)> {
         self.get_project_progress(project_id).await
     }
 
@@ -1248,11 +1170,7 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
-    async fn supersede_note(
-        &self,
-        old_note_id: Uuid,
-        new_note_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn supersede_note(&self, old_note_id: Uuid, new_note_id: Uuid) -> anyhow::Result<()> {
         self.supersede_note(old_note_id, new_note_id).await
     }
 

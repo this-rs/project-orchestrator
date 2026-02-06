@@ -644,7 +644,10 @@ mod tests {
         mgr.create_note(req_b, "agent-1").await.unwrap();
 
         let filters = NoteFilters::default();
-        let (notes, total) = mgr.list_project_notes(project_a.id, &filters).await.unwrap();
+        let (notes, total) = mgr
+            .list_project_notes(project_a.id, &filters)
+            .await
+            .unwrap();
 
         assert_eq!(total, 1);
         assert_eq!(notes.len(), 1);
@@ -709,7 +712,11 @@ mod tests {
         let req = make_create_request(pid, "Confirm me");
         let note = mgr.create_note(req, "agent-1").await.unwrap();
 
-        let confirmed = mgr.confirm_note(note.id, "reviewer").await.unwrap().unwrap();
+        let confirmed = mgr
+            .confirm_note(note.id, "reviewer")
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(confirmed.staleness_score, 0.0);
         assert_eq!(confirmed.last_confirmed_by, Some("reviewer".to_string()));
@@ -846,6 +853,9 @@ mod tests {
         assert_eq!(ctx.direct_notes.len(), 1);
         assert_eq!(ctx.direct_notes[0].id, note.id);
         // Propagated notes may be empty in the mock (no graph traversal)
-        assert_eq!(ctx.total_count, ctx.direct_notes.len() + ctx.propagated_notes.len());
+        assert_eq!(
+            ctx.total_count,
+            ctx.direct_notes.len() + ctx.propagated_notes.len()
+        );
     }
 }

@@ -409,7 +409,11 @@ mod tests {
         }
 
         let plans = pm.list_active_plans().await.unwrap();
-        assert_eq!(plans.len(), 3, "Expected all 3 plans to be listed as active (Draft status)");
+        assert_eq!(
+            plans.len(),
+            3,
+            "Expected all 3 plans to be listed as active (Draft status)"
+        );
 
         // All should be Draft
         for plan in &plans {
@@ -722,7 +726,10 @@ mod tests {
         assert_eq!(details.steps.len(), 1);
         assert_eq!(details.decisions.len(), 1);
         assert_eq!(details.decisions[0].description, "Use REST over gRPC");
-        assert_eq!(details.decisions[0].rationale, "Simpler for frontend integration");
+        assert_eq!(
+            details.decisions[0].rationale,
+            "Simpler for frontend integration"
+        );
         assert_eq!(details.decisions[0].chosen_option, Some("REST".to_string()));
         assert!(details.depends_on.is_empty());
     }
@@ -1209,7 +1216,10 @@ mod tests {
 
         // Verify constraints
         assert_eq!(details.constraints.len(), 1);
-        assert_eq!(details.constraints[0].constraint_type, ConstraintType::Style);
+        assert_eq!(
+            details.constraints[0].constraint_type,
+            ConstraintType::Style
+        );
         assert_eq!(
             details.constraints[0].enforced_by,
             Some("rustfmt".to_string())
@@ -1219,7 +1229,11 @@ mod tests {
         assert_eq!(details.tasks.len(), 2);
 
         // Find task1 in details
-        let t1_details = details.tasks.iter().find(|t| t.task.id == task1.id).unwrap();
+        let t1_details = details
+            .tasks
+            .iter()
+            .find(|t| t.task.id == task1.id)
+            .unwrap();
         assert_eq!(t1_details.steps.len(), 1);
         assert!(t1_details.depends_on.is_empty());
 
