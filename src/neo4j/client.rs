@@ -837,7 +837,7 @@ impl Neo4jClient {
         }
     }
 
-    /// List workspace milestones
+    /// List workspace milestones (unpaginated, used internally)
     pub async fn list_workspace_milestones(
         &self,
         workspace_id: Uuid,
@@ -860,6 +860,144 @@ impl Neo4jClient {
         }
 
         Ok(milestones)
+    }
+
+    /// List workspace milestones with pagination and status filter
+    ///
+    /// Returns (milestones, total_count)
+    pub async fn list_workspace_milestones_filtered(
+        &self,
+        workspace_id: Uuid,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)> {
+        let status_filter = if let Some(s) = status {
+            let pascal = snake_to_pascal_case(s);
+            format!("WHERE wm.status = '{}'", pascal)
+        } else {
+            String::new()
+        };
+
+        let count_cypher = format!(
+            "MATCH (w:Workspace {{id: $workspace_id}})-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone) {} RETURN count(wm) AS total",
+            status_filter
+        );
+        let mut count_stream = self
+            .graph
+            .execute(query(&count_cypher).param("workspace_id", workspace_id.to_string()))
+            .await?;
+        let total: i64 = if let Some(row) = count_stream.next().await? {
+            row.get("total")?
+        } else {
+            0
+        };
+
+        let data_cypher = format!(
+            r#"
+            MATCH (w:Workspace {{id: $workspace_id}})-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone)
+            {}
+            RETURN wm
+            ORDER BY wm.target_date, wm.title
+            SKIP {}
+            LIMIT {}
+            "#,
+            status_filter, offset, limit
+        );
+
+        let mut result = self
+            .graph
+            .execute(query(&data_cypher).param("workspace_id", workspace_id.to_string()))
+            .await?;
+        let mut milestones = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("wm")?;
+            milestones.push(self.node_to_workspace_milestone(&node)?);
+        }
+
+        Ok((milestones, total as usize))
+    }
+
+    /// List all workspace milestones across all workspaces with filters and pagination
+    ///
+    /// Returns (milestones_with_workspace_info, total_count)
+    pub async fn list_all_workspace_milestones_filtered(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(WorkspaceMilestoneNode, String, String, String)>> {
+        let mut conditions = Vec::new();
+        if let Some(wid) = workspace_id {
+            conditions.push(format!("w.id = '{}'", wid));
+        }
+        if let Some(s) = status {
+            let pascal = snake_to_pascal_case(s);
+            conditions.push(format!("wm.status = '{}'", pascal));
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let cypher = format!(
+            r#"
+            MATCH (w:Workspace)-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone)
+            {}
+            RETURN wm, w.id AS workspace_id, w.name AS workspace_name, w.slug AS workspace_slug
+            ORDER BY wm.target_date, wm.title
+            SKIP {}
+            LIMIT {}
+            "#,
+            where_clause, offset, limit
+        );
+
+        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut items = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("wm")?;
+            let wid: String = row.get("workspace_id")?;
+            let wname: String = row.get("workspace_name")?;
+            let wslug: String = row.get("workspace_slug")?;
+            items.push((self.node_to_workspace_milestone(&node)?, wid, wname, wslug));
+        }
+
+        Ok(items)
+    }
+
+    /// Count all workspace milestones across workspaces with optional filters
+    pub async fn count_all_workspace_milestones(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+    ) -> Result<usize> {
+        let mut conditions = Vec::new();
+        if let Some(wid) = workspace_id {
+            conditions.push(format!("w.id = '{}'", wid));
+        }
+        if let Some(s) = status {
+            let pascal = snake_to_pascal_case(s);
+            conditions.push(format!("wm.status = '{}'", pascal));
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let cypher = format!(
+            "MATCH (w:Workspace)-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone) {} RETURN count(wm) AS total",
+            where_clause
+        );
+        let count_result = self.execute(&cypher).await?;
+        let total: i64 = count_result
+            .first()
+            .and_then(|r| r.get("total").ok())
+            .unwrap_or(0);
+
+        Ok(total as usize)
     }
 
     /// Update a workspace milestone
@@ -4754,6 +4892,7 @@ impl Neo4jClient {
     #[allow(clippy::too_many_arguments)]
     pub async fn list_plans_filtered(
         &self,
+        project_id: Option<Uuid>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -4778,8 +4917,17 @@ impl Neo4jClient {
         };
         let order_dir = if sort_order == "asc" { "ASC" } else { "DESC" };
 
+        let match_clause = if let Some(pid) = project_id {
+            format!(
+                "MATCH (proj:Project {{id: '{}'}})-[:HAS_PLAN]->(p:Plan)",
+                pid
+            )
+        } else {
+            "MATCH (p:Plan)".to_string()
+        };
+
         // Count query
-        let count_cypher = format!("MATCH (p:Plan) {} RETURN count(p) AS total", where_clause);
+        let count_cypher = format!("{} {} RETURN count(p) AS total", match_clause, where_clause);
         let count_result = self.execute(&count_cypher).await?;
         let total: i64 = count_result
             .first()
@@ -4789,14 +4937,14 @@ impl Neo4jClient {
         // Data query
         let cypher = format!(
             r#"
-            MATCH (p:Plan)
+            {}
             {}
             RETURN p
             ORDER BY {} {}
             SKIP {}
             LIMIT {}
             "#,
-            where_clause, order_field, order_dir, offset, limit
+            match_clause, where_clause, order_field, order_dir, offset, limit
         );
 
         let mut result = self.graph.execute(query(&cypher)).await?;
