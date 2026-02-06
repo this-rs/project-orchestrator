@@ -279,3 +279,963 @@ impl PlanManager {
         self.neo4j.find_blocked_tasks(plan_id).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::*;
+
+    fn create_plan_manager() -> PlanManager {
+        let state = mock_app_state();
+        PlanManager::new(state.neo4j.clone(), state.meili.clone())
+    }
+
+    // =========================================================================
+    // Plan CRUD
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_create_plan() {
+        let pm = create_plan_manager();
+        let req = CreatePlanRequest {
+            title: "Test Plan".to_string(),
+            description: "A plan for testing".to_string(),
+            project_id: None,
+            priority: Some(5),
+            constraints: None,
+        };
+
+        let plan = pm.create_plan(req, "test-agent").await.unwrap();
+        assert_eq!(plan.title, "Test Plan");
+        assert_eq!(plan.description, "A plan for testing");
+        assert_eq!(plan.created_by, "test-agent");
+        assert_eq!(plan.priority, 5);
+        assert_eq!(plan.status, PlanStatus::Draft);
+        assert!(plan.project_id.is_none());
+
+        // Verify it can be fetched back
+        let fetched = pm.get_plan(plan.id).await.unwrap();
+        assert!(fetched.is_some());
+        let fetched = fetched.unwrap();
+        assert_eq!(fetched.id, plan.id);
+        assert_eq!(fetched.title, "Test Plan");
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_with_constraints() {
+        let pm = create_plan_manager();
+        let req = CreatePlanRequest {
+            title: "Constrained Plan".to_string(),
+            description: "Plan with constraints".to_string(),
+            project_id: None,
+            priority: Some(8),
+            constraints: Some(vec![
+                CreateConstraintRequest {
+                    constraint_type: ConstraintType::Performance,
+                    description: "Response time under 100ms".to_string(),
+                    enforced_by: Some("benchmark".to_string()),
+                },
+                CreateConstraintRequest {
+                    constraint_type: ConstraintType::Security,
+                    description: "Sanitize all user input".to_string(),
+                    enforced_by: None,
+                },
+            ]),
+        };
+
+        let plan = pm.create_plan(req, "architect").await.unwrap();
+        assert_eq!(plan.title, "Constrained Plan");
+
+        // Verify constraints were stored via get_plan_details
+        let details = pm.get_plan_details(plan.id).await.unwrap().unwrap();
+        assert_eq!(
+            details.constraints.len(),
+            2,
+            "Expected 2 constraints to be stored"
+        );
+
+        let types: Vec<ConstraintType> = details
+            .constraints
+            .iter()
+            .map(|c| c.constraint_type.clone())
+            .collect();
+        assert!(types.contains(&ConstraintType::Performance));
+        assert!(types.contains(&ConstraintType::Security));
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_for_project() {
+        let pm = create_plan_manager();
+        let project_id = Uuid::new_v4();
+
+        let req = CreatePlanRequest {
+            title: "Project Plan".to_string(),
+            description: "Linked to a project".to_string(),
+            project_id: Some(project_id),
+            priority: Some(3),
+            constraints: None,
+        };
+
+        let plan = pm.create_plan(req, "agent").await.unwrap();
+        assert_eq!(plan.project_id, Some(project_id));
+
+        let fetched = pm.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(fetched.project_id, Some(project_id));
+    }
+
+    #[tokio::test]
+    async fn test_get_plan_not_found() {
+        let pm = create_plan_manager();
+        let nonexistent_id = Uuid::new_v4();
+
+        let result = pm.get_plan(nonexistent_id).await.unwrap();
+        assert!(result.is_none(), "Expected None for non-existent plan ID");
+    }
+
+    #[tokio::test]
+    async fn test_list_active_plans() {
+        let pm = create_plan_manager();
+
+        // Create several plans
+        for i in 0..3 {
+            let req = CreatePlanRequest {
+                title: format!("Plan {}", i),
+                description: format!("Description {}", i),
+                project_id: None,
+                priority: Some(i),
+                constraints: None,
+            };
+            pm.create_plan(req, "agent").await.unwrap();
+        }
+
+        let plans = pm.list_active_plans().await.unwrap();
+        assert_eq!(plans.len(), 3, "Expected all 3 plans to be listed as active (Draft status)");
+
+        // All should be Draft
+        for plan in &plans {
+            assert_eq!(plan.status, PlanStatus::Draft);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_plan_status() {
+        let pm = create_plan_manager();
+        let req = CreatePlanRequest {
+            title: "Status Test".to_string(),
+            description: "Will update status".to_string(),
+            project_id: None,
+            priority: Some(1),
+            constraints: None,
+        };
+        let plan = pm.create_plan(req, "agent").await.unwrap();
+
+        // Update to InProgress
+        pm.update_plan_status(plan.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+
+        let fetched = pm.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, PlanStatus::InProgress);
+
+        // Update to Completed
+        pm.update_plan_status(plan.id, PlanStatus::Completed)
+            .await
+            .unwrap();
+
+        let fetched = pm.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, PlanStatus::Completed);
+
+        // Completed plans should not appear in list_active_plans
+        let active = pm.list_active_plans().await.unwrap();
+        assert!(
+            active.iter().all(|p| p.id != plan.id),
+            "Completed plan should not appear in active plans"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_plan() {
+        let pm = create_plan_manager();
+        let req = CreatePlanRequest {
+            title: "Delete Me".to_string(),
+            description: "Will be deleted".to_string(),
+            project_id: None,
+            priority: Some(1),
+            constraints: None,
+        };
+        let plan = pm.create_plan(req, "agent").await.unwrap();
+
+        // Verify it exists
+        assert!(pm.get_plan(plan.id).await.unwrap().is_some());
+
+        // Delete it
+        pm.delete_plan(plan.id).await.unwrap();
+
+        // Verify it's gone
+        assert!(
+            pm.get_plan(plan.id).await.unwrap().is_none(),
+            "Plan should be deleted"
+        );
+    }
+
+    // =========================================================================
+    // Task CRUD
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_add_task() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let task_req = CreateTaskRequest {
+            title: Some("Implement feature".to_string()),
+            description: "Add the new endpoint".to_string(),
+            priority: Some(7),
+            tags: Some(vec!["backend".to_string(), "api".to_string()]),
+            acceptance_criteria: Some(vec!["Tests pass".to_string()]),
+            affected_files: Some(vec!["src/api/routes.rs".to_string()]),
+            depends_on: None,
+            steps: None,
+            estimated_complexity: Some(4),
+        };
+
+        let task = pm.add_task(plan.id, task_req).await.unwrap();
+        assert_eq!(task.title, Some("Implement feature".to_string()));
+        assert_eq!(task.description, "Add the new endpoint");
+        assert_eq!(task.priority, Some(7));
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.tags, vec!["backend", "api"]);
+        assert_eq!(task.acceptance_criteria, vec!["Tests pass"]);
+        assert_eq!(task.affected_files, vec!["src/api/routes.rs"]);
+        assert_eq!(task.estimated_complexity, Some(4));
+
+        // Verify task appears in plan details
+        let details = pm.get_plan_details(plan.id).await.unwrap().unwrap();
+        assert_eq!(details.tasks.len(), 1);
+        assert_eq!(details.tasks[0].task.id, task.id);
+    }
+
+    #[tokio::test]
+    async fn test_add_task_with_steps() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let task_req = CreateTaskRequest {
+            title: Some("Multi-step task".to_string()),
+            description: "Task with steps".to_string(),
+            priority: None,
+            tags: None,
+            acceptance_criteria: None,
+            affected_files: None,
+            depends_on: None,
+            steps: Some(vec![
+                CreateStepRequest {
+                    description: "Write the code".to_string(),
+                    verification: Some("cargo check passes".to_string()),
+                },
+                CreateStepRequest {
+                    description: "Write tests".to_string(),
+                    verification: Some("cargo test passes".to_string()),
+                },
+                CreateStepRequest {
+                    description: "Update docs".to_string(),
+                    verification: None,
+                },
+            ]),
+            estimated_complexity: None,
+        };
+
+        let task = pm.add_task(plan.id, task_req).await.unwrap();
+
+        // Verify steps via task details
+        let details = pm.get_task_details(task.id).await.unwrap().unwrap();
+        assert_eq!(details.steps.len(), 3, "Expected 3 steps");
+
+        // Steps should be ordered
+        assert_eq!(details.steps[0].order, 0);
+        assert_eq!(details.steps[0].description, "Write the code");
+        assert_eq!(
+            details.steps[0].verification,
+            Some("cargo check passes".to_string())
+        );
+
+        assert_eq!(details.steps[1].order, 1);
+        assert_eq!(details.steps[1].description, "Write tests");
+
+        assert_eq!(details.steps[2].order, 2);
+        assert!(details.steps[2].verification.is_none());
+
+        // All steps should be pending
+        for step in &details.steps {
+            assert_eq!(step.status, StepStatus::Pending);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_task_with_dependencies() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        // Create task A (no deps)
+        let task_a = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task A".to_string()),
+                    description: "First task".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Create task B that depends on A
+        let task_b = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task B".to_string()),
+                    description: "Depends on A".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: Some(vec![task_a.id]),
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify dependency via task details
+        let details_b = pm.get_task_details(task_b.id).await.unwrap().unwrap();
+        assert!(
+            details_b.depends_on.contains(&task_a.id),
+            "Task B should depend on Task A"
+        );
+
+        // Task A should have no dependencies
+        let details_a = pm.get_task_details(task_a.id).await.unwrap().unwrap();
+        assert!(
+            details_a.depends_on.is_empty(),
+            "Task A should have no dependencies"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_details() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Detailed Task".to_string()),
+                    description: "Full details".to_string(),
+                    priority: Some(5),
+                    tags: Some(vec!["feature".to_string()]),
+                    acceptance_criteria: Some(vec!["Works correctly".to_string()]),
+                    affected_files: None,
+                    depends_on: None,
+                    steps: Some(vec![CreateStepRequest {
+                        description: "Step 1".to_string(),
+                        verification: None,
+                    }]),
+                    estimated_complexity: Some(3),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Add a decision to the task
+        pm.add_decision(
+            task.id,
+            CreateDecisionRequest {
+                description: "Use REST over gRPC".to_string(),
+                rationale: "Simpler for frontend integration".to_string(),
+                alternatives: Some(vec!["gRPC".to_string(), "GraphQL".to_string()]),
+                chosen_option: Some("REST".to_string()),
+            },
+            "architect",
+        )
+        .await
+        .unwrap();
+
+        let details = pm.get_task_details(task.id).await.unwrap().unwrap();
+        assert_eq!(details.task.title, Some("Detailed Task".to_string()));
+        assert_eq!(details.steps.len(), 1);
+        assert_eq!(details.decisions.len(), 1);
+        assert_eq!(details.decisions[0].description, "Use REST over gRPC");
+        assert_eq!(details.decisions[0].rationale, "Simpler for frontend integration");
+        assert_eq!(details.decisions[0].chosen_option, Some("REST".to_string()));
+        assert!(details.depends_on.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_task_details_not_found() {
+        let pm = create_plan_manager();
+        let result = pm.get_task_details(Uuid::new_v4()).await.unwrap();
+        assert!(result.is_none(), "Expected None for non-existent task");
+    }
+
+    #[tokio::test]
+    async fn test_update_task() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Original Title".to_string()),
+                    description: "Original description".to_string(),
+                    priority: Some(3),
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Update multiple fields
+        pm.update_task(
+            task.id,
+            UpdateTaskRequest {
+                title: Some("Updated Title".to_string()),
+                status: Some(TaskStatus::InProgress),
+                assigned_to: Some("agent-1".to_string()),
+                priority: Some(9),
+                tags: Some(vec!["urgent".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let details = pm.get_task_details(task.id).await.unwrap().unwrap();
+        assert_eq!(details.task.title, Some("Updated Title".to_string()));
+        assert_eq!(details.task.status, TaskStatus::InProgress);
+        assert_eq!(details.task.assigned_to, Some("agent-1".to_string()));
+        assert_eq!(details.task.priority, Some(9));
+        assert_eq!(details.task.tags, vec!["urgent"]);
+        assert!(
+            details.task.started_at.is_some(),
+            "started_at should be set when transitioning to InProgress"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_task() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Doomed Task".to_string()),
+                    description: "Will be deleted".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: Some(vec![CreateStepRequest {
+                        description: "Step".to_string(),
+                        verification: None,
+                    }]),
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify it exists
+        assert!(pm.get_task_details(task.id).await.unwrap().is_some());
+
+        // Delete it
+        pm.delete_task(task.id).await.unwrap();
+
+        // Verify it's gone
+        assert!(
+            pm.get_task_details(task.id).await.unwrap().is_none(),
+            "Task should be deleted"
+        );
+    }
+
+    // =========================================================================
+    // Task Dependencies & Ordering
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_next_available_task() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        // Task A: no dependencies
+        let task_a = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task A".to_string()),
+                    description: "No deps".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Task B: depends on A
+        let _task_b = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task B".to_string()),
+                    description: "Depends on A".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: Some(vec![task_a.id]),
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Next available should be Task A (B is blocked)
+        let next = pm.get_next_available_task(plan.id).await.unwrap();
+        assert!(next.is_some());
+        let next = next.unwrap();
+        assert_eq!(
+            next.id, task_a.id,
+            "Task A should be the next available task since it has no deps"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_next_available_task_after_completion() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        // Task A: no deps
+        let task_a = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task A".to_string()),
+                    description: "First".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Task B: depends on A
+        let task_b = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task B".to_string()),
+                    description: "Second".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: Some(vec![task_a.id]),
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Complete Task A
+        pm.update_task(
+            task_a.id,
+            UpdateTaskRequest {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Now Task B should be available
+        let next = pm.get_next_available_task(plan.id).await.unwrap();
+        assert!(next.is_some());
+        assert_eq!(
+            next.unwrap().id,
+            task_b.id,
+            "Task B should become available after Task A is completed"
+        );
+    }
+
+    // =========================================================================
+    // Decisions
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_add_decision() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task".to_string()),
+                    description: "Task desc".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let decision = pm
+            .add_decision(
+                task.id,
+                CreateDecisionRequest {
+                    description: "Use Tokio runtime".to_string(),
+                    rationale: "Best async runtime for Rust".to_string(),
+                    alternatives: Some(vec!["async-std".to_string(), "smol".to_string()]),
+                    chosen_option: Some("tokio".to_string()),
+                },
+                "engineer",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(decision.description, "Use Tokio runtime");
+        assert_eq!(decision.rationale, "Best async runtime for Rust");
+        assert_eq!(decision.alternatives, vec!["async-std", "smol"]);
+        assert_eq!(decision.chosen_option, Some("tokio".to_string()));
+        assert_eq!(decision.decided_by, "engineer");
+
+        // Verify it appears in task details
+        let details = pm.get_task_details(task.id).await.unwrap().unwrap();
+        assert_eq!(details.decisions.len(), 1);
+        assert_eq!(details.decisions[0].id, decision.id);
+    }
+
+    #[tokio::test]
+    async fn test_search_decisions() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task".to_string()),
+                    description: "Task desc".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Add decisions
+        pm.add_decision(
+            task.id,
+            CreateDecisionRequest {
+                description: "Adopt microservices architecture".to_string(),
+                rationale: "Better scalability".to_string(),
+                alternatives: None,
+                chosen_option: None,
+            },
+            "architect",
+        )
+        .await
+        .unwrap();
+
+        pm.add_decision(
+            task.id,
+            CreateDecisionRequest {
+                description: "Use PostgreSQL database".to_string(),
+                rationale: "Strong ACID compliance".to_string(),
+                alternatives: None,
+                chosen_option: None,
+            },
+            "architect",
+        )
+        .await
+        .unwrap();
+
+        // Search for "microservices" should find first decision
+        let results = pm.search_decisions("microservices", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].description, "Adopt microservices architecture");
+
+        // Search for "database" should find second decision (via description)
+        let results = pm.search_decisions("database", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Search for something not present
+        let results = pm.search_decisions("nonexistent", 10).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // =========================================================================
+    // Plan Details
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_plan_details() {
+        let pm = create_plan_manager();
+
+        // Create plan with constraints
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Full Plan".to_string(),
+                    description: "Plan with everything".to_string(),
+                    project_id: None,
+                    priority: Some(8),
+                    constraints: Some(vec![CreateConstraintRequest {
+                        constraint_type: ConstraintType::Style,
+                        description: "Follow Rust conventions".to_string(),
+                        enforced_by: Some("rustfmt".to_string()),
+                    }]),
+                },
+                "architect",
+            )
+            .await
+            .unwrap();
+
+        // Add tasks
+        let task1 = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task 1".to_string()),
+                    description: "First task".to_string(),
+                    priority: Some(5),
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: Some(vec![CreateStepRequest {
+                        description: "Step 1".to_string(),
+                        verification: None,
+                    }]),
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let _task2 = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task 2".to_string()),
+                    description: "Second task".to_string(),
+                    priority: Some(3),
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: Some(vec![task1.id]),
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Get full details
+        let details = pm.get_plan_details(plan.id).await.unwrap().unwrap();
+
+        // Verify plan
+        assert_eq!(details.plan.title, "Full Plan");
+        assert_eq!(details.plan.priority, 8);
+
+        // Verify constraints
+        assert_eq!(details.constraints.len(), 1);
+        assert_eq!(details.constraints[0].constraint_type, ConstraintType::Style);
+        assert_eq!(
+            details.constraints[0].enforced_by,
+            Some("rustfmt".to_string())
+        );
+
+        // Verify tasks
+        assert_eq!(details.tasks.len(), 2);
+
+        // Find task1 in details
+        let t1_details = details.tasks.iter().find(|t| t.task.id == task1.id).unwrap();
+        assert_eq!(t1_details.steps.len(), 1);
+        assert!(t1_details.depends_on.is_empty());
+
+        // Find task2 in details
+        let t2_details = details
+            .tasks
+            .iter()
+            .find(|t| t.task.title == Some("Task 2".to_string()))
+            .unwrap();
+        assert!(t2_details.depends_on.contains(&task1.id));
+    }
+
+    #[tokio::test]
+    async fn test_get_plan_details_not_found() {
+        let pm = create_plan_manager();
+        let result = pm.get_plan_details(Uuid::new_v4()).await.unwrap();
+        assert!(result.is_none(), "Expected None for non-existent plan");
+    }
+}

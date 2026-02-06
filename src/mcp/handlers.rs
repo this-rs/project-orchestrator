@@ -4322,4 +4322,324 @@ mod tests {
         assert!(slug.is_err());
         assert!(slug.unwrap_err().to_string().contains("slug is required"));
     }
+
+    // ========================================================================
+    // Async integration tests (mock backends)
+    // ========================================================================
+
+    use crate::orchestrator::Orchestrator;
+    use crate::test_helpers::mock_app_state;
+
+    async fn create_handler() -> ToolHandler {
+        let state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    // -- Basic tool routing -------------------------------------------------
+
+    #[tokio::test]
+    async fn test_unknown_tool() {
+        let handler = create_handler().await;
+        let result = handler.handle("nonexistent_tool", None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown tool: nonexistent_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_list_plans_empty() {
+        let handler = create_handler().await;
+        let result = handler.handle("list_plans", Some(json!({}))).await.unwrap();
+        assert!(result.is_object());
+        let items = result.get("items").unwrap().as_array().unwrap();
+        assert!(items.is_empty());
+        assert_eq!(result.get("total").unwrap().as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_plan() {
+        let handler = create_handler().await;
+
+        // Create a plan
+        let create_result = handler
+            .handle(
+                "create_plan",
+                Some(json!({
+                    "title": "Integration Test Plan",
+                    "description": "Testing plan creation via MCP handler"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(create_result.is_object());
+        let plan_id = create_result.get("id").unwrap().as_str().unwrap();
+        assert!(!plan_id.is_empty());
+        assert_eq!(
+            create_result.get("title").unwrap().as_str().unwrap(),
+            "Integration Test Plan"
+        );
+
+        // Get the plan back
+        let get_result = handler
+            .handle("get_plan", Some(json!({"plan_id": plan_id})))
+            .await
+            .unwrap();
+
+        assert!(get_result.is_object());
+        let plan = get_result.get("plan").unwrap();
+        assert_eq!(plan.get("title").unwrap().as_str().unwrap(), "Integration Test Plan");
+    }
+
+    // -- Project tools ------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_project() {
+        let handler = create_handler().await;
+
+        let result = handler
+            .handle(
+                "create_project",
+                Some(json!({
+                    "name": "My Test Project",
+                    "slug": "my-test-project",
+                    "root_path": "/tmp/my-test-project"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_object());
+        assert_eq!(result.get("name").unwrap().as_str().unwrap(), "My Test Project");
+        assert_eq!(result.get("slug").unwrap().as_str().unwrap(), "my-test-project");
+        assert_eq!(
+            result.get("root_path").unwrap().as_str().unwrap(),
+            "/tmp/my-test-project"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_project_not_found() {
+        let handler = create_handler().await;
+
+        let result = handler
+            .handle("get_project", Some(json!({"slug": "nonexistent"})))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Project not found"));
+    }
+
+    // -- Task tools ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_task() {
+        let handler = create_handler().await;
+
+        // Create plan first
+        let plan = handler
+            .handle(
+                "create_plan",
+                Some(json!({
+                    "title": "Plan for Tasks",
+                    "description": "Plan to hold tasks"
+                })),
+            )
+            .await
+            .unwrap();
+        let plan_id = plan.get("id").unwrap().as_str().unwrap();
+
+        // Create task
+        let task = handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": plan_id,
+                    "title": "First Task",
+                    "description": "Implement feature X"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(task.is_object());
+        assert_eq!(task.get("title").unwrap().as_str().unwrap(), "First Task");
+        assert_eq!(
+            task.get("description").unwrap().as_str().unwrap(),
+            "Implement feature X"
+        );
+        assert_eq!(task.get("status").unwrap().as_str().unwrap(), "pending");
+    }
+
+    #[tokio::test]
+    async fn test_get_next_task() {
+        let handler = create_handler().await;
+
+        // Create plan
+        let plan = handler
+            .handle(
+                "create_plan",
+                Some(json!({
+                    "title": "Plan with Tasks",
+                    "description": "Plan for next-task test"
+                })),
+            )
+            .await
+            .unwrap();
+        let plan_id = plan.get("id").unwrap().as_str().unwrap();
+
+        // Create two tasks
+        handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": plan_id,
+                    "title": "Task A",
+                    "description": "First task"
+                })),
+            )
+            .await
+            .unwrap();
+
+        handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": plan_id,
+                    "title": "Task B",
+                    "description": "Second task"
+                })),
+            )
+            .await
+            .unwrap();
+
+        // Get next task — should return one of the pending tasks
+        let next = handler
+            .handle("get_next_task", Some(json!({"plan_id": plan_id})))
+            .await
+            .unwrap();
+
+        // get_next_task returns a task or null
+        assert!(next.is_object() || next.is_null());
+        if next.is_object() {
+            assert_eq!(next.get("status").unwrap().as_str().unwrap(), "pending");
+        }
+    }
+
+    // -- Step tools ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_and_list_steps() {
+        let handler = create_handler().await;
+
+        // Create plan + task
+        let plan = handler
+            .handle(
+                "create_plan",
+                Some(json!({
+                    "title": "Step Test Plan",
+                    "description": "Plan for step tests"
+                })),
+            )
+            .await
+            .unwrap();
+        let plan_id = plan.get("id").unwrap().as_str().unwrap();
+
+        let task = handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": plan_id,
+                    "title": "Task with Steps",
+                    "description": "A task that has steps"
+                })),
+            )
+            .await
+            .unwrap();
+        let task_id = task.get("id").unwrap().as_str().unwrap();
+
+        // Create two steps
+        let step1 = handler
+            .handle(
+                "create_step",
+                Some(json!({
+                    "task_id": task_id,
+                    "description": "Step one: setup"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            step1.get("description").unwrap().as_str().unwrap(),
+            "Step one: setup"
+        );
+        assert_eq!(step1.get("order").unwrap().as_u64().unwrap(), 0);
+
+        let step2 = handler
+            .handle(
+                "create_step",
+                Some(json!({
+                    "task_id": task_id,
+                    "description": "Step two: implement"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(step2.get("order").unwrap().as_u64().unwrap(), 1);
+
+        // List steps
+        let steps = handler
+            .handle("list_steps", Some(json!({"task_id": task_id})))
+            .await
+            .unwrap();
+
+        let steps_arr = steps.as_array().unwrap();
+        assert_eq!(steps_arr.len(), 2);
+    }
+
+    // -- Error handling -----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_missing_required_arg() {
+        let handler = create_handler().await;
+
+        // create_plan requires "title" and "description"
+        let result = handler
+            .handle("create_plan", Some(json!({"title": "No desc"})))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("description is required"));
+
+        // create_task requires "plan_id" and "description"
+        let result = handler
+            .handle(
+                "create_task",
+                Some(json!({"description": "Missing plan_id"})),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("plan_id is required"));
+
+        // create_project requires "name" and "root_path"
+        let result = handler
+            .handle("create_project", Some(json!({"name": "test"})))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("root_path is required"));
+    }
 }
