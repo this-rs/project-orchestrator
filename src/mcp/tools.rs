@@ -2162,4 +2162,79 @@ mod tests {
         assert!(names.contains(&"update_resource"));
         assert!(names.contains(&"update_component"));
     }
+
+    #[test]
+    fn test_list_all_workspace_milestones_tool_exists() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "list_all_workspace_milestones");
+        assert!(
+            tool.is_some(),
+            "list_all_workspace_milestones tool must exist"
+        );
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_tool_properties() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "list_all_workspace_milestones")
+            .unwrap();
+
+        let props = tool.input_schema.properties.as_ref().unwrap();
+        assert!(props.get("workspace_id").is_some());
+        assert!(props.get("status").is_some());
+        assert!(props.get("limit").is_some());
+        assert!(props.get("offset").is_some());
+
+        // No required params - all optional
+        assert!(tool.input_schema.required.is_none());
+    }
+
+    #[test]
+    fn test_list_all_workspace_milestones_in_workspace_tools() {
+        let tools = workspace_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"list_all_workspace_milestones"),
+            "list_all_workspace_milestones should be in workspace tools"
+        );
+    }
+
+    #[test]
+    fn test_list_plans_tool_has_project_id() {
+        let tools = all_tools();
+        let tool = tools.iter().find(|t| t.name == "list_plans").unwrap();
+
+        let props = tool.input_schema.properties.as_ref().unwrap();
+        assert!(
+            props.get("project_id").is_some(),
+            "list_plans tool must have project_id parameter"
+        );
+
+        // project_id should be a string type
+        let project_id_schema = props.get("project_id").unwrap();
+        assert_eq!(project_id_schema["type"], "string");
+    }
+
+    #[test]
+    fn test_list_workspace_milestones_tool_has_pagination() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "list_workspace_milestones")
+            .unwrap();
+
+        let props = tool.input_schema.properties.as_ref().unwrap();
+        assert!(props.get("slug").is_some());
+        assert!(props.get("status").is_some());
+        assert!(props.get("limit").is_some());
+        assert!(props.get("offset").is_some());
+
+        // slug is required
+        let required = tool.input_schema.required.as_ref().unwrap();
+        assert!(required.contains(&"slug".to_string()));
+    }
 }

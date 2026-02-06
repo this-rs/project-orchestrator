@@ -1684,4 +1684,44 @@ mod tests {
         assert_eq!(query.priority_filter.priority_min, Some(5));
         assert_eq!(query.search_filter.search, Some("auth".to_string()));
     }
+
+    #[test]
+    fn test_plans_list_query_project_id_uuid_validation() {
+        // Valid UUID
+        let json = r#"{"project_id":"e83b0663-9600-450d-9f63-234e857394df"}"#;
+        let query: PlansListQuery = serde_json::from_str(json).unwrap();
+        let parsed = query
+            .project_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap().is_ok());
+    }
+
+    #[test]
+    fn test_plans_list_query_project_id_invalid_uuid() {
+        let json = r#"{"project_id":"not-valid"}"#;
+        let query: PlansListQuery = serde_json::from_str(json).unwrap();
+        let parsed = query
+            .project_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap().is_err());
+    }
+
+    #[test]
+    fn test_plans_list_query_project_id_empty_string() {
+        let json = r#"{"project_id":""}"#;
+        let query: PlansListQuery = serde_json::from_str(json).unwrap();
+        // Empty string should be filtered out
+        let parsed = query
+            .project_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_none());
+    }
 }

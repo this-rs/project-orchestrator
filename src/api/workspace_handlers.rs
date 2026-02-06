@@ -1434,4 +1434,90 @@ mod tests {
         assert_eq!(json["workspace_name"], "My Workspace");
         assert_eq!(json["workspace_slug"], "my-workspace");
     }
+
+    #[test]
+    fn test_workspace_milestone_with_workspace_flatten() {
+        // Verify flatten merges milestone fields into top-level
+        let resp = WorkspaceMilestoneWithWorkspace {
+            milestone: WorkspaceMilestoneResponse {
+                id: "m-123".to_string(),
+                workspace_id: "ws-inner".to_string(),
+                title: "Cross-project milestone".to_string(),
+                description: Some("Important milestone".to_string()),
+                status: "Open".to_string(),
+                target_date: Some("2026-06-01T00:00:00Z".to_string()),
+                closed_at: None,
+                created_at: "2026-01-15T10:00:00Z".to_string(),
+                tags: vec!["release".to_string(), "q2".to_string()],
+            },
+            workspace_id: "ws-outer".to_string(),
+            workspace_name: "Production".to_string(),
+            workspace_slug: "production".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+
+        // Flattened milestone fields
+        assert_eq!(json["id"], "m-123");
+        assert_eq!(json["title"], "Cross-project milestone");
+        assert_eq!(json["description"], "Important milestone");
+        assert_eq!(json["status"], "Open");
+        assert_eq!(json["target_date"], "2026-06-01T00:00:00Z");
+        assert!(json["closed_at"].is_null());
+        assert_eq!(json["created_at"], "2026-01-15T10:00:00Z");
+        assert_eq!(json["tags"], serde_json::json!(["release", "q2"]));
+
+        // Extra workspace fields
+        assert_eq!(json["workspace_id"], "ws-outer");
+        assert_eq!(json["workspace_name"], "Production");
+        assert_eq!(json["workspace_slug"], "production");
+    }
+
+    #[test]
+    fn test_all_workspace_milestones_query_workspace_id_validation() {
+        // Valid UUID workspace_id
+        let json = r#"{"workspace_id":"b37351e3-6c90-4a53-bc4f-8cbd024cecb7"}"#;
+        let query: AllWorkspaceMilestonesQuery = serde_json::from_str(json).unwrap();
+        let parsed = query
+            .workspace_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap().is_ok());
+    }
+
+    #[test]
+    fn test_all_workspace_milestones_query_invalid_workspace_id() {
+        let json = r#"{"workspace_id":"not-a-uuid"}"#;
+        let query: AllWorkspaceMilestonesQuery = serde_json::from_str(json).unwrap();
+        let parsed = query
+            .workspace_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap().is_err());
+    }
+
+    #[test]
+    fn test_all_workspace_milestones_query_empty_workspace_id() {
+        let json = r#"{"workspace_id":""}"#;
+        let query: AllWorkspaceMilestonesQuery = serde_json::from_str(json).unwrap();
+        // Empty string should be filtered out
+        let parsed = query
+            .workspace_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| uuid::Uuid::parse_str(s));
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_workspace_milestones_list_query_pagination_values() {
+        let json = r#"{"limit":"25","offset":"10","status":"closed"}"#;
+        let query: WorkspaceMilestonesListQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.pagination.limit, 25);
+        assert_eq!(query.pagination.offset, 10);
+        assert_eq!(query.status_filter.status, Some("closed".to_string()));
+    }
 }
