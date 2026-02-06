@@ -31,14 +31,16 @@ impl Orchestrator {
     pub async fn new(state: AppState) -> Result<Self> {
         let plan_manager = Arc::new(PlanManager::new(state.neo4j.clone(), state.meili.clone()));
 
+        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
+
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
             state.meili.clone(),
             plan_manager.clone(),
+            note_manager.clone(),
         ));
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
-        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
 
         Ok(Self {

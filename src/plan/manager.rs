@@ -146,156 +146,7 @@ impl PlanManager {
 
     /// Get task details
     pub async fn get_task_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>> {
-        // Get task from a query
-        let q = neo4rs::query(
-            r#"
-            MATCH (t:Task {id: $id})
-            OPTIONAL MATCH (t)-[:HAS_STEP]->(s:Step)
-            OPTIONAL MATCH (t)-[:INFORMED_BY]->(d:Decision)
-            OPTIONAL MATCH (t)-[:DEPENDS_ON]->(dep:Task)
-            OPTIONAL MATCH (t)-[:MODIFIES]->(f:File)
-            RETURN t,
-                   collect(DISTINCT s) AS steps,
-                   collect(DISTINCT d) AS decisions,
-                   collect(DISTINCT dep.id) AS depends_on,
-                   collect(DISTINCT f.path) AS files
-            "#,
-        )
-        .param("id", task_id.to_string());
-
-        let rows = self.neo4j.execute_with_params(q).await?;
-
-        if rows.is_empty() {
-            return Ok(None);
-        }
-
-        let row = &rows[0];
-        let task_node: neo4rs::Node = row.get("t")?;
-
-        let task = TaskNode {
-            id: task_node.get::<String>("id")?.parse()?,
-            title: task_node
-                .get::<String>("title")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            description: task_node.get("description")?,
-            status: serde_json::from_str(&format!(
-                "\"{}\"",
-                task_node.get::<String>("status")?.to_lowercase()
-            ))
-            .unwrap_or(TaskStatus::Pending),
-            assigned_to: task_node.get("assigned_to").ok(),
-            priority: task_node.get::<i64>("priority").ok().map(|v| v as i32),
-            tags: task_node.get("tags").unwrap_or_default(),
-            acceptance_criteria: task_node.get("acceptance_criteria").unwrap_or_default(),
-            affected_files: task_node.get("affected_files").unwrap_or_default(),
-            estimated_complexity: task_node
-                .get::<i64>("estimated_complexity")
-                .ok()
-                .filter(|&v| v > 0)
-                .map(|v| v as u32),
-            actual_complexity: task_node
-                .get::<i64>("actual_complexity")
-                .ok()
-                .filter(|&v| v > 0)
-                .map(|v| v as u32),
-            created_at: task_node
-                .get::<String>("created_at")?
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            updated_at: task_node
-                .get::<String>("updated_at")
-                .ok()
-                .and_then(|s| s.parse().ok()),
-            started_at: task_node
-                .get::<String>("started_at")
-                .ok()
-                .and_then(|s| s.parse().ok()),
-            completed_at: task_node
-                .get::<String>("completed_at")
-                .ok()
-                .and_then(|s| s.parse().ok()),
-        };
-
-        // Parse steps from Neo4j nodes
-        let step_nodes: Vec<neo4rs::Node> = row.get("steps").unwrap_or_default();
-        let mut steps: Vec<StepNode> = step_nodes
-            .iter()
-            .filter_map(|node| {
-                Some(StepNode {
-                    id: node.get::<String>("id").ok()?.parse().ok()?,
-                    order: node.get::<i64>("order").ok()? as u32,
-                    description: node.get::<String>("description").ok()?,
-                    status: node
-                        .get::<String>("status")
-                        .ok()
-                        .and_then(|s| {
-                            serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok()
-                        })
-                        .unwrap_or(StepStatus::Pending),
-                    verification: node
-                        .get::<String>("verification")
-                        .ok()
-                        .filter(|s| !s.is_empty()),
-                    created_at: node
-                        .get::<String>("created_at")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or_else(chrono::Utc::now),
-                    updated_at: node
-                        .get::<String>("updated_at")
-                        .ok()
-                        .and_then(|s| s.parse().ok()),
-                    completed_at: node
-                        .get::<String>("completed_at")
-                        .ok()
-                        .and_then(|s| s.parse().ok()),
-                })
-            })
-            .collect();
-        // Sort steps by order
-        steps.sort_by_key(|s| s.order);
-
-        // Parse decisions from Neo4j nodes
-        let decision_nodes: Vec<neo4rs::Node> = row.get("decisions").unwrap_or_default();
-        let decisions: Vec<DecisionNode> = decision_nodes
-            .iter()
-            .filter_map(|node| {
-                Some(DecisionNode {
-                    id: node.get::<String>("id").ok()?.parse().ok()?,
-                    description: node.get::<String>("description").ok()?,
-                    rationale: node.get::<String>("rationale").ok()?,
-                    alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
-                    chosen_option: node
-                        .get::<String>("chosen_option")
-                        .ok()
-                        .filter(|s| !s.is_empty()),
-                    decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
-                    decided_at: node
-                        .get::<String>("decided_at")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or_else(chrono::Utc::now),
-                })
-            })
-            .collect();
-
-        // Parse dependencies
-        let depends_on: Vec<String> = row.get("depends_on").unwrap_or_default();
-        let depends_on: Vec<Uuid> = depends_on
-            .into_iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-
-        let modifies_files: Vec<String> = row.get("files").unwrap_or_default();
-
-        Ok(Some(TaskDetails {
-            task,
-            steps,
-            decisions,
-            depends_on,
-            modifies_files,
-        }))
+        self.neo4j.get_task_with_full_details(task_id).await
     }
 
     /// Update task fields
@@ -332,46 +183,12 @@ impl PlanManager {
 
     /// Add a step to a task
     pub async fn add_step(&self, task_id: Uuid, step: &StepNode) -> Result<()> {
-        let q = neo4rs::query(
-            r#"
-            MATCH (t:Task {id: $task_id})
-            CREATE (s:Step {
-                id: $id,
-                order: $order,
-                description: $description,
-                status: $status,
-                verification: $verification
-            })
-            CREATE (t)-[:HAS_STEP]->(s)
-            "#,
-        )
-        .param("task_id", task_id.to_string())
-        .param("id", step.id.to_string())
-        .param("order", step.order as i64)
-        .param("description", step.description.clone())
-        .param("status", format!("{:?}", step.status))
-        .param(
-            "verification",
-            step.verification.clone().unwrap_or_default(),
-        );
-
-        self.neo4j.execute_with_params(q).await?;
-        Ok(())
+        self.neo4j.create_step(task_id, step).await
     }
 
     /// Update step status
     pub async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
-        let q = neo4rs::query(
-            r#"
-            MATCH (s:Step {id: $id})
-            SET s.status = $status
-            "#,
-        )
-        .param("id", step_id.to_string())
-        .param("status", format!("{:?}", status));
-
-        self.neo4j.execute_with_params(q).await?;
-        Ok(())
+        self.neo4j.update_step_status(step_id, status).await
     }
 
     // ========================================================================
@@ -442,29 +259,7 @@ impl PlanManager {
 
     /// Add a constraint to a plan
     pub async fn add_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {
-        let q = neo4rs::query(
-            r#"
-            MATCH (p:Plan {id: $plan_id})
-            CREATE (c:Constraint {
-                id: $id,
-                constraint_type: $type,
-                description: $description,
-                enforced_by: $enforced_by
-            })
-            CREATE (p)-[:CONSTRAINED_BY]->(c)
-            "#,
-        )
-        .param("plan_id", plan_id.to_string())
-        .param("id", constraint.id.to_string())
-        .param("type", format!("{:?}", constraint.constraint_type))
-        .param("description", constraint.description.clone())
-        .param(
-            "enforced_by",
-            constraint.enforced_by.clone().unwrap_or_default(),
-        );
-
-        self.neo4j.execute_with_params(q).await?;
-        Ok(())
+        self.neo4j.create_constraint(plan_id, constraint).await
     }
 
     // ========================================================================
@@ -473,31 +268,7 @@ impl PlanManager {
 
     /// Analyze the impact of a task on the codebase
     pub async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>> {
-        let q = neo4rs::query(
-            r#"
-            MATCH (t:Task {id: $id})-[:MODIFIES]->(f:File)
-            OPTIONAL MATCH (f)<-[:IMPORTS*1..3]-(dependent:File)
-            RETURN f.path AS file, collect(DISTINCT dependent.path) AS dependents
-            "#,
-        )
-        .param("id", task_id.to_string());
-
-        let rows = self.neo4j.execute_with_params(q).await?;
-        let mut impacted = Vec::new();
-
-        for row in rows {
-            let file: String = row.get("file")?;
-            impacted.push(file);
-
-            let dependents: Vec<String> = row.get("dependents").unwrap_or_default();
-            impacted.extend(dependents);
-        }
-
-        // Deduplicate
-        impacted.sort();
-        impacted.dedup();
-
-        Ok(impacted)
+        self.neo4j.analyze_task_impact(task_id).await
     }
 
     /// Find blocked tasks in a plan
@@ -505,107 +276,6 @@ impl PlanManager {
         &self,
         plan_id: Uuid,
     ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
-        let q = neo4rs::query(
-            r#"
-            MATCH (p:Plan {id: $plan_id})-[:HAS_TASK]->(t:Task {status: 'Pending'})
-            MATCH (t)-[:DEPENDS_ON]->(blocker:Task)
-            WHERE blocker.status <> 'Completed'
-            RETURN t, collect(blocker) AS blockers
-            "#,
-        )
-        .param("plan_id", plan_id.to_string());
-
-        let rows = self.neo4j.execute_with_params(q).await?;
-        let mut result = Vec::new();
-
-        for row in rows {
-            let task_node: neo4rs::Node = row.get("t")?;
-            let task = TaskNode {
-                id: task_node.get::<String>("id")?.parse()?,
-                title: task_node
-                    .get::<String>("title")
-                    .ok()
-                    .filter(|s| !s.is_empty()),
-                description: task_node.get("description")?,
-                status: TaskStatus::Pending,
-                assigned_to: None,
-                priority: task_node.get::<i64>("priority").ok().map(|v| v as i32),
-                tags: task_node.get("tags").unwrap_or_default(),
-                acceptance_criteria: task_node.get("acceptance_criteria").unwrap_or_default(),
-                affected_files: task_node.get("affected_files").unwrap_or_default(),
-                estimated_complexity: None,
-                actual_complexity: None,
-                created_at: task_node
-                    .get::<String>("created_at")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(chrono::Utc::now),
-                updated_at: task_node
-                    .get::<String>("updated_at")
-                    .ok()
-                    .and_then(|s| s.parse().ok()),
-                started_at: None,
-                completed_at: None,
-            };
-
-            // Parse blockers from Neo4j nodes
-            let blocker_nodes: Vec<neo4rs::Node> = row.get("blockers").unwrap_or_default();
-            let blockers: Vec<TaskNode> = blocker_nodes
-                .iter()
-                .filter_map(|node| {
-                    Some(TaskNode {
-                        id: node.get::<String>("id").ok()?.parse().ok()?,
-                        title: node.get::<String>("title").ok().filter(|s| !s.is_empty()),
-                        description: node.get::<String>("description").ok()?,
-                        status: node
-                            .get::<String>("status")
-                            .ok()
-                            .and_then(|s| {
-                                serde_json::from_str(&format!("\"{}\"", s.to_lowercase())).ok()
-                            })
-                            .unwrap_or(TaskStatus::Pending),
-                        assigned_to: node.get::<String>("assigned_to").ok(),
-                        priority: node.get::<i64>("priority").ok().map(|v| v as i32),
-                        tags: node.get::<Vec<String>>("tags").unwrap_or_default(),
-                        acceptance_criteria: node
-                            .get::<Vec<String>>("acceptance_criteria")
-                            .unwrap_or_default(),
-                        affected_files: node
-                            .get::<Vec<String>>("affected_files")
-                            .unwrap_or_default(),
-                        estimated_complexity: node
-                            .get::<i64>("estimated_complexity")
-                            .ok()
-                            .filter(|&v| v > 0)
-                            .map(|v| v as u32),
-                        actual_complexity: node
-                            .get::<i64>("actual_complexity")
-                            .ok()
-                            .filter(|&v| v > 0)
-                            .map(|v| v as u32),
-                        started_at: node
-                            .get::<String>("started_at")
-                            .ok()
-                            .and_then(|s| s.parse().ok()),
-                        completed_at: node
-                            .get::<String>("completed_at")
-                            .ok()
-                            .and_then(|s| s.parse().ok()),
-                        created_at: node
-                            .get::<String>("created_at")
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or_else(chrono::Utc::now),
-                        updated_at: node
-                            .get::<String>("updated_at")
-                            .ok()
-                            .and_then(|s| s.parse().ok()),
-                    })
-                })
-                .collect();
-            result.push((task, blockers));
-        }
-
-        Ok(result)
+        self.neo4j.find_blocked_tasks(plan_id).await
     }
 }
