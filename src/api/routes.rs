@@ -6,6 +6,7 @@ use super::handlers::{self, OrchestratorState};
 use super::note_handlers;
 use super::project_handlers;
 use super::workspace_handlers;
+use super::ws_handlers;
 use axum::{
     routing::{get, post},
     Router,
@@ -425,6 +426,10 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/workspaces/{slug}/topology",
             get(workspace_handlers::get_workspace_topology),
         )
+        // ====================================================================
+        // WebSocket CRUD Event Notifications
+        // ====================================================================
+        .route("/ws/events", get(ws_handlers::ws_events))
         // ====================================================================
         // Chat (SSE streaming + session management)
         // ====================================================================
