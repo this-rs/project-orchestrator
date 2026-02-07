@@ -14,9 +14,10 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatSessionNode;
 use crate::neo4j::GraphStore;
 use anyhow::{anyhow, Context, Result};
+use futures::StreamExt;
 use nexus_claude::{
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
-    PermissionMode,
+    PermissionMode, StreamDelta, StreamEventData,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,6 +151,7 @@ impl ChatManager {
             .system_prompt(system_prompt)
             .permission_mode(PermissionMode::BypassPermissions)
             .max_turns(self.config.max_turns)
+            .include_partial_messages(true)
             .add_mcp_server("project-orchestrator", mcp_config);
 
         if let Some(id) = resume_id {
@@ -217,6 +219,15 @@ impl ChatManager {
                     cost_usd: *total_cost_usd,
                 }]
             }
+            Message::StreamEvent { event, .. } => match event {
+                StreamEventData::ContentBlockDelta {
+                    delta: StreamDelta::TextDelta { text },
+                    ..
+                } => {
+                    vec![ChatEvent::StreamDelta { text: text.clone() }]
+                }
+                _ => vec![],
+            },
             Message::System { subtype, data } => {
                 debug!("System message: {} — {:?}", subtype, data);
                 vec![]
@@ -357,67 +368,97 @@ impl ChatManager {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        // Use send_and_receive() which cleanly acquires and releases the transport
-        // lock. This avoids the deadlock caused by receive_response_stream() spawning
-        // a background task that holds the transport lock indefinitely.
-        let result = {
+        // Use send_and_receive_stream() for real-time token streaming.
+        // The returned stream borrows &mut InteractiveClient, so we must hold
+        // the Mutex lock for the entire stream duration. This is safe because:
+        // - Each message spawns stream_response in its own tokio::spawn
+        // - send_message() creates a new broadcast channel for each follow-up
+        // - The lock is only held during active streaming (not between messages)
+        {
             let mut c = client.lock().await;
-            c.send_and_receive(prompt).await
-        };
+            let stream_result = c.send_and_receive_stream(prompt).await;
 
-        match result {
-            Ok(messages) => {
-                for msg in &messages {
-                    // Check interrupt flag between messages
-                    if interrupt_flag.load(Ordering::SeqCst) {
-                        info!(
-                            "Interrupt flag detected while processing messages for session {}",
-                            session_id
-                        );
+            let mut stream = match stream_result {
+                Ok(s) => std::pin::pin!(s),
+                Err(e) => {
+                    error!("Error starting stream for session {}: {}", session_id, e);
+                    let _ = events_tx.send(ChatEvent::Error {
+                        message: format!("Error: {}", e),
+                    });
+                    return;
+                }
+            };
+
+            while let Some(result) = stream.next().await {
+                // Check interrupt flag at each iteration
+                if interrupt_flag.load(Ordering::SeqCst) {
+                    info!(
+                        "Interrupt flag detected during stream for session {}",
+                        session_id
+                    );
+                    break;
+                }
+
+                match result {
+                    Ok(ref msg) => {
+                        // Handle StreamEvent — emit StreamDelta for text tokens directly
+                        if let Message::StreamEvent {
+                            event:
+                                StreamEventData::ContentBlockDelta {
+                                    delta: StreamDelta::TextDelta { ref text },
+                                    ..
+                                },
+                            ..
+                        } = msg
+                        {
+                            let _ = events_tx.send(ChatEvent::StreamDelta { text: text.clone() });
+                            continue;
+                        }
+
+                        // Extract cli_session_id from Result message
+                        if let Message::Result {
+                            session_id: ref cli_sid,
+                            total_cost_usd: ref cost,
+                            ..
+                        } = msg
+                        {
+                            // Update Neo4j with cli_session_id and cost
+                            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                                let _ = graph
+                                    .update_chat_session(
+                                        uuid,
+                                        Some(cli_sid.clone()),
+                                        None,
+                                        Some(1),
+                                        *cost,
+                                    )
+                                    .await;
+                            }
+
+                            // Update active session's cli_session_id
+                            let mut sessions = active_sessions.write().await;
+                            if let Some(active) = sessions.get_mut(&session_id) {
+                                active.cli_session_id = Some(cli_sid.clone());
+                                active.last_activity = Instant::now();
+                            }
+                        }
+
+                        // For all other messages, use existing converter
+                        let events = Self::message_to_events(msg);
+                        for event in events {
+                            let _ = events_tx.send(event);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Stream error for session {}: {}", session_id, e);
+                        let _ = events_tx.send(ChatEvent::Error {
+                            message: format!("Error: {}", e),
+                        });
                         break;
-                    }
-
-                    // Extract cli_session_id from Result message
-                    if let Message::Result {
-                        session_id: ref cli_sid,
-                        total_cost_usd: ref cost,
-                        ..
-                    } = msg
-                    {
-                        // Update Neo4j with cli_session_id and cost
-                        if let Ok(uuid) = Uuid::parse_str(&session_id) {
-                            let _ = graph
-                                .update_chat_session(
-                                    uuid,
-                                    Some(cli_sid.clone()),
-                                    None,
-                                    Some(1),
-                                    *cost,
-                                )
-                                .await;
-                        }
-
-                        // Update active session's cli_session_id
-                        let mut sessions = active_sessions.write().await;
-                        if let Some(active) = sessions.get_mut(&session_id) {
-                            active.cli_session_id = Some(cli_sid.clone());
-                            active.last_activity = Instant::now();
-                        }
-                    }
-
-                    let events = Self::message_to_events(msg);
-                    for event in events {
-                        let _ = events_tx.send(event);
                     }
                 }
             }
-            Err(e) => {
-                error!("Error for session {}: {}", session_id, e);
-                let _ = events_tx.send(ChatEvent::Error {
-                    message: format!("Error: {}", e),
-                });
-            }
-        }
+        } // Lock released here after stream completes
 
         // If interrupted, send the interrupt signal to the CLI
         if interrupt_flag.load(Ordering::SeqCst) {
@@ -963,6 +1004,193 @@ mod tests {
 
         let events = ChatManager::message_to_events(&msg);
         assert!(events.is_empty());
+    }
+
+    // ====================================================================
+    // message_to_events — StreamEvent
+    // ====================================================================
+
+    #[test]
+    fn test_message_to_events_stream_text_delta() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::TextDelta {
+                    text: "Hello".into(),
+                },
+            },
+            session_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ChatEvent::StreamDelta { text } if text == "Hello"));
+    }
+
+    #[test]
+    fn test_message_to_events_stream_thinking_delta() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::ThinkingDelta {
+                    thinking: "hmm".into(),
+                },
+            },
+            session_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_message_to_events_stream_message_stop() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::MessageStop,
+            session_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_message_to_events_stream_content_block_start() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::ContentBlockStart {
+                index: 0,
+                content_block: serde_json::json!({"type": "text", "text": ""}),
+            },
+            session_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_message_to_events_stream_input_json_delta() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::InputJsonDelta {
+                    partial_json: r#"{"title":"#.into(),
+                },
+            },
+            session_id: Some("sess-1".into()),
+        };
+
+        // InputJsonDelta is not TextDelta, so it should produce empty events
+        let events = ChatManager::message_to_events(&msg);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_message_to_events_stream_message_start() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::MessageStart {
+                message: serde_json::json!({"id": "msg_123"}),
+            },
+            session_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_message_to_events_stream_message_delta() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::MessageDelta {
+                delta: serde_json::json!({"stop_reason": "end_turn"}),
+                usage: Some(serde_json::json!({"output_tokens": 50})),
+            },
+            session_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_message_to_events_tool_result_structured() {
+        let msg = Message::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: "tool-3".into(),
+                    content: Some(ContentValue::Structured(vec![
+                        serde_json::json!({"type": "text", "text": "result 1"}),
+                        serde_json::json!({"type": "text", "text": "result 2"}),
+                    ])),
+                    is_error: None,
+                })],
+            },
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ChatEvent::ToolResult {
+                id,
+                result,
+                is_error,
+            } => {
+                assert_eq!(id, "tool-3");
+                assert!(result.is_array());
+                assert_eq!(result.as_array().unwrap().len(), 2);
+                assert!(!is_error); // None defaults to false
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_message_to_events_tool_result_none_content() {
+        let msg = Message::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: "tool-4".into(),
+                    content: None,
+                    is_error: Some(false),
+                })],
+            },
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ChatEvent::ToolResult { result, .. } => {
+                assert!(result.is_null());
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    // ====================================================================
+    // build_system_prompt with active plans
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_build_system_prompt_with_active_plans() {
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        // Create an active plan linked to the project
+        let plan = crate::test_helpers::test_plan();
+        state.neo4j.create_plan(&plan).await.unwrap();
+        state
+            .neo4j
+            .link_plan_to_project(plan.id, project.id)
+            .await
+            .unwrap();
+
+        let manager = ChatManager::new(state.neo4j, state.meili, test_config());
+        let prompt = manager.build_system_prompt(Some(&project.slug)).await;
+
+        assert!(prompt.contains("Projet actif"));
+        assert!(prompt.contains(&project.name));
+        assert!(prompt.contains("Plans en cours"));
     }
 
     // ====================================================================
