@@ -159,7 +159,6 @@ pub async fn link_plan_to_project(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .link_plan_to_project(plan_id, req.project_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -172,7 +171,6 @@ pub async fn unlink_plan_from_project(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .unlink_plan_from_project(plan_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -412,7 +410,6 @@ pub async fn update_decision(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .update_decision(
             decision_id,
             req.description,
@@ -430,7 +427,6 @@ pub async fn delete_decision(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .delete_decision(decision_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -642,7 +638,7 @@ pub async fn delete_step(
     State(state): State<OrchestratorState>,
     Path(step_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    state.orchestrator.neo4j().delete_step(step_id).await?;
+    state.orchestrator.delete_step(step_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -757,7 +753,6 @@ pub async fn update_constraint(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .update_constraint(
             constraint_id,
             req.description,
@@ -775,7 +770,6 @@ pub async fn delete_constraint(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .delete_constraint(constraint_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -852,7 +846,7 @@ pub async fn create_commit(
         timestamp: req.timestamp.unwrap_or_else(chrono::Utc::now),
     };
 
-    state.orchestrator.neo4j().create_commit(&commit).await?;
+    state.orchestrator.create_commit(&commit).await?;
     Ok(Json(commit))
 }
 
@@ -870,7 +864,6 @@ pub async fn link_commit_to_task(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .link_commit_to_task(&req.commit_hash, task_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -893,7 +886,6 @@ pub async fn link_commit_to_plan(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .link_commit_to_plan(&req.commit_hash, plan_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -939,7 +931,7 @@ pub async fn create_release(
         project_id,
     };
 
-    state.orchestrator.neo4j().create_release(&release).await?;
+    state.orchestrator.create_release(&release).await?;
     Ok(Json(release))
 }
 
@@ -999,7 +991,6 @@ pub async fn update_release(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .update_release(
             release_id,
             req.status,
@@ -1019,7 +1010,6 @@ pub async fn delete_release(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .delete_release(release_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1039,7 +1029,6 @@ pub async fn add_task_to_release(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .add_task_to_release(release_id, req.task_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1059,7 +1048,6 @@ pub async fn add_commit_to_release(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .add_commit_to_release(release_id, &req.commit_hash)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1123,7 +1111,6 @@ pub async fn create_milestone(
 
     state
         .orchestrator
-        .neo4j()
         .create_milestone(&milestone)
         .await?;
     Ok(Json(milestone))
@@ -1185,7 +1172,6 @@ pub async fn update_milestone(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .update_milestone(
             milestone_id,
             req.status,
@@ -1205,7 +1191,6 @@ pub async fn delete_milestone(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .delete_milestone(milestone_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1225,7 +1210,6 @@ pub async fn add_task_to_milestone(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .add_task_to_milestone(milestone_id, req.task_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1307,7 +1291,6 @@ pub async fn add_task_dependencies(
     for dep_id in req.depends_on {
         state
             .orchestrator
-            .neo4j()
             .add_task_dependency(task_id, dep_id)
             .await?;
     }
@@ -1321,7 +1304,6 @@ pub async fn remove_task_dependency(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
         .remove_task_dependency(task_id, dep_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
