@@ -14,7 +14,6 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatSessionNode;
 use crate::neo4j::GraphStore;
 use anyhow::{anyhow, Context, Result};
-use futures::StreamExt;
 use nexus_claude::{
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode,
@@ -149,7 +148,7 @@ impl ChatManager {
             .model(model)
             .cwd(cwd)
             .system_prompt(system_prompt)
-            .permission_mode(PermissionMode::AcceptEdits)
+            .permission_mode(PermissionMode::BypassPermissions)
             .max_turns(self.config.max_turns)
             .add_mcp_server("project-orchestrator", mcp_config);
 
@@ -336,95 +335,93 @@ impl ChatManager {
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
         interrupt_flag: Arc<AtomicBool>,
     ) {
-        // Send message
-        {
-            let mut c = client.lock().await;
-            if let Err(e) = c.send_message(prompt).await {
-                let _ = events_tx.send(ChatEvent::Error {
-                    message: format!("Failed to send message: {}", e),
-                });
+        // Wait for at least one SSE subscriber before sending the message to the CLI.
+        // Without this, events emitted before the frontend connects are lost (broadcast
+        // has no replay buffer). Poll every 50ms, timeout after 10s.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while events_tx.receiver_count() == 0 {
+            if Instant::now() >= deadline {
+                warn!(
+                    "No SSE subscriber connected within 10s for session {}, proceeding anyway",
+                    session_id
+                );
+                break;
+            }
+            if interrupt_flag.load(Ordering::SeqCst) {
+                debug!(
+                    "Interrupt flag set while waiting for subscriber for session {}",
+                    session_id
+                );
                 return;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        // Check interrupt before starting stream
-        if interrupt_flag.load(Ordering::SeqCst) {
-            debug!(
-                "Interrupt flag set before streaming for session {}",
-                session_id
-            );
-            return;
-        }
-
-        // Stream response in a block so that the lock (and stream borrow) are dropped at block end
-        {
+        // Use send_and_receive() which cleanly acquires and releases the transport
+        // lock. This avoids the deadlock caused by receive_response_stream() spawning
+        // a background task that holds the transport lock indefinitely.
+        let result = {
             let mut c = client.lock().await;
-            let stream = c.receive_response_stream().await;
-            tokio::pin!(stream);
+            c.send_and_receive(prompt).await
+        };
 
-            while let Some(result) = stream.next().await {
-                // Check interrupt flag on every iteration — this is the key fix
-                if interrupt_flag.load(Ordering::SeqCst) {
-                    info!(
-                        "Interrupt flag detected in stream loop for session {}",
-                        session_id
-                    );
-                    break;
-                }
+        match result {
+            Ok(messages) => {
+                for msg in &messages {
+                    // Check interrupt flag between messages
+                    if interrupt_flag.load(Ordering::SeqCst) {
+                        info!(
+                            "Interrupt flag detected while processing messages for session {}",
+                            session_id
+                        );
+                        break;
+                    }
 
-                match result {
-                    Ok(msg) => {
-                        // Extract cli_session_id from Result message
-                        if let Message::Result {
-                            session_id: ref cli_sid,
-                            total_cost_usd: ref cost,
-                            ..
-                        } = msg
-                        {
-                            // Update Neo4j with cli_session_id and cost
-                            if let Ok(uuid) = Uuid::parse_str(&session_id) {
-                                let _ = graph
-                                    .update_chat_session(
-                                        uuid,
-                                        Some(cli_sid.clone()),
-                                        None,
-                                        Some(1),
-                                        *cost,
-                                    )
-                                    .await;
-                            }
-
-                            // Update active session's cli_session_id
-                            let mut sessions = active_sessions.write().await;
-                            if let Some(active) = sessions.get_mut(&session_id) {
-                                active.cli_session_id = Some(cli_sid.clone());
-                                active.last_activity = Instant::now();
-                            }
+                    // Extract cli_session_id from Result message
+                    if let Message::Result {
+                        session_id: ref cli_sid,
+                        total_cost_usd: ref cost,
+                        ..
+                    } = msg
+                    {
+                        // Update Neo4j with cli_session_id and cost
+                        if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                            let _ = graph
+                                .update_chat_session(
+                                    uuid,
+                                    Some(cli_sid.clone()),
+                                    None,
+                                    Some(1),
+                                    *cost,
+                                )
+                                .await;
                         }
 
-                        let events = Self::message_to_events(&msg);
-                        for event in events {
-                            let _ = events_tx.send(event);
+                        // Update active session's cli_session_id
+                        let mut sessions = active_sessions.write().await;
+                        if let Some(active) = sessions.get_mut(&session_id) {
+                            active.cli_session_id = Some(cli_sid.clone());
+                            active.last_activity = Instant::now();
                         }
                     }
-                    Err(e) => {
-                        error!("Stream error for session {}: {}", session_id, e);
-                        let _ = events_tx.send(ChatEvent::Error {
-                            message: format!("Stream error: {}", e),
-                        });
-                        break;
+
+                    let events = Self::message_to_events(msg);
+                    for event in events {
+                        let _ = events_tx.send(event);
                     }
                 }
             }
-            // stream and c are dropped here, releasing the Mutex
+            Err(e) => {
+                error!("Error for session {}: {}", session_id, e);
+                let _ = events_tx.send(ChatEvent::Error {
+                    message: format!("Error: {}", e),
+                });
+            }
         }
 
-        // If interrupted, now that the lock is released, send the interrupt signal to the CLI
+        // If interrupted, send the interrupt signal to the CLI
         if interrupt_flag.load(Ordering::SeqCst) {
-            debug!(
-                "Stream loop broken by interrupt, sending interrupt signal to CLI for session {}",
-                session_id
-            );
+            debug!("Sending interrupt signal to CLI for session {}", session_id);
             let mut c = client.lock().await;
             if let Err(e) = c.interrupt().await {
                 warn!(
@@ -439,28 +436,28 @@ impl ChatManager {
 
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
-        // Check if session is active
+        // Create a NEW broadcast channel for this message so that the fresh /stream
+        // subscriber receives all events (old subscribers just stop getting new data).
         let (client, events_tx, interrupt_flag) = {
-            let sessions = self.active_sessions.read().await;
+            let mut sessions = self.active_sessions.write().await;
             let session = sessions
-                .get(session_id)
+                .get_mut(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+
             // Reset interrupt flag for new message
             session.interrupt_flag.store(false, Ordering::SeqCst);
+
+            // Replace the broadcast channel so new /stream subscribers get fresh events
+            let (new_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+            session.events_tx = new_tx.clone();
+            session.last_activity = Instant::now();
+
             (
                 session.client.clone(),
-                session.events_tx.clone(),
+                new_tx,
                 session.interrupt_flag.clone(),
             )
         };
-
-        // Update last activity
-        {
-            let mut sessions = self.active_sessions.write().await;
-            if let Some(active) = sessions.get_mut(session_id) {
-                active.last_activity = Instant::now();
-            }
-        }
 
         // Update message count in Neo4j
         if let Ok(uuid) = Uuid::parse_str(session_id) {
