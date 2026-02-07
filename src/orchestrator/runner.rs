@@ -58,9 +58,33 @@ impl Orchestrator {
 
     /// Create a new orchestrator with an EventBus for CRUD notifications
     pub async fn with_event_bus(state: AppState, event_bus: Arc<EventBus>) -> Result<Self> {
-        let mut orchestrator = Self::new(state).await?;
-        orchestrator.event_bus = Some(event_bus);
-        Ok(orchestrator)
+        let plan_manager = Arc::new(PlanManager::with_event_bus(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            event_bus.clone(),
+        ));
+
+        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
+
+        let context_builder = Arc::new(ContextBuilder::new(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            plan_manager.clone(),
+            note_manager.clone(),
+        ));
+
+        let parser = Arc::new(RwLock::new(CodeParser::new()?));
+        let note_lifecycle = Arc::new(NoteLifecycleManager::new());
+
+        Ok(Self {
+            state,
+            plan_manager,
+            context_builder,
+            parser,
+            note_manager,
+            note_lifecycle,
+            event_bus: Some(event_bus),
+        })
     }
 
     /// Get the event bus (if configured)
