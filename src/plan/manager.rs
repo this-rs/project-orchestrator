@@ -1,6 +1,7 @@
 //! Plan management operations
 
 use super::models::*;
+use crate::events::{CrudAction, CrudEvent, EntityType, EventBus};
 use crate::meilisearch::indexes::DecisionDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
@@ -13,12 +14,37 @@ use uuid::Uuid;
 pub struct PlanManager {
     neo4j: Arc<dyn GraphStore>,
     meili: Arc<dyn SearchStore>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl PlanManager {
     /// Create a new plan manager
     pub fn new(neo4j: Arc<dyn GraphStore>, meili: Arc<dyn SearchStore>) -> Self {
-        Self { neo4j, meili }
+        Self {
+            neo4j,
+            meili,
+            event_bus: None,
+        }
+    }
+
+    /// Create a new plan manager with an event bus
+    pub fn with_event_bus(
+        neo4j: Arc<dyn GraphStore>,
+        meili: Arc<dyn SearchStore>,
+        event_bus: Arc<EventBus>,
+    ) -> Self {
+        Self {
+            neo4j,
+            meili,
+            event_bus: Some(event_bus),
+        }
+    }
+
+    /// Emit a CRUD event (no-op if event_bus is None)
+    fn emit(&self, event: CrudEvent) {
+        if let Some(bus) = &self.event_bus {
+            bus.emit(event);
+        }
     }
 
     // ========================================================================
@@ -58,6 +84,16 @@ impl PlanManager {
             }
         }
 
+        {
+            let mut event =
+                CrudEvent::new(EntityType::Plan, CrudAction::Created, plan.id.to_string())
+                    .with_payload(serde_json::json!({"title": &plan.title}));
+            if let Some(pid) = plan.project_id {
+                event = event.with_project_id(pid.to_string());
+            }
+            self.emit(event);
+        }
+
         Ok(plan)
     }
 
@@ -73,12 +109,23 @@ impl PlanManager {
 
     /// Update plan status
     pub async fn update_plan_status(&self, plan_id: Uuid, status: PlanStatus) -> Result<()> {
-        self.neo4j.update_plan_status(plan_id, status).await
+        self.neo4j.update_plan_status(plan_id, status.clone()).await?;
+        self.emit(
+            CrudEvent::new(EntityType::Plan, CrudAction::Updated, plan_id.to_string())
+                .with_payload(serde_json::json!({"status": status})),
+        );
+        Ok(())
     }
 
     /// Delete a plan and all its related data
     pub async fn delete_plan(&self, plan_id: Uuid) -> Result<()> {
-        self.neo4j.delete_plan(plan_id).await
+        self.neo4j.delete_plan(plan_id).await?;
+        self.emit(CrudEvent::new(
+            EntityType::Plan,
+            CrudAction::Deleted,
+            plan_id.to_string(),
+        ));
+        Ok(())
     }
 
     /// Get full plan details including tasks
@@ -141,6 +188,11 @@ impl PlanManager {
             }
         }
 
+        self.emit(
+            CrudEvent::new(EntityType::Task, CrudAction::Created, task.id.to_string())
+                .with_payload(serde_json::json!({"title": &task.title, "plan_id": plan_id.to_string()})),
+        );
+
         Ok(task)
     }
 
@@ -159,12 +211,23 @@ impl PlanManager {
         // Update all other fields via the full update method
         self.neo4j.update_task(task_id, &req).await?;
 
+        self.emit(
+            CrudEvent::new(EntityType::Task, CrudAction::Updated, task_id.to_string())
+                .with_payload(serde_json::to_value(&req).unwrap_or_default()),
+        );
+
         Ok(())
     }
 
     /// Delete a task and all its related data (steps, decisions)
     pub async fn delete_task(&self, task_id: Uuid) -> Result<()> {
-        self.neo4j.delete_task(task_id).await
+        self.neo4j.delete_task(task_id).await?;
+        self.emit(CrudEvent::new(
+            EntityType::Task,
+            CrudAction::Deleted,
+            task_id.to_string(),
+        ));
+        Ok(())
     }
 
     /// Get next available task from a plan
@@ -183,12 +246,22 @@ impl PlanManager {
 
     /// Add a step to a task
     pub async fn add_step(&self, task_id: Uuid, step: &StepNode) -> Result<()> {
-        self.neo4j.create_step(task_id, step).await
+        self.neo4j.create_step(task_id, step).await?;
+        self.emit(
+            CrudEvent::new(EntityType::Step, CrudAction::Created, step.id.to_string())
+                .with_payload(serde_json::json!({"task_id": task_id.to_string(), "order": step.order})),
+        );
+        Ok(())
     }
 
     /// Update step status
     pub async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
-        self.neo4j.update_step_status(step_id, status).await
+        self.neo4j.update_step_status(step_id, status.clone()).await?;
+        self.emit(
+            CrudEvent::new(EntityType::Step, CrudAction::Updated, step_id.to_string())
+                .with_payload(serde_json::json!({"status": status})),
+        );
+        Ok(())
     }
 
     // ========================================================================
@@ -229,6 +302,11 @@ impl PlanManager {
         };
         self.meili.index_decision(&doc).await?;
 
+        self.emit(
+            CrudEvent::new(EntityType::Decision, CrudAction::Created, decision.id.to_string())
+                .with_payload(serde_json::json!({"task_id": task_id.to_string(), "description": &decision.description})),
+        );
+
         Ok(decision)
     }
 
@@ -259,7 +337,12 @@ impl PlanManager {
 
     /// Add a constraint to a plan
     pub async fn add_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {
-        self.neo4j.create_constraint(plan_id, constraint).await
+        self.neo4j.create_constraint(plan_id, constraint).await?;
+        self.emit(
+            CrudEvent::new(EntityType::Constraint, CrudAction::Created, constraint.id.to_string())
+                .with_payload(serde_json::json!({"plan_id": plan_id.to_string(), "type": constraint.constraint_type})),
+        );
+        Ok(())
     }
 
     // ========================================================================
