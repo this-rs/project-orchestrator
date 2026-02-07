@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod chat;
+pub mod events;
 pub mod mcp;
 pub mod meilisearch;
 pub mod neo4j;
