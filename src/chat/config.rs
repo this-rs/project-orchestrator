@@ -21,6 +21,8 @@ pub struct ChatConfig {
     /// Meilisearch connection details for MCP server env
     pub meilisearch_url: String,
     pub meilisearch_key: String,
+    /// Maximum number of agentic turns (tool calls) per message
+    pub max_turns: i32,
 }
 
 impl ChatConfig {
@@ -51,6 +53,10 @@ impl ChatConfig {
                 .unwrap_or_else(|_| "http://localhost:7700".into()),
             meilisearch_key: std::env::var("MEILISEARCH_KEY")
                 .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
+            max_turns: std::env::var("CHAT_MAX_TURNS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
         }
     }
 
@@ -112,6 +118,7 @@ mod tests {
             neo4j_password: "test".into(),
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "test-key".into(),
+            max_turns: 10,
         };
 
         assert_eq!(config.default_model, "claude-opus-4-6");
@@ -178,6 +185,7 @@ mod tests {
             neo4j_password: "pass".into(),
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "key".into(),
+            max_turns: 10,
         };
 
         let json = config.mcp_server_config();

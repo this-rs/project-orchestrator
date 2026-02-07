@@ -147,6 +147,7 @@ impl ChatManager {
             .cwd(cwd)
             .system_prompt(system_prompt)
             .permission_mode(PermissionMode::AcceptEdits)
+            .max_turns(self.config.max_turns)
             .add_mcp_server("project-orchestrator", mcp_config);
 
         if let Some(id) = resume_id {
@@ -630,6 +631,7 @@ mod tests {
             neo4j_password: "test".into(),
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "key".into(),
+            max_turns: 10,
         }
     }
 
