@@ -25,7 +25,7 @@ For user-facing documentation, see the `docs/` folder:
 - Meilisearch for semantic search across code and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
-- MCP server for Claude Code integration (113 tools)
+- MCP server for Claude Code integration (135 tools)
 - File watcher for auto-syncing changes
 
 ## Build Commands
@@ -105,7 +105,7 @@ Or use command-line arguments:
 
 ### Available MCP Tools
 
-The MCP server exposes 113 tools organized by category:
+The MCP server exposes 135 tools organized by category:
 
 **Project Management (8 tools)**
 - `list_projects` - List all registered projects
@@ -253,7 +253,7 @@ docs/
 │   └── cursor.md            # Cursor IDE setup
 ├── api/
 │   ├── reference.md         # REST API documentation
-│   └── mcp-tools.md         # MCP tools reference (113 tools)
+│   └── mcp-tools.md         # MCP tools reference (135 tools)
 └── guides/
     ├── getting-started.md   # Tutorial for new users
     ├── multi-agent-workflow.md # Multi-agent coordination
@@ -264,13 +264,19 @@ src/
 │   ├── mod.rs           # API module exports
 │   ├── routes.rs        # Route definitions (axum)
 │   ├── handlers.rs      # Plan/Task/Decision handlers
+│   ├── chat_handlers.rs # Chat SSE streaming endpoints
 │   ├── code_handlers.rs # Code exploration endpoints
 │   ├── note_handlers.rs # Knowledge Notes endpoints
 │   └── workspace_handlers.rs # Workspace endpoints
+├── chat/
+│   ├── mod.rs           # Chat module exports
+│   ├── config.rs        # ChatConfig (MCP server path, model, timeouts)
+│   ├── manager.rs       # ChatManager — Nexus SDK orchestration
+│   └── types.rs         # ChatRequest, ChatEvent, ChatSession, ClientMessage
 ├── mcp/
 │   ├── mod.rs           # MCP module exports
 │   ├── protocol.rs      # JSON-RPC 2.0 types
-│   ├── tools.rs         # Tool definitions (113 tools)
+│   ├── tools.rs         # Tool definitions (135 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
 ├── neo4j/
@@ -501,6 +507,39 @@ GET /api/projects/{id}/milestones?status=open&limit=5
 GET /api/projects?search=orchestrator&limit=10
 ```
 
+### Chat (SSE Streaming)
+
+Conversational interface with Claude Code CLI via Nexus SDK. Uses SSE for real-time streaming.
+
+**Session lifecycle:**
+- `POST /api/chat/sessions` — Create session + send first message → `{ session_id, stream_url }`
+- `GET /api/chat/sessions/{id}/stream` — Subscribe to SSE event stream (Accept: text/event-stream)
+- `POST /api/chat/sessions/{id}/messages` — Send follow-up message (auto-resumes inactive sessions)
+- `POST /api/chat/sessions/{id}/interrupt` — Interrupt current operation
+
+**Session management:**
+- `GET /api/chat/sessions` — List sessions (pagination, `project_slug` filter)
+- `GET /api/chat/sessions/{id}` — Get session details
+- `DELETE /api/chat/sessions/{id}` — Delete session (closes active process)
+
+**SSE Event types:**
+```
+event: assistant_text    → {"content": "..."}
+event: thinking          → {"content": "..."}
+event: tool_use          → {"id": "tu_1", "tool": "create_plan", "input": {...}}
+event: tool_result       → {"id": "tu_1", "result": {...}, "is_error": false}
+event: permission_request → {"id": "pr_1", "tool": "...", "input": {...}}
+event: input_request     → {"prompt": "...", "options": [...]}
+event: result            → {"session_id": "...", "duration_ms": 5200, "cost_usd": 0.03}
+event: error             → {"message": "..."}
+```
+
+**MCP Chat Tools (4):**
+- `list_chat_sessions` — List sessions with project filter
+- `get_chat_session` — Get session details
+- `delete_chat_session` — Delete a session
+- `chat_send_message` — Send message and wait for complete response (non-streaming)
+
 ### Sync & Watch
 - `POST /api/sync` - Manual sync
 - `POST /api/watch` - Start auto-sync
@@ -514,7 +553,7 @@ GET /api/projects?search=orchestrator&limit=10
 
 1. **Axum 0.8 syntax**: Routes use `{param}` not `:param`
 2. **Error handling**: Use `anyhow::Result` and `AppError` for HTTP errors
-3. **State**: `ServerState` contains `orchestrator` and `watcher`
+3. **State**: `ServerState` contains `orchestrator`, `watcher`, and `chat_manager`
 4. **Tests**: All API tests require the server running on port 8080
 5. **File extensions**: Parser supports 12 languages:
    - Rust: `.rs`
@@ -584,6 +623,9 @@ External Trait nodes have:
 - `(Release)-[:INCLUDES_TASK]->(Task)` - Tasks included in a release
 - `(Release)-[:INCLUDES_COMMIT]->(Commit)` - Commits included in a release
 - `(Milestone)-[:INCLUDES_TASK]->(Task)` - Tasks included in a milestone
+
+### Chat Sessions
+- `(Project)-[:HAS_CHAT_SESSION]->(ChatSession)` - Project has chat sessions
 
 ### Workspaces
 - `(Project)-[:BELONGS_TO_WORKSPACE]->(Workspace)` - Project is in a workspace

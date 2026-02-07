@@ -6815,4 +6815,240 @@ impl Neo4jClient {
             last_assertion_result: None, // Loaded separately if needed
         })
     }
+
+    // ========================================================================
+    // Chat Session operations
+    // ========================================================================
+
+    /// Create a new chat session, optionally linking to a project via slug
+    pub async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
+        let q = if session.project_slug.is_some() {
+            query(
+                r#"
+                CREATE (s:ChatSession {
+                    id: $id,
+                    cli_session_id: $cli_session_id,
+                    project_slug: $project_slug,
+                    cwd: $cwd,
+                    title: $title,
+                    model: $model,
+                    created_at: datetime($created_at),
+                    updated_at: datetime($updated_at),
+                    message_count: $message_count,
+                    total_cost_usd: $total_cost_usd
+                })
+                WITH s
+                OPTIONAL MATCH (p:Project {slug: $project_slug})
+                FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
+                    CREATE (p)-[:HAS_CHAT_SESSION]->(s)
+                )
+                "#,
+            )
+        } else {
+            query(
+                r#"
+                CREATE (s:ChatSession {
+                    id: $id,
+                    cli_session_id: $cli_session_id,
+                    project_slug: $project_slug,
+                    cwd: $cwd,
+                    title: $title,
+                    model: $model,
+                    created_at: datetime($created_at),
+                    updated_at: datetime($updated_at),
+                    message_count: $message_count,
+                    total_cost_usd: $total_cost_usd
+                })
+                "#,
+            )
+        };
+
+        self.graph
+            .run(
+                q.param("id", session.id.to_string())
+                    .param(
+                        "cli_session_id",
+                        session.cli_session_id.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "project_slug",
+                        session.project_slug.clone().unwrap_or_default(),
+                    )
+                    .param("cwd", session.cwd.clone())
+                    .param("title", session.title.clone().unwrap_or_default())
+                    .param("model", session.model.clone())
+                    .param("created_at", session.created_at.to_rfc3339())
+                    .param("updated_at", session.updated_at.to_rfc3339())
+                    .param("message_count", session.message_count)
+                    .param("total_cost_usd", session.total_cost_usd.unwrap_or(0.0)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Get a chat session by ID
+    pub async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
+        let q = query("MATCH (s:ChatSession {id: $id}) RETURN s").param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            Ok(Some(Self::parse_chat_session_node(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List chat sessions with optional project_slug filter
+    pub async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ChatSessionNode>, usize)> {
+        let (data_query, count_query) = if let Some(slug) = project_slug {
+            (
+                query(
+                    r#"
+                    MATCH (s:ChatSession {project_slug: $slug})
+                    RETURN s ORDER BY s.updated_at DESC
+                    SKIP $offset LIMIT $limit
+                    "#,
+                )
+                .param("slug", slug.to_string())
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+                query("MATCH (s:ChatSession {project_slug: $slug}) RETURN count(s) AS total")
+                    .param("slug", slug.to_string()),
+            )
+        } else {
+            (
+                query(
+                    r#"
+                    MATCH (s:ChatSession)
+                    RETURN s ORDER BY s.updated_at DESC
+                    SKIP $offset LIMIT $limit
+                    "#,
+                )
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+                query("MATCH (s:ChatSession) RETURN count(s) AS total"),
+            )
+        };
+
+        let mut sessions = Vec::new();
+        let mut result = self.graph.execute(data_query).await?;
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            sessions.push(Self::parse_chat_session_node(&node)?);
+        }
+
+        let mut count_result = self.graph.execute(count_query).await?;
+        let total = if let Some(row) = count_result.next().await? {
+            row.get::<i64>("total")? as usize
+        } else {
+            0
+        };
+
+        Ok((sessions, total))
+    }
+
+    /// Update a chat session (partial, None fields are skipped)
+    pub async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+    ) -> Result<Option<ChatSessionNode>> {
+        let mut set_clauses = vec!["s.updated_at = datetime()".to_string()];
+
+        if let Some(ref v) = cli_session_id {
+            set_clauses.push(format!("s.cli_session_id = '{}'", v.replace('\'', "\\'")));
+        }
+        if let Some(ref v) = title {
+            set_clauses.push(format!("s.title = '{}'", v.replace('\'', "\\'")));
+        }
+        if let Some(v) = message_count {
+            set_clauses.push(format!("s.message_count = {}", v));
+        }
+        if let Some(v) = total_cost_usd {
+            set_clauses.push(format!("s.total_cost_usd = {}", v));
+        }
+
+        let cypher = format!(
+            "MATCH (s:ChatSession {{id: $id}}) SET {} RETURN s",
+            set_clauses.join(", ")
+        );
+
+        let q = query(&cypher).param("id", id.to_string());
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            Ok(Some(Self::parse_chat_session_node(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete a chat session
+    pub async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
+        // First check existence, then delete
+        let check =
+            query("MATCH (s:ChatSession {id: $id}) RETURN s.id AS sid").param("id", id.to_string());
+        let mut check_result = self.graph.execute(check).await?;
+        let exists = check_result.next().await?.is_some();
+
+        if exists {
+            let q = query("MATCH (s:ChatSession {id: $id}) DETACH DELETE s")
+                .param("id", id.to_string());
+            self.graph.run(q).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Parse a Neo4j Node into a ChatSessionNode
+    fn parse_chat_session_node(node: &neo4rs::Node) -> Result<ChatSessionNode> {
+        let cli_session_id: String = node.get("cli_session_id").unwrap_or_default();
+        let project_slug: String = node.get("project_slug").unwrap_or_default();
+        let title: String = node.get("title").unwrap_or_default();
+
+        Ok(ChatSessionNode {
+            id: node.get::<String>("id")?.parse()?,
+            cli_session_id: if cli_session_id.is_empty() {
+                None
+            } else {
+                Some(cli_session_id)
+            },
+            project_slug: if project_slug.is_empty() {
+                None
+            } else {
+                Some(project_slug)
+            },
+            cwd: node.get("cwd")?,
+            title: if title.is_empty() { None } else { Some(title) },
+            model: node.get("model")?,
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: node
+                .get::<String>("updated_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            message_count: node.get("message_count").unwrap_or(0),
+            total_cost_usd: {
+                let v: f64 = node.get("total_cost_usd").unwrap_or(0.0);
+                if v == 0.0 {
+                    None
+                } else {
+                    Some(v)
+                }
+            },
+        })
+    }
 }

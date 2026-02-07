@@ -2,6 +2,7 @@
 //!
 //! Implements the actual logic for each MCP tool.
 
+use crate::chat::ChatManager;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
 use crate::neo4j::GraphStore;
@@ -15,11 +16,20 @@ use uuid::Uuid;
 /// Handles MCP tool calls
 pub struct ToolHandler {
     orchestrator: Arc<Orchestrator>,
+    chat_manager: Option<Arc<ChatManager>>,
 }
 
 impl ToolHandler {
     pub fn new(orchestrator: Arc<Orchestrator>) -> Self {
-        Self { orchestrator }
+        Self {
+            orchestrator,
+            chat_manager: None,
+        }
+    }
+
+    pub fn with_chat_manager(mut self, chat_manager: Option<Arc<ChatManager>>) -> Self {
+        self.chat_manager = chat_manager;
+        self
     }
 
     fn neo4j(&self) -> &dyn GraphStore {
@@ -200,6 +210,12 @@ impl ToolHandler {
             "remove_component_dependency" => self.remove_component_dependency(args).await,
             "map_component_to_project" => self.map_component_to_project(args).await,
             "get_workspace_topology" => self.get_workspace_topology(args).await,
+
+            // Chat
+            "list_chat_sessions" => self.list_chat_sessions(args).await,
+            "get_chat_session" => self.get_chat_session(args).await,
+            "delete_chat_session" => self.delete_chat_session(args).await,
+            "chat_send_message" => self.chat_send_message(args).await,
 
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
@@ -3100,6 +3116,131 @@ impl ToolHandler {
             .await?;
         Ok(json!({"updated": true}))
     }
+
+    // ========================================================================
+    // Chat
+    // ========================================================================
+
+    async fn list_chat_sessions(&self, args: Value) -> Result<Value> {
+        let project_slug = args.get("project_slug").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let (sessions, total) = self
+            .neo4j()
+            .list_chat_sessions(project_slug, limit, offset)
+            .await?;
+
+        Ok(json!({
+            "items": sessions,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }))
+    }
+
+    async fn get_chat_session(&self, args: Value) -> Result<Value> {
+        let session_id = parse_uuid(&args, "session_id")?;
+        let session = self
+            .neo4j()
+            .get_chat_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
+
+        Ok(serde_json::to_value(session)?)
+    }
+
+    async fn delete_chat_session(&self, args: Value) -> Result<Value> {
+        let session_id = parse_uuid(&args, "session_id")?;
+
+        // Close active session if chat manager is available
+        if let Some(cm) = &self.chat_manager {
+            let _ = cm.close_session(&session_id.to_string()).await;
+        }
+
+        let deleted = self.neo4j().delete_chat_session(session_id).await?;
+
+        if deleted {
+            Ok(json!({"deleted": true}))
+        } else {
+            Err(anyhow!("Session {} not found", session_id))
+        }
+    }
+
+    async fn chat_send_message(&self, args: Value) -> Result<Value> {
+        let cm = self
+            .chat_manager
+            .as_ref()
+            .ok_or_else(|| anyhow!("Chat manager not initialized"))?;
+
+        let message = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("message is required"))?;
+        let cwd = args
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("cwd is required"))?;
+        let session_id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let model = args.get("model").and_then(|v| v.as_str()).map(String::from);
+
+        let request = crate::chat::ChatRequest {
+            message: message.to_string(),
+            session_id,
+            cwd: cwd.to_string(),
+            project_slug,
+            model,
+        };
+
+        // Create session and wait for it to complete (non-streaming for MCP)
+        let response = cm.create_session(&request).await?;
+
+        // Subscribe and collect all events until Result
+        let rx = cm.subscribe(&response.session_id).await?;
+        let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut result_session_id = response.session_id.clone();
+        let mut cost_usd = None;
+        let mut duration_ms = 0u64;
+
+        use tokio_stream::StreamExt;
+        while let Some(Ok(event)) = stream.next().await {
+            match event {
+                crate::chat::ChatEvent::AssistantText { content } => {
+                    text_parts.push(content);
+                }
+                crate::chat::ChatEvent::Result {
+                    session_id: sid,
+                    duration_ms: dur,
+                    cost_usd: cost,
+                } => {
+                    result_session_id = sid;
+                    duration_ms = dur;
+                    cost_usd = cost;
+                    break;
+                }
+                crate::chat::ChatEvent::Error { message } => {
+                    return Err(anyhow!("Chat error: {}", message));
+                }
+                _ => {} // Skip tool_use, tool_result, thinking, etc.
+            }
+        }
+
+        Ok(json!({
+            "session_id": result_session_id,
+            "response": text_parts.join(""),
+            "duration_ms": duration_ms,
+            "cost_usd": cost_usd
+        }))
+    }
 }
 
 // ============================================================================
@@ -4650,5 +4791,147 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("root_path is required"));
+    }
+
+    // -- Chat tools ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_chat_sessions_empty() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle("list_chat_sessions", Some(json!({})))
+            .await
+            .unwrap();
+        assert!(result.is_object());
+        let items = result.get("items").unwrap().as_array().unwrap();
+        assert!(items.is_empty());
+        assert_eq!(result.get("total").unwrap().as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_session_not_found() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "get_chat_session",
+                Some(json!({"session_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_session_not_found() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "delete_chat_session",
+                Some(json!({"session_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_send_message_no_chat_manager() {
+        let handler = create_handler().await;
+        // chat_manager is None by default, so chat_send_message should error
+        let result = handler
+            .handle(
+                "chat_send_message",
+                Some(json!({
+                    "message": "Hello",
+                    "cwd": "/tmp"
+                })),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Chat manager not initialized"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_send_message_missing_args() {
+        let handler = create_handler().await;
+        // Missing "message" field
+        let result = handler
+            .handle("chat_send_message", Some(json!({"cwd": "/tmp"})))
+            .await;
+        assert!(result.is_err());
+        // Should fail because chat_manager is None (checked first)
+        assert!(result.unwrap_err().to_string().contains("not initialized"));
+    }
+
+    #[tokio::test]
+    async fn test_list_chat_sessions_with_project_filter() {
+        let handler = create_handler().await;
+
+        // Create a chat session via neo4j directly
+        use crate::test_helpers::test_chat_session;
+        let session = test_chat_session(Some("my-project"));
+        handler.neo4j().create_chat_session(&session).await.unwrap();
+
+        // List with matching filter
+        let result = handler
+            .handle(
+                "list_chat_sessions",
+                Some(json!({"project_slug": "my-project"})),
+            )
+            .await
+            .unwrap();
+        let items = result.get("items").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 1);
+
+        // List with non-matching filter
+        let result = handler
+            .handle(
+                "list_chat_sessions",
+                Some(json!({"project_slug": "other-project"})),
+            )
+            .await
+            .unwrap();
+        let items = result.get("items").unwrap().as_array().unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_crud_via_mcp() {
+        let handler = create_handler().await;
+
+        // Create a session via neo4j
+        use crate::test_helpers::test_chat_session;
+        let session = test_chat_session(Some("test-proj"));
+        let session_id = session.id.to_string();
+        handler.neo4j().create_chat_session(&session).await.unwrap();
+
+        // Get it
+        let result = handler
+            .handle("get_chat_session", Some(json!({"session_id": session_id})))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.get("project_slug").unwrap().as_str().unwrap(),
+            "test-proj"
+        );
+
+        // Delete it
+        let result = handler
+            .handle(
+                "delete_chat_session",
+                Some(json!({"session_id": session_id})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.get("deleted").unwrap().as_bool().unwrap(), true);
+
+        // Verify it's gone
+        let result = handler
+            .handle("get_chat_session", Some(json!({"session_id": session_id})))
+            .await;
+        assert!(result.is_err());
     }
 }

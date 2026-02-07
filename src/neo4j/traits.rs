@@ -894,4 +894,37 @@ pub trait GraphStore: Send + Sync {
 
     /// Get anchors for a note
     async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>>;
+
+    // ========================================================================
+    // Chat session operations
+    // ========================================================================
+
+    /// Create a new chat session
+    async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()>;
+
+    /// Get a chat session by ID
+    async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>>;
+
+    /// List chat sessions with optional project_slug filter and pagination
+    ///
+    /// Returns (sessions, total_count)
+    async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ChatSessionNode>, usize)>;
+
+    /// Update a chat session (partial update, None fields are skipped)
+    async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+    ) -> Result<Option<ChatSessionNode>>;
+
+    /// Delete a chat session
+    async fn delete_chat_session(&self, id: Uuid) -> Result<bool>;
 }

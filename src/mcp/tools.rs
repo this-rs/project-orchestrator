@@ -22,6 +22,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     tools.extend(meilisearch_tools());
     tools.extend(note_tools());
     tools.extend(workspace_tools());
+    tools.extend(chat_tools());
     tools
 }
 
@@ -1861,6 +1862,65 @@ fn workspace_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+// ============================================================================
+// Chat Tools (4)
+// ============================================================================
+
+fn chat_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_chat_sessions".to_string(),
+            description: "List chat sessions with optional project filter and pagination".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Filter by project slug"},
+                    "limit": {"type": "integer", "description": "Max items (default 50)"},
+                    "offset": {"type": "integer", "description": "Items to skip"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "get_chat_session".to_string(),
+            description: "Get chat session details by ID".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "session_id": {"type": "string", "description": "Session UUID"}
+                })),
+                required: Some(vec!["session_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_chat_session".to_string(),
+            description: "Delete a chat session".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "session_id": {"type": "string", "description": "Session UUID"}
+                })),
+                required: Some(vec!["session_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "chat_send_message".to_string(),
+            description: "Send a chat message and wait for the complete response (non-streaming). Creates a new session or resumes an existing one.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "message": {"type": "string", "description": "The user message to send"},
+                    "cwd": {"type": "string", "description": "Working directory for Claude Code CLI"},
+                    "session_id": {"type": "string", "description": "Session ID to resume (optional — creates new session if omitted)"},
+                    "project_slug": {"type": "string", "description": "Project slug to associate with the session"},
+                    "model": {"type": "string", "description": "Model override (default: from config)"}
+                })),
+                required: Some(vec!["message".to_string(), "cwd".to_string()]),
+            },
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1868,7 +1928,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 131, "Expected 131 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 135, "Expected 135 tools, got {}", tools.len());
     }
 
     #[test]

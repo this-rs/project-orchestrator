@@ -1,5 +1,6 @@
 //! API route definitions
 
+use super::chat_handlers;
 use super::code_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::note_handlers;
@@ -423,6 +424,29 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .route(
             "/api/workspaces/{slug}/topology",
             get(workspace_handlers::get_workspace_topology),
+        )
+        // ====================================================================
+        // Chat (SSE streaming + session management)
+        // ====================================================================
+        .route(
+            "/api/chat/sessions",
+            get(chat_handlers::list_sessions).post(chat_handlers::create_session),
+        )
+        .route(
+            "/api/chat/sessions/{id}",
+            get(chat_handlers::get_session).delete(chat_handlers::delete_session),
+        )
+        .route(
+            "/api/chat/sessions/{id}/stream",
+            get(chat_handlers::stream_events),
+        )
+        .route(
+            "/api/chat/sessions/{id}/messages",
+            post(chat_handlers::send_message),
+        )
+        .route(
+            "/api/chat/sessions/{id}/interrupt",
+            post(chat_handlers::interrupt_session),
         )
         // Middleware
         .layer(TraceLayer::new_for_http())

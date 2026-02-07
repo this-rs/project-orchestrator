@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use project_orchestrator::{
     api::{self, handlers::ServerState},
+    chat::{ChatConfig, ChatManager},
     orchestrator::{FileWatcher, Orchestrator},
     AppState, Config,
 };
@@ -83,10 +84,24 @@ async fn run_server(config: Config) -> Result<()> {
     // Create file watcher
     let watcher = FileWatcher::new(orchestrator.clone());
 
+    // Create chat manager (optional — requires Claude CLI)
+    let chat_manager = {
+        let chat_config = ChatConfig::from_env();
+        let cm = Arc::new(ChatManager::new(
+            orchestrator.neo4j_arc(),
+            orchestrator.meili_arc(),
+            chat_config,
+        ));
+        cm.start_cleanup_task();
+        tracing::info!("Chat manager initialized");
+        Some(cm)
+    };
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
         watcher: Arc::new(RwLock::new(watcher)),
+        chat_manager,
     });
 
     // Create router
