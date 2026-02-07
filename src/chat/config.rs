@@ -56,7 +56,7 @@ impl ChatConfig {
             max_turns: std::env::var("CHAT_MAX_TURNS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(10),
+                .unwrap_or(50),
         }
     }
 
