@@ -64,7 +64,11 @@ impl Orchestrator {
             event_bus.clone(),
         ));
 
-        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
+        let note_manager = Arc::new(NoteManager::with_event_bus(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            event_bus.clone(),
+        ));
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
