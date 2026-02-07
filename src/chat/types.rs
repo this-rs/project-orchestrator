@@ -60,6 +60,8 @@ pub enum ChatEvent {
         #[serde(default)]
         cost_usd: Option<f64>,
     },
+    /// Streaming text delta (real-time token)
+    StreamDelta { text: String },
     /// An error occurred
     Error { message: String },
 }
@@ -75,6 +77,7 @@ impl ChatEvent {
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::InputRequest { .. } => "input_request",
             ChatEvent::Result { .. } => "result",
+            ChatEvent::StreamDelta { .. } => "stream_delta",
             ChatEvent::Error { .. } => "error",
         }
     }
@@ -191,6 +194,10 @@ mod tests {
             "permission_request"
         );
         assert_eq!(
+            ChatEvent::StreamDelta { text: "".into() }.event_type(),
+            "stream_delta"
+        );
+        assert_eq!(
             ChatEvent::Result {
                 session_id: "".into(),
                 duration_ms: 0,
@@ -265,6 +272,9 @@ mod tests {
                 session_id: "cli-456".into(),
                 duration_ms: 1000,
                 cost_usd: None,
+            },
+            ChatEvent::StreamDelta {
+                text: "Hello".into(),
             },
             ChatEvent::Error {
                 message: "CLI not found".into(),
