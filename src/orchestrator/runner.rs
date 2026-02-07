@@ -1604,3 +1604,549 @@ pub struct SyncResult {
     pub symbols_deleted: usize,
     pub errors: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{CrudAction, EntityType as EventEntityType, EventBus};
+    use crate::test_helpers::*;
+
+    /// Helper: create an Orchestrator with EventBus, return (orchestrator, receiver)
+    async fn orch_with_bus() -> (Orchestrator, tokio::sync::broadcast::Receiver<CrudEvent>) {
+        let state = mock_app_state();
+        let bus = Arc::new(EventBus::default());
+        let rx = bus.subscribe();
+        let orch = Orchestrator::with_event_bus(state, bus).await.unwrap();
+        (orch, rx)
+    }
+
+    // ── constructors ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_new_has_no_event_bus() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        assert!(orch.event_bus().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_event_bus_has_bus() {
+        let (orch, _rx) = orch_with_bus().await;
+        assert!(orch.event_bus().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_accessors() {
+        let (orch, _rx) = orch_with_bus().await;
+        let _ = orch.plan_manager();
+        let _ = orch.context_builder();
+        let _ = orch.neo4j();
+        let _ = orch.note_manager();
+        let _ = orch.note_lifecycle();
+    }
+
+    // ── Projects ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.create_project(&project).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Project);
+        assert_eq!(ev.action, CrudAction::Created);
+        assert_eq!(ev.entity_id, project.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_update_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+        orch.update_project(project.id, Some("new-name".into()), None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+        orch.delete_project(project.id).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    // ── Plan link/unlink ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_link_plan_to_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let plan_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        orch.link_plan_to_project(plan_id, project_id)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Plan);
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_unlink_plan_from_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.unlink_plan_from_project(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+    }
+
+    // ── Task dependencies ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_add_task_dependency_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        orch.add_task_dependency(t1, t2).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Task);
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_remove_task_dependency_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.remove_task_dependency(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+    }
+
+    // ── Steps / Decisions / Constraints ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_delete_step_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let id = Uuid::new_v4();
+        orch.delete_step(id).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Step);
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_update_decision_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let id = Uuid::new_v4();
+        orch.update_decision(id, Some("desc".into()), None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Decision);
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_decision_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_decision(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_update_constraint_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_constraint(Uuid::new_v4(), Some("desc".into()), None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Constraint);
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_constraint_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_constraint(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    // ── Commits ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_commit_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let commit = test_commit("abc123", "feat: test");
+        orch.create_commit(&commit).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Commit);
+        assert_eq!(ev.action, CrudAction::Created);
+        assert_eq!(ev.entity_id, "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_link_commit_to_task_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_commit_to_task("abc", Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_link_commit_to_plan_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_commit_to_plan("abc", Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Releases ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let release = test_release(Uuid::new_v4(), "1.0.0");
+        orch.create_release(&release).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Release);
+        assert_eq!(ev.action, CrudAction::Created);
+        assert!(ev.project_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_release(Uuid::new_v4(), None, None, None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_release(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_task_to_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_task_to_release(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_add_commit_to_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_commit_to_release(Uuid::new_v4(), "abc123")
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Milestones ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let ms = test_milestone(Uuid::new_v4(), "v1 launch");
+        orch.create_milestone(&ms).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Milestone);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_milestone(Uuid::new_v4(), None, None, None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_milestone(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_task_to_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_task_to_milestone(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Workspaces ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let ws = test_workspace();
+        orch.create_workspace(&ws).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Workspace);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let ws = test_workspace();
+        orch.neo4j().create_workspace(&ws).await.unwrap();
+        orch.update_workspace(ws.id, Some("new".into()), None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_workspace(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_project_to_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_project_to_workspace(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_remove_project_from_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.remove_project_from_workspace(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+    }
+
+    // ── Workspace Milestones ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let ms = WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            title: "Cross-project milestone".into(),
+            description: None,
+            status: MilestoneStatus::Open,
+            target_date: None,
+            closed_at: None,
+            created_at: chrono::Utc::now(),
+            tags: vec![],
+        };
+        orch.create_workspace_milestone(&ms).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::WorkspaceMilestone);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_workspace_milestone(Uuid::new_v4(), Some("t".into()), None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_workspace_milestone(Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_task_to_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_task_to_workspace_milestone(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Resources ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let res = ResourceNode {
+            id: Uuid::new_v4(),
+            workspace_id: Some(Uuid::new_v4()),
+            project_id: None,
+            name: "API spec".into(),
+            resource_type: ResourceType::ApiContract,
+            file_path: "api.yaml".into(),
+            url: None,
+            format: Some("openapi".into()),
+            version: Some("1.0".into()),
+            description: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+        orch.create_resource(&res).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Resource);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_resource(Uuid::new_v4(), Some("n".into()), None, None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_resource(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_link_project_implements_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_project_implements_resource(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+        assert!(!ev.payload.is_null());
+    }
+
+    #[tokio::test]
+    async fn test_link_project_uses_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_project_uses_resource(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Components ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_component_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let comp = ComponentNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            name: "api-gateway".into(),
+            component_type: ComponentType::Gateway,
+            description: None,
+            runtime: None,
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            tags: vec![],
+        };
+        orch.create_component(&comp).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Component);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_component_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_component(Uuid::new_v4(), Some("n".into()), None, None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_component_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_component(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_component_dependency_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_component_dependency(Uuid::new_v4(), Uuid::new_v4(), Some("grpc".into()), true)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_remove_component_dependency_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.remove_component_dependency(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+    }
+
+    #[tokio::test]
+    async fn test_map_component_to_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.map_component_to_project(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── emit without bus (no-op, no panic) ───────────────────────────
+
+    #[tokio::test]
+    async fn test_wrapper_without_bus_does_not_panic() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let project = test_project();
+        // Should succeed silently even without event bus
+        orch.create_project(&project).await.unwrap();
+        orch.delete_project(project.id).await.unwrap();
+    }
+}
