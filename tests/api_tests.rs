@@ -2048,7 +2048,7 @@ async fn test_workspace_milestone_crud() {
     assert!(update_resp.status().is_success());
     let updated: Value = update_resp.json().await.unwrap();
     assert_eq!(updated["title"], "Q1 Release - Updated");
-    assert_eq!(updated["status"], "Closed");
+    assert_eq!(updated["status"], "closed");
 
     // Delete milestone
     let delete_resp = client

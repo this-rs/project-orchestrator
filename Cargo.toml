@@ -65,7 +65,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { path = "../../../../projects/project-orchestrator/nexus/claude-code-sdk-rs", features = ["memory"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", features = ["memory"] }
 tokio-stream = "0.1"
 
 # Config

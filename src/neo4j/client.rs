@@ -801,7 +801,14 @@ impl Neo4jClient {
             "description",
             milestone.description.clone().unwrap_or_default(),
         )
-        .param("status", format!("{:?}", milestone.status))
+        .param(
+            "status",
+            serde_json::to_value(&milestone.status)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
         .param(
             "target_date",
             milestone
@@ -874,8 +881,7 @@ impl Neo4jClient {
         offset: usize,
     ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)> {
         let status_filter = if let Some(s) = status {
-            let pascal = snake_to_pascal_case(s);
-            format!("WHERE wm.status = '{}'", pascal)
+            format!("WHERE toLower(wm.status) = toLower('{}')", s)
         } else {
             String::new()
         };
@@ -1046,7 +1052,14 @@ impl Neo4jClient {
             q = q.param("description", d);
         }
         if let Some(s) = status {
-            q = q.param("status", format!("{:?}", s));
+            q = q.param(
+                "status",
+                serde_json::to_value(&s)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
         }
         if let Some(td) = target_date {
             q = q.param("target_date", td.to_rfc3339());
@@ -1166,10 +1179,9 @@ impl Neo4jClient {
     /// Helper to convert Neo4j node to WorkspaceMilestoneNode
     fn node_to_workspace_milestone(&self, node: &neo4rs::Node) -> Result<WorkspaceMilestoneNode> {
         let status_str: String = node.get("status").unwrap_or_else(|_| "Open".to_string());
-        let status = match status_str.to_lowercase().as_str() {
-            "closed" => MilestoneStatus::Closed,
-            _ => MilestoneStatus::Open,
-        };
+        let status =
+            serde_json::from_str::<MilestoneStatus>(&format!("\"{}\"", status_str.to_lowercase()))
+                .unwrap_or(MilestoneStatus::Open);
 
         let tags: Vec<String> = node.get("tags").unwrap_or_else(|_| vec![]);
 
@@ -5271,7 +5283,14 @@ impl Neo4jClient {
             "description",
             milestone.description.clone().unwrap_or_default(),
         )
-        .param("status", format!("{:?}", milestone.status))
+        .param(
+            "status",
+            serde_json::to_value(&milestone.status)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
         .param("project_id", milestone.project_id.to_string())
         .param(
             "target_date",
@@ -5406,7 +5425,14 @@ impl Neo4jClient {
         let mut q = query(&cypher).param("id", id.to_string());
 
         if let Some(ref s) = status {
-            q = q.param("status", format!("{:?}", s));
+            q = q.param(
+                "status",
+                serde_json::to_value(s)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
         }
         if let Some(d) = target_date {
             q = q.param("target_date", d.to_rfc3339());

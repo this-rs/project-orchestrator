@@ -406,7 +406,10 @@ pub struct MilestoneNode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MilestoneStatus {
+    Planned,
     Open,
+    InProgress,
+    Completed,
     Closed,
 }
 

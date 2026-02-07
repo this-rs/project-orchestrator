@@ -1319,7 +1319,7 @@ impl ToolHandler {
         let status = match args.get("status").and_then(|v| v.as_str()) {
             Some(s) => Some(
                 serde_json::from_str::<MilestoneStatus>(&format!("\"{}\"", s)).map_err(|_| {
-                    anyhow!("Invalid milestone status '{}'. Valid: open, closed", s)
+                    anyhow!("Invalid milestone status '{}'. Valid: planned, open, in_progress, completed, closed", s)
                 })?,
             ),
             None => None,
@@ -2590,13 +2590,14 @@ impl ToolHandler {
             .get("description")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let status = args.get("status").and_then(|v| v.as_str()).and_then(|s| {
-            match s.to_lowercase().as_str() {
-                "open" => Some(MilestoneStatus::Open),
-                "closed" => Some(MilestoneStatus::Closed),
-                _ => None,
-            }
-        });
+        let status = match args.get("status").and_then(|v| v.as_str()) {
+            Some(s) => Some(
+                serde_json::from_str::<MilestoneStatus>(&format!("\"{}\"", s)).map_err(|_| {
+                    anyhow!("Invalid milestone status '{}'. Valid: planned, open, in_progress, completed, closed", s)
+                })?,
+            ),
+            None => None,
+        };
         let target_date = args
             .get("target_date")
             .and_then(|v| v.as_str())
@@ -3520,18 +3521,22 @@ mod tests {
     #[test]
     fn test_milestone_status_parsing() {
         // Test status parsing logic
-        let parse_status = |s: &str| match s.to_lowercase().as_str() {
-            "open" => Some(MilestoneStatus::Open),
-            "closed" => Some(MilestoneStatus::Closed),
-            _ => None,
+        let parse_status = |s: &str| -> Result<MilestoneStatus, _> {
+            serde_json::from_str(&format!("\"{}\"", s.to_lowercase()))
         };
 
-        assert_eq!(parse_status("open"), Some(MilestoneStatus::Open));
-        assert_eq!(parse_status("OPEN"), Some(MilestoneStatus::Open));
-        assert_eq!(parse_status("Open"), Some(MilestoneStatus::Open));
-        assert_eq!(parse_status("closed"), Some(MilestoneStatus::Closed));
-        assert_eq!(parse_status("CLOSED"), Some(MilestoneStatus::Closed));
-        assert_eq!(parse_status("invalid"), None);
+        assert_eq!(parse_status("open").unwrap(), MilestoneStatus::Open);
+        assert_eq!(parse_status("planned").unwrap(), MilestoneStatus::Planned);
+        assert_eq!(
+            parse_status("in_progress").unwrap(),
+            MilestoneStatus::InProgress
+        );
+        assert_eq!(
+            parse_status("completed").unwrap(),
+            MilestoneStatus::Completed
+        );
+        assert_eq!(parse_status("closed").unwrap(), MilestoneStatus::Closed);
+        assert!(parse_status("invalid").is_err());
     }
 
     #[test]

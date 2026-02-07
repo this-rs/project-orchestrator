@@ -711,7 +711,7 @@ fn milestone_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "project_id": {"type": "string", "description": "Project UUID"},
-                    "status": {"type": "string", "description": "Filter by status (open, closed)"},
+                    "status": {"type": "string", "description": "Filter by status (planned, open, in_progress, completed, closed)"},
                     "limit": {"type": "integer", "description": "Max items"},
                     "offset": {"type": "integer", "description": "Items to skip"}
                 })),
@@ -750,7 +750,7 @@ fn milestone_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "milestone_id": {"type": "string", "description": "Milestone UUID"},
-                    "status": {"type": "string", "description": "New status (open, closed)"},
+                    "status": {"type": "string", "description": "New status (planned, open, in_progress, completed, closed)"},
                     "target_date": {"type": "string", "description": "New target date"},
                     "closed_at": {"type": "string", "description": "Closure date"},
                     "title": {"type": "string", "description": "New title"},
@@ -1541,7 +1541,7 @@ fn workspace_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "workspace_id": {"type": "string", "description": "Filter by workspace UUID"},
-                    "status": {"type": "string", "description": "Filter by status (open, closed)"},
+                    "status": {"type": "string", "description": "Filter by status (planned, open, in_progress, completed, closed)"},
                     "limit": {"type": "integer", "description": "Max items (default 50)"},
                     "offset": {"type": "integer", "description": "Items to skip"}
                 })),
@@ -1555,7 +1555,7 @@ fn workspace_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "slug": {"type": "string", "description": "Workspace slug"},
-                    "status": {"type": "string", "description": "Filter by status (open, closed)"},
+                    "status": {"type": "string", "description": "Filter by status (planned, open, in_progress, completed, closed)"},
                     "limit": {"type": "integer", "description": "Max items"},
                     "offset": {"type": "integer", "description": "Items to skip"}
                 })),
@@ -1597,7 +1597,7 @@ fn workspace_tools() -> Vec<ToolDefinition> {
                     "id": {"type": "string", "description": "Workspace milestone UUID"},
                     "title": {"type": "string", "description": "New title"},
                     "description": {"type": "string", "description": "New description"},
-                    "status": {"type": "string", "description": "New status (open, closed)"},
+                    "status": {"type": "string", "description": "New status (planned, open, in_progress, completed, closed)"},
                     "target_date": {"type": "string", "description": "New target date"},
                     "closed_at": {"type": "string", "description": "Closure date"}
                 })),
