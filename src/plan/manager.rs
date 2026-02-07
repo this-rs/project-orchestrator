@@ -109,7 +109,9 @@ impl PlanManager {
 
     /// Update plan status
     pub async fn update_plan_status(&self, plan_id: Uuid, status: PlanStatus) -> Result<()> {
-        self.neo4j.update_plan_status(plan_id, status.clone()).await?;
+        self.neo4j
+            .update_plan_status(plan_id, status.clone())
+            .await?;
         self.emit(
             CrudEvent::new(EntityType::Plan, CrudAction::Updated, plan_id.to_string())
                 .with_payload(serde_json::json!({"status": status})),
@@ -190,7 +192,9 @@ impl PlanManager {
 
         self.emit(
             CrudEvent::new(EntityType::Task, CrudAction::Created, task.id.to_string())
-                .with_payload(serde_json::json!({"title": &task.title, "plan_id": plan_id.to_string()})),
+                .with_payload(
+                    serde_json::json!({"title": &task.title, "plan_id": plan_id.to_string()}),
+                ),
         );
 
         Ok(task)
@@ -249,14 +253,18 @@ impl PlanManager {
         self.neo4j.create_step(task_id, step).await?;
         self.emit(
             CrudEvent::new(EntityType::Step, CrudAction::Created, step.id.to_string())
-                .with_payload(serde_json::json!({"task_id": task_id.to_string(), "order": step.order})),
+                .with_payload(
+                    serde_json::json!({"task_id": task_id.to_string(), "order": step.order}),
+                ),
         );
         Ok(())
     }
 
     /// Update step status
     pub async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
-        self.neo4j.update_step_status(step_id, status.clone()).await?;
+        self.neo4j
+            .update_step_status(step_id, status.clone())
+            .await?;
         self.emit(
             CrudEvent::new(EntityType::Step, CrudAction::Updated, step_id.to_string())
                 .with_payload(serde_json::json!({"status": status})),

@@ -88,9 +88,13 @@ impl NoteManager {
         }
 
         self.emit(
-            CrudEvent::new(EventEntityType::Note, CrudAction::Created, note.id.to_string())
-                .with_payload(serde_json::json!({"note_type": note.note_type.to_string()}))
-                .with_project_id(note.project_id.to_string()),
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Created,
+                note.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"note_type": note.note_type.to_string()}))
+            .with_project_id(note.project_id.to_string()),
         );
 
         Ok(note)
@@ -214,8 +218,14 @@ impl NoteManager {
             .unlink_note_from_entity(note_id, entity_type, entity_id)
             .await?;
         self.emit(
-            CrudEvent::new(EventEntityType::Note, CrudAction::Unlinked, note_id.to_string())
-                .with_payload(serde_json::json!({"entity_type": entity_type.to_string(), "entity_id": entity_id})),
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Unlinked,
+                note_id.to_string(),
+            )
+            .with_payload(
+                serde_json::json!({"entity_type": entity_type.to_string(), "entity_id": entity_id}),
+            ),
         );
         Ok(())
     }
@@ -239,9 +249,13 @@ impl NoteManager {
             self.meilisearch.index_note(&doc).await?;
 
             self.emit(
-                CrudEvent::new(EventEntityType::Note, CrudAction::Updated, note_id.to_string())
-                    .with_payload(serde_json::json!({"confirmed_by": confirmed_by}))
-                    .with_project_id(note.project_id.to_string()),
+                CrudEvent::new(
+                    EventEntityType::Note,
+                    CrudAction::Updated,
+                    note_id.to_string(),
+                )
+                .with_payload(serde_json::json!({"confirmed_by": confirmed_by}))
+                .with_project_id(note.project_id.to_string()),
             );
         }
 
@@ -277,8 +291,12 @@ impl NoteManager {
 
         if updated.is_some() {
             self.emit(
-                CrudEvent::new(EventEntityType::Note, CrudAction::Updated, note_id.to_string())
-                    .with_payload(serde_json::json!({"status": "obsolete", "reason": reason})),
+                CrudEvent::new(
+                    EventEntityType::Note,
+                    CrudAction::Updated,
+                    note_id.to_string(),
+                )
+                .with_payload(serde_json::json!({"status": "obsolete", "reason": reason})),
             );
         }
 
@@ -305,8 +323,14 @@ impl NoteManager {
             .await?;
 
         self.emit(
-            CrudEvent::new(EventEntityType::Note, CrudAction::Updated, old_note_id.to_string())
-                .with_payload(serde_json::json!({"status": "archived", "superseded_by": new_note.id.to_string()})),
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Updated,
+                old_note_id.to_string(),
+            )
+            .with_payload(
+                serde_json::json!({"status": "archived", "superseded_by": new_note.id.to_string()}),
+            ),
         );
 
         Ok(new_note)

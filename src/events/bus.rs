@@ -57,8 +57,8 @@ impl EventBus {
         payload: serde_json::Value,
         project_id: Option<String>,
     ) {
-        let mut event = CrudEvent::new(entity_type, CrudAction::Created, entity_id)
-            .with_payload(payload);
+        let mut event =
+            CrudEvent::new(entity_type, CrudAction::Created, entity_id).with_payload(payload);
         if let Some(pid) = project_id {
             event = event.with_project_id(pid);
         }
@@ -73,8 +73,8 @@ impl EventBus {
         payload: serde_json::Value,
         project_id: Option<String>,
     ) {
-        let mut event = CrudEvent::new(entity_type, CrudAction::Updated, entity_id)
-            .with_payload(payload);
+        let mut event =
+            CrudEvent::new(entity_type, CrudAction::Updated, entity_id).with_payload(payload);
         if let Some(pid) = project_id {
             event = event.with_project_id(pid);
         }
@@ -274,12 +274,7 @@ mod tests {
         let mut rx = bus.subscribe();
 
         // Emit from the clone
-        bus2.emit_created(
-            EntityType::Workspace,
-            "ws-1",
-            serde_json::Value::Null,
-            None,
-        );
+        bus2.emit_created(EntityType::Workspace, "ws-1", serde_json::Value::Null, None);
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.entity_type, EntityType::Workspace);

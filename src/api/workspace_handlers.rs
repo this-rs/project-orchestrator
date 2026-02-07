@@ -330,10 +330,7 @@ pub async fn create_workspace(
         metadata: req.metadata,
     };
 
-    state
-        .orchestrator
-        .create_workspace(&workspace)
-        .await?;
+    state.orchestrator.create_workspace(&workspace).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -396,10 +393,7 @@ pub async fn delete_workspace(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
-    state
-        .orchestrator
-        .delete_workspace(workspace.id)
-        .await?;
+    state.orchestrator.delete_workspace(workspace.id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -719,10 +713,7 @@ pub async fn delete_workspace_milestone(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
 
-    state
-        .orchestrator
-        .delete_workspace_milestone(id)
-        .await?;
+    state.orchestrator.delete_workspace_milestone(id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -931,10 +922,7 @@ pub async fn create_resource(
         metadata: req.metadata,
     };
 
-    state
-        .orchestrator
-        .create_resource(&resource)
-        .await?;
+    state.orchestrator.create_resource(&resource).await?;
 
     Ok((StatusCode::CREATED, Json(ResourceResponse::from(resource))))
 }
@@ -1112,10 +1100,7 @@ pub async fn create_component(
         tags: req.tags,
     };
 
-    state
-        .orchestrator
-        .create_component(&component)
-        .await?;
+    state.orchestrator.create_component(&component).await?;
 
     Ok((
         StatusCode::CREATED,

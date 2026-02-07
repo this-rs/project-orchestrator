@@ -890,7 +890,9 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("dependency_ids is required"))?;
 
         for dep_id in dependency_ids {
-            self.orchestrator.add_task_dependency(task_id, dep_id).await?;
+            self.orchestrator
+                .add_task_dependency(task_id, dep_id)
+                .await?;
         }
         Ok(json!({"added": true}))
     }
@@ -2559,7 +2561,9 @@ impl ToolHandler {
             tags,
         };
 
-        self.orchestrator.create_workspace_milestone(&milestone).await?;
+        self.orchestrator
+            .create_workspace_milestone(&milestone)
+            .await?;
         Ok(serde_json::to_value(milestone)?)
     }
 
@@ -2947,7 +2951,9 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let dep_id = parse_uuid(&args, "dep_id")?;
 
-        self.orchestrator.remove_component_dependency(id, dep_id).await?;
+        self.orchestrator
+            .remove_component_dependency(id, dep_id)
+            .await?;
 
         Ok(json!({"removed": true}))
     }

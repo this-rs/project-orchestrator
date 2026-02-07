@@ -169,10 +169,7 @@ pub async fn unlink_plan_from_project(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .unlink_plan_from_project(plan_id)
-        .await?;
+    state.orchestrator.unlink_plan_from_project(plan_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -425,10 +422,7 @@ pub async fn delete_decision(
     State(state): State<OrchestratorState>,
     Path(decision_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .delete_decision(decision_id)
-        .await?;
+    state.orchestrator.delete_decision(decision_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -768,10 +762,7 @@ pub async fn delete_constraint(
     State(state): State<OrchestratorState>,
     Path(constraint_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .delete_constraint(constraint_id)
-        .await?;
+    state.orchestrator.delete_constraint(constraint_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1008,10 +999,7 @@ pub async fn delete_release(
     State(state): State<OrchestratorState>,
     Path(release_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .delete_release(release_id)
-        .await?;
+    state.orchestrator.delete_release(release_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1109,10 +1097,7 @@ pub async fn create_milestone(
         project_id,
     };
 
-    state
-        .orchestrator
-        .create_milestone(&milestone)
-        .await?;
+    state.orchestrator.create_milestone(&milestone).await?;
     Ok(Json(milestone))
 }
 
@@ -1189,10 +1174,7 @@ pub async fn delete_milestone(
     State(state): State<OrchestratorState>,
     Path(milestone_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .delete_milestone(milestone_id)
-        .await?;
+    state.orchestrator.delete_milestone(milestone_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
