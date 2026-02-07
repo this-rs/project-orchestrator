@@ -330,11 +330,7 @@ pub async fn create_workspace(
         metadata: req.metadata,
     };
 
-    state
-        .orchestrator
-        .neo4j()
-        .create_workspace(&workspace)
-        .await?;
+    state.orchestrator.create_workspace(&workspace).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -372,7 +368,6 @@ pub async fn update_workspace(
 
     state
         .orchestrator
-        .neo4j()
         .update_workspace(workspace.id, req.name, req.description, req.metadata)
         .await?;
 
@@ -398,11 +393,7 @@ pub async fn delete_workspace(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
-    state
-        .orchestrator
-        .neo4j()
-        .delete_workspace(workspace.id)
-        .await?;
+    state.orchestrator.delete_workspace(workspace.id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -524,7 +515,6 @@ pub async fn add_project_to_workspace(
 
     state
         .orchestrator
-        .neo4j()
         .add_project_to_workspace(workspace.id, project_id)
         .await?;
 
@@ -549,7 +539,6 @@ pub async fn remove_project_from_workspace(
 
     state
         .orchestrator
-        .neo4j()
         .remove_project_from_workspace(workspace.id, project_id)
         .await?;
 
@@ -642,7 +631,6 @@ pub async fn create_workspace_milestone(
 
     state
         .orchestrator
-        .neo4j()
         .create_workspace_milestone(&milestone)
         .await?;
 
@@ -703,7 +691,6 @@ pub async fn update_workspace_milestone(
 
     state
         .orchestrator
-        .neo4j()
         .update_workspace_milestone(id, req.title, req.description, status, target_date)
         .await?;
 
@@ -726,11 +713,7 @@ pub async fn delete_workspace_milestone(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
 
-    state
-        .orchestrator
-        .neo4j()
-        .delete_workspace_milestone(id)
-        .await?;
+    state.orchestrator.delete_workspace_milestone(id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -757,7 +740,6 @@ pub async fn add_task_to_workspace_milestone(
 
     state
         .orchestrator
-        .neo4j()
         .add_task_to_workspace_milestone(milestone_id, task_id)
         .await?;
 
@@ -940,11 +922,7 @@ pub async fn create_resource(
         metadata: req.metadata,
     };
 
-    state
-        .orchestrator
-        .neo4j()
-        .create_resource(&resource)
-        .await?;
+    state.orchestrator.create_resource(&resource).await?;
 
     Ok((StatusCode::CREATED, Json(ResourceResponse::from(resource))))
 }
@@ -990,7 +968,6 @@ pub async fn update_resource(
 
     state
         .orchestrator
-        .neo4j()
         .update_resource(
             id,
             req.name,
@@ -1013,7 +990,7 @@ pub async fn delete_resource(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid resource ID".to_string()))?;
 
-    state.orchestrator.neo4j().delete_resource(id).await?;
+    state.orchestrator.delete_resource(id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1037,14 +1014,12 @@ pub async fn link_resource_to_project(
         "implements" => {
             state
                 .orchestrator
-                .neo4j()
                 .link_project_implements_resource(project_id, resource_id)
                 .await?;
         }
         "uses" => {
             state
                 .orchestrator
-                .neo4j()
                 .link_project_uses_resource(project_id, resource_id)
                 .await?;
         }
@@ -1125,11 +1100,7 @@ pub async fn create_component(
         tags: req.tags,
     };
 
-    state
-        .orchestrator
-        .neo4j()
-        .create_component(&component)
-        .await?;
+    state.orchestrator.create_component(&component).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -1178,7 +1149,6 @@ pub async fn update_component(
 
     state
         .orchestrator
-        .neo4j()
         .update_component(
             id,
             req.name,
@@ -1201,7 +1171,7 @@ pub async fn delete_component(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid component ID".to_string()))?;
 
-    state.orchestrator.neo4j().delete_component(id).await?;
+    state.orchestrator.delete_component(id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1223,7 +1193,6 @@ pub async fn add_component_dependency(
 
     state
         .orchestrator
-        .neo4j()
         .add_component_dependency(component_id, depends_on_id, req.protocol, req.required)
         .await?;
 
@@ -1245,7 +1214,6 @@ pub async fn remove_component_dependency(
 
     state
         .orchestrator
-        .neo4j()
         .remove_component_dependency(component_id, depends_on_id)
         .await?;
 
@@ -1269,7 +1237,6 @@ pub async fn map_component_to_project(
 
     state
         .orchestrator
-        .neo4j()
         .map_component_to_project(component_id, project_id)
         .await?;
 

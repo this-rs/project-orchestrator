@@ -143,7 +143,7 @@ pub async fn create_project(
         last_synced: None,
     };
 
-    state.orchestrator.neo4j().create_project(&project).await?;
+    state.orchestrator.create_project(&project).await?;
 
     Ok(Json(ProjectResponse {
         id: project.id.to_string(),

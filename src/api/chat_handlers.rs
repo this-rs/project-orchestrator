@@ -267,6 +267,7 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
+            event_bus: Arc::new(crate::events::EventBus::default()),
         })
     }
 
@@ -292,6 +293,7 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
+            event_bus: Arc::new(crate::events::EventBus::default()),
         });
         create_router(state)
     }

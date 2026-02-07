@@ -4,6 +4,7 @@
 //! including linking notes to entities and managing note lifecycle.
 
 use super::models::*;
+use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventBus};
 use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::GraphStore;
@@ -15,12 +16,37 @@ use uuid::Uuid;
 pub struct NoteManager {
     neo4j: Arc<dyn GraphStore>,
     meilisearch: Arc<dyn SearchStore>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl NoteManager {
     /// Create a new NoteManager
     pub fn new(neo4j: Arc<dyn GraphStore>, meilisearch: Arc<dyn SearchStore>) -> Self {
-        Self { neo4j, meilisearch }
+        Self {
+            neo4j,
+            meilisearch,
+            event_bus: None,
+        }
+    }
+
+    /// Create a new NoteManager with an event bus
+    pub fn with_event_bus(
+        neo4j: Arc<dyn GraphStore>,
+        meilisearch: Arc<dyn SearchStore>,
+        event_bus: Arc<EventBus>,
+    ) -> Self {
+        Self {
+            neo4j,
+            meilisearch,
+            event_bus: Some(event_bus),
+        }
+    }
+
+    /// Emit a CRUD event (no-op if event_bus is None)
+    fn emit(&self, event: crate::events::CrudEvent) {
+        if let Some(bus) = &self.event_bus {
+            bus.emit(event);
+        }
     }
 
     // ========================================================================
@@ -61,6 +87,16 @@ impl NoteManager {
             }
         }
 
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Created,
+                note.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"note_type": note.note_type.to_string()}))
+            .with_project_id(note.project_id.to_string()),
+        );
+
         Ok(note)
     }
 
@@ -95,6 +131,11 @@ impl NoteManager {
         if let Some(ref note) = updated {
             let doc = self.note_to_document(note, None).await?;
             self.meilisearch.index_note(&doc).await?;
+
+            self.emit(
+                CrudEvent::new(EventEntityType::Note, CrudAction::Updated, id.to_string())
+                    .with_project_id(note.project_id.to_string()),
+            );
         }
 
         Ok(updated)
@@ -108,6 +149,11 @@ impl NoteManager {
         // Delete from Meilisearch
         if deleted {
             self.meilisearch.delete_note(&id.to_string()).await?;
+            self.emit(CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Deleted,
+                id.to_string(),
+            ));
         }
 
         Ok(deleted)
@@ -139,7 +185,12 @@ impl NoteManager {
     pub async fn link_note_to_entity(&self, note_id: Uuid, entity: &LinkNoteRequest) -> Result<()> {
         self.neo4j
             .link_note_to_entity(note_id, &entity.entity_type, &entity.entity_id, None, None)
-            .await
+            .await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Note, CrudAction::Linked, note_id.to_string())
+                .with_payload(serde_json::json!({"entity_type": entity.entity_type.to_string(), "entity_id": &entity.entity_id})),
+        );
+        Ok(())
     }
 
     /// Link a note to an entity with semantic hashes
@@ -165,7 +216,18 @@ impl NoteManager {
     ) -> Result<()> {
         self.neo4j
             .unlink_note_from_entity(note_id, entity_type, entity_id)
-            .await
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Unlinked,
+                note_id.to_string(),
+            )
+            .with_payload(
+                serde_json::json!({"entity_type": entity_type.to_string(), "entity_id": entity_id}),
+            ),
+        );
+        Ok(())
     }
 
     /// Get all anchors for a note
@@ -185,6 +247,16 @@ impl NoteManager {
         if let Some(ref note) = note {
             let doc = self.note_to_document(note, None).await?;
             self.meilisearch.index_note(&doc).await?;
+
+            self.emit(
+                CrudEvent::new(
+                    EventEntityType::Note,
+                    CrudAction::Updated,
+                    note_id.to_string(),
+                )
+                .with_payload(serde_json::json!({"confirmed_by": confirmed_by}))
+                .with_project_id(note.project_id.to_string()),
+            );
         }
 
         Ok(note)
@@ -217,6 +289,17 @@ impl NoteManager {
             reason
         );
 
+        if updated.is_some() {
+            self.emit(
+                CrudEvent::new(
+                    EventEntityType::Note,
+                    CrudAction::Updated,
+                    note_id.to_string(),
+                )
+                .with_payload(serde_json::json!({"status": "obsolete", "reason": reason})),
+            );
+        }
+
         Ok(updated)
     }
 
@@ -238,6 +321,17 @@ impl NoteManager {
         self.meilisearch
             .update_note_status(&old_note_id.to_string(), "archived")
             .await?;
+
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Updated,
+                old_note_id.to_string(),
+            )
+            .with_payload(
+                serde_json::json!({"status": "archived", "superseded_by": new_note.id.to_string()}),
+            ),
+        );
 
         Ok(new_note)
     }

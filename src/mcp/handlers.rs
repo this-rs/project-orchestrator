@@ -274,7 +274,7 @@ impl ToolHandler {
             last_synced: None,
         };
 
-        self.neo4j().create_project(&project).await?;
+        self.orchestrator.create_project(&project).await?;
         Ok(serde_json::to_value(project)?)
     }
 
@@ -317,7 +317,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.neo4j()
+        self.orchestrator
             .update_project(project.id, name, description, root_path)
             .await?;
         Ok(json!({"updated": true}))
@@ -335,7 +335,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
 
-        self.neo4j().delete_project(project.id).await?;
+        self.orchestrator.delete_project(project.id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -538,7 +538,7 @@ impl ToolHandler {
         let plan_id = parse_uuid(&args, "plan_id")?;
         let project_id = parse_uuid(&args, "project_id")?;
 
-        self.neo4j()
+        self.orchestrator
             .link_plan_to_project(plan_id, project_id)
             .await?;
         Ok(json!({"linked": true}))
@@ -547,7 +547,7 @@ impl ToolHandler {
     async fn unlink_plan_from_project(&self, args: Value) -> Result<Value> {
         let plan_id = parse_uuid(&args, "plan_id")?;
 
-        self.neo4j().unlink_plan_from_project(plan_id).await?;
+        self.orchestrator.unlink_plan_from_project(plan_id).await?;
         Ok(json!({"unlinked": true}))
     }
 
@@ -890,7 +890,9 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("dependency_ids is required"))?;
 
         for dep_id in dependency_ids {
-            self.neo4j().add_task_dependency(task_id, dep_id).await?;
+            self.orchestrator
+                .add_task_dependency(task_id, dep_id)
+                .await?;
         }
         Ok(json!({"added": true}))
     }
@@ -899,7 +901,7 @@ impl ToolHandler {
         let task_id = parse_uuid(&args, "task_id")?;
         let dependency_id = parse_uuid(&args, "dependency_id")?;
 
-        self.neo4j()
+        self.orchestrator
             .remove_task_dependency(task_id, dependency_id)
             .await?;
         Ok(json!({"removed": true}))
@@ -1091,7 +1093,7 @@ impl ToolHandler {
     async fn delete_constraint(&self, args: Value) -> Result<Value> {
         let constraint_id = parse_uuid(&args, "constraint_id")?;
 
-        self.neo4j().delete_constraint(constraint_id).await?;
+        self.orchestrator.delete_constraint(constraint_id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -1153,7 +1155,7 @@ impl ToolHandler {
             project_id,
         };
 
-        self.neo4j().create_release(&release).await?;
+        self.orchestrator.create_release(&release).await?;
         Ok(serde_json::to_value(release)?)
     }
 
@@ -1205,7 +1207,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.neo4j()
+        self.orchestrator
             .update_release(
                 release_id,
                 status,
@@ -1222,7 +1224,7 @@ impl ToolHandler {
         let release_id = parse_uuid(&args, "release_id")?;
         let task_id = parse_uuid(&args, "task_id")?;
 
-        self.neo4j()
+        self.orchestrator
             .add_task_to_release(release_id, task_id)
             .await?;
         Ok(json!({"added": true}))
@@ -1235,7 +1237,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("commit_sha is required"))?;
 
-        self.neo4j()
+        self.orchestrator
             .add_commit_to_release(release_id, commit_sha)
             .await?;
         Ok(json!({"added": true}))
@@ -1294,7 +1296,7 @@ impl ToolHandler {
             project_id,
         };
 
-        self.neo4j().create_milestone(&milestone).await?;
+        self.orchestrator.create_milestone(&milestone).await?;
         Ok(serde_json::to_value(milestone)?)
     }
 
@@ -1343,7 +1345,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.neo4j()
+        self.orchestrator
             .update_milestone(
                 milestone_id,
                 status,
@@ -1377,7 +1379,7 @@ impl ToolHandler {
         let milestone_id = parse_uuid(&args, "milestone_id")?;
         let task_id = parse_uuid(&args, "task_id")?;
 
-        self.neo4j()
+        self.orchestrator
             .add_task_to_milestone(milestone_id, task_id)
             .await?;
         Ok(json!({"added": true}))
@@ -1408,7 +1410,7 @@ impl ToolHandler {
             timestamp: chrono::Utc::now(),
         };
 
-        self.neo4j().create_commit(&commit).await?;
+        self.orchestrator.create_commit(&commit).await?;
         Ok(serde_json::to_value(commit)?)
     }
 
@@ -1419,7 +1421,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("commit_sha is required"))?;
 
-        self.neo4j()
+        self.orchestrator
             .link_commit_to_task(commit_sha, task_id)
             .await?;
         Ok(json!({"linked": true}))
@@ -1432,7 +1434,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("commit_sha is required"))?;
 
-        self.neo4j()
+        self.orchestrator
             .link_commit_to_plan(commit_sha, plan_id)
             .await?;
         Ok(json!({"linked": true}))
@@ -2274,7 +2276,7 @@ impl ToolHandler {
             metadata,
         };
 
-        self.neo4j().create_workspace(&workspace).await?;
+        self.orchestrator.create_workspace(&workspace).await?;
         Ok(serde_json::to_value(workspace)?)
     }
 
@@ -2315,7 +2317,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        self.neo4j()
+        self.orchestrator
             .update_workspace(workspace.id, name, description, metadata)
             .await?;
 
@@ -2342,7 +2344,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        self.neo4j().delete_workspace(workspace.id).await?;
+        self.orchestrator.delete_workspace(workspace.id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -2415,7 +2417,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        self.neo4j()
+        self.orchestrator
             .add_project_to_workspace(workspace.id, project_id)
             .await?;
 
@@ -2435,7 +2437,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        self.neo4j()
+        self.orchestrator
             .remove_project_from_workspace(workspace.id, project_id)
             .await?;
 
@@ -2559,7 +2561,9 @@ impl ToolHandler {
             tags,
         };
 
-        self.neo4j().create_workspace_milestone(&milestone).await?;
+        self.orchestrator
+            .create_workspace_milestone(&milestone)
+            .await?;
         Ok(serde_json::to_value(milestone)?)
     }
 
@@ -2604,7 +2608,7 @@ impl ToolHandler {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
 
-        self.neo4j()
+        self.orchestrator
             .update_workspace_milestone(id, title, description, status, target_date)
             .await?;
 
@@ -2620,7 +2624,7 @@ impl ToolHandler {
     async fn delete_workspace_milestone(&self, args: Value) -> Result<Value> {
         let id = parse_uuid(&args, "id")?;
 
-        self.neo4j().delete_workspace_milestone(id).await?;
+        self.orchestrator.delete_workspace_milestone(id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -2628,7 +2632,7 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let task_id = parse_uuid(&args, "task_id")?;
 
-        self.neo4j()
+        self.orchestrator
             .add_task_to_workspace_milestone(id, task_id)
             .await?;
 
@@ -2755,7 +2759,7 @@ impl ToolHandler {
             metadata,
         };
 
-        self.neo4j().create_resource(&resource).await?;
+        self.orchestrator.create_resource(&resource).await?;
         Ok(serde_json::to_value(resource)?)
     }
 
@@ -2774,7 +2778,7 @@ impl ToolHandler {
     async fn delete_resource(&self, args: Value) -> Result<Value> {
         let id = parse_uuid(&args, "id")?;
 
-        self.neo4j().delete_resource(id).await?;
+        self.orchestrator.delete_resource(id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -2788,12 +2792,12 @@ impl ToolHandler {
 
         match link_type.to_lowercase().as_str() {
             "implements" => {
-                self.neo4j()
+                self.orchestrator
                     .link_project_implements_resource(project_id, id)
                     .await?;
             }
             "uses" => {
-                self.neo4j()
+                self.orchestrator
                     .link_project_uses_resource(project_id, id)
                     .await?;
             }
@@ -2901,7 +2905,7 @@ impl ToolHandler {
             tags,
         };
 
-        self.neo4j().create_component(&component).await?;
+        self.orchestrator.create_component(&component).await?;
         Ok(serde_json::to_value(component)?)
     }
 
@@ -2920,7 +2924,7 @@ impl ToolHandler {
     async fn delete_component(&self, args: Value) -> Result<Value> {
         let id = parse_uuid(&args, "id")?;
 
-        self.neo4j().delete_component(id).await?;
+        self.orchestrator.delete_component(id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -2936,7 +2940,7 @@ impl ToolHandler {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        self.neo4j()
+        self.orchestrator
             .add_component_dependency(id, depends_on_id, protocol, required)
             .await?;
 
@@ -2947,7 +2951,9 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let dep_id = parse_uuid(&args, "dep_id")?;
 
-        self.neo4j().remove_component_dependency(id, dep_id).await?;
+        self.orchestrator
+            .remove_component_dependency(id, dep_id)
+            .await?;
 
         Ok(json!({"removed": true}))
     }
@@ -2956,7 +2962,7 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let project_id = parse_uuid(&args, "project_id")?;
 
-        self.neo4j()
+        self.orchestrator
             .map_component_to_project(id, project_id)
             .await?;
 
@@ -2996,7 +3002,7 @@ impl ToolHandler {
 
     async fn delete_step_handler(&self, args: Value) -> Result<Value> {
         let step_id = parse_uuid(&args, "step_id")?;
-        self.neo4j().delete_step(step_id).await?;
+        self.orchestrator.delete_step(step_id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3032,7 +3038,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.neo4j()
+        self.orchestrator
             .update_constraint(constraint_id, description, constraint_type, enforced_by)
             .await?;
         Ok(json!({"updated": true}))
@@ -3040,13 +3046,13 @@ impl ToolHandler {
 
     async fn delete_release(&self, args: Value) -> Result<Value> {
         let release_id = parse_uuid(&args, "release_id")?;
-        self.neo4j().delete_release(release_id).await?;
+        self.orchestrator.delete_release(release_id).await?;
         Ok(json!({"deleted": true}))
     }
 
     async fn delete_milestone(&self, args: Value) -> Result<Value> {
         let milestone_id = parse_uuid(&args, "milestone_id")?;
-        self.neo4j().delete_milestone(milestone_id).await?;
+        self.orchestrator.delete_milestone(milestone_id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3075,7 +3081,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.neo4j()
+        self.orchestrator
             .update_decision(decision_id, description, rationale, chosen_option)
             .await?;
         Ok(json!({"updated": true}))
@@ -3083,7 +3089,7 @@ impl ToolHandler {
 
     async fn delete_decision(&self, args: Value) -> Result<Value> {
         let decision_id = parse_uuid(&args, "decision_id")?;
-        self.neo4j().delete_decision(decision_id).await?;
+        self.orchestrator.delete_decision(decision_id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3110,7 +3116,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.neo4j()
+        self.orchestrator
             .update_resource(id, name, file_path, url, version, description)
             .await?;
         Ok(json!({"updated": true}))
@@ -3137,7 +3143,7 @@ impl ToolHandler {
                 .collect()
         });
 
-        self.neo4j()
+        self.orchestrator
             .update_component(id, name, description, runtime, config, tags)
             .await?;
         Ok(json!({"updated": true}))

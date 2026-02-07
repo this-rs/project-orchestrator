@@ -1,5 +1,6 @@
 //! Main orchestrator runner
 
+use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventBus};
 use crate::neo4j::models::*;
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
@@ -24,6 +25,7 @@ pub struct Orchestrator {
     parser: Arc<RwLock<CodeParser>>,
     note_manager: Arc<NoteManager>,
     note_lifecycle: Arc<NoteLifecycleManager>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl Orchestrator {
@@ -50,7 +52,55 @@ impl Orchestrator {
             parser,
             note_manager,
             note_lifecycle,
+            event_bus: None,
         })
+    }
+
+    /// Create a new orchestrator with an EventBus for CRUD notifications
+    pub async fn with_event_bus(state: AppState, event_bus: Arc<EventBus>) -> Result<Self> {
+        let plan_manager = Arc::new(PlanManager::with_event_bus(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            event_bus.clone(),
+        ));
+
+        let note_manager = Arc::new(NoteManager::with_event_bus(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            event_bus.clone(),
+        ));
+
+        let context_builder = Arc::new(ContextBuilder::new(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            plan_manager.clone(),
+            note_manager.clone(),
+        ));
+
+        let parser = Arc::new(RwLock::new(CodeParser::new()?));
+        let note_lifecycle = Arc::new(NoteLifecycleManager::new());
+
+        Ok(Self {
+            state,
+            plan_manager,
+            context_builder,
+            parser,
+            note_manager,
+            note_lifecycle,
+            event_bus: Some(event_bus),
+        })
+    }
+
+    /// Get the event bus (if configured)
+    pub fn event_bus(&self) -> Option<&Arc<EventBus>> {
+        self.event_bus.as_ref()
+    }
+
+    /// Emit a CRUD event (no-op if event_bus is None)
+    fn emit(&self, event: CrudEvent) {
+        if let Some(bus) = &self.event_bus {
+            bus.emit(event);
+        }
     }
 
     /// Get the plan manager
@@ -823,6 +873,726 @@ impl Orchestrator {
 
         Ok(())
     }
+
+    // ========================================================================
+    // CRUD wrappers — mutation + event emission
+    // ========================================================================
+
+    // --- Projects ---
+
+    /// Create a project and emit event
+    pub async fn create_project(&self, project: &ProjectNode) -> Result<()> {
+        self.neo4j().create_project(project).await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Project,
+                CrudAction::Created,
+                project.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"name": &project.name, "slug": &project.slug})),
+        );
+        Ok(())
+    }
+
+    /// Update a project and emit event
+    pub async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        root_path: Option<String>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_project(id, name, description, root_path)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Project,
+            CrudAction::Updated,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a project and emit event
+    pub async fn delete_project(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_project(id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Project,
+            CrudAction::Deleted,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    // --- Plans (link/unlink only — CRUD is in PlanManager) ---
+
+    /// Link a plan to a project and emit event
+    pub async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
+        self.neo4j()
+            .link_plan_to_project(plan_id, project_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Plan,
+                CrudAction::Linked,
+                plan_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"project_id": project_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Unlink a plan from its project and emit event
+    pub async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()> {
+        self.neo4j().unlink_plan_from_project(plan_id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Plan,
+            CrudAction::Unlinked,
+            plan_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    // --- Task dependencies ---
+
+    /// Add a task dependency and emit event
+    pub async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        self.neo4j()
+            .add_task_dependency(task_id, depends_on_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Task,
+                CrudAction::Linked,
+                task_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"depends_on": depends_on_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Remove a task dependency and emit event
+    pub async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        self.neo4j()
+            .remove_task_dependency(task_id, depends_on_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Task,
+                CrudAction::Unlinked,
+                task_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"depends_on": depends_on_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Steps/Decisions/Constraints (delete + update only — create is in PlanManager) ---
+
+    /// Delete a step and emit event
+    pub async fn delete_step(&self, step_id: Uuid) -> Result<()> {
+        self.neo4j().delete_step(step_id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Step,
+            CrudAction::Deleted,
+            step_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Update a decision and emit event
+    pub async fn update_decision(
+        &self,
+        decision_id: Uuid,
+        description: Option<String>,
+        rationale: Option<String>,
+        chosen_option: Option<String>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_decision(decision_id, description, rationale, chosen_option)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Decision,
+            CrudAction::Updated,
+            decision_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a decision and emit event
+    pub async fn delete_decision(&self, decision_id: Uuid) -> Result<()> {
+        self.neo4j().delete_decision(decision_id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Decision,
+            CrudAction::Deleted,
+            decision_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Update a constraint and emit event
+    pub async fn update_constraint(
+        &self,
+        constraint_id: Uuid,
+        description: Option<String>,
+        constraint_type: Option<ConstraintType>,
+        enforced_by: Option<String>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_constraint(constraint_id, description, constraint_type, enforced_by)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Constraint,
+            CrudAction::Updated,
+            constraint_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a constraint and emit event
+    pub async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()> {
+        self.neo4j().delete_constraint(constraint_id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Constraint,
+            CrudAction::Deleted,
+            constraint_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    // --- Commits ---
+
+    /// Create a commit and emit event
+    pub async fn create_commit(&self, commit: &CommitNode) -> Result<()> {
+        self.neo4j().create_commit(commit).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Commit, CrudAction::Created, &commit.hash)
+                .with_payload(serde_json::json!({"message": &commit.message})),
+        );
+        Ok(())
+    }
+
+    /// Link a commit to a task and emit event
+    pub async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()> {
+        self.neo4j()
+            .link_commit_to_task(commit_hash, task_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Commit, CrudAction::Linked, commit_hash)
+                .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Link a commit to a plan and emit event
+    pub async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()> {
+        self.neo4j()
+            .link_commit_to_plan(commit_hash, plan_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Commit, CrudAction::Linked, commit_hash)
+                .with_payload(serde_json::json!({"plan_id": plan_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Releases ---
+
+    /// Create a release and emit event
+    pub async fn create_release(&self, release: &ReleaseNode) -> Result<()> {
+        self.neo4j().create_release(release).await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Release,
+                CrudAction::Created,
+                release.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"version": &release.version}))
+            .with_project_id(release.project_id.to_string()),
+        );
+        Ok(())
+    }
+
+    /// Update a release and emit event
+    pub async fn update_release(
+        &self,
+        id: Uuid,
+        status: Option<ReleaseStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        released_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_release(id, status, target_date, released_at, title, description)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Release,
+            CrudAction::Updated,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a release and emit event
+    pub async fn delete_release(&self, release_id: Uuid) -> Result<()> {
+        self.neo4j().delete_release(release_id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Release,
+            CrudAction::Deleted,
+            release_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Add a task to a release and emit event
+    pub async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()> {
+        self.neo4j()
+            .add_task_to_release(release_id, task_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Release,
+                CrudAction::Linked,
+                release_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Add a commit to a release and emit event
+    pub async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
+        self.neo4j()
+            .add_commit_to_release(release_id, commit_hash)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Release,
+                CrudAction::Linked,
+                release_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"commit_hash": commit_hash})),
+        );
+        Ok(())
+    }
+
+    // --- Milestones ---
+
+    /// Create a milestone and emit event
+    pub async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()> {
+        self.neo4j().create_milestone(milestone).await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Milestone,
+                CrudAction::Created,
+                milestone.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"title": &milestone.title}))
+            .with_project_id(milestone.project_id.to_string()),
+        );
+        Ok(())
+    }
+
+    /// Update a milestone and emit event
+    pub async fn update_milestone(
+        &self,
+        id: Uuid,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        closed_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_milestone(id, status, target_date, closed_at, title, description)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Milestone,
+            CrudAction::Updated,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a milestone and emit event
+    pub async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {
+        self.neo4j().delete_milestone(milestone_id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Milestone,
+            CrudAction::Deleted,
+            milestone_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Add a task to a milestone and emit event
+    pub async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()> {
+        self.neo4j()
+            .add_task_to_milestone(milestone_id, task_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Milestone,
+                CrudAction::Linked,
+                milestone_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Workspaces ---
+
+    /// Create a workspace and emit event
+    pub async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()> {
+        self.neo4j().create_workspace(workspace).await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Workspace,
+                CrudAction::Created,
+                workspace.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"name": &workspace.name, "slug": &workspace.slug})),
+        );
+        Ok(())
+    }
+
+    /// Update a workspace and emit event
+    pub async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_workspace(id, name, description, metadata)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Workspace,
+            CrudAction::Updated,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a workspace and emit event
+    pub async fn delete_workspace(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_workspace(id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Workspace,
+            CrudAction::Deleted,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Add a project to a workspace and emit event
+    pub async fn add_project_to_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .add_project_to_workspace(workspace_id, project_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Workspace,
+                CrudAction::Linked,
+                workspace_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"project_id": project_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Remove a project from a workspace and emit event
+    pub async fn remove_project_from_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .remove_project_from_workspace(workspace_id, project_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Workspace,
+                CrudAction::Unlinked,
+                workspace_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"project_id": project_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Workspace Milestones ---
+
+    /// Create a workspace milestone and emit event
+    pub async fn create_workspace_milestone(
+        &self,
+        milestone: &WorkspaceMilestoneNode,
+    ) -> Result<()> {
+        self.neo4j().create_workspace_milestone(milestone).await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::WorkspaceMilestone,
+                CrudAction::Created,
+                milestone.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"title": &milestone.title})),
+        );
+        Ok(())
+    }
+
+    /// Update a workspace milestone and emit event
+    pub async fn update_workspace_milestone(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_workspace_milestone(id, title, description, status, target_date)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::WorkspaceMilestone,
+            CrudAction::Updated,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a workspace milestone and emit event
+    pub async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_workspace_milestone(id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::WorkspaceMilestone,
+            CrudAction::Deleted,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Add a task to a workspace milestone and emit event
+    pub async fn add_task_to_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .add_task_to_workspace_milestone(milestone_id, task_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::WorkspaceMilestone,
+                CrudAction::Linked,
+                milestone_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Resources ---
+
+    /// Create a resource and emit event
+    pub async fn create_resource(&self, resource: &ResourceNode) -> Result<()> {
+        self.neo4j().create_resource(resource).await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Resource,
+                CrudAction::Created,
+                resource.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"name": &resource.name})),
+        );
+        Ok(())
+    }
+
+    /// Update a resource and emit event
+    pub async fn update_resource(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        file_path: Option<String>,
+        url: Option<String>,
+        version: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_resource(id, name, file_path, url, version, description)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Resource,
+            CrudAction::Updated,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a resource and emit event
+    pub async fn delete_resource(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_resource(id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Resource,
+            CrudAction::Deleted,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Link a project to a resource (implements) and emit event
+    pub async fn link_project_implements_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .link_project_implements_resource(project_id, resource_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Resource, CrudAction::Linked, resource_id.to_string())
+                .with_payload(serde_json::json!({"project_id": project_id.to_string(), "link_type": "implements"})),
+        );
+        Ok(())
+    }
+
+    /// Link a project to a resource (uses) and emit event
+    pub async fn link_project_uses_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .link_project_uses_resource(project_id, resource_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Resource,
+                CrudAction::Linked,
+                resource_id.to_string(),
+            )
+            .with_payload(
+                serde_json::json!({"project_id": project_id.to_string(), "link_type": "uses"}),
+            ),
+        );
+        Ok(())
+    }
+
+    // --- Components ---
+
+    /// Create a component and emit event
+    pub async fn create_component(&self, component: &ComponentNode) -> Result<()> {
+        self.neo4j().create_component(component).await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Component,
+                CrudAction::Created,
+                component.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"name": &component.name})),
+        );
+        Ok(())
+    }
+
+    /// Update a component and emit event
+    pub async fn update_component(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        runtime: Option<String>,
+        config: Option<serde_json::Value>,
+        tags: Option<Vec<String>>,
+    ) -> Result<()> {
+        self.neo4j()
+            .update_component(id, name, description, runtime, config, tags)
+            .await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Component,
+            CrudAction::Updated,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Delete a component and emit event
+    pub async fn delete_component(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_component(id).await?;
+        self.emit(CrudEvent::new(
+            EventEntityType::Component,
+            CrudAction::Deleted,
+            id.to_string(),
+        ));
+        Ok(())
+    }
+
+    /// Add a component dependency and emit event
+    pub async fn add_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+        protocol: Option<String>,
+        required: bool,
+    ) -> Result<()> {
+        self.neo4j()
+            .add_component_dependency(component_id, depends_on_id, protocol, required)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Component,
+                CrudAction::Linked,
+                component_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"depends_on": depends_on_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Remove a component dependency and emit event
+    pub async fn remove_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .remove_component_dependency(component_id, depends_on_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Component,
+                CrudAction::Unlinked,
+                component_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"depends_on": depends_on_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Map a component to a project and emit event
+    pub async fn map_component_to_project(
+        &self,
+        component_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .map_component_to_project(component_id, project_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Component,
+                CrudAction::Linked,
+                component_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"project_id": project_id.to_string()})),
+        );
+        Ok(())
+    }
 }
 
 /// Result of a sync operation
@@ -833,4 +1603,550 @@ pub struct SyncResult {
     pub files_deleted: usize,
     pub symbols_deleted: usize,
     pub errors: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{CrudAction, EntityType as EventEntityType, EventBus};
+    use crate::test_helpers::*;
+
+    /// Helper: create an Orchestrator with EventBus, return (orchestrator, receiver)
+    async fn orch_with_bus() -> (Orchestrator, tokio::sync::broadcast::Receiver<CrudEvent>) {
+        let state = mock_app_state();
+        let bus = Arc::new(EventBus::default());
+        let rx = bus.subscribe();
+        let orch = Orchestrator::with_event_bus(state, bus).await.unwrap();
+        (orch, rx)
+    }
+
+    // ── constructors ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_new_has_no_event_bus() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        assert!(orch.event_bus().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_event_bus_has_bus() {
+        let (orch, _rx) = orch_with_bus().await;
+        assert!(orch.event_bus().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_accessors() {
+        let (orch, _rx) = orch_with_bus().await;
+        let _ = orch.plan_manager();
+        let _ = orch.context_builder();
+        let _ = orch.neo4j();
+        let _ = orch.note_manager();
+        let _ = orch.note_lifecycle();
+    }
+
+    // ── Projects ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.create_project(&project).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Project);
+        assert_eq!(ev.action, CrudAction::Created);
+        assert_eq!(ev.entity_id, project.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_update_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+        orch.update_project(project.id, Some("new-name".into()), None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+        orch.delete_project(project.id).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    // ── Plan link/unlink ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_link_plan_to_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let plan_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        orch.link_plan_to_project(plan_id, project_id)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Plan);
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_unlink_plan_from_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.unlink_plan_from_project(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+    }
+
+    // ── Task dependencies ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_add_task_dependency_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        orch.add_task_dependency(t1, t2).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Task);
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_remove_task_dependency_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.remove_task_dependency(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+    }
+
+    // ── Steps / Decisions / Constraints ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_delete_step_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let id = Uuid::new_v4();
+        orch.delete_step(id).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Step);
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_update_decision_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let id = Uuid::new_v4();
+        orch.update_decision(id, Some("desc".into()), None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Decision);
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_decision_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_decision(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_update_constraint_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_constraint(Uuid::new_v4(), Some("desc".into()), None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Constraint);
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_constraint_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_constraint(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    // ── Commits ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_commit_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let commit = test_commit("abc123", "feat: test");
+        orch.create_commit(&commit).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Commit);
+        assert_eq!(ev.action, CrudAction::Created);
+        assert_eq!(ev.entity_id, "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_link_commit_to_task_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_commit_to_task("abc", Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_link_commit_to_plan_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_commit_to_plan("abc", Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Releases ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let release = test_release(Uuid::new_v4(), "1.0.0");
+        orch.create_release(&release).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Release);
+        assert_eq!(ev.action, CrudAction::Created);
+        assert!(ev.project_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_release(Uuid::new_v4(), None, None, None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_release(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_task_to_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_task_to_release(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_add_commit_to_release_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_commit_to_release(Uuid::new_v4(), "abc123")
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Milestones ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let ms = test_milestone(Uuid::new_v4(), "v1 launch");
+        orch.create_milestone(&ms).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Milestone);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_milestone(Uuid::new_v4(), None, None, None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_milestone(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_task_to_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_task_to_milestone(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Workspaces ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let ws = test_workspace();
+        orch.create_workspace(&ws).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Workspace);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let ws = test_workspace();
+        orch.neo4j().create_workspace(&ws).await.unwrap();
+        orch.update_workspace(ws.id, Some("new".into()), None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_workspace(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_project_to_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_project_to_workspace(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_remove_project_from_workspace_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.remove_project_from_workspace(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+    }
+
+    // ── Workspace Milestones ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let ms = WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            title: "Cross-project milestone".into(),
+            description: None,
+            status: MilestoneStatus::Open,
+            target_date: None,
+            closed_at: None,
+            created_at: chrono::Utc::now(),
+            tags: vec![],
+        };
+        orch.create_workspace_milestone(&ms).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::WorkspaceMilestone);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_workspace_milestone(Uuid::new_v4(), Some("t".into()), None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_workspace_milestone(Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_task_to_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_task_to_workspace_milestone(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Resources ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let res = ResourceNode {
+            id: Uuid::new_v4(),
+            workspace_id: Some(Uuid::new_v4()),
+            project_id: None,
+            name: "API spec".into(),
+            resource_type: ResourceType::ApiContract,
+            file_path: "api.yaml".into(),
+            url: None,
+            format: Some("openapi".into()),
+            version: Some("1.0".into()),
+            description: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+        orch.create_resource(&res).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Resource);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_resource(Uuid::new_v4(), Some("n".into()), None, None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_resource(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_link_project_implements_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_project_implements_resource(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+        assert!(!ev.payload.is_null());
+    }
+
+    #[tokio::test]
+    async fn test_link_project_uses_resource_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_project_uses_resource(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── Components ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_component_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let comp = ComponentNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            name: "api-gateway".into(),
+            component_type: ComponentType::Gateway,
+            description: None,
+            runtime: None,
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            tags: vec![],
+        };
+        orch.create_component(&comp).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Component);
+        assert_eq!(ev.action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_update_component_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.update_component(Uuid::new_v4(), Some("n".into()), None, None, None, None)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_delete_component_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.delete_component(Uuid::new_v4()).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_add_component_dependency_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.add_component_dependency(Uuid::new_v4(), Uuid::new_v4(), Some("grpc".into()), true)
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_remove_component_dependency_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.remove_component_dependency(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+    }
+
+    #[tokio::test]
+    async fn test_map_component_to_project_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.map_component_to_project(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    // ── emit without bus (no-op, no panic) ───────────────────────────
+
+    #[tokio::test]
+    async fn test_wrapper_without_bus_does_not_panic() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let project = test_project();
+        // Should succeed silently even without event bus
+        orch.create_project(&project).await.unwrap();
+        orch.delete_project(project.id).await.unwrap();
+    }
 }

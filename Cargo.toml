@@ -11,7 +11,7 @@ license = "MIT"
 tokio = { version = "1.49", features = ["full"] }
 
 # Web framework for webhook listener
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
