@@ -3,6 +3,7 @@
 use crate::api::{
     PaginatedResponse, PaginationParams, PriorityFilter, SearchFilter, StatusFilter, TagsFilter,
 };
+use crate::chat::ChatManager;
 use crate::neo4j::models::{
     CommitNode, ConstraintNode, DecisionNode, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus,
     ReleaseNode, ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
@@ -24,6 +25,7 @@ use uuid::Uuid;
 pub struct ServerState {
     pub orchestrator: Arc<Orchestrator>,
     pub watcher: Arc<RwLock<FileWatcher>>,
+    pub chat_manager: Option<Arc<ChatManager>>,
 }
 
 /// Shared orchestrator state

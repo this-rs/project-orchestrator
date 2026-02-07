@@ -40,6 +40,36 @@ pub struct WorkspaceNode {
 }
 
 // ============================================================================
+// Chat Session Node
+// ============================================================================
+
+/// A chat session with Claude Code CLI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSessionNode {
+    pub id: Uuid,
+    /// Claude CLI session ID (for --resume)
+    pub cli_session_id: Option<String>,
+    /// Associated project slug
+    pub project_slug: Option<String>,
+    /// Working directory
+    pub cwd: String,
+    /// Session title (auto-generated or user-provided)
+    pub title: Option<String>,
+    /// Model used
+    pub model: String,
+    /// Creation timestamp
+    pub created_at: DateTime<Utc>,
+    /// Last update timestamp
+    pub updated_at: DateTime<Utc>,
+    /// Number of messages exchanged
+    #[serde(default)]
+    pub message_count: i64,
+    /// Total cost in USD
+    #[serde(default)]
+    pub total_cost_usd: Option<f64>,
+}
+
+// ============================================================================
 // Code Structure Nodes (from Tree-sitter)
 // ============================================================================
 
@@ -376,7 +406,10 @@ pub struct MilestoneNode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MilestoneStatus {
+    Planned,
     Open,
+    InProgress,
+    Completed,
     Closed,
 }
 

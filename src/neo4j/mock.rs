@@ -41,6 +41,7 @@ pub struct MockGraphStore {
     pub impls_map: RwLock<HashMap<String, ImplNode>>,
     pub imports: RwLock<HashMap<String, ImportNode>>,
     pub notes: RwLock<HashMap<Uuid, Note>>,
+    pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -99,6 +100,7 @@ impl MockGraphStore {
             impls_map: RwLock::new(HashMap::new()),
             imports: RwLock::new(HashMap::new()),
             notes: RwLock::new(HashMap::new()),
+            chat_sessions: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -222,6 +224,12 @@ impl MockGraphStore {
     /// Seed a note.
     pub async fn with_note(self, note: Note) -> Self {
         self.notes.write().await.insert(note.id, note);
+        self
+    }
+
+    /// Seed a chat session.
+    pub async fn with_chat_session(self, session: ChatSessionNode) -> Self {
+        self.chat_sessions.write().await.insert(session.id, session);
         self
     }
 
@@ -3194,5 +3202,79 @@ impl GraphStore for MockGraphStore {
             .get(&note_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    // ========================================================================
+    // Chat session operations
+    // ========================================================================
+
+    async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
+        self.chat_sessions
+            .write()
+            .await
+            .insert(session.id, session.clone());
+        Ok(())
+    }
+
+    async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
+        Ok(self.chat_sessions.read().await.get(&id).cloned())
+    }
+
+    async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ChatSessionNode>, usize)> {
+        let sessions = self.chat_sessions.read().await;
+        let mut filtered: Vec<_> = sessions
+            .values()
+            .filter(|s| {
+                if let Some(slug) = project_slug {
+                    s.project_slug.as_deref() == Some(slug)
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        // Sort by updated_at descending
+        filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let total = filtered.len();
+        let page = paginate(&filtered, limit, offset);
+        Ok((page, total))
+    }
+
+    async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+    ) -> Result<Option<ChatSessionNode>> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.updated_at = Utc::now();
+            if let Some(v) = cli_session_id {
+                session.cli_session_id = Some(v);
+            }
+            if let Some(v) = title {
+                session.title = Some(v);
+            }
+            if let Some(v) = message_count {
+                session.message_count = v;
+            }
+            if let Some(v) = total_cost_usd {
+                session.total_cost_usd = Some(v);
+            }
+            Ok(Some(session.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
+        Ok(self.chat_sessions.write().await.remove(&id).is_some())
     }
 }

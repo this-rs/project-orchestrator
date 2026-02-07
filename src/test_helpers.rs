@@ -211,6 +211,22 @@ pub fn test_release(project_id: Uuid, version: &str) -> ReleaseNode {
     }
 }
 
+/// Create a test chat session
+pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
+    ChatSessionNode {
+        id: Uuid::new_v4(),
+        cli_session_id: None,
+        project_slug: project_slug.map(|s| s.to_string()),
+        cwd: "/tmp/test".to_string(),
+        title: None,
+        model: "claude-opus-4-6".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        message_count: 0,
+        total_cost_usd: None,
+    }
+}
+
 /// Create a test milestone
 pub fn test_milestone(project_id: Uuid, title: &str) -> MilestoneNode {
     MilestoneNode {

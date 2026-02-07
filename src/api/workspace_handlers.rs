@@ -114,7 +114,11 @@ impl From<WorkspaceMilestoneNode> for WorkspaceMilestoneResponse {
             workspace_id: m.workspace_id.to_string(),
             title: m.title,
             description: m.description,
-            status: format!("{:?}", m.status),
+            status: serde_json::to_value(&m.status)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string(),
             target_date: m.target_date.map(|dt| dt.to_rfc3339()),
             closed_at: m.closed_at.map(|dt| dt.to_rfc3339()),
             created_at: m.created_at.to_rfc3339(),
@@ -677,10 +681,20 @@ pub async fn update_workspace_milestone(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
 
-    let status = req.status.map(|s| match s.to_lowercase().as_str() {
-        "closed" => MilestoneStatus::Closed,
-        _ => MilestoneStatus::Open,
-    });
+    let status = req
+        .status
+        .map(|s| match s.to_lowercase().as_str() {
+            "planned" => Ok(MilestoneStatus::Planned),
+            "open" => Ok(MilestoneStatus::Open),
+            "in_progress" => Ok(MilestoneStatus::InProgress),
+            "completed" => Ok(MilestoneStatus::Completed),
+            "closed" => Ok(MilestoneStatus::Closed),
+            other => Err(AppError::BadRequest(format!(
+                "Invalid milestone status '{}'. Valid: planned, open, in_progress, completed, closed",
+                other
+            ))),
+        })
+        .transpose()?;
 
     let target_date = req
         .target_date
@@ -1419,7 +1433,7 @@ mod tests {
                 workspace_id: "ws-id".to_string(),
                 title: "Test".to_string(),
                 description: None,
-                status: "Open".to_string(),
+                status: "open".to_string(),
                 target_date: None,
                 closed_at: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1444,7 +1458,7 @@ mod tests {
                 workspace_id: "ws-inner".to_string(),
                 title: "Cross-project milestone".to_string(),
                 description: Some("Important milestone".to_string()),
-                status: "Open".to_string(),
+                status: "open".to_string(),
                 target_date: Some("2026-06-01T00:00:00Z".to_string()),
                 closed_at: None,
                 created_at: "2026-01-15T10:00:00Z".to_string(),
@@ -1460,7 +1474,7 @@ mod tests {
         assert_eq!(json["id"], "m-123");
         assert_eq!(json["title"], "Cross-project milestone");
         assert_eq!(json["description"], "Important milestone");
-        assert_eq!(json["status"], "Open");
+        assert_eq!(json["status"], "open");
         assert_eq!(json["target_date"], "2026-06-01T00:00:00Z");
         assert!(json["closed_at"].is_null());
         assert_eq!(json["created_at"], "2026-01-15T10:00:00Z");

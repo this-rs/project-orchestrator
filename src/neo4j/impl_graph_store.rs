@@ -1196,4 +1196,41 @@ impl GraphStore for Neo4jClient {
     async fn get_note_anchors(&self, note_id: Uuid) -> anyhow::Result<Vec<NoteAnchor>> {
         self.get_note_anchors(note_id).await
     }
+
+    // ========================================================================
+    // Chat session operations
+    // ========================================================================
+
+    async fn create_chat_session(&self, session: &ChatSessionNode) -> anyhow::Result<()> {
+        self.create_chat_session(session).await
+    }
+
+    async fn get_chat_session(&self, id: Uuid) -> anyhow::Result<Option<ChatSessionNode>> {
+        self.get_chat_session(id).await
+    }
+
+    async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<ChatSessionNode>, usize)> {
+        self.list_chat_sessions(project_slug, limit, offset).await
+    }
+
+    async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+    ) -> anyhow::Result<Option<ChatSessionNode>> {
+        self.update_chat_session(id, cli_session_id, title, message_count, total_cost_usd)
+            .await
+    }
+
+    async fn delete_chat_session(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.delete_chat_session(id).await
+    }
 }

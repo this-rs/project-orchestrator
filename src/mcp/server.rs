@@ -5,6 +5,7 @@
 use super::handlers::ToolHandler;
 use super::protocol::*;
 use super::tools::all_tools;
+use crate::chat::ChatManager;
 use crate::orchestrator::Orchestrator;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -28,6 +29,20 @@ impl McpServer {
     /// Create a new MCP server with the given orchestrator
     pub fn new(orchestrator: Arc<Orchestrator>) -> Self {
         let tool_handler = ToolHandler::new(orchestrator.clone());
+        Self {
+            orchestrator,
+            tool_handler,
+            initialized: false,
+        }
+    }
+
+    /// Create a new MCP server with chat support
+    pub fn with_chat_manager(
+        orchestrator: Arc<Orchestrator>,
+        chat_manager: Arc<ChatManager>,
+    ) -> Self {
+        let tool_handler =
+            ToolHandler::new(orchestrator.clone()).with_chat_manager(Some(chat_manager));
         Self {
             orchestrator,
             tool_handler,

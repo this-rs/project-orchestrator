@@ -68,9 +68,19 @@ impl Orchestrator {
         self.state.neo4j.as_ref()
     }
 
+    /// Get the graph store as Arc (for sharing with ChatManager etc.)
+    pub fn neo4j_arc(&self) -> Arc<dyn crate::neo4j::GraphStore> {
+        self.state.neo4j.clone()
+    }
+
     /// Get the search store
     pub fn meili(&self) -> &dyn crate::meilisearch::SearchStore {
         self.state.meili.as_ref()
+    }
+
+    /// Get the search store as Arc (for sharing with ChatManager etc.)
+    pub fn meili_arc(&self) -> Arc<dyn crate::meilisearch::SearchStore> {
+        self.state.meili.clone()
     }
 
     /// Get the note manager

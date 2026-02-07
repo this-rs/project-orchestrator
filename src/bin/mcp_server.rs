@@ -39,6 +39,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use project_orchestrator::chat::{ChatConfig, ChatManager};
 use project_orchestrator::mcp::McpServer;
 use project_orchestrator::orchestrator::Orchestrator;
 use project_orchestrator::{AppState, Config};
@@ -122,8 +123,18 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Create ChatManager
+    let chat_config = ChatConfig::from_env();
+    let chat_manager = Arc::new(ChatManager::new(
+        orchestrator.neo4j_arc(),
+        orchestrator.meili_arc(),
+        chat_config,
+    ));
+    chat_manager.start_cleanup_task();
+    info!("Chat manager initialized");
+
     // Create and run MCP server
-    let mut server = McpServer::new(orchestrator);
+    let mut server = McpServer::with_chat_manager(orchestrator, chat_manager);
 
     if let Err(e) = server.run().await {
         error!("MCP server error: {}", e);
