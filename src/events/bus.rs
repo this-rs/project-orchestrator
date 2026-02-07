@@ -1,7 +1,6 @@
 //! Event bus for broadcasting CRUD events to WebSocket clients
 
-use super::{CrudAction, CrudEvent, EntityType, RelatedEntity};
-use std::sync::Arc;
+use super::{CrudAction, CrudEvent, EntityType};
 use tokio::sync::broadcast;
 use tracing::debug;
 

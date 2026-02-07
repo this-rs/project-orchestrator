@@ -1,5 +1,6 @@
 //! Main orchestrator runner
 
+use crate::events::EventBus;
 use crate::neo4j::models::*;
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
@@ -24,6 +25,7 @@ pub struct Orchestrator {
     parser: Arc<RwLock<CodeParser>>,
     note_manager: Arc<NoteManager>,
     note_lifecycle: Arc<NoteLifecycleManager>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl Orchestrator {
@@ -50,7 +52,20 @@ impl Orchestrator {
             parser,
             note_manager,
             note_lifecycle,
+            event_bus: None,
         })
+    }
+
+    /// Create a new orchestrator with an EventBus for CRUD notifications
+    pub async fn with_event_bus(state: AppState, event_bus: Arc<EventBus>) -> Result<Self> {
+        let mut orchestrator = Self::new(state).await?;
+        orchestrator.event_bus = Some(event_bus);
+        Ok(orchestrator)
+    }
+
+    /// Get the event bus (if configured)
+    pub fn event_bus(&self) -> Option<&Arc<EventBus>> {
+        self.event_bus.as_ref()
     }
 
     /// Get the plan manager
