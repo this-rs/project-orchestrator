@@ -1,6 +1,6 @@
 //! Main orchestrator runner
 
-use crate::events::EventBus;
+use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventBus};
 use crate::neo4j::models::*;
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
@@ -94,6 +94,13 @@ impl Orchestrator {
     /// Get the event bus (if configured)
     pub fn event_bus(&self) -> Option<&Arc<EventBus>> {
         self.event_bus.as_ref()
+    }
+
+    /// Emit a CRUD event (no-op if event_bus is None)
+    fn emit(&self, event: CrudEvent) {
+        if let Some(bus) = &self.event_bus {
+            bus.emit(event);
+        }
     }
 
     /// Get the plan manager
@@ -864,6 +871,483 @@ impl Orchestrator {
             }
         }
 
+        Ok(())
+    }
+
+    // ========================================================================
+    // CRUD wrappers — mutation + event emission
+    // ========================================================================
+
+    // --- Projects ---
+
+    /// Create a project and emit event
+    pub async fn create_project(&self, project: &ProjectNode) -> Result<()> {
+        self.neo4j().create_project(project).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Project, CrudAction::Created, project.id.to_string())
+                .with_payload(serde_json::json!({"name": &project.name, "slug": &project.slug})),
+        );
+        Ok(())
+    }
+
+    /// Update a project and emit event
+    pub async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        root_path: Option<String>,
+    ) -> Result<()> {
+        self.neo4j().update_project(id, name, description, root_path).await?;
+        self.emit(CrudEvent::new(EventEntityType::Project, CrudAction::Updated, id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a project and emit event
+    pub async fn delete_project(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_project(id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Project, CrudAction::Deleted, id.to_string()));
+        Ok(())
+    }
+
+    // --- Plans (link/unlink only — CRUD is in PlanManager) ---
+
+    /// Link a plan to a project and emit event
+    pub async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
+        self.neo4j().link_plan_to_project(plan_id, project_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Plan, CrudAction::Linked, plan_id.to_string())
+                .with_payload(serde_json::json!({"project_id": project_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Unlink a plan from its project and emit event
+    pub async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()> {
+        self.neo4j().unlink_plan_from_project(plan_id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Plan, CrudAction::Unlinked, plan_id.to_string()));
+        Ok(())
+    }
+
+    // --- Task dependencies ---
+
+    /// Add a task dependency and emit event
+    pub async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        self.neo4j().add_task_dependency(task_id, depends_on_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Task, CrudAction::Linked, task_id.to_string())
+                .with_payload(serde_json::json!({"depends_on": depends_on_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Remove a task dependency and emit event
+    pub async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        self.neo4j().remove_task_dependency(task_id, depends_on_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Task, CrudAction::Unlinked, task_id.to_string())
+                .with_payload(serde_json::json!({"depends_on": depends_on_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Steps/Decisions/Constraints (delete + update only — create is in PlanManager) ---
+
+    /// Delete a step and emit event
+    pub async fn delete_step(&self, step_id: Uuid) -> Result<()> {
+        self.neo4j().delete_step(step_id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Step, CrudAction::Deleted, step_id.to_string()));
+        Ok(())
+    }
+
+    /// Update a decision and emit event
+    pub async fn update_decision(
+        &self,
+        decision_id: Uuid,
+        description: Option<String>,
+        rationale: Option<String>,
+        chosen_option: Option<String>,
+    ) -> Result<()> {
+        self.neo4j().update_decision(decision_id, description, rationale, chosen_option).await?;
+        self.emit(CrudEvent::new(EventEntityType::Decision, CrudAction::Updated, decision_id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a decision and emit event
+    pub async fn delete_decision(&self, decision_id: Uuid) -> Result<()> {
+        self.neo4j().delete_decision(decision_id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Decision, CrudAction::Deleted, decision_id.to_string()));
+        Ok(())
+    }
+
+    /// Update a constraint and emit event
+    pub async fn update_constraint(
+        &self,
+        constraint_id: Uuid,
+        description: Option<String>,
+        constraint_type: Option<ConstraintType>,
+        enforced_by: Option<String>,
+    ) -> Result<()> {
+        self.neo4j().update_constraint(constraint_id, description, constraint_type, enforced_by).await?;
+        self.emit(CrudEvent::new(EventEntityType::Constraint, CrudAction::Updated, constraint_id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a constraint and emit event
+    pub async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()> {
+        self.neo4j().delete_constraint(constraint_id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Constraint, CrudAction::Deleted, constraint_id.to_string()));
+        Ok(())
+    }
+
+    // --- Commits ---
+
+    /// Create a commit and emit event
+    pub async fn create_commit(&self, commit: &CommitNode) -> Result<()> {
+        self.neo4j().create_commit(commit).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Commit, CrudAction::Created, &commit.hash)
+                .with_payload(serde_json::json!({"message": &commit.message})),
+        );
+        Ok(())
+    }
+
+    /// Link a commit to a task and emit event
+    pub async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()> {
+        self.neo4j().link_commit_to_task(commit_hash, task_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Commit, CrudAction::Linked, commit_hash)
+                .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Link a commit to a plan and emit event
+    pub async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()> {
+        self.neo4j().link_commit_to_plan(commit_hash, plan_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Commit, CrudAction::Linked, commit_hash)
+                .with_payload(serde_json::json!({"plan_id": plan_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Releases ---
+
+    /// Create a release and emit event
+    pub async fn create_release(&self, release: &ReleaseNode) -> Result<()> {
+        self.neo4j().create_release(release).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Release, CrudAction::Created, release.id.to_string())
+                .with_payload(serde_json::json!({"version": &release.version}))
+                .with_project_id(release.project_id.to_string()),
+        );
+        Ok(())
+    }
+
+    /// Update a release and emit event
+    pub async fn update_release(
+        &self,
+        id: Uuid,
+        status: Option<ReleaseStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        released_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        self.neo4j().update_release(id, status, target_date, released_at, title, description).await?;
+        self.emit(CrudEvent::new(EventEntityType::Release, CrudAction::Updated, id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a release and emit event
+    pub async fn delete_release(&self, release_id: Uuid) -> Result<()> {
+        self.neo4j().delete_release(release_id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Release, CrudAction::Deleted, release_id.to_string()));
+        Ok(())
+    }
+
+    /// Add a task to a release and emit event
+    pub async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()> {
+        self.neo4j().add_task_to_release(release_id, task_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Release, CrudAction::Linked, release_id.to_string())
+                .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Add a commit to a release and emit event
+    pub async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
+        self.neo4j().add_commit_to_release(release_id, commit_hash).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Release, CrudAction::Linked, release_id.to_string())
+                .with_payload(serde_json::json!({"commit_hash": commit_hash})),
+        );
+        Ok(())
+    }
+
+    // --- Milestones ---
+
+    /// Create a milestone and emit event
+    pub async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()> {
+        self.neo4j().create_milestone(milestone).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Milestone, CrudAction::Created, milestone.id.to_string())
+                .with_payload(serde_json::json!({"title": &milestone.title}))
+                .with_project_id(milestone.project_id.to_string()),
+        );
+        Ok(())
+    }
+
+    /// Update a milestone and emit event
+    pub async fn update_milestone(
+        &self,
+        id: Uuid,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        closed_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        self.neo4j().update_milestone(id, status, target_date, closed_at, title, description).await?;
+        self.emit(CrudEvent::new(EventEntityType::Milestone, CrudAction::Updated, id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a milestone and emit event
+    pub async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {
+        self.neo4j().delete_milestone(milestone_id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Milestone, CrudAction::Deleted, milestone_id.to_string()));
+        Ok(())
+    }
+
+    /// Add a task to a milestone and emit event
+    pub async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()> {
+        self.neo4j().add_task_to_milestone(milestone_id, task_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Milestone, CrudAction::Linked, milestone_id.to_string())
+                .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Workspaces ---
+
+    /// Create a workspace and emit event
+    pub async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()> {
+        self.neo4j().create_workspace(workspace).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Workspace, CrudAction::Created, workspace.id.to_string())
+                .with_payload(serde_json::json!({"name": &workspace.name, "slug": &workspace.slug})),
+        );
+        Ok(())
+    }
+
+    /// Update a workspace and emit event
+    pub async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
+        self.neo4j().update_workspace(id, name, description, metadata).await?;
+        self.emit(CrudEvent::new(EventEntityType::Workspace, CrudAction::Updated, id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a workspace and emit event
+    pub async fn delete_workspace(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_workspace(id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Workspace, CrudAction::Deleted, id.to_string()));
+        Ok(())
+    }
+
+    /// Add a project to a workspace and emit event
+    pub async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()> {
+        self.neo4j().add_project_to_workspace(workspace_id, project_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Workspace, CrudAction::Linked, workspace_id.to_string())
+                .with_payload(serde_json::json!({"project_id": project_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Remove a project from a workspace and emit event
+    pub async fn remove_project_from_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()> {
+        self.neo4j().remove_project_from_workspace(workspace_id, project_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Workspace, CrudAction::Unlinked, workspace_id.to_string())
+                .with_payload(serde_json::json!({"project_id": project_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Workspace Milestones ---
+
+    /// Create a workspace milestone and emit event
+    pub async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()> {
+        self.neo4j().create_workspace_milestone(milestone).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::WorkspaceMilestone, CrudAction::Created, milestone.id.to_string())
+                .with_payload(serde_json::json!({"title": &milestone.title})),
+        );
+        Ok(())
+    }
+
+    /// Update a workspace milestone and emit event
+    pub async fn update_workspace_milestone(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        self.neo4j().update_workspace_milestone(id, title, description, status, target_date).await?;
+        self.emit(CrudEvent::new(EventEntityType::WorkspaceMilestone, CrudAction::Updated, id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a workspace milestone and emit event
+    pub async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_workspace_milestone(id).await?;
+        self.emit(CrudEvent::new(EventEntityType::WorkspaceMilestone, CrudAction::Deleted, id.to_string()));
+        Ok(())
+    }
+
+    /// Add a task to a workspace milestone and emit event
+    pub async fn add_task_to_workspace_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()> {
+        self.neo4j().add_task_to_workspace_milestone(milestone_id, task_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::WorkspaceMilestone, CrudAction::Linked, milestone_id.to_string())
+                .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    // --- Resources ---
+
+    /// Create a resource and emit event
+    pub async fn create_resource(&self, resource: &ResourceNode) -> Result<()> {
+        self.neo4j().create_resource(resource).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Resource, CrudAction::Created, resource.id.to_string())
+                .with_payload(serde_json::json!({"name": &resource.name})),
+        );
+        Ok(())
+    }
+
+    /// Update a resource and emit event
+    pub async fn update_resource(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        file_path: Option<String>,
+        url: Option<String>,
+        version: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        self.neo4j().update_resource(id, name, file_path, url, version, description).await?;
+        self.emit(CrudEvent::new(EventEntityType::Resource, CrudAction::Updated, id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a resource and emit event
+    pub async fn delete_resource(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_resource(id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Resource, CrudAction::Deleted, id.to_string()));
+        Ok(())
+    }
+
+    /// Link a project to a resource (implements) and emit event
+    pub async fn link_project_implements_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()> {
+        self.neo4j().link_project_implements_resource(project_id, resource_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Resource, CrudAction::Linked, resource_id.to_string())
+                .with_payload(serde_json::json!({"project_id": project_id.to_string(), "link_type": "implements"})),
+        );
+        Ok(())
+    }
+
+    /// Link a project to a resource (uses) and emit event
+    pub async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()> {
+        self.neo4j().link_project_uses_resource(project_id, resource_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Resource, CrudAction::Linked, resource_id.to_string())
+                .with_payload(serde_json::json!({"project_id": project_id.to_string(), "link_type": "uses"})),
+        );
+        Ok(())
+    }
+
+    // --- Components ---
+
+    /// Create a component and emit event
+    pub async fn create_component(&self, component: &ComponentNode) -> Result<()> {
+        self.neo4j().create_component(component).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Component, CrudAction::Created, component.id.to_string())
+                .with_payload(serde_json::json!({"name": &component.name})),
+        );
+        Ok(())
+    }
+
+    /// Update a component and emit event
+    pub async fn update_component(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        runtime: Option<String>,
+        config: Option<serde_json::Value>,
+        tags: Option<Vec<String>>,
+    ) -> Result<()> {
+        self.neo4j().update_component(id, name, description, runtime, config, tags).await?;
+        self.emit(CrudEvent::new(EventEntityType::Component, CrudAction::Updated, id.to_string()));
+        Ok(())
+    }
+
+    /// Delete a component and emit event
+    pub async fn delete_component(&self, id: Uuid) -> Result<()> {
+        self.neo4j().delete_component(id).await?;
+        self.emit(CrudEvent::new(EventEntityType::Component, CrudAction::Deleted, id.to_string()));
+        Ok(())
+    }
+
+    /// Add a component dependency and emit event
+    pub async fn add_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+        protocol: Option<String>,
+        required: bool,
+    ) -> Result<()> {
+        self.neo4j().add_component_dependency(component_id, depends_on_id, protocol, required).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Component, CrudAction::Linked, component_id.to_string())
+                .with_payload(serde_json::json!({"depends_on": depends_on_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Remove a component dependency and emit event
+    pub async fn remove_component_dependency(&self, component_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        self.neo4j().remove_component_dependency(component_id, depends_on_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Component, CrudAction::Unlinked, component_id.to_string())
+                .with_payload(serde_json::json!({"depends_on": depends_on_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Map a component to a project and emit event
+    pub async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()> {
+        self.neo4j().map_component_to_project(component_id, project_id).await?;
+        self.emit(
+            CrudEvent::new(EventEntityType::Component, CrudAction::Linked, component_id.to_string())
+                .with_payload(serde_json::json!({"project_id": project_id.to_string()})),
+        );
         Ok(())
     }
 }
