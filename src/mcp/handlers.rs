@@ -826,10 +826,17 @@ impl ToolHandler {
 
     async fn update_task(&self, args: Value) -> Result<Value> {
         let task_id = parse_uuid(&args, "task_id")?;
-        let status = args
-            .get("status")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+        let status = match args.get("status").and_then(|v| v.as_str()) {
+            Some(s) => Some(
+                serde_json::from_str::<TaskStatus>(&format!("\"{}\"", s)).map_err(|_| {
+                    anyhow!(
+                        "Invalid task status '{}'. Valid: pending, in_progress, blocked, completed, failed",
+                        s
+                    )
+                })?,
+            ),
+            None => None,
+        };
         let assigned_to = args
             .get("assigned_to")
             .and_then(|v| v.as_str())
@@ -1168,10 +1175,17 @@ impl ToolHandler {
 
     async fn update_release(&self, args: Value) -> Result<Value> {
         let release_id = parse_uuid(&args, "release_id")?;
-        let status = args
-            .get("status")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+        let status = match args.get("status").and_then(|v| v.as_str()) {
+            Some(s) => Some(
+                serde_json::from_str::<ReleaseStatus>(&format!("\"{}\"", s)).map_err(|_| {
+                    anyhow!(
+                        "Invalid release status '{}'. Valid: planned, in_progress, released, cancelled",
+                        s
+                    )
+                })?,
+            ),
+            None => None,
+        };
         let target_date = args
             .get("target_date")
             .and_then(|v| v.as_str())
@@ -1302,10 +1316,14 @@ impl ToolHandler {
 
     async fn update_milestone(&self, args: Value) -> Result<Value> {
         let milestone_id = parse_uuid(&args, "milestone_id")?;
-        let status = args
-            .get("status")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+        let status = match args.get("status").and_then(|v| v.as_str()) {
+            Some(s) => Some(
+                serde_json::from_str::<MilestoneStatus>(&format!("\"{}\"", s)).map_err(|_| {
+                    anyhow!("Invalid milestone status '{}'. Valid: open, closed", s)
+                })?,
+            ),
+            None => None,
+        };
         let target_date = args
             .get("target_date")
             .and_then(|v| v.as_str())
@@ -2997,10 +3015,17 @@ impl ToolHandler {
             .get("description")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let constraint_type = args
-            .get("constraint_type")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+        let constraint_type = match args.get("constraint_type").and_then(|v| v.as_str()) {
+            Some(s) => Some(
+                serde_json::from_str::<ConstraintType>(&format!("\"{}\"", s)).map_err(|_| {
+                    anyhow!(
+                        "Invalid constraint type '{}'. Valid: performance, compatibility, security, style, testing, other",
+                        s
+                    )
+                })?,
+            ),
+            None => None,
+        };
         let enforced_by = args
             .get("enforced_by")
             .and_then(|v| v.as_str())
