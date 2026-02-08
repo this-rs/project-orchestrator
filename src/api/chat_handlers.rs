@@ -475,7 +475,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/chat/sessions/{}", session_id))
+                    .uri(format!("/api/chat/sessions/{}", session_id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -500,7 +500,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/chat/sessions/{}", fake_id))
+                    .uri(format!("/api/chat/sessions/{}", fake_id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -524,7 +524,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri(&format!("/api/chat/sessions/{}", session_id))
+                    .uri(format!("/api/chat/sessions/{}", session_id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -548,7 +548,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri(&format!("/api/chat/sessions/{}", fake_id))
+                    .uri(format!("/api/chat/sessions/{}", fake_id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -590,7 +590,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(&format!("/api/chat/sessions/{}/messages", fake_id))
+                    .uri(format!("/api/chat/sessions/{}/messages", fake_id))
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"type":"user_message","content":"Hello"}"#))
                     .unwrap(),
@@ -610,7 +610,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(&format!("/api/chat/sessions/{}/interrupt", fake_id))
+                    .uri(format!("/api/chat/sessions/{}/interrupt", fake_id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -628,7 +628,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/chat/sessions/{}/stream", fake_id))
+                    .uri(format!("/api/chat/sessions/{}/stream", fake_id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -675,7 +675,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/chat/sessions/{}/messages", fake_id))
+                    .uri(format!("/api/chat/sessions/{}/messages", fake_id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -718,7 +718,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/chat/sessions/{}", session_id))
+                    .uri(format!("/api/chat/sessions/{}", session_id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -742,7 +742,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/chat/sessions/{}", session_id))
+                    .uri(format!("/api/chat/sessions/{}", session_id))
                     .body(Body::empty())
                     .unwrap(),
             )

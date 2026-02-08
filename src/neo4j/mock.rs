@@ -65,6 +65,7 @@ pub struct MockGraphStore {
     pub ws_milestone_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub workspace_resources: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub workspace_components: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+    #[allow(clippy::type_complexity)]
     pub component_dependencies: RwLock<HashMap<Uuid, Vec<(Uuid, Option<String>, bool)>>>,
     pub component_projects: RwLock<HashMap<Uuid, Uuid>>,
     pub resource_implementers: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -75,6 +76,7 @@ pub struct MockGraphStore {
     pub note_supersedes: RwLock<HashMap<Uuid, Uuid>>,
 }
 
+#[allow(dead_code)]
 impl MockGraphStore {
     /// Create a new empty MockGraphStore.
     pub fn new() -> Self {
@@ -3254,7 +3256,7 @@ impl GraphStore for MockGraphStore {
                     let days = (Utc::now() - confirmed_at).num_days() as f64;
                     let base_days = n.base_decay_days();
                     let decay = n.importance.decay_factor();
-                    n.staleness_score = (days * decay / base_days).min(1.0).max(0.0);
+                    n.staleness_score = (days * decay / base_days).clamp(0.0, 1.0);
                     count += 1;
                 }
             }

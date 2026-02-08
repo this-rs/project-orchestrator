@@ -1434,22 +1434,14 @@ impl ToolHandler {
             let orchestrator = self.orchestrator.clone();
 
             // Resolve project slug for MeiliSearch indexing
-            let project_slug = self
-                .neo4j()
-                .get_project(project_id)
-                .await?
-                .map(|p| p.slug);
+            let project_slug = self.neo4j().get_project(project_id).await?.map(|p| p.slug);
 
             tokio::spawn(async move {
                 for file_path in &files_changed {
                     let path = std::path::Path::new(file_path);
                     if path.exists() {
                         if let Err(e) = orchestrator
-                            .sync_file_for_project(
-                                path,
-                                Some(project_id),
-                                project_slug.as_deref(),
-                            )
+                            .sync_file_for_project(path, Some(project_id), project_slug.as_deref())
                             .await
                         {
                             tracing::warn!("Incremental sync failed for {}: {}", file_path, e);
@@ -1457,11 +1449,7 @@ impl ToolHandler {
                     }
                 }
                 // Update last_synced timestamp
-                if let Err(e) = orchestrator
-                    .neo4j()
-                    .update_project_synced(project_id)
-                    .await
-                {
+                if let Err(e) = orchestrator.neo4j().update_project_synced(project_id).await {
                     tracing::warn!("Failed to update last_synced: {}", e);
                 }
             });
@@ -1577,10 +1565,7 @@ impl ToolHandler {
             .get_workspace_by_slug(workspace_slug)
             .await?
             .ok_or_else(|| anyhow!("Workspace not found: {}", workspace_slug))?;
-        let projects = self
-            .neo4j()
-            .list_workspace_projects(workspace.id)
-            .await?;
+        let projects = self.neo4j().list_workspace_projects(workspace.id).await?;
 
         if projects.is_empty() {
             return Ok(json!([]));
@@ -1591,13 +1576,7 @@ impl ToolHandler {
         for project in &projects {
             let hits = self
                 .meili()
-                .search_code_with_scores(
-                    query,
-                    limit,
-                    language,
-                    Some(&project.slug),
-                    path_prefix,
-                )
+                .search_code_with_scores(query, limit, language, Some(&project.slug), path_prefix)
                 .await
                 .unwrap_or_default();
             all_hits.extend(hits);
@@ -3803,10 +3782,8 @@ mod tests {
 
     #[test]
     fn test_link_type_validation() {
-        let validate_link_type = |link_type: &str| match link_type.to_lowercase().as_str() {
-            "implements" | "uses" => true,
-            _ => false,
-        };
+        let validate_link_type =
+            |link_type: &str| matches!(link_type.to_lowercase().as_str(), "implements" | "uses");
 
         assert!(validate_link_type("implements"));
         assert!(validate_link_type("IMPLEMENTS"));
@@ -5154,7 +5131,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.get("deleted").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("deleted").unwrap().as_bool().unwrap());
 
         // Verify it's gone
         let result = handler
@@ -5369,10 +5346,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_object());
-        assert_eq!(
-            result.get("sync_triggered").unwrap().as_bool().unwrap(),
-            false
-        );
+        assert!(!result.get("sync_triggered").unwrap().as_bool().unwrap());
     }
 
     #[tokio::test]
@@ -5390,10 +5364,7 @@ mod tests {
             .await
             .unwrap();
         // No project_id → no sync
-        assert_eq!(
-            result.get("sync_triggered").unwrap().as_bool().unwrap(),
-            false
-        );
+        assert!(!result.get("sync_triggered").unwrap().as_bool().unwrap());
     }
 
     #[tokio::test]

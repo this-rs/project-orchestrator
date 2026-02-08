@@ -2,6 +2,7 @@
 //!
 //! Provides convenience functions for creating test objects with sensible defaults,
 //! and helpers for building mock AppState / Orchestrator / ToolHandler instances.
+#![allow(dead_code)]
 
 use crate::meilisearch::mock::MockSearchStore;
 use crate::neo4j::mock::MockGraphStore;

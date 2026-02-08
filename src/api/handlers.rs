@@ -1681,7 +1681,7 @@ mod tests {
             .project_id
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| uuid::Uuid::parse_str(s));
+            .map(uuid::Uuid::parse_str);
         assert!(parsed.is_some());
         assert!(parsed.unwrap().is_ok());
     }
@@ -1694,7 +1694,7 @@ mod tests {
             .project_id
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| uuid::Uuid::parse_str(s));
+            .map(uuid::Uuid::parse_str);
         assert!(parsed.is_some());
         assert!(parsed.unwrap().is_err());
     }
@@ -1708,7 +1708,7 @@ mod tests {
             .project_id
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| uuid::Uuid::parse_str(s));
+            .map(uuid::Uuid::parse_str);
         assert!(parsed.is_none());
     }
 }
