@@ -1403,6 +1403,19 @@ impl ToolHandler {
             .get("author")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+        let files_changed: Vec<String> = args
+            .get("files_changed")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
 
         let commit = CommitNode {
             hash: hash.to_string(),
@@ -1412,7 +1425,53 @@ impl ToolHandler {
         };
 
         self.orchestrator.create_commit(&commit).await?;
-        Ok(serde_json::to_value(commit)?)
+
+        // Trigger incremental sync if files_changed and project_id are provided
+        let sync_triggered = !files_changed.is_empty() && project_id.is_some();
+        if sync_triggered {
+            let project_id = project_id.unwrap();
+            let orchestrator = self.orchestrator.clone();
+
+            // Resolve project slug for MeiliSearch indexing
+            let project_slug = self
+                .neo4j()
+                .get_project(project_id)
+                .await?
+                .map(|p| p.slug);
+
+            tokio::spawn(async move {
+                for file_path in &files_changed {
+                    let path = std::path::Path::new(file_path);
+                    if path.exists() {
+                        if let Err(e) = orchestrator
+                            .sync_file_for_project(
+                                path,
+                                Some(project_id),
+                                project_slug.as_deref(),
+                            )
+                            .await
+                        {
+                            tracing::warn!("Incremental sync failed for {}: {}", file_path, e);
+                        }
+                    }
+                }
+                // Update last_synced timestamp
+                if let Err(e) = orchestrator
+                    .neo4j()
+                    .update_project_synced(project_id)
+                    .await
+                {
+                    tracing::warn!("Failed to update last_synced: {}", e);
+                }
+            });
+        }
+
+        let mut result = serde_json::to_value(&commit)?;
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert("sync_triggered".to_string(), json!(sync_triggered));
+        Ok(result)
     }
 
     async fn link_commit_to_task(&self, args: Value) -> Result<Value> {

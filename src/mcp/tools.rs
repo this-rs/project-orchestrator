@@ -811,7 +811,8 @@ fn commit_tools() -> Vec<ToolDefinition> {
                     "sha": {"type": "string", "description": "Commit SHA"},
                     "message": {"type": "string", "description": "Commit message"},
                     "author": {"type": "string", "description": "Author name"},
-                    "files_changed": {"type": "array", "items": {"type": "string"}, "description": "Files changed"}
+                    "files_changed": {"type": "array", "items": {"type": "string"}, "description": "Files changed"},
+                    "project_id": {"type": "string", "description": "Project UUID — enables incremental sync of changed files"}
                 })),
                 required: Some(vec!["sha".to_string(), "message".to_string()]),
             },

@@ -65,7 +65,8 @@ Workspace
 - `sync_project(slug)` / `sync_directory(path)` parse le code source avec Tree-sitter
 - Construit le **graphe de connaissances** : fichiers, fonctions, structs, traits, enums, imports, appels entre fonctions
 - `start_watch(path)` active la synchronisation automatique sur changements fichiers
-- **Requis avant toute exploration de code** : si `last_synced` est absent ou ancien, lancer `sync_project` en premier
+- **Sync incrémentale au commit** : `create_commit` avec `files_changed` + `project_id` déclenche automatiquement la re-sync des fichiers modifiés en arrière-plan. Pas besoin de `sync_project` après chaque commit.
+- **Requis avant toute exploration de code** : si `last_synced` est absent, lancer `sync_project` en premier ; sinon, le sync au commit maintient la fraîcheur automatiquement
 - Outils d'exploration disponibles après sync :
   - `search_code(query)` / `search_project_code(slug, query)` — recherche sémantique
   - `get_file_symbols(file_path)` — fonctions, structs, traits d'un fichier
@@ -637,9 +638,19 @@ pub fn context_to_markdown(ctx: &ProjectContext) -> String {
         match ctx.last_synced {
             Some(ts) => {
                 let ago = Utc::now().signed_duration_since(ts);
-                if ago.num_hours() > 24 {
+                if ago.num_hours() < 1 {
                     md.push_str(&format!(
-                        "⚠️ **Sync obsolète** — dernier sync il y a {} jours. Lance `sync_project` avant d'explorer le code.\n\n",
+                        "- **Dernière sync** : il y a {} min (à jour)\n\n",
+                        ago.num_minutes().max(1)
+                    ));
+                } else if ago.num_hours() < 24 {
+                    md.push_str(&format!(
+                        "- **Dernière sync** : il y a {}h\n\n",
+                        ago.num_hours()
+                    ));
+                } else {
+                    md.push_str(&format!(
+                        "- **Dernière sync** : il y a {}j — si le code a changé depuis, lance `sync_project`\n\n",
                         ago.num_days()
                     ));
                 }
