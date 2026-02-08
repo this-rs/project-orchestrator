@@ -135,6 +135,74 @@ pub async fn interrupt_session(
 }
 
 // ============================================================================
+// Message history
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct MessagesQuery {
+    #[serde(default = "default_messages_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_messages_limit() -> usize {
+    50
+}
+
+/// GET /api/chat/sessions/{id}/messages — Get message history
+pub async fn list_messages(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    Query(query): Query<MessagesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    let loaded = chat_manager
+        .get_session_messages(
+            &session_id.to_string(),
+            Some(query.limit),
+            Some(query.offset),
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("no conversation_id") {
+                AppError::NotFound(msg)
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
+
+    // Convert to chronological order for UI display
+    let messages: Vec<serde_json::Value> = loaded
+        .messages_chronological()
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "conversation_id": m.conversation_id,
+                "role": m.role,
+                "content": m.content,
+                "turn_index": m.turn_index,
+                "created_at": m.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "messages": messages,
+        "total_count": loaded.total_count,
+        "has_more": loaded.has_more,
+        "offset": loaded.offset,
+        "limit": loaded.limit,
+    })))
+}
+
+// ============================================================================
 // Session CRUD
 // ============================================================================
 
@@ -178,6 +246,7 @@ pub async fn list_sessions(
             updated_at: s.updated_at.to_rfc3339(),
             message_count: s.message_count,
             total_cost_usd: s.total_cost_usd,
+            conversation_id: s.conversation_id,
         })
         .collect();
 
@@ -213,6 +282,7 @@ pub async fn get_session(
         updated_at: node.updated_at.to_rfc3339(),
         message_count: node.message_count,
         total_cost_usd: node.total_cost_usd,
+        conversation_id: node.conversation_id,
     }))
 }
 
@@ -566,5 +636,152 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ====================================================================
+    // MessagesQuery serde
+    // ====================================================================
+
+    #[test]
+    fn test_messages_query_defaults() {
+        let json = r#"{}"#;
+        let query: MessagesQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit, 50);
+        assert_eq!(query.offset, 0);
+    }
+
+    #[test]
+    fn test_messages_query_custom() {
+        let json = r#"{"limit": 10, "offset": 5}"#;
+        let query: MessagesQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit, 10);
+        assert_eq!(query.offset, 5);
+    }
+
+    #[test]
+    fn test_default_messages_limit_value() {
+        assert_eq!(default_messages_limit(), 50);
+    }
+
+    // ====================================================================
+    // GET /api/chat/sessions/{id}/messages — no chat_manager
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_list_messages_no_chat_manager() {
+        let app = test_app().await;
+        let fake_id = Uuid::new_v4();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/chat/sessions/{}/messages", fake_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No chat_manager → 500 Internal Server Error
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_list_messages_invalid_session_id() {
+        let app = test_app().await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/chat/sessions/not-a-uuid/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Invalid UUID in path → 400 Bad Request
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/chat/sessions/{id} — conversation_id field
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_session_includes_conversation_id() {
+        let mut session = test_chat_session(Some("my-proj"));
+        session.conversation_id = Some("conv-test-123".into());
+        let session_id = session.id;
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/chat/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["conversation_id"], "conv-test-123");
+    }
+
+    #[tokio::test]
+    async fn test_get_session_conversation_id_null() {
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/chat/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["conversation_id"].is_null());
+    }
+
+    // ====================================================================
+    // GET /api/chat/sessions — list includes conversation_id
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_list_sessions_includes_conversation_id() {
+        let mut session = test_chat_session(Some("proj-a"));
+        session.conversation_id = Some("conv-xyz".into());
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/chat/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["items"][0]["conversation_id"], "conv-xyz");
     }
 }

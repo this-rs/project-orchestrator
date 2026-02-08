@@ -91,11 +91,14 @@ async fn run_server(config: Config) -> Result<()> {
     // Create chat manager (optional — requires Claude CLI)
     let chat_manager = {
         let chat_config = ChatConfig::from_env();
-        let cm = Arc::new(ChatManager::new(
-            orchestrator.neo4j_arc(),
-            orchestrator.meili_arc(),
-            chat_config,
-        ));
+        let cm = Arc::new(
+            ChatManager::new(
+                orchestrator.neo4j_arc(),
+                orchestrator.meili_arc(),
+                chat_config,
+            )
+            .await,
+        );
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");
         Some(cm)

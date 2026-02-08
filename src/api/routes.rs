@@ -447,7 +447,7 @@ pub fn create_router(state: OrchestratorState) -> Router {
         )
         .route(
             "/api/chat/sessions/{id}/messages",
-            post(chat_handlers::send_message),
+            get(chat_handlers::list_messages).post(chat_handlers::send_message),
         )
         .route(
             "/api/chat/sessions/{id}/interrupt",
