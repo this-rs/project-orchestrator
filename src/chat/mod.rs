@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod manager;
+pub mod prompt;
 pub mod types;
 
 pub use config::ChatConfig;

@@ -118,35 +118,103 @@ impl ChatManager {
             .unwrap_or_else(|| self.config.default_model.clone())
     }
 
-    /// Build the system prompt with project context
-    pub async fn build_system_prompt(&self, project_slug: Option<&str>) -> String {
-        let mut prompt = String::from(
-            "Tu es un assistant de développement intégré au Project Orchestrator. \
-             Tu as accès à tous les outils MCP pour gérer les plans, tasks, milestones, \
-             notes et explorer le code. Utilise-les proactivement quand l'utilisateur \
-             te demande de planifier, organiser ou analyser du code.\n\n",
-        );
+    /// Build the system prompt with project context.
+    ///
+    /// Two-layer architecture:
+    /// 1. Hardcoded base (BASE_SYSTEM_PROMPT) — protocols, data model, git, statuses
+    /// 2. Dynamic context — oneshot Opus refines raw Neo4j data, fallback to markdown
+    pub async fn build_system_prompt(
+        &self,
+        project_slug: Option<&str>,
+        user_message: &str,
+    ) -> String {
+        use super::prompt::{
+            assemble_prompt, context_to_json, context_to_markdown, fetch_project_context,
+            BASE_SYSTEM_PROMPT,
+        };
 
-        if let Some(slug) = project_slug {
-            // Fetch project context from Neo4j
-            if let Ok(Some(project)) = self.graph.get_project_by_slug(slug).await {
-                prompt.push_str(&format!("## Projet actif : {} ({})\n", project.name, slug));
-                prompt.push_str(&format!("Root: {}\n\n", project.root_path));
+        // No project → base prompt only
+        let Some(slug) = project_slug else {
+            return BASE_SYSTEM_PROMPT.to_string();
+        };
+
+        // Fetch raw context from Neo4j
+        let ctx = match fetch_project_context(&self.graph, slug).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                warn!("Failed to fetch project context for '{}': {} — using base prompt only", slug, e);
+                return BASE_SYSTEM_PROMPT.to_string();
             }
+        };
 
-            // Fetch active plans
-            if let Ok(plans) = self.graph.list_active_plans().await {
-                if !plans.is_empty() {
-                    prompt.push_str("## Plans en cours\n");
-                    for plan in &plans {
-                        prompt.push_str(&format!("- {} ({:?})\n", plan.title, plan.status));
+        // Try oneshot Opus refinement
+        let context_json = context_to_json(&ctx);
+        let dynamic_section = match self
+            .refine_context_with_oneshot(user_message, &context_json)
+            .await
+        {
+            Ok(refined) => refined,
+            Err(e) => {
+                warn!("Oneshot context refinement failed: {} — using markdown fallback", e);
+                context_to_markdown(&ctx)
+            }
+        };
+
+        assemble_prompt(BASE_SYSTEM_PROMPT, &dynamic_section)
+    }
+
+    /// Use a oneshot Opus call to refine raw project context into a concise,
+    /// relevant contextual section for the system prompt.
+    async fn refine_context_with_oneshot(
+        &self,
+        user_message: &str,
+        context_json: &str,
+    ) -> Result<String> {
+        use super::prompt::build_refinement_prompt;
+
+        let refinement_prompt = build_refinement_prompt(user_message, context_json);
+
+        // Build options: no MCP server, max_turns=1, just text generation
+        #[allow(deprecated)]
+        let options = ClaudeCodeOptions::builder()
+            .model(&self.config.prompt_builder_model)
+            .system_prompt("Tu es un assistant qui construit des sections de contexte concises.")
+            .permission_mode(PermissionMode::BypassPermissions)
+            .max_turns(1)
+            .build();
+
+        let mut client = InteractiveClient::new(options)
+            .map_err(|e| anyhow!("Failed to create oneshot client: {}", e))?;
+
+        client
+            .connect()
+            .await
+            .map_err(|e| anyhow!("Failed to connect oneshot client: {}", e))?;
+
+        let messages = client
+            .send_and_receive(refinement_prompt)
+            .await
+            .map_err(|e| anyhow!("Oneshot send_and_receive failed: {}", e))?;
+
+        // Extract text from assistant messages
+        let mut result = String::new();
+        for msg in &messages {
+            if let Message::Assistant { message } = msg {
+                for block in &message.content {
+                    if let ContentBlock::Text(text) = block {
+                        result.push_str(&text.text);
                     }
-                    prompt.push('\n');
                 }
             }
         }
 
-        prompt
+        let _ = client.disconnect().await;
+
+        if result.is_empty() {
+            return Err(anyhow!("Oneshot returned empty response"));
+        }
+
+        Ok(result)
     }
 
     /// Check if a session is currently active (subprocess alive)
@@ -299,7 +367,7 @@ impl ChatManager {
         let session_id = Uuid::new_v4();
         let model = self.resolve_model(request.model.as_deref());
         let system_prompt = self
-            .build_system_prompt(request.project_slug.as_deref())
+            .build_system_prompt(request.project_slug.as_deref(), &request.message)
             .await;
 
         // Persist session in Neo4j
@@ -675,7 +743,7 @@ impl ChatManager {
 
         // Build options with resume flag
         let system_prompt = self
-            .build_system_prompt(session_node.project_slug.as_deref())
+            .build_system_prompt(session_node.project_slug.as_deref(), message)
             .await;
         let options = self.build_options(
             &session_node.cwd,
@@ -908,6 +976,7 @@ mod tests {
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "key".into(),
             max_turns: 10,
+            prompt_builder_model: "claude-opus-4-6".into(),
         }
     }
 
@@ -935,8 +1004,9 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let prompt = manager.build_system_prompt(None).await;
+        let prompt = manager.build_system_prompt(None, "test").await;
         assert!(prompt.contains("Project Orchestrator"));
+        assert!(prompt.contains("EXCLUSIVEMENT les outils MCP"));
         assert!(!prompt.contains("Projet actif"));
     }
 
@@ -947,9 +1017,15 @@ mod tests {
         state.neo4j.create_project(&project).await.unwrap();
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        let prompt = manager.build_system_prompt(Some(&project.slug)).await;
+        let prompt = manager
+            .build_system_prompt(Some(&project.slug), "help me plan")
+            .await;
 
-        assert!(prompt.contains("Projet actif"));
+        // Contains the base prompt
+        assert!(prompt.contains("EXCLUSIVEMENT les outils MCP"));
+        // Contains dynamic context section (either oneshot or fallback)
+        assert!(prompt.contains("---"));
+        // The project name should appear somewhere in the dynamic context
         assert!(prompt.contains(&project.name));
     }
 
@@ -1366,11 +1442,16 @@ mod tests {
             .unwrap();
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        let prompt = manager.build_system_prompt(Some(&project.slug)).await;
+        let prompt = manager
+            .build_system_prompt(Some(&project.slug), "check the plan")
+            .await;
 
-        assert!(prompt.contains("Projet actif"));
+        // Base prompt present
+        assert!(prompt.contains("EXCLUSIVEMENT les outils MCP"));
+        // Dynamic context section present (either oneshot or fallback)
+        assert!(prompt.contains("---"));
+        // Project name should appear in the dynamic context
         assert!(prompt.contains(&project.name));
-        assert!(prompt.contains("Plans en cours"));
     }
 
     // ====================================================================
