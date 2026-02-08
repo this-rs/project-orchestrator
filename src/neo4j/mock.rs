@@ -3374,13 +3374,16 @@ impl GraphStore for MockGraphStore {
         limit: i64,
     ) -> Result<Vec<ChatEventRecord>> {
         let store = self.chat_events.read().await;
-        let events = store.get(&session_id).map(|v| {
-            v.iter()
-                .filter(|e| e.seq > after_seq)
-                .take(limit as usize)
-                .cloned()
-                .collect::<Vec<_>>()
-        }).unwrap_or_default();
+        let events = store
+            .get(&session_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|e| e.seq > after_seq)
+                    .take(limit as usize)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Ok(events)
     }
 

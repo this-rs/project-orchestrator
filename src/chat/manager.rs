@@ -12,6 +12,7 @@
 use super::config::ChatConfig;
 use super::types::{ChatEvent, ChatRequest, CreateSessionResponse};
 use crate::meilisearch::SearchStore;
+use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::models::ChatSessionNode;
 use crate::neo4j::GraphStore;
 use anyhow::{anyhow, Context, Result};
@@ -21,7 +22,6 @@ use nexus_claude::{
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
 };
-use crate::neo4j::models::ChatEventRecord;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
@@ -577,103 +577,103 @@ impl ChatManager {
                 }
             };
 
-        while let Some(result) = stream.next().await {
-            // Check interrupt flag at each iteration
-            if interrupt_flag.load(Ordering::SeqCst) {
-                info!(
-                    "Interrupt flag detected during stream for session {}",
-                    session_id
-                );
-                break;
-            }
-
-            match result {
-                Ok(ref msg) => {
-                    // Handle StreamEvent — emit StreamDelta for text tokens directly
-                    // stream_delta are NOT persisted (too many writes)
-                    if let Message::StreamEvent {
-                        event:
-                            StreamEventData::ContentBlockDelta {
-                                delta: StreamDelta::TextDelta { ref text },
-                                ..
-                            },
-                        ..
-                    } = msg
-                    {
-                        // Accumulate for mid-stream join snapshot
-                        streaming_text.lock().await.push_str(text);
-                        let _ = events_tx.send(ChatEvent::StreamDelta { text: text.clone() });
-                        continue;
-                    }
-
-                    // Extract cli_session_id from Result message
-                    if let Message::Result {
-                        session_id: ref cli_sid,
-                        total_cost_usd: ref cost,
-                        ..
-                    } = msg
-                    {
-                        // Update Neo4j with cli_session_id and cost
-                        if let Some(uuid) = session_uuid {
-                            let _ = graph
-                                .update_chat_session(
-                                    uuid,
-                                    Some(cli_sid.clone()),
-                                    None,
-                                    Some(1),
-                                    *cost,
-                                    None,
-                                )
-                                .await;
-                        }
-
-                        // Update active session's cli_session_id
-                        let mut sessions = active_sessions.write().await;
-                        if let Some(active) = sessions.get_mut(&session_id) {
-                            active.cli_session_id = Some(cli_sid.clone());
-                            active.last_activity = Instant::now();
-                        }
-                    }
-
-                    // Collect assistant text for memory
-                    if let Message::Assistant { message: ref am } = msg {
-                        for block in &am.content {
-                            if let ContentBlock::Text(t) = block {
-                                assistant_text_parts.push(t.text.clone());
-                            }
-                        }
-                    }
-
-                    // Convert to ChatEvent(s) and emit + persist structured events
-                    let events = Self::message_to_events(msg);
-                    for event in events {
-                        // Persist structured events (not stream_delta) with seq number
-                        if !matches!(event, ChatEvent::StreamDelta { .. }) {
-                            if let Some(uuid) = session_uuid {
-                                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-                                events_to_persist.push(ChatEventRecord {
-                                    id: Uuid::new_v4(),
-                                    session_id: uuid,
-                                    seq,
-                                    event_type: event.event_type().to_string(),
-                                    data: serde_json::to_string(&event).unwrap_or_default(),
-                                    created_at: chrono::Utc::now(),
-                                });
-                            }
-                        }
-
-                        let _ = events_tx.send(event);
-                    }
-                }
-                Err(e) => {
-                    error!("Stream error for session {}: {}", session_id, e);
-                    let _ = events_tx.send(ChatEvent::Error {
-                        message: format!("Error: {}", e),
-                    });
+            while let Some(result) = stream.next().await {
+                // Check interrupt flag at each iteration
+                if interrupt_flag.load(Ordering::SeqCst) {
+                    info!(
+                        "Interrupt flag detected during stream for session {}",
+                        session_id
+                    );
                     break;
                 }
+
+                match result {
+                    Ok(ref msg) => {
+                        // Handle StreamEvent — emit StreamDelta for text tokens directly
+                        // stream_delta are NOT persisted (too many writes)
+                        if let Message::StreamEvent {
+                            event:
+                                StreamEventData::ContentBlockDelta {
+                                    delta: StreamDelta::TextDelta { ref text },
+                                    ..
+                                },
+                            ..
+                        } = msg
+                        {
+                            // Accumulate for mid-stream join snapshot
+                            streaming_text.lock().await.push_str(text);
+                            let _ = events_tx.send(ChatEvent::StreamDelta { text: text.clone() });
+                            continue;
+                        }
+
+                        // Extract cli_session_id from Result message
+                        if let Message::Result {
+                            session_id: ref cli_sid,
+                            total_cost_usd: ref cost,
+                            ..
+                        } = msg
+                        {
+                            // Update Neo4j with cli_session_id and cost
+                            if let Some(uuid) = session_uuid {
+                                let _ = graph
+                                    .update_chat_session(
+                                        uuid,
+                                        Some(cli_sid.clone()),
+                                        None,
+                                        Some(1),
+                                        *cost,
+                                        None,
+                                    )
+                                    .await;
+                            }
+
+                            // Update active session's cli_session_id
+                            let mut sessions = active_sessions.write().await;
+                            if let Some(active) = sessions.get_mut(&session_id) {
+                                active.cli_session_id = Some(cli_sid.clone());
+                                active.last_activity = Instant::now();
+                            }
+                        }
+
+                        // Collect assistant text for memory
+                        if let Message::Assistant { message: ref am } = msg {
+                            for block in &am.content {
+                                if let ContentBlock::Text(t) = block {
+                                    assistant_text_parts.push(t.text.clone());
+                                }
+                            }
+                        }
+
+                        // Convert to ChatEvent(s) and emit + persist structured events
+                        let events = Self::message_to_events(msg);
+                        for event in events {
+                            // Persist structured events (not stream_delta) with seq number
+                            if !matches!(event, ChatEvent::StreamDelta { .. }) {
+                                if let Some(uuid) = session_uuid {
+                                    let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                                    events_to_persist.push(ChatEventRecord {
+                                        id: Uuid::new_v4(),
+                                        session_id: uuid,
+                                        seq,
+                                        event_type: event.event_type().to_string(),
+                                        data: serde_json::to_string(&event).unwrap_or_default(),
+                                        created_at: chrono::Utc::now(),
+                                    });
+                                }
+                            }
+
+                            let _ = events_tx.send(event);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Stream error for session {}: {}", session_id, e);
+                        let _ = events_tx.send(ChatEvent::Error {
+                            message: format!("Error: {}", e),
+                        });
+                        break;
+                    }
+                }
             }
-        }
         } // client lock released here
 
         // Batch-persist all collected events to Neo4j
@@ -784,7 +784,16 @@ impl ChatManager {
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
         // Get session state — NO broadcast replacement, the same channel is reused
-        let (client, events_tx, interrupt_flag, memory_manager, next_seq, pending_messages, is_streaming, streaming_text) = {
+        let (
+            client,
+            events_tx,
+            interrupt_flag,
+            memory_manager,
+            next_seq,
+            pending_messages,
+            is_streaming,
+            streaming_text,
+        ) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
@@ -827,10 +836,7 @@ impl ChatManager {
                     .unwrap_or_default(),
                 created_at: chrono::Utc::now(),
             };
-            let _ = self
-                .graph
-                .store_chat_events(uuid, vec![user_event])
-                .await;
+            let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
         }
 
         // Emit user_message on broadcast (visible to all WS clients)
@@ -994,10 +1000,7 @@ impl ChatManager {
                 .unwrap_or_default(),
             created_at: chrono::Utc::now(),
         };
-        let _ = self
-            .graph
-            .store_chat_events(uuid, vec![user_event])
-            .await;
+        let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
 
         // Emit user_message on broadcast
         let _ = events_tx.send(ChatEvent::UserMessage {

@@ -154,7 +154,10 @@ async fn handle_ws_chat(
             session_id = %session_id,
             "No ChatEventRecord found, falling back to Nexus message history"
         );
-        match chat_manager.get_session_messages(&session_id, None, None).await {
+        match chat_manager
+            .get_session_messages(&session_id, None, None)
+            .await
+        {
             Ok(loaded) => {
                 let messages = loaded.messages_chronological();
                 debug!(
