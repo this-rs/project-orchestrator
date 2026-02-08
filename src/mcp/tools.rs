@@ -879,7 +879,8 @@ fn code_tools() -> Vec<ToolDefinition> {
                 properties: Some(json!({
                     "query": {"type": "string", "description": "Search query"},
                     "limit": {"type": "integer", "description": "Max results (default 10)"},
-                    "language": {"type": "string", "description": "Filter by language"}
+                    "language": {"type": "string", "description": "Filter by language"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["query".to_string()]),
             },
@@ -971,7 +972,9 @@ fn code_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "code_snippet": {"type": "string", "description": "Code to find similar matches for"},
-                    "limit": {"type": "integer", "description": "Max results"}
+                    "limit": {"type": "integer", "description": "Max results"},
+                    "language": {"type": "string", "description": "Filter by language"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["code_snippet".to_string()]),
             },
@@ -1064,7 +1067,8 @@ fn decision_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "query": {"type": "string", "description": "Search query"},
-                    "limit": {"type": "integer", "description": "Max results"}
+                    "limit": {"type": "integer", "description": "Max results"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["query".to_string()]),
             },
