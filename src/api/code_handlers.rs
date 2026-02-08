@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::handlers::{AppError, OrchestratorState};
+use crate::neo4j::models::ConnectedFileNode;
 
 // ============================================================================
 // Code Search (Meilisearch)
@@ -18,50 +19,36 @@ use super::handlers::{AppError, OrchestratorState};
 #[derive(Deserialize)]
 pub struct CodeSearchQuery {
     /// Search query (semantic search across code content, symbols, comments)
-    pub q: String,
+    pub query: String,
     /// Max results (default 10)
     pub limit: Option<usize>,
     /// Filter by language (rust, typescript, python, go)
     pub language: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct CodeSearchResult {
-    pub path: String,
-    pub language: String,
-    pub snippet: String,
-    pub symbols: Vec<String>,
-    pub score: f64,
-}
-
 /// Search code semantically across the codebase
+///
+/// Returns `SearchHit<CodeDocument>` directly so the frontend gets
+/// the `{ document, score }` shape it expects.
 pub async fn search_code(
     State(state): State<OrchestratorState>,
-    Query(query): Query<CodeSearchQuery>,
-) -> Result<Json<Vec<CodeSearchResult>>, AppError> {
+    Query(params): Query<CodeSearchQuery>,
+) -> Result<
+    Json<Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>>,
+    AppError,
+> {
     let hits = state
         .orchestrator
         .meili()
         .search_code_with_scores(
-            &query.q,
-            query.limit.unwrap_or(10),
-            query.language.as_deref(),
+            &params.query,
+            params.limit.unwrap_or(10),
+            params.language.as_deref(),
             None,
         )
         .await?;
 
-    let results: Vec<CodeSearchResult> = hits
-        .into_iter()
-        .map(|hit| CodeSearchResult {
-            path: hit.document.path,
-            language: hit.document.language,
-            snippet: hit.document.docstrings.chars().take(500).collect(),
-            symbols: hit.document.symbols,
-            score: hit.score,
-        })
-        .collect();
-
-    Ok(Json(results))
+    Ok(Json(hits))
 }
 
 // ============================================================================
@@ -427,7 +414,7 @@ pub struct ArchitectureOverview {
     pub total_files: usize,
     pub languages: Vec<LanguageStats>,
     pub modules: Vec<ModuleInfo>,
-    pub most_connected: Vec<String>,
+    pub key_files: Vec<ConnectedFileNode>,
     pub orphan_files: Vec<String>,
 }
 
@@ -462,10 +449,10 @@ pub async fn get_architecture(
         })
         .collect();
 
-    let most_connected = state
+    let key_files = state
         .orchestrator
         .neo4j()
-        .get_most_connected_files(10)
+        .get_most_connected_files_detailed(10)
         .await?;
 
     let total_files: usize = languages.iter().map(|l| l.file_count).sum();
@@ -474,7 +461,7 @@ pub async fn get_architecture(
         total_files,
         languages,
         modules: vec![],
-        most_connected,
+        key_files,
         orphan_files: vec![],
     }))
 }
@@ -687,4 +674,277 @@ pub async fn get_impl_blocks(
         type_name: query.type_name,
         impl_blocks,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::ServerState;
+    use crate::api::routes::create_router;
+    use crate::meilisearch::indexes::CodeDocument;
+    use crate::neo4j::models::FileNode;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::mock_app_state;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// Build a test router with mock backends
+    async fn test_app() -> axum::Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::EventBus::default()),
+        });
+        create_router(state)
+    }
+
+    /// Build a test router with pre-seeded code documents and files
+    async fn test_app_with_code() -> axum::Router {
+        let app_state = mock_app_state();
+
+        // Seed a code document in the mock search store
+        let doc = CodeDocument {
+            id: "src/main.rs".to_string(),
+            path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            symbols: vec!["main".to_string(), "Config".to_string()],
+            docstrings: "Main entry point for the application".to_string(),
+            signatures: vec!["fn main()".to_string()],
+            imports: vec!["std::io".to_string()],
+            project_id: "proj-1".to_string(),
+            project_slug: "test-project".to_string(),
+        };
+        app_state.meili.index_code(&doc).await.unwrap();
+
+        // Seed files in the mock graph store for architecture endpoint
+        let file1 = FileNode {
+            path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: None,
+        };
+        let file2 = FileNode {
+            path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "def456".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: None,
+        };
+        app_state.neo4j.upsert_file(&file1).await.unwrap();
+        app_state.neo4j.upsert_file(&file2).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::EventBus::default()),
+        });
+        create_router(state)
+    }
+
+    // ====================================================================
+    // GET /api/code/search
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_search_code_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/code/search?query=something&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_results() {
+        let app = test_app_with_code().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/code/search?query=main&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_array());
+        let results = json.as_array().unwrap();
+        assert!(!results.is_empty());
+        // Verify SearchHit<CodeDocument> shape: { document, score }
+        let first = &results[0];
+        assert!(first["document"].is_object());
+        assert!(first["score"].is_number());
+        assert_eq!(first["document"]["path"], "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_language_filter() {
+        let app = test_app_with_code().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/code/search?query=main&limit=10&language=rust")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let results = json.as_array().unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0]["document"]["language"], "rust");
+    }
+
+    #[tokio::test]
+    async fn test_search_code_language_filter_no_match() {
+        let app = test_app_with_code().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/code/search?query=main&limit=10&language=python")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_code_missing_query_param() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/code/search?limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Missing required 'query' param → 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/code/architecture
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_architecture_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/code/architecture")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_files"], 0);
+        assert!(json["languages"].is_array());
+        assert!(json["key_files"].is_array());
+        assert!(json["orphan_files"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_architecture_with_files() {
+        let app = test_app_with_code().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/code/architecture")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // We seeded 2 rust files
+        assert_eq!(json["total_files"], 2);
+        let languages = json["languages"].as_array().unwrap();
+        assert_eq!(languages.len(), 1);
+        assert_eq!(languages[0]["language"], "rust");
+        assert_eq!(languages[0]["file_count"], 2);
+        // key_files is a Vec<ConnectedFileNode> with { path, imports, dependents }
+        assert!(json["key_files"].is_array());
+    }
+
+    // ====================================================================
+    // CodeSearchQuery serde
+    // ====================================================================
+
+    #[test]
+    fn test_code_search_query_deserialization() {
+        let json = r#"{"query":"fn main","limit":5,"language":"rust"}"#;
+        let q: CodeSearchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.query, "fn main");
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.language, Some("rust".to_string()));
+    }
+
+    #[test]
+    fn test_code_search_query_minimal() {
+        let json = r#"{"query":"test"}"#;
+        let q: CodeSearchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.query, "test");
+        assert_eq!(q.limit, None);
+        assert_eq!(q.language, None);
+    }
 }
