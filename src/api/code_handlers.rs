@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::handlers::{AppError, OrchestratorState};
+use crate::neo4j::models::ConnectedFileNode;
 
 // ============================================================================
 // Code Search (Meilisearch)
@@ -427,7 +428,7 @@ pub struct ArchitectureOverview {
     pub total_files: usize,
     pub languages: Vec<LanguageStats>,
     pub modules: Vec<ModuleInfo>,
-    pub most_connected: Vec<String>,
+    pub key_files: Vec<ConnectedFileNode>,
     pub orphan_files: Vec<String>,
 }
 
@@ -462,10 +463,10 @@ pub async fn get_architecture(
         })
         .collect();
 
-    let most_connected = state
+    let key_files = state
         .orchestrator
         .neo4j()
-        .get_most_connected_files(10)
+        .get_most_connected_files_detailed(10)
         .await?;
 
     let total_files: usize = languages.iter().map(|l| l.file_count).sum();
@@ -474,7 +475,7 @@ pub async fn get_architecture(
         total_files,
         languages,
         modules: vec![],
-        most_connected,
+        key_files,
         orphan_files: vec![],
     }))
 }
