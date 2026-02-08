@@ -430,6 +430,8 @@ pub fn create_router(state: OrchestratorState) -> Router {
         // WebSocket CRUD Event Notifications
         // ====================================================================
         .route("/ws/events", get(ws_handlers::ws_events))
+        // Internal: receive CrudEvent from MCP server
+        .route("/internal/events", post(handlers::receive_event))
         // ====================================================================
         // Chat (SSE streaming + session management)
         // ====================================================================

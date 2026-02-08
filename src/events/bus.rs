@@ -1,6 +1,6 @@
 //! Event bus for broadcasting CRUD events to WebSocket clients
 
-use super::{CrudAction, CrudEvent, EntityType};
+use super::{CrudEvent, EventEmitter};
 use tokio::sync::broadcast;
 use tracing::debug;
 
@@ -28,10 +28,14 @@ impl EventBus {
         self.sender.subscribe()
     }
 
-    /// Emit a CrudEvent to all subscribers (fire-and-forget)
-    ///
-    /// If no subscribers are connected, the event is silently dropped.
-    pub fn emit(&self, event: CrudEvent) {
+    /// Number of active subscribers
+    pub fn subscriber_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
+}
+
+impl EventEmitter for EventBus {
+    fn emit(&self, event: CrudEvent) {
         let entity = format!("{:?}", event.entity_type);
         let action = format!("{:?}", event.action);
         match self.sender.send(event) {
@@ -48,91 +52,6 @@ impl EventBus {
             }
         }
     }
-
-    /// Emit a Created event
-    pub fn emit_created(
-        &self,
-        entity_type: EntityType,
-        entity_id: impl Into<String>,
-        payload: serde_json::Value,
-        project_id: Option<String>,
-    ) {
-        let mut event =
-            CrudEvent::new(entity_type, CrudAction::Created, entity_id).with_payload(payload);
-        if let Some(pid) = project_id {
-            event = event.with_project_id(pid);
-        }
-        self.emit(event);
-    }
-
-    /// Emit an Updated event
-    pub fn emit_updated(
-        &self,
-        entity_type: EntityType,
-        entity_id: impl Into<String>,
-        payload: serde_json::Value,
-        project_id: Option<String>,
-    ) {
-        let mut event =
-            CrudEvent::new(entity_type, CrudAction::Updated, entity_id).with_payload(payload);
-        if let Some(pid) = project_id {
-            event = event.with_project_id(pid);
-        }
-        self.emit(event);
-    }
-
-    /// Emit a Deleted event
-    pub fn emit_deleted(
-        &self,
-        entity_type: EntityType,
-        entity_id: impl Into<String>,
-        project_id: Option<String>,
-    ) {
-        let mut event = CrudEvent::new(entity_type, CrudAction::Deleted, entity_id);
-        if let Some(pid) = project_id {
-            event = event.with_project_id(pid);
-        }
-        self.emit(event);
-    }
-
-    /// Emit a Linked event (entity linked to a related entity)
-    pub fn emit_linked(
-        &self,
-        entity_type: EntityType,
-        entity_id: impl Into<String>,
-        related_type: EntityType,
-        related_id: impl Into<String>,
-        project_id: Option<String>,
-    ) {
-        let mut event = CrudEvent::new(entity_type, CrudAction::Linked, entity_id)
-            .with_related(related_type, related_id);
-        if let Some(pid) = project_id {
-            event = event.with_project_id(pid);
-        }
-        self.emit(event);
-    }
-
-    /// Emit an Unlinked event (entity unlinked from a related entity)
-    pub fn emit_unlinked(
-        &self,
-        entity_type: EntityType,
-        entity_id: impl Into<String>,
-        related_type: EntityType,
-        related_id: impl Into<String>,
-        project_id: Option<String>,
-    ) {
-        let mut event = CrudEvent::new(entity_type, CrudAction::Unlinked, entity_id)
-            .with_related(related_type, related_id);
-        if let Some(pid) = project_id {
-            event = event.with_project_id(pid);
-        }
-        self.emit(event);
-    }
-
-    /// Number of active subscribers
-    pub fn subscriber_count(&self) -> usize {
-        self.sender.receiver_count()
-    }
 }
 
 impl Default for EventBus {
@@ -144,6 +63,7 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{CrudAction, EntityType};
 
     #[test]
     fn test_emit_without_subscriber_no_panic() {

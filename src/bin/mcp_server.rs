@@ -40,6 +40,7 @@
 use anyhow::Result;
 use clap::Parser;
 use project_orchestrator::chat::{ChatConfig, ChatManager};
+use project_orchestrator::events::EventNotifier;
 use project_orchestrator::mcp::McpServer;
 use project_orchestrator::orchestrator::Orchestrator;
 use project_orchestrator::{AppState, Config};
@@ -76,6 +77,10 @@ struct Args {
         default_value = "orchestrator-meili-key-change-me"
     )]
     meilisearch_key: String,
+
+    /// HTTP server URL for event forwarding (MCP → HTTP bridge)
+    #[arg(long, env = "MCP_HTTP_URL", default_value = "http://localhost:8080")]
+    http_url: String,
 }
 
 #[tokio::main]
@@ -114,8 +119,12 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Create orchestrator
-    let orchestrator = match Orchestrator::new(state).await {
+    // Create event notifier for MCP → HTTP bridge
+    let notifier = Arc::new(EventNotifier::new(&args.http_url));
+    info!("Event notifier targeting: {}", args.http_url);
+
+    // Create orchestrator with event notifier
+    let orchestrator = match Orchestrator::with_event_emitter(state, notifier).await {
         Ok(o) => Arc::new(o),
         Err(e) => {
             error!("Failed to create orchestrator: {}", e);

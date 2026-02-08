@@ -1,6 +1,6 @@
 //! Main orchestrator runner
 
-use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventBus};
+use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventBus, EventEmitter};
 use crate::neo4j::models::*;
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
@@ -26,6 +26,7 @@ pub struct Orchestrator {
     note_manager: Arc<NoteManager>,
     note_lifecycle: Arc<NoteLifecycleManager>,
     event_bus: Option<Arc<EventBus>>,
+    event_emitter: Option<Arc<dyn EventEmitter>>,
 }
 
 impl Orchestrator {
@@ -53,21 +54,26 @@ impl Orchestrator {
             note_manager,
             note_lifecycle,
             event_bus: None,
+            event_emitter: None,
         })
     }
 
     /// Create a new orchestrator with an EventBus for CRUD notifications
+    ///
+    /// Used by the HTTP server — the EventBus is kept for `subscribe()` (WebSocket clients).
     pub async fn with_event_bus(state: AppState, event_bus: Arc<EventBus>) -> Result<Self> {
-        let plan_manager = Arc::new(PlanManager::with_event_bus(
+        let emitter: Arc<dyn EventEmitter> = event_bus.clone();
+
+        let plan_manager = Arc::new(PlanManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
-            event_bus.clone(),
+            emitter.clone(),
         ));
 
-        let note_manager = Arc::new(NoteManager::with_event_bus(
+        let note_manager = Arc::new(NoteManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
-            event_bus.clone(),
+            emitter.clone(),
         ));
 
         let context_builder = Arc::new(ContextBuilder::new(
@@ -88,18 +94,61 @@ impl Orchestrator {
             note_manager,
             note_lifecycle,
             event_bus: Some(event_bus),
+            event_emitter: Some(emitter),
         })
     }
 
-    /// Get the event bus (if configured)
+    /// Create a new orchestrator with a generic EventEmitter
+    ///
+    /// Used by the MCP server — passes an `EventNotifier` that forwards events
+    /// to the HTTP server via POST /internal/events.
+    pub async fn with_event_emitter(
+        state: AppState,
+        emitter: Arc<dyn EventEmitter>,
+    ) -> Result<Self> {
+        let plan_manager = Arc::new(PlanManager::with_event_emitter(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            emitter.clone(),
+        ));
+
+        let note_manager = Arc::new(NoteManager::with_event_emitter(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            emitter.clone(),
+        ));
+
+        let context_builder = Arc::new(ContextBuilder::new(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            plan_manager.clone(),
+            note_manager.clone(),
+        ));
+
+        let parser = Arc::new(RwLock::new(CodeParser::new()?));
+        let note_lifecycle = Arc::new(NoteLifecycleManager::new());
+
+        Ok(Self {
+            state,
+            plan_manager,
+            context_builder,
+            parser,
+            note_manager,
+            note_lifecycle,
+            event_bus: None,
+            event_emitter: Some(emitter),
+        })
+    }
+
+    /// Get the event bus (if configured — only available on HTTP server)
     pub fn event_bus(&self) -> Option<&Arc<EventBus>> {
         self.event_bus.as_ref()
     }
 
-    /// Emit a CRUD event (no-op if event_bus is None)
+    /// Emit a CRUD event (no-op if no event emitter is configured)
     fn emit(&self, event: CrudEvent) {
-        if let Some(bus) = &self.event_bus {
-            bus.emit(event);
+        if let Some(emitter) = &self.event_emitter {
+            emitter.emit(event);
         }
     }
 
@@ -2148,5 +2197,89 @@ mod tests {
         // Should succeed silently even without event bus
         orch.create_project(&project).await.unwrap();
         orch.delete_project(project.id).await.unwrap();
+    }
+
+    // ── with_event_emitter ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_with_event_emitter_has_no_event_bus() {
+        // with_event_emitter should NOT set the event_bus field (only event_emitter)
+        let state = mock_app_state();
+        let bus = Arc::new(EventBus::default());
+        let emitter: Arc<dyn EventEmitter> = bus;
+        let orch = Orchestrator::with_event_emitter(state, emitter)
+            .await
+            .unwrap();
+        // event_bus is None (only set by with_event_bus for WS subscribe)
+        assert!(orch.event_bus().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_event_emitter_emits_events() {
+        use std::sync::Mutex;
+
+        struct RecordingEmitter(Mutex<Vec<CrudEvent>>);
+        impl EventEmitter for RecordingEmitter {
+            fn emit(&self, event: CrudEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let emitter = Arc::new(RecordingEmitter(Mutex::new(Vec::new())));
+        let state = mock_app_state();
+        let orch = Orchestrator::with_event_emitter(state, emitter.clone())
+            .await
+            .unwrap();
+
+        let project = test_project();
+        orch.create_project(&project).await.unwrap();
+
+        let events = emitter.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_type, EventEntityType::Project);
+        assert_eq!(events[0].action, CrudAction::Created);
+    }
+
+    #[tokio::test]
+    async fn test_with_event_emitter_managers_emit_too() {
+        use std::sync::Mutex;
+
+        struct RecordingEmitter(Mutex<Vec<CrudEvent>>);
+        impl EventEmitter for RecordingEmitter {
+            fn emit(&self, event: CrudEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let emitter = Arc::new(RecordingEmitter(Mutex::new(Vec::new())));
+        let state = mock_app_state();
+        let orch = Orchestrator::with_event_emitter(state, emitter.clone())
+            .await
+            .unwrap();
+
+        // Create plan via PlanManager — should also use the emitter
+        let plan = orch
+            .plan_manager()
+            .create_plan(
+                crate::plan::models::CreatePlanRequest {
+                    title: "Test".into(),
+                    description: "Desc".into(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let events = emitter.0.lock().unwrap();
+        // PlanManager should have emitted a Created event
+        assert!(
+            events.iter().any(|e| e.entity_type == EventEntityType::Plan
+                && e.action == CrudAction::Created
+                && e.entity_id == plan.id.to_string()),
+            "PlanManager should emit via the shared EventEmitter"
+        );
     }
 }
