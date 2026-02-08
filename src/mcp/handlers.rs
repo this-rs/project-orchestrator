@@ -125,6 +125,7 @@ impl ToolHandler {
             // Code
             "search_code" => self.search_code(args).await,
             "search_project_code" => self.search_project_code(args).await,
+            "search_workspace_code" => self.search_workspace_code(args).await,
             "get_file_symbols" => self.get_file_symbols(args).await,
             "find_references" => self.find_references(args).await,
             "get_file_dependencies" => self.get_file_dependencies(args).await,
@@ -1555,6 +1556,62 @@ impl ToolHandler {
             .await?;
 
         Ok(serde_json::to_value(results)?)
+    }
+
+    async fn search_workspace_code(&self, args: Value) -> Result<Value> {
+        let workspace_slug = args
+            .get("workspace_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("workspace_slug is required"))?;
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("query is required"))?;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        let language = args.get("language").and_then(|v| v.as_str());
+        let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
+
+        // Resolve workspace to project slugs
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(workspace_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found: {}", workspace_slug))?;
+        let projects = self
+            .neo4j()
+            .list_workspace_projects(workspace.id)
+            .await?;
+
+        if projects.is_empty() {
+            return Ok(json!([]));
+        }
+
+        // Search across all projects and merge results
+        let mut all_hits = Vec::new();
+        for project in &projects {
+            let hits = self
+                .meili()
+                .search_code_with_scores(
+                    query,
+                    limit,
+                    language,
+                    Some(&project.slug),
+                    path_prefix,
+                )
+                .await
+                .unwrap_or_default();
+            all_hits.extend(hits);
+        }
+
+        // Sort by score descending and truncate to limit
+        all_hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_hits.truncate(limit);
+
+        Ok(serde_json::to_value(all_hits)?)
     }
 
     async fn get_file_symbols(&self, args: Value) -> Result<Value> {

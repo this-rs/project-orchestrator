@@ -1078,6 +1078,21 @@ fn decision_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["query".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "search_workspace_code".to_string(),
+            description: "Search code across all projects in a workspace".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "workspace_slug": {"type": "string", "description": "Workspace slug"},
+                    "query": {"type": "string", "description": "Search query"},
+                    "language": {"type": "string", "description": "Filter by language"},
+                    "limit": {"type": "integer", "description": "Max results (default 10)"},
+                    "path_prefix": {"type": "string", "description": "Filter by path prefix (e.g. 'src/mcp/')"}
+                })),
+                required: Some(vec!["workspace_slug".to_string(), "query".to_string()]),
+            },
+        },
     ]
 }
 
@@ -1950,7 +1965,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 136, "Expected 136 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 137, "Expected 137 tools, got {}", tools.len());
     }
 
     #[test]
