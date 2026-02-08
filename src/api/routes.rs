@@ -6,6 +6,7 @@ use super::handlers::{self, OrchestratorState};
 use super::note_handlers;
 use super::project_handlers;
 use super::workspace_handlers;
+use super::ws_chat_handler;
 use super::ws_handlers;
 use axum::{
     routing::{get, post},
@@ -430,6 +431,11 @@ pub fn create_router(state: OrchestratorState) -> Router {
         // WebSocket CRUD Event Notifications
         // ====================================================================
         .route("/ws/events", get(ws_handlers::ws_events))
+        // WebSocket Chat (bidirectional)
+        .route(
+            "/ws/chat/{session_id}",
+            get(ws_chat_handler::ws_chat),
+        )
         // Internal: receive CrudEvent from MCP server
         .route("/internal/events", post(handlers::receive_event))
         // ====================================================================
