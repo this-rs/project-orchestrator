@@ -69,7 +69,7 @@ pub enum ChatEvent {
 }
 
 impl ChatEvent {
-    /// Get the SSE event type name
+    /// Get the event type name (used for WebSocket messages and persistence)
     pub fn event_type(&self) -> &'static str {
         match self {
             ChatEvent::UserMessage { .. } => "user_message",

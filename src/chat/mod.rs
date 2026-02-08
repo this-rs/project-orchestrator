@@ -1,7 +1,7 @@
 //! Chat module — conversational interface via Claude Code CLI (Nexus SDK)
 //!
-//! Provides SSE streaming chat endpoint with bidirectional communication,
-//! session persistence, and auto-resume capabilities.
+//! Provides WebSocket streaming chat with bidirectional communication,
+//! event persistence with replay, session management, and auto-resume capabilities.
 
 pub mod config;
 pub mod manager;

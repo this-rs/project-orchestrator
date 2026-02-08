@@ -119,34 +119,81 @@ async fn handle_ws_chat(
     // ========================================================================
     // Phase 1: Replay persisted events since last_event
     // ========================================================================
-    match chat_manager.get_events_since(&session_id, last_event).await {
-        Ok(events) => {
-            debug!(
-                session_id = %session_id,
-                count = events.len(),
-                "Replaying persisted events"
-            );
-            for event in events {
-                let msg = serde_json::json!({
-                    "seq": event.seq,
-                    "type": event.event_type,
-                    "data": serde_json::from_str::<serde_json::Value>(&event.data)
-                        .unwrap_or_else(|_| serde_json::Value::String(event.data.clone())),
-                    "replaying": true,
-                });
-                if ws_sender
-                    .send(Message::Text(msg.to_string().into()))
-                    .await
-                    .is_err()
-                {
-                    debug!("Client disconnected during replay");
-                    return;
-                }
+    let events = chat_manager
+        .get_events_since(&session_id, last_event)
+        .await
+        .unwrap_or_default();
+
+    if !events.is_empty() {
+        // New format: replay ChatEventRecord from Neo4j
+        debug!(
+            session_id = %session_id,
+            count = events.len(),
+            "Replaying persisted ChatEventRecord"
+        );
+        for event in events {
+            let msg = serde_json::json!({
+                "seq": event.seq,
+                "type": event.event_type,
+                "data": serde_json::from_str::<serde_json::Value>(&event.data)
+                    .unwrap_or_else(|_| serde_json::Value::String(event.data.clone())),
+                "replaying": true,
+            });
+            if ws_sender
+                .send(Message::Text(msg.to_string().into()))
+                .await
+                .is_err()
+            {
+                debug!("Client disconnected during replay");
+                return;
             }
         }
-        Err(e) => {
-            warn!(session_id = %session_id, error = %e, "Failed to load events for replay");
-            // Continue anyway — the client just won't get the replay
+    } else if last_event == 0 {
+        // Fallback: Load from Nexus SDK for pre-migration sessions
+        debug!(
+            session_id = %session_id,
+            "No ChatEventRecord found, falling back to Nexus message history"
+        );
+        match chat_manager.get_session_messages(&session_id, None, None).await {
+            Ok(loaded) => {
+                let messages = loaded.messages_chronological();
+                debug!(
+                    session_id = %session_id,
+                    count = messages.len(),
+                    "Replaying Nexus message history"
+                );
+                let mut seq = 1i64;
+                for msg in messages {
+                    let event_type = if msg.role == "user" {
+                        "user_message"
+                    } else {
+                        "assistant_text"
+                    };
+                    let data = serde_json::json!({ "content": msg.content });
+                    let replay_msg = serde_json::json!({
+                        "seq": seq,
+                        "type": event_type,
+                        "data": data,
+                        "replaying": true,
+                    });
+                    seq += 1;
+                    if ws_sender
+                        .send(Message::Text(replay_msg.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        debug!("Client disconnected during Nexus replay");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to load Nexus message history for replay"
+                );
+            }
         }
     }
 

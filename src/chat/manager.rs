@@ -4,7 +4,8 @@
 //!
 //! Architecture:
 //! - Each session spawns an `InteractiveClient` (Nexus SDK) subprocess
-//! - Messages are streamed via `broadcast::channel` to SSE subscribers
+//! - Messages are streamed via `broadcast::channel` to WebSocket subscribers
+//! - Structured events are persisted in Neo4j with sequence numbers for replay
 //! - Inactive sessions are persisted in Neo4j with `cli_session_id` for resume
 //! - A cleanup task periodically closes timed-out sessions
 
@@ -29,7 +30,7 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Broadcast channel buffer size for SSE subscribers
+/// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
 
 /// An active chat session with a live Claude CLI subprocess
@@ -512,7 +513,7 @@ impl ChatManager {
 
         Ok(CreateSessionResponse {
             session_id: session_id.to_string(),
-            stream_url: format!("/api/chat/{}/stream", session_id),
+            stream_url: format!("/ws/chat/{}", session_id),
         })
     }
 
@@ -540,8 +541,7 @@ impl ChatManager {
             mm.record_user_message(&prompt);
         }
 
-        // No more waiting for SSE subscribers — events are persisted in Neo4j,
-        // the WebSocket replay handles late-joining clients.
+        // Events are persisted in Neo4j — the WebSocket replay handles late-joining clients.
 
         // Use send_and_receive_stream() for real-time token streaming.
         // The stream's lifetime is tied to the MutexGuard, so we hold the client lock
@@ -1046,7 +1046,7 @@ impl ChatManager {
             .context("Failed to load conversation messages")
     }
 
-    /// Subscribe to a session's events (for SSE streaming)
+    /// Subscribe to a session's broadcast channel (used by WebSocket handler)
     pub async fn subscribe(&self, session_id: &str) -> Result<broadcast::Receiver<ChatEvent>> {
         let sessions = self.active_sessions.read().await;
         let session = sessions
