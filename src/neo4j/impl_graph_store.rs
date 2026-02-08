@@ -529,6 +529,13 @@ impl GraphStore for Neo4jClient {
         self.get_language_stats().await
     }
 
+    async fn get_language_stats_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<LanguageStatsNode>> {
+        self.get_language_stats_for_project(project_id).await
+    }
+
     async fn get_most_connected_files(&self, limit: usize) -> anyhow::Result<Vec<String>> {
         self.get_most_connected_files(limit).await
     }
@@ -538,6 +545,15 @@ impl GraphStore for Neo4jClient {
         limit: usize,
     ) -> anyhow::Result<Vec<ConnectedFileNode>> {
         self.get_most_connected_files_detailed(limit).await
+    }
+
+    async fn get_most_connected_files_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConnectedFileNode>> {
+        self.get_most_connected_files_for_project(project_id, limit)
+            .await
     }
 
     async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {

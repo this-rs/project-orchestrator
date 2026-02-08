@@ -3069,6 +3069,38 @@ impl Neo4jClient {
         Ok(stats)
     }
 
+    /// Get language stats for a specific project
+    pub async fn get_language_stats_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<LanguageStatsNode>> {
+        let q = query(
+            r#"
+            MATCH (f:File)
+            WHERE f.project_id = $project_id
+            RETURN f.language AS language, count(f) AS count
+            ORDER BY count DESC
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut stats = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(language), Ok(count)) =
+                (row.get::<String>("language"), row.get::<i64>("count"))
+            {
+                stats.push(LanguageStatsNode {
+                    language,
+                    file_count: count as usize,
+                });
+            }
+        }
+
+        Ok(stats)
+    }
+
     /// Get most connected files (highest in-degree from imports)
     pub async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>> {
         let q = query(
@@ -3109,6 +3141,43 @@ impl Neo4jClient {
             LIMIT $limit
             "#,
         )
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut files = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(path) = row.get::<String>("path") {
+                files.push(ConnectedFileNode {
+                    path,
+                    imports: row.get("imports").unwrap_or(0),
+                    dependents: row.get("dependents").unwrap_or(0),
+                });
+            }
+        }
+
+        Ok(files)
+    }
+
+    /// Get most connected files with import/dependent counts for a specific project
+    pub async fn get_most_connected_files_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>> {
+        let q = query(
+            r#"
+            MATCH (f:File)
+            WHERE f.project_id = $project_id
+            OPTIONAL MATCH (f)-[:IMPORTS]->(imported:File)
+            OPTIONAL MATCH (dependent:File)-[:IMPORTS]->(f)
+            WITH f, count(DISTINCT imported) AS imports, count(DISTINCT dependent) AS dependents
+            RETURN f.path AS path, imports, dependents, imports + dependents AS connections
+            ORDER BY connections DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("project_id", project_id.to_string())
         .param("limit", limit as i64);
 
         let mut result = self.graph.execute(q).await?;

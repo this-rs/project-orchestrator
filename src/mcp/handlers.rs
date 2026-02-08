@@ -1601,14 +1601,36 @@ impl ToolHandler {
         }))
     }
 
-    async fn get_architecture(&self, _args: Value) -> Result<Value> {
-        let lang_stats = self.neo4j().get_language_stats().await?;
+    async fn get_architecture(&self, args: Value) -> Result<Value> {
+        let project_slug = args.get("project_slug").and_then(|v| v.as_str());
+
+        let (lang_stats, connected) = if let Some(slug) = project_slug {
+            let project = self
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
+            let project_id = project.id;
+            let stats = self
+                .neo4j()
+                .get_language_stats_for_project(project_id)
+                .await?;
+            let files = self
+                .neo4j()
+                .get_most_connected_files_for_project(project_id, 10)
+                .await?;
+            (stats, files)
+        } else {
+            let stats = self.neo4j().get_language_stats().await?;
+            let files = self.neo4j().get_most_connected_files_detailed(10).await?;
+            (stats, files)
+        };
+
         let languages: Vec<Value> = lang_stats
             .into_iter()
             .map(|s| json!({"language": s.language, "file_count": s.file_count}))
             .collect();
 
-        let connected = self.neo4j().get_most_connected_files_detailed(10).await?;
         let key_files: Vec<Value> = connected
             .into_iter()
             .map(|f| json!({"path": f.path, "imports": f.imports, "dependents": f.dependents}))

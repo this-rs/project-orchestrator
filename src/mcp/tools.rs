@@ -961,7 +961,9 @@ fn code_tools() -> Vec<ToolDefinition> {
             description: "Get codebase architecture overview (most connected files)".to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
-                properties: Some(json!({})),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
+                })),
                 required: None,
             },
         },

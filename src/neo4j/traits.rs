@@ -395,12 +395,25 @@ pub trait GraphStore: Send + Sync {
     /// Get language statistics across all files
     async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>>;
 
+    /// Get language statistics for a specific project
+    async fn get_language_stats_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<LanguageStatsNode>>;
+
     /// Get most connected files (highest in-degree from imports)
     async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>>;
 
     /// Get most connected files with import/dependent counts
     async fn get_most_connected_files_detailed(
         &self,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>>;
+
+    /// Get most connected files with import/dependent counts for a specific project
+    async fn get_most_connected_files_for_project(
+        &self,
+        project_id: Uuid,
         limit: usize,
     ) -> Result<Vec<ConnectedFileNode>>;
 

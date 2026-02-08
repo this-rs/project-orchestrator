@@ -362,12 +362,15 @@ pub async fn fetch_project_context(
         .await
         .unwrap_or_default();
 
-    // 9. Language stats
-    ctx.language_stats = graph.get_language_stats().await.unwrap_or_default();
+    // 9. Language stats (scoped to project)
+    ctx.language_stats = graph
+        .get_language_stats_for_project(project_id)
+        .await
+        .unwrap_or_default();
 
-    // 10. Key files (most connected)
+    // 10. Key files (most connected, scoped to project)
     ctx.key_files = graph
-        .get_most_connected_files_detailed(5)
+        .get_most_connected_files_for_project(project_id, 5)
         .await
         .unwrap_or_default();
 
