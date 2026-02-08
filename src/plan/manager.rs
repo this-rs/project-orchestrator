@@ -1,7 +1,7 @@
 //! Plan management operations
 
 use super::models::*;
-use crate::events::{CrudAction, CrudEvent, EntityType, EventBus};
+use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::meilisearch::indexes::DecisionDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
@@ -14,7 +14,7 @@ use uuid::Uuid;
 pub struct PlanManager {
     neo4j: Arc<dyn GraphStore>,
     meili: Arc<dyn SearchStore>,
-    event_bus: Option<Arc<EventBus>>,
+    event_emitter: Option<Arc<dyn EventEmitter>>,
 }
 
 impl PlanManager {
@@ -23,27 +23,27 @@ impl PlanManager {
         Self {
             neo4j,
             meili,
-            event_bus: None,
+            event_emitter: None,
         }
     }
 
-    /// Create a new plan manager with an event bus
-    pub fn with_event_bus(
+    /// Create a new plan manager with an event emitter
+    pub fn with_event_emitter(
         neo4j: Arc<dyn GraphStore>,
         meili: Arc<dyn SearchStore>,
-        event_bus: Arc<EventBus>,
+        emitter: Arc<dyn EventEmitter>,
     ) -> Self {
         Self {
             neo4j,
             meili,
-            event_bus: Some(event_bus),
+            event_emitter: Some(emitter),
         }
     }
 
-    /// Emit a CRUD event (no-op if event_bus is None)
+    /// Emit a CRUD event (no-op if event_emitter is None)
     fn emit(&self, event: CrudEvent) {
-        if let Some(bus) = &self.event_bus {
-            bus.emit(event);
+        if let Some(emitter) = &self.event_emitter {
+            emitter.emit(event);
         }
     }
 

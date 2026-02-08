@@ -4,7 +4,7 @@
 //! including linking notes to entities and managing note lifecycle.
 
 use super::models::*;
-use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventBus};
+use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter};
 use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::GraphStore;
@@ -16,7 +16,7 @@ use uuid::Uuid;
 pub struct NoteManager {
     neo4j: Arc<dyn GraphStore>,
     meilisearch: Arc<dyn SearchStore>,
-    event_bus: Option<Arc<EventBus>>,
+    event_emitter: Option<Arc<dyn EventEmitter>>,
 }
 
 impl NoteManager {
@@ -25,27 +25,27 @@ impl NoteManager {
         Self {
             neo4j,
             meilisearch,
-            event_bus: None,
+            event_emitter: None,
         }
     }
 
-    /// Create a new NoteManager with an event bus
-    pub fn with_event_bus(
+    /// Create a new NoteManager with an event emitter
+    pub fn with_event_emitter(
         neo4j: Arc<dyn GraphStore>,
         meilisearch: Arc<dyn SearchStore>,
-        event_bus: Arc<EventBus>,
+        emitter: Arc<dyn EventEmitter>,
     ) -> Self {
         Self {
             neo4j,
             meilisearch,
-            event_bus: Some(event_bus),
+            event_emitter: Some(emitter),
         }
     }
 
-    /// Emit a CRUD event (no-op if event_bus is None)
+    /// Emit a CRUD event (no-op if event_emitter is None)
     fn emit(&self, event: crate::events::CrudEvent) {
-        if let Some(bus) = &self.event_bus {
-            bus.emit(event);
+        if let Some(emitter) = &self.event_emitter {
+            emitter.emit(event);
         }
     }
 

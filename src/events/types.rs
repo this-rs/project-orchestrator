@@ -65,6 +65,91 @@ pub struct CrudEvent {
     pub project_id: Option<String>,
 }
 
+/// Trait for emitting CRUD events.
+///
+/// Implemented by both `EventBus` (in-process broadcast) and `EventNotifier` (HTTP bridge).
+/// Consumers (PlanManager, NoteManager, Orchestrator) hold `Option<Arc<dyn EventEmitter>>`
+/// so the same code works for both the HTTP server and the MCP server.
+pub trait EventEmitter: Send + Sync {
+    /// Emit a CrudEvent (fire-and-forget)
+    fn emit(&self, event: CrudEvent);
+
+    /// Emit a Created event
+    fn emit_created(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        payload: serde_json::Value,
+        project_id: Option<String>,
+    ) {
+        let mut event =
+            CrudEvent::new(entity_type, CrudAction::Created, entity_id).with_payload(payload);
+        if let Some(pid) = project_id {
+            event = event.with_project_id(pid);
+        }
+        self.emit(event);
+    }
+
+    /// Emit an Updated event
+    fn emit_updated(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        payload: serde_json::Value,
+        project_id: Option<String>,
+    ) {
+        let mut event =
+            CrudEvent::new(entity_type, CrudAction::Updated, entity_id).with_payload(payload);
+        if let Some(pid) = project_id {
+            event = event.with_project_id(pid);
+        }
+        self.emit(event);
+    }
+
+    /// Emit a Deleted event
+    fn emit_deleted(&self, entity_type: EntityType, entity_id: &str, project_id: Option<String>) {
+        let mut event = CrudEvent::new(entity_type, CrudAction::Deleted, entity_id);
+        if let Some(pid) = project_id {
+            event = event.with_project_id(pid);
+        }
+        self.emit(event);
+    }
+
+    /// Emit a Linked event
+    fn emit_linked(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        related_type: EntityType,
+        related_id: &str,
+        project_id: Option<String>,
+    ) {
+        let mut event = CrudEvent::new(entity_type, CrudAction::Linked, entity_id)
+            .with_related(related_type, related_id);
+        if let Some(pid) = project_id {
+            event = event.with_project_id(pid);
+        }
+        self.emit(event);
+    }
+
+    /// Emit an Unlinked event
+    fn emit_unlinked(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        related_type: EntityType,
+        related_id: &str,
+        project_id: Option<String>,
+    ) {
+        let mut event = CrudEvent::new(entity_type, CrudAction::Unlinked, entity_id)
+            .with_related(related_type, related_id);
+        if let Some(pid) = project_id {
+            event = event.with_project_id(pid);
+        }
+        self.emit(event);
+    }
+}
+
 impl CrudEvent {
     /// Create a new CrudEvent with the current timestamp
     pub fn new(entity_type: EntityType, action: CrudAction, entity_id: impl Into<String>) -> Self {
@@ -227,5 +312,129 @@ mod tests {
             EntityType::Note,
         ];
         assert_eq!(all.len(), 14);
+    }
+
+    // ================================================================
+    // EventEmitter trait tests
+    // ================================================================
+
+    use std::sync::{Arc, Mutex};
+
+    /// A test-only EventEmitter that captures emitted events
+    struct RecordingEmitter {
+        events: Mutex<Vec<CrudEvent>>,
+    }
+
+    impl RecordingEmitter {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_events(&self) -> Vec<CrudEvent> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    impl EventEmitter for RecordingEmitter {
+        fn emit(&self, event: CrudEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[test]
+    fn test_emit_created_default_method() {
+        let emitter = RecordingEmitter::new();
+        emitter.emit_created(
+            EntityType::Plan,
+            "plan-1",
+            serde_json::json!({"title": "My Plan"}),
+            Some("proj-1".into()),
+        );
+
+        let events = emitter.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_type, EntityType::Plan);
+        assert_eq!(events[0].action, CrudAction::Created);
+        assert_eq!(events[0].entity_id, "plan-1");
+        assert_eq!(events[0].payload["title"], "My Plan");
+        assert_eq!(events[0].project_id.as_deref(), Some("proj-1"));
+    }
+
+    #[test]
+    fn test_emit_updated_default_method() {
+        let emitter = RecordingEmitter::new();
+        emitter.emit_updated(
+            EntityType::Task,
+            "task-1",
+            serde_json::json!({"status": "completed"}),
+            None,
+        );
+
+        let events = emitter.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, CrudAction::Updated);
+        assert_eq!(events[0].entity_id, "task-1");
+        assert!(events[0].project_id.is_none());
+    }
+
+    #[test]
+    fn test_emit_deleted_default_method() {
+        let emitter = RecordingEmitter::new();
+        emitter.emit_deleted(EntityType::Note, "note-1", Some("proj-2".into()));
+
+        let events = emitter.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, CrudAction::Deleted);
+        assert_eq!(events[0].entity_id, "note-1");
+        assert_eq!(events[0].project_id.as_deref(), Some("proj-2"));
+    }
+
+    #[test]
+    fn test_emit_linked_default_method() {
+        let emitter = RecordingEmitter::new();
+        emitter.emit_linked(
+            EntityType::Task,
+            "task-1",
+            EntityType::Release,
+            "release-1",
+            None,
+        );
+
+        let events = emitter.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, CrudAction::Linked);
+        let related = events[0].related.as_ref().unwrap();
+        assert_eq!(related.entity_type, EntityType::Release);
+        assert_eq!(related.entity_id, "release-1");
+    }
+
+    #[test]
+    fn test_emit_unlinked_default_method() {
+        let emitter = RecordingEmitter::new();
+        emitter.emit_unlinked(
+            EntityType::Note,
+            "note-1",
+            EntityType::Task,
+            "task-2",
+            Some("proj-1".into()),
+        );
+
+        let events = emitter.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, CrudAction::Unlinked);
+        assert_eq!(events[0].project_id.as_deref(), Some("proj-1"));
+        let related = events[0].related.as_ref().unwrap();
+        assert_eq!(related.entity_type, EntityType::Task);
+        assert_eq!(related.entity_id, "task-2");
+    }
+
+    #[test]
+    fn test_event_emitter_as_dyn_trait_object() {
+        // Verify the trait is dyn-compatible
+        let emitter: Arc<dyn EventEmitter> = Arc::new(RecordingEmitter::new());
+        emitter.emit_created(EntityType::Workspace, "ws-1", serde_json::Value::Null, None);
+        // If this compiles and runs, the trait is dyn-compatible
     }
 }

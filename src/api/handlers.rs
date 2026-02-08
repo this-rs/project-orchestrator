@@ -4,7 +4,7 @@ use crate::api::{
     PaginatedResponse, PaginationParams, PriorityFilter, SearchFilter, StatusFilter, TagsFilter,
 };
 use crate::chat::ChatManager;
-use crate::events::EventBus;
+use crate::events::{EventBus, EventEmitter};
 use crate::neo4j::models::{
     CommitNode, ConstraintNode, DecisionNode, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus,
     ReleaseNode, ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
@@ -511,6 +511,25 @@ pub async fn wake(
         .await?;
 
     Ok(Json(WakeResponse { acknowledged: true }))
+}
+
+// ============================================================================
+// Internal Events (MCP → HTTP bridge)
+// ============================================================================
+
+/// POST /internal/events — Receive a CrudEvent from the MCP server and broadcast it
+pub async fn receive_event(
+    State(state): State<OrchestratorState>,
+    Json(event): Json<crate::events::CrudEvent>,
+) -> Result<StatusCode, AppError> {
+    tracing::debug!(
+        entity_type = ?event.entity_type,
+        action = ?event.action,
+        entity_id = %event.entity_id,
+        "Received internal event from MCP"
+    );
+    state.event_bus.emit(event);
+    Ok(StatusCode::OK)
 }
 
 // ============================================================================
