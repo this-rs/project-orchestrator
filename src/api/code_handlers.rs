@@ -26,20 +26,14 @@ pub struct CodeSearchQuery {
     pub language: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct CodeSearchResult {
-    pub path: String,
-    pub language: String,
-    pub snippet: String,
-    pub symbols: Vec<String>,
-    pub score: f64,
-}
-
 /// Search code semantically across the codebase
+///
+/// Returns `SearchHit<CodeDocument>` directly so the frontend gets
+/// the `{ document, score }` shape it expects.
 pub async fn search_code(
     State(state): State<OrchestratorState>,
     Query(params): Query<CodeSearchQuery>,
-) -> Result<Json<Vec<CodeSearchResult>>, AppError> {
+) -> Result<Json<Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>>, AppError> {
     let hits = state
         .orchestrator
         .meili()
@@ -51,18 +45,7 @@ pub async fn search_code(
         )
         .await?;
 
-    let results: Vec<CodeSearchResult> = hits
-        .into_iter()
-        .map(|hit| CodeSearchResult {
-            path: hit.document.path,
-            language: hit.document.language,
-            snippet: hit.document.docstrings.chars().take(500).collect(),
-            symbols: hit.document.symbols,
-            score: hit.score,
-        })
-        .collect();
-
-    Ok(Json(results))
+    Ok(Json(hits))
 }
 
 // ============================================================================
