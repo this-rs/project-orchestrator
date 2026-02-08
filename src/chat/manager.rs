@@ -53,6 +53,8 @@ pub struct ActiveSession {
     pub pending_messages: Arc<Mutex<VecDeque<String>>>,
     /// Whether a stream is currently in progress
     pub is_streaming: Arc<AtomicBool>,
+    /// Accumulated text from stream_delta during the current stream (for mid-stream join)
+    pub streaming_text: Arc<Mutex<String>>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -443,6 +445,7 @@ impl ChatManager {
         let next_seq = Arc::new(AtomicI64::new(1));
         let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
         let is_streaming = Arc::new(AtomicBool::new(false));
+        let streaming_text = Arc::new(Mutex::new(String::new()));
 
         // Register active session
         let interrupt_flag = {
@@ -460,6 +463,7 @@ impl ChatManager {
                     next_seq: next_seq.clone(),
                     pending_messages: pending_messages.clone(),
                     is_streaming: is_streaming.clone(),
+                    streaming_text: streaming_text.clone(),
                 },
             );
             interrupt_flag
@@ -507,6 +511,7 @@ impl ChatManager {
                 next_seq,
                 pending_messages,
                 is_streaming,
+                streaming_text,
             )
             .await;
         });
@@ -532,8 +537,11 @@ impl ChatManager {
         next_seq: Arc<AtomicI64>,
         pending_messages: Arc<Mutex<VecDeque<String>>>,
         is_streaming: Arc<AtomicBool>,
+        streaming_text: Arc<Mutex<String>>,
     ) {
         is_streaming.store(true, Ordering::SeqCst);
+        // Clear streaming_text buffer for the new stream
+        streaming_text.lock().await.clear();
 
         // Record user message in memory manager
         if let Some(ref mm) = memory_manager {
@@ -564,6 +572,7 @@ impl ChatManager {
                         message: format!("Error: {}", e),
                     });
                     is_streaming.store(false, Ordering::SeqCst);
+                    streaming_text.lock().await.clear();
                     return;
                 }
             };
@@ -591,6 +600,8 @@ impl ChatManager {
                         ..
                     } = msg
                     {
+                        // Accumulate for mid-stream join snapshot
+                        streaming_text.lock().await.push_str(text);
                         let _ = events_tx.send(ChatEvent::StreamDelta { text: text.clone() });
                         continue;
                     }
@@ -715,6 +726,7 @@ impl ChatManager {
         }
 
         is_streaming.store(false, Ordering::SeqCst);
+        streaming_text.lock().await.clear();
         debug!("Stream completed for session {}", session_id);
 
         // Check pending_messages queue — if there are queued messages, process the next one
@@ -763,6 +775,7 @@ impl ChatManager {
                 next_seq,
                 pending_messages,
                 is_streaming,
+                streaming_text,
             ))
             .await;
         }
@@ -771,7 +784,7 @@ impl ChatManager {
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
         // Get session state — NO broadcast replacement, the same channel is reused
-        let (client, events_tx, interrupt_flag, memory_manager, next_seq, pending_messages, is_streaming) = {
+        let (client, events_tx, interrupt_flag, memory_manager, next_seq, pending_messages, is_streaming, streaming_text) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
@@ -789,6 +802,7 @@ impl ChatManager {
                 session.next_seq.clone(),
                 session.pending_messages.clone(),
                 session.is_streaming.clone(),
+                session.streaming_text.clone(),
             )
         };
 
@@ -856,6 +870,7 @@ impl ChatManager {
                 next_seq,
                 pending_messages,
                 is_streaming,
+                streaming_text,
             )
             .await;
         });
@@ -945,6 +960,7 @@ impl ChatManager {
         let next_seq = Arc::new(AtomicI64::new(latest_seq + 1));
         let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
         let is_streaming = Arc::new(AtomicBool::new(false));
+        let streaming_text = Arc::new(Mutex::new(String::new()));
 
         // Register as active
         let interrupt_flag = {
@@ -962,6 +978,7 @@ impl ChatManager {
                     next_seq: next_seq.clone(),
                     pending_messages: pending_messages.clone(),
                     is_streaming: is_streaming.clone(),
+                    streaming_text: streaming_text.clone(),
                 },
             );
             interrupt_flag
@@ -1008,6 +1025,7 @@ impl ChatManager {
                 next_seq,
                 pending_messages,
                 is_streaming,
+                streaming_text,
             )
             .await;
         });
@@ -1074,6 +1092,23 @@ impl ChatManager {
             .get(session_id)
             .map(|s| s.is_streaming.load(Ordering::SeqCst))
             .unwrap_or(false)
+    }
+
+    /// Get a snapshot of the current streaming state for mid-stream join.
+    ///
+    /// Returns `(is_streaming, accumulated_text)`. The accumulated text contains all
+    /// stream_delta text received since the current stream started. This allows a
+    /// newly connected WebSocket client to reconstruct the partial assistant message.
+    pub async fn get_streaming_snapshot(&self, session_id: &str) -> (bool, String) {
+        let sessions = self.active_sessions.read().await;
+        match sessions.get(session_id) {
+            Some(session) => {
+                let is_streaming = session.is_streaming.load(Ordering::SeqCst);
+                let text = session.streaming_text.lock().await.clone();
+                (is_streaming, text)
+            }
+            None => (false, String::new()),
+        }
     }
 
     /// Interrupt the current operation in a session.

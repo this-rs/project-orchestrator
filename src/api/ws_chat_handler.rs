@@ -197,6 +197,49 @@ async fn handle_ws_chat(
         }
     }
 
+    // ========================================================================
+    // Phase 1.5: Send streaming snapshot if a stream is in progress
+    // ========================================================================
+    let (is_currently_streaming, partial_text) =
+        chat_manager.get_streaming_snapshot(&session_id).await;
+
+    if is_currently_streaming && !partial_text.is_empty() {
+        debug!(
+            session_id = %session_id,
+            text_len = partial_text.len(),
+            "Sending partial_text snapshot for mid-stream join"
+        );
+        let partial_msg = serde_json::json!({
+            "type": "partial_text",
+            "content": partial_text,
+            "seq": 0,
+            "replaying": true,
+        });
+        if ws_sender
+            .send(Message::Text(partial_msg.to_string().into()))
+            .await
+            .is_err()
+        {
+            debug!("Client disconnected during partial_text");
+            return;
+        }
+    }
+
+    if is_currently_streaming {
+        let status_msg = serde_json::json!({
+            "type": "streaming_status",
+            "is_streaming": true,
+        });
+        if ws_sender
+            .send(Message::Text(status_msg.to_string().into()))
+            .await
+            .is_err()
+        {
+            debug!("Client disconnected during streaming_status");
+            return;
+        }
+    }
+
     // Send replay_complete marker
     let replay_complete = serde_json::json!({ "type": "replay_complete" });
     if ws_sender
