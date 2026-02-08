@@ -127,6 +127,9 @@ pub struct ChatSession {
     /// Total cost in USD
     #[serde(default)]
     pub total_cost_usd: Option<f64>,
+    /// Nexus conversation ID (for message history)
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 /// Response when creating a session
@@ -378,6 +381,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             message_count: 5,
             total_cost_usd: Some(0.15),
+            conversation_id: Some("conv-abc-123".into()),
         };
 
         let json = serde_json::to_string(&session).unwrap();

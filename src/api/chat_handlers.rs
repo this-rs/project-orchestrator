@@ -135,6 +135,74 @@ pub async fn interrupt_session(
 }
 
 // ============================================================================
+// Message history
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct MessagesQuery {
+    #[serde(default = "default_messages_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_messages_limit() -> usize {
+    50
+}
+
+/// GET /api/chat/sessions/{id}/messages — Get message history
+pub async fn list_messages(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    Query(query): Query<MessagesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    let loaded = chat_manager
+        .get_session_messages(
+            &session_id.to_string(),
+            Some(query.limit),
+            Some(query.offset),
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("no conversation_id") {
+                AppError::NotFound(msg)
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
+
+    // Convert to chronological order for UI display
+    let messages: Vec<serde_json::Value> = loaded
+        .messages_chronological()
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "conversation_id": m.conversation_id,
+                "role": m.role,
+                "content": m.content,
+                "turn_index": m.turn_index,
+                "created_at": m.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "messages": messages,
+        "total_count": loaded.total_count,
+        "has_more": loaded.has_more,
+        "offset": loaded.offset,
+        "limit": loaded.limit,
+    })))
+}
+
+// ============================================================================
 // Session CRUD
 // ============================================================================
 
@@ -178,6 +246,7 @@ pub async fn list_sessions(
             updated_at: s.updated_at.to_rfc3339(),
             message_count: s.message_count,
             total_cost_usd: s.total_cost_usd,
+            conversation_id: s.conversation_id,
         })
         .collect();
 
@@ -213,6 +282,7 @@ pub async fn get_session(
         updated_at: node.updated_at.to_rfc3339(),
         message_count: node.message_count,
         total_cost_usd: node.total_cost_usd,
+        conversation_id: node.conversation_id,
     }))
 }
 

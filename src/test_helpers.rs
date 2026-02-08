@@ -224,6 +224,7 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         updated_at: chrono::Utc::now(),
         message_count: 0,
         total_cost_usd: None,
+        conversation_id: None,
     }
 }
 

@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
         orchestrator.neo4j_arc(),
         orchestrator.meili_arc(),
         chat_config,
-    ));
+    ).await);
     chat_manager.start_cleanup_task();
     info!("Chat manager initialized");
 

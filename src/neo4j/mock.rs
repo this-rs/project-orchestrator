@@ -3252,6 +3252,7 @@ impl GraphStore for MockGraphStore {
         title: Option<String>,
         message_count: Option<i64>,
         total_cost_usd: Option<f64>,
+        conversation_id: Option<String>,
     ) -> Result<Option<ChatSessionNode>> {
         let mut sessions = self.chat_sessions.write().await;
         if let Some(session) = sessions.get_mut(&id) {
@@ -3267,6 +3268,9 @@ impl GraphStore for MockGraphStore {
             }
             if let Some(v) = total_cost_usd {
                 session.total_cost_usd = Some(v);
+            }
+            if let Some(v) = conversation_id {
+                session.conversation_id = Some(v);
             }
             Ok(Some(session.clone()))
         } else {

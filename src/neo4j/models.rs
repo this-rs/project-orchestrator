@@ -67,6 +67,9 @@ pub struct ChatSessionNode {
     /// Total cost in USD
     #[serde(default)]
     pub total_cost_usd: Option<f64>,
+    /// Nexus conversation ID (for message history retrieval)
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 // ============================================================================

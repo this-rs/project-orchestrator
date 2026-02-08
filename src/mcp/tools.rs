@@ -1863,11 +1863,24 @@ fn workspace_tools() -> Vec<ToolDefinition> {
 }
 
 // ============================================================================
-// Chat Tools (4)
+// Chat Tools (5)
 // ============================================================================
 
 fn chat_tools() -> Vec<ToolDefinition> {
     vec![
+        ToolDefinition {
+            name: "list_chat_messages".to_string(),
+            description: "List message history for a chat session (chronological order)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "session_id": {"type": "string", "description": "Session UUID"},
+                    "limit": {"type": "integer", "description": "Max messages to retrieve (default 50)"},
+                    "offset": {"type": "integer", "description": "Messages to skip for pagination (default 0)"}
+                })),
+                required: Some(vec!["session_id".to_string()]),
+            },
+        },
         ToolDefinition {
             name: "list_chat_sessions".to_string(),
             description: "List chat sessions with optional project filter and pagination".to_string(),
@@ -1928,7 +1941,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 135, "Expected 135 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 136, "Expected 136 tools, got {}", tools.len());
     }
 
     #[test]

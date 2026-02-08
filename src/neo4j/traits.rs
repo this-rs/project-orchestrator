@@ -923,6 +923,7 @@ pub trait GraphStore: Send + Sync {
         title: Option<String>,
         message_count: Option<i64>,
         total_cost_usd: Option<f64>,
+        conversation_id: Option<String>,
     ) -> Result<Option<ChatSessionNode>>;
 
     /// Delete a chat session

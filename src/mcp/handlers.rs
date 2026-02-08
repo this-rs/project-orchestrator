@@ -216,6 +216,7 @@ impl ToolHandler {
             "get_chat_session" => self.get_chat_session(args).await,
             "delete_chat_session" => self.delete_chat_session(args).await,
             "chat_send_message" => self.chat_send_message(args).await,
+            "list_chat_messages" => self.list_chat_messages(args).await,
 
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
@@ -3271,6 +3272,44 @@ impl ToolHandler {
             "response": text_parts.join(""),
             "duration_ms": duration_ms,
             "cost_usd": cost_usd
+        }))
+    }
+
+    async fn list_chat_messages(&self, args: Value) -> Result<Value> {
+        let cm = self
+            .chat_manager
+            .as_ref()
+            .ok_or_else(|| anyhow!("Chat manager not initialized"))?;
+
+        let session_id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("session_id is required"))?;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+
+        let loaded = cm.get_session_messages(session_id, limit, offset).await?;
+
+        let messages: Vec<serde_json::Value> = loaded
+            .messages_chronological()
+            .iter()
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "role": m.role,
+                    "content": m.content,
+                    "turn_index": m.turn_index,
+                    "created_at": m.created_at,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "messages": messages,
+            "total_count": loaded.total_count,
+            "has_more": loaded.has_more,
+            "offset": loaded.offset,
+            "limit": loaded.limit,
         }))
     }
 }

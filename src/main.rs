@@ -95,7 +95,7 @@ async fn run_server(config: Config) -> Result<()> {
             orchestrator.neo4j_arc(),
             orchestrator.meili_arc(),
             chat_config,
-        ));
+        ).await);
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");
         Some(cm)

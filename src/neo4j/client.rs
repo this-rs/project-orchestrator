@@ -6861,7 +6861,8 @@ impl Neo4jClient {
                     created_at: datetime($created_at),
                     updated_at: datetime($updated_at),
                     message_count: $message_count,
-                    total_cost_usd: $total_cost_usd
+                    total_cost_usd: $total_cost_usd,
+                    conversation_id: $conversation_id
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -6883,7 +6884,8 @@ impl Neo4jClient {
                     created_at: datetime($created_at),
                     updated_at: datetime($updated_at),
                     message_count: $message_count,
-                    total_cost_usd: $total_cost_usd
+                    total_cost_usd: $total_cost_usd,
+                    conversation_id: $conversation_id
                 })
                 "#,
             )
@@ -6906,7 +6908,11 @@ impl Neo4jClient {
                     .param("created_at", session.created_at.to_rfc3339())
                     .param("updated_at", session.updated_at.to_rfc3339())
                     .param("message_count", session.message_count)
-                    .param("total_cost_usd", session.total_cost_usd.unwrap_or(0.0)),
+                    .param("total_cost_usd", session.total_cost_usd.unwrap_or(0.0))
+                    .param(
+                        "conversation_id",
+                        session.conversation_id.clone().unwrap_or_default(),
+                    ),
             )
             .await?;
         Ok(())
@@ -6987,6 +6993,7 @@ impl Neo4jClient {
         title: Option<String>,
         message_count: Option<i64>,
         total_cost_usd: Option<f64>,
+        conversation_id: Option<String>,
     ) -> Result<Option<ChatSessionNode>> {
         let mut set_clauses = vec!["s.updated_at = datetime()".to_string()];
 
@@ -7001,6 +7008,12 @@ impl Neo4jClient {
         }
         if let Some(v) = total_cost_usd {
             set_clauses.push(format!("s.total_cost_usd = {}", v));
+        }
+        if let Some(ref v) = conversation_id {
+            set_clauses.push(format!(
+                "s.conversation_id = '{}'",
+                v.replace('\'', "\\'")
+            ));
         }
 
         let cypher = format!(
@@ -7042,6 +7055,7 @@ impl Neo4jClient {
         let cli_session_id: String = node.get("cli_session_id").unwrap_or_default();
         let project_slug: String = node.get("project_slug").unwrap_or_default();
         let title: String = node.get("title").unwrap_or_default();
+        let conversation_id: String = node.get("conversation_id").unwrap_or_default();
 
         Ok(ChatSessionNode {
             id: node.get::<String>("id")?.parse()?,
@@ -7074,6 +7088,11 @@ impl Neo4jClient {
                 } else {
                     Some(v)
                 }
+            },
+            conversation_id: if conversation_id.is_empty() {
+                None
+            } else {
+                Some(conversation_id)
             },
         })
     }
