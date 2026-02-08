@@ -481,7 +481,10 @@ async fn test_code_search() {
 
     // Search for code (may return empty if nothing synced)
     let resp = client
-        .get(format!("{}/api/code/search?q=function&limit=5", BASE_URL))
+        .get(format!(
+            "{}/api/code/search?query=function&limit=5",
+            BASE_URL
+        ))
         .send()
         .await
         .unwrap();
@@ -512,7 +515,7 @@ async fn test_code_architecture() {
     let arch: Value = resp.json().await.unwrap();
     assert!(arch["total_files"].is_number());
     assert!(arch["languages"].is_array());
-    assert!(arch["most_connected"].is_array());
+    assert!(arch["key_files"].is_array());
 }
 
 #[tokio::test]
