@@ -257,6 +257,7 @@ use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteTy
 
 /// Contextual data fetched from Neo4j for the current project.
 /// Used to build the dynamic section of the system prompt.
+#[derive(Default)]
 pub struct ProjectContext {
     pub project: Option<ProjectNode>,
     pub workspace: Option<WorkspaceNode>,
@@ -269,24 +270,6 @@ pub struct ProjectContext {
     pub language_stats: Vec<LanguageStatsNode>,
     pub key_files: Vec<ConnectedFileNode>,
     pub last_synced: Option<DateTime<Utc>>,
-}
-
-impl Default for ProjectContext {
-    fn default() -> Self {
-        Self {
-            project: None,
-            workspace: None,
-            active_plans: Vec::new(),
-            plan_constraints: Vec::new(),
-            guidelines: Vec::new(),
-            gotchas: Vec::new(),
-            milestones: Vec::new(),
-            releases: Vec::new(),
-            language_stats: Vec::new(),
-            key_files: Vec::new(),
-            last_synced: None,
-        }
-    }
 }
 
 // ============================================================================
@@ -584,7 +567,7 @@ pub fn context_to_markdown(ctx: &ProjectContext) -> String {
     if !ctx.guidelines.is_empty() {
         md.push_str("## Guidelines\n");
         for g in &ctx.guidelines {
-            md.push_str(&format!("- [{}] {}\n", format!("{:?}", g.importance), g.content));
+            md.push_str(&format!("- [{:?}] {}\n", g.importance, g.content));
         }
         md.push('\n');
     }

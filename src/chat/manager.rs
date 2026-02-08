@@ -142,7 +142,10 @@ impl ChatManager {
         let ctx = match fetch_project_context(&self.graph, slug).await {
             Ok(ctx) => ctx,
             Err(e) => {
-                warn!("Failed to fetch project context for '{}': {} — using base prompt only", slug, e);
+                warn!(
+                    "Failed to fetch project context for '{}': {} — using base prompt only",
+                    slug, e
+                );
                 return BASE_SYSTEM_PROMPT.to_string();
             }
         };
@@ -155,7 +158,10 @@ impl ChatManager {
         {
             Ok(refined) => refined,
             Err(e) => {
-                warn!("Oneshot context refinement failed: {} — using markdown fallback", e);
+                warn!(
+                    "Oneshot context refinement failed: {} — using markdown fallback",
+                    e
+                );
                 context_to_markdown(&ctx)
             }
         };
