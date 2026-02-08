@@ -540,6 +540,8 @@ impl ChatManager {
         streaming_text: Arc<Mutex<String>>,
     ) {
         is_streaming.store(true, Ordering::SeqCst);
+        // Broadcast streaming_status to all connected clients (multi-tab support)
+        let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: true });
         // Clear streaming_text buffer for the new stream
         streaming_text.lock().await.clear();
 
@@ -726,6 +728,8 @@ impl ChatManager {
         }
 
         is_streaming.store(false, Ordering::SeqCst);
+        // Broadcast streaming_status=false to all connected clients (multi-tab support)
+        let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: false });
         streaming_text.lock().await.clear();
         debug!("Stream completed for session {}", session_id);
 

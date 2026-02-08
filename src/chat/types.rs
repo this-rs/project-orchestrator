@@ -64,6 +64,8 @@ pub enum ChatEvent {
     },
     /// Streaming text delta (real-time token)
     StreamDelta { text: String },
+    /// Streaming status change (broadcast to all connected clients)
+    StreamingStatus { is_streaming: bool },
     /// An error occurred
     Error { message: String },
 }
@@ -81,6 +83,7 @@ impl ChatEvent {
             ChatEvent::InputRequest { .. } => "input_request",
             ChatEvent::Result { .. } => "result",
             ChatEvent::StreamDelta { .. } => "stream_delta",
+            ChatEvent::StreamingStatus { .. } => "streaming_status",
             ChatEvent::Error { .. } => "error",
         }
     }
