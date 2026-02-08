@@ -33,7 +33,10 @@ pub struct CodeSearchQuery {
 pub async fn search_code(
     State(state): State<OrchestratorState>,
     Query(params): Query<CodeSearchQuery>,
-) -> Result<Json<Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>>, AppError> {
+) -> Result<
+    Json<Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>>,
+    AppError,
+> {
     let hits = state
         .orchestrator
         .meili()
