@@ -637,4 +637,151 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // ====================================================================
+    // MessagesQuery serde
+    // ====================================================================
+
+    #[test]
+    fn test_messages_query_defaults() {
+        let json = r#"{}"#;
+        let query: MessagesQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit, 50);
+        assert_eq!(query.offset, 0);
+    }
+
+    #[test]
+    fn test_messages_query_custom() {
+        let json = r#"{"limit": 10, "offset": 5}"#;
+        let query: MessagesQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit, 10);
+        assert_eq!(query.offset, 5);
+    }
+
+    #[test]
+    fn test_default_messages_limit_value() {
+        assert_eq!(default_messages_limit(), 50);
+    }
+
+    // ====================================================================
+    // GET /api/chat/sessions/{id}/messages — no chat_manager
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_list_messages_no_chat_manager() {
+        let app = test_app().await;
+        let fake_id = Uuid::new_v4();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/chat/sessions/{}/messages", fake_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No chat_manager → 500 Internal Server Error
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_list_messages_invalid_session_id() {
+        let app = test_app().await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/chat/sessions/not-a-uuid/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Invalid UUID in path → 400 Bad Request
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/chat/sessions/{id} — conversation_id field
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_session_includes_conversation_id() {
+        let mut session = test_chat_session(Some("my-proj"));
+        session.conversation_id = Some("conv-test-123".into());
+        let session_id = session.id;
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/chat/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["conversation_id"], "conv-test-123");
+    }
+
+    #[tokio::test]
+    async fn test_get_session_conversation_id_null() {
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/chat/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["conversation_id"].is_null());
+    }
+
+    // ====================================================================
+    // GET /api/chat/sessions — list includes conversation_id
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_list_sessions_includes_conversation_id() {
+        let mut session = test_chat_session(Some("proj-a"));
+        session.conversation_id = Some("conv-xyz".into());
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/chat/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["items"][0]["conversation_id"], "conv-xyz");
+    }
 }

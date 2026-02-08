@@ -125,11 +125,14 @@ async fn main() -> Result<()> {
 
     // Create ChatManager
     let chat_config = ChatConfig::from_env();
-    let chat_manager = Arc::new(ChatManager::new(
-        orchestrator.neo4j_arc(),
-        orchestrator.meili_arc(),
-        chat_config,
-    ).await);
+    let chat_manager = Arc::new(
+        ChatManager::new(
+            orchestrator.neo4j_arc(),
+            orchestrator.meili_arc(),
+            chat_config,
+        )
+        .await,
+    );
     chat_manager.start_cleanup_task();
     info!("Chat manager initialized");
 

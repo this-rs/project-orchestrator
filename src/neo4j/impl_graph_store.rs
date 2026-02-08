@@ -1227,8 +1227,15 @@ impl GraphStore for Neo4jClient {
         total_cost_usd: Option<f64>,
         conversation_id: Option<String>,
     ) -> anyhow::Result<Option<ChatSessionNode>> {
-        self.update_chat_session(id, cli_session_id, title, message_count, total_cost_usd, conversation_id)
-            .await
+        self.update_chat_session(
+            id,
+            cli_session_id,
+            title,
+            message_count,
+            total_cost_usd,
+            conversation_id,
+        )
+        .await
     }
 
     async fn delete_chat_session(&self, id: Uuid) -> anyhow::Result<bool> {

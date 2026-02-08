@@ -7010,10 +7010,7 @@ impl Neo4jClient {
             set_clauses.push(format!("s.total_cost_usd = {}", v));
         }
         if let Some(ref v) = conversation_id {
-            set_clauses.push(format!(
-                "s.conversation_id = '{}'",
-                v.replace('\'', "\\'")
-            ));
+            set_clauses.push(format!("s.conversation_id = '{}'", v.replace('\'', "\\'")));
         }
 
         let cypher = format!(

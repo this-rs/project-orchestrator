@@ -561,10 +561,7 @@ impl ChatManager {
                     let pending = mm.take_pending_messages();
                     if !pending.is_empty() {
                         if let Err(e) = injector.store_messages(&pending).await {
-                            warn!(
-                                "Failed to store messages for session {}: {}",
-                                session_id, e
-                            );
+                            warn!("Failed to store messages for session {}: {}", session_id, e);
                         } else {
                             debug!(
                                 "Stored {} messages for session {}",
@@ -777,10 +774,9 @@ impl ChatManager {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<LoadedConversation> {
-        let injector = self
-            .context_injector
-            .as_ref()
-            .ok_or_else(|| anyhow!("Message history not available (ContextInjector not initialized)"))?;
+        let injector = self.context_injector.as_ref().ok_or_else(|| {
+            anyhow!("Message history not available (ContextInjector not initialized)")
+        })?;
 
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
@@ -1569,7 +1565,14 @@ mod tests {
 
         // Update only title
         let updated = graph
-            .update_chat_session(session.id, None, Some("Title only".into()), None, None, None)
+            .update_chat_session(
+                session.id,
+                None,
+                Some("Title only".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1624,5 +1627,176 @@ mod tests {
         assert_eq!(deserialized.cli_session_id, session.cli_session_id);
         assert_eq!(deserialized.message_count, 10);
         assert_eq!(deserialized.total_cost_usd, Some(1.50));
+    }
+
+    // ====================================================================
+    // new_without_memory — fields
+    // ====================================================================
+
+    #[test]
+    fn test_new_without_memory_has_no_injector() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        assert!(manager.context_injector.is_none());
+        assert!(manager.memory_config.is_none());
+    }
+
+    // ====================================================================
+    // get_session_messages — error paths
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_session_messages_no_injector() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager
+            .get_session_messages(&Uuid::new_v4().to_string(), None, None)
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ContextInjector not initialized"));
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_invalid_uuid() {
+        // Even with no injector, the error about injector comes first
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager.get_session_messages("not-a-uuid", None, None).await;
+        assert!(result.is_err());
+        // Without injector, the "ContextInjector not initialized" error comes first
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ContextInjector not initialized"));
+    }
+
+    // ====================================================================
+    // conversation_id in mock GraphStore CRUD
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_chat_session_update_conversation_id() {
+        let state = mock_app_state();
+        let graph = &state.neo4j;
+
+        let session = test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        assert!(session.conversation_id.is_none());
+
+        // Update conversation_id
+        let updated = graph
+            .update_chat_session(
+                session.id,
+                None,
+                None,
+                None,
+                None,
+                Some("conv-new-123".into()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.conversation_id.as_deref(), Some("conv-new-123"));
+
+        // Fetch and verify persisted
+        let fetched = graph.get_chat_session(session.id).await.unwrap().unwrap();
+        assert_eq!(fetched.conversation_id.as_deref(), Some("conv-new-123"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_create_with_conversation_id() {
+        let state = mock_app_state();
+        let graph = &state.neo4j;
+
+        let mut session = test_chat_session(Some("proj"));
+        session.conversation_id = Some("conv-init-456".into());
+        graph.create_chat_session(&session).await.unwrap();
+
+        let fetched = graph.get_chat_session(session.id).await.unwrap().unwrap();
+        assert_eq!(fetched.conversation_id.as_deref(), Some("conv-init-456"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_conversation_id_survives_other_updates() {
+        let state = mock_app_state();
+        let graph = &state.neo4j;
+
+        let session = test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+
+        // Set conversation_id
+        graph
+            .update_chat_session(
+                session.id,
+                None,
+                None,
+                None,
+                None,
+                Some("conv-persist".into()),
+            )
+            .await
+            .unwrap();
+
+        // Update title only — conversation_id should be preserved
+        let updated = graph
+            .update_chat_session(session.id, None, Some("New Title".into()), None, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.title.as_deref(), Some("New Title"));
+        assert_eq!(updated.conversation_id.as_deref(), Some("conv-persist"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_node_serialization_with_conversation_id() {
+        let session = ChatSessionNode {
+            id: uuid::Uuid::new_v4(),
+            cli_session_id: None,
+            project_slug: None,
+            cwd: "/tmp".into(),
+            title: None,
+            model: "model".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            message_count: 0,
+            total_cost_usd: None,
+            conversation_id: Some("conv-serde-test".into()),
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("conv-serde-test"));
+
+        let deserialized: ChatSessionNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.conversation_id.as_deref(),
+            Some("conv-serde-test")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_node_serialization_without_conversation_id() {
+        let session = ChatSessionNode {
+            id: uuid::Uuid::new_v4(),
+            cli_session_id: None,
+            project_slug: None,
+            cwd: "/tmp".into(),
+            title: None,
+            model: "model".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            message_count: 0,
+            total_cost_usd: None,
+            conversation_id: None,
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        let deserialized: ChatSessionNode = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.conversation_id.is_none());
     }
 }
