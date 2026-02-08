@@ -23,6 +23,8 @@ pub struct ChatConfig {
     pub meilisearch_key: String,
     /// Maximum number of agentic turns (tool calls) per message
     pub max_turns: i32,
+    /// Model used for the oneshot prompt builder (context refinement)
+    pub prompt_builder_model: String,
 }
 
 impl ChatConfig {
@@ -57,6 +59,8 @@ impl ChatConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50),
+            prompt_builder_model: std::env::var("PROMPT_BUILDER_MODEL")
+                .unwrap_or_else(|_| "claude-opus-4-6".into()),
         }
     }
 
@@ -119,6 +123,7 @@ mod tests {
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "test-key".into(),
             max_turns: 10,
+            prompt_builder_model: "claude-opus-4-6".into(),
         };
 
         assert_eq!(config.default_model, "claude-opus-4-6");
@@ -186,6 +191,7 @@ mod tests {
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "key".into(),
             max_turns: 10,
+            prompt_builder_model: "claude-opus-4-6".into(),
         };
 
         let json = config.mcp_server_config();
