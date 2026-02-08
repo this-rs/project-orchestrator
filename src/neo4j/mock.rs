@@ -42,6 +42,7 @@ pub struct MockGraphStore {
     pub imports: RwLock<HashMap<String, ImportNode>>,
     pub notes: RwLock<HashMap<Uuid, Note>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
+    pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -103,6 +104,7 @@ impl MockGraphStore {
             imports: RwLock::new(HashMap::new()),
             notes: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            chat_events: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -3350,5 +3352,218 @@ impl GraphStore for MockGraphStore {
 
     async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
         Ok(self.chat_sessions.write().await.remove(&id).is_some())
+    }
+
+    // Chat event operations
+
+    async fn store_chat_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<ChatEventRecord>,
+    ) -> Result<()> {
+        let mut store = self.chat_events.write().await;
+        let entry = store.entry(session_id).or_default();
+        entry.extend(events);
+        Ok(())
+    }
+
+    async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let store = self.chat_events.read().await;
+        let events = store.get(&session_id).map(|v| {
+            v.iter()
+                .filter(|e| e.seq > after_seq)
+                .take(limit as usize)
+                .cloned()
+                .collect::<Vec<_>>()
+        }).unwrap_or_default();
+        Ok(events)
+    }
+
+    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
+        let store = self.chat_events.read().await;
+        let max_seq = store
+            .get(&session_id)
+            .and_then(|v| v.iter().map(|e| e.seq).max())
+            .unwrap_or(0);
+        Ok(max_seq)
+    }
+
+    async fn delete_chat_events(&self, session_id: Uuid) -> Result<()> {
+        self.chat_events.write().await.remove(&session_id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::neo4j::traits::GraphStore;
+    use chrono::Utc;
+
+    fn make_event(session_id: Uuid, seq: i64, event_type: &str, data: &str) -> ChatEventRecord {
+        ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id,
+            seq,
+            event_type: event_type.to_string(),
+            data: data.to_string(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_store_and_get() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", r#"{"content":"Hello"}"#),
+            make_event(session_id, 2, "assistant_text", r#"{"content":"Hi!"}"#),
+            make_event(session_id, 3, "result", r#"{"duration_ms":1000}"#),
+        ];
+
+        store.store_chat_events(session_id, events).await.unwrap();
+
+        // Get all events (after_seq=0)
+        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].seq, 1);
+        assert_eq!(result[0].event_type, "user_message");
+        assert_eq!(result[1].seq, 2);
+        assert_eq!(result[2].seq, 3);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_get_with_after_seq() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", r#"{"content":"Hello"}"#),
+            make_event(session_id, 2, "assistant_text", r#"{"content":"Hi!"}"#),
+            make_event(session_id, 3, "tool_use", r#"{"tool":"bash"}"#),
+            make_event(session_id, 4, "tool_result", r#"{"result":"ok"}"#),
+            make_event(session_id, 5, "result", r#"{"duration_ms":2000}"#),
+        ];
+
+        store.store_chat_events(session_id, events).await.unwrap();
+
+        // Get events after seq 2 (should return 3,4,5)
+        let result = store.get_chat_events(session_id, 2, 100).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].seq, 3);
+        assert_eq!(result[1].seq, 4);
+        assert_eq!(result[2].seq, 5);
+
+        // Get events after seq 4 (should return only 5)
+        let result = store.get_chat_events(session_id, 4, 100).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].seq, 5);
+
+        // Get events after seq 5 (should return empty)
+        let result = store.get_chat_events(session_id, 5, 100).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_get_with_limit() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", "{}"),
+            make_event(session_id, 2, "assistant_text", "{}"),
+            make_event(session_id, 3, "tool_use", "{}"),
+            make_event(session_id, 4, "tool_result", "{}"),
+            make_event(session_id, 5, "result", "{}"),
+        ];
+
+        store.store_chat_events(session_id, events).await.unwrap();
+
+        // Limit to 2 events
+        let result = store.get_chat_events(session_id, 0, 2).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].seq, 1);
+        assert_eq!(result[1].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_latest_seq() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        // No events — should return 0
+        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
+        assert_eq!(seq, 0);
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", "{}"),
+            make_event(session_id, 2, "assistant_text", "{}"),
+            make_event(session_id, 3, "result", "{}"),
+        ];
+        store.store_chat_events(session_id, events).await.unwrap();
+
+        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
+        assert_eq!(seq, 3);
+
+        // Add more events
+        let more = vec![make_event(session_id, 4, "user_message", "{}")];
+        store.store_chat_events(session_id, more).await.unwrap();
+
+        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
+        assert_eq!(seq, 4);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_delete() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+        let other_session_id = Uuid::new_v4();
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", "{}"),
+            make_event(session_id, 2, "result", "{}"),
+        ];
+        let other_events = vec![make_event(other_session_id, 1, "user_message", "{}")];
+
+        store.store_chat_events(session_id, events).await.unwrap();
+        store
+            .store_chat_events(other_session_id, other_events)
+            .await
+            .unwrap();
+
+        // Delete session's events
+        store.delete_chat_events(session_id).await.unwrap();
+
+        // Verify deleted
+        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
+        assert!(result.is_empty());
+        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
+        assert_eq!(seq, 0);
+
+        // Other session unaffected
+        let result = store
+            .get_chat_events(other_session_id, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_empty_session() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        // Getting events for non-existent session should return empty
+        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
+        assert!(result.is_empty());
+
+        // Deleting events for non-existent session should not error
+        store.delete_chat_events(session_id).await.unwrap();
     }
 }

@@ -941,4 +941,26 @@ pub trait GraphStore: Send + Sync {
 
     /// Delete a chat session
     async fn delete_chat_session(&self, id: Uuid) -> Result<bool>;
+
+    // ========================================================================
+    // Chat event operations (WebSocket replay & persistence)
+    // ========================================================================
+
+    /// Store a batch of chat events for a session
+    async fn store_chat_events(&self, session_id: Uuid, events: Vec<ChatEventRecord>)
+        -> Result<()>;
+
+    /// Get chat events for a session after a given sequence number (for replay)
+    async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>>;
+
+    /// Get the latest sequence number for a session (0 if no events)
+    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64>;
+
+    /// Delete all chat events for a session
+    async fn delete_chat_events(&self, session_id: Uuid) -> Result<()>;
 }

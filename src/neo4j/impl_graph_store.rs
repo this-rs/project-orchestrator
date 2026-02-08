@@ -1257,4 +1257,31 @@ impl GraphStore for Neo4jClient {
     async fn delete_chat_session(&self, id: Uuid) -> anyhow::Result<bool> {
         self.delete_chat_session(id).await
     }
+
+    // Chat event operations
+
+    async fn store_chat_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<ChatEventRecord>,
+    ) -> anyhow::Result<()> {
+        self.store_chat_events(session_id, events).await
+    }
+
+    async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChatEventRecord>> {
+        self.get_chat_events(session_id, after_seq, limit).await
+    }
+
+    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> anyhow::Result<i64> {
+        self.get_latest_chat_event_seq(session_id).await
+    }
+
+    async fn delete_chat_events(&self, session_id: Uuid) -> anyhow::Result<()> {
+        self.delete_chat_events(session_id).await
+    }
 }

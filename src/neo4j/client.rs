@@ -7162,4 +7162,118 @@ impl Neo4jClient {
             },
         })
     }
+
+    // ========================================================================
+    // Chat Event operations (WebSocket replay & persistence)
+    // ========================================================================
+
+    /// Store a batch of chat events for a session
+    pub async fn store_chat_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<ChatEventRecord>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        for event in &events {
+            let q = query(
+                "MATCH (s:ChatSession {id: $session_id})
+                 CREATE (s)-[:HAS_EVENT]->(e:ChatEvent {
+                     id: $id,
+                     session_id: $session_id,
+                     seq: $seq,
+                     event_type: $event_type,
+                     data: $data,
+                     created_at: $created_at
+                 })",
+            )
+            .param("session_id", session_id.to_string())
+            .param("id", event.id.to_string())
+            .param("seq", event.seq)
+            .param("event_type", event.event_type.clone())
+            .param("data", event.data.clone())
+            .param("created_at", event.created_at.to_rfc3339());
+
+            self.graph.run(q).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get chat events for a session after a given sequence number (for replay)
+    pub async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+             WHERE e.seq > $after_seq
+             RETURN e
+             ORDER BY e.seq ASC
+             LIMIT $limit",
+        )
+        .param("session_id", session_id.to_string())
+        .param("after_seq", after_seq)
+        .param("limit", limit);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut events = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("e")?;
+            events.push(Self::parse_chat_event_node(&node)?);
+        }
+
+        Ok(events)
+    }
+
+    /// Get the latest sequence number for a session (0 if no events)
+    pub async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+             RETURN MAX(e.seq) AS max_seq",
+        )
+        .param("session_id", session_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            // MAX returns null if no rows, so unwrap_or(0)
+            let max_seq: i64 = row.get("max_seq").unwrap_or(0);
+            Ok(max_seq)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Delete all chat events for a session
+    pub async fn delete_chat_events(&self, session_id: Uuid) -> Result<()> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+             DETACH DELETE e",
+        )
+        .param("session_id", session_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Parse a Neo4j Node into a ChatEventRecord
+    fn parse_chat_event_node(node: &neo4rs::Node) -> Result<ChatEventRecord> {
+        Ok(ChatEventRecord {
+            id: node.get::<String>("id")?.parse()?,
+            session_id: node.get::<String>("session_id")?.parse()?,
+            seq: node.get("seq")?,
+            event_type: node.get("event_type")?,
+            data: node.get("data")?,
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        })
+    }
 }
