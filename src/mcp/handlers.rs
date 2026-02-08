@@ -5237,4 +5237,177 @@ mod tests {
             .map(|v| v as usize);
         assert!(offset.is_none());
     }
+
+    // ========================================================================
+    // Search scoping tests (project_slug, path_prefix, workspace)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_search_code_without_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle("search_code", Some(json!({"query": "nonexistent_xyz"})))
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "search_code",
+                Some(json!({"query": "test", "project_slug": "my-project"})),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_path_prefix() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "search_code",
+                Some(json!({"query": "test", "path_prefix": "src/mcp/"})),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_find_similar_code_with_filters() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "find_similar_code",
+                Some(json!({
+                    "code_snippet": "fn main()",
+                    "project_slug": "my-project",
+                    "language": "rust"
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_find_similar_code_without_filters() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "find_similar_code",
+                Some(json!({"code_snippet": "fn main()"})),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_search_decisions_without_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle("search_decisions", Some(json!({"query": "architecture"})))
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_search_decisions_with_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "search_decisions",
+                Some(json!({"query": "architecture", "project_slug": "my-project"})),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_architecture_without_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle("get_architecture", Some(json!({})))
+            .await
+            .unwrap();
+        assert!(result.is_object());
+        assert!(result.get("languages").is_some());
+        assert!(result.get("key_files").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_architecture_with_nonexistent_project() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "get_architecture",
+                Some(json!({"project_slug": "nonexistent"})),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_commit_without_sync() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "create_commit",
+                Some(json!({
+                    "sha": "abc1234",
+                    "message": "test commit"
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_object());
+        assert_eq!(
+            result.get("sync_triggered").unwrap().as_bool().unwrap(),
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_commit_with_files_but_no_project() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "create_commit",
+                Some(json!({
+                    "sha": "def5678",
+                    "message": "test commit",
+                    "files_changed": ["src/main.rs"]
+                })),
+            )
+            .await
+            .unwrap();
+        // No project_id → no sync
+        assert_eq!(
+            result.get("sync_triggered").unwrap().as_bool().unwrap(),
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_workspace_code_nonexistent_workspace() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "search_workspace_code",
+                Some(json!({
+                    "workspace_slug": "nonexistent",
+                    "query": "test"
+                })),
+            )
+            .await;
+        assert!(result.is_err());
+    }
 }

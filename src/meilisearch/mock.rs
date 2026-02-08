@@ -861,4 +861,65 @@ mod tests {
         let results = store.search_notes("concurrency", 10).await.unwrap();
         assert_eq!(results.len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_search_code_with_path_prefix_filter() {
+        let store = MockSearchStore::new();
+        store
+            .index_code(&sample_code_doc("src/mcp/handlers.rs", "proj"))
+            .await
+            .unwrap();
+        store
+            .index_code(&sample_code_doc("src/neo4j/client.rs", "proj"))
+            .await
+            .unwrap();
+        store
+            .index_code(&sample_code_doc("src/api/routes.rs", "proj"))
+            .await
+            .unwrap();
+
+        // Search with path_prefix "src/mcp/" should only return handlers.rs
+        let hits = store
+            .search_code_with_scores("src", 10, None, None, Some("src/mcp/"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].document.path.starts_with("src/mcp/"));
+
+        // Search with path_prefix "src/neo4j/" should only return client.rs
+        let hits = store
+            .search_code_with_scores("src", 10, None, None, Some("src/neo4j/"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].document.path.starts_with("src/neo4j/"));
+
+        // Search without path_prefix should return all 3
+        let hits = store
+            .search_code_with_scores("src", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_project_slug_and_path_prefix() {
+        let store = MockSearchStore::new();
+        store
+            .index_code(&sample_code_doc("src/mcp/handlers.rs", "proj-a"))
+            .await
+            .unwrap();
+        store
+            .index_code(&sample_code_doc("src/mcp/tools.rs", "proj-b"))
+            .await
+            .unwrap();
+
+        // Filter by project_slug AND path_prefix
+        let hits = store
+            .search_code_with_scores("src", 10, None, Some("proj-a"), Some("src/mcp/"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document.project_slug, "proj-a");
+    }
 }
