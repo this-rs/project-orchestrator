@@ -45,6 +45,7 @@ pub async fn search_code(
             params.limit.unwrap_or(10),
             params.language.as_deref(),
             None,
+            None,
         )
         .await?;
 
@@ -494,7 +495,7 @@ pub async fn find_similar_code(
     let hits = state
         .orchestrator
         .meili()
-        .search_code_with_scores(&query.snippet, query.limit.unwrap_or(5), None, None)
+        .search_code_with_scores(&query.snippet, query.limit.unwrap_or(5), None, None, None)
         .await?;
 
     let similar: Vec<SimilarCode> = hits

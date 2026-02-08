@@ -811,7 +811,8 @@ fn commit_tools() -> Vec<ToolDefinition> {
                     "sha": {"type": "string", "description": "Commit SHA"},
                     "message": {"type": "string", "description": "Commit message"},
                     "author": {"type": "string", "description": "Author name"},
-                    "files_changed": {"type": "array", "items": {"type": "string"}, "description": "Files changed"}
+                    "files_changed": {"type": "array", "items": {"type": "string"}, "description": "Files changed"},
+                    "project_id": {"type": "string", "description": "Project UUID — enables incremental sync of changed files"}
                 })),
                 required: Some(vec!["sha".to_string(), "message".to_string()]),
             },
@@ -879,7 +880,9 @@ fn code_tools() -> Vec<ToolDefinition> {
                 properties: Some(json!({
                     "query": {"type": "string", "description": "Search query"},
                     "limit": {"type": "integer", "description": "Max results (default 10)"},
-                    "language": {"type": "string", "description": "Filter by language"}
+                    "language": {"type": "string", "description": "Filter by language"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"},
+                    "path_prefix": {"type": "string", "description": "Filter by path prefix (e.g. 'src/mcp/')"}
                 })),
                 required: Some(vec!["query".to_string()]),
             },
@@ -893,7 +896,8 @@ fn code_tools() -> Vec<ToolDefinition> {
                     "project_slug": {"type": "string", "description": "Project slug"},
                     "query": {"type": "string", "description": "Search query"},
                     "limit": {"type": "integer", "description": "Max results"},
-                    "language": {"type": "string", "description": "Filter by language"}
+                    "language": {"type": "string", "description": "Filter by language"},
+                    "path_prefix": {"type": "string", "description": "Filter by path prefix (e.g. 'src/mcp/')"}
                 })),
                 required: Some(vec!["project_slug".to_string(), "query".to_string()]),
             },
@@ -960,7 +964,9 @@ fn code_tools() -> Vec<ToolDefinition> {
             description: "Get codebase architecture overview (most connected files)".to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
-                properties: Some(json!({})),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
+                })),
                 required: None,
             },
         },
@@ -971,7 +977,9 @@ fn code_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "code_snippet": {"type": "string", "description": "Code to find similar matches for"},
-                    "limit": {"type": "integer", "description": "Max results"}
+                    "limit": {"type": "integer", "description": "Max results"},
+                    "language": {"type": "string", "description": "Filter by language"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["code_snippet".to_string()]),
             },
@@ -1064,9 +1072,25 @@ fn decision_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "query": {"type": "string", "description": "Search query"},
-                    "limit": {"type": "integer", "description": "Max results"}
+                    "limit": {"type": "integer", "description": "Max results"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["query".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "search_workspace_code".to_string(),
+            description: "Search code across all projects in a workspace".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "workspace_slug": {"type": "string", "description": "Workspace slug"},
+                    "query": {"type": "string", "description": "Search query"},
+                    "language": {"type": "string", "description": "Filter by language"},
+                    "limit": {"type": "integer", "description": "Max results (default 10)"},
+                    "path_prefix": {"type": "string", "description": "Filter by path prefix (e.g. 'src/mcp/')"}
+                })),
+                required: Some(vec!["workspace_slug".to_string(), "query".to_string()]),
             },
         },
     ]
@@ -1941,7 +1965,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 136, "Expected 136 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 137, "Expected 137 tools, got {}", tools.len());
     }
 
     #[test]

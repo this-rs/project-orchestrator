@@ -65,6 +65,7 @@ pub struct MockGraphStore {
     pub ws_milestone_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub workspace_resources: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub workspace_components: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+    #[allow(clippy::type_complexity)]
     pub component_dependencies: RwLock<HashMap<Uuid, Vec<(Uuid, Option<String>, bool)>>>,
     pub component_projects: RwLock<HashMap<Uuid, Uuid>>,
     pub resource_implementers: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -75,6 +76,7 @@ pub struct MockGraphStore {
     pub note_supersedes: RwLock<HashMap<Uuid, Uuid>>,
 }
 
+#[allow(dead_code)]
 impl MockGraphStore {
     /// Create a new empty MockGraphStore.
     pub fn new() -> Self {
@@ -1378,6 +1380,26 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
+    async fn get_language_stats_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<LanguageStatsNode>> {
+        let files = self.files.read().await;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for f in files.values() {
+            if f.project_id == Some(project_id) {
+                *counts.entry(f.language.clone()).or_default() += 1;
+            }
+        }
+        Ok(counts
+            .into_iter()
+            .map(|(language, file_count)| LanguageStatsNode {
+                language,
+                file_count,
+            })
+            .collect())
+    }
+
     async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>> {
         let ir = self.import_relationships.read().await;
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -1403,6 +1425,54 @@ impl GraphStore for MockGraphStore {
             *import_counts.entry(from.clone()).or_default() += tos.len() as i64;
             for to in tos {
                 *dependent_counts.entry(to.clone()).or_default() += 1;
+            }
+        }
+
+        let all_files: std::collections::HashSet<_> = import_counts
+            .keys()
+            .chain(dependent_counts.keys())
+            .cloned()
+            .collect();
+
+        let mut result: Vec<ConnectedFileNode> = all_files
+            .into_iter()
+            .map(|path| ConnectedFileNode {
+                imports: *import_counts.get(&path).unwrap_or(&0),
+                dependents: *dependent_counts.get(&path).unwrap_or(&0),
+                path,
+            })
+            .collect();
+
+        result.sort_by(|a, b| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)));
+        result.truncate(limit);
+        Ok(result)
+    }
+
+    async fn get_most_connected_files_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>> {
+        let files = self.files.read().await;
+        let project_paths: std::collections::HashSet<_> = files
+            .values()
+            .filter(|f| f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+
+        let ir = self.import_relationships.read().await;
+        let mut import_counts: HashMap<String, i64> = HashMap::new();
+        let mut dependent_counts: HashMap<String, i64> = HashMap::new();
+
+        for (from, tos) in ir.iter() {
+            if !project_paths.contains(from) {
+                continue;
+            }
+            *import_counts.entry(from.clone()).or_default() += tos.len() as i64;
+            for to in tos {
+                if project_paths.contains(to) {
+                    *dependent_counts.entry(to.clone()).or_default() += 1;
+                }
             }
         }
 
@@ -3186,7 +3256,7 @@ impl GraphStore for MockGraphStore {
                     let days = (Utc::now() - confirmed_at).num_days() as f64;
                     let base_days = n.base_decay_days();
                     let decay = n.importance.decay_factor();
-                    n.staleness_score = (days * decay / base_days).min(1.0).max(0.0);
+                    n.staleness_score = (days * decay / base_days).clamp(0.0, 1.0);
                     count += 1;
                 }
             }

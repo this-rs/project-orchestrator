@@ -65,7 +65,8 @@ Workspace
 - `sync_project(slug)` / `sync_directory(path)` parse le code source avec Tree-sitter
 - Construit le **graphe de connaissances** : fichiers, fonctions, structs, traits, enums, imports, appels entre fonctions
 - `start_watch(path)` active la synchronisation automatique sur changements fichiers
-- **Requis avant toute exploration de code** : si `last_synced` est absent ou ancien, lancer `sync_project` en premier
+- **Sync incrémentale au commit** : `create_commit` avec `files_changed` + `project_id` déclenche automatiquement la re-sync des fichiers modifiés en arrière-plan. Pas besoin de `sync_project` après chaque commit.
+- **Requis avant toute exploration de code** : si `last_synced` est absent, lancer `sync_project` en premier ; sinon, le sync au commit maintient la fraîcheur automatiquement
 - Outils d'exploration disponibles après sync :
   - `search_code(query)` / `search_project_code(slug, query)` — recherche sémantique
   - `get_file_symbols(file_path)` — fonctions, structs, traits d'un fichier
@@ -214,14 +215,28 @@ Exemple de décomposition correcte :
 - `get_file_dependencies(file_path)` → imports et dépendants
 - `get_context_notes(entity_type, entity_id)` → notes pertinentes (guidelines, gotchas...)
 
+### Stratégie de recherche
+
+Choisir le bon outil selon le besoin :
+- **Recherche sémantique** (concept, nom approché) → `search_code(query)` / `search_project_code(slug, query)` — MeiliSearch, cross-fichier, ranking par pertinence
+- **Usages d'un symbole** → `find_references(symbol)` — graphe Neo4j, résolution des imports, plus fiable que grep
+- **Graphe d'appels** → `get_call_graph(function)` — qui appelle cette fonction et qui elle appelle
+- **Impact d'une modification** → `analyze_impact(target)` — fichiers et symboles dépendants
+- **Vue d'ensemble** → `get_architecture(project_slug?)` — fichiers les plus connectés, stats langages
+- **String exacte / regex** → grep/find de Claude Code — quand on cherche une chaîne littérale précise
+
+Préférer les outils MeiliSearch pour les recherches exploratoires et cross-fichier.
+
 ### Exploration du code
 
-- `search_code(query)` / `search_project_code(slug, query)` — recherche sémantique
+- `search_code(query, project_slug?, path_prefix?)` — recherche sémantique, filtrable par projet et répertoire
+- `search_project_code(slug, query, path_prefix?)` — recherche scopée à un projet
+- `search_workspace_code(workspace_slug, query)` — recherche cross-projets dans un workspace
 - `get_file_symbols(file_path)` → fonctions, structs, traits du fichier
 - `find_references(symbol)` → tous les usages d'un symbole
 - `get_call_graph(function)` → graphe d'appels
 - `find_trait_implementations(trait_name)` → implémentations
-- `get_architecture()` → vue d'ensemble des fichiers les plus connectés
+- `get_architecture(project_slug?)` → vue d'ensemble (filtrable par projet)
 
 ### Capture des connaissances
 
@@ -362,12 +377,15 @@ pub async fn fetch_project_context(
         .await
         .unwrap_or_default();
 
-    // 9. Language stats
-    ctx.language_stats = graph.get_language_stats().await.unwrap_or_default();
+    // 9. Language stats (scoped to project)
+    ctx.language_stats = graph
+        .get_language_stats_for_project(project_id)
+        .await
+        .unwrap_or_default();
 
-    // 10. Key files (most connected)
+    // 10. Key files (most connected, scoped to project)
     ctx.key_files = graph
-        .get_most_connected_files_detailed(5)
+        .get_most_connected_files_for_project(project_id, 5)
         .await
         .unwrap_or_default();
 
@@ -634,9 +652,19 @@ pub fn context_to_markdown(ctx: &ProjectContext) -> String {
         match ctx.last_synced {
             Some(ts) => {
                 let ago = Utc::now().signed_duration_since(ts);
-                if ago.num_hours() > 24 {
+                if ago.num_hours() < 1 {
                     md.push_str(&format!(
-                        "⚠️ **Sync obsolète** — dernier sync il y a {} jours. Lance `sync_project` avant d'explorer le code.\n\n",
+                        "- **Dernière sync** : il y a {} min (à jour)\n\n",
+                        ago.num_minutes().max(1)
+                    ));
+                } else if ago.num_hours() < 24 {
+                    md.push_str(&format!(
+                        "- **Dernière sync** : il y a {}h\n\n",
+                        ago.num_hours()
+                    ));
+                } else {
+                    md.push_str(&format!(
+                        "- **Dernière sync** : il y a {}j — si le code a changé depuis, lance `sync_project`\n\n",
                         ago.num_days()
                     ));
                 }
@@ -722,6 +750,10 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains("Protocole de planification"));
         assert!(BASE_SYSTEM_PROMPT.contains("Gestion des statuts"));
         assert!(BASE_SYSTEM_PROMPT.contains("Bonnes pratiques"));
+        assert!(BASE_SYSTEM_PROMPT.contains("Stratégie de recherche"));
+        assert!(BASE_SYSTEM_PROMPT.contains("search_workspace_code"));
+        assert!(BASE_SYSTEM_PROMPT.contains("path_prefix"));
+        assert!(BASE_SYSTEM_PROMPT.contains("Sync incrémentale au commit"));
     }
 
     #[test]

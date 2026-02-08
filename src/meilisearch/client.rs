@@ -174,7 +174,7 @@ impl MeiliClient {
         project_slug: Option<&str>,
     ) -> Result<Vec<CodeDocument>> {
         let hits = self
-            .search_code_with_scores(query, limit, language_filter, project_slug)
+            .search_code_with_scores(query, limit, language_filter, project_slug, None)
             .await?;
         Ok(hits.into_iter().map(|h| h.document).collect())
     }
@@ -186,6 +186,7 @@ impl MeiliClient {
         limit: usize,
         language_filter: Option<&str>,
         project_slug: Option<&str>,
+        path_prefix: Option<&str>,
     ) -> Result<Vec<SearchHit<CodeDocument>>> {
         let index = self.client.index(index_names::CODE);
 
@@ -195,6 +196,9 @@ impl MeiliClient {
         }
         if let Some(slug) = project_slug {
             filters.push(format!("project_slug = \"{}\"", slug));
+        }
+        if let Some(prefix) = path_prefix {
+            filters.push(format!("path STARTS WITH \"{}\"", prefix));
         }
 
         let filter_str = if filters.is_empty() {

@@ -18,6 +18,7 @@ async fn delete_plan(client: &Client, plan_id: &str) {
 }
 
 /// Helper to delete a project (for cleanup)
+#[allow(dead_code)]
 async fn delete_project(client: &Client, slug: &str) {
     let _ = client
         .delete(format!("{}/api/projects/{}", BASE_URL, slug))
@@ -1943,7 +1944,7 @@ async fn test_workspace_project_association() {
 
     assert!(list_resp.status().is_success());
     let projects: Value = list_resp.json().await.unwrap();
-    assert!(projects.as_array().unwrap().len() >= 1);
+    assert!(!projects.as_array().unwrap().is_empty());
 
     // Remove project from workspace
     let remove_resp = client
@@ -2680,7 +2681,7 @@ async fn test_workspace_list_with_search() {
 
     assert!(search_resp.status().is_success());
     let results: Value = search_resp.json().await.unwrap();
-    assert!(results["items"].as_array().unwrap().len() >= 1);
+    assert!(!results["items"].as_array().unwrap().is_empty());
 
     // Clean up
     let _ = client
@@ -2767,7 +2768,7 @@ async fn test_workspace_milestone_list_with_status_filter() {
     assert!(results["items"].is_array());
     assert!(results["total"].is_number());
     assert!(results["has_more"].is_boolean());
-    assert!(results["items"].as_array().unwrap().len() >= 1);
+    assert!(!results["items"].as_array().unwrap().is_empty());
 
     // Clean up
     let _ = client

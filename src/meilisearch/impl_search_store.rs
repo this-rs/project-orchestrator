@@ -50,8 +50,9 @@ impl SearchStore for MeiliClient {
         limit: usize,
         language_filter: Option<&str>,
         project_slug: Option<&str>,
+        path_prefix: Option<&str>,
     ) -> Result<Vec<SearchHit<CodeDocument>>> {
-        self.search_code_with_scores(query, limit, language_filter, project_slug)
+        self.search_code_with_scores(query, limit, language_filter, project_slug, path_prefix)
             .await
     }
 

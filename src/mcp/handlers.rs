@@ -125,6 +125,7 @@ impl ToolHandler {
             // Code
             "search_code" => self.search_code(args).await,
             "search_project_code" => self.search_project_code(args).await,
+            "search_workspace_code" => self.search_workspace_code(args).await,
             "get_file_symbols" => self.get_file_symbols(args).await,
             "find_references" => self.find_references(args).await,
             "get_file_dependencies" => self.get_file_dependencies(args).await,
@@ -1403,6 +1404,19 @@ impl ToolHandler {
             .get("author")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+        let files_changed: Vec<String> = args
+            .get("files_changed")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let project_id = args
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
 
         let commit = CommitNode {
             hash: hash.to_string(),
@@ -1412,7 +1426,41 @@ impl ToolHandler {
         };
 
         self.orchestrator.create_commit(&commit).await?;
-        Ok(serde_json::to_value(commit)?)
+
+        // Trigger incremental sync if files_changed and project_id are provided
+        let sync_triggered = !files_changed.is_empty() && project_id.is_some();
+        if sync_triggered {
+            let project_id = project_id.unwrap();
+            let orchestrator = self.orchestrator.clone();
+
+            // Resolve project slug for MeiliSearch indexing
+            let project_slug = self.neo4j().get_project(project_id).await?.map(|p| p.slug);
+
+            tokio::spawn(async move {
+                for file_path in &files_changed {
+                    let path = std::path::Path::new(file_path);
+                    if path.exists() {
+                        if let Err(e) = orchestrator
+                            .sync_file_for_project(path, Some(project_id), project_slug.as_deref())
+                            .await
+                        {
+                            tracing::warn!("Incremental sync failed for {}: {}", file_path, e);
+                        }
+                    }
+                }
+                // Update last_synced timestamp
+                if let Err(e) = orchestrator.neo4j().update_project_synced(project_id).await {
+                    tracing::warn!("Failed to update last_synced: {}", e);
+                }
+            });
+        }
+
+        let mut result = serde_json::to_value(&commit)?;
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert("sync_triggered".to_string(), json!(sync_triggered));
+        Ok(result)
     }
 
     async fn link_commit_to_task(&self, args: Value) -> Result<Value> {
@@ -1466,10 +1514,12 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("query is required"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
         let language = args.get("language").and_then(|v| v.as_str());
+        let project_slug = args.get("project_slug").and_then(|v| v.as_str());
+        let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
 
         let results = self
             .meili()
-            .search_code_with_scores(query, limit, language, None)
+            .search_code_with_scores(query, limit, language, project_slug, path_prefix)
             .await?;
 
         Ok(serde_json::to_value(results)?)
@@ -1486,13 +1536,61 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("query is required"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
         let language = args.get("language").and_then(|v| v.as_str());
+        let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
 
         let results = self
             .meili()
-            .search_code_in_project(query, limit, language, Some(project_slug))
+            .search_code_with_scores(query, limit, language, Some(project_slug), path_prefix)
             .await?;
 
         Ok(serde_json::to_value(results)?)
+    }
+
+    async fn search_workspace_code(&self, args: Value) -> Result<Value> {
+        let workspace_slug = args
+            .get("workspace_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("workspace_slug is required"))?;
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("query is required"))?;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        let language = args.get("language").and_then(|v| v.as_str());
+        let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
+
+        // Resolve workspace to project slugs
+        let workspace = self
+            .neo4j()
+            .get_workspace_by_slug(workspace_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Workspace not found: {}", workspace_slug))?;
+        let projects = self.neo4j().list_workspace_projects(workspace.id).await?;
+
+        if projects.is_empty() {
+            return Ok(json!([]));
+        }
+
+        // Search across all projects and merge results
+        let mut all_hits = Vec::new();
+        for project in &projects {
+            let hits = self
+                .meili()
+                .search_code_with_scores(query, limit, language, Some(&project.slug), path_prefix)
+                .await
+                .unwrap_or_default();
+            all_hits.extend(hits);
+        }
+
+        // Sort by score descending and truncate to limit
+        all_hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_hits.truncate(limit);
+
+        Ok(serde_json::to_value(all_hits)?)
     }
 
     async fn get_file_symbols(&self, args: Value) -> Result<Value> {
@@ -1600,14 +1698,36 @@ impl ToolHandler {
         }))
     }
 
-    async fn get_architecture(&self, _args: Value) -> Result<Value> {
-        let lang_stats = self.neo4j().get_language_stats().await?;
+    async fn get_architecture(&self, args: Value) -> Result<Value> {
+        let project_slug = args.get("project_slug").and_then(|v| v.as_str());
+
+        let (lang_stats, connected) = if let Some(slug) = project_slug {
+            let project = self
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
+            let project_id = project.id;
+            let stats = self
+                .neo4j()
+                .get_language_stats_for_project(project_id)
+                .await?;
+            let files = self
+                .neo4j()
+                .get_most_connected_files_for_project(project_id, 10)
+                .await?;
+            (stats, files)
+        } else {
+            let stats = self.neo4j().get_language_stats().await?;
+            let files = self.neo4j().get_most_connected_files_detailed(10).await?;
+            (stats, files)
+        };
+
         let languages: Vec<Value> = lang_stats
             .into_iter()
             .map(|s| json!({"language": s.language, "file_count": s.file_count}))
             .collect();
 
-        let connected = self.neo4j().get_most_connected_files_detailed(10).await?;
         let key_files: Vec<Value> = connected
             .into_iter()
             .map(|f| json!({"path": f.path, "imports": f.imports, "dependents": f.dependents}))
@@ -1625,11 +1745,13 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("code_snippet is required"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+        let language = args.get("language").and_then(|v| v.as_str());
+        let project_slug = args.get("project_slug").and_then(|v| v.as_str());
 
         // Use meilisearch to find similar code by searching for the snippet
         let results = self
             .meili()
-            .search_code_with_scores(code_snippet, limit, None, None)
+            .search_code_with_scores(code_snippet, limit, language, project_slug, None)
             .await?;
         Ok(serde_json::to_value(results)?)
     }
@@ -1683,8 +1805,12 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("query is required"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        let project_slug = args.get("project_slug").and_then(|v| v.as_str());
 
-        let decisions = self.meili().search_decisions(query, limit).await?;
+        let decisions = self
+            .meili()
+            .search_decisions_in_project(query, limit, project_slug)
+            .await?;
         Ok(serde_json::to_value(decisions)?)
     }
 
@@ -3656,10 +3782,8 @@ mod tests {
 
     #[test]
     fn test_link_type_validation() {
-        let validate_link_type = |link_type: &str| match link_type.to_lowercase().as_str() {
-            "implements" | "uses" => true,
-            _ => false,
-        };
+        let validate_link_type =
+            |link_type: &str| matches!(link_type.to_lowercase().as_str(), "implements" | "uses");
 
         assert!(validate_link_type("implements"));
         assert!(validate_link_type("IMPLEMENTS"));
@@ -5007,7 +5131,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.get("deleted").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("deleted").unwrap().as_bool().unwrap());
 
         // Verify it's gone
         let result = handler
@@ -5089,5 +5213,172 @@ mod tests {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
         assert!(offset.is_none());
+    }
+
+    // ========================================================================
+    // Search scoping tests (project_slug, path_prefix, workspace)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_search_code_without_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle("search_code", Some(json!({"query": "nonexistent_xyz"})))
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "search_code",
+                Some(json!({"query": "test", "project_slug": "my-project"})),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_path_prefix() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "search_code",
+                Some(json!({"query": "test", "path_prefix": "src/mcp/"})),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_find_similar_code_with_filters() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "find_similar_code",
+                Some(json!({
+                    "code_snippet": "fn main()",
+                    "project_slug": "my-project",
+                    "language": "rust"
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_find_similar_code_without_filters() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "find_similar_code",
+                Some(json!({"code_snippet": "fn main()"})),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_search_decisions_without_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle("search_decisions", Some(json!({"query": "architecture"})))
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_search_decisions_with_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "search_decisions",
+                Some(json!({"query": "architecture", "project_slug": "my-project"})),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_architecture_without_project_slug() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle("get_architecture", Some(json!({})))
+            .await
+            .unwrap();
+        assert!(result.is_object());
+        assert!(result.get("languages").is_some());
+        assert!(result.get("key_files").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_architecture_with_nonexistent_project() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "get_architecture",
+                Some(json!({"project_slug": "nonexistent"})),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_commit_without_sync() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "create_commit",
+                Some(json!({
+                    "sha": "abc1234",
+                    "message": "test commit"
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_object());
+        assert!(!result.get("sync_triggered").unwrap().as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_create_commit_with_files_but_no_project() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "create_commit",
+                Some(json!({
+                    "sha": "def5678",
+                    "message": "test commit",
+                    "files_changed": ["src/main.rs"]
+                })),
+            )
+            .await
+            .unwrap();
+        // No project_id → no sync
+        assert!(!result.get("sync_triggered").unwrap().as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_search_workspace_code_nonexistent_workspace() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "search_workspace_code",
+                Some(json!({
+                    "workspace_slug": "nonexistent",
+                    "query": "test"
+                })),
+            )
+            .await;
+        assert!(result.is_err());
     }
 }

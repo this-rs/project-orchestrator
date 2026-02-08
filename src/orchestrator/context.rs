@@ -215,7 +215,7 @@ impl ContextBuilder {
     async fn search_similar_code(&self, query: &str, limit: usize) -> Result<Vec<CodeReference>> {
         let hits = self
             .meili
-            .search_code_with_scores(query, limit, None, None)
+            .search_code_with_scores(query, limit, None, None, None)
             .await?;
 
         let references = hits
