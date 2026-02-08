@@ -151,6 +151,7 @@ impl SearchStore for MockSearchStore {
         limit: usize,
         language_filter: Option<&str>,
         project_slug: Option<&str>,
+        path_prefix: Option<&str>,
     ) -> Result<Vec<SearchHit<CodeDocument>>> {
         let docs = self.code_documents.read().await;
         let mut results: Vec<SearchHit<CodeDocument>> = docs
@@ -163,6 +164,11 @@ impl SearchStore for MockSearchStore {
                 }
                 if let Some(lang) = language_filter {
                     if !d.language.eq_ignore_ascii_case(lang) {
+                        return None;
+                    }
+                }
+                if let Some(prefix) = path_prefix {
+                    if !d.path.starts_with(prefix) {
                         return None;
                     }
                 }
@@ -566,7 +572,7 @@ mod tests {
             .unwrap();
 
         let hits = store
-            .search_code_with_scores("main", 10, None, None)
+            .search_code_with_scores("main", 10, None, None, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);

@@ -45,6 +45,7 @@ pub trait SearchStore: Send + Sync {
         limit: usize,
         language_filter: Option<&str>,
         project_slug: Option<&str>,
+        path_prefix: Option<&str>,
     ) -> Result<Vec<SearchHit<CodeDocument>>>;
 
     /// Delete code document by path

@@ -881,7 +881,8 @@ fn code_tools() -> Vec<ToolDefinition> {
                     "query": {"type": "string", "description": "Search query"},
                     "limit": {"type": "integer", "description": "Max results (default 10)"},
                     "language": {"type": "string", "description": "Filter by language"},
-                    "project_slug": {"type": "string", "description": "Filter by project slug"}
+                    "project_slug": {"type": "string", "description": "Filter by project slug"},
+                    "path_prefix": {"type": "string", "description": "Filter by path prefix (e.g. 'src/mcp/')"}
                 })),
                 required: Some(vec!["query".to_string()]),
             },
@@ -895,7 +896,8 @@ fn code_tools() -> Vec<ToolDefinition> {
                     "project_slug": {"type": "string", "description": "Project slug"},
                     "query": {"type": "string", "description": "Search query"},
                     "limit": {"type": "integer", "description": "Max results"},
-                    "language": {"type": "string", "description": "Filter by language"}
+                    "language": {"type": "string", "description": "Filter by language"},
+                    "path_prefix": {"type": "string", "description": "Filter by path prefix (e.g. 'src/mcp/')"}
                 })),
                 required: Some(vec!["project_slug".to_string(), "query".to_string()]),
             },

@@ -1526,10 +1526,11 @@ impl ToolHandler {
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
         let language = args.get("language").and_then(|v| v.as_str());
         let project_slug = args.get("project_slug").and_then(|v| v.as_str());
+        let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
 
         let results = self
             .meili()
-            .search_code_with_scores(query, limit, language, project_slug)
+            .search_code_with_scores(query, limit, language, project_slug, path_prefix)
             .await?;
 
         Ok(serde_json::to_value(results)?)
@@ -1546,10 +1547,11 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("query is required"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
         let language = args.get("language").and_then(|v| v.as_str());
+        let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
 
         let results = self
             .meili()
-            .search_code_in_project(query, limit, language, Some(project_slug))
+            .search_code_with_scores(query, limit, language, Some(project_slug), path_prefix)
             .await?;
 
         Ok(serde_json::to_value(results)?)
@@ -1713,7 +1715,7 @@ impl ToolHandler {
         // Use meilisearch to find similar code by searching for the snippet
         let results = self
             .meili()
-            .search_code_with_scores(code_snippet, limit, language, project_slug)
+            .search_code_with_scores(code_snippet, limit, language, project_slug, None)
             .await?;
         Ok(serde_json::to_value(results)?)
     }
