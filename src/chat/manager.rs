@@ -649,8 +649,8 @@ impl ChatManager {
                         // Convert to ChatEvent(s) and emit + persist structured events
                         let events = Self::message_to_events(msg);
                         for event in events {
-                            // Persist structured events (not stream_delta) with seq number
-                            if !matches!(event, ChatEvent::StreamDelta { .. }) {
+                            // Persist structured events (skip transient: stream_delta, streaming_status)
+                            if !matches!(event, ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. }) {
                                 if let Some(uuid) = session_uuid {
                                     let seq = next_seq.fetch_add(1, Ordering::SeqCst);
                                     events_to_persist.push(ChatEventRecord {
