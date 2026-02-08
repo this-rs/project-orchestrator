@@ -19,7 +19,7 @@ use crate::neo4j::models::ConnectedFileNode;
 #[derive(Deserialize)]
 pub struct CodeSearchQuery {
     /// Search query (semantic search across code content, symbols, comments)
-    pub q: String,
+    pub query: String,
     /// Max results (default 10)
     pub limit: Option<usize>,
     /// Filter by language (rust, typescript, python, go)
@@ -38,15 +38,15 @@ pub struct CodeSearchResult {
 /// Search code semantically across the codebase
 pub async fn search_code(
     State(state): State<OrchestratorState>,
-    Query(query): Query<CodeSearchQuery>,
+    Query(params): Query<CodeSearchQuery>,
 ) -> Result<Json<Vec<CodeSearchResult>>, AppError> {
     let hits = state
         .orchestrator
         .meili()
         .search_code_with_scores(
-            &query.q,
-            query.limit.unwrap_or(10),
-            query.language.as_deref(),
+            &params.query,
+            params.limit.unwrap_or(10),
+            params.language.as_deref(),
             None,
         )
         .await?;
