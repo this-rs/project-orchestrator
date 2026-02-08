@@ -20,10 +20,12 @@ pub struct ChatRequest {
     pub model: Option<String>,
 }
 
-/// Events emitted by the chat system (sent as SSE)
+/// Events emitted by the chat system (sent via WebSocket / broadcast)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEvent {
+    /// A user message (emitted so multi-tab clients see it)
+    UserMessage { content: String },
     /// Text content from the assistant
     AssistantText { content: String },
     /// Claude is thinking (extended thinking)
@@ -70,6 +72,7 @@ impl ChatEvent {
     /// Get the SSE event type name
     pub fn event_type(&self) -> &'static str {
         match self {
+            ChatEvent::UserMessage { .. } => "user_message",
             ChatEvent::AssistantText { .. } => "assistant_text",
             ChatEvent::Thinking { .. } => "thinking",
             ChatEvent::ToolUse { .. } => "tool_use",
