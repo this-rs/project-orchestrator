@@ -97,7 +97,8 @@ async fn run_server(config: Config) -> Result<()> {
                 orchestrator.meili_arc(),
                 chat_config,
             )
-            .await,
+            .await
+            .with_event_emitter(event_bus.clone()),
         );
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");

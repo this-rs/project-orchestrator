@@ -78,6 +78,8 @@ pub struct ChatManager {
     pub(crate) context_injector: Option<Arc<ContextInjector>>,
     /// Memory config (for creating ConversationMemoryManagers)
     pub(crate) memory_config: Option<MemoryConfig>,
+    /// Event emitter for CRUD events (streaming status changes)
+    pub(crate) event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
 }
 
 impl ChatManager {
@@ -94,6 +96,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
             memory_config: None,
+            event_emitter: None,
         }
     }
 
@@ -128,7 +131,14 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
             memory_config: Some(memory_config),
+            event_emitter: None,
         }
+    }
+
+    /// Set the event emitter for CRUD events (streaming status notifications)
+    pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
+        self.event_emitter = Some(emitter);
+        self
     }
 
     /// Resolve the model to use: request > config default
@@ -538,6 +548,7 @@ impl ChatManager {
         let message = request.message.clone();
         let events_tx_clone = events_tx.clone();
         let injector = self.context_injector.clone();
+        let event_emitter = self.event_emitter.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -555,6 +566,7 @@ impl ChatManager {
                 is_streaming,
                 streaming_text,
                 streaming_events,
+                event_emitter,
             )
             .await;
         });
@@ -582,10 +594,20 @@ impl ChatManager {
         is_streaming: Arc<AtomicBool>,
         streaming_text: Arc<Mutex<String>>,
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
+        event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
     ) {
         is_streaming.store(true, Ordering::SeqCst);
         // Broadcast streaming_status to all connected clients (multi-tab support)
         let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: true });
+        // Emit CRUD event for session list live refresh
+        if let Some(ref emitter) = event_emitter {
+            emitter.emit_updated(
+                crate::events::EntityType::ChatSession,
+                &session_id,
+                serde_json::json!({ "is_streaming": true }),
+                None,
+            );
+        }
         // Clear streaming buffers for the new stream
         streaming_text.lock().await.clear();
         streaming_events.lock().await.clear();
@@ -619,6 +641,14 @@ impl ChatManager {
                         message: format!("Error: {}", e),
                     });
                     is_streaming.store(false, Ordering::SeqCst);
+                    if let Some(ref emitter) = event_emitter {
+                        emitter.emit_updated(
+                            crate::events::EntityType::ChatSession,
+                            &session_id,
+                            serde_json::json!({ "is_streaming": false }),
+                            None,
+                        );
+                    }
                     streaming_text.lock().await.clear();
                     streaming_events.lock().await.clear();
                     return;
@@ -796,6 +826,15 @@ impl ChatManager {
         let _ = events_tx.send(ChatEvent::StreamingStatus {
             is_streaming: false,
         });
+        // Emit CRUD event for session list live refresh
+        if let Some(ref emitter) = event_emitter {
+            emitter.emit_updated(
+                crate::events::EntityType::ChatSession,
+                &session_id,
+                serde_json::json!({ "is_streaming": false }),
+                None,
+            );
+        }
         streaming_text.lock().await.clear();
         streaming_events.lock().await.clear();
         debug!("Stream completed for session {}", session_id);
@@ -863,6 +902,7 @@ impl ChatManager {
                 is_streaming,
                 streaming_text,
                 streaming_events,
+                event_emitter,
             ))
             .await;
         }
@@ -954,6 +994,7 @@ impl ChatManager {
         let active_sessions = self.active_sessions.clone();
         let prompt = message.to_string();
         let injector = self.context_injector.clone();
+        let event_emitter = self.event_emitter.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -971,6 +1012,7 @@ impl ChatManager {
                 is_streaming,
                 streaming_text,
                 streaming_events,
+                event_emitter,
             )
             .await;
         });
@@ -1110,6 +1152,7 @@ impl ChatManager {
         let active_sessions = self.active_sessions.clone();
         let prompt = message.to_string();
         let injector = self.context_injector.clone();
+        let event_emitter = self.event_emitter.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -1127,6 +1170,7 @@ impl ChatManager {
                 is_streaming,
                 streaming_text,
                 streaming_events,
+                event_emitter,
             )
             .await;
         });
@@ -1163,6 +1207,76 @@ impl ChatManager {
             .load_conversation(&conversation_id, limit, offset)
             .await
             .context("Failed to load conversation messages")
+    }
+
+    /// Backfill title/preview for sessions that have a conversation_id but no title.
+    /// Uses Meilisearch to fetch the first user message from each conversation.
+    pub async fn backfill_previews_from_meilisearch(&self) -> Result<usize> {
+        let injector = match self.context_injector.as_ref() {
+            Some(i) => i,
+            None => return Ok(0),
+        };
+
+        // Get all sessions without title
+        let sessions = self
+            .graph
+            .list_chat_sessions(None, 200, 0)
+            .await
+            .context("Failed to list sessions")?;
+
+        let mut count = 0;
+        for session in &sessions.0 {
+            // Skip sessions that already have a title
+            if session.title.is_some() {
+                continue;
+            }
+            // Need a conversation_id to look up messages
+            let conv_id = match &session.conversation_id {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+
+            // Load the first user message from Meilisearch
+            let loaded = match injector.load_conversation(&conv_id, Some(1), Some(0)).await {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            let first_user_msg = loaded
+                .messages
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone());
+
+            if let Some(content) = first_user_msg {
+                let chars: Vec<char> = content.chars().collect();
+                let title = if chars.len() > 80 {
+                    format!("{}...", chars[..77].iter().collect::<String>().trim_end())
+                } else {
+                    content.clone()
+                };
+                let preview = if chars.len() > 200 {
+                    format!("{}...", chars[..197].iter().collect::<String>().trim_end())
+                } else {
+                    content
+                };
+                let _ = self
+                    .graph
+                    .update_chat_session(
+                        session.id,
+                        None,
+                        Some(title),
+                        None,
+                        None,
+                        None,
+                        Some(preview),
+                    )
+                    .await;
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 
     /// Search messages across all sessions via Meilisearch full-text search.
