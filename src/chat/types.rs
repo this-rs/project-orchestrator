@@ -467,4 +467,159 @@ mod tests {
         assert_eq!(deserialized.model, "claude-opus-4-6");
         assert_eq!(deserialized.message_count, 5);
     }
+
+    // ====================================================================
+    // truncate_snippet
+    // ====================================================================
+
+    #[test]
+    fn test_truncate_snippet_short_text() {
+        let text = "Hello, world!";
+        assert_eq!(truncate_snippet(text, 50), "Hello, world!");
+    }
+
+    #[test]
+    fn test_truncate_snippet_exact_length() {
+        let text = "abcde";
+        assert_eq!(truncate_snippet(text, 5), "abcde");
+    }
+
+    #[test]
+    fn test_truncate_snippet_long_text_breaks_at_space() {
+        let text = "Hello world this is a long text";
+        let result = truncate_snippet(text, 15);
+        // Should break at word boundary before char 15 and add "..."
+        assert!(result.ends_with("..."));
+        assert!(result.len() < text.len());
+    }
+
+    #[test]
+    fn test_truncate_snippet_no_space_to_break() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let result = truncate_snippet(text, 10);
+        // No spaces, so truncates at char boundary
+        assert!(result.ends_with("..."));
+        assert!(result.starts_with("abcdefghij"));
+    }
+
+    #[test]
+    fn test_truncate_snippet_utf8_multibyte() {
+        let text = "Héllo wörld café résumé";
+        let result = truncate_snippet(text, 10);
+        assert!(result.ends_with("..."));
+        // Should not panic on multi-byte chars
+    }
+
+    #[test]
+    fn test_truncate_snippet_emoji() {
+        let text = "🎉🎊🎈🎁🎀🎆🎇✨🧨🎃🎄";
+        let result = truncate_snippet(text, 5);
+        assert!(result.ends_with("..."));
+        // 5 emoji chars + "..."
+        assert_eq!(result.chars().filter(|c| *c != '.').count(), 5);
+    }
+
+    #[test]
+    fn test_truncate_snippet_empty() {
+        assert_eq!(truncate_snippet("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_snippet_single_char() {
+        assert_eq!(truncate_snippet("a", 10), "a");
+    }
+
+    // ====================================================================
+    // MessageSearchHit & MessageSearchResult serde
+    // ====================================================================
+
+    #[test]
+    fn test_message_search_hit_serde_roundtrip() {
+        let hit = MessageSearchHit {
+            message_id: "msg-123".into(),
+            role: "user".into(),
+            content_snippet: "Hello, help me with...".into(),
+            turn_index: 3,
+            created_at: 1700000000,
+            score: 0.95,
+        };
+        let json = serde_json::to_string(&hit).unwrap();
+        let deserialized: MessageSearchHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.message_id, "msg-123");
+        assert_eq!(deserialized.role, "user");
+        assert_eq!(deserialized.turn_index, 3);
+        assert!((deserialized.score - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_message_search_result_serde_roundtrip() {
+        let result = MessageSearchResult {
+            session_id: "sess-abc".into(),
+            session_title: Some("My session".into()),
+            session_preview: Some("First message preview".into()),
+            project_slug: Some("my-project".into()),
+            conversation_id: "conv-xyz".into(),
+            hits: vec![MessageSearchHit {
+                message_id: "msg-1".into(),
+                role: "assistant".into(),
+                content_snippet: "Here is the answer...".into(),
+                turn_index: 4,
+                created_at: 1700000100,
+                score: 0.88,
+            }],
+            best_score: 0.88,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: MessageSearchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.session_id, "sess-abc");
+        assert_eq!(deserialized.session_title.as_deref(), Some("My session"));
+        assert_eq!(
+            deserialized.session_preview.as_deref(),
+            Some("First message preview")
+        );
+        assert_eq!(deserialized.project_slug.as_deref(), Some("my-project"));
+        assert_eq!(deserialized.conversation_id, "conv-xyz");
+        assert_eq!(deserialized.hits.len(), 1);
+        assert!((deserialized.best_score - 0.88).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_message_search_result_minimal_fields() {
+        let result = MessageSearchResult {
+            session_id: "sess-1".into(),
+            session_title: None,
+            session_preview: None,
+            project_slug: None,
+            conversation_id: "conv-1".into(),
+            hits: vec![],
+            best_score: 0.0,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: MessageSearchResult = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.session_title.is_none());
+        assert!(deserialized.session_preview.is_none());
+        assert!(deserialized.project_slug.is_none());
+        assert!(deserialized.hits.is_empty());
+    }
+
+    #[test]
+    fn test_chat_session_with_preview_field() {
+        let json = r#"{
+            "id": "test-id",
+            "cwd": "/tmp",
+            "model": "claude-opus-4-6",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "preview": "Can you help me build a REST API?"
+        }"#;
+        let session: ChatSession = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            session.preview.as_deref(),
+            Some("Can you help me build a REST API?")
+        );
+        // Optional fields default correctly
+        assert!(session.title.is_none());
+        assert!(session.conversation_id.is_none());
+        assert_eq!(session.message_count, 0);
+    }
 }

@@ -2849,4 +2849,258 @@ mod tests {
             matches!(deserialized, ChatEvent::UserMessage { ref content } if content == "Hello world")
         );
     }
+
+    // ====================================================================
+    // with_event_emitter builder
+    // ====================================================================
+
+    #[test]
+    fn test_with_event_emitter_sets_emitter() {
+        use crate::events::{CrudEvent, EventEmitter};
+
+        struct DummyEmitter;
+        impl EventEmitter for DummyEmitter {
+            fn emit(&self, _event: CrudEvent) {}
+        }
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        assert!(manager.event_emitter.is_none());
+
+        let manager = manager.with_event_emitter(Arc::new(DummyEmitter));
+        assert!(manager.event_emitter.is_some());
+    }
+
+    // ====================================================================
+    // backfill_previews_from_meilisearch — early return when no injector
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_backfill_previews_no_injector_returns_zero() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        // new_without_memory => context_injector is None => should return Ok(0)
+        let result = manager.backfill_previews_from_meilisearch().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    // ====================================================================
+    // update_chat_session via mock — title, preview, conversation_id
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_update_session_title_and_preview() {
+        let state = mock_app_state();
+        let session = test_chat_session(Some("test-proj"));
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        // Update title
+        let updated = state
+            .neo4j
+            .update_chat_session(
+                session_id,
+                None,
+                Some("My new title".into()),
+                None,
+                None,
+                None,
+                Some("Preview of the conversation".into()),
+            )
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        let s = updated.unwrap();
+        assert_eq!(s.title.as_deref(), Some("My new title"));
+        assert_eq!(s.preview.as_deref(), Some("Preview of the conversation"));
+    }
+
+    #[tokio::test]
+    async fn test_update_session_conversation_id() {
+        let state = mock_app_state();
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        let updated = state
+            .neo4j
+            .update_chat_session(
+                session_id,
+                None,
+                None,
+                None,
+                None,
+                Some("conv-abc-123".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        assert_eq!(
+            updated.unwrap().conversation_id.as_deref(),
+            Some("conv-abc-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_session_cost_and_message_count() {
+        let state = mock_app_state();
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        let updated = state
+            .neo4j
+            .update_chat_session(session_id, None, None, Some(42), Some(1.50), None, None)
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        let s = updated.unwrap();
+        assert_eq!(s.message_count, 42);
+        assert!((s.total_cost_usd.unwrap() - 1.50).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_update_session_not_found() {
+        let state = mock_app_state();
+        let fake_id = Uuid::new_v4();
+        let updated = state
+            .neo4j
+            .update_chat_session(fake_id, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(updated.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_session_cli_session_id() {
+        let state = mock_app_state();
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        let updated = state
+            .neo4j
+            .update_chat_session(
+                session_id,
+                Some("cli-session-xyz".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        assert_eq!(
+            updated.unwrap().cli_session_id.as_deref(),
+            Some("cli-session-xyz")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_session_partial_preserves_existing() {
+        let state = mock_app_state();
+        let mut session = test_chat_session(Some("my-proj"));
+        session.title = Some("Original title".into());
+        session.preview = Some("Original preview".into());
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        // Update only message_count — should preserve title and preview
+        let updated = state
+            .neo4j
+            .update_chat_session(session_id, None, None, Some(10), None, None, None)
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        let s = updated.unwrap();
+        assert_eq!(s.title.as_deref(), Some("Original title"));
+        assert_eq!(s.preview.as_deref(), Some("Original preview"));
+        assert_eq!(s.message_count, 10);
+    }
+
+    // ====================================================================
+    // backfill_chat_session_previews via mock — returns 0 (mock has no events)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_backfill_session_previews_mock_returns_zero() {
+        let state = mock_app_state();
+        let result = state.neo4j.backfill_chat_session_previews().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    // ====================================================================
+    // Title truncation logic (mirrors send_message_internal behavior)
+    // ====================================================================
+
+    #[test]
+    fn test_title_generation_short_message() {
+        let msg = "Hello, help me with my project";
+        // < 80 chars → title == message
+        let title = if msg.chars().count() > 80 {
+            let truncated: String = msg.chars().take(77).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(title, "Hello, help me with my project");
+    }
+
+    #[test]
+    fn test_title_generation_long_message() {
+        let msg = "a".repeat(100);
+        // > 80 chars → truncated to 77 + "..."
+        let title = if msg.chars().count() > 80 {
+            let truncated: String = msg.chars().take(77).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(title.chars().count(), 80);
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_preview_generation_short_message() {
+        let msg = "Short message";
+        let preview = if msg.chars().count() > 200 {
+            let truncated: String = msg.chars().take(197).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(preview, "Short message");
+    }
+
+    #[test]
+    fn test_preview_generation_long_message() {
+        let msg = "b".repeat(300);
+        let preview = if msg.chars().count() > 200 {
+            let truncated: String = msg.chars().take(197).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(preview.chars().count(), 200);
+        assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn test_title_generation_utf8_multibyte() {
+        // 90 chars with accented characters
+        let msg: String = "é".repeat(90);
+        let title = if msg.chars().count() > 80 {
+            let truncated: String = msg.chars().take(77).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(title.chars().count(), 80);
+        assert!(title.ends_with("..."));
+    }
 }
