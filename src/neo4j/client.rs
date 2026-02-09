@@ -7352,4 +7352,124 @@ impl Neo4jClient {
                 .unwrap_or_else(|_| chrono::Utc::now()),
         })
     }
+
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    /// Upsert a user by google_id: create if not exists, update if exists.
+    pub async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
+        let q = query(
+            r#"
+            MERGE (u:User {google_id: $google_id})
+            ON CREATE SET
+                u.id = $id,
+                u.email = $email,
+                u.name = $name,
+                u.picture_url = $picture_url,
+                u.created_at = datetime($created_at),
+                u.last_login_at = datetime($last_login_at)
+            ON MATCH SET
+                u.email = $email,
+                u.name = $name,
+                u.picture_url = $picture_url,
+                u.last_login_at = datetime($last_login_at)
+            RETURN u
+            "#,
+        )
+        .param("id", user.id.to_string())
+        .param("google_id", user.google_id.clone())
+        .param("email", user.email.clone())
+        .param("name", user.name.clone())
+        .param(
+            "picture_url",
+            user.picture_url.clone().unwrap_or_default(),
+        )
+        .param("created_at", user.created_at.to_rfc3339())
+        .param("last_login_at", user.last_login_at.to_rfc3339());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            self.node_to_user(&node)
+        } else {
+            anyhow::bail!("upsert_user: no row returned")
+        }
+    }
+
+    /// Get a user by internal UUID
+    pub async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
+        let q = query("MATCH (u:User {id: $id}) RETURN u")
+            .param("id", id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            Ok(Some(self.node_to_user(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a user by Google ID
+    pub async fn get_user_by_google_id(&self, google_id: &str) -> Result<Option<UserNode>> {
+        let q = query("MATCH (u:User {google_id: $google_id}) RETURN u")
+            .param("google_id", google_id);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            Ok(Some(self.node_to_user(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a user by email
+    pub async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
+        let q = query("MATCH (u:User {email: $email}) RETURN u")
+            .param("email", email);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            Ok(Some(self.node_to_user(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List all users
+    pub async fn list_users(&self) -> Result<Vec<UserNode>> {
+        let q = query("MATCH (u:User) RETURN u ORDER BY u.created_at DESC");
+
+        let mut result = self.graph.execute(q).await?;
+        let mut users = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("u")?;
+            users.push(self.node_to_user(&node)?);
+        }
+        Ok(users)
+    }
+
+    /// Parse a Neo4j Node into a UserNode
+    fn node_to_user(&self, node: &neo4rs::Node) -> Result<UserNode> {
+        Ok(UserNode {
+            id: node.get::<String>("id")?.parse()?,
+            email: node.get("email")?,
+            name: node.get("name")?,
+            picture_url: node.get::<String>("picture_url").ok().and_then(|s| {
+                if s.is_empty() { None } else { Some(s) }
+            }),
+            google_id: node.get("google_id")?,
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            last_login_at: node
+                .get::<String>("last_login_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        })
+    }
 }

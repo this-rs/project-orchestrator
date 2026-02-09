@@ -968,4 +968,23 @@ pub trait GraphStore: Send + Sync {
 
     /// Delete all chat events for a session
     async fn delete_chat_events(&self, session_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    /// Upsert a user (create or update by google_id). Returns the resulting UserNode.
+    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode>;
+
+    /// Get a user by internal ID
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>>;
+
+    /// Get a user by Google ID (unique)
+    async fn get_user_by_google_id(&self, google_id: &str) -> Result<Option<UserNode>>;
+
+    /// Get a user by email
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>>;
+
+    /// List all users
+    async fn list_users(&self) -> Result<Vec<UserNode>>;
 }

@@ -232,6 +232,19 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
     }
 }
 
+/// Create a test user
+pub fn test_user() -> UserNode {
+    UserNode {
+        id: Uuid::new_v4(),
+        email: "test@ffs.holdings".to_string(),
+        name: "Test User".to_string(),
+        picture_url: Some("https://lh3.googleusercontent.com/test".to_string()),
+        google_id: "google-id-123456".to_string(),
+        created_at: chrono::Utc::now(),
+        last_login_at: chrono::Utc::now(),
+    }
+}
+
 /// Create a test milestone
 pub fn test_milestone(project_id: Uuid, title: &str) -> MilestoneNode {
     MilestoneNode {

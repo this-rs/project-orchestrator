@@ -75,6 +75,7 @@ pub struct MockGraphStore {
     pub call_relationships: RwLock<HashMap<String, Vec<String>>>,
     pub note_anchors: RwLock<HashMap<Uuid, Vec<NoteAnchor>>>,
     pub note_supersedes: RwLock<HashMap<Uuid, Uuid>>,
+    pub users: RwLock<HashMap<Uuid, UserNode>>,
 }
 
 #[allow(dead_code)]
@@ -134,6 +135,7 @@ impl MockGraphStore {
             call_relationships: RwLock::new(HashMap::new()),
             note_anchors: RwLock::new(HashMap::new()),
             note_supersedes: RwLock::new(HashMap::new()),
+            users: RwLock::new(HashMap::new()),
         }
     }
 
@@ -3410,6 +3412,61 @@ impl GraphStore for MockGraphStore {
         self.chat_events.write().await.remove(&session_id);
         Ok(())
     }
+
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
+        let mut users = self.users.write().await;
+        // Check if a user with this google_id already exists
+        let existing_id = users
+            .values()
+            .find(|u| u.google_id == user.google_id)
+            .map(|u| u.id);
+
+        if let Some(id) = existing_id {
+            // Update existing user
+            let existing = users.get_mut(&id).unwrap();
+            existing.email = user.email.clone();
+            existing.name = user.name.clone();
+            existing.picture_url = user.picture_url.clone();
+            existing.last_login_at = user.last_login_at;
+            Ok(existing.clone())
+        } else {
+            // Insert new user
+            users.insert(user.id, user.clone());
+            Ok(user.clone())
+        }
+    }
+
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
+        Ok(self.users.read().await.get(&id).cloned())
+    }
+
+    async fn get_user_by_google_id(&self, google_id: &str) -> Result<Option<UserNode>> {
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.google_id == google_id)
+            .cloned())
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.email == email)
+            .cloned())
+    }
+
+    async fn list_users(&self) -> Result<Vec<UserNode>> {
+        Ok(self.users.read().await.values().cloned().collect())
+    }
 }
 
 #[cfg(test)]
@@ -3578,5 +3635,119 @@ mod tests {
 
         // Deleting events for non-existent session should not error
         store.delete_chat_events(session_id).await.unwrap();
+    }
+
+    // ====================================================================
+    // User / Auth tests
+    // ====================================================================
+
+    fn make_user(google_id: &str, email: &str) -> UserNode {
+        UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: "Test User".to_string(),
+            picture_url: Some("https://example.com/pic.jpg".to_string()),
+            google_id: google_id.to_string(),
+            created_at: Utc::now(),
+            last_login_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upsert_user_create() {
+        let store = MockGraphStore::new();
+        let user = make_user("gid-001", "alice@ffs.holdings");
+
+        let result = store.upsert_user(&user).await.unwrap();
+        assert_eq!(result.email, "alice@ffs.holdings");
+        assert_eq!(result.google_id, "gid-001");
+
+        // Should be retrievable
+        let found = store.get_user_by_id(user.id).await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().email, "alice@ffs.holdings");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_user_update() {
+        let store = MockGraphStore::new();
+        let user = make_user("gid-002", "bob@ffs.holdings");
+        store.upsert_user(&user).await.unwrap();
+
+        // Upsert same google_id with updated fields
+        let mut updated = make_user("gid-002", "bob.new@ffs.holdings");
+        updated.name = "Bob Updated".to_string();
+        updated.picture_url = None;
+
+        let result = store.upsert_user(&updated).await.unwrap();
+        // Should keep the original id (found by google_id)
+        assert_eq!(result.id, user.id);
+        // But fields should be updated
+        assert_eq!(result.email, "bob.new@ffs.holdings");
+        assert_eq!(result.name, "Bob Updated");
+        assert!(result.picture_url.is_none());
+
+        // Only 1 user in the store
+        let all = store.list_users().await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_google_id() {
+        let store = MockGraphStore::new();
+        let user = make_user("gid-003", "charlie@ffs.holdings");
+        store.upsert_user(&user).await.unwrap();
+
+        let found = store.get_user_by_google_id("gid-003").await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().email, "charlie@ffs.holdings");
+
+        let not_found = store.get_user_by_google_id("gid-999").await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_email() {
+        let store = MockGraphStore::new();
+        let user = make_user("gid-004", "diana@ffs.holdings");
+        store.upsert_user(&user).await.unwrap();
+
+        let found = store.get_user_by_email("diana@ffs.holdings").await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().google_id, "gid-004");
+
+        let not_found = store.get_user_by_email("nobody@ffs.holdings").await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_user_not_found() {
+        let store = MockGraphStore::new();
+
+        let not_found = store.get_user_by_id(Uuid::new_v4()).await.unwrap();
+        assert!(not_found.is_none());
+
+        let not_found = store.get_user_by_google_id("nonexistent").await.unwrap();
+        assert!(not_found.is_none());
+
+        let not_found = store.get_user_by_email("nonexistent@ffs.holdings").await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_users() {
+        let store = MockGraphStore::new();
+
+        // Empty list
+        let users = store.list_users().await.unwrap();
+        assert!(users.is_empty());
+
+        // Add 3 users
+        store.upsert_user(&make_user("gid-a", "a@ffs.holdings")).await.unwrap();
+        store.upsert_user(&make_user("gid-b", "b@ffs.holdings")).await.unwrap();
+        store.upsert_user(&make_user("gid-c", "c@ffs.holdings")).await.unwrap();
+
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 3);
     }
 }

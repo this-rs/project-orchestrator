@@ -1291,4 +1291,28 @@ impl GraphStore for Neo4jClient {
     async fn delete_chat_events(&self, session_id: Uuid) -> anyhow::Result<()> {
         self.delete_chat_events(session_id).await
     }
+
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    async fn upsert_user(&self, user: &UserNode) -> anyhow::Result<UserNode> {
+        self.upsert_user(user).await
+    }
+
+    async fn get_user_by_id(&self, id: Uuid) -> anyhow::Result<Option<UserNode>> {
+        self.get_user_by_id(id).await
+    }
+
+    async fn get_user_by_google_id(&self, google_id: &str) -> anyhow::Result<Option<UserNode>> {
+        self.get_user_by_google_id(google_id).await
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> anyhow::Result<Option<UserNode>> {
+        self.get_user_by_email(email).await
+    }
+
+    async fn list_users(&self) -> anyhow::Result<Vec<UserNode>> {
+        self.list_users().await
+    }
 }

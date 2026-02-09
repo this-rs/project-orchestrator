@@ -778,6 +778,23 @@ pub enum RelationType {
     MapsToProject,
 }
 
+// ============================================================================
+// User / Auth
+// ============================================================================
+
+/// A user authenticated via Google OAuth
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserNode {
+    pub id: Uuid,
+    pub email: String,
+    pub name: String,
+    pub picture_url: Option<String>,
+    /// Google sub (unique identifier from Google)
+    pub google_id: String,
+    pub created_at: DateTime<Utc>,
+    pub last_login_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
