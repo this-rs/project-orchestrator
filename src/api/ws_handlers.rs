@@ -43,11 +43,22 @@ pub async fn ws_events(
 
 /// Handle an individual WebSocket connection
 async fn handle_ws(
-    socket: WebSocket,
+    mut socket: WebSocket,
     state: OrchestratorState,
     entity_filter: Option<HashSet<String>>,
     project_filter: Option<String>,
 ) {
+    // ========================================================================
+    // Phase 0: Authenticate via first message
+    // ========================================================================
+    let claims = match super::ws_auth::ws_authenticate(&mut socket, &state.auth_config).await {
+        Ok(claims) => claims,
+        Err(reason) => {
+            debug!(reason = %reason, "WS events: auth failed");
+            return;
+        }
+    };
+
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut event_rx = state.event_bus.subscribe();
 
@@ -57,9 +68,10 @@ async fn handle_ws(
     ping_interval.tick().await;
 
     debug!(
+        email = %claims.email,
         entity_filter = ?entity_filter,
         project_filter = ?project_filter,
-        "WebSocket client connected"
+        "WebSocket events client authenticated"
     );
 
     loop {
