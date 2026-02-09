@@ -1,18 +1,13 @@
-//! Chat API handlers — SSE streaming + session management
+//! Chat API handlers — session management (streaming via WebSocket)
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::api::query::{PaginatedResponse, PaginationParams};
-use crate::chat::types::{ChatRequest, ChatSession, ClientMessage, CreateSessionResponse};
+use crate::chat::types::{ChatRequest, ChatSession, CreateSessionResponse};
 use axum::{
     extract::{Path, Query, State},
-    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
-use futures::stream::Stream;
 use serde::Deserialize;
-use std::convert::Infallible;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 // ============================================================================
@@ -35,103 +30,6 @@ pub async fn create_session(
         .map_err(AppError::Internal)?;
 
     Ok(Json(response))
-}
-
-// ============================================================================
-// SSE stream
-// ============================================================================
-
-/// GET /api/chat/sessions/{id}/stream — Subscribe to SSE event stream
-pub async fn stream_events(
-    State(state): State<OrchestratorState>,
-    Path(session_id): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let chat_manager = state
-        .chat_manager
-        .as_ref()
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
-
-    let rx = chat_manager
-        .subscribe(&session_id)
-        .await
-        .map_err(|e| AppError::NotFound(format!("Session not found: {}", e)))?;
-
-    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(event) => {
-            let json = serde_json::to_string(&event).unwrap_or_default();
-            Some(Ok(Event::default().event(event.event_type()).data(json)))
-        }
-        Err(_) => None, // Lagged — skip missed events
-    });
-
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
-}
-
-// ============================================================================
-// Send follow-up message
-// ============================================================================
-
-/// POST /api/chat/sessions/{id}/messages — Send a follow-up message
-pub async fn send_message(
-    State(state): State<OrchestratorState>,
-    Path(session_id): Path<String>,
-    Json(client_msg): Json<ClientMessage>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let chat_manager = state
-        .chat_manager
-        .as_ref()
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
-
-    // Extract the message text based on ClientMessage type
-    let message = match &client_msg {
-        ClientMessage::UserMessage { content } => content.clone(),
-        ClientMessage::PermissionResponse { allow, reason } => {
-            // For now, format as text — the CLI handles permissions via control protocol
-            format!(
-                "Permission {}: {}",
-                if *allow { "granted" } else { "denied" },
-                reason.as_deref().unwrap_or("")
-            )
-        }
-        ClientMessage::InputResponse { content } => content.clone(),
-    };
-
-    // Check if session is active; if not, auto-resume
-    if !chat_manager.is_session_active(&session_id).await {
-        chat_manager
-            .resume_session(&session_id, &message)
-            .await
-            .map_err(AppError::Internal)?;
-    } else {
-        chat_manager
-            .send_message(&session_id, &message)
-            .await
-            .map_err(AppError::Internal)?;
-    }
-
-    Ok(Json(serde_json::json!({ "status": "sent" })))
-}
-
-// ============================================================================
-// Interrupt
-// ============================================================================
-
-/// POST /api/chat/sessions/{id}/interrupt — Interrupt current operation
-pub async fn interrupt_session(
-    State(state): State<OrchestratorState>,
-    Path(session_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let chat_manager = state
-        .chat_manager
-        .as_ref()
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
-
-    chat_manager
-        .interrupt(&session_id)
-        .await
-        .map_err(AppError::Internal)?;
-
-    Ok(Json(serde_json::json!({ "status": "interrupted" })))
 }
 
 // ============================================================================
@@ -573,63 +471,6 @@ mod tests {
                     .uri("/api/chat/sessions")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"message":"Hello","cwd":"/tmp"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn test_send_message_no_chat_manager() {
-        let app = test_app().await;
-        let fake_id = Uuid::new_v4();
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/chat/sessions/{}/messages", fake_id))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"type":"user_message","content":"Hello"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn test_interrupt_no_chat_manager() {
-        let app = test_app().await;
-        let fake_id = Uuid::new_v4();
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/chat/sessions/{}/interrupt", fake_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn test_stream_no_chat_manager() {
-        let app = test_app().await;
-        let fake_id = Uuid::new_v4();
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/chat/sessions/{}/stream", fake_id))
-                    .body(Body::empty())
                     .unwrap(),
             )
             .await

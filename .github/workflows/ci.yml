@@ -63,10 +63,10 @@ jobs:
           save-if: false
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   # ==========================================================================
   # Unit Tests - Library and parser tests without external services

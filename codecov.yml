@@ -1,0 +1,24 @@
+codecov:
+  require_ci_to_pass: false
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        # The chat module contains WebSocket handlers and streaming logic
+        # that requires a live CLI subprocess and WS connections.
+        # Unit tests cover the testable business logic but cannot cover
+        # infrastructure code (ws_chat_handler.rs, stream_response internals).
+        target: 30%
+        threshold: 5%
+
+ignore:
+  # WebSocket handler — requires live WS connection for testing (integration only)
+  - "src/api/ws_chat_handler.rs"
+  # Main entry points
+  - "src/main.rs"
+  - "src/bin/**"

@@ -8,6 +8,7 @@ pub mod project_handlers;
 pub mod query;
 pub mod routes;
 pub mod workspace_handlers;
+pub mod ws_chat_handler;
 pub mod ws_handlers;
 
 pub use query::*;

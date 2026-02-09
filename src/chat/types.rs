@@ -20,10 +20,12 @@ pub struct ChatRequest {
     pub model: Option<String>,
 }
 
-/// Events emitted by the chat system (sent as SSE)
+/// Events emitted by the chat system (sent via WebSocket / broadcast)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEvent {
+    /// A user message (emitted so multi-tab clients see it)
+    UserMessage { content: String },
     /// Text content from the assistant
     AssistantText { content: String },
     /// Claude is thinking (extended thinking)
@@ -62,14 +64,17 @@ pub enum ChatEvent {
     },
     /// Streaming text delta (real-time token)
     StreamDelta { text: String },
+    /// Streaming status change (broadcast to all connected clients)
+    StreamingStatus { is_streaming: bool },
     /// An error occurred
     Error { message: String },
 }
 
 impl ChatEvent {
-    /// Get the SSE event type name
+    /// Get the event type name (used for WebSocket messages and persistence)
     pub fn event_type(&self) -> &'static str {
         match self {
+            ChatEvent::UserMessage { .. } => "user_message",
             ChatEvent::AssistantText { .. } => "assistant_text",
             ChatEvent::Thinking { .. } => "thinking",
             ChatEvent::ToolUse { .. } => "tool_use",
@@ -78,6 +83,7 @@ impl ChatEvent {
             ChatEvent::InputRequest { .. } => "input_request",
             ChatEvent::Result { .. } => "result",
             ChatEvent::StreamDelta { .. } => "stream_delta",
+            ChatEvent::StreamingStatus { .. } => "streaming_status",
             ChatEvent::Error { .. } => "error",
         }
     }

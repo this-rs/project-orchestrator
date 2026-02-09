@@ -73,6 +73,31 @@ pub struct ChatSessionNode {
 }
 
 // ============================================================================
+// Chat Event Record (for WebSocket replay & persistence)
+// ============================================================================
+
+/// A persisted chat event with sequence number for replay support.
+///
+/// Events are stored as `(:ChatSession)-[:HAS_EVENT]->(:ChatEvent)` in Neo4j.
+/// `stream_delta` events are NOT persisted (accumulated in memory, stored as
+/// a single `assistant_text` at the end).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatEventRecord {
+    pub id: Uuid,
+    /// Session this event belongs to
+    pub session_id: Uuid,
+    /// Monotonically increasing sequence number (per session)
+    pub seq: i64,
+    /// Event type: "user_message", "assistant_text", "thinking", "tool_use",
+    /// "tool_result", "permission_request", "input_request", "result", "error"
+    pub event_type: String,
+    /// JSON-serialized event payload
+    pub data: String,
+    /// When this event was created
+    pub created_at: DateTime<Utc>,
+}
+
+// ============================================================================
 // Code Structure Nodes (from Tree-sitter)
 // ============================================================================
 

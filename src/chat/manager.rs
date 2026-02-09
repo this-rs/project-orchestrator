@@ -4,13 +4,15 @@
 //!
 //! Architecture:
 //! - Each session spawns an `InteractiveClient` (Nexus SDK) subprocess
-//! - Messages are streamed via `broadcast::channel` to SSE subscribers
+//! - Messages are streamed via `broadcast::channel` to WebSocket subscribers
+//! - Structured events are persisted in Neo4j with sequence numbers for replay
 //! - Inactive sessions are persisted in Neo4j with `cli_session_id` for resume
 //! - A cleanup task periodically closes timed-out sessions
 
 use super::config::ChatConfig;
 use super::types::{ChatEvent, ChatRequest, CreateSessionResponse};
 use crate::meilisearch::SearchStore;
+use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::models::ChatSessionNode;
 use crate::neo4j::GraphStore;
 use anyhow::{anyhow, Context, Result};
@@ -20,20 +22,20 @@ use nexus_claude::{
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
 };
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Broadcast channel buffer size for SSE subscribers
+/// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
 
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
-    /// Broadcast sender for SSE subscribers
+    /// Persistent broadcast sender — one per session lifetime, NOT replaced per message
     pub events_tx: broadcast::Sender<ChatEvent>,
     /// When the session was last active
     pub last_activity: Instant,
@@ -45,6 +47,18 @@ pub struct ActiveSession {
     pub interrupt_flag: Arc<AtomicBool>,
     /// Nexus conversation memory manager (records messages for persistence)
     pub memory_manager: Option<Arc<Mutex<ConversationMemoryManager>>>,
+    /// Monotonically increasing sequence number for persisted events
+    pub next_seq: Arc<AtomicI64>,
+    /// Queue of messages waiting to be sent (received while streaming)
+    pub pending_messages: Arc<Mutex<VecDeque<String>>>,
+    /// Whether a stream is currently in progress
+    pub is_streaming: Arc<AtomicBool>,
+    /// Accumulated text from stream_delta during the current stream (for mid-stream join)
+    pub streaming_text: Arc<Mutex<String>>,
+    /// Accumulated structured events during the current stream (for mid-stream join).
+    /// Contains all non-StreamDelta events (ToolUse, ToolResult, AssistantText, etc.)
+    /// that haven't been persisted yet. Cleared at stream start/end.
+    pub streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -431,6 +445,13 @@ impl ChatManager {
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let client = Arc::new(Mutex::new(client));
 
+        // Initialize next_seq (new session = start at 1)
+        let next_seq = Arc::new(AtomicI64::new(1));
+        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let is_streaming = Arc::new(AtomicBool::new(false));
+        let streaming_text = Arc::new(Mutex::new(String::new()));
+        let streaming_events = Arc::new(Mutex::new(Vec::new()));
+
         // Register active session
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
@@ -444,10 +465,35 @@ impl ChatManager {
                     client: client.clone(),
                     interrupt_flag: interrupt_flag.clone(),
                     memory_manager: memory_manager.clone(),
+                    next_seq: next_seq.clone(),
+                    pending_messages: pending_messages.clone(),
+                    is_streaming: is_streaming.clone(),
+                    streaming_text: streaming_text.clone(),
+                    streaming_events: streaming_events.clone(),
                 },
             );
             interrupt_flag
         };
+
+        // Persist the initial user_message event
+        let user_event = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id,
+            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+            event_type: "user_message".to_string(),
+            data: serde_json::to_string(&serde_json::json!({"content": &request.message}))
+                .unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+        };
+        let _ = self
+            .graph
+            .store_chat_events(session_id, vec![user_event])
+            .await;
+
+        // Emit user_message on the broadcast (so other WS clients see it)
+        let _ = events_tx.send(ChatEvent::UserMessage {
+            content: request.message.clone(),
+        });
 
         // Send the initial message and start streaming in a background task
         let session_id_str = session_id.to_string();
@@ -468,13 +514,18 @@ impl ChatManager {
                 interrupt_flag,
                 memory_manager,
                 injector,
+                next_seq,
+                pending_messages,
+                is_streaming,
+                streaming_text,
+                streaming_events,
             )
             .await;
         });
 
         Ok(CreateSessionResponse {
             session_id: session_id.to_string(),
-            stream_url: format!("/api/chat/{}/stream", session_id),
+            stream_url: format!("/ws/chat/{}", session_id),
         })
     }
 
@@ -490,42 +541,35 @@ impl ChatManager {
         interrupt_flag: Arc<AtomicBool>,
         memory_manager: Option<Arc<Mutex<ConversationMemoryManager>>>,
         context_injector: Option<Arc<ContextInjector>>,
+        next_seq: Arc<AtomicI64>,
+        pending_messages: Arc<Mutex<VecDeque<String>>>,
+        is_streaming: Arc<AtomicBool>,
+        streaming_text: Arc<Mutex<String>>,
+        streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
     ) {
+        is_streaming.store(true, Ordering::SeqCst);
+        // Broadcast streaming_status to all connected clients (multi-tab support)
+        let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: true });
+        // Clear streaming buffers for the new stream
+        streaming_text.lock().await.clear();
+        streaming_events.lock().await.clear();
+
         // Record user message in memory manager
         if let Some(ref mm) = memory_manager {
             let mut mm = mm.lock().await;
             mm.record_user_message(&prompt);
         }
-        // Wait for at least one SSE subscriber before sending the message to the CLI.
-        // Without this, events emitted before the frontend connects are lost (broadcast
-        // has no replay buffer). Poll every 50ms, timeout after 10s.
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while events_tx.receiver_count() == 0 {
-            if Instant::now() >= deadline {
-                warn!(
-                    "No SSE subscriber connected within 10s for session {}, proceeding anyway",
-                    session_id
-                );
-                break;
-            }
-            if interrupt_flag.load(Ordering::SeqCst) {
-                debug!(
-                    "Interrupt flag set while waiting for subscriber for session {}",
-                    session_id
-                );
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+
+        // Events are persisted in Neo4j — the WebSocket replay handles late-joining clients.
 
         // Use send_and_receive_stream() for real-time token streaming.
-        // The returned stream borrows &mut InteractiveClient, so we must hold
-        // the Mutex lock for the entire stream duration. This is safe because:
-        // - Each message spawns stream_response in its own tokio::spawn
-        // - send_message() creates a new broadcast channel for each follow-up
-        // - The lock is only held during active streaming (not between messages)
-        // Collect assistant text for memory recording
+        // The stream's lifetime is tied to the MutexGuard, so we hold the client lock
+        // during the stream. However, the underlying transport uses separate stdin/stdout
+        // channels, so other operations (like interrupt) can still proceed via the
+        // interrupt_flag mechanism.
         let mut assistant_text_parts: Vec<String> = Vec::new();
+        let mut events_to_persist: Vec<ChatEventRecord> = Vec::new();
+        let session_uuid = Uuid::parse_str(&session_id).ok();
 
         {
             let mut c = client.lock().await;
@@ -538,6 +582,9 @@ impl ChatManager {
                     let _ = events_tx.send(ChatEvent::Error {
                         message: format!("Error: {}", e),
                     });
+                    is_streaming.store(false, Ordering::SeqCst);
+                    streaming_text.lock().await.clear();
+                    streaming_events.lock().await.clear();
                     return;
                 }
             };
@@ -555,6 +602,7 @@ impl ChatManager {
                 match result {
                     Ok(ref msg) => {
                         // Handle StreamEvent — emit StreamDelta for text tokens directly
+                        // stream_delta are NOT persisted (too many writes)
                         if let Message::StreamEvent {
                             event:
                                 StreamEventData::ContentBlockDelta {
@@ -564,6 +612,8 @@ impl ChatManager {
                             ..
                         } = msg
                         {
+                            // Accumulate for mid-stream join snapshot
+                            streaming_text.lock().await.push_str(text);
                             let _ = events_tx.send(ChatEvent::StreamDelta { text: text.clone() });
                             continue;
                         }
@@ -576,7 +626,7 @@ impl ChatManager {
                         } = msg
                         {
                             // Update Neo4j with cli_session_id and cost
-                            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                            if let Some(uuid) = session_uuid {
                                 let _ = graph
                                     .update_chat_session(
                                         uuid,
@@ -606,9 +656,41 @@ impl ChatManager {
                             }
                         }
 
-                        // For all other messages, use existing converter
+                        // Convert to ChatEvent(s) and emit + persist structured events
                         let events = Self::message_to_events(msg);
                         for event in events {
+                            // Persist structured events (skip transient: stream_delta, streaming_status)
+                            if !matches!(
+                                event,
+                                ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. }
+                            ) {
+                                if let Some(uuid) = session_uuid {
+                                    let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                                    events_to_persist.push(ChatEventRecord {
+                                        id: Uuid::new_v4(),
+                                        session_id: uuid,
+                                        seq,
+                                        event_type: event.event_type().to_string(),
+                                        data: serde_json::to_string(&event).unwrap_or_default(),
+                                        created_at: chrono::Utc::now(),
+                                    });
+                                }
+                            }
+
+                            // Accumulate structured events for mid-stream join snapshot.
+                            // Excluded:
+                            // - StreamDelta: text is in streaming_text (sent as partial_text)
+                            // - StreamingStatus: transient, sent explicitly in Phase 1.5
+                            // - AssistantText: duplicates streaming_text content (sent as partial_text)
+                            if !matches!(
+                                event,
+                                ChatEvent::StreamDelta { .. }
+                                    | ChatEvent::StreamingStatus { .. }
+                                    | ChatEvent::AssistantText { .. }
+                            ) {
+                                streaming_events.lock().await.push(event.clone());
+                            }
+
                             let _ = events_tx.send(event);
                         }
                     }
@@ -621,7 +703,19 @@ impl ChatManager {
                     }
                 }
             }
-        } // Lock released here after stream completes
+        } // client lock released here
+
+        // Batch-persist all collected events to Neo4j
+        if let Some(uuid) = session_uuid {
+            if !events_to_persist.is_empty() {
+                if let Err(e) = graph.store_chat_events(uuid, events_to_persist).await {
+                    warn!(
+                        "Failed to persist {} chat events for session {}: {}",
+                        0, session_id, e
+                    );
+                }
+            }
+        }
 
         // Record assistant message and persist to memory store
         if let Some(ref mm) = memory_manager {
@@ -660,14 +754,96 @@ impl ChatManager {
             }
         }
 
+        is_streaming.store(false, Ordering::SeqCst);
+        // Broadcast streaming_status=false to all connected clients (multi-tab support)
+        let _ = events_tx.send(ChatEvent::StreamingStatus {
+            is_streaming: false,
+        });
+        streaming_text.lock().await.clear();
+        streaming_events.lock().await.clear();
         debug!("Stream completed for session {}", session_id);
+
+        // Check pending_messages queue — if there are queued messages, process the next one
+        let next_message = {
+            let mut queue = pending_messages.lock().await;
+            queue.pop_front()
+        };
+
+        if let Some(next_msg) = next_message {
+            info!(
+                "Processing queued message for session {} (queue was non-empty after stream)",
+                session_id
+            );
+
+            // Persist the queued user_message event and update message count
+            if let Some(uuid) = session_uuid {
+                // Update message count
+                if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
+                    let _ = graph
+                        .update_chat_session(
+                            uuid,
+                            None,
+                            None,
+                            Some(node.message_count + 1),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+
+                let user_event = ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                    event_type: "user_message".to_string(),
+                    data: serde_json::to_string(&serde_json::json!({"content": &next_msg}))
+                        .unwrap_or_default(),
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = graph.store_chat_events(uuid, vec![user_event]).await;
+            }
+
+            // Emit user_message on broadcast
+            let _ = events_tx.send(ChatEvent::UserMessage {
+                content: next_msg.clone(),
+            });
+
+            // Recursive call to process the queued message
+            // Use Box::pin to handle recursive async
+            Box::pin(Self::stream_response(
+                client,
+                events_tx,
+                next_msg,
+                session_id,
+                graph,
+                active_sessions,
+                interrupt_flag,
+                memory_manager,
+                context_injector,
+                next_seq,
+                pending_messages,
+                is_streaming,
+                streaming_text,
+                streaming_events,
+            ))
+            .await;
+        }
     }
 
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
-        // Create a NEW broadcast channel for this message so that the fresh /stream
-        // subscriber receives all events (old subscribers just stop getting new data).
-        let (client, events_tx, interrupt_flag, memory_manager) = {
+        // Get session state — NO broadcast replacement, the same channel is reused
+        let (
+            client,
+            events_tx,
+            interrupt_flag,
+            memory_manager,
+            next_seq,
+            pending_messages,
+            is_streaming,
+            streaming_text,
+            streaming_events,
+        ) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
@@ -675,23 +851,38 @@ impl ChatManager {
 
             // Reset interrupt flag for new message
             session.interrupt_flag.store(false, Ordering::SeqCst);
-
-            // Replace the broadcast channel so new /stream subscribers get fresh events
-            let (new_tx, _) = broadcast::channel(BROADCAST_BUFFER);
-            session.events_tx = new_tx.clone();
             session.last_activity = Instant::now();
 
             (
                 session.client.clone(),
-                new_tx,
+                session.events_tx.clone(),
                 session.interrupt_flag.clone(),
                 session.memory_manager.clone(),
+                session.next_seq.clone(),
+                session.pending_messages.clone(),
+                session.is_streaming.clone(),
+                session.streaming_text.clone(),
+                session.streaming_events.clone(),
             )
         };
 
+        // If a stream is in progress, queue the message for later processing.
+        // Do NOT persist or broadcast yet — the dequeue in stream_response() handles that,
+        // ensuring the user_message seq comes AFTER the current stream's events.
+        if is_streaming.load(Ordering::SeqCst) {
+            info!(
+                "Stream in progress for session {}, queuing message",
+                session_id
+            );
+            let mut queue = pending_messages.lock().await;
+            queue.push_back(message.to_string());
+            return Ok(());
+        }
+
+        // No stream in progress — persist and broadcast immediately
+
         // Update message count in Neo4j
         if let Ok(uuid) = Uuid::parse_str(session_id) {
-            // Get current count and increment
             if let Ok(Some(node)) = self.graph.get_chat_session(uuid).await {
                 let _ = self
                     .graph
@@ -700,7 +891,26 @@ impl ChatManager {
             }
         }
 
-        // Stream in background
+        // Persist the user_message event
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            let user_event = ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: uuid,
+                seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                event_type: "user_message".to_string(),
+                data: serde_json::to_string(&serde_json::json!({"content": message}))
+                    .unwrap_or_default(),
+                created_at: chrono::Utc::now(),
+            };
+            let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
+        }
+
+        // Emit user_message on broadcast (visible to all WS clients)
+        let _ = events_tx.send(ChatEvent::UserMessage {
+            content: message.to_string(),
+        });
+
+        // Start streaming directly
         let session_id_str = session_id.to_string();
         let graph = self.graph.clone();
         let active_sessions = self.active_sessions.clone();
@@ -718,6 +928,11 @@ impl ChatManager {
                 interrupt_flag,
                 memory_manager,
                 injector,
+                next_seq,
+                pending_messages,
+                is_streaming,
+                streaming_text,
+                streaming_events,
             )
             .await;
         });
@@ -798,6 +1013,18 @@ impl ChatManager {
             None
         };
 
+        // Initialize next_seq from Neo4j (resume existing event history)
+        let latest_seq = self
+            .graph
+            .get_latest_chat_event_seq(uuid)
+            .await
+            .unwrap_or(0);
+        let next_seq = Arc::new(AtomicI64::new(latest_seq + 1));
+        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let is_streaming = Arc::new(AtomicBool::new(false));
+        let streaming_text = Arc::new(Mutex::new(String::new()));
+        let streaming_events = Arc::new(Mutex::new(Vec::new()));
+
         // Register as active
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
@@ -811,10 +1038,32 @@ impl ChatManager {
                     client: client.clone(),
                     interrupt_flag: interrupt_flag.clone(),
                     memory_manager: memory_manager.clone(),
+                    next_seq: next_seq.clone(),
+                    pending_messages: pending_messages.clone(),
+                    is_streaming: is_streaming.clone(),
+                    streaming_text: streaming_text.clone(),
+                    streaming_events: streaming_events.clone(),
                 },
             );
             interrupt_flag
         };
+
+        // Persist the user_message event
+        let user_event = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+            event_type: "user_message".to_string(),
+            data: serde_json::to_string(&serde_json::json!({"content": message}))
+                .unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+        };
+        let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
+
+        // Emit user_message on broadcast
+        let _ = events_tx.send(ChatEvent::UserMessage {
+            content: message.to_string(),
+        });
 
         // Stream in background
         let session_id_str = session_id.to_string();
@@ -834,6 +1083,11 @@ impl ChatManager {
                 interrupt_flag,
                 memory_manager,
                 injector,
+                next_seq,
+                pending_messages,
+                is_streaming,
+                streaming_text,
+                streaming_events,
             )
             .await;
         });
@@ -872,13 +1126,56 @@ impl ChatManager {
             .context("Failed to load conversation messages")
     }
 
-    /// Subscribe to a session's events (for SSE streaming)
+    /// Subscribe to a session's broadcast channel (used by WebSocket handler)
     pub async fn subscribe(&self, session_id: &str) -> Result<broadcast::Receiver<ChatEvent>> {
         let sessions = self.active_sessions.read().await;
         let session = sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
         Ok(session.events_tx.subscribe())
+    }
+
+    /// Get persisted events since a given sequence number (for WebSocket replay)
+    pub async fn get_events_since(
+        &self,
+        session_id: &str,
+        after_seq: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
+        self.graph
+            .get_chat_events(uuid, after_seq, 10000) // generous limit for replay
+            .await
+    }
+
+    /// Check if a session is currently streaming
+    pub async fn is_session_streaming(&self, session_id: &str) -> bool {
+        let sessions = self.active_sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|s| s.is_streaming.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// Get a snapshot of the current streaming state for mid-stream join.
+    ///
+    /// Returns `(is_streaming, accumulated_text, streaming_events)`.
+    /// - `accumulated_text`: all stream_delta text since the current stream started
+    /// - `streaming_events`: all structured events (ToolUse, ToolResult, AssistantText, etc.)
+    ///   since the current stream started, excluding StreamDelta (which is in accumulated_text)
+    ///
+    /// This allows a newly connected WebSocket client to fully reconstruct the
+    /// in-progress assistant turn, including tool calls.
+    pub async fn get_streaming_snapshot(&self, session_id: &str) -> (bool, String, Vec<ChatEvent>) {
+        let sessions = self.active_sessions.read().await;
+        match sessions.get(session_id) {
+            Some(session) => {
+                let is_streaming = session.is_streaming.load(Ordering::SeqCst);
+                let text = session.streaming_text.lock().await.clone();
+                let events = session.streaming_events.lock().await.clone();
+                (is_streaming, text, events)
+            }
+            None => (false, String::new(), Vec::new()),
+        }
     }
 
     /// Interrupt the current operation in a session.
@@ -1885,5 +2182,353 @@ mod tests {
         let json = serde_json::to_string(&session).unwrap();
         let deserialized: ChatSessionNode = serde_json::from_str(&json).unwrap();
         assert!(deserialized.conversation_id.is_none());
+    }
+
+    // ====================================================================
+    // get_streaming_snapshot
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_streaming_snapshot_nonexistent_session() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let (is_streaming, text, events) = manager.get_streaming_snapshot("nonexistent").await;
+        assert!(!is_streaming);
+        assert!(text.is_empty());
+        assert!(events.is_empty());
+    }
+
+    /// Helper: create a dummy InteractiveClient for tests.
+    /// Returns None if the Claude CLI is not installed (e.g., in CI).
+    fn try_create_dummy_client() -> Option<InteractiveClient> {
+        let opts = ClaudeCodeOptions {
+            model: Some("test".into()),
+            ..Default::default()
+        };
+        InteractiveClient::new(opts).ok()
+    }
+
+    /// Helper: create a dummy ActiveSession for testing.
+    /// Returns None if the Claude CLI is not installed.
+    fn try_create_dummy_session(
+        is_streaming: bool,
+        streaming_text: &str,
+        streaming_events_data: Vec<ChatEvent>,
+    ) -> Option<(ActiveSession, Arc<Mutex<VecDeque<String>>>)> {
+        let client = try_create_dummy_client()?;
+        let (tx, _rx) = broadcast::channel(16);
+        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+
+        let session = ActiveSession {
+            events_tx: tx,
+            last_activity: Instant::now(),
+            cli_session_id: None,
+            client: Arc::new(Mutex::new(client)),
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            memory_manager: None,
+            next_seq: Arc::new(AtomicI64::new(1)),
+            pending_messages: pending_messages.clone(),
+            is_streaming: Arc::new(AtomicBool::new(is_streaming)),
+            streaming_text: Arc::new(Mutex::new(streaming_text.to_string())),
+            streaming_events: Arc::new(Mutex::new(streaming_events_data)),
+        };
+
+        Some((session, pending_messages))
+    }
+
+    #[tokio::test]
+    async fn test_get_streaming_snapshot_with_active_session_not_streaming() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("test-session".into(), session);
+
+        let (is_streaming, text, events) = manager.get_streaming_snapshot("test-session").await;
+        assert!(!is_streaming);
+        assert!(text.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_streaming_snapshot_with_active_streaming_session() {
+        let events_data = vec![
+            ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "list_plans".into(),
+                input: serde_json::json!({}),
+            },
+            ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: serde_json::json!({"plans": []}),
+                is_error: false,
+            },
+        ];
+
+        let Some((session, _)) = try_create_dummy_session(true, "Hello world", events_data) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("streaming-session".into(), session);
+
+        let (is_streaming, text, events) =
+            manager.get_streaming_snapshot("streaming-session").await;
+        assert!(is_streaming);
+        assert_eq!(text, "Hello world");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], ChatEvent::ToolUse { tool, .. } if tool == "list_plans"));
+        assert!(matches!(&events[1], ChatEvent::ToolResult { id, .. } if id == "t1"));
+    }
+
+    // ====================================================================
+    // send_message — queuing when is_streaming=true
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_send_message_queues_when_streaming() {
+        let Some((session, pending_messages)) = try_create_dummy_session(true, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let session_id = Uuid::new_v4().to_string();
+
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+
+        // Send a message while streaming — should be queued, NOT sent
+        let result = manager.send_message(&session_id, "queued message").await;
+        assert!(result.is_ok());
+
+        // Verify the message was queued
+        let queue = pending_messages.lock().await;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0], "queued message");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_queues_multiple_when_streaming() {
+        let Some((session, pending_messages)) = try_create_dummy_session(true, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let session_id = Uuid::new_v4().to_string();
+
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+
+        // Queue multiple messages
+        manager.send_message(&session_id, "first").await.unwrap();
+        manager.send_message(&session_id, "second").await.unwrap();
+        manager.send_message(&session_id, "third").await.unwrap();
+
+        let queue = pending_messages.lock().await;
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0], "first");
+        assert_eq!(queue[1], "second");
+        assert_eq!(queue[2], "third");
+    }
+
+    // ====================================================================
+    // streaming_events filtering logic
+    // ====================================================================
+
+    #[test]
+    fn test_streaming_events_filter_excludes_transient_events() {
+        // This tests the filtering logic used in stream_response():
+        // StreamDelta, StreamingStatus, and AssistantText should be EXCLUDED
+        // from streaming_events buffer (they are handled via streaming_text or
+        // sent explicitly in Phase 1.5)
+
+        let events_to_exclude = vec![
+            ChatEvent::StreamDelta {
+                text: "Hello".into(),
+            },
+            ChatEvent::StreamingStatus { is_streaming: true },
+            ChatEvent::StreamingStatus {
+                is_streaming: false,
+            },
+            ChatEvent::AssistantText {
+                content: "Hello world".into(),
+            },
+        ];
+
+        for event in &events_to_exclude {
+            let should_add = !matches!(
+                event,
+                ChatEvent::StreamDelta { .. }
+                    | ChatEvent::StreamingStatus { .. }
+                    | ChatEvent::AssistantText { .. }
+            );
+            assert!(
+                !should_add,
+                "Event {:?} should be excluded from streaming_events",
+                event.event_type()
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_events_filter_includes_structured_events() {
+        // These events SHOULD be included in streaming_events buffer
+        // so mid-stream joiners can reconstruct tool calls
+
+        let events_to_include = vec![
+            ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "create_plan".into(),
+                input: serde_json::json!({"title": "Plan"}),
+            },
+            ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: serde_json::json!({"id": "abc"}),
+                is_error: false,
+            },
+            ChatEvent::Thinking {
+                content: "Let me think...".into(),
+            },
+            ChatEvent::PermissionRequest {
+                id: "p1".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            ChatEvent::InputRequest {
+                prompt: "Choose:".into(),
+                options: Some(vec!["A".into(), "B".into()]),
+            },
+            ChatEvent::Error {
+                message: "Something went wrong".into(),
+            },
+            ChatEvent::Result {
+                session_id: "cli-123".into(),
+                duration_ms: 5000,
+                cost_usd: Some(0.15),
+            },
+            ChatEvent::UserMessage {
+                content: "Hello".into(),
+            },
+        ];
+
+        for event in &events_to_include {
+            let should_add = !matches!(
+                event,
+                ChatEvent::StreamDelta { .. }
+                    | ChatEvent::StreamingStatus { .. }
+                    | ChatEvent::AssistantText { .. }
+            );
+            assert!(
+                should_add,
+                "Event {:?} should be included in streaming_events",
+                event.event_type()
+            );
+        }
+    }
+
+    // ====================================================================
+    // ActiveSession with streaming_events field
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_active_session_streaming_events_field() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // Verify streaming_events starts empty
+        assert!(session.streaming_events.lock().await.is_empty());
+
+        // Push an event and verify it's accessible
+        session
+            .streaming_events
+            .lock()
+            .await
+            .push(ChatEvent::Thinking {
+                content: "test".into(),
+            });
+        assert_eq!(session.streaming_events.lock().await.len(), 1);
+
+        // Clear and verify
+        session.streaming_events.lock().await.clear();
+        assert!(session.streaming_events.lock().await.is_empty());
+    }
+
+    // ====================================================================
+    // ChatEvent event_type() — covers the StreamingStatus variant
+    // ====================================================================
+
+    #[test]
+    fn test_chat_event_streaming_status_type() {
+        let event = ChatEvent::StreamingStatus { is_streaming: true };
+        assert_eq!(event.event_type(), "streaming_status");
+
+        let event = ChatEvent::StreamingStatus {
+            is_streaming: false,
+        };
+        assert_eq!(event.event_type(), "streaming_status");
+    }
+
+    #[test]
+    fn test_chat_event_user_message_type() {
+        let event = ChatEvent::UserMessage {
+            content: "Hello".into(),
+        };
+        assert_eq!(event.event_type(), "user_message");
+    }
+
+    #[test]
+    fn test_chat_event_streaming_status_serde_roundtrip() {
+        let event = ChatEvent::StreamingStatus { is_streaming: true };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"streaming_status\""));
+        assert!(json.contains("\"is_streaming\":true"));
+
+        let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            deserialized,
+            ChatEvent::StreamingStatus { is_streaming: true }
+        ));
+    }
+
+    #[test]
+    fn test_chat_event_user_message_serde_roundtrip() {
+        let event = ChatEvent::UserMessage {
+            content: "Hello world".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"user_message\""));
+
+        let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(deserialized, ChatEvent::UserMessage { ref content } if content == "Hello world")
+        );
     }
 }
