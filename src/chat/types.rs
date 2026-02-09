@@ -136,6 +136,9 @@ pub struct ChatSession {
     /// Nexus conversation ID (for message history)
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// Preview text (first user message, truncated)
+    #[serde(default)]
+    pub preview: Option<String>,
 }
 
 /// Response when creating a session
@@ -143,6 +146,63 @@ pub struct ChatSession {
 pub struct CreateSessionResponse {
     pub session_id: String,
     pub stream_url: String,
+}
+
+// ============================================================================
+// Search types
+// ============================================================================
+
+/// A single message hit from full-text search
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSearchHit {
+    /// Message ID in Meilisearch
+    pub message_id: String,
+    /// Message role (user or assistant)
+    pub role: String,
+    /// Truncated content snippet
+    pub content_snippet: String,
+    /// Turn index within the conversation
+    pub turn_index: usize,
+    /// Unix timestamp of message creation
+    pub created_at: i64,
+    /// Relevance score
+    pub score: f64,
+}
+
+/// Search results grouped by session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSearchResult {
+    /// Session ID (UUID)
+    pub session_id: String,
+    /// Session title
+    #[serde(default)]
+    pub session_title: Option<String>,
+    /// Session preview text
+    #[serde(default)]
+    pub session_preview: Option<String>,
+    /// Associated project slug
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// Nexus conversation ID
+    pub conversation_id: String,
+    /// Matching messages in this session
+    pub hits: Vec<MessageSearchHit>,
+    /// Best (highest) score among hits
+    pub best_score: f64,
+}
+
+/// Truncate text to a maximum length, preserving word boundaries.
+pub fn truncate_snippet(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    // Find last space before max_len
+    let truncated = &text[..max_len];
+    if let Some(last_space) = truncated.rfind(' ') {
+        format!("{}...", &text[..last_space])
+    } else {
+        format!("{}...", truncated)
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +448,7 @@ mod tests {
             message_count: 5,
             total_cost_usd: Some(0.15),
             conversation_id: Some("conv-abc-123".into()),
+            preview: Some("Hello, can you help me?".into()),
         };
 
         let json = serde_json::to_string(&session).unwrap();

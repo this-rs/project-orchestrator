@@ -10,7 +10,10 @@
 //! - A cleanup task periodically closes timed-out sessions
 
 use super::config::ChatConfig;
-use super::types::{ChatEvent, ChatRequest, CreateSessionResponse};
+use super::types::{
+    truncate_snippet, ChatEvent, ChatRequest, CreateSessionResponse, MessageSearchHit,
+    MessageSearchResult,
+};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::models::ChatSessionNode;
@@ -18,7 +21,10 @@ use crate::neo4j::GraphStore;
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use nexus_claude::{
-    memory::{ContextInjector, ConversationMemoryManager, LoadedConversation, MemoryConfig},
+    memory::{
+        ContextInjector, ConversationMemoryManager, LoadedConversation, MemoryConfig,
+        MemoryProvider, ScoredMemoryResult,
+    },
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
 };
@@ -403,6 +409,7 @@ impl ChatManager {
             message_count: 0,
             total_cost_usd: None,
             conversation_id: None,
+            preview: None,
         };
         self.graph
             .create_chat_session(&session_node)
@@ -431,7 +438,7 @@ impl ChatManager {
             // Persist conversation_id in Neo4j
             let _ = self
                 .graph
-                .update_chat_session(session_id, None, None, None, None, Some(conversation_id))
+                .update_chat_session(session_id, None, None, None, None, Some(conversation_id), None)
                 .await;
 
             Some(Arc::new(Mutex::new(mm)))
@@ -494,6 +501,35 @@ impl ChatManager {
         let _ = events_tx.send(ChatEvent::UserMessage {
             content: request.message.clone(),
         });
+
+        // Auto-generate title and preview from the first user message
+        {
+            let msg = &request.message;
+            let title = if msg.chars().count() > 80 {
+                let truncated: String = msg.chars().take(77).collect();
+                format!("{}...", truncated.trim_end())
+            } else {
+                msg.to_string()
+            };
+            let preview = if msg.chars().count() > 200 {
+                let truncated: String = msg.chars().take(197).collect();
+                format!("{}...", truncated.trim_end())
+            } else {
+                msg.to_string()
+            };
+            let _ = self
+                .graph
+                .update_chat_session(
+                    session_id,
+                    None,
+                    Some(title),
+                    None,
+                    None,
+                    None,
+                    Some(preview),
+                )
+                .await;
+        }
 
         // Send the initial message and start streaming in a background task
         let session_id_str = session_id.to_string();
@@ -634,6 +670,7 @@ impl ChatManager {
                                         None,
                                         Some(1),
                                         *cost,
+                                        None,
                                         None,
                                     )
                                     .await;
@@ -787,6 +824,7 @@ impl ChatManager {
                             Some(node.message_count + 1),
                             None,
                             None,
+                            None,
                         )
                         .await;
                 }
@@ -886,7 +924,7 @@ impl ChatManager {
             if let Ok(Some(node)) = self.graph.get_chat_session(uuid).await {
                 let _ = self
                     .graph
-                    .update_chat_session(uuid, None, None, Some(node.message_count + 1), None, None)
+                    .update_chat_session(uuid, None, None, Some(node.message_count + 1), None, None, None)
                     .await;
             }
         }
@@ -1004,6 +1042,7 @@ impl ChatManager {
                         None,
                         None,
                         Some(mm.conversation_id().to_string()),
+                        None,
                     )
                     .await;
                 mm
@@ -1124,6 +1163,107 @@ impl ChatManager {
             .load_conversation(&conversation_id, limit, offset)
             .await
             .context("Failed to load conversation messages")
+    }
+
+    /// Search messages across all sessions via Meilisearch full-text search.
+    ///
+    /// Returns matching messages grouped by session, with session metadata resolved from Neo4j.
+    pub async fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slug: Option<&str>,
+    ) -> Result<Vec<MessageSearchResult>> {
+        use nexus_claude::memory::QueryContext;
+        use std::collections::HashMap as StdHashMap;
+
+        let injector = self.context_injector.as_ref().ok_or_else(|| {
+            anyhow!("Message search not available (ContextInjector not initialized)")
+        })?;
+
+        // Use the MemoryProvider's retrieve_context with a minimal QueryContext
+        // (no cwd/files so scoring is based purely on text relevance)
+        let context = QueryContext::new(query);
+        let scored_results: Vec<ScoredMemoryResult> = injector
+            .provider()
+            .retrieve_context(&context, limit * 3) // Fetch more to allow grouping
+            .await
+            .map_err(|e| anyhow!("Meilisearch search failed: {}", e))?;
+
+        if scored_results.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Group results by conversation_id
+        let mut by_conversation: StdHashMap<String, Vec<MessageSearchHit>> = StdHashMap::new();
+        for result in &scored_results {
+            let doc = &result.document;
+            let hit = MessageSearchHit {
+                message_id: doc.id.clone(),
+                role: doc.role.clone(),
+                content_snippet: truncate_snippet(&doc.content, 300),
+                turn_index: doc.turn_index,
+                created_at: doc.created_at,
+                score: result.score.total,
+            };
+            by_conversation
+                .entry(doc.conversation_id.clone())
+                .or_default()
+                .push(hit);
+        }
+
+        // Resolve conversation_id → session metadata from Neo4j
+        // Fetch all sessions and build a lookup by conversation_id
+        let (all_sessions, _) = self.graph.list_chat_sessions(None, 200, 0).await?;
+        let session_lookup: StdHashMap<String, &crate::neo4j::models::ChatSessionNode> =
+            all_sessions
+                .iter()
+                .filter_map(|s| {
+                    s.conversation_id
+                        .as_ref()
+                        .map(|cid| (cid.clone(), s))
+                })
+                .collect();
+
+        // Build grouped results
+        let mut results: Vec<MessageSearchResult> = Vec::new();
+        for (conv_id, hits) in by_conversation {
+            let session_info = session_lookup.get(&conv_id);
+
+            // Filter by project_slug if specified
+            if let Some(filter_slug) = project_slug {
+                if let Some(session) = session_info {
+                    if session.project_slug.as_deref() != Some(filter_slug) {
+                        continue;
+                    }
+                } else {
+                    continue; // No session found, skip
+                }
+            }
+
+            let best_score = hits
+                .iter()
+                .map(|h| h.score)
+                .fold(0.0_f64, f64::max);
+
+            results.push(MessageSearchResult {
+                session_id: session_info.map(|s| s.id.to_string()).unwrap_or_default(),
+                session_title: session_info.and_then(|s| s.title.clone()),
+                session_preview: session_info.and_then(|s| s.preview.clone()),
+                project_slug: session_info.and_then(|s| s.project_slug.clone()),
+                conversation_id: conv_id,
+                hits,
+                best_score,
+            });
+        }
+
+        // Sort by best_score descending
+        results.sort_by(|a, b| b.best_score.partial_cmp(&a.best_score).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Limit to requested number of sessions
+        results.truncate(limit);
+
+        Ok(results)
     }
 
     /// Subscribe to a session's broadcast channel (used by WebSocket handler)
@@ -1884,6 +2024,7 @@ mod tests {
                 Some(5),
                 Some(0.25),
                 None,
+                None,
             )
             .await
             .unwrap()
@@ -1956,6 +2097,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap()
@@ -1971,7 +2113,7 @@ mod tests {
         let graph = &state.neo4j;
 
         let result = graph
-            .update_chat_session(uuid::Uuid::new_v4(), None, None, None, None, None)
+            .update_chat_session(uuid::Uuid::new_v4(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert!(result.is_none());
@@ -2003,6 +2145,7 @@ mod tests {
             message_count: 10,
             total_cost_usd: Some(1.50),
             conversation_id: Some("conv-abc-123".into()),
+            preview: Some("Hello, can you help me with this?".into()),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2082,6 +2225,7 @@ mod tests {
                 None,
                 None,
                 Some("conv-new-123".into()),
+                None,
             )
             .await
             .unwrap()
@@ -2123,13 +2267,14 @@ mod tests {
                 None,
                 None,
                 Some("conv-persist".into()),
+                None,
             )
             .await
             .unwrap();
 
         // Update title only — conversation_id should be preserved
         let updated = graph
-            .update_chat_session(session.id, None, Some("New Title".into()), None, None, None)
+            .update_chat_session(session.id, None, Some("New Title".into()), None, None, None, None)
             .await
             .unwrap()
             .unwrap();
@@ -2151,6 +2296,7 @@ mod tests {
             message_count: 0,
             total_cost_usd: None,
             conversation_id: Some("conv-serde-test".into()),
+            preview: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2177,6 +2323,7 @@ mod tests {
             message_count: 0,
             total_cost_usd: None,
             conversation_id: None,
+            preview: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();

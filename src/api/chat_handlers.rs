@@ -2,7 +2,7 @@
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::api::query::{PaginatedResponse, PaginationParams};
-use crate::chat::types::{ChatRequest, ChatSession, CreateSessionResponse};
+use crate::chat::types::{ChatRequest, ChatSession, CreateSessionResponse, MessageSearchResult};
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -145,6 +145,7 @@ pub async fn list_sessions(
             message_count: s.message_count,
             total_cost_usd: s.total_cost_usd,
             conversation_id: s.conversation_id,
+            preview: s.preview,
         })
         .collect();
 
@@ -181,6 +182,7 @@ pub async fn get_session(
         message_count: node.message_count,
         total_cost_usd: node.total_cost_usd,
         conversation_id: node.conversation_id,
+        preview: node.preview,
     }))
 }
 
@@ -210,6 +212,71 @@ pub async fn delete_session(
             session_id
         )))
     }
+}
+
+// ============================================================================
+// Search messages across sessions
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SearchMessagesQuery {
+    /// Full-text search query
+    pub q: String,
+    /// Optional project slug filter
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// Maximum number of session groups to return (default 10)
+    #[serde(default = "default_search_limit")]
+    pub limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+/// GET /api/chat/search — Search messages across all sessions
+pub async fn search_messages(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<SearchMessagesQuery>,
+) -> Result<Json<Vec<MessageSearchResult>>, AppError> {
+    if query.q.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Search query 'q' cannot be empty".to_string(),
+        ));
+    }
+
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    let results = chat_manager
+        .search_messages(&query.q, query.limit, query.project_slug.as_deref())
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(results))
+}
+
+// ============================================================================
+// Backfill
+// ============================================================================
+
+/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing sessions
+pub async fn backfill_previews(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let count = state
+        .orchestrator
+        .neo4j()
+        .backfill_chat_session_previews()
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "updated": count,
+        "message": format!("Backfilled title/preview for {} sessions", count)
+    })))
 }
 
 #[cfg(test)]
