@@ -88,14 +88,9 @@ pub async fn list_messages(
             }
         })?;
 
-    // Sort messages in proper chronological order for UI display.
-    // The SDK's messages_chronological() does a naive .reverse() which doesn't
-    // guarantee correct ordering. The turn_index is per-Claude-session, not
-    // a global sequence number, so we must sort strictly by created_at timestamp.
-    let mut sorted_msgs: Vec<_> = loaded.messages.iter().collect();
-    sorted_msgs.sort_by_key(|m| m.created_at);
-
-    let messages: Vec<serde_json::Value> = sorted_msgs
+    // Messages are already sorted by created_at:asc from Meilisearch (see manager)
+    let messages: Vec<serde_json::Value> = loaded
+        .messages
         .iter()
         .map(|m| {
             serde_json::json!({

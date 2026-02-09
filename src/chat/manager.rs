@@ -1177,16 +1177,19 @@ impl ChatManager {
         Ok(())
     }
 
-    /// Retrieve message history for a session via ContextInjector
+    /// Retrieve message history for a session, sorted by `created_at` ascending.
+    ///
+    /// Bypasses the SDK's `load_conversation()` which uses `newest_first(true)` and
+    /// sorts by `turn_index` — both of which produce wrong ordering when a conversation
+    /// spans multiple Claude Code sessions. Instead, we query Meilisearch directly with
+    /// `created_at:asc` so that offset 0 = oldest messages (standard chronological pagination).
     pub async fn get_session_messages(
         &self,
         session_id: &str,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<LoadedConversation> {
-        let injector = self.context_injector.as_ref().ok_or_else(|| {
-            anyhow!("Message history not available (ContextInjector not initialized)")
-        })?;
+        use nexus_claude::memory::MessageDocument;
 
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
@@ -1202,10 +1205,41 @@ impl ChatManager {
             .conversation_id
             .ok_or_else(|| anyhow!("Session {} has no conversation_id", session_id))?;
 
-        injector
-            .load_conversation(&conversation_id, limit, offset)
+        let limit_val = limit.unwrap_or(50);
+        let offset_val = offset.unwrap_or(0);
+
+        // Query Meilisearch directly, sorted by created_at ascending
+        let meili_client = meilisearch_sdk::client::Client::new(
+            &self.config.meilisearch_url,
+            Some(&self.config.meilisearch_key),
+        )
+        .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
+
+        let index = meili_client.index("nexus_messages");
+        let filter = format!("conversation_id = \"{}\"", conversation_id);
+
+        let results: meilisearch_sdk::search::SearchResults<MessageDocument> = index
+            .search()
+            .with_query("")
+            .with_filter(&filter)
+            .with_sort(&["created_at:asc"])
+            .with_limit(limit_val)
+            .with_offset(offset_val)
+            .execute()
             .await
-            .context("Failed to load conversation messages")
+            .map_err(|e| anyhow!("Meilisearch query failed: {}", e))?;
+
+        let total_count = results.estimated_total_hits.unwrap_or(0);
+        let messages: Vec<MessageDocument> = results.hits.into_iter().map(|h| h.result).collect();
+        let has_more = offset_val + messages.len() < total_count;
+
+        Ok(LoadedConversation {
+            messages,
+            total_count,
+            has_more,
+            offset: offset_val,
+            limit: limit_val,
+        })
     }
 
     /// Backfill title/preview for sessions that have a conversation_id but no title.
