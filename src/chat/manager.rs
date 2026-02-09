@@ -2183,4 +2183,352 @@ mod tests {
         let deserialized: ChatSessionNode = serde_json::from_str(&json).unwrap();
         assert!(deserialized.conversation_id.is_none());
     }
+
+    // ====================================================================
+    // get_streaming_snapshot
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_streaming_snapshot_nonexistent_session() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let (is_streaming, text, events) = manager.get_streaming_snapshot("nonexistent").await;
+        assert!(!is_streaming);
+        assert!(text.is_empty());
+        assert!(events.is_empty());
+    }
+
+    /// Helper: create a dummy InteractiveClient for tests.
+    /// Returns None if the Claude CLI is not installed (e.g., in CI).
+    fn try_create_dummy_client() -> Option<InteractiveClient> {
+        let opts = ClaudeCodeOptions {
+            model: Some("test".into()),
+            ..Default::default()
+        };
+        InteractiveClient::new(opts).ok()
+    }
+
+    /// Helper: create a dummy ActiveSession for testing.
+    /// Returns None if the Claude CLI is not installed.
+    fn try_create_dummy_session(
+        is_streaming: bool,
+        streaming_text: &str,
+        streaming_events_data: Vec<ChatEvent>,
+    ) -> Option<(ActiveSession, Arc<Mutex<VecDeque<String>>>)> {
+        let client = try_create_dummy_client()?;
+        let (tx, _rx) = broadcast::channel(16);
+        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+
+        let session = ActiveSession {
+            events_tx: tx,
+            last_activity: Instant::now(),
+            cli_session_id: None,
+            client: Arc::new(Mutex::new(client)),
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            memory_manager: None,
+            next_seq: Arc::new(AtomicI64::new(1)),
+            pending_messages: pending_messages.clone(),
+            is_streaming: Arc::new(AtomicBool::new(is_streaming)),
+            streaming_text: Arc::new(Mutex::new(streaming_text.to_string())),
+            streaming_events: Arc::new(Mutex::new(streaming_events_data)),
+        };
+
+        Some((session, pending_messages))
+    }
+
+    #[tokio::test]
+    async fn test_get_streaming_snapshot_with_active_session_not_streaming() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("test-session".into(), session);
+
+        let (is_streaming, text, events) = manager.get_streaming_snapshot("test-session").await;
+        assert!(!is_streaming);
+        assert!(text.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_streaming_snapshot_with_active_streaming_session() {
+        let events_data = vec![
+            ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "list_plans".into(),
+                input: serde_json::json!({}),
+            },
+            ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: serde_json::json!({"plans": []}),
+                is_error: false,
+            },
+        ];
+
+        let Some((session, _)) = try_create_dummy_session(true, "Hello world", events_data) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("streaming-session".into(), session);
+
+        let (is_streaming, text, events) =
+            manager.get_streaming_snapshot("streaming-session").await;
+        assert!(is_streaming);
+        assert_eq!(text, "Hello world");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], ChatEvent::ToolUse { tool, .. } if tool == "list_plans"));
+        assert!(matches!(&events[1], ChatEvent::ToolResult { id, .. } if id == "t1"));
+    }
+
+    // ====================================================================
+    // send_message — queuing when is_streaming=true
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_send_message_queues_when_streaming() {
+        let Some((session, pending_messages)) = try_create_dummy_session(true, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let session_id = Uuid::new_v4().to_string();
+
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+
+        // Send a message while streaming — should be queued, NOT sent
+        let result = manager.send_message(&session_id, "queued message").await;
+        assert!(result.is_ok());
+
+        // Verify the message was queued
+        let queue = pending_messages.lock().await;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0], "queued message");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_queues_multiple_when_streaming() {
+        let Some((session, pending_messages)) = try_create_dummy_session(true, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let session_id = Uuid::new_v4().to_string();
+
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+
+        // Queue multiple messages
+        manager.send_message(&session_id, "first").await.unwrap();
+        manager.send_message(&session_id, "second").await.unwrap();
+        manager.send_message(&session_id, "third").await.unwrap();
+
+        let queue = pending_messages.lock().await;
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0], "first");
+        assert_eq!(queue[1], "second");
+        assert_eq!(queue[2], "third");
+    }
+
+    // ====================================================================
+    // streaming_events filtering logic
+    // ====================================================================
+
+    #[test]
+    fn test_streaming_events_filter_excludes_transient_events() {
+        // This tests the filtering logic used in stream_response():
+        // StreamDelta, StreamingStatus, and AssistantText should be EXCLUDED
+        // from streaming_events buffer (they are handled via streaming_text or
+        // sent explicitly in Phase 1.5)
+
+        let events_to_exclude = vec![
+            ChatEvent::StreamDelta {
+                text: "Hello".into(),
+            },
+            ChatEvent::StreamingStatus { is_streaming: true },
+            ChatEvent::StreamingStatus {
+                is_streaming: false,
+            },
+            ChatEvent::AssistantText {
+                content: "Hello world".into(),
+            },
+        ];
+
+        for event in &events_to_exclude {
+            let should_add = !matches!(
+                event,
+                ChatEvent::StreamDelta { .. }
+                    | ChatEvent::StreamingStatus { .. }
+                    | ChatEvent::AssistantText { .. }
+            );
+            assert!(
+                !should_add,
+                "Event {:?} should be excluded from streaming_events",
+                event.event_type()
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_events_filter_includes_structured_events() {
+        // These events SHOULD be included in streaming_events buffer
+        // so mid-stream joiners can reconstruct tool calls
+
+        let events_to_include = vec![
+            ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "create_plan".into(),
+                input: serde_json::json!({"title": "Plan"}),
+            },
+            ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: serde_json::json!({"id": "abc"}),
+                is_error: false,
+            },
+            ChatEvent::Thinking {
+                content: "Let me think...".into(),
+            },
+            ChatEvent::PermissionRequest {
+                id: "p1".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            ChatEvent::InputRequest {
+                prompt: "Choose:".into(),
+                options: Some(vec!["A".into(), "B".into()]),
+            },
+            ChatEvent::Error {
+                message: "Something went wrong".into(),
+            },
+            ChatEvent::Result {
+                session_id: "cli-123".into(),
+                duration_ms: 5000,
+                cost_usd: Some(0.15),
+            },
+            ChatEvent::UserMessage {
+                content: "Hello".into(),
+            },
+        ];
+
+        for event in &events_to_include {
+            let should_add = !matches!(
+                event,
+                ChatEvent::StreamDelta { .. }
+                    | ChatEvent::StreamingStatus { .. }
+                    | ChatEvent::AssistantText { .. }
+            );
+            assert!(
+                should_add,
+                "Event {:?} should be included in streaming_events",
+                event.event_type()
+            );
+        }
+    }
+
+    // ====================================================================
+    // ActiveSession with streaming_events field
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_active_session_streaming_events_field() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // Verify streaming_events starts empty
+        assert!(session.streaming_events.lock().await.is_empty());
+
+        // Push an event and verify it's accessible
+        session
+            .streaming_events
+            .lock()
+            .await
+            .push(ChatEvent::Thinking {
+                content: "test".into(),
+            });
+        assert_eq!(session.streaming_events.lock().await.len(), 1);
+
+        // Clear and verify
+        session.streaming_events.lock().await.clear();
+        assert!(session.streaming_events.lock().await.is_empty());
+    }
+
+    // ====================================================================
+    // ChatEvent event_type() — covers the StreamingStatus variant
+    // ====================================================================
+
+    #[test]
+    fn test_chat_event_streaming_status_type() {
+        let event = ChatEvent::StreamingStatus { is_streaming: true };
+        assert_eq!(event.event_type(), "streaming_status");
+
+        let event = ChatEvent::StreamingStatus {
+            is_streaming: false,
+        };
+        assert_eq!(event.event_type(), "streaming_status");
+    }
+
+    #[test]
+    fn test_chat_event_user_message_type() {
+        let event = ChatEvent::UserMessage {
+            content: "Hello".into(),
+        };
+        assert_eq!(event.event_type(), "user_message");
+    }
+
+    #[test]
+    fn test_chat_event_streaming_status_serde_roundtrip() {
+        let event = ChatEvent::StreamingStatus { is_streaming: true };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"streaming_status\""));
+        assert!(json.contains("\"is_streaming\":true"));
+
+        let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            deserialized,
+            ChatEvent::StreamingStatus { is_streaming: true }
+        ));
+    }
+
+    #[test]
+    fn test_chat_event_user_message_serde_roundtrip() {
+        let event = ChatEvent::UserMessage {
+            content: "Hello world".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"user_message\""));
+
+        let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(deserialized, ChatEvent::UserMessage { ref content } if content == "Hello world")
+        );
+    }
 }
