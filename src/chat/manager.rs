@@ -23,7 +23,6 @@ use futures::StreamExt;
 use nexus_claude::{
     memory::{
         ContextInjector, ConversationMemoryManager, LoadedConversation, MemoryConfig,
-        MemoryProvider, ScoredMemoryResult,
     },
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
@@ -1281,53 +1280,61 @@ impl ChatManager {
 
     /// Search messages across all sessions via Meilisearch full-text search.
     ///
-    /// Returns matching messages grouped by session, with session metadata resolved from Neo4j.
+    /// Queries the `nexus_messages` index directly (bypassing the nexus SDK's
+    /// `retrieve_context` which applies token_budget / max_context_items limits
+    /// designed for LLM context injection, not UI search).
     pub async fn search_messages(
         &self,
         query: &str,
         limit: usize,
         project_slug: Option<&str>,
     ) -> Result<Vec<MessageSearchResult>> {
-        use nexus_claude::memory::QueryContext;
+        use nexus_claude::memory::MessageDocument;
         use std::collections::HashMap as StdHashMap;
 
-        let injector = self.context_injector.as_ref().ok_or_else(|| {
-            anyhow!("Message search not available (ContextInjector not initialized)")
-        })?;
+        // Build a direct Meilisearch client from our config
+        let meili_client = meilisearch_sdk::client::Client::new(
+            &self.config.meilisearch_url,
+            Some(&self.config.meilisearch_key),
+        )
+        .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
 
-        // Use the MemoryProvider's retrieve_context with a minimal QueryContext
-        // (no cwd/files so scoring is based purely on text relevance)
-        let context = QueryContext::new(query);
-        let scored_results: Vec<ScoredMemoryResult> = injector
-            .provider()
-            .retrieve_context(&context, limit * 3) // Fetch more to allow grouping
+        let index = meili_client.index("nexus_messages");
+
+        // Query Meilisearch directly — no token budget, no max_context_items
+        let search_results: meilisearch_sdk::search::SearchResults<MessageDocument> = index
+            .search()
+            .with_query(query)
+            .with_limit(limit * 5) // Fetch extra to allow grouping by session
+            .with_show_ranking_score(true)
+            .execute()
             .await
             .map_err(|e| anyhow!("Meilisearch search failed: {}", e))?;
 
-        if scored_results.is_empty() {
+        if search_results.hits.is_empty() {
             return Ok(vec![]);
         }
 
         // Group results by conversation_id
         let mut by_conversation: StdHashMap<String, Vec<MessageSearchHit>> = StdHashMap::new();
-        for result in &scored_results {
-            let doc = &result.document;
-            let hit = MessageSearchHit {
+        for hit in &search_results.hits {
+            let doc = &hit.result;
+            let score = hit.ranking_score.unwrap_or(0.0);
+            let search_hit = MessageSearchHit {
                 message_id: doc.id.clone(),
                 role: doc.role.clone(),
                 content_snippet: truncate_snippet(&doc.content, 300),
                 turn_index: doc.turn_index,
                 created_at: doc.created_at,
-                score: result.score.total,
+                score,
             };
             by_conversation
                 .entry(doc.conversation_id.clone())
                 .or_default()
-                .push(hit);
+                .push(search_hit);
         }
 
         // Resolve conversation_id → session metadata from Neo4j
-        // Fetch all sessions and build a lookup by conversation_id
         let (all_sessions, _) = self.graph.list_chat_sessions(None, 200, 0).await?;
         let session_lookup: StdHashMap<String, &crate::neo4j::models::ChatSessionNode> =
             all_sessions

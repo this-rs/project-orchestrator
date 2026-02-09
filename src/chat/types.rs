@@ -191,13 +191,22 @@ pub struct MessageSearchResult {
     pub best_score: f64,
 }
 
-/// Truncate text to a maximum length, preserving word boundaries.
+/// Truncate text to a maximum length (in characters, not bytes),
+/// preserving word boundaries and UTF-8 safety.
 pub fn truncate_snippet(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
+    // Count characters, not bytes (UTF-8 safe)
+    let char_count = text.chars().count();
+    if char_count <= max_len {
         return text.to_string();
     }
-    // Find last space before max_len
-    let truncated = &text[..max_len];
+    // Collect up to max_len characters and find the byte boundary
+    let byte_end = text
+        .char_indices()
+        .nth(max_len)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let truncated = &text[..byte_end];
+    // Try to break at last space for cleaner output
     if let Some(last_space) = truncated.rfind(' ') {
         format!("{}...", &text[..last_space])
     } else {
