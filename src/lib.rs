@@ -8,6 +8,7 @@
 //! - MCP server for Claude Code integration
 
 pub mod api;
+pub mod auth;
 pub mod chat;
 pub mod events;
 pub mod mcp;

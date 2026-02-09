@@ -69,6 +69,9 @@ reqwest = { version = "0.12", features = ["json"] }
 nexus-claude = { git = "https://github.com/this-rs/nexus.git", features = ["memory"] }
 tokio-stream = "0.1"
 
+# Auth
+jsonwebtoken = "9"
+
 # Config
 dotenvy = "0.15"
 urlencoding = "2.1.3"
