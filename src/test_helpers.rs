@@ -31,6 +31,7 @@ pub fn mock_app_state() -> AppState {
             meilisearch_key: "mock-key".to_string(),
             workspace_path: ".".to_string(),
             server_port: 0,
+            auth_config: None,
         }),
     }
 }
@@ -49,6 +50,7 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             meilisearch_key: "mock-key".to_string(),
             workspace_path: ".".to_string(),
             server_port: 0,
+            auth_config: None,
         }),
     }
 }
