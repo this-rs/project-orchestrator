@@ -337,6 +337,7 @@ mod tests {
             watcher,
             chat_manager: None,
             event_bus: Arc::new(crate::events::EventBus::default()),
+            auth_config: None,
         })
     }
 
@@ -363,6 +364,7 @@ mod tests {
             watcher,
             chat_manager: None,
             event_bus: Arc::new(crate::events::EventBus::default()),
+            auth_config: None,
         });
         create_router(state)
     }

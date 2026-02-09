@@ -111,6 +111,7 @@ async fn run_server(config: Config) -> Result<()> {
         watcher: Arc::new(RwLock::new(watcher)),
         chat_manager,
         event_bus,
+        auth_config: config.auth_config.clone(),
     });
 
     // Create router
