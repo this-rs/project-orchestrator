@@ -21,9 +21,7 @@ use crate::neo4j::GraphStore;
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use nexus_claude::{
-    memory::{
-        ContextInjector, ConversationMemoryManager, LoadedConversation, MemoryConfig,
-    },
+    memory::{ContextInjector, ConversationMemoryManager, LoadedConversation, MemoryConfig},
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
 };
@@ -447,7 +445,15 @@ impl ChatManager {
             // Persist conversation_id in Neo4j
             let _ = self
                 .graph
-                .update_chat_session(session_id, None, None, None, None, Some(conversation_id), None)
+                .update_chat_session(
+                    session_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(conversation_id),
+                    None,
+                )
                 .await;
 
             Some(Arc::new(Mutex::new(mm)))
@@ -963,7 +969,15 @@ impl ChatManager {
             if let Ok(Some(node)) = self.graph.get_chat_session(uuid).await {
                 let _ = self
                     .graph
-                    .update_chat_session(uuid, None, None, Some(node.message_count + 1), None, None, None)
+                    .update_chat_session(
+                        uuid,
+                        None,
+                        None,
+                        Some(node.message_count + 1),
+                        None,
+                        None,
+                        None,
+                    )
                     .await;
             }
         }
@@ -1373,11 +1387,7 @@ impl ChatManager {
         let session_lookup: StdHashMap<String, &crate::neo4j::models::ChatSessionNode> =
             all_sessions
                 .iter()
-                .filter_map(|s| {
-                    s.conversation_id
-                        .as_ref()
-                        .map(|cid| (cid.clone(), s))
-                })
+                .filter_map(|s| s.conversation_id.as_ref().map(|cid| (cid.clone(), s)))
                 .collect();
 
         // Build grouped results
@@ -1396,10 +1406,7 @@ impl ChatManager {
                 }
             }
 
-            let best_score = hits
-                .iter()
-                .map(|h| h.score)
-                .fold(0.0_f64, f64::max);
+            let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
 
             results.push(MessageSearchResult {
                 session_id: session_info.map(|s| s.id.to_string()).unwrap_or_default(),
@@ -1413,7 +1420,11 @@ impl ChatManager {
         }
 
         // Sort by best_score descending
-        results.sort_by(|a, b| b.best_score.partial_cmp(&a.best_score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.best_score
+                .partial_cmp(&a.best_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Limit to requested number of sessions
         results.truncate(limit);
@@ -2333,29 +2344,26 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
+        // Session doesn't exist in mock store — should get "not found"
         let result = manager
             .get_session_messages(&Uuid::new_v4().to_string(), None, None)
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ContextInjector not initialized"));
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[tokio::test]
     async fn test_get_session_messages_invalid_uuid() {
-        // Even with no injector, the error about injector comes first
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let result = manager.get_session_messages("not-a-uuid", None, None).await;
         assert!(result.is_err());
-        // Without injector, the "ContextInjector not initialized" error comes first
+        // Invalid UUID is rejected before any storage lookup
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("ContextInjector not initialized"));
+            .contains("Invalid session ID"));
     }
 
     // ====================================================================
@@ -2429,7 +2437,15 @@ mod tests {
 
         // Update title only — conversation_id should be preserved
         let updated = graph
-            .update_chat_session(session.id, None, Some("New Title".into()), None, None, None, None)
+            .update_chat_session(
+                session.id,
+                None,
+                Some("New Title".into()),
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap()
             .unwrap();

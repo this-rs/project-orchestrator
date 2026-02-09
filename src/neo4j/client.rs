@@ -6984,10 +6984,7 @@ impl Neo4jClient {
                         "conversation_id",
                         session.conversation_id.clone().unwrap_or_default(),
                     )
-                    .param(
-                        "preview",
-                        session.preview.clone().unwrap_or_default(),
-                    ),
+                    .param("preview", session.preview.clone().unwrap_or_default()),
             )
             .await?;
         Ok(())
@@ -7061,6 +7058,7 @@ impl Neo4jClient {
     }
 
     /// Update a chat session (partial, None fields are skipped)
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_chat_session(
         &self,
         id: Uuid,

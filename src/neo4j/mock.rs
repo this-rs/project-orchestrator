@@ -3317,6 +3317,7 @@ impl GraphStore for MockGraphStore {
         Ok((page, total))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_chat_session(
         &self,
         id: Uuid,

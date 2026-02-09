@@ -929,6 +929,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<(Vec<ChatSessionNode>, usize)>;
 
     /// Update a chat session (partial update, None fields are skipped)
+    #[allow(clippy::too_many_arguments)]
     async fn update_chat_session(
         &self,
         id: Uuid,
