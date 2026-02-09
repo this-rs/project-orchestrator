@@ -55,6 +55,10 @@ pub struct ActiveSession {
     pub is_streaming: Arc<AtomicBool>,
     /// Accumulated text from stream_delta during the current stream (for mid-stream join)
     pub streaming_text: Arc<Mutex<String>>,
+    /// Accumulated structured events during the current stream (for mid-stream join).
+    /// Contains all non-StreamDelta events (ToolUse, ToolResult, AssistantText, etc.)
+    /// that haven't been persisted yet. Cleared at stream start/end.
+    pub streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -446,6 +450,7 @@ impl ChatManager {
         let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
         let is_streaming = Arc::new(AtomicBool::new(false));
         let streaming_text = Arc::new(Mutex::new(String::new()));
+        let streaming_events = Arc::new(Mutex::new(Vec::new()));
 
         // Register active session
         let interrupt_flag = {
@@ -464,6 +469,7 @@ impl ChatManager {
                     pending_messages: pending_messages.clone(),
                     is_streaming: is_streaming.clone(),
                     streaming_text: streaming_text.clone(),
+                    streaming_events: streaming_events.clone(),
                 },
             );
             interrupt_flag
@@ -512,6 +518,7 @@ impl ChatManager {
                 pending_messages,
                 is_streaming,
                 streaming_text,
+                streaming_events,
             )
             .await;
         });
@@ -538,12 +545,14 @@ impl ChatManager {
         pending_messages: Arc<Mutex<VecDeque<String>>>,
         is_streaming: Arc<AtomicBool>,
         streaming_text: Arc<Mutex<String>>,
+        streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
     ) {
         is_streaming.store(true, Ordering::SeqCst);
         // Broadcast streaming_status to all connected clients (multi-tab support)
         let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: true });
-        // Clear streaming_text buffer for the new stream
+        // Clear streaming buffers for the new stream
         streaming_text.lock().await.clear();
+        streaming_events.lock().await.clear();
 
         // Record user message in memory manager
         if let Some(ref mm) = memory_manager {
@@ -575,6 +584,7 @@ impl ChatManager {
                     });
                     is_streaming.store(false, Ordering::SeqCst);
                     streaming_text.lock().await.clear();
+                    streaming_events.lock().await.clear();
                     return;
                 }
             };
@@ -650,7 +660,10 @@ impl ChatManager {
                         let events = Self::message_to_events(msg);
                         for event in events {
                             // Persist structured events (skip transient: stream_delta, streaming_status)
-                            if !matches!(event, ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. }) {
+                            if !matches!(
+                                event,
+                                ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. }
+                            ) {
                                 if let Some(uuid) = session_uuid {
                                     let seq = next_seq.fetch_add(1, Ordering::SeqCst);
                                     events_to_persist.push(ChatEventRecord {
@@ -662,6 +675,20 @@ impl ChatManager {
                                         created_at: chrono::Utc::now(),
                                     });
                                 }
+                            }
+
+                            // Accumulate structured events for mid-stream join snapshot.
+                            // Excluded:
+                            // - StreamDelta: text is in streaming_text (sent as partial_text)
+                            // - StreamingStatus: transient, sent explicitly in Phase 1.5
+                            // - AssistantText: duplicates streaming_text content (sent as partial_text)
+                            if !matches!(
+                                event,
+                                ChatEvent::StreamDelta { .. }
+                                    | ChatEvent::StreamingStatus { .. }
+                                    | ChatEvent::AssistantText { .. }
+                            ) {
+                                streaming_events.lock().await.push(event.clone());
                             }
 
                             let _ = events_tx.send(event);
@@ -729,8 +756,11 @@ impl ChatManager {
 
         is_streaming.store(false, Ordering::SeqCst);
         // Broadcast streaming_status=false to all connected clients (multi-tab support)
-        let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: false });
+        let _ = events_tx.send(ChatEvent::StreamingStatus {
+            is_streaming: false,
+        });
         streaming_text.lock().await.clear();
+        streaming_events.lock().await.clear();
         debug!("Stream completed for session {}", session_id);
 
         // Check pending_messages queue — if there are queued messages, process the next one
@@ -745,8 +775,22 @@ impl ChatManager {
                 session_id
             );
 
-            // Persist the queued user_message event
+            // Persist the queued user_message event and update message count
             if let Some(uuid) = session_uuid {
+                // Update message count
+                if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
+                    let _ = graph
+                        .update_chat_session(
+                            uuid,
+                            None,
+                            None,
+                            Some(node.message_count + 1),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+
                 let user_event = ChatEventRecord {
                     id: Uuid::new_v4(),
                     session_id: uuid,
@@ -780,6 +824,7 @@ impl ChatManager {
                 pending_messages,
                 is_streaming,
                 streaming_text,
+                streaming_events,
             ))
             .await;
         }
@@ -797,6 +842,7 @@ impl ChatManager {
             pending_messages,
             is_streaming,
             streaming_text,
+            streaming_events,
         ) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
@@ -816,8 +862,24 @@ impl ChatManager {
                 session.pending_messages.clone(),
                 session.is_streaming.clone(),
                 session.streaming_text.clone(),
+                session.streaming_events.clone(),
             )
         };
+
+        // If a stream is in progress, queue the message for later processing.
+        // Do NOT persist or broadcast yet — the dequeue in stream_response() handles that,
+        // ensuring the user_message seq comes AFTER the current stream's events.
+        if is_streaming.load(Ordering::SeqCst) {
+            info!(
+                "Stream in progress for session {}, queuing message",
+                session_id
+            );
+            let mut queue = pending_messages.lock().await;
+            queue.push_back(message.to_string());
+            return Ok(());
+        }
+
+        // No stream in progress — persist and broadcast immediately
 
         // Update message count in Neo4j
         if let Ok(uuid) = Uuid::parse_str(session_id) {
@@ -848,18 +910,7 @@ impl ChatManager {
             content: message.to_string(),
         });
 
-        // If a stream is in progress, queue the message for later processing
-        if is_streaming.load(Ordering::SeqCst) {
-            info!(
-                "Stream in progress for session {}, queuing message",
-                session_id
-            );
-            let mut queue = pending_messages.lock().await;
-            queue.push_back(message.to_string());
-            return Ok(());
-        }
-
-        // No stream in progress — start streaming directly
+        // Start streaming directly
         let session_id_str = session_id.to_string();
         let graph = self.graph.clone();
         let active_sessions = self.active_sessions.clone();
@@ -881,6 +932,7 @@ impl ChatManager {
                 pending_messages,
                 is_streaming,
                 streaming_text,
+                streaming_events,
             )
             .await;
         });
@@ -971,6 +1023,7 @@ impl ChatManager {
         let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
         let is_streaming = Arc::new(AtomicBool::new(false));
         let streaming_text = Arc::new(Mutex::new(String::new()));
+        let streaming_events = Arc::new(Mutex::new(Vec::new()));
 
         // Register as active
         let interrupt_flag = {
@@ -989,6 +1042,7 @@ impl ChatManager {
                     pending_messages: pending_messages.clone(),
                     is_streaming: is_streaming.clone(),
                     streaming_text: streaming_text.clone(),
+                    streaming_events: streaming_events.clone(),
                 },
             );
             interrupt_flag
@@ -1033,6 +1087,7 @@ impl ChatManager {
                 pending_messages,
                 is_streaming,
                 streaming_text,
+                streaming_events,
             )
             .await;
         });
@@ -1103,18 +1158,23 @@ impl ChatManager {
 
     /// Get a snapshot of the current streaming state for mid-stream join.
     ///
-    /// Returns `(is_streaming, accumulated_text)`. The accumulated text contains all
-    /// stream_delta text received since the current stream started. This allows a
-    /// newly connected WebSocket client to reconstruct the partial assistant message.
-    pub async fn get_streaming_snapshot(&self, session_id: &str) -> (bool, String) {
+    /// Returns `(is_streaming, accumulated_text, streaming_events)`.
+    /// - `accumulated_text`: all stream_delta text since the current stream started
+    /// - `streaming_events`: all structured events (ToolUse, ToolResult, AssistantText, etc.)
+    ///   since the current stream started, excluding StreamDelta (which is in accumulated_text)
+    ///
+    /// This allows a newly connected WebSocket client to fully reconstruct the
+    /// in-progress assistant turn, including tool calls.
+    pub async fn get_streaming_snapshot(&self, session_id: &str) -> (bool, String, Vec<ChatEvent>) {
         let sessions = self.active_sessions.read().await;
         match sessions.get(session_id) {
             Some(session) => {
                 let is_streaming = session.is_streaming.load(Ordering::SeqCst);
                 let text = session.streaming_text.lock().await.clone();
-                (is_streaming, text)
+                let events = session.streaming_events.lock().await.clone();
+                (is_streaming, text, events)
             }
-            None => (false, String::new()),
+            None => (false, String::new(), Vec::new()),
         }
     }
 

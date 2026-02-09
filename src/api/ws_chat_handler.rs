@@ -203,32 +203,73 @@ async fn handle_ws_chat(
     // ========================================================================
     // Phase 1.5: Send streaming snapshot if a stream is in progress
     // ========================================================================
-    let (is_currently_streaming, partial_text) =
+    let (is_currently_streaming, partial_text, streaming_events) =
         chat_manager.get_streaming_snapshot(&session_id).await;
 
-    if is_currently_streaming && !partial_text.is_empty() {
-        debug!(
-            session_id = %session_id,
-            text_len = partial_text.len(),
-            "Sending partial_text snapshot for mid-stream join"
-        );
-        let partial_msg = serde_json::json!({
-            "type": "partial_text",
-            "content": partial_text,
-            "seq": 0,
-            "replaying": true,
-        });
-        if ws_sender
-            .send(Message::Text(partial_msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            debug!("Client disconnected during partial_text");
-            return;
-        }
-    }
+    info!(
+        session_id = %session_id,
+        is_currently_streaming,
+        partial_text_len = partial_text.len(),
+        streaming_events_count = streaming_events.len(),
+        "Phase 1.5: streaming snapshot"
+    );
 
     if is_currently_streaming {
+        // Send accumulated structured events (tool_use, tool_result, assistant_text, etc.)
+        // These are the non-StreamDelta events that occurred during the current stream.
+        if !streaming_events.is_empty() {
+            debug!(
+                session_id = %session_id,
+                count = streaming_events.len(),
+                "Sending streaming_events snapshot for mid-stream join"
+            );
+            for event in &streaming_events {
+                match serde_json::to_value(event) {
+                    Ok(mut val) => {
+                        if let Some(obj) = val.as_object_mut() {
+                            obj.insert("seq".to_string(), serde_json::json!(0));
+                            obj.insert("replaying".to_string(), serde_json::json!(true));
+                        }
+                        if ws_sender
+                            .send(Message::Text(val.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            debug!("Client disconnected during streaming_events replay");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to serialize streaming event: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Send accumulated stream_delta text as a single partial_text snapshot
+        if !partial_text.is_empty() {
+            debug!(
+                session_id = %session_id,
+                text_len = partial_text.len(),
+                "Sending partial_text snapshot for mid-stream join"
+            );
+            let partial_msg = serde_json::json!({
+                "type": "partial_text",
+                "content": partial_text,
+                "seq": 0,
+                "replaying": true,
+            });
+            if ws_sender
+                .send(Message::Text(partial_msg.to_string().into()))
+                .await
+                .is_err()
+            {
+                debug!("Client disconnected during partial_text");
+                return;
+            }
+        }
+
+        // Notify client that streaming is in progress (for interrupt button)
         let status_msg = serde_json::json!({
             "type": "streaming_status",
             "is_streaming": true,
