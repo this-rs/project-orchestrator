@@ -442,6 +442,11 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/chat/sessions",
             get(chat_handlers::list_sessions).post(chat_handlers::create_session),
         )
+        .route("/api/chat/search", get(chat_handlers::search_messages))
+        .route(
+            "/api/chat/sessions/backfill-previews",
+            post(chat_handlers::backfill_previews),
+        )
         .route(
             "/api/chat/sessions/{id}",
             get(chat_handlers::get_session).delete(chat_handlers::delete_session),

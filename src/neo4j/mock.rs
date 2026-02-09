@@ -3317,6 +3317,7 @@ impl GraphStore for MockGraphStore {
         Ok((page, total))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_chat_session(
         &self,
         id: Uuid,
@@ -3325,6 +3326,7 @@ impl GraphStore for MockGraphStore {
         message_count: Option<i64>,
         total_cost_usd: Option<f64>,
         conversation_id: Option<String>,
+        preview: Option<String>,
     ) -> Result<Option<ChatSessionNode>> {
         let mut sessions = self.chat_sessions.write().await;
         if let Some(session) = sessions.get_mut(&id) {
@@ -3344,10 +3346,18 @@ impl GraphStore for MockGraphStore {
             if let Some(v) = conversation_id {
                 session.conversation_id = Some(v);
             }
+            if let Some(v) = preview {
+                session.preview = Some(v);
+            }
             Ok(Some(session.clone()))
         } else {
             Ok(None)
         }
+    }
+
+    async fn backfill_chat_session_previews(&self) -> Result<usize> {
+        // Mock: no events stored, nothing to backfill
+        Ok(0)
     }
 
     async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {

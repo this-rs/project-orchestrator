@@ -1234,6 +1234,7 @@ impl GraphStore for Neo4jClient {
         self.list_chat_sessions(project_slug, limit, offset).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_chat_session(
         &self,
         id: Uuid,
@@ -1242,6 +1243,7 @@ impl GraphStore for Neo4jClient {
         message_count: Option<i64>,
         total_cost_usd: Option<f64>,
         conversation_id: Option<String>,
+        preview: Option<String>,
     ) -> anyhow::Result<Option<ChatSessionNode>> {
         self.update_chat_session(
             id,
@@ -1250,8 +1252,13 @@ impl GraphStore for Neo4jClient {
             message_count,
             total_cost_usd,
             conversation_id,
+            preview,
         )
         .await
+    }
+
+    async fn backfill_chat_session_previews(&self) -> anyhow::Result<usize> {
+        self.backfill_chat_session_previews().await
     }
 
     async fn delete_chat_session(&self, id: Uuid) -> anyhow::Result<bool> {

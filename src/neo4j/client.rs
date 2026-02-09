@@ -6931,7 +6931,8 @@ impl Neo4jClient {
                     updated_at: datetime($updated_at),
                     message_count: $message_count,
                     total_cost_usd: $total_cost_usd,
-                    conversation_id: $conversation_id
+                    conversation_id: $conversation_id,
+                    preview: $preview
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -6954,7 +6955,8 @@ impl Neo4jClient {
                     updated_at: datetime($updated_at),
                     message_count: $message_count,
                     total_cost_usd: $total_cost_usd,
-                    conversation_id: $conversation_id
+                    conversation_id: $conversation_id,
+                    preview: $preview
                 })
                 "#,
             )
@@ -6981,7 +6983,8 @@ impl Neo4jClient {
                     .param(
                         "conversation_id",
                         session.conversation_id.clone().unwrap_or_default(),
-                    ),
+                    )
+                    .param("preview", session.preview.clone().unwrap_or_default()),
             )
             .await?;
         Ok(())
@@ -7055,6 +7058,7 @@ impl Neo4jClient {
     }
 
     /// Update a chat session (partial, None fields are skipped)
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_chat_session(
         &self,
         id: Uuid,
@@ -7063,6 +7067,7 @@ impl Neo4jClient {
         message_count: Option<i64>,
         total_cost_usd: Option<f64>,
         conversation_id: Option<String>,
+        preview: Option<String>,
     ) -> Result<Option<ChatSessionNode>> {
         let mut set_clauses = vec!["s.updated_at = datetime()".to_string()];
 
@@ -7081,6 +7086,9 @@ impl Neo4jClient {
         if let Some(ref v) = conversation_id {
             set_clauses.push(format!("s.conversation_id = '{}'", v.replace('\'', "\\'")));
         }
+        if let Some(ref v) = preview {
+            set_clauses.push(format!("s.preview = '{}'", v.replace('\'', "\\'")));
+        }
 
         let cypher = format!(
             "MATCH (s:ChatSession {{id: $id}}) SET {} RETURN s",
@@ -7096,6 +7104,68 @@ impl Neo4jClient {
         } else {
             Ok(None)
         }
+    }
+
+    /// Backfill title and preview for sessions that don't have them yet.
+    /// Uses the first user_message event stored in Neo4j.
+    /// Returns the number of sessions updated.
+    pub async fn backfill_chat_session_previews(&self) -> Result<usize> {
+        // Find sessions without preview, get their first user_message event
+        let q = query(
+            r#"
+            MATCH (s:ChatSession)
+            WHERE s.preview IS NULL OR s.preview = ''
+            OPTIONAL MATCH (s)-[:HAS_EVENT]->(e:ChatEvent {event_type: 'user_message'})
+            WITH s, e ORDER BY e.seq ASC
+            WITH s, collect(e)[0] AS first_event
+            WHERE first_event IS NOT NULL
+            RETURN s.id AS session_id, first_event.data AS event_data
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut updates = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let session_id: String = row.get("session_id")?;
+            let event_data: String = row.get("event_data").unwrap_or_default();
+
+            // Parse the event data JSON to extract content
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&event_data) {
+                if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
+                    let chars: Vec<char> = content.chars().collect();
+                    let title = if chars.len() > 80 {
+                        format!("{}...", chars[..77].iter().collect::<String>().trim_end())
+                    } else {
+                        content.to_string()
+                    };
+                    let preview = if chars.len() > 200 {
+                        format!("{}...", chars[..197].iter().collect::<String>().trim_end())
+                    } else {
+                        content.to_string()
+                    };
+                    updates.push((session_id, title, preview));
+                }
+            }
+        }
+
+        let count = updates.len();
+        for (session_id, title, preview) in updates {
+            let update_q = query(
+                r#"
+                MATCH (s:ChatSession {id: $id})
+                WHERE s.preview IS NULL OR s.preview = ''
+                SET s.title = $title, s.preview = $preview, s.updated_at = datetime()
+                "#,
+            )
+            .param("id", session_id)
+            .param("title", title)
+            .param("preview", preview);
+
+            let _ = self.graph.run(update_q).await;
+        }
+
+        Ok(count)
     }
 
     /// Delete a chat session
@@ -7122,6 +7192,7 @@ impl Neo4jClient {
         let project_slug: String = node.get("project_slug").unwrap_or_default();
         let title: String = node.get("title").unwrap_or_default();
         let conversation_id: String = node.get("conversation_id").unwrap_or_default();
+        let preview: String = node.get("preview").unwrap_or_default();
 
         Ok(ChatSessionNode {
             id: node.get::<String>("id")?.parse()?,
@@ -7159,6 +7230,11 @@ impl Neo4jClient {
                 None
             } else {
                 Some(conversation_id)
+            },
+            preview: if preview.is_empty() {
+                None
+            } else {
+                Some(preview)
             },
         })
     }

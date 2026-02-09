@@ -2,7 +2,8 @@
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::api::query::{PaginatedResponse, PaginationParams};
-use crate::chat::types::{ChatRequest, ChatSession, CreateSessionResponse};
+use crate::chat::types::{ChatRequest, ChatSession, CreateSessionResponse, MessageSearchResult};
+use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -28,6 +29,18 @@ pub async fn create_session(
         .create_session(&request)
         .await
         .map_err(AppError::Internal)?;
+
+    // Emit CRUD event for live refresh
+    state.event_bus.emit(
+        CrudEvent::new(
+            EntityType::ChatSession,
+            CrudAction::Created,
+            &response.session_id,
+        )
+        .with_payload(serde_json::json!({
+            "project_slug": request.project_slug,
+        })),
+    );
 
     Ok(Json(response))
 }
@@ -75,9 +88,9 @@ pub async fn list_messages(
             }
         })?;
 
-    // Convert to chronological order for UI display
+    // Messages are already sorted by created_at:asc from Meilisearch (see manager)
     let messages: Vec<serde_json::Value> = loaded
-        .messages_chronological()
+        .messages
         .iter()
         .map(|m| {
             serde_json::json!({
@@ -145,6 +158,7 @@ pub async fn list_sessions(
             message_count: s.message_count,
             total_cost_usd: s.total_cost_usd,
             conversation_id: s.conversation_id,
+            preview: s.preview,
         })
         .collect();
 
@@ -181,6 +195,7 @@ pub async fn get_session(
         message_count: node.message_count,
         total_cost_usd: node.total_cost_usd,
         conversation_id: node.conversation_id,
+        preview: node.preview,
     }))
 }
 
@@ -203,6 +218,13 @@ pub async fn delete_session(
         .map_err(AppError::Internal)?;
 
     if deleted {
+        // Emit CRUD event for live refresh
+        state.event_bus.emit(CrudEvent::new(
+            EntityType::ChatSession,
+            CrudAction::Deleted,
+            session_id.to_string(),
+        ));
+
         Ok(Json(serde_json::json!({ "deleted": true })))
     } else {
         Err(AppError::NotFound(format!(
@@ -210,6 +232,85 @@ pub async fn delete_session(
             session_id
         )))
     }
+}
+
+// ============================================================================
+// Search messages across sessions
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SearchMessagesQuery {
+    /// Full-text search query
+    pub q: String,
+    /// Optional project slug filter
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// Maximum number of session groups to return (default 10)
+    #[serde(default = "default_search_limit")]
+    pub limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+/// GET /api/chat/search — Search messages across all sessions
+pub async fn search_messages(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<SearchMessagesQuery>,
+) -> Result<Json<Vec<MessageSearchResult>>, AppError> {
+    if query.q.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Search query 'q' cannot be empty".to_string(),
+        ));
+    }
+
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    let results = chat_manager
+        .search_messages(&query.q, query.limit, query.project_slug.as_deref())
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(results))
+}
+
+// ============================================================================
+// Backfill
+// ============================================================================
+
+/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing sessions
+pub async fn backfill_previews(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Phase 1: backfill from Neo4j events (fast, for sessions with stored events)
+    let neo4j_count = state
+        .orchestrator
+        .neo4j()
+        .backfill_chat_session_previews()
+        .await
+        .map_err(AppError::Internal)?;
+
+    // Phase 2: backfill from Meilisearch (for older sessions without Neo4j events)
+    let meili_count = if let Some(chat_manager) = &state.chat_manager {
+        chat_manager
+            .backfill_previews_from_meilisearch()
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let total = neo4j_count + meili_count;
+    Ok(Json(serde_json::json!({
+        "updated": total,
+        "from_neo4j": neo4j_count,
+        "from_meilisearch": meili_count,
+        "message": format!("Backfilled title/preview for {} sessions", total)
+    })))
 }
 
 #[cfg(test)]

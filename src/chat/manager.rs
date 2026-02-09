@@ -10,7 +10,10 @@
 //! - A cleanup task periodically closes timed-out sessions
 
 use super::config::ChatConfig;
-use super::types::{ChatEvent, ChatRequest, CreateSessionResponse};
+use super::types::{
+    truncate_snippet, ChatEvent, ChatRequest, CreateSessionResponse, MessageSearchHit,
+    MessageSearchResult,
+};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::models::ChatSessionNode;
@@ -72,6 +75,8 @@ pub struct ChatManager {
     pub(crate) context_injector: Option<Arc<ContextInjector>>,
     /// Memory config (for creating ConversationMemoryManagers)
     pub(crate) memory_config: Option<MemoryConfig>,
+    /// Event emitter for CRUD events (streaming status changes)
+    pub(crate) event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
 }
 
 impl ChatManager {
@@ -88,6 +93,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
             memory_config: None,
+            event_emitter: None,
         }
     }
 
@@ -122,7 +128,14 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
             memory_config: Some(memory_config),
+            event_emitter: None,
         }
+    }
+
+    /// Set the event emitter for CRUD events (streaming status notifications)
+    pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
+        self.event_emitter = Some(emitter);
+        self
     }
 
     /// Resolve the model to use: request > config default
@@ -403,6 +416,7 @@ impl ChatManager {
             message_count: 0,
             total_cost_usd: None,
             conversation_id: None,
+            preview: None,
         };
         self.graph
             .create_chat_session(&session_node)
@@ -431,7 +445,15 @@ impl ChatManager {
             // Persist conversation_id in Neo4j
             let _ = self
                 .graph
-                .update_chat_session(session_id, None, None, None, None, Some(conversation_id))
+                .update_chat_session(
+                    session_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(conversation_id),
+                    None,
+                )
                 .await;
 
             Some(Arc::new(Mutex::new(mm)))
@@ -495,6 +517,35 @@ impl ChatManager {
             content: request.message.clone(),
         });
 
+        // Auto-generate title and preview from the first user message
+        {
+            let msg = &request.message;
+            let title = if msg.chars().count() > 80 {
+                let truncated: String = msg.chars().take(77).collect();
+                format!("{}...", truncated.trim_end())
+            } else {
+                msg.to_string()
+            };
+            let preview = if msg.chars().count() > 200 {
+                let truncated: String = msg.chars().take(197).collect();
+                format!("{}...", truncated.trim_end())
+            } else {
+                msg.to_string()
+            };
+            let _ = self
+                .graph
+                .update_chat_session(
+                    session_id,
+                    None,
+                    Some(title),
+                    None,
+                    None,
+                    None,
+                    Some(preview),
+                )
+                .await;
+        }
+
         // Send the initial message and start streaming in a background task
         let session_id_str = session_id.to_string();
         let graph = self.graph.clone();
@@ -502,6 +553,7 @@ impl ChatManager {
         let message = request.message.clone();
         let events_tx_clone = events_tx.clone();
         let injector = self.context_injector.clone();
+        let event_emitter = self.event_emitter.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -519,6 +571,7 @@ impl ChatManager {
                 is_streaming,
                 streaming_text,
                 streaming_events,
+                event_emitter,
             )
             .await;
         });
@@ -546,10 +599,20 @@ impl ChatManager {
         is_streaming: Arc<AtomicBool>,
         streaming_text: Arc<Mutex<String>>,
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
+        event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
     ) {
         is_streaming.store(true, Ordering::SeqCst);
         // Broadcast streaming_status to all connected clients (multi-tab support)
         let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: true });
+        // Emit CRUD event for session list live refresh
+        if let Some(ref emitter) = event_emitter {
+            emitter.emit_updated(
+                crate::events::EntityType::ChatSession,
+                &session_id,
+                serde_json::json!({ "is_streaming": true }),
+                None,
+            );
+        }
         // Clear streaming buffers for the new stream
         streaming_text.lock().await.clear();
         streaming_events.lock().await.clear();
@@ -583,6 +646,14 @@ impl ChatManager {
                         message: format!("Error: {}", e),
                     });
                     is_streaming.store(false, Ordering::SeqCst);
+                    if let Some(ref emitter) = event_emitter {
+                        emitter.emit_updated(
+                            crate::events::EntityType::ChatSession,
+                            &session_id,
+                            serde_json::json!({ "is_streaming": false }),
+                            None,
+                        );
+                    }
                     streaming_text.lock().await.clear();
                     streaming_events.lock().await.clear();
                     return;
@@ -634,6 +705,7 @@ impl ChatManager {
                                         None,
                                         Some(1),
                                         *cost,
+                                        None,
                                         None,
                                     )
                                     .await;
@@ -759,6 +831,15 @@ impl ChatManager {
         let _ = events_tx.send(ChatEvent::StreamingStatus {
             is_streaming: false,
         });
+        // Emit CRUD event for session list live refresh
+        if let Some(ref emitter) = event_emitter {
+            emitter.emit_updated(
+                crate::events::EntityType::ChatSession,
+                &session_id,
+                serde_json::json!({ "is_streaming": false }),
+                None,
+            );
+        }
         streaming_text.lock().await.clear();
         streaming_events.lock().await.clear();
         debug!("Stream completed for session {}", session_id);
@@ -785,6 +866,7 @@ impl ChatManager {
                             None,
                             None,
                             Some(node.message_count + 1),
+                            None,
                             None,
                             None,
                         )
@@ -825,6 +907,7 @@ impl ChatManager {
                 is_streaming,
                 streaming_text,
                 streaming_events,
+                event_emitter,
             ))
             .await;
         }
@@ -886,7 +969,15 @@ impl ChatManager {
             if let Ok(Some(node)) = self.graph.get_chat_session(uuid).await {
                 let _ = self
                     .graph
-                    .update_chat_session(uuid, None, None, Some(node.message_count + 1), None, None)
+                    .update_chat_session(
+                        uuid,
+                        None,
+                        None,
+                        Some(node.message_count + 1),
+                        None,
+                        None,
+                        None,
+                    )
                     .await;
             }
         }
@@ -916,6 +1007,7 @@ impl ChatManager {
         let active_sessions = self.active_sessions.clone();
         let prompt = message.to_string();
         let injector = self.context_injector.clone();
+        let event_emitter = self.event_emitter.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -933,6 +1025,7 @@ impl ChatManager {
                 is_streaming,
                 streaming_text,
                 streaming_events,
+                event_emitter,
             )
             .await;
         });
@@ -1004,6 +1097,7 @@ impl ChatManager {
                         None,
                         None,
                         Some(mm.conversation_id().to_string()),
+                        None,
                     )
                     .await;
                 mm
@@ -1071,6 +1165,7 @@ impl ChatManager {
         let active_sessions = self.active_sessions.clone();
         let prompt = message.to_string();
         let injector = self.context_injector.clone();
+        let event_emitter = self.event_emitter.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -1088,6 +1183,7 @@ impl ChatManager {
                 is_streaming,
                 streaming_text,
                 streaming_events,
+                event_emitter,
             )
             .await;
         });
@@ -1095,16 +1191,19 @@ impl ChatManager {
         Ok(())
     }
 
-    /// Retrieve message history for a session via ContextInjector
+    /// Retrieve message history for a session, sorted by `created_at` ascending.
+    ///
+    /// Bypasses the SDK's `load_conversation()` which uses `newest_first(true)` and
+    /// sorts by `turn_index` — both of which produce wrong ordering when a conversation
+    /// spans multiple Claude Code sessions. Instead, we query Meilisearch directly with
+    /// `created_at:asc` so that offset 0 = oldest messages (standard chronological pagination).
     pub async fn get_session_messages(
         &self,
         session_id: &str,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<LoadedConversation> {
-        let injector = self.context_injector.as_ref().ok_or_else(|| {
-            anyhow!("Message history not available (ContextInjector not initialized)")
-        })?;
+        use nexus_claude::memory::MessageDocument;
 
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
@@ -1120,10 +1219,217 @@ impl ChatManager {
             .conversation_id
             .ok_or_else(|| anyhow!("Session {} has no conversation_id", session_id))?;
 
-        injector
-            .load_conversation(&conversation_id, limit, offset)
+        let limit_val = limit.unwrap_or(50);
+        let offset_val = offset.unwrap_or(0);
+
+        // Query Meilisearch directly, sorted by created_at ascending
+        let meili_client = meilisearch_sdk::client::Client::new(
+            &self.config.meilisearch_url,
+            Some(&self.config.meilisearch_key),
+        )
+        .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
+
+        let index = meili_client.index("nexus_messages");
+        let filter = format!("conversation_id = \"{}\"", conversation_id);
+
+        let results: meilisearch_sdk::search::SearchResults<MessageDocument> = index
+            .search()
+            .with_query("")
+            .with_filter(&filter)
+            .with_sort(&["created_at:asc"])
+            .with_limit(limit_val)
+            .with_offset(offset_val)
+            .execute()
             .await
-            .context("Failed to load conversation messages")
+            .map_err(|e| anyhow!("Meilisearch query failed: {}", e))?;
+
+        let total_count = results.estimated_total_hits.unwrap_or(0);
+        let messages: Vec<MessageDocument> = results.hits.into_iter().map(|h| h.result).collect();
+        let has_more = offset_val + messages.len() < total_count;
+
+        Ok(LoadedConversation {
+            messages,
+            total_count,
+            has_more,
+            offset: offset_val,
+            limit: limit_val,
+        })
+    }
+
+    /// Backfill title/preview for sessions that have a conversation_id but no title.
+    /// Uses Meilisearch to fetch the first user message from each conversation.
+    pub async fn backfill_previews_from_meilisearch(&self) -> Result<usize> {
+        let injector = match self.context_injector.as_ref() {
+            Some(i) => i,
+            None => return Ok(0),
+        };
+
+        // Get all sessions without title
+        let sessions = self
+            .graph
+            .list_chat_sessions(None, 200, 0)
+            .await
+            .context("Failed to list sessions")?;
+
+        let mut count = 0;
+        for session in &sessions.0 {
+            // Skip sessions that already have a title
+            if session.title.is_some() {
+                continue;
+            }
+            // Need a conversation_id to look up messages
+            let conv_id = match &session.conversation_id {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+
+            // Load the first user message from Meilisearch
+            let loaded = match injector.load_conversation(&conv_id, Some(1), Some(0)).await {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            let first_user_msg = loaded
+                .messages
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone());
+
+            if let Some(content) = first_user_msg {
+                let chars: Vec<char> = content.chars().collect();
+                let title = if chars.len() > 80 {
+                    format!("{}...", chars[..77].iter().collect::<String>().trim_end())
+                } else {
+                    content.clone()
+                };
+                let preview = if chars.len() > 200 {
+                    format!("{}...", chars[..197].iter().collect::<String>().trim_end())
+                } else {
+                    content
+                };
+                let _ = self
+                    .graph
+                    .update_chat_session(
+                        session.id,
+                        None,
+                        Some(title),
+                        None,
+                        None,
+                        None,
+                        Some(preview),
+                    )
+                    .await;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Search messages across all sessions via Meilisearch full-text search.
+    ///
+    /// Queries the `nexus_messages` index directly (bypassing the nexus SDK's
+    /// `retrieve_context` which applies token_budget / max_context_items limits
+    /// designed for LLM context injection, not UI search).
+    pub async fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slug: Option<&str>,
+    ) -> Result<Vec<MessageSearchResult>> {
+        use nexus_claude::memory::MessageDocument;
+        use std::collections::HashMap as StdHashMap;
+
+        // Build a direct Meilisearch client from our config
+        let meili_client = meilisearch_sdk::client::Client::new(
+            &self.config.meilisearch_url,
+            Some(&self.config.meilisearch_key),
+        )
+        .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
+
+        let index = meili_client.index("nexus_messages");
+
+        // Query Meilisearch directly — no token budget, no max_context_items
+        let search_results: meilisearch_sdk::search::SearchResults<MessageDocument> = index
+            .search()
+            .with_query(query)
+            .with_limit(limit * 5) // Fetch extra to allow grouping by session
+            .with_show_ranking_score(true)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Meilisearch search failed: {}", e))?;
+
+        if search_results.hits.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Group results by conversation_id
+        let mut by_conversation: StdHashMap<String, Vec<MessageSearchHit>> = StdHashMap::new();
+        for hit in &search_results.hits {
+            let doc = &hit.result;
+            let score = hit.ranking_score.unwrap_or(0.0);
+            let search_hit = MessageSearchHit {
+                message_id: doc.id.clone(),
+                role: doc.role.clone(),
+                content_snippet: truncate_snippet(&doc.content, 300),
+                turn_index: doc.turn_index,
+                created_at: doc.created_at,
+                score,
+            };
+            by_conversation
+                .entry(doc.conversation_id.clone())
+                .or_default()
+                .push(search_hit);
+        }
+
+        // Resolve conversation_id → session metadata from Neo4j
+        let (all_sessions, _) = self.graph.list_chat_sessions(None, 200, 0).await?;
+        let session_lookup: StdHashMap<String, &crate::neo4j::models::ChatSessionNode> =
+            all_sessions
+                .iter()
+                .filter_map(|s| s.conversation_id.as_ref().map(|cid| (cid.clone(), s)))
+                .collect();
+
+        // Build grouped results
+        let mut results: Vec<MessageSearchResult> = Vec::new();
+        for (conv_id, hits) in by_conversation {
+            let session_info = session_lookup.get(&conv_id);
+
+            // Filter by project_slug if specified
+            if let Some(filter_slug) = project_slug {
+                if let Some(session) = session_info {
+                    if session.project_slug.as_deref() != Some(filter_slug) {
+                        continue;
+                    }
+                } else {
+                    continue; // No session found, skip
+                }
+            }
+
+            let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
+
+            results.push(MessageSearchResult {
+                session_id: session_info.map(|s| s.id.to_string()).unwrap_or_default(),
+                session_title: session_info.and_then(|s| s.title.clone()),
+                session_preview: session_info.and_then(|s| s.preview.clone()),
+                project_slug: session_info.and_then(|s| s.project_slug.clone()),
+                conversation_id: conv_id,
+                hits,
+                best_score,
+            });
+        }
+
+        // Sort by best_score descending
+        results.sort_by(|a, b| {
+            b.best_score
+                .partial_cmp(&a.best_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Limit to requested number of sessions
+        results.truncate(limit);
+
+        Ok(results)
     }
 
     /// Subscribe to a session's broadcast channel (used by WebSocket handler)
@@ -1884,6 +2190,7 @@ mod tests {
                 Some(5),
                 Some(0.25),
                 None,
+                None,
             )
             .await
             .unwrap()
@@ -1956,6 +2263,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap()
@@ -1971,7 +2279,7 @@ mod tests {
         let graph = &state.neo4j;
 
         let result = graph
-            .update_chat_session(uuid::Uuid::new_v4(), None, None, None, None, None)
+            .update_chat_session(uuid::Uuid::new_v4(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert!(result.is_none());
@@ -2003,6 +2311,7 @@ mod tests {
             message_count: 10,
             total_cost_usd: Some(1.50),
             conversation_id: Some("conv-abc-123".into()),
+            preview: Some("Hello, can you help me with this?".into()),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2035,29 +2344,26 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
+        // Session doesn't exist in mock store — should get "not found"
         let result = manager
             .get_session_messages(&Uuid::new_v4().to_string(), None, None)
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ContextInjector not initialized"));
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[tokio::test]
     async fn test_get_session_messages_invalid_uuid() {
-        // Even with no injector, the error about injector comes first
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let result = manager.get_session_messages("not-a-uuid", None, None).await;
         assert!(result.is_err());
-        // Without injector, the "ContextInjector not initialized" error comes first
+        // Invalid UUID is rejected before any storage lookup
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("ContextInjector not initialized"));
+            .contains("Invalid session ID"));
     }
 
     // ====================================================================
@@ -2082,6 +2388,7 @@ mod tests {
                 None,
                 None,
                 Some("conv-new-123".into()),
+                None,
             )
             .await
             .unwrap()
@@ -2123,13 +2430,22 @@ mod tests {
                 None,
                 None,
                 Some("conv-persist".into()),
+                None,
             )
             .await
             .unwrap();
 
         // Update title only — conversation_id should be preserved
         let updated = graph
-            .update_chat_session(session.id, None, Some("New Title".into()), None, None, None)
+            .update_chat_session(
+                session.id,
+                None,
+                Some("New Title".into()),
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -2151,6 +2467,7 @@ mod tests {
             message_count: 0,
             total_cost_usd: None,
             conversation_id: Some("conv-serde-test".into()),
+            preview: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2177,6 +2494,7 @@ mod tests {
             message_count: 0,
             total_cost_usd: None,
             conversation_id: None,
+            preview: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2530,5 +2848,259 @@ mod tests {
         assert!(
             matches!(deserialized, ChatEvent::UserMessage { ref content } if content == "Hello world")
         );
+    }
+
+    // ====================================================================
+    // with_event_emitter builder
+    // ====================================================================
+
+    #[test]
+    fn test_with_event_emitter_sets_emitter() {
+        use crate::events::{CrudEvent, EventEmitter};
+
+        struct DummyEmitter;
+        impl EventEmitter for DummyEmitter {
+            fn emit(&self, _event: CrudEvent) {}
+        }
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        assert!(manager.event_emitter.is_none());
+
+        let manager = manager.with_event_emitter(Arc::new(DummyEmitter));
+        assert!(manager.event_emitter.is_some());
+    }
+
+    // ====================================================================
+    // backfill_previews_from_meilisearch — early return when no injector
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_backfill_previews_no_injector_returns_zero() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        // new_without_memory => context_injector is None => should return Ok(0)
+        let result = manager.backfill_previews_from_meilisearch().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    // ====================================================================
+    // update_chat_session via mock — title, preview, conversation_id
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_update_session_title_and_preview() {
+        let state = mock_app_state();
+        let session = test_chat_session(Some("test-proj"));
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        // Update title
+        let updated = state
+            .neo4j
+            .update_chat_session(
+                session_id,
+                None,
+                Some("My new title".into()),
+                None,
+                None,
+                None,
+                Some("Preview of the conversation".into()),
+            )
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        let s = updated.unwrap();
+        assert_eq!(s.title.as_deref(), Some("My new title"));
+        assert_eq!(s.preview.as_deref(), Some("Preview of the conversation"));
+    }
+
+    #[tokio::test]
+    async fn test_update_session_conversation_id() {
+        let state = mock_app_state();
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        let updated = state
+            .neo4j
+            .update_chat_session(
+                session_id,
+                None,
+                None,
+                None,
+                None,
+                Some("conv-abc-123".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        assert_eq!(
+            updated.unwrap().conversation_id.as_deref(),
+            Some("conv-abc-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_session_cost_and_message_count() {
+        let state = mock_app_state();
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        let updated = state
+            .neo4j
+            .update_chat_session(session_id, None, None, Some(42), Some(1.50), None, None)
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        let s = updated.unwrap();
+        assert_eq!(s.message_count, 42);
+        assert!((s.total_cost_usd.unwrap() - 1.50).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_update_session_not_found() {
+        let state = mock_app_state();
+        let fake_id = Uuid::new_v4();
+        let updated = state
+            .neo4j
+            .update_chat_session(fake_id, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(updated.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_session_cli_session_id() {
+        let state = mock_app_state();
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        let updated = state
+            .neo4j
+            .update_chat_session(
+                session_id,
+                Some("cli-session-xyz".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        assert_eq!(
+            updated.unwrap().cli_session_id.as_deref(),
+            Some("cli-session-xyz")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_session_partial_preserves_existing() {
+        let state = mock_app_state();
+        let mut session = test_chat_session(Some("my-proj"));
+        session.title = Some("Original title".into());
+        session.preview = Some("Original preview".into());
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        // Update only message_count — should preserve title and preview
+        let updated = state
+            .neo4j
+            .update_chat_session(session_id, None, None, Some(10), None, None, None)
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        let s = updated.unwrap();
+        assert_eq!(s.title.as_deref(), Some("Original title"));
+        assert_eq!(s.preview.as_deref(), Some("Original preview"));
+        assert_eq!(s.message_count, 10);
+    }
+
+    // ====================================================================
+    // backfill_chat_session_previews via mock — returns 0 (mock has no events)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_backfill_session_previews_mock_returns_zero() {
+        let state = mock_app_state();
+        let result = state.neo4j.backfill_chat_session_previews().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    // ====================================================================
+    // Title truncation logic (mirrors send_message_internal behavior)
+    // ====================================================================
+
+    #[test]
+    fn test_title_generation_short_message() {
+        let msg = "Hello, help me with my project";
+        // < 80 chars → title == message
+        let title = if msg.chars().count() > 80 {
+            let truncated: String = msg.chars().take(77).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(title, "Hello, help me with my project");
+    }
+
+    #[test]
+    fn test_title_generation_long_message() {
+        let msg = "a".repeat(100);
+        // > 80 chars → truncated to 77 + "..."
+        let title = if msg.chars().count() > 80 {
+            let truncated: String = msg.chars().take(77).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(title.chars().count(), 80);
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_preview_generation_short_message() {
+        let msg = "Short message";
+        let preview = if msg.chars().count() > 200 {
+            let truncated: String = msg.chars().take(197).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(preview, "Short message");
+    }
+
+    #[test]
+    fn test_preview_generation_long_message() {
+        let msg = "b".repeat(300);
+        let preview = if msg.chars().count() > 200 {
+            let truncated: String = msg.chars().take(197).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(preview.chars().count(), 200);
+        assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn test_title_generation_utf8_multibyte() {
+        // 90 chars with accented characters
+        let msg: String = "é".repeat(90);
+        let title = if msg.chars().count() > 80 {
+            let truncated: String = msg.chars().take(77).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        };
+        assert_eq!(title.chars().count(), 80);
+        assert!(title.ends_with("..."));
     }
 }

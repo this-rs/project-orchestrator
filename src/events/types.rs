@@ -20,6 +20,7 @@ pub enum EntityType {
     Resource,
     Component,
     Note,
+    ChatSession,
 }
 
 /// The CRUD action performed
@@ -207,6 +208,7 @@ mod tests {
             EntityType::Resource,
             EntityType::Component,
             EntityType::Note,
+            EntityType::ChatSession,
         ];
 
         for variant in &variants {
@@ -219,6 +221,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&EntityType::WorkspaceMilestone).unwrap(),
             "\"workspace_milestone\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EntityType::ChatSession).unwrap(),
+            "\"chat_session\""
         );
     }
 
@@ -293,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_type_has_14_variants() {
+    fn test_entity_type_has_15_variants() {
         // Ensure we don't accidentally add/remove variants
         let all = vec![
             EntityType::Project,
@@ -310,8 +316,9 @@ mod tests {
             EntityType::Resource,
             EntityType::Component,
             EntityType::Note,
+            EntityType::ChatSession,
         ];
-        assert_eq!(all.len(), 14);
+        assert_eq!(all.len(), 15);
     }
 
     // ================================================================
