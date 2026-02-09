@@ -937,7 +937,11 @@ pub trait GraphStore: Send + Sync {
         message_count: Option<i64>,
         total_cost_usd: Option<f64>,
         conversation_id: Option<String>,
+        preview: Option<String>,
     ) -> Result<Option<ChatSessionNode>>;
+
+    /// Backfill title and preview for sessions that don't have them yet
+    async fn backfill_chat_session_previews(&self) -> Result<usize>;
 
     /// Delete a chat session
     async fn delete_chat_session(&self, id: Uuid) -> Result<bool>;

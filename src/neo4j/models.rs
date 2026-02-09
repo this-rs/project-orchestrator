@@ -70,6 +70,9 @@ pub struct ChatSessionNode {
     /// Nexus conversation ID (for message history retrieval)
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// Preview text (first user message, truncated to ~200 chars)
+    #[serde(default)]
+    pub preview: Option<String>,
 }
 
 // ============================================================================
