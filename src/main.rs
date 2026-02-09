@@ -105,6 +105,28 @@ async fn run_server(config: Config) -> Result<()> {
         Some(cm)
     };
 
+    // Log auth status
+    match &config.auth_config {
+        Some(auth) => {
+            tracing::info!("Auth enabled (Google OAuth)");
+            if let Some(ref domain) = auth.allowed_email_domain {
+                tracing::info!("  Email domain restriction: @{}", domain);
+            }
+            if let Some(ref url) = auth.frontend_url {
+                tracing::info!("  Frontend URL (CORS): {}", url);
+            }
+            tracing::info!(
+                "  JWT expiry: {}h",
+                auth.jwt_expiry_secs / 3600
+            );
+        }
+        None => {
+            tracing::warn!(
+                "Auth disabled — deny-by-default active, all /api/* requests will be rejected"
+            );
+        }
+    }
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
