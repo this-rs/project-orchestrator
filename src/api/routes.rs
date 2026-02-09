@@ -73,6 +73,11 @@ fn public_routes() -> Router<OrchestratorState> {
             post(auth_handlers::google_callback),
         )
         // ================================================================
+        // WebSocket (public — auth via first application message)
+        // ================================================================
+        .route("/ws/events", get(ws_handlers::ws_events))
+        .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
+        // ================================================================
         // Webhooks & Internal
         // ================================================================
         .route("/hooks/wake", post(handlers::wake))
@@ -495,12 +500,6 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/workspaces/{slug}/topology",
             get(workspace_handlers::get_workspace_topology),
         )
-        // ================================================================
-        // WebSocket CRUD Event Notifications
-        // ================================================================
-        .route("/ws/events", get(ws_handlers::ws_events))
-        // WebSocket Chat (bidirectional)
-        .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
         // ================================================================
         // Chat (session management — streaming via WebSocket above)
         // ================================================================
