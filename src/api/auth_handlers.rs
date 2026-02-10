@@ -181,18 +181,15 @@ pub async fn password_login(
     }
 
     // Generic error to prevent user enumeration
-    let invalid_credentials =
-        || AppError::Unauthorized("Invalid email or password".to_string());
+    let invalid_credentials = || AppError::Unauthorized("Invalid email or password".to_string());
 
     // 1. Check root account first (in-memory, no DB)
     if let Some(ref root) = auth_config.root_account {
         if req.email == root.email {
-            let password_ok = bcrypt::verify(&req.password, &root.password_hash)
-                .unwrap_or(false);
+            let password_ok = bcrypt::verify(&req.password, &root.password_hash).unwrap_or(false);
             if password_ok {
                 // Root user gets a deterministic UUID based on email
-                let root_user_id =
-                    Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes());
+                let root_user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes());
                 let token = encode_jwt(
                     root_user_id,
                     &root.email,
@@ -231,8 +228,7 @@ pub async fn password_login(
         .as_deref()
         .ok_or_else(invalid_credentials)?;
 
-    let password_ok =
-        bcrypt::verify(&req.password, password_hash).unwrap_or(false);
+    let password_ok = bcrypt::verify(&req.password, password_hash).unwrap_or(false);
     if !password_ok {
         return Err(invalid_credentials());
     }
@@ -269,9 +265,7 @@ pub async fn register(
 
     // 1. Check registration is enabled
     if !auth_config.allow_registration {
-        return Err(AppError::Forbidden(
-            "Registration is disabled".to_string(),
-        ));
+        return Err(AppError::Forbidden("Registration is disabled".to_string()));
     }
 
     // 2. Validate input fields
@@ -451,8 +445,8 @@ pub async fn oidc_login(
         ));
     }
 
-    let client = OidcClient::from_auth_config_sync(auth_config)
-        .map_err(|e| AppError::Internal(e))?;
+    let client =
+        OidcClient::from_auth_config_sync(auth_config).map_err(|e| AppError::Internal(e))?;
 
     Ok(Json(AuthUrlResponse {
         auth_url: client.auth_url(),
@@ -480,8 +474,8 @@ pub async fn oidc_callback(
     }
 
     // 1. Build OIDC client and exchange code
-    let client = OidcClient::from_auth_config_sync(auth_config)
-        .map_err(|e| AppError::Internal(e))?;
+    let client =
+        OidcClient::from_auth_config_sync(auth_config).map_err(|e| AppError::Internal(e))?;
 
     let oidc_user = client
         .exchange_code(&req.code)
@@ -533,19 +527,27 @@ pub async fn oidc_callback(
 /// GET /auth/me — Returns the authenticated user's info.
 ///
 /// Requires a valid JWT token (via `require_auth` middleware + `AuthUser` extractor).
+/// Falls back to JWT claims when the user isn't found in Neo4j (e.g. root account).
 pub async fn get_me(
     State(state): State<OrchestratorState>,
     user: AuthUser,
 ) -> Result<Json<UserResponse>, AppError> {
-    // Fetch full user from Neo4j (may have updated picture, etc.)
-    let user_node = state
+    // Try to fetch full user from Neo4j (may have updated picture, etc.)
+    match state
         .orchestrator
         .neo4j()
         .get_user_by_id(user.user_id)
         .await?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
-
-    Ok(Json(UserResponse::from(user_node)))
+    {
+        Some(user_node) => Ok(Json(UserResponse::from(user_node))),
+        // Root account or users not yet in Neo4j — use JWT claims directly
+        None => Ok(Json(UserResponse {
+            id: user.user_id,
+            email: user.email,
+            name: user.name,
+            picture_url: None,
+        })),
+    }
 }
 
 /// POST /auth/refresh — Issue a new JWT from a still-valid token.
@@ -1095,7 +1097,10 @@ mod tests {
         let providers = json["providers"].as_array().unwrap();
         assert_eq!(providers.len(), 2);
 
-        let types: Vec<&str> = providers.iter().map(|p| p["type"].as_str().unwrap()).collect();
+        let types: Vec<&str> = providers
+            .iter()
+            .map(|p| p["type"].as_str().unwrap())
+            .collect();
         assert!(types.contains(&"password"));
         assert!(types.contains(&"oidc"));
     }
@@ -1140,7 +1145,11 @@ mod tests {
             .method("POST")
             .uri("/auth/register")
             .header("content-type", "application/json")
-            .body(register_body("newuser@ffs.holdings", "securepass123", "New User"))
+            .body(register_body(
+                "newuser@ffs.holdings",
+                "securepass123",
+                "New User",
+            ))
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
@@ -1169,7 +1178,11 @@ mod tests {
             .method("POST")
             .uri("/auth/register")
             .header("content-type", "application/json")
-            .body(register_body("newuser@ffs.holdings", "securepass123", "New User"))
+            .body(register_body(
+                "newuser@ffs.holdings",
+                "securepass123",
+                "New User",
+            ))
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
@@ -1178,8 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_duplicate_email_returns_409() {
-        let (app, state) =
-            test_auth_app_with_state(Some(auth_config_with_registration())).await;
+        let (app, state) = test_auth_app_with_state(Some(auth_config_with_registration())).await;
 
         // Pre-create a password user
         let password_hash = bcrypt::hash("existing123", 4).unwrap();
@@ -1194,7 +1206,11 @@ mod tests {
             .method("POST")
             .uri("/auth/register")
             .header("content-type", "application/json")
-            .body(register_body("existing@ffs.holdings", "newpass123", "Another"))
+            .body(register_body(
+                "existing@ffs.holdings",
+                "newpass123",
+                "Another",
+            ))
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
