@@ -4,6 +4,7 @@
 mod docker;
 mod setup;
 mod tray;
+mod updater;
 
 use project_orchestrator::Config;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -96,6 +97,7 @@ fn main() {
     // Launch Tauri application
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(docker_manager)
         .invoke_handler(tauri::generate_handler![
             get_server_port,
@@ -111,6 +113,9 @@ fn main() {
             docker::check_services_health,
             docker::stop_docker_services,
             docker::get_service_logs,
+            // Auto-update commands
+            updater::check_update,
+            updater::install_update,
         ])
         .setup(|app| {
             // Create system tray
@@ -119,6 +124,8 @@ fn main() {
             }
             // Set up minimize-to-tray behavior
             tray::setup_minimize_to_tray(app.handle());
+            // Check for updates in background
+            updater::check_for_updates(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!())
