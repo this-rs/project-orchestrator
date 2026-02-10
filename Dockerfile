@@ -1,3 +1,35 @@
+# =============================================================================
+# Stage 1: Build the frontend (React SPA)
+# =============================================================================
+FROM node:22-slim AS frontend-builder
+
+WORKDIR /app/frontend
+
+# Accept frontend source path as build arg (default: ./frontend)
+# In docker-compose, this should point to the frontend directory in the build context.
+# If no frontend source is available, this stage produces an empty dist/.
+ARG FRONTEND_SRC=./frontend
+
+# Copy package files first for dependency caching
+COPY ${FRONTEND_SRC}/package.json ${FRONTEND_SRC}/package-lock.json* ./
+
+# Install dependencies
+RUN npm ci --ignore-scripts 2>/dev/null || echo "No frontend dependencies found, skipping"
+
+# Copy the rest of the frontend source
+COPY ${FRONTEND_SRC}/ ./
+
+# Build the frontend (produces dist/)
+RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
+        npm run build; \
+    else \
+        echo "No frontend build script found, creating empty dist/"; \
+        mkdir -p dist; \
+    fi
+
+# =============================================================================
+# Stage 2: Build the backend (Rust)
+# =============================================================================
 FROM rustlang/rust:nightly-bookworm AS builder
 
 WORKDIR /app
@@ -31,6 +63,9 @@ RUN mkdir -p src && \
     echo "pub mod routes; pub mod handlers;" > src/api/mod.rs && \
     echo "" > src/api/routes.rs && echo "" > src/api/handlers.rs
 
+# Create empty dist/ so rust-embed doesn't fail during dependency build
+RUN mkdir -p dist
+
 # Build dependencies only
 RUN cargo build --release 2>/dev/null || true
 
@@ -41,15 +76,18 @@ RUN rm -rf src
 COPY src ./src
 COPY queries ./queries
 
+# Copy the frontend dist/ from stage 1 (for embedded-frontend feature or ServeDir)
+COPY --from=frontend-builder /app/frontend/dist ./dist
+
 # Touch source files to trigger rebuild
 RUN find src -name "*.rs" -exec touch {} \;
 
 # Build the actual application
 RUN cargo build --release
 
-# ============================================
-# Runtime image
-# ============================================
+# =============================================================================
+# Stage 3: Runtime image
+# =============================================================================
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
@@ -65,6 +103,9 @@ COPY --from=builder /app/target/release/orch /app/orch
 
 # Copy tree-sitter queries
 COPY queries ./queries
+
+# Copy frontend dist/ (for serve_frontend mode)
+COPY --from=frontend-builder /app/frontend/dist ./dist
 
 # Create data directory
 RUN mkdir -p /data

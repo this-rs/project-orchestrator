@@ -48,6 +48,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Path to the frontend source within the build context.
+        # To include the frontend, either:
+        # 1. Symlink/copy the frontend dir into this repo as ./frontend
+        # 2. Pre-build the frontend and copy dist/ to ./dist
+        # 3. Set FRONTEND_SRC to a valid path in the build context
+        FRONTEND_SRC: ./frontend
     container_name: orchestrator-server
     ports:
       - "8080:8080"
@@ -59,6 +66,9 @@ services:
       - MEILISEARCH_KEY=orchestrator-meili-key-change-me
       - RUST_LOG=info,project_orchestrator=debug
       - WORKSPACE_PATH=/workspace
+      # Frontend is served from /app/dist (default: true)
+      # Set to false for API-only mode
+      # - SERVE_FRONTEND=false
     depends_on:
       neo4j:
         condition: service_healthy
