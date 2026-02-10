@@ -6,8 +6,6 @@ FROM node:22-slim AS frontend-builder
 WORKDIR /app/frontend
 
 # Accept frontend source path as build arg (default: ./frontend)
-# In docker-compose, this should point to the frontend directory in the build context.
-# If no frontend source is available, this stage produces an empty dist/.
 ARG FRONTEND_SRC=./frontend
 
 # Copy package files first for dependency caching
@@ -88,7 +86,13 @@ RUN cargo build --release
 # =============================================================================
 # Stage 3: Runtime image
 # =============================================================================
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
+
+# OCI labels
+LABEL org.opencontainers.image.source="https://github.com/this-rs/project-orchestrator"
+LABEL org.opencontainers.image.description="AI agent orchestrator with Neo4j knowledge graph, Meilisearch, and Tree-sitter"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.vendor="OpenClaw"
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -101,18 +105,36 @@ WORKDIR /app
 COPY --from=builder /app/target/release/orchestrator /app/orchestrator
 COPY --from=builder /app/target/release/orch /app/orch
 
-# Copy tree-sitter queries
+# Copy tree-sitter queries (if they exist)
 COPY queries ./queries
 
-# Copy frontend dist/ (for serve_frontend mode)
-COPY --from=frontend-builder /app/frontend/dist ./dist
+# Build arg: include frontend dist/ or not (default: true)
+ARG INCLUDE_FRONTEND=true
+
+# Copy frontend dist/ conditionally
+# When INCLUDE_FRONTEND=false, dist/ will be empty (created below)
+COPY --from=frontend-builder /app/frontend/dist /tmp/frontend-dist
+
+RUN if [ "$INCLUDE_FRONTEND" = "true" ]; then \
+        cp -r /tmp/frontend-dist ./dist && \
+        echo "Frontend included in image"; \
+    else \
+        mkdir -p ./dist && \
+        echo "API-only image (no frontend)"; \
+    fi && \
+    rm -rf /tmp/frontend-dist
 
 # Create data directory
 RUN mkdir -p /data
 
 ENV RUST_LOG=info
 ENV WORKSPACE_PATH=/workspace
+ENV SERVE_FRONTEND=${INCLUDE_FRONTEND}
+ENV FRONTEND_PATH=/app/dist
 
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
 
 CMD ["./orchestrator", "serve"]
