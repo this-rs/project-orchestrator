@@ -108,8 +108,10 @@ async fn main() -> Result<()> {
         meilisearch_url: args.meilisearch_url,
         meilisearch_key: args.meilisearch_key,
         workspace_path: ".".to_string(),
-        server_port: 8080, // Not used in MCP mode
-        auth_config: None, // MCP server doesn't need auth (stdio-based)
+        server_port: 8080,          // Not used in MCP mode
+        auth_config: None,           // MCP server doesn't need auth (stdio-based)
+        serve_frontend: false,       // MCP server doesn't serve frontend
+        frontend_path: "./dist".to_string(),
     };
 
     let state = match AppState::new(config).await {

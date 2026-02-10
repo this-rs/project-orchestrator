@@ -49,6 +49,10 @@ pub struct YamlConfig {
 pub struct ServerYamlConfig {
     pub port: u16,
     pub workspace_path: String,
+    /// Whether the backend should serve the frontend static files (default: true)
+    pub serve_frontend: bool,
+    /// Path to the frontend dist/ directory (default: "./dist")
+    pub frontend_path: String,
 }
 
 impl Default for ServerYamlConfig {
@@ -56,6 +60,8 @@ impl Default for ServerYamlConfig {
         Self {
             port: 8080,
             workspace_path: ".".into(),
+            serve_frontend: true,
+            frontend_path: "./dist".into(),
         }
     }
 }
@@ -294,6 +300,10 @@ pub struct Config {
     pub server_port: u16,
     /// Auth config — None means deny-by-default (no auth section in YAML)
     pub auth_config: Option<AuthConfig>,
+    /// Whether to serve the frontend static files (default: true)
+    pub serve_frontend: bool,
+    /// Path to the frontend dist/ directory (default: "./dist")
+    pub frontend_path: String,
 }
 
 impl Config {
@@ -326,6 +336,12 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(yaml.server.port),
             auth_config: yaml.auth,
+            serve_frontend: std::env::var("SERVE_FRONTEND")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(yaml.server.serve_frontend),
+            frontend_path: std::env::var("FRONTEND_PATH")
+                .unwrap_or(yaml.server.frontend_path),
         })
     }
 
@@ -502,6 +518,8 @@ auth:
                 "MEILISEARCH_KEY",
                 "WORKSPACE_PATH",
                 "SERVER_PORT",
+                "SERVE_FRONTEND",
+                "FRONTEND_PATH",
             ] {
                 std::env::remove_var(var);
             }
@@ -551,6 +569,38 @@ meilisearch:
         assert_eq!(config.server_port, 8080);
         assert_eq!(config.neo4j_uri, "bolt://localhost:7687");
         assert!(config.auth_config.is_none());
+        // Frontend defaults when no YAML
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+
+        // --- Phase 4: Frontend env var overrides ---
+        let frontend_yaml = r#"
+server:
+  port: 8080
+  serve_frontend: true
+  frontend_path: "./dist"
+"#;
+        let dir2 = tempfile::tempdir().unwrap();
+        let frontend_file = dir2.path().join("config.yaml");
+        let mut f2 = std::fs::File::create(&frontend_file).unwrap();
+        f2.write_all(frontend_yaml.as_bytes()).unwrap();
+
+        clear_env();
+        std::env::set_var("SERVE_FRONTEND", "false");
+        std::env::set_var("FRONTEND_PATH", "/custom/dist");
+
+        let config = Config::from_yaml_and_env(Some(&frontend_file)).unwrap();
+        assert!(!config.serve_frontend);
+        assert_eq!(config.frontend_path, "/custom/dist");
+
+        clear_env();
+
+        // Without env overrides → YAML values used
+        let config = Config::from_yaml_and_env(Some(&frontend_file)).unwrap();
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+
+        clear_env();
     }
 
     // ========================================================================
@@ -707,4 +757,41 @@ server:
         assert!(config.auth.is_none());
         // When auth is None, the middleware should allow all requests (no-auth mode)
     }
+
+    // ========================================================================
+    // Frontend serving config tests
+    // ========================================================================
+
+    #[test]
+    fn test_frontend_config_defaults() {
+        let config = ServerYamlConfig::default();
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+    }
+
+    #[test]
+    fn test_frontend_config_from_yaml() {
+        let yaml = r#"
+server:
+  port: 8080
+  serve_frontend: false
+  frontend_path: "/var/www/orchestrator/dist"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.server.serve_frontend);
+        assert_eq!(config.server.frontend_path, "/var/www/orchestrator/dist");
+    }
+
+    #[test]
+    fn test_frontend_config_defaults_when_absent() {
+        // serve_frontend and frontend_path should default when not in YAML
+        let yaml = r#"
+server:
+  port: 9090
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.server.serve_frontend); // default true
+        assert_eq!(config.server.frontend_path, "./dist"); // default
+    }
+
 }

@@ -32,6 +32,8 @@ pub fn mock_app_state() -> AppState {
             workspace_path: ".".to_string(),
             server_port: 0,
             auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
         }),
     }
 }
@@ -51,6 +53,8 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             workspace_path: ".".to_string(),
             server_port: 0,
             auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
         }),
     }
 }

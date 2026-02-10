@@ -26,6 +26,12 @@
 server:
   port: 8080                    # SERVER_PORT env override
   workspace_path: "."           # WORKSPACE_PATH env override
+  # Serve the frontend React app as static files (default: true)
+  # Set to false for API-only mode (equivalent to --no-frontend CLI flag)
+  serve_frontend: true          # SERVE_FRONTEND env override
+  # Path to the frontend dist/ directory (default: "./dist")
+  # Ignored when serve_frontend is false or when embedded-frontend feature is active
+  frontend_path: "./dist"       # FRONTEND_PATH env override
 
 # -----------------------------------------------------------------------------
 # Neo4j — Knowledge graph database

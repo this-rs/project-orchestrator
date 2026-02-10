@@ -31,6 +31,14 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
+
+        /// Disable serving the frontend static files (API-only mode)
+        #[arg(long)]
+        no_frontend: bool,
+
+        /// Path to the frontend dist/ directory (overrides config.yaml)
+        #[arg(long)]
+        frontend_path: Option<String>,
     },
 
     /// Sync a directory to the knowledge base
@@ -61,8 +69,18 @@ async fn main() -> Result<()> {
     let mut config = Config::from_env()?;
 
     match cli.command {
-        Commands::Serve { port } => {
+        Commands::Serve {
+            port,
+            no_frontend,
+            frontend_path,
+        } => {
             config.server_port = port;
+            if no_frontend {
+                config.serve_frontend = false;
+            }
+            if let Some(path) = frontend_path {
+                config.frontend_path = path;
+            }
             run_server(config).await
         }
         Commands::Sync { path } => run_sync(config, &path).await,
@@ -167,6 +185,16 @@ async fn run_server(mut config: Config) -> Result<()> {
 
     // Create router
     let app = api::create_router(server_state);
+
+    // Log frontend serving mode
+    if config.serve_frontend {
+        tracing::info!(
+            "Frontend serving enabled — path: {}",
+            config.frontend_path
+        );
+    } else {
+        tracing::info!("Frontend serving disabled (API-only mode)");
+    }
 
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
