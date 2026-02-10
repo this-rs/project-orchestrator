@@ -19,15 +19,20 @@ use axum::{
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
+#[cfg(not(feature = "embedded-frontend"))]
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 /// Create the API router with public + protected route groups.
 ///
-/// When `state.serve_frontend` is true, a fallback service is attached that
-/// serves the React SPA from `state.frontend_path`. Axum's explicit routes
-/// (/api/*, /auth/*, /ws/*, /health, /hooks/*, /internal/*) always take
-/// priority over the fallback — only unmatched paths hit ServeDir/index.html.
+/// Frontend serving behavior depends on the build:
+/// - **`embedded-frontend` feature ON**: The SPA is baked into the binary via
+///   rust-embed; `serve_frontend` and `frontend_path` are ignored.
+/// - **`embedded-frontend` feature OFF** (default): When `serve_frontend` is true,
+///   a `ServeDir` fallback serves files from `frontend_path` with SPA routing.
+///
+/// In both cases, Axum's explicit routes (/api/*, /auth/*, /ws/*, /health,
+/// /hooks/*, /internal/*) always take priority — only unmatched paths hit the fallback.
 pub fn create_router(state: OrchestratorState) -> Router {
     let cors = build_cors(&state);
 
@@ -40,10 +45,24 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .layer(cors)
         .with_state(state.clone());
 
-    // Conditionally attach frontend static file serving (SPA fallback).
-    // Uses `fallback()` (not `not_found_service()`) to preserve 200 status
-    // on SPA routes — `not_found_service` would force 404 on every fallback.
+    attach_frontend(router, &state)
+}
+
+/// Attach frontend serving to the router.
+///
+/// When the `embedded-frontend` feature is active, the SPA is served from
+/// memory (rust-embed). Otherwise, it's served from the filesystem via ServeDir.
+#[cfg(feature = "embedded-frontend")]
+fn attach_frontend(router: Router, _state: &OrchestratorState) -> Router {
+    tracing::info!("Frontend serving: embedded (rust-embed, compiled into binary)");
+    router.fallback(super::embedded_frontend::serve_embedded)
+}
+
+#[cfg(not(feature = "embedded-frontend"))]
+fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
     if state.serve_frontend {
+        // Uses `fallback()` (not `not_found_service()`) to preserve 200 status
+        // on SPA routes — `not_found_service` would force 404 on every fallback.
         let index_path = format!("{}/index.html", state.frontend_path);
         let serve_dir = ServeDir::new(&state.frontend_path)
             .fallback(ServeFile::new(index_path));
