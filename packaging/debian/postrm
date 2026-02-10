@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Remove user and group
+        if getent passwd orchestrator >/dev/null 2>&1; then
+            userdel orchestrator || true
+            echo "Removed system user 'orchestrator'"
+        fi
+
+        # Remove data and config directories
+        rm -rf /var/lib/project-orchestrator
+        rm -rf /etc/project-orchestrator
+
+        # Reload systemd
+        systemctl daemon-reload || true
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        systemctl daemon-reload || true
+        ;;
+esac
+
+exit 0

@@ -101,3 +101,32 @@ path = "src/cli.rs"
 [[bin]]
 name = "mcp_server"
 path = "src/bin/mcp_server.rs"
+
+# =============================================================================
+# Debian packaging (cargo-deb)
+# =============================================================================
+[package.metadata.deb]
+maintainer = "Elun <elun@openclaw.ai>"
+copyright = "2026, Elun / OpenClaw"
+license-file = ["LICENSE", "0"]
+section = "net"
+priority = "optional"
+extended-description = """AI agent orchestrator with Neo4j knowledge graph, \
+Meilisearch semantic search, and Tree-sitter code parsing. \
+Provides a REST API, WebSocket events, and an optional embedded React frontend."""
+depends = "$auto"
+maintainer-scripts = "packaging/debian/"
+assets = [
+    ["target/release/orchestrator", "/usr/bin/orchestrator", "755"],
+    ["target/release/orch", "/usr/bin/orch", "755"],
+    ["target/release/mcp_server", "/usr/bin/orchestrator-mcp", "755"],
+    ["config.yaml.example", "/etc/project-orchestrator/config.yaml.example", "644"],
+    ["packaging/debian/project-orchestrator.service", "/lib/systemd/system/project-orchestrator.service", "644"],
+    ["packaging/debian/docker-compose.services.yml", "/etc/project-orchestrator/docker-compose.services.yml", "644"],
+]
+conf-files = ["/etc/project-orchestrator/config.yaml"]
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "packaging/debian/"
+enable = false
+start = false

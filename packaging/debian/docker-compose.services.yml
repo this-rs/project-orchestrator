@@ -1,0 +1,56 @@
+# Docker Compose for Project Orchestrator dependencies (Neo4j + MeiliSearch)
+#
+# Usage:
+#   cd /etc/project-orchestrator
+#   docker compose -f docker-compose.services.yml up -d
+#
+# This only runs the required services. The orchestrator itself runs as a
+# systemd service (installed via the .deb package).
+
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: orchestrator-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-change-me}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    container_name: orchestrator-meilisearch
+    restart: unless-stopped
+    ports:
+      - "7700:7700"
+    environment:
+      - MEILI_MASTER_KEY=${MEILISEARCH_KEY:-change-me}
+      - MEILI_ENV=production
+      - MEILI_LOG_LEVEL=INFO
+      - MEILI_MAX_INDEXING_MEMORY=512MiB
+    volumes:
+      - meilisearch_data:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  meilisearch_data:

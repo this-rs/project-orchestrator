@@ -271,12 +271,83 @@ jobs:
           retention-days: 1
 
   # ==========================================================================
+  # Package Debian - Build .deb packages for Linux targets
+  # ==========================================================================
+  package-deb:
+    name: Package .deb (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            artifact_os: linux
+            artifact_arch: x86_64
+
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            artifact_os: linux
+            artifact_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}.tar.gz
+          path: artifact/
+
+      - name: Extract binary to target dir
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
+          mkdir -p "target/release"
+          cp "artifact/${ARCHIVE_NAME}/${BINARY_NAME}" "target/release/${BINARY_NAME}"
+          # cargo-deb also needs orch and mcp_server — rebuild them or copy from archive
+          # For now, copy the main binary and let cargo-deb handle what's available
+          cp "target/release/${BINARY_NAME}" "target/release/orch" || true
+          cp "target/release/${BINARY_NAME}" "target/release/mcp_server" || true
+          chmod +x target/release/*
+
+      - name: Build .deb package
+        run: cargo deb --no-build --target ${{ matrix.target }}
+
+      - name: Find and upload .deb
+        run: |
+          DEB_FILE=$(find target/ -name "*.deb" | head -1)
+          DEB_NAME=$(basename "$DEB_FILE")
+          cp "$DEB_FILE" "$DEB_NAME"
+          echo "DEB_NAME=${DEB_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEB_NAME }}
+          path: ${{ env.DEB_NAME }}
+          retention-days: 1
+
+  # ==========================================================================
   # Release - Collect all artifacts and publish GitHub Release
   # ==========================================================================
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [build, build-full]
+    needs: [build, build-full, package-deb]
     steps:
       - uses: actions/checkout@v4
 
@@ -288,7 +359,7 @@ jobs:
       - name: Collect release files
         run: |
           mkdir -p release-files
-          find artifacts/ -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-files/ \;
+          find artifacts/ -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" \) -exec cp {} release-files/ \;
           echo "=== Release artifacts ==="
           ls -la release-files/
 

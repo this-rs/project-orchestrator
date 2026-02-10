@@ -1,0 +1,28 @@
+[Unit]
+Description=Project Orchestrator — AI agent orchestrator
+Documentation=https://github.com/this-rs/project-orchestrator
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=orchestrator
+Group=orchestrator
+ExecStart=/usr/bin/orchestrator serve
+WorkingDirectory=/var/lib/project-orchestrator
+EnvironmentFile=-/etc/project-orchestrator/env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=project-orchestrator
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/project-orchestrator
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
