@@ -40,6 +40,10 @@ rand = "0.8"
 # Platform directories (config path)
 dirs = "5"
 
+# Docker management
+bollard = "0.18"
+futures-util = "0.3"
+
 # Error handling
 anyhow = "1"
 

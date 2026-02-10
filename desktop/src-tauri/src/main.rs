@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod docker;
 mod setup;
 
 use project_orchestrator::Config;
@@ -34,6 +35,9 @@ fn main() {
         .init();
 
     tracing::info!("Starting Project Orchestrator Desktop...");
+
+    // Initialize Docker manager (shared state for Tauri commands)
+    let docker_manager = docker::create_docker_manager();
 
     // Check if this is first launch (no config.yaml)
     let has_config = setup::check_config_exists();
@@ -85,17 +89,47 @@ fn main() {
         // The frontend will detect the absence of config and show /setup
     }
 
+    // Clone docker manager for the exit handler
+    let docker_for_exit = docker_manager.clone();
+
     // Launch Tauri application
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .manage(docker_manager)
         .invoke_handler(tauri::generate_handler![
             get_server_port,
             check_health,
+            // Setup wizard commands
             setup::check_config_exists,
             setup::get_config_path,
             setup::generate_config,
             setup::detect_claude_code,
+            // Docker management commands
+            docker::check_docker,
+            docker::start_docker_services,
+            docker::check_services_health,
+            docker::stop_docker_services,
+            docker::get_service_logs,
         ])
-        .run(tauri::generate_context!())
-        .expect("Error while running Tauri application");
+        .build(tauri::generate_context!())
+        .expect("Error while building Tauri application");
+
+    app.run(move |_app, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            tracing::info!("Application exiting — stopping Docker services...");
+            let dm = docker_for_exit.clone();
+            // Spawn a blocking task to stop containers
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let mgr = dm.read().await;
+                    if let Err(e) = mgr.stop_services().await {
+                        tracing::warn!("Failed to stop Docker services on exit: {}", e);
+                    }
+                });
+            })
+            .join()
+            .ok();
+        }
+    });
 }
