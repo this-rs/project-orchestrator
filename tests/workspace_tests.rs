@@ -10,6 +10,7 @@ use uuid::Uuid;
 /// Get test configuration from environment or use defaults
 fn test_config() -> Config {
     Config {
+        setup_completed: true,
         neo4j_uri: std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into()),
         neo4j_user: std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
         neo4j_password: std::env::var("NEO4J_PASSWORD")
@@ -18,9 +19,12 @@ fn test_config() -> Config {
             .unwrap_or_else(|_| "http://localhost:7700".into()),
         meilisearch_key: std::env::var("MEILISEARCH_KEY")
             .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
+        nats_url: None,
         workspace_path: ".".into(),
         server_port: 8080,
         auth_config: None,
+        serve_frontend: false,
+        frontend_path: "./dist".to_string(),
     }
 }
 

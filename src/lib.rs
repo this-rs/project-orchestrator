@@ -29,6 +29,21 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Expand tilde (~) in paths to the user's home directory.
+/// Shell expansion doesn't happen when paths are passed programmatically.
+pub(crate) fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &path[1..]);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.display().to_string();
+        }
+    }
+    path.to_string()
+}
+
 // ============================================================================
 // YAML config structs (deserialization targets)
 // ============================================================================
@@ -37,12 +52,21 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct YamlConfig {
+    /// When false, the app is not yet configured — the frontend shows the setup wizard.
+    /// Defaults to true for backward compat (existing config.yaml files without this field).
+    #[serde(default = "default_true")]
+    pub setup_completed: bool,
     pub server: ServerYamlConfig,
     pub neo4j: Neo4jYamlConfig,
     pub meilisearch: MeilisearchYamlConfig,
+    pub nats: NatsYamlConfig,
     pub chat: ChatYamlConfig,
     /// Auth section — if absent, auth_config will be None (deny-by-default)
     pub auth: Option<AuthConfig>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Server configuration section
@@ -102,6 +126,14 @@ impl Default for MeilisearchYamlConfig {
             key: "orchestrator-meili-key-change-me".into(),
         }
     }
+}
+
+/// NATS configuration section (optional — enables inter-process event sync)
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct NatsYamlConfig {
+    /// NATS server URL (e.g. "nats://localhost:4222")
+    pub url: Option<String>,
 }
 
 /// Chat configuration section (YAML only — ChatConfig in chat/config.rs handles full setup)
@@ -293,11 +325,16 @@ impl AuthConfig {
 /// Application configuration
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// When false, the setup wizard should be shown instead of the main app.
+    /// Defaults to true for backward compat.
+    pub setup_completed: bool,
     pub neo4j_uri: String,
     pub neo4j_user: String,
     pub neo4j_password: String,
     pub meilisearch_url: String,
     pub meilisearch_key: String,
+    /// NATS server URL (optional — enables inter-process event sync)
+    pub nats_url: Option<String>,
     pub workspace_path: String,
     pub server_port: u16,
     /// Auth config — None means deny-by-default (no auth section in YAML)
@@ -327,11 +364,13 @@ impl Config {
 
         // 2. Build Config with env var overrides
         Ok(Self {
+            setup_completed: yaml.setup_completed,
             neo4j_uri: std::env::var("NEO4J_URI").unwrap_or(yaml.neo4j.uri),
             neo4j_user: std::env::var("NEO4J_USER").unwrap_or(yaml.neo4j.user),
             neo4j_password: std::env::var("NEO4J_PASSWORD").unwrap_or(yaml.neo4j.password),
             meilisearch_url: std::env::var("MEILISEARCH_URL").unwrap_or(yaml.meilisearch.url),
             meilisearch_key: std::env::var("MEILISEARCH_KEY").unwrap_or(yaml.meilisearch.key),
+            nats_url: std::env::var("NATS_URL").ok().or(yaml.nats.url),
             workspace_path: std::env::var("WORKSPACE_PATH").unwrap_or(yaml.server.workspace_path),
             server_port: std::env::var("SERVER_PORT")
                 .ok()
@@ -423,8 +462,26 @@ impl AppState {
 ///
 /// Returns when the server shuts down (or an error occurs during startup).
 pub async fn start_server(mut config: Config) -> Result<()> {
-    use api::handlers::ServerState;
     use std::net::SocketAddr;
+
+    // ────────────────────────────────────────────────────────────────────
+    // Setup-only mode: if the wizard hasn't been completed yet, start a
+    // minimal server that only serves /health and /api/setup-status.
+    // This avoids connecting to Neo4j/MeiliSearch (which are likely not
+    // configured yet) and lets the frontend show the setup wizard.
+    // ────────────────────────────────────────────────────────────────────
+    if !config.setup_completed {
+        tracing::info!(
+            "Setup not completed — starting minimal setup-only server on port {}",
+            config.server_port
+        );
+        return start_setup_server(config.server_port).await;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Normal (fully configured) server
+    // ────────────────────────────────────────────────────────────────────
+    use api::handlers::ServerState;
     use tokio::sync::RwLock;
 
     // Hash root account password at startup (if plaintext)
@@ -475,6 +532,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         auth_config: config.auth_config.clone(),
         serve_frontend: config.serve_frontend,
         frontend_path: config.frontend_path.clone(),
+        setup_completed: config.setup_completed,
     });
 
     // Create router
@@ -493,6 +551,74 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
     tracing::info!("Server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Start a minimal server for the setup wizard.
+///
+/// Only serves `/health`, `/api/setup-status`, and `/auth/providers`.
+/// No database connections are required — it's a lightweight Axum server
+/// that lets the Tauri frontend display the setup wizard.
+async fn start_setup_server(port: u16) -> Result<()> {
+    use axum::routing::get;
+    use serde::Serialize;
+    use std::net::SocketAddr;
+    use tower_http::cors::{Any, CorsLayer};
+
+    #[derive(Serialize)]
+    struct HealthResp {
+        status: String,
+        version: String,
+    }
+
+    #[derive(Serialize)]
+    struct SetupStatusResp {
+        configured: bool,
+    }
+
+    #[derive(Serialize)]
+    struct AuthProvidersResp {
+        auth_required: bool,
+        providers: Vec<String>,
+        allow_registration: bool,
+    }
+
+    async fn health() -> axum::Json<HealthResp> {
+        axum::Json(HealthResp {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+    }
+
+    async fn setup_status() -> axum::Json<SetupStatusResp> {
+        axum::Json(SetupStatusResp { configured: false })
+    }
+
+    async fn auth_providers() -> axum::Json<AuthProvidersResp> {
+        axum::Json(AuthProvidersResp {
+            auth_required: false,
+            providers: vec![],
+            allow_registration: false,
+        })
+    }
+
+    let cors = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .allow_origin(Any);
+
+    let app = axum::Router::new()
+        .route("/health", get(health))
+        .route("/api/setup-status", get(setup_status))
+        .route("/auth/providers", get(auth_providers))
+        .layer(cors);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!("Setup-only server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

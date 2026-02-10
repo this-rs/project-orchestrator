@@ -102,11 +102,13 @@ async fn main() -> Result<()> {
 
     // Create config and app state
     let config = Config {
+        setup_completed: true,
         neo4j_uri: args.neo4j_uri,
         neo4j_user: args.neo4j_user,
         neo4j_password: args.neo4j_password,
         meilisearch_url: args.meilisearch_url,
         meilisearch_key: args.meilisearch_key,
+        nats_url: std::env::var("NATS_URL").ok(),
         workspace_path: ".".to_string(),
         server_port: 8080,          // Not used in MCP mode
         auth_config: None,           // MCP server doesn't need auth (stdio-based)

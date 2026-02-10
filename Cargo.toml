@@ -81,6 +81,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Home directory detection
 dirs = "6"
 
+# NATS message broker (inter-process event sync)
+async-nats = "0.39"
+
 # Config
 dotenvy = "0.15"
 urlencoding = "2.1.3"

@@ -44,6 +44,21 @@ services:
     networks:
       - orchestrator-net
 
+  nats:
+    image: nats:latest
+    container_name: orchestrator-nats
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+    command: ["--http_port", "8222"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - orchestrator-net
+
   orchestrator:
     build:
       context: .
@@ -66,6 +81,7 @@ services:
       - MEILISEARCH_KEY=orchestrator-meili-key-change-me
       - RUST_LOG=info,project_orchestrator=debug
       - WORKSPACE_PATH=/workspace
+      - NATS_URL=nats://nats:4222
       # Frontend is served from /app/dist (default: true)
       # Set to false for API-only mode
       # - SERVE_FRONTEND=false
@@ -73,6 +89,8 @@ services:
       neo4j:
         condition: service_healthy
       meilisearch:
+        condition: service_healthy
+      nats:
         condition: service_healthy
     volumes:
       - ./workspace:/workspace:ro

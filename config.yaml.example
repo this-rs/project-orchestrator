@@ -49,6 +49,15 @@ meilisearch:
   key: "orchestrator-meili-key-change-me"   # MEILISEARCH_KEY env override
 
 # -----------------------------------------------------------------------------
+# NATS — Message broker for inter-process event sync (optional)
+# -----------------------------------------------------------------------------
+# Enables real-time event synchronization between multiple instances
+# (e.g. dev server on port 8080 + desktop app on port 6600).
+# If absent or url is null, the system works in local-only mode.
+# nats:
+#   url: "nats://localhost:4222"     # NATS_URL env override
+
+# -----------------------------------------------------------------------------
 # Chat — Claude Code integration (optional, uses env vars)
 # -----------------------------------------------------------------------------
 chat:
