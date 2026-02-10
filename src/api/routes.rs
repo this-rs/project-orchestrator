@@ -96,8 +96,9 @@ fn build_cors(state: &OrchestratorState) -> CorsLayer {
 /// Includes: health check, OAuth login/callback, webhook endpoints, internal events.
 fn public_routes() -> Router<OrchestratorState> {
     Router::new()
-        // Health check
+        // Health check & version
         .route("/health", get(handlers::health))
+        .route("/api/version", get(handlers::get_version))
         // ================================================================
         // Auth (public — login flow + discovery)
         // ================================================================

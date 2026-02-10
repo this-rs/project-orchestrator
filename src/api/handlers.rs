@@ -60,6 +60,51 @@ pub async fn health() -> Json<HealthResponse> {
 }
 
 // ============================================================================
+// Version info
+// ============================================================================
+
+/// Feature flags exposed in the version endpoint
+#[derive(Serialize)]
+pub struct VersionFeatures {
+    pub embedded_frontend: bool,
+    pub serve_frontend: bool,
+}
+
+/// Build metadata exposed in the version endpoint
+#[derive(Serialize)]
+pub struct VersionBuild {
+    pub target: String,
+    pub profile: &'static str,
+}
+
+/// Full version response
+#[derive(Serialize)]
+pub struct VersionResponse {
+    pub version: &'static str,
+    pub features: VersionFeatures,
+    pub build: VersionBuild,
+}
+
+/// GET /api/version — public endpoint returning server version and build info.
+pub async fn get_version(State(state): State<OrchestratorState>) -> Json<VersionResponse> {
+    Json(VersionResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        features: VersionFeatures {
+            embedded_frontend: cfg!(feature = "embedded-frontend"),
+            serve_frontend: state.serve_frontend,
+        },
+        build: VersionBuild {
+            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+        },
+    })
+}
+
+// ============================================================================
 // Plans
 // ============================================================================
 
