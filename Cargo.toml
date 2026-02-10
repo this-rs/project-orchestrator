@@ -62,8 +62,8 @@ hex = "0.4"
 futures = "0.3"
 async-trait = "0.1"
 
-# HTTP client (for CLI)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (for CLI) — rustls-only for cross-compilation (no OpenSSL dependency)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
 nexus-claude = { git = "https://github.com/this-rs/nexus.git", branch = "main", features = ["memory"] }
