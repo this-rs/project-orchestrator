@@ -323,7 +323,7 @@ fn validate_registration(
 
     // Email basic validation (contains @ and a dot after @)
     let email = req.email.trim().to_lowercase();
-    if !email.contains('@') || !email.split('@').nth(1).map_or(false, |d| d.contains('.')) {
+    if !email.contains('@') || !email.split('@').nth(1).is_some_and(|d| d.contains('.')) {
         return Err(AppError::BadRequest("Invalid email format".to_string()));
     }
 
@@ -445,8 +445,7 @@ pub async fn oidc_login(
         ));
     }
 
-    let client =
-        OidcClient::from_auth_config_sync(auth_config).map_err(|e| AppError::Internal(e))?;
+    let client = OidcClient::from_auth_config_sync(auth_config).map_err(AppError::Internal)?;
 
     Ok(Json(AuthUrlResponse {
         auth_url: client.auth_url(),
@@ -474,8 +473,7 @@ pub async fn oidc_callback(
     }
 
     // 1. Build OIDC client and exchange code
-    let client =
-        OidcClient::from_auth_config_sync(auth_config).map_err(|e| AppError::Internal(e))?;
+    let client = OidcClient::from_auth_config_sync(auth_config).map_err(AppError::Internal)?;
 
     let oidc_user = client
         .exchange_code(&req.code)

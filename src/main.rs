@@ -152,9 +152,7 @@ async fn run_server(mut config: Config) -> Result<()> {
             );
         }
         None => {
-            tracing::info!(
-                "Auth disabled — open access mode (no auth section in config.yaml)"
-            );
+            tracing::info!("Auth disabled — open access mode (no auth section in config.yaml)");
         }
     }
 

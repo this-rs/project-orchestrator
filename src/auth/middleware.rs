@@ -161,9 +161,7 @@ mod tests {
         let state = make_server_state(None).await;
 
         // Handler that checks the injected claims
-        async fn check_claims(
-            axum::Extension(claims): axum::Extension<Claims>,
-        ) -> String {
+        async fn check_claims(axum::Extension(claims): axum::Extension<Claims>) -> String {
             format!("{}|{}|{}", claims.sub, claims.email, claims.name)
         }
 

@@ -3439,9 +3439,7 @@ impl GraphStore for MockGraphStore {
                 // Password: match on auth_provider + email
                 users
                     .values()
-                    .find(|u| {
-                        u.auth_provider == AuthProvider::Password && u.email == user.email
-                    })
+                    .find(|u| u.auth_provider == AuthProvider::Password && u.email == user.email)
                     .map(|u| u.id)
             }
         };
@@ -3478,8 +3476,7 @@ impl GraphStore for MockGraphStore {
             .await
             .values()
             .find(|u| {
-                u.auth_provider == provider_parsed
-                    && u.external_id.as_deref() == Some(external_id)
+                u.auth_provider == provider_parsed && u.external_id.as_deref() == Some(external_id)
             })
             .cloned())
     }
@@ -3867,10 +3864,7 @@ mod tests {
         let user = make_oidc_user("gid-004", "diana@ffs.holdings");
         store.upsert_user(&user).await.unwrap();
 
-        let found = store
-            .get_user_by_email("diana@ffs.holdings")
-            .await
-            .unwrap();
+        let found = store.get_user_by_email("diana@ffs.holdings").await.unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().external_id, Some("gid-004".to_string()));
 

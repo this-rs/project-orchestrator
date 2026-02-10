@@ -53,18 +53,9 @@ impl GoogleOAuthClient {
     /// Prefer using `OidcClient` with `AuthConfig::effective_oidc()` for new code.
     pub fn new(config: &AuthConfig) -> Self {
         Self {
-            client_id: config
-                .google_client_id
-                .clone()
-                .unwrap_or_default(),
-            client_secret: config
-                .google_client_secret
-                .clone()
-                .unwrap_or_default(),
-            redirect_uri: config
-                .google_redirect_uri
-                .clone()
-                .unwrap_or_default(),
+            client_id: config.google_client_id.clone().unwrap_or_default(),
+            client_secret: config.google_client_secret.clone().unwrap_or_default(),
+            redirect_uri: config.google_redirect_uri.clone().unwrap_or_default(),
             http_client: reqwest::Client::new(),
         }
     }

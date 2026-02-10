@@ -7417,10 +7417,7 @@ impl Neo4jClient {
         .param("email", user.email.clone())
         .param("name", user.name.clone())
         .param("picture_url", user.picture_url.clone().unwrap_or_default())
-        .param(
-            "external_id",
-            user.external_id.clone().unwrap_or_default(),
-        )
+        .param("external_id", user.external_id.clone().unwrap_or_default())
         .param(
             "password_hash",
             user.password_hash.clone().unwrap_or_default(),
@@ -7456,11 +7453,10 @@ impl Neo4jClient {
         provider: &str,
         external_id: &str,
     ) -> Result<Option<UserNode>> {
-        let q = query(
-            "MATCH (u:User {auth_provider: $provider, external_id: $external_id}) RETURN u",
-        )
-        .param("provider", provider)
-        .param("external_id", external_id);
+        let q =
+            query("MATCH (u:User {auth_provider: $provider, external_id: $external_id}) RETURN u")
+                .param("provider", provider)
+                .param("external_id", external_id);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -7477,11 +7473,9 @@ impl Neo4jClient {
         email: &str,
         provider: &str,
     ) -> Result<Option<UserNode>> {
-        let q = query(
-            "MATCH (u:User {email: $email, auth_provider: $provider}) RETURN u",
-        )
-        .param("email", email)
-        .param("provider", provider);
+        let q = query("MATCH (u:User {email: $email, auth_provider: $provider}) RETURN u")
+            .param("email", email)
+            .param("provider", provider);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -7564,15 +7558,22 @@ impl Neo4jClient {
             .ok()
             .and_then(|s| if s.is_empty() { None } else { Some(s) })
             .or_else(|| {
-                node.get::<String>("google_id")
-                    .ok()
-                    .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                node.get::<String>("google_id").ok().and_then(|s| {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                })
             });
 
-        let password_hash = node
-            .get::<String>("password_hash")
-            .ok()
-            .and_then(|s| if s.is_empty() { None } else { Some(s) });
+        let password_hash = node.get::<String>("password_hash").ok().and_then(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
 
         Ok(UserNode {
             id: node.get::<String>("id")?.parse()?,

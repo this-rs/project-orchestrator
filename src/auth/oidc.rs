@@ -66,14 +66,12 @@ impl OidcClient {
     ///
     /// Uses auth_endpoint/token_endpoint from config (must be present).
     pub fn from_config(config: &OidcConfig) -> Result<Self> {
-        let auth_endpoint = config
-            .auth_endpoint
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("OIDC auth_endpoint is required when discovery_url is not set"))?;
-        let token_endpoint = config
-            .token_endpoint
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("OIDC token_endpoint is required when discovery_url is not set"))?;
+        let auth_endpoint = config.auth_endpoint.clone().ok_or_else(|| {
+            anyhow::anyhow!("OIDC auth_endpoint is required when discovery_url is not set")
+        })?;
+        let token_endpoint = config.token_endpoint.clone().ok_or_else(|| {
+            anyhow::anyhow!("OIDC token_endpoint is required when discovery_url is not set")
+        })?;
 
         Ok(Self {
             provider_name: config.provider_name.clone(),
@@ -109,7 +107,9 @@ impl OidcClient {
             provider_name: config.provider_name.clone(),
             auth_endpoint: doc.authorization_endpoint,
             token_endpoint: doc.token_endpoint,
-            userinfo_endpoint: doc.userinfo_endpoint.or_else(|| config.userinfo_endpoint.clone()),
+            userinfo_endpoint: doc
+                .userinfo_endpoint
+                .or_else(|| config.userinfo_endpoint.clone()),
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
             redirect_uri: config.redirect_uri.clone(),
@@ -373,7 +373,10 @@ mod tests {
         assert_eq!(user.external_id, "1234567890");
         assert_eq!(user.email, "alice@company.com");
         assert_eq!(user.name, "Alice Dupont");
-        assert_eq!(user.picture.as_deref(), Some("https://example.com/photo.jpg"));
+        assert_eq!(
+            user.picture.as_deref(),
+            Some("https://example.com/photo.jpg")
+        );
     }
 
     #[test]
@@ -404,10 +407,7 @@ mod tests {
             doc.authorization_endpoint,
             "https://accounts.google.com/o/oauth2/v2/auth"
         );
-        assert_eq!(
-            doc.token_endpoint,
-            "https://oauth2.googleapis.com/token"
-        );
+        assert_eq!(doc.token_endpoint, "https://oauth2.googleapis.com/token");
         assert_eq!(
             doc.userinfo_endpoint.as_deref(),
             Some("https://openidconnect.googleapis.com/v1/userinfo")

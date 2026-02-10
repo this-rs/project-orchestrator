@@ -231,9 +231,7 @@ impl AuthConfig {
             &self.google_client_secret,
             &self.google_redirect_uri,
         ) {
-            (Some(client_id), Some(client_secret), Some(redirect_uri))
-                if !client_id.is_empty() =>
-            {
+            (Some(client_id), Some(client_secret), Some(redirect_uri)) if !client_id.is_empty() => {
                 Some(OidcConfig {
                     discovery_url: None,
                     auth_endpoint: Some(GOOGLE_AUTH_ENDPOINT.to_string()),
@@ -267,8 +265,7 @@ impl AuthConfig {
     /// Logs a warning when plaintext is detected to encourage using pre-hashed values.
     pub fn ensure_root_password_hashed(&mut self) -> anyhow::Result<()> {
         if let Some(ref mut root) = self.root_account {
-            if !root.password_hash.starts_with("$2b$") && !root.password_hash.starts_with("$2a$")
-            {
+            if !root.password_hash.starts_with("$2b$") && !root.password_hash.starts_with("$2a$") {
                 tracing::warn!(
                     "Root account password is stored as plaintext in config.yaml — hashing at startup. \
                      Consider pre-hashing with: echo -n 'password' | htpasswd -bnBC 12 '' | cut -d: -f2"
