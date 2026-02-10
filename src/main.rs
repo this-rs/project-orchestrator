@@ -4,16 +4,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use project_orchestrator::{
-    api::{self, handlers::ServerState},
-    chat::{ChatConfig, ChatManager},
-    events::EventBus,
-    orchestrator::{FileWatcher, Orchestrator},
-    AppState, Config,
-};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use project_orchestrator::{orchestrator::Orchestrator, AppState, Config};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -81,131 +72,10 @@ async fn main() -> Result<()> {
             if let Some(path) = frontend_path {
                 config.frontend_path = path;
             }
-            run_server(config).await
+            project_orchestrator::start_server(config).await
         }
         Commands::Sync { path } => run_sync(config, &path).await,
     }
-}
-
-async fn run_server(mut config: Config) -> Result<()> {
-    tracing::info!("Starting Project Orchestrator server...");
-
-    // Hash root account password at startup (if plaintext)
-    if let Some(ref mut auth) = config.auth_config {
-        auth.ensure_root_password_hashed()?;
-    }
-
-    // Initialize application state
-    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
-    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
-
-    let state = AppState::new(config.clone()).await?;
-    tracing::info!("Connected to databases");
-
-    // Create event bus for CRUD notifications
-    let event_bus = Arc::new(EventBus::default());
-
-    // Create orchestrator with event bus
-    let orchestrator = Arc::new(Orchestrator::with_event_bus(state, event_bus.clone()).await?);
-
-    // Create file watcher
-    let watcher = FileWatcher::new(orchestrator.clone());
-
-    // Create chat manager (optional — requires Claude CLI)
-    let chat_manager = {
-        let chat_config = ChatConfig::from_env();
-        let cm = Arc::new(
-            ChatManager::new(
-                orchestrator.neo4j_arc(),
-                orchestrator.meili_arc(),
-                chat_config,
-            )
-            .await
-            .with_event_emitter(event_bus.clone()),
-        );
-        cm.start_cleanup_task();
-        tracing::info!("Chat manager initialized");
-        Some(cm)
-    };
-
-    // Log auth status
-    match &config.auth_config {
-        Some(auth) => {
-            // Determine active auth modes
-            let mut modes = vec![];
-            if auth.has_password_auth() {
-                modes.push("password (root account)");
-            }
-            if auth.has_oidc() {
-                let provider_name = auth
-                    .effective_oidc()
-                    .map(|o| o.provider_name.clone())
-                    .unwrap_or_else(|| "OIDC".to_string());
-                modes.push(Box::leak(
-                    format!("OIDC ({})", provider_name).into_boxed_str(),
-                ));
-            }
-            tracing::info!(
-                "Auth enabled — modes: [{}]",
-                if modes.is_empty() {
-                    "none configured".to_string()
-                } else {
-                    modes.join(", ")
-                }
-            );
-            if let Some(ref domain) = auth.allowed_email_domain {
-                tracing::info!("  Email domain restriction: @{}", domain);
-            }
-            if let Some(ref url) = auth.frontend_url {
-                tracing::info!("  Frontend URL (CORS): {}", url);
-            }
-            tracing::info!("  JWT expiry: {}h", auth.jwt_expiry_secs / 3600);
-            tracing::info!(
-                "  Registration: {}",
-                if auth.allow_registration {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
-        }
-        None => {
-            tracing::info!("Auth disabled — open access mode (no auth section in config.yaml)");
-        }
-    }
-
-    // Create server state
-    let server_state = Arc::new(ServerState {
-        orchestrator,
-        watcher: Arc::new(RwLock::new(watcher)),
-        chat_manager,
-        event_bus,
-        auth_config: config.auth_config.clone(),
-        serve_frontend: config.serve_frontend,
-        frontend_path: config.frontend_path.clone(),
-    });
-
-    // Create router
-    let app = api::create_router(server_state);
-
-    // Log frontend serving mode
-    if config.serve_frontend {
-        tracing::info!(
-            "Frontend serving enabled — path: {}",
-            config.frontend_path
-        );
-    } else {
-        tracing::info!("Frontend serving disabled (API-only mode)");
-    }
-
-    // Start server
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
-    tracing::info!("Server listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
 }
 
 async fn run_sync(config: Config, path: &str) -> Result<()> {

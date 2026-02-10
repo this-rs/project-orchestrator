@@ -410,6 +410,95 @@ impl AppState {
 }
 
 // ============================================================================
+// Server entry point (for embedding in Tauri or other hosts)
+// ============================================================================
+
+/// Start the orchestrator server with the given configuration.
+///
+/// This is the main entry point for embedding the server in another application
+/// (e.g., Tauri desktop). It initializes all services, creates the Axum router,
+/// and binds to the configured port.
+///
+/// Returns when the server shuts down (or an error occurs during startup).
+pub async fn start_server(mut config: Config) -> Result<()> {
+    use api::handlers::ServerState;
+    use std::net::SocketAddr;
+    use tokio::sync::RwLock;
+
+    // Hash root account password at startup (if plaintext)
+    if let Some(ref mut auth) = config.auth_config {
+        auth.ensure_root_password_hashed()?;
+    }
+
+    // Initialize application state
+    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
+    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+
+    let state = AppState::new(config.clone()).await?;
+    tracing::info!("Connected to databases");
+
+    // Create event bus for CRUD notifications
+    let event_bus = Arc::new(events::EventBus::default());
+
+    // Create orchestrator with event bus
+    let orchestrator =
+        Arc::new(orchestrator::Orchestrator::with_event_bus(state, event_bus.clone()).await?);
+
+    // Create file watcher
+    let watcher = orchestrator::FileWatcher::new(orchestrator.clone());
+
+    // Create chat manager (optional — requires Claude CLI)
+    let chat_manager = {
+        let chat_config = chat::ChatConfig::from_env();
+        let cm = Arc::new(
+            chat::ChatManager::new(
+                orchestrator.neo4j_arc(),
+                orchestrator.meili_arc(),
+                chat_config,
+            )
+            .await
+            .with_event_emitter(event_bus.clone()),
+        );
+        cm.start_cleanup_task();
+        tracing::info!("Chat manager initialized");
+        Some(cm)
+    };
+
+    // Create server state
+    let server_state = Arc::new(ServerState {
+        orchestrator,
+        watcher: Arc::new(RwLock::new(watcher)),
+        chat_manager,
+        event_bus,
+        auth_config: config.auth_config.clone(),
+        serve_frontend: config.serve_frontend,
+        frontend_path: config.frontend_path.clone(),
+    });
+
+    // Create router
+    let app = api::create_router(server_state);
+
+    // Log frontend serving mode
+    if config.serve_frontend {
+        tracing::info!(
+            "Frontend serving enabled — path: {}",
+            config.frontend_path
+        );
+    } else {
+        tracing::info!("Frontend serving disabled (API-only mode)");
+    }
+
+    // Start server
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
+    tracing::info!("Server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
