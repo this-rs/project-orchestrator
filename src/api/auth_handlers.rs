@@ -11,6 +11,7 @@ use crate::api::handlers::{AppError, OrchestratorState};
 use crate::auth::extractor::AuthUser;
 use crate::auth::google::GoogleOAuthClient;
 use crate::auth::jwt::encode_jwt;
+use crate::auth::oidc::OidcClient;
 use crate::neo4j::models::UserNode;
 use axum::{extract::State, Json};
 use chrono::Utc;
@@ -45,6 +46,12 @@ pub struct AuthUrlResponse {
 /// Request body for POST /auth/google/callback
 #[derive(Deserialize)]
 pub struct GoogleCallbackRequest {
+    pub code: String,
+}
+
+/// Request body for POST /auth/oidc/callback
+#[derive(Deserialize)]
+pub struct OidcCallbackRequest {
     pub code: String,
 }
 
@@ -403,6 +410,103 @@ pub async fn google_callback(
         picture_url: google_user.picture.clone(),
         auth_provider: crate::neo4j::models::AuthProvider::Oidc,
         external_id: Some(google_user.google_id.clone()),
+        password_hash: None,
+        created_at: now,
+        last_login_at: now,
+    };
+
+    let user = state.orchestrator.neo4j().upsert_user(&user_node).await?;
+
+    // 4. Generate JWT
+    let token = encode_jwt(
+        user.id,
+        &user.email,
+        &user.name,
+        &auth_config.jwt_secret,
+        auth_config.jwt_expiry_secs,
+    )
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(AuthTokenResponse {
+        token,
+        user: UserResponse::from(user),
+    }))
+}
+
+/// GET /auth/oidc — Returns the OIDC authorization URL.
+///
+/// Uses the generic OIDC client built from `effective_oidc()` config
+/// or legacy Google fields. The frontend redirects the user to this URL.
+pub async fn oidc_login(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<AuthUrlResponse>, AppError> {
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
+
+    if !auth_config.has_oidc() {
+        return Err(AppError::Forbidden(
+            "OIDC authentication is not configured".to_string(),
+        ));
+    }
+
+    let client = OidcClient::from_auth_config_sync(auth_config)
+        .map_err(|e| AppError::Internal(e))?;
+
+    Ok(Json(AuthUrlResponse {
+        auth_url: client.auth_url(),
+    }))
+}
+
+/// POST /auth/oidc/callback — Exchange OIDC authorization code for JWT + user.
+///
+/// 1. Exchanges the auth code via the generic OIDC client
+/// 2. Upserts the user in Neo4j with auth_provider="oidc" + external_id=sub
+/// 3. Returns a JWT token + user info
+pub async fn oidc_callback(
+    State(state): State<OrchestratorState>,
+    Json(req): Json<OidcCallbackRequest>,
+) -> Result<Json<AuthTokenResponse>, AppError> {
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
+
+    if !auth_config.has_oidc() {
+        return Err(AppError::Forbidden(
+            "OIDC authentication is not configured".to_string(),
+        ));
+    }
+
+    // 1. Build OIDC client and exchange code
+    let client = OidcClient::from_auth_config_sync(auth_config)
+        .map_err(|e| AppError::Internal(e))?;
+
+    let oidc_user = client
+        .exchange_code(&req.code)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("OIDC code exchange failed: {}", e)))?;
+
+    // 2. Check email domain restriction
+    if let Some(ref domain) = auth_config.allowed_email_domain {
+        if !oidc_user.email.ends_with(&format!("@{}", domain)) {
+            return Err(AppError::Forbidden(format!(
+                "Email domain not allowed (expected @{})",
+                domain
+            )));
+        }
+    }
+
+    // 3. Upsert user in Neo4j
+    let now = Utc::now();
+    let user_node = UserNode {
+        id: Uuid::new_v4(),
+        email: oidc_user.email.clone(),
+        name: oidc_user.name.clone(),
+        picture_url: oidc_user.picture.clone(),
+        auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+        external_id: Some(oidc_user.external_id.clone()),
         password_hash: None,
         created_at: now,
         last_login_at: now,

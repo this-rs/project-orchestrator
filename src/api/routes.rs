@@ -67,6 +67,11 @@ fn public_routes() -> Router<OrchestratorState> {
         .route("/auth/providers", get(auth_handlers::get_auth_providers))
         .route("/auth/login", post(auth_handlers::password_login))
         .route("/auth/register", post(auth_handlers::register))
+        // OIDC generic routes
+        .route("/auth/oidc", get(auth_handlers::oidc_login))
+        .route("/auth/oidc/callback", post(auth_handlers::oidc_callback))
+        // Legacy Google routes (alias → same underlying OIDC flow for google_login,
+        // google_callback kept for direct Google OAuth backward compat)
         .route("/auth/google", get(auth_handlers::google_login))
         .route(
             "/auth/google/callback",
