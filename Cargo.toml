@@ -130,3 +130,20 @@ conf-files = ["/etc/project-orchestrator/config.yaml"]
 unit-scripts = "packaging/debian/"
 enable = false
 start = false
+
+# =============================================================================
+# RPM packaging (cargo-generate-rpm)
+# =============================================================================
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/orchestrator", dest = "/usr/bin/orchestrator", mode = "755" },
+    { source = "target/release/orch", dest = "/usr/bin/orch", mode = "755" },
+    { source = "target/release/mcp_server", dest = "/usr/bin/orchestrator-mcp", mode = "755" },
+    { source = "config.yaml.example", dest = "/etc/project-orchestrator/config.yaml.example", mode = "644", config = "noreplace" },
+    { source = "packaging/debian/project-orchestrator.service", dest = "/lib/systemd/system/project-orchestrator.service", mode = "644" },
+    { source = "packaging/debian/docker-compose.services.yml", dest = "/etc/project-orchestrator/docker-compose.services.yml", mode = "644" },
+]
+post_install_script = "packaging/rpm/postinst.sh"
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"
