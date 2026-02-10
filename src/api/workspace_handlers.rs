@@ -746,6 +746,24 @@ pub async fn add_task_to_workspace_milestone(
     Ok(StatusCode::CREATED)
 }
 
+/// List tasks linked to a workspace milestone
+pub async fn list_workspace_milestone_tasks(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<TaskNode>>, AppError> {
+    let id: Uuid = id
+        .parse()
+        .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
+
+    let tasks = state
+        .orchestrator
+        .neo4j()
+        .get_workspace_milestone_tasks(id)
+        .await?;
+
+    Ok(Json(tasks))
+}
+
 /// Get workspace milestone progress
 pub async fn get_workspace_milestone_progress(
     State(state): State<OrchestratorState>,
