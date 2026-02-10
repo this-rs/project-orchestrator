@@ -40,7 +40,7 @@
     "shortDescription": "AI Agent Orchestrator with Knowledge Graph",
     "longDescription": "Project Orchestrator is an AI agent orchestrator with Neo4j knowledge graph, Meilisearch semantic search, and Tree-sitter code parsing. It provides a REST API, WebSocket events, and an embedded React frontend.",
     "macOS": {
-      "entitlements": null,
+      "entitlements": "entitlements.plist",
       "minimumSystemVersion": "10.15"
     },
     "windows": {
