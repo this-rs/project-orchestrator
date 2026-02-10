@@ -31,6 +31,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP client (for health check — blocking needed for pre-Tauri startup)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
+# YAML config generation
+serde_yaml = "0.9"
+
+# Random secret generation
+rand = "0.8"
+
+# Platform directories (config path)
+dirs = "5"
+
 # Error handling
 anyhow = "1"
 
