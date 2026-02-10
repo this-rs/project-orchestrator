@@ -28,7 +28,7 @@ Complete setup instructions for Project Orchestrator.
 ### Step 1: Clone the repository
 
 ```bash
-git clone https://github.com/your-org/project-orchestrator.git
+git clone https://github.com/this-rs/project-orchestrator.git
 cd project-orchestrator
 ```
 
@@ -41,7 +41,7 @@ docker compose up -d
 This starts:
 - **Neo4j** — Graph database for code structure and relationships
 - **Meilisearch** — Search engine for code and decisions
-- **Orchestrator** — API server with 62 MCP tools
+- **Orchestrator** — API server with 137 MCP tools
 
 ### Step 3: Verify the installation
 
@@ -107,7 +107,7 @@ cargo build --release --bin mcp_server
 | `MEILISEARCH_KEY` | `orchestrator-meili-key-change-me` | Meilisearch API key |
 | `SERVER_PORT` | `8080` | HTTP API port |
 | `WORKSPACE_PATH` | `.` | Default workspace for syncing |
-| `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `RUST_LOG` | `info,project_orchestrator=debug` | Log level filter (see [env_logger syntax](https://docs.rs/env_logger)) |
 
 ### Production Configuration
 
@@ -124,6 +124,98 @@ Then update `docker-compose.yml` or pass environment variables:
 ```bash
 docker compose --env-file .env up -d
 ```
+
+> **Note:** Authentication (Google OAuth, JWT) is configured exclusively through
+> `config.yaml`, not environment variables. See the [Configuration System](#configuration-system-configyaml)
+> and [Authentication Setup](#authentication-setup) sections below.
+
+---
+
+## Configuration System (config.yaml)
+
+Project Orchestrator uses a layered configuration system with the following priority (highest wins):
+
+1. **Environment variables** -- override everything
+2. **`config.yaml`** -- file-based configuration
+3. **Built-in defaults** -- sensible fallbacks for development
+
+### Quick Start
+
+```bash
+cp config.yaml.example config.yaml
+# Edit config.yaml to match your environment
+```
+
+### Full Example
+
+```yaml
+server:
+  port: 8080
+  workspace_path: "."
+
+neo4j:
+  uri: "bolt://localhost:7687"
+  user: "neo4j"
+  password: "orchestrator123"
+
+meilisearch:
+  url: "http://localhost:7700"
+  key: "orchestrator-meili-key-change-me"
+
+chat:
+  default_model: "claude-opus-4-6"
+  max_sessions: 10
+  session_timeout_secs: 1800
+  max_turns: 50
+  prompt_builder_model: "claude-opus-4-6"
+
+# Auth section -- if absent, server denies ALL /api/* and /ws/* requests
+auth:
+  google_client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
+  google_client_secret: "YOUR_CLIENT_SECRET"
+  google_redirect_uri: "http://localhost:3000/auth/callback"
+  jwt_secret: "change-me-to-a-random-32-char-string!"
+  jwt_expiry_secs: 28800
+  allowed_email_domain: "example.com"  # optional
+  frontend_url: "http://localhost:3000"
+```
+
+Each YAML key has a corresponding environment variable override (noted as comments
+in `config.yaml.example`). For example, `neo4j.uri` is overridden by `NEO4J_URI`,
+`chat.default_model` by `CHAT_DEFAULT_MODEL`, and so on.
+
+---
+
+## Authentication Setup
+
+Authentication is **optional** but follows a **deny-by-default** security model:
+
+- If `config.yaml` has **no `auth` section**, the server denies all requests to
+  `/api/*` and `/ws/*` endpoints. The MCP server (stdio) is unaffected.
+- If `config.yaml` has an `auth` section with valid credentials, Google OAuth
+  login is enabled and JWT tokens are required for API/WebSocket access.
+
+### Development Without Auth
+
+For local development where you only use the MCP server (stdio transport),
+no auth configuration is needed. The MCP binary communicates directly with
+Neo4j and Meilisearch, bypassing the HTTP API entirely.
+
+If you need the HTTP API without auth during development, you can add an
+`auth` section to `config.yaml` with placeholder values and set
+`jwt_secret` to any 32+ character string.
+
+### Production With Auth
+
+1. Create OAuth credentials at [Google Cloud Console](https://console.cloud.google.com/apis/credentials):
+   - Application type: **Web application**
+   - Authorized redirect URI: `https://your-domain.com/auth/callback`
+2. Fill in the `auth` section of `config.yaml` with the generated client ID
+   and client secret.
+3. Set a strong, random `jwt_secret` (minimum 32 characters).
+4. Optionally restrict access to a specific email domain with `allowed_email_domain`.
+
+For a detailed walkthrough, see the [Authentication Guide](../guides/authentication.md).
 
 ---
 
@@ -172,6 +264,21 @@ orchestrator:
     meilisearch:
       condition: service_healthy
 ```
+
+### Network and Volumes
+
+All three services communicate over a dedicated `orchestrator-net` bridge network.
+Data is persisted in four named Docker volumes:
+
+| Volume | Service | Content |
+|--------|---------|---------|
+| `neo4j_data` | Neo4j | Graph database files |
+| `neo4j_logs` | Neo4j | Server logs |
+| `meilisearch_data` | Meilisearch | Search indexes |
+| `orchestrator_data` | Orchestrator | Application data |
+
+To completely reset all data, run `docker compose down -v` (this removes all
+volumes and is **destructive**).
 
 ---
 
@@ -341,5 +448,6 @@ rm -rf target/
 ## Next Steps
 
 - [Configure your IDE integration](../integrations/claude-code.md)
+- [Set up authentication](../guides/authentication.md)
 - [Follow the Getting Started tutorial](../guides/getting-started.md)
 - [Explore the API Reference](../api/reference.md)

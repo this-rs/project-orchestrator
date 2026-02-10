@@ -9,7 +9,7 @@ use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::*;
 use crate::notes::{Note, NoteImportance, NoteScope, NoteType};
 use crate::plan::models::*;
-use crate::AppState;
+use crate::{AppState, AuthConfig};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -31,6 +31,7 @@ pub fn mock_app_state() -> AppState {
             meilisearch_key: "mock-key".to_string(),
             workspace_path: ".".to_string(),
             server_port: 0,
+            auth_config: None,
         }),
     }
 }
@@ -49,8 +50,45 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             meilisearch_key: "mock-key".to_string(),
             workspace_path: ".".to_string(),
             server_port: 0,
+            auth_config: None,
         }),
     }
+}
+
+/// Create a test AuthConfig suitable for integration tests.
+///
+/// Uses a fixed JWT secret and disables domain restriction.
+/// Tests that use `create_router()` should pass `Some(test_auth_config())`
+/// as `auth_config` to avoid deny-by-default 403 rejections.
+pub fn test_auth_config() -> AuthConfig {
+    AuthConfig {
+        jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
+        jwt_expiry_secs: 28800,
+        allowed_email_domain: None,
+        frontend_url: None,
+        allow_registration: false,
+        root_account: None,
+        oidc: None,
+        google_client_id: Some("test-client-id".to_string()),
+        google_client_secret: Some("test-client-secret".to_string()),
+        google_redirect_uri: Some("http://localhost:3000/auth/callback".to_string()),
+    }
+}
+
+/// Generate a valid Bearer token string for test requests.
+///
+/// Returns the full header value: `"Bearer eyJ..."`.
+/// Uses the same secret as `test_auth_config()`.
+pub fn test_bearer_token() -> String {
+    let token = crate::auth::jwt::encode_jwt(
+        Uuid::new_v4(),
+        "test@ffs.holdings",
+        "Test User",
+        "test-secret-key-minimum-32-chars!!",
+        28800,
+    )
+    .expect("test token encoding should succeed");
+    format!("Bearer {}", token)
 }
 
 // ============================================================================
@@ -227,6 +265,21 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         total_cost_usd: None,
         conversation_id: None,
         preview: None,
+    }
+}
+
+/// Create a test user (OIDC provider)
+pub fn test_user() -> UserNode {
+    UserNode {
+        id: Uuid::new_v4(),
+        email: "test@ffs.holdings".to_string(),
+        name: "Test User".to_string(),
+        picture_url: Some("https://lh3.googleusercontent.com/test".to_string()),
+        auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+        external_id: Some("google-id-123456".to_string()),
+        password_hash: None,
+        created_at: chrono::Utc::now(),
+        last_login_at: chrono::Utc::now(),
     }
 }
 

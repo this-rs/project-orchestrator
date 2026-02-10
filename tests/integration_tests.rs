@@ -21,6 +21,7 @@ fn test_config() -> Config {
             .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
         workspace_path: ".".into(),
         server_port: 8080,
+        auth_config: None,
     }
 }
 

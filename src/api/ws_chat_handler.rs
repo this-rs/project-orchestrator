@@ -90,14 +90,30 @@ pub async fn ws_chat(
 
 /// Handle an individual chat WebSocket connection
 async fn handle_ws_chat(
-    socket: WebSocket,
+    mut socket: WebSocket,
     state: OrchestratorState,
     session_id: String,
     last_event: i64,
 ) {
+    // ========================================================================
+    // Phase 0: Authenticate via first message
+    // ========================================================================
+    let claims = match super::ws_auth::ws_authenticate(&mut socket, &state.auth_config).await {
+        Ok(claims) => claims,
+        Err(reason) => {
+            debug!(session_id = %session_id, reason = %reason, "WS chat: auth failed");
+            return;
+        }
+    };
+
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    info!(session_id = %session_id, last_event, "Chat WebSocket client connected");
+    info!(
+        session_id = %session_id,
+        email = %claims.email,
+        last_event,
+        "Chat WebSocket client authenticated"
+    );
 
     let chat_manager = match state.chat_manager.as_ref() {
         Some(cm) => cm,

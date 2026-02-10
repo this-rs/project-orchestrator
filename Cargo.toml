@@ -18,6 +18,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 
 # Neo4j
 neo4rs = "0.8"
@@ -52,7 +53,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Utilities
-uuid = { version = "1.11", features = ["v4", "serde"] }
+uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2.5"
 glob = "0.3"
@@ -65,8 +66,12 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", features = ["memory"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", branch = "main", features = ["memory"] }
 tokio-stream = "0.1"
+
+# Auth
+jsonwebtoken = "9"
+bcrypt = "0.16"
 
 # Config
 dotenvy = "0.15"

@@ -1,5 +1,9 @@
 //! API route definitions
+//!
+//! Routes are split into public (no auth) and protected (require valid JWT).
+//! The `require_auth` middleware is applied only to protected routes.
 
+use super::auth_handlers;
 use super::chat_handlers;
 use super::code_handlers;
 use super::handlers::{self, OrchestratorState};
@@ -8,26 +12,100 @@ use super::project_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
 use super::ws_handlers;
+use crate::auth::middleware::require_auth;
 use axum::{
+    middleware::from_fn_with_state,
     routing::{get, post},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-/// Create the API router
+/// Create the API router with public + protected route groups.
 pub fn create_router(state: OrchestratorState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = build_cors(&state);
 
+    let public = public_routes();
+    let protected = protected_routes().layer(from_fn_with_state(state.clone(), require_auth));
+
+    public
+        .merge(protected)
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state)
+}
+
+/// Build CORS layer — restricted to `frontend_url` if configured, otherwise `Any`.
+fn build_cors(state: &OrchestratorState) -> CorsLayer {
+    let cors = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+
+    if let Some(ref auth_config) = state.auth_config {
+        if let Some(ref frontend_url) = auth_config.frontend_url {
+            if let Ok(origin) = frontend_url.parse::<axum::http::HeaderValue>() {
+                return cors.allow_origin(origin);
+            }
+        }
+    }
+
+    cors.allow_origin(Any)
+}
+
+// ============================================================================
+// Public routes (no authentication required)
+// ============================================================================
+
+/// Routes accessible without authentication.
+///
+/// Includes: health check, OAuth login/callback, webhook endpoints, internal events.
+fn public_routes() -> Router<OrchestratorState> {
     Router::new()
         // Health check
         .route("/health", get(handlers::health))
-        // ====================================================================
+        // ================================================================
+        // Auth (public — login flow + discovery)
+        // ================================================================
+        .route("/auth/providers", get(auth_handlers::get_auth_providers))
+        .route("/auth/login", post(auth_handlers::password_login))
+        .route("/auth/register", post(auth_handlers::register))
+        // OIDC generic routes
+        .route("/auth/oidc", get(auth_handlers::oidc_login))
+        .route("/auth/oidc/callback", post(auth_handlers::oidc_callback))
+        // Legacy Google routes (alias → same underlying OIDC flow for google_login,
+        // google_callback kept for direct Google OAuth backward compat)
+        .route("/auth/google", get(auth_handlers::google_login))
+        .route(
+            "/auth/google/callback",
+            post(auth_handlers::google_callback),
+        )
+        // ================================================================
+        // WebSocket (public — auth via first application message)
+        // ================================================================
+        .route("/ws/events", get(ws_handlers::ws_events))
+        .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
+        // ================================================================
+        // Webhooks & Internal
+        // ================================================================
+        .route("/hooks/wake", post(handlers::wake))
+        .route("/internal/events", post(handlers::receive_event))
+}
+
+// ============================================================================
+// Protected routes (require valid JWT)
+// ============================================================================
+
+/// Routes that require a valid Bearer JWT token.
+///
+/// The `require_auth` middleware layer is applied by `create_router`.
+fn protected_routes() -> Router<OrchestratorState> {
+    Router::new()
+        // ================================================================
+        // Auth (protected — user info & token refresh)
+        // ================================================================
+        .route("/auth/me", get(auth_handlers::get_me))
+        .route("/auth/refresh", post(auth_handlers::refresh_token))
+        // ================================================================
         // Projects (multi-project support)
-        // ====================================================================
+        // ================================================================
         .route(
             "/api/projects",
             get(project_handlers::list_projects).post(project_handlers::create_project),
@@ -65,8 +143,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/projects/{project_id}/roadmap",
             get(handlers::get_project_roadmap),
         )
-        // ====================================================================
+        // ================================================================
         // Plans (global or legacy)
+        // ================================================================
         .route(
             "/api/plans",
             get(handlers::list_plans).post(handlers::create_plan),
@@ -210,21 +289,20 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/plans/{plan_id}/commits",
             get(handlers::get_plan_commits).post(handlers::link_commit_to_plan),
         )
-        // Webhooks
+        // Webhooks (protected — /api prefix)
         .route("/api/wake", post(handlers::wake))
-        .route("/hooks/wake", post(handlers::wake)) // Alias for compatibility
-        // ====================================================================
+        // ================================================================
         // File Watcher (auto-sync on file changes)
-        // ====================================================================
+        // ================================================================
         .route(
             "/api/watch",
             get(handlers::watch_status)
                 .post(handlers::start_watch)
                 .delete(handlers::stop_watch),
         )
-        // ====================================================================
+        // ================================================================
         // Code Exploration (Graph + Search powered)
-        // ====================================================================
+        // ================================================================
         // Search code semantically (Meilisearch)
         .route("/api/code/search", get(code_handlers::search_code))
         // Get symbols in a file (Neo4j)
@@ -260,9 +338,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
             get(code_handlers::find_type_traits),
         )
         .route("/api/code/impl-blocks", get(code_handlers::get_impl_blocks))
-        // ====================================================================
+        // ================================================================
         // Knowledge Notes
-        // ====================================================================
+        // ================================================================
         // Notes CRUD
         .route(
             "/api/notes",
@@ -324,9 +402,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/entities/{entity_type}/{entity_id}/notes",
             get(note_handlers::get_entity_notes),
         )
-        // ====================================================================
+        // ================================================================
         // Meilisearch Maintenance
-        // ====================================================================
+        // ================================================================
         .route(
             "/api/meilisearch/stats",
             get(handlers::get_meilisearch_stats),
@@ -335,9 +413,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/meilisearch/orphans",
             axum::routing::delete(handlers::delete_meilisearch_orphans),
         )
-        // ====================================================================
+        // ================================================================
         // Workspaces
-        // ====================================================================
+        // ================================================================
         .route(
             "/api/workspaces",
             get(workspace_handlers::list_workspaces).post(workspace_handlers::create_workspace),
@@ -427,17 +505,9 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/workspaces/{slug}/topology",
             get(workspace_handlers::get_workspace_topology),
         )
-        // ====================================================================
-        // WebSocket CRUD Event Notifications
-        // ====================================================================
-        .route("/ws/events", get(ws_handlers::ws_events))
-        // WebSocket Chat (bidirectional)
-        .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
-        // Internal: receive CrudEvent from MCP server
-        .route("/internal/events", post(handlers::receive_event))
-        // ====================================================================
+        // ================================================================
         // Chat (session management — streaming via WebSocket above)
-        // ====================================================================
+        // ================================================================
         .route(
             "/api/chat/sessions",
             get(chat_handlers::list_sessions).post(chat_handlers::create_session),
@@ -455,8 +525,4 @@ pub fn create_router(state: OrchestratorState) -> Router {
             "/api/chat/sessions/{id}/messages",
             get(chat_handlers::list_messages),
         )
-        // Middleware
-        .layer(TraceLayer::new_for_http())
-        .layer(cors)
-        .with_state(state)
 }

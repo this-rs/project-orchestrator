@@ -232,7 +232,7 @@ impl ChatManager {
         // Extract text from assistant messages
         let mut result = String::new();
         for msg in &messages {
-            if let Message::Assistant { message } = msg {
+            if let Message::Assistant { message, .. } = msg {
                 for block in &message.content {
                     if let ContentBlock::Text(text) = block {
                         result.push_str(&text.text);
@@ -312,7 +312,7 @@ impl ChatManager {
     /// Convert a Nexus SDK `Message` to a list of `ChatEvent`s
     pub fn message_to_events(msg: &Message) -> Vec<ChatEvent> {
         match msg {
-            Message::Assistant { message } => {
+            Message::Assistant { message, .. } => {
                 let mut events = Vec::new();
                 for block in &message.content {
                     match block {
@@ -370,13 +370,66 @@ impl ChatManager {
                 } => {
                     vec![ChatEvent::StreamDelta { text: text.clone() }]
                 }
+                // Extract tool_use from ContentBlockStart — this is where tool calls
+                // first appear in the stream (before the AssistantMessage is finalized).
+                // The content_block is raw JSON: {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
+                StreamEventData::ContentBlockStart { content_block, .. } => {
+                    if content_block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                        let id = content_block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = content_block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = content_block
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({}));
+                        vec![ChatEvent::ToolUse {
+                            id,
+                            tool: name,
+                            input,
+                        }]
+                    } else {
+                        vec![]
+                    }
+                }
                 _ => vec![],
             },
             Message::System { subtype, data } => {
                 debug!("System message: {} — {:?}", subtype, data);
                 vec![]
             }
-            Message::User { .. } => vec![],
+            Message::User { message, .. } => {
+                // User messages with content_blocks contain tool_result blocks
+                // from the CLI's tool execution. Extract them as ChatEvent::ToolResult.
+                if let Some(blocks) = &message.content_blocks {
+                    let mut events = Vec::new();
+                    for block in blocks {
+                        if let ContentBlock::ToolResult(t) = block {
+                            let result = match &t.content {
+                                Some(ContentValue::Text(s)) => serde_json::Value::String(s.clone()),
+                                Some(ContentValue::Structured(v)) => {
+                                    serde_json::Value::Array(v.clone())
+                                }
+                                None => serde_json::Value::Null,
+                            };
+                            events.push(ChatEvent::ToolResult {
+                                id: t.tool_use_id.clone(),
+                                result,
+                                is_error: t.is_error.unwrap_or(false),
+                            });
+                        }
+                    }
+                    events
+                } else {
+                    vec![]
+                }
+            }
         }
     }
 
@@ -632,6 +685,10 @@ impl ChatManager {
         // interrupt_flag mechanism.
         let mut assistant_text_parts: Vec<String> = Vec::new();
         let mut events_to_persist: Vec<ChatEventRecord> = Vec::new();
+        // Maps tool_use ID → index in events_to_persist, so we can update
+        // the persisted record when AssistantMessage provides the full input.
+        let mut emitted_tool_use_ids: std::collections::HashMap<String, Option<usize>> =
+            std::collections::HashMap::new();
         let session_uuid = Uuid::parse_str(&session_id).ok();
 
         {
@@ -720,7 +777,10 @@ impl ChatManager {
                         }
 
                         // Collect assistant text for memory
-                        if let Message::Assistant { message: ref am } = msg {
+                        if let Message::Assistant {
+                            message: ref am, ..
+                        } = msg
+                        {
                             for block in &am.content {
                                 if let ContentBlock::Text(t) = block {
                                     assistant_text_parts.push(t.text.clone());
@@ -731,6 +791,57 @@ impl ChatManager {
                         // Convert to ChatEvent(s) and emit + persist structured events
                         let events = Self::message_to_events(msg);
                         for event in events {
+                            // Deduplicate ToolUse events — ContentBlockStart and
+                            // AssistantMessage can both produce the same tool_use.
+                            //
+                            // ContentBlockStart arrives first with input: {} (empty),
+                            // AssistantMessage arrives later with the FULL input params.
+                            //
+                            // Strategy:
+                            // 1. First occurrence (ContentBlockStart): emit + persist normally
+                            // 2. Second occurrence (AssistantMessage): DON'T re-emit to broadcast
+                            //    (clients already have the tool_use), but UPDATE the persisted
+                            //    record and streaming_events with the full input.
+                            if let ChatEvent::ToolUse {
+                                ref id, ref input, ..
+                            } = event
+                            {
+                                if let Some(persist_idx) = emitted_tool_use_ids.get(id) {
+                                    // Duplicate — update persisted record with full input
+                                    let has_real_input = input.is_object()
+                                        && input.as_object().is_some_and(|o| !o.is_empty());
+                                    if has_real_input {
+                                        if let Some(idx) = persist_idx {
+                                            if let Some(record) = events_to_persist.get_mut(*idx) {
+                                                record.data = serde_json::to_string(&event)
+                                                    .unwrap_or_default();
+                                                debug!(
+                                                    "Updated persisted ToolUse input for id={}",
+                                                    id
+                                                );
+                                            }
+                                        }
+                                        // Also update in streaming_events snapshot
+                                        let mut se = streaming_events.lock().await;
+                                        if let Some(existing) = se.iter_mut().find(|e| {
+                                            matches!(e, ChatEvent::ToolUse { id: ref eid, .. } if eid == id)
+                                        }) {
+                                            *existing = event.clone();
+                                        }
+                                        // Emit ToolUseInputResolved so the frontend can
+                                        // update the existing tool_use block's input
+                                        let _ = events_tx.send(ChatEvent::ToolUseInputResolved {
+                                            id: id.clone(),
+                                            input: input.clone(),
+                                        });
+                                    }
+                                    debug!("Skipping duplicate ToolUse broadcast (id={}), sent input_resolved", id);
+                                    continue;
+                                }
+                                // First occurrence — record it
+                                emitted_tool_use_ids.insert(id.clone(), None);
+                            }
+
                             // Persist structured events (skip transient: stream_delta, streaming_status)
                             if !matches!(
                                 event,
@@ -738,6 +849,7 @@ impl ChatManager {
                             ) {
                                 if let Some(uuid) = session_uuid {
                                     let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                                    let persist_idx = events_to_persist.len();
                                     events_to_persist.push(ChatEventRecord {
                                         id: Uuid::new_v4(),
                                         session_id: uuid,
@@ -746,6 +858,10 @@ impl ChatManager {
                                         data: serde_json::to_string(&event).unwrap_or_default(),
                                         created_at: chrono::Utc::now(),
                                     });
+                                    // Track persist index for ToolUse so we can update later
+                                    if let ChatEvent::ToolUse { ref id, .. } = event {
+                                        emitted_tool_use_ids.insert(id.clone(), Some(persist_idx));
+                                    }
                                 }
                             }
 
@@ -1718,6 +1834,7 @@ mod tests {
                     text: "Hello!".into(),
                 })],
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1734,6 +1851,7 @@ mod tests {
                     signature: "sig".into(),
                 })],
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1753,6 +1871,7 @@ mod tests {
                     input: serde_json::json!({"title": "My Plan"}),
                 })],
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1771,6 +1890,7 @@ mod tests {
                     is_error: Some(false),
                 })],
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1791,6 +1911,7 @@ mod tests {
                     is_error: Some(true),
                 })],
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1839,6 +1960,7 @@ mod tests {
                     }),
                 ],
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1864,11 +1986,59 @@ mod tests {
         let msg = Message::User {
             message: nexus_claude::UserMessage {
                 content: "Hi".into(),
+                content_blocks: None,
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_message_to_events_user_message_with_tool_result() {
+        let msg = Message::User {
+            message: nexus_claude::UserMessage {
+                content: String::new(),
+                content_blocks: Some(vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: "toolu_abc123".into(),
+                    content: Some(ContentValue::Text("fn main() {}".into())),
+                    is_error: Some(false),
+                })]),
+            },
+            parent_tool_use_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ChatEvent::ToolResult { id, is_error, .. }
+            if id == "toolu_abc123" && !is_error
+        ));
+    }
+
+    #[test]
+    fn test_message_to_events_user_message_with_tool_result_error() {
+        let msg = Message::User {
+            message: nexus_claude::UserMessage {
+                content: String::new(),
+                content_blocks: Some(vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: "toolu_err001".into(),
+                    content: Some(ContentValue::Text("File not found".into())),
+                    is_error: Some(true),
+                })]),
+            },
+            parent_tool_use_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ChatEvent::ToolResult { id, is_error, .. }
+            if id == "toolu_err001" && *is_error
+        ));
     }
 
     // ====================================================================
@@ -1885,11 +2055,49 @@ mod tests {
                 },
             },
             session_id: None,
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::StreamDelta { text } if text == "Hello"));
+    }
+
+    #[test]
+    fn test_message_to_events_stream_content_block_start_tool_use() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::ContentBlockStart {
+                index: 1,
+                content_block: serde_json::json!({
+                    "type": "tool_use",
+                    "id": "toolu_abc123",
+                    "name": "list_plans",
+                    "input": {"status": "active"}
+                }),
+            },
+            session_id: None,
+            parent_tool_use_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ChatEvent::ToolUse { id, tool, .. }
+                if id == "toolu_abc123" && tool == "list_plans"));
+    }
+
+    #[test]
+    fn test_message_to_events_stream_content_block_start_text_ignored() {
+        let msg = Message::StreamEvent {
+            event: StreamEventData::ContentBlockStart {
+                index: 0,
+                content_block: serde_json::json!({"type": "text", "text": ""}),
+            },
+            session_id: None,
+            parent_tool_use_id: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1902,6 +2110,7 @@ mod tests {
                 },
             },
             session_id: None,
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1913,6 +2122,7 @@ mod tests {
         let msg = Message::StreamEvent {
             event: StreamEventData::MessageStop,
             session_id: None,
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1927,6 +2137,7 @@ mod tests {
                 content_block: serde_json::json!({"type": "text", "text": ""}),
             },
             session_id: None,
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1943,6 +2154,7 @@ mod tests {
                 },
             },
             session_id: Some("sess-1".into()),
+            parent_tool_use_id: None,
         };
 
         // InputJsonDelta is not TextDelta, so it should produce empty events
@@ -1957,6 +2169,7 @@ mod tests {
                 message: serde_json::json!({"id": "msg_123"}),
             },
             session_id: None,
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1971,6 +2184,7 @@ mod tests {
                 usage: Some(serde_json::json!({"output_tokens": 50})),
             },
             session_id: None,
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -1990,6 +2204,7 @@ mod tests {
                     is_error: None,
                 })],
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);
@@ -2019,6 +2234,7 @@ mod tests {
                     is_error: Some(false),
                 })],
             },
+            parent_tool_use_id: None,
         };
 
         let events = ChatManager::message_to_events(&msg);

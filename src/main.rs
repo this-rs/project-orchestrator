@@ -69,8 +69,13 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_server(config: Config) -> Result<()> {
+async fn run_server(mut config: Config) -> Result<()> {
     tracing::info!("Starting Project Orchestrator server...");
+
+    // Hash root account password at startup (if plaintext)
+    if let Some(ref mut auth) = config.auth_config {
+        auth.ensure_root_password_hashed()?;
+    }
 
     // Initialize application state
     tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
@@ -105,12 +110,59 @@ async fn run_server(config: Config) -> Result<()> {
         Some(cm)
     };
 
+    // Log auth status
+    match &config.auth_config {
+        Some(auth) => {
+            // Determine active auth modes
+            let mut modes = vec![];
+            if auth.has_password_auth() {
+                modes.push("password (root account)");
+            }
+            if auth.has_oidc() {
+                let provider_name = auth
+                    .effective_oidc()
+                    .map(|o| o.provider_name.clone())
+                    .unwrap_or_else(|| "OIDC".to_string());
+                modes.push(Box::leak(
+                    format!("OIDC ({})", provider_name).into_boxed_str(),
+                ));
+            }
+            tracing::info!(
+                "Auth enabled — modes: [{}]",
+                if modes.is_empty() {
+                    "none configured".to_string()
+                } else {
+                    modes.join(", ")
+                }
+            );
+            if let Some(ref domain) = auth.allowed_email_domain {
+                tracing::info!("  Email domain restriction: @{}", domain);
+            }
+            if let Some(ref url) = auth.frontend_url {
+                tracing::info!("  Frontend URL (CORS): {}", url);
+            }
+            tracing::info!("  JWT expiry: {}h", auth.jwt_expiry_secs / 3600);
+            tracing::info!(
+                "  Registration: {}",
+                if auth.allow_registration {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+        }
+        None => {
+            tracing::info!("Auth disabled — open access mode (no auth section in config.yaml)");
+        }
+    }
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
         watcher: Arc::new(RwLock::new(watcher)),
         chat_manager,
         event_bus,
+        auth_config: config.auth_config.clone(),
     });
 
     // Create router

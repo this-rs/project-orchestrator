@@ -319,11 +319,41 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::orchestrator::{FileWatcher, Orchestrator};
-    use crate::test_helpers::{mock_app_state, test_chat_session};
+    use crate::test_helpers::{mock_app_state, test_bearer_token, test_chat_session};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// Create an authenticated GET request for a given URI
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Create an authenticated DELETE request for a given URI
+    fn auth_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Create an authenticated POST request with JSON body
+    fn auth_post(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
 
     /// Build an OrchestratorState with mock backends (no ChatManager)
     async fn mock_server_state() -> OrchestratorState {
@@ -337,6 +367,7 @@ mod tests {
             watcher,
             chat_manager: None,
             event_bus: Arc::new(crate::events::EventBus::default()),
+            auth_config: Some(crate::test_helpers::test_auth_config()),
         })
     }
 
@@ -363,6 +394,7 @@ mod tests {
             watcher,
             chat_manager: None,
             event_bus: Arc::new(crate::events::EventBus::default()),
+            auth_config: Some(crate::test_helpers::test_auth_config()),
         });
         create_router(state)
     }
@@ -392,15 +424,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_sessions_empty() {
         let app = test_app().await;
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/chat/sessions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -417,15 +441,7 @@ mod tests {
         let s2 = test_chat_session(Some("proj-b"));
         let app = test_app_with_sessions(&[s1, s2]).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/chat/sessions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -444,12 +460,7 @@ mod tests {
         let app = test_app_with_sessions(&[s1, s2, s3]).await;
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/chat/sessions?project_slug=proj-a")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/chat/sessions?project_slug=proj-a"))
             .await
             .unwrap();
 
@@ -472,12 +483,7 @@ mod tests {
         let app = test_app_with_sessions(&[session]).await;
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/chat/sessions/{}", session_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get(&format!("/api/chat/sessions/{}", session_id)))
             .await
             .unwrap();
 
@@ -497,12 +503,7 @@ mod tests {
         let fake_id = Uuid::new_v4();
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/chat/sessions/{}", fake_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get(&format!("/api/chat/sessions/{}", fake_id)))
             .await
             .unwrap();
 
@@ -520,13 +521,7 @@ mod tests {
         let app = test_app_with_sessions(&[session]).await;
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/chat/sessions/{}", session_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_delete(&format!("/api/chat/sessions/{}", session_id)))
             .await
             .unwrap();
 
@@ -544,13 +539,7 @@ mod tests {
         let fake_id = Uuid::new_v4();
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/chat/sessions/{}", fake_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_delete(&format!("/api/chat/sessions/{}", fake_id)))
             .await
             .unwrap();
 
@@ -566,14 +555,10 @@ mod tests {
         let app = test_app().await;
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/chat/sessions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"Hello","cwd":"/tmp"}"#))
-                    .unwrap(),
-            )
+            .oneshot(auth_post(
+                "/api/chat/sessions",
+                r#"{"message":"Hello","cwd":"/tmp"}"#,
+            ))
             .await
             .unwrap();
 
@@ -615,12 +600,10 @@ mod tests {
         let fake_id = Uuid::new_v4();
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/chat/sessions/{}/messages", fake_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get(&format!(
+                "/api/chat/sessions/{}/messages",
+                fake_id
+            )))
             .await
             .unwrap();
 
@@ -633,12 +616,7 @@ mod tests {
         let app = test_app().await;
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/chat/sessions/not-a-uuid/messages")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/chat/sessions/not-a-uuid/messages"))
             .await
             .unwrap();
 
@@ -658,12 +636,7 @@ mod tests {
         let app = test_app_with_sessions(&[session]).await;
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/chat/sessions/{}", session_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get(&format!("/api/chat/sessions/{}", session_id)))
             .await
             .unwrap();
 
@@ -682,12 +655,7 @@ mod tests {
         let app = test_app_with_sessions(&[session]).await;
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/chat/sessions/{}", session_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get(&format!("/api/chat/sessions/{}", session_id)))
             .await
             .unwrap();
 
@@ -709,15 +677,7 @@ mod tests {
         session.conversation_id = Some("conv-xyz".into());
         let app = test_app_with_sessions(&[session]).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/chat/sessions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

@@ -685,11 +685,20 @@ mod tests {
     use crate::meilisearch::indexes::CodeDocument;
     use crate::neo4j::models::FileNode;
     use crate::orchestrator::{FileWatcher, Orchestrator};
-    use crate::test_helpers::mock_app_state;
+    use crate::test_helpers::{mock_app_state, test_bearer_token};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// Create an authenticated GET request for a given URI
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
 
     /// Build a test router with mock backends
     async fn test_app() -> axum::Router {
@@ -703,6 +712,7 @@ mod tests {
             watcher,
             chat_manager: None,
             event_bus: Arc::new(crate::events::EventBus::default()),
+            auth_config: Some(crate::test_helpers::test_auth_config()),
         });
         create_router(state)
     }
@@ -752,6 +762,7 @@ mod tests {
             watcher,
             chat_manager: None,
             event_bus: Arc::new(crate::events::EventBus::default()),
+            auth_config: Some(crate::test_helpers::test_auth_config()),
         });
         create_router(state)
     }
@@ -764,12 +775,7 @@ mod tests {
     async fn test_search_code_empty() {
         let app = test_app().await;
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/code/search?query=something&limit=5")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/code/search?query=something&limit=5"))
             .await
             .unwrap();
 
@@ -786,12 +792,7 @@ mod tests {
     async fn test_search_code_with_results() {
         let app = test_app_with_code().await;
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/code/search?query=main&limit=10")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/code/search?query=main&limit=10"))
             .await
             .unwrap();
 
@@ -814,12 +815,9 @@ mod tests {
     async fn test_search_code_with_language_filter() {
         let app = test_app_with_code().await;
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/code/search?query=main&limit=10&language=rust")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get(
+                "/api/code/search?query=main&limit=10&language=rust",
+            ))
             .await
             .unwrap();
 
@@ -837,12 +835,9 @@ mod tests {
     async fn test_search_code_language_filter_no_match() {
         let app = test_app_with_code().await;
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/code/search?query=main&limit=10&language=python")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get(
+                "/api/code/search?query=main&limit=10&language=python",
+            ))
             .await
             .unwrap();
 
@@ -858,12 +853,7 @@ mod tests {
     async fn test_search_code_missing_query_param() {
         let app = test_app().await;
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/code/search?limit=5")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/code/search?limit=5"))
             .await
             .unwrap();
 
@@ -879,12 +869,7 @@ mod tests {
     async fn test_get_architecture_empty() {
         let app = test_app().await;
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/code/architecture")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/code/architecture"))
             .await
             .unwrap();
 
@@ -903,12 +888,7 @@ mod tests {
     async fn test_get_architecture_with_files() {
         let app = test_app_with_code().await;
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/code/architecture")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(auth_get("/api/code/architecture"))
             .await
             .unwrap();
 

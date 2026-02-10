@@ -19,7 +19,11 @@ Coordinate multiple AI coding agents with a shared knowledge base.
 - **Meilisearch**: Fast semantic search across code and decisions
 - **Tree-sitter**: Precise code parsing for 12 languages
 - **Plan Management**: Structured tasks with dependencies and constraints
-- **MCP Integration**: 62 tools for Claude Code, OpenAI Agents, and Cursor
+- **MCP Integration**: 137 tools for Claude Code, OpenAI Agents, and Cursor
+- **Authentication**: Google OAuth2 + JWT with deny-by-default security
+- **Chat WebSocket**: Real-time conversational AI via Claude integration
+- **Event System**: CRUD event notifications via WebSocket
+- **YAML Configuration**: Hierarchical config with env var overrides
 
 ## Documentation
 

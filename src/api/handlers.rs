@@ -11,6 +11,7 @@ use crate::neo4j::models::{
 };
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
+use crate::AuthConfig;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -28,6 +29,8 @@ pub struct ServerState {
     pub watcher: Arc<RwLock<FileWatcher>>,
     pub chat_manager: Option<Arc<ChatManager>>,
     pub event_bus: Arc<EventBus>,
+    /// Auth config — None means deny-by-default
+    pub auth_config: Option<AuthConfig>,
 }
 
 /// Shared orchestrator state
@@ -1544,10 +1547,14 @@ pub async fn get_project_roadmap(
 // ============================================================================
 
 /// Application error type
+#[derive(Debug)]
 pub enum AppError {
     Internal(anyhow::Error),
     NotFound(String),
     BadRequest(String),
+    Unauthorized(String),
+    Forbidden(String),
+    Conflict(String),
 }
 
 impl IntoResponse for AppError {
@@ -1556,6 +1563,9 @@ impl IntoResponse for AppError {
             AppError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
         };
 
         let body = Json(serde_json::json!({

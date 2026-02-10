@@ -1,0 +1,107 @@
+# =============================================================================
+# Project Orchestrator — Configuration
+# =============================================================================
+#
+# Copy this file to config.yaml and adjust values.
+# Environment variables override YAML values (priority: env > yaml > default).
+#
+# AUTHENTICATION MODES:
+# ─────────────────────
+# 1. NO-AUTH (default): Remove or comment out the entire "auth" section.
+#    All /api/* and /ws/* routes are accessible without login.
+#    Ideal for local development or single-user setups.
+#
+# 2. PASSWORD ONLY: Add "auth" with "root_account" (and optionally
+#    "allow_registration: true" to let others sign up).
+#
+# 3. OIDC (SSO): Add "auth" with "oidc" section to enable SSO via
+#    Google, Microsoft, Okta, Keycloak, or any OIDC provider.
+#
+# 4. PASSWORD + OIDC: Add both "root_account" and "oidc" sections.
+#    Users can sign in with either method.
+
+# -----------------------------------------------------------------------------
+# Server
+# -----------------------------------------------------------------------------
+server:
+  port: 8080                    # SERVER_PORT env override
+  workspace_path: "."           # WORKSPACE_PATH env override
+
+# -----------------------------------------------------------------------------
+# Neo4j — Knowledge graph database
+# -----------------------------------------------------------------------------
+neo4j:
+  uri: "bolt://localhost:7687"  # NEO4J_URI env override
+  user: "neo4j"                 # NEO4J_USER env override
+  password: "orchestrator123"   # NEO4J_PASSWORD env override
+
+# -----------------------------------------------------------------------------
+# Meilisearch — Semantic search engine
+# -----------------------------------------------------------------------------
+meilisearch:
+  url: "http://localhost:7700"              # MEILISEARCH_URL env override
+  key: "orchestrator-meili-key-change-me"   # MEILISEARCH_KEY env override
+
+# -----------------------------------------------------------------------------
+# Chat — Claude Code integration (optional, uses env vars)
+# -----------------------------------------------------------------------------
+chat:
+  default_model: "claude-opus-4-6"    # CHAT_DEFAULT_MODEL env override
+  max_sessions: 10                     # CHAT_MAX_SESSIONS env override
+  session_timeout_secs: 1800           # CHAT_SESSION_TIMEOUT_SECS env override
+  max_turns: 50                        # CHAT_MAX_TURNS env override
+  prompt_builder_model: "claude-opus-4-6"  # PROMPT_BUILDER_MODEL env override
+
+# -----------------------------------------------------------------------------
+# Authentication — Flexible multi-provider auth
+# -----------------------------------------------------------------------------
+# Remove or comment out this entire section for NO-AUTH mode (open access).
+#
+# auth:
+#   # ── Common settings ──────────────────────────────────────────────
+#   # JWT signing secret (min 32 characters, keep private!)
+#   jwt_secret: "change-me-to-a-random-32-char-string!"
+#
+#   # Token lifetime in seconds (default: 28800 = 8 hours)
+#   jwt_expiry_secs: 28800
+#
+#   # Optional: restrict to a specific email domain (all providers)
+#   allowed_email_domain: "example.com"
+#
+#   # Frontend URL for CORS and OAuth redirects
+#   frontend_url: "http://localhost:3000"
+#
+#   # Allow new user registration via POST /auth/register (default: false)
+#   allow_registration: false
+#
+#   # ── Password auth (root account) ────────────────────────────────
+#   # The root account is always verified in-memory (no DB needed).
+#   # If password_hash is plaintext (doesn't start with $2b$), it will
+#   # be hashed with bcrypt at startup (with a warning log).
+#   root_account:
+#     email: "admin@example.com"
+#     name: "Admin"
+#     password_hash: "change-me"   # Will be hashed at startup
+#
+#   # ── OIDC auth (generic OpenID Connect) ──────────────────────────
+#   # Works with Google, Microsoft, Okta, Keycloak, or any OIDC provider.
+#   oidc:
+#     # Option A: Auto-discover endpoints from the provider
+#     discovery_url: "https://accounts.google.com/.well-known/openid-configuration"
+#
+#     # Option B: Specify endpoints manually (if no discovery)
+#     # auth_endpoint: "https://accounts.google.com/o/oauth2/v2/auth"
+#     # token_endpoint: "https://oauth2.googleapis.com/token"
+#     # userinfo_endpoint: "https://www.googleapis.com/oauth2/v3/userinfo"
+#
+#     client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
+#     client_secret: "YOUR_CLIENT_SECRET"
+#     redirect_uri: "http://localhost:3000/auth/callback"
+#     provider_name: "Google"          # Shown on the login button
+#     scopes: "openid email profile"   # Default scopes
+#
+#   # ── Legacy Google OAuth (backward compatible) ───────────────────
+#   # These fields still work but are deprecated. Prefer the "oidc" section.
+#   # google_client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
+#   # google_client_secret: "YOUR_CLIENT_SECRET"
+#   # google_redirect_uri: "http://localhost:3000/auth/callback"

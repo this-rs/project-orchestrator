@@ -3,11 +3,49 @@
 //! These tests require the full stack to be running.
 //! Run with: cargo test --test api_tests
 
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
 
 const BASE_URL: &str = "http://localhost:8080";
+
+/// JWT secret matching config.yaml (or override via TEST_JWT_SECRET env var).
+const DEFAULT_JWT_SECRET: &str = "change-me-to-a-random-32-char-string!";
+
+/// Create a reqwest Client with a valid JWT Bearer header.
+///
+/// The token is generated using the same secret as the server's `config.yaml`.
+/// Override the secret via `TEST_JWT_SECRET` env var if needed.
+fn auth_client() -> Client {
+    let secret =
+        std::env::var("TEST_JWT_SECRET").unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_string());
+    let now = chrono::Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "sub": uuid::Uuid::new_v4().to_string(),
+        "email": "test@ffs.holdings",
+        "name": "Integration Test",
+        "iat": now,
+        "exp": now + 3600,
+    });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .expect("Failed to encode test JWT");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+    );
+
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("Failed to build auth client")
+}
 
 /// Helper to delete a plan (for cleanup)
 async fn delete_plan(client: &Client, plan_id: &str) {
@@ -28,7 +66,7 @@ async fn delete_project(client: &Client, slug: &str) {
 
 /// Check if API is available
 async fn api_available() -> bool {
-    let client = Client::new();
+    let client = auth_client();
     client
         .get(format!("{}/health", BASE_URL))
         .timeout(Duration::from_secs(2))
@@ -45,7 +83,7 @@ async fn test_health_endpoint() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let resp = client
         .get(format!("{}/health", BASE_URL))
         .send()
@@ -66,7 +104,7 @@ async fn test_create_and_get_plan() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create a plan
     let create_resp = client
@@ -113,7 +151,7 @@ async fn test_list_plans() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!("{}/api/plans", BASE_URL))
@@ -139,7 +177,7 @@ async fn test_add_task_to_plan() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create a plan first
     let plan_resp = client
@@ -188,7 +226,7 @@ async fn test_get_next_task() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create a plan with a task
     let plan_resp = client
@@ -242,7 +280,7 @@ async fn test_sync_endpoint() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Sync current directory (should work even if empty)
     let resp = client
@@ -270,7 +308,7 @@ async fn test_wake_webhook() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create a plan and task first
     let plan_resp = client
@@ -332,7 +370,7 @@ async fn test_add_and_search_decisions() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan and task
     let plan_resp = client
@@ -411,7 +449,7 @@ async fn test_watch_status() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!("{}/api/watch", BASE_URL))
@@ -433,7 +471,7 @@ async fn test_start_and_stop_watch() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Start watching current directory
     let start_resp = client
@@ -478,7 +516,7 @@ async fn test_code_search() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Search for code (may return empty if nothing synced)
     let resp = client
@@ -503,7 +541,7 @@ async fn test_code_architecture() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!("{}/api/code/architecture", BASE_URL))
@@ -526,7 +564,7 @@ async fn test_code_callgraph() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!(
@@ -552,7 +590,7 @@ async fn test_code_impact() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!(
@@ -578,7 +616,7 @@ async fn test_find_similar_code() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .post(format!("{}/api/code/similar", BASE_URL))
@@ -607,7 +645,7 @@ async fn test_list_projects() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!("{}/api/projects", BASE_URL))
@@ -633,7 +671,7 @@ async fn test_create_and_get_project() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let unique_name = format!("Test Project {}", uuid::Uuid::new_v4());
 
     // Create a project
@@ -695,7 +733,7 @@ async fn test_project_not_found() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!(
@@ -720,7 +758,7 @@ async fn test_find_trait_implementations() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!(
@@ -751,7 +789,7 @@ async fn test_find_type_traits() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!(
@@ -782,7 +820,7 @@ async fn test_get_impl_blocks() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     let resp = client
         .get(format!(
@@ -817,7 +855,7 @@ async fn test_add_and_get_steps() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan and task
     let plan_resp = client
@@ -915,7 +953,7 @@ async fn test_update_step_status() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan, task and step
     let plan_resp = client
@@ -986,7 +1024,7 @@ async fn test_step_progress() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan and task
     let plan_resp = client
@@ -1073,7 +1111,7 @@ async fn test_add_and_get_constraints() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan
     let plan_resp = client
@@ -1150,7 +1188,7 @@ async fn test_delete_constraint() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan
     let plan_resp = client
@@ -1218,7 +1256,7 @@ async fn test_task_with_rich_fields() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan
     let plan_resp = client
@@ -1285,7 +1323,7 @@ async fn test_task_details_includes_steps() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan and task
     let plan_resp = client
@@ -1372,7 +1410,7 @@ async fn test_plan_details_includes_constraints() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plan with constraints
     let plan_resp = client
@@ -1425,7 +1463,7 @@ async fn test_list_plans_with_pagination() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Test with explicit pagination parameters
     let resp = client
@@ -1457,7 +1495,7 @@ async fn test_list_plans_with_status_filter() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // First create a plan with known status
     let plan_resp = client
@@ -1503,7 +1541,7 @@ async fn test_list_plans_with_priority_filter() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create plans with different priorities
     for priority in [1, 5, 10] {
@@ -1549,7 +1587,7 @@ async fn test_list_plans_with_sorting() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Test sorting by priority descending (default)
     let resp = client
@@ -1588,7 +1626,7 @@ async fn test_list_all_tasks() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Test global task listing
     let resp = client
@@ -1626,7 +1664,7 @@ async fn test_list_all_tasks_with_filters() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create a plan and task
     let plan_resp = client
@@ -1685,7 +1723,7 @@ async fn test_pagination_validation() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Test invalid limit (> 100)
     let resp = client
@@ -1728,7 +1766,7 @@ async fn test_workspace_crud() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let unique_name = format!("Test Workspace {}", uuid::Uuid::new_v4());
     let unique_slug = format!("test-workspace-{}", uuid::Uuid::new_v4());
 
@@ -1806,7 +1844,7 @@ async fn test_list_workspaces() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Create a workspace first
     let unique_slug = format!("test-list-ws-{}", uuid::Uuid::new_v4());
@@ -1846,7 +1884,7 @@ async fn test_workspace_overview() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let unique_slug = format!("test-overview-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -1893,7 +1931,7 @@ async fn test_workspace_project_association() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-proj-assoc-{}", uuid::Uuid::new_v4());
     let proj_slug = format!("test-project-{}", uuid::Uuid::new_v4());
 
@@ -1980,7 +2018,7 @@ async fn test_workspace_milestone_crud() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-ms-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -2080,7 +2118,7 @@ async fn test_workspace_milestone_progress() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-ms-progress-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -2151,7 +2189,7 @@ async fn test_resource_crud() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-res-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -2234,7 +2272,7 @@ async fn test_resource_project_linking() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-res-link-{}", uuid::Uuid::new_v4());
     let proj_slug = format!("test-proj-res-{}", uuid::Uuid::new_v4());
 
@@ -2326,7 +2364,7 @@ async fn test_component_crud() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-comp-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -2415,7 +2453,7 @@ async fn test_component_dependencies() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-comp-deps-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -2514,7 +2552,7 @@ async fn test_workspace_topology() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-topo-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -2568,7 +2606,7 @@ async fn test_component_project_mapping() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-comp-map-{}", uuid::Uuid::new_v4());
     let proj_slug = format!("test-proj-map-{}", uuid::Uuid::new_v4());
 
@@ -2656,7 +2694,7 @@ async fn test_workspace_list_with_search() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let unique_id = uuid::Uuid::new_v4();
     let ws_slug = format!("searchable-workspace-{}", unique_id);
 
@@ -2697,7 +2735,7 @@ async fn test_workspace_list_pagination() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
 
     // Test pagination parameters
     let resp = client
@@ -2721,7 +2759,7 @@ async fn test_workspace_milestone_list_with_status_filter() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-ms-filter-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -2784,7 +2822,7 @@ async fn test_resource_list_with_type_filter() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-res-filter-{}", uuid::Uuid::new_v4());
 
     // Create workspace
@@ -2839,7 +2877,7 @@ async fn test_component_list_with_type_filter() {
         return;
     }
 
-    let client = Client::new();
+    let client = auth_client();
     let ws_slug = format!("test-comp-filter-{}", uuid::Uuid::new_v4());
 
     // Create workspace

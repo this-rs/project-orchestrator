@@ -778,6 +778,61 @@ pub enum RelationType {
     MapsToProject,
 }
 
+// ============================================================================
+// User / Auth
+// ============================================================================
+
+/// Authentication provider type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthProvider {
+    /// Password-based authentication (root account or registered users)
+    Password,
+    /// OIDC/OAuth provider (Google, Microsoft, Okta, etc.)
+    Oidc,
+}
+
+impl std::fmt::Display for AuthProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthProvider::Password => write!(f, "password"),
+            AuthProvider::Oidc => write!(f, "oidc"),
+        }
+    }
+}
+
+impl std::str::FromStr for AuthProvider {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "password" => Ok(AuthProvider::Password),
+            "oidc" | "google" | "oauth" => Ok(AuthProvider::Oidc),
+            _ => Err(format!("Unknown AuthProvider: {}", s)),
+        }
+    }
+}
+
+/// A user in the system (supports multiple auth providers)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserNode {
+    pub id: Uuid,
+    pub email: String,
+    pub name: String,
+    pub picture_url: Option<String>,
+    /// How this user authenticates
+    pub auth_provider: AuthProvider,
+    /// External identifier from the auth provider (e.g., Google "sub" claim).
+    /// Present for OIDC users, absent for password users.
+    #[serde(default)]
+    pub external_id: Option<String>,
+    /// Bcrypt hash of the password. Present for password users, absent for OIDC users.
+    #[serde(default, skip_serializing)]
+    pub password_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_login_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
