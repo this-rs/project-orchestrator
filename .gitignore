@@ -22,3 +22,4 @@ Thumbs.db
 /.claude/
 
 /config.yaml
+tarpaulin-report.json
