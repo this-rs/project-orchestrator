@@ -18,8 +18,12 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 - **Plan & Task Management** — Structured workflows with dependencies, steps, and progress tracking
 - **Multi-Language Parsing** — Tree-sitter support for Rust, TypeScript, Python, Go, and 8 more languages
 - **Multi-Project Workspaces** — Group related projects with shared context, contracts, and milestones
-- **MCP Integration** — 113 tools available for Claude Code, OpenAI Agents, and Cursor
+- **MCP Integration** — 137 tools available for Claude Code, OpenAI Agents, and Cursor
 - **Auto-Sync** — File watcher keeps the knowledge base updated as you code
+- **Authentication** — Google OAuth2 + JWT with deny-by-default security
+- **Chat WebSocket** — Real-time conversational AI via Claude integration
+- **Event System** — Live CRUD notifications via WebSocket
+- **YAML Configuration** — Hierarchical config with env var overrides
 
 ---
 
@@ -28,7 +32,7 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 ### 1. Start the backend services
 
 ```bash
-git clone https://github.com/your-org/project-orchestrator.git
+git clone https://github.com/this-rs/project-orchestrator.git
 cd project-orchestrator
 docker compose up -d
 ```
@@ -62,7 +66,7 @@ Add to your MCP configuration (e.g., `~/.claude/mcp.json`):
 # - sync_project: Parse and index your code
 # - create_plan: Start a development plan
 # - create_workspace: Group related projects
-# - And 108 more tools...
+# - And 133 more tools...
 ```
 
 That's it! Your AI agents now have shared context.
@@ -118,9 +122,12 @@ That's it! Your AI agents now have shared context.
 | [Installation](docs/setup/installation.md) | Full setup instructions and configuration |
 | [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
 | [API Reference](docs/api/reference.md) | Complete REST API documentation |
-| [MCP Tools](docs/api/mcp-tools.md) | All 113 MCP tools with examples |
+| [MCP Tools](docs/api/mcp-tools.md) | All 137 MCP tools with examples |
 | [Workspaces](docs/guides/workspaces.md) | Multi-project coordination |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
+| [Authentication](docs/guides/authentication.md) | JWT + Google OAuth setup |
+| [Chat & WebSocket](docs/guides/chat-websocket.md) | Real-time chat and events |
+| [Knowledge Notes](docs/guides/knowledge-notes.md) | Contextual knowledge capture |
 
 ---
 
@@ -130,12 +137,18 @@ That's it! Your AI agents now have shared context.
 ┌─────────────────────────────────────────────────────────────┐
 │                     YOUR AI AGENTS                          │
 │           (Claude Code / OpenAI / Cursor)                   │
-└─────────────────────────────┬───────────────────────────────┘
-                              │ MCP Protocol
-                              ▼
+└──────────┬──────────────────┬───────────────────┬───────────┘
+           │ MCP Protocol     │ WebSocket         │ REST API
+           ▼                  ▼                   ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  PROJECT ORCHESTRATOR                        │
-│                   (113 MCP Tools)                           │
+│                    (137 MCP Tools)                           │
+│                                                             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
+│  │   Auth   │  │   Chat   │  │  Events  │  │   Config   │  │
+│  │ OAuth+JWT│  │  Claude  │  │ Live WS  │  │   YAML +   │  │
+│  │          │  │  Streams │  │  CRUD    │  │  env vars  │  │
+│  └──────────┘  └──────────┘  └──────────┘  └────────────┘  │
 └─────────────────────────────┬───────────────────────────────┘
                               │
         ┌─────────────────────┼─────────────────────┐

@@ -14,7 +14,7 @@ Thank you for your interest in contributing to Project Orchestrator! This docume
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/your-org/project-orchestrator.git
+   git clone https://github.com/this-rs/project-orchestrator.git
    cd project-orchestrator
    ```
 
@@ -45,7 +45,9 @@ Thank you for your interest in contributing to Project Orchestrator! This docume
 
 - Write tests for new functionality
 - Ensure all tests pass before submitting a PR: `cargo test`
-- Integration tests require the backend services to be running
+- **Unit tests** use mock backends (`MockGraphStore`, `MockSearchStore`) — no external services needed
+- **Integration tests** require Neo4j and Meilisearch running
+- Current test count: **467 tests** (unit + integration)
 
 ### Commit Messages
 
@@ -100,11 +102,15 @@ test(mcp): add unit tests for workspace handlers
 
 ```
 src/
-├── api/           # REST API handlers and routes
-├── mcp/           # MCP server and tool definitions
-├── neo4j/         # Neo4j client and graph models
-├── meilisearch/   # Search client and indexing
-├── parser/        # Tree-sitter code parsing
+├── api/           # REST API handlers and routes (13 files)
+├── auth/          # Authentication: JWT, Google OAuth, middleware
+├── chat/          # Chat system: WebSocket, sessions, Claude integration
+├── config/        # YAML configuration system with env var overrides
+├── events/        # Event bus: CRUD notifications via WebSocket
+├── mcp/           # MCP server and tool definitions (137 tools)
+├── neo4j/         # Neo4j client, models, GraphStore trait + mock
+├── meilisearch/   # Search client, SearchStore trait + mock
+├── parser/        # Tree-sitter code parsing (12 languages)
 ├── plan/          # Plan and task management
 ├── notes/         # Knowledge notes system
 ├── orchestrator/  # Core orchestration logic
@@ -116,6 +122,8 @@ tests/
 ├── integration_tests.rs # Database integration tests
 └── parser_tests.rs      # Parser unit tests
 ```
+
+> **Note:** The project has 467 tests total, including unit tests with mock backends (no external services required).
 
 ## Adding New Features
 
@@ -135,9 +143,10 @@ tests/
 
 ### Adding a New REST Endpoint
 
-1. Add the handler in `src/api/handlers.rs` or create a new handler file
-2. Register the route in `src/api/routes.rs`
+1. Add the handler in `src/api/handlers.rs` or the appropriate handler file (`auth_handlers.rs`, `chat_handlers.rs`, `note_handlers.rs`, `workspace_handlers.rs`, etc.)
+2. Register the route in `src/api/routes.rs` (mark as public or protected)
 3. Add integration tests in `tests/api_tests.rs`
+4. If adding an MCP tool, also update `src/mcp/tools.rs` and `src/mcp/handlers.rs`
 
 ## Reporting Issues
 

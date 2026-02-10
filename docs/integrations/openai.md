@@ -6,7 +6,7 @@ Guide to integrating Project Orchestrator with OpenAI's Agents SDK.
 
 ## Overview
 
-OpenAI Agents SDK supports MCP (Model Context Protocol), allowing your agents to use Project Orchestrator's **62 tools** for code intelligence, plan management, and multi-agent coordination.
+OpenAI Agents SDK supports MCP (Model Context Protocol), allowing your agents to use Project Orchestrator's **137 tools** for code intelligence, plan management, and multi-agent coordination.
 
 ### What you get
 
@@ -14,6 +14,8 @@ OpenAI Agents SDK supports MCP (Model Context Protocol), allowing your agents to
 - **Code exploration** via semantic search and graph queries
 - **Plan & task tracking** with dependencies
 - **Decision history** searchable across sessions
+- **Knowledge notes** anchored to code entities, with staleness tracking
+- **Chat delegation** to sub-agents via MCP tools
 
 ---
 
@@ -296,7 +298,7 @@ async def run_team():
 
 ## Available Tools
 
-All 62 Project Orchestrator tools are available. See [Claude Code Integration](./claude-code.md#available-tools-62) for the complete list.
+All 137 Project Orchestrator tools are available. See [Claude Code Integration](./claude-code.md#available-tools-137) for the complete list.
 
 Key tools for OpenAI agents:
 
@@ -309,6 +311,20 @@ Key tools for OpenAI agents:
 | `update_task` | Track progress |
 | `add_decision` | Record architectural choices |
 | `analyze_impact` | Check before making changes |
+| `create_note` | Capture knowledge about code patterns |
+| `search_notes` | Find past observations and guidelines |
+| `get_context_notes` | Get notes relevant to a file or function |
+| `chat_send_message` | Delegate a task to a sub-agent |
+| `list_chat_sessions` | Review past sub-agent conversations |
+
+### Authentication Considerations
+
+The MCP server runs via **stdio** as a child process of your agent, so it does not require authentication itself. However, if your agents also interact with the Project Orchestrator **HTTP REST API** (e.g., for webhooks, dashboard access, or WebSocket chat), you will need to handle authentication:
+
+- **API Keys** — Best for programmatic access from agents. Pass the key as a Bearer token in the `Authorization` header.
+- **Google OAuth** — Best for browser-based dashboard access, not typically used by agents directly.
+
+See the [Authentication Guide](../guides/authentication.md) for setup details.
 
 ---
 
@@ -430,6 +446,9 @@ mcp = MCPServer(
 ## Next Steps
 
 - [Getting Started Tutorial](../guides/getting-started.md)
+- [Authentication Guide](../guides/authentication.md) — OAuth, API keys, and JWT setup
+- [Chat & WebSocket Guide](../guides/chat-websocket.md) — Sub-agent delegation and real-time chat
+- [Knowledge Notes Guide](../guides/knowledge-notes.md) — Persistent notes anchored to code
 - [Multi-Agent Workflows](../guides/multi-agent-workflow.md)
 - [API Reference](../api/reference.md)
 - [MCP Tools Reference](../api/mcp-tools.md)

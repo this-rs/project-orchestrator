@@ -4,11 +4,244 @@ Complete REST API documentation for Project Orchestrator.
 
 **Base URL:** `http://localhost:8080`
 
+**Total routes:** 148 (7 public + 141 protected)
+
 ---
 
 ## Authentication
 
-Currently, the API does not require authentication. For production deployments, implement authentication at the reverse proxy level.
+The API uses **JWT Bearer token authentication**. When authentication is configured, it operates on a **deny-by-default** basis: all routes require a valid JWT unless explicitly marked as public.
+
+Routes are split into two groups:
+
+- **Public** (no auth required) -- marked with the unlocked padlock icon in this document
+- **Protected** (require `Authorization: Bearer <JWT>` header) -- marked with the locked padlock icon
+
+For detailed setup instructions (Google OAuth, JWT configuration, environment variables), see the [Authentication Guide](../guides/authentication.md).
+
+### Route Access Summary
+
+| Route Prefix | Access | Notes |
+|--------------|--------|-------|
+| `GET /health` | Public | Health check |
+| `/auth/google`, `/auth/google/callback` | Public | OAuth login flow |
+| `/auth/me`, `/auth/refresh` | **Protected** | User info and token refresh |
+| `/ws/*` | Public | Auth via first WebSocket message |
+| `/hooks/wake` | Public | Agent webhook |
+| `/internal/events` | Public | Internal event receiver |
+| `/api/*` | **Protected** | All API routes require JWT |
+
+### Authenticated Request Example
+
+```bash
+curl -H "Authorization: Bearer <JWT>" http://localhost:8080/api/plans
+```
+
+---
+
+## Auth Routes
+
+### GET /auth/google -- Public
+
+Start Google OAuth login flow. Redirects the user to Google's consent screen.
+
+```bash
+curl -v http://localhost:8080/auth/google
+# Returns 302 redirect to Google OAuth
+```
+
+### POST /auth/google/callback -- Public
+
+OAuth callback. Exchanges the authorization code for a JWT token.
+
+```bash
+curl -X POST http://localhost:8080/auth/google/callback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "4/0AX4XfWh...",
+    "redirect_uri": "http://localhost:3000/callback"
+  }'
+```
+
+**Request Body:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `code` | string | Yes | Authorization code from Google |
+| `redirect_uri` | string | Yes | Redirect URI used in the login request |
+
+**Response:**
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "user": {
+    "email": "user@example.com",
+    "name": "User Name",
+    "picture": "https://lh3.googleusercontent.com/..."
+  }
+}
+```
+
+### GET /auth/me -- Protected
+
+Get the currently authenticated user's information.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" http://localhost:8080/auth/me
+```
+
+**Response:**
+```json
+{
+  "email": "user@example.com",
+  "name": "User Name",
+  "picture": "https://lh3.googleusercontent.com/..."
+}
+```
+
+### POST /auth/refresh -- Protected
+
+Refresh the JWT token.
+
+```bash
+curl -X POST http://localhost:8080/auth/refresh \
+  -H "Authorization: Bearer <JWT>"
+```
+
+**Response:**
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+---
+
+## WebSocket Routes
+
+### GET /ws/events -- Public
+
+Connect to the CRUD event stream. Auth is performed via the first WebSocket message.
+
+Receives real-time notifications for all entity changes (create, update, delete). Events cover: projects, plans, tasks, steps, decisions, notes, milestones, releases, workspaces, and more.
+
+```bash
+wscat -c ws://localhost:8080/ws/events
+```
+
+### GET /ws/chat/{session_id} -- Public
+
+WebSocket chat with Claude. Auth is performed via the first WebSocket message.
+
+Send user messages and receive streaming response events (`AssistantText`, `Thinking`, `ToolUse`, `ToolResult`, `Error`, etc.).
+
+```bash
+wscat -c ws://localhost:8080/ws/chat/{session_id}
+```
+
+See the [Chat & WebSocket Guide](../guides/chat-websocket.md) for details.
+
+---
+
+## Chat Sessions -- Protected
+
+REST endpoints for managing chat sessions. Streaming chat is handled via the WebSocket route above.
+
+### GET /api/chat/sessions -- Protected
+
+List chat sessions.
+
+**Query Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `project_slug` | string | Filter by project |
+| `limit` | integer | Max items |
+| `offset` | integer | Items to skip |
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/chat/sessions?project_slug=my-project"
+```
+
+### POST /api/chat/sessions -- Protected
+
+Create a new chat session.
+
+```bash
+curl -X POST http://localhost:8080/api/chat/sessions \
+  -H "Authorization: Bearer <JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"project_slug": "my-project"}'
+```
+
+### GET /api/chat/sessions/{id} -- Protected
+
+Get session details.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/chat/sessions/{id}
+```
+
+### DELETE /api/chat/sessions/{id} -- Protected
+
+Delete a session.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/chat/sessions/{id}
+```
+
+### GET /api/chat/sessions/{id}/messages -- Protected
+
+List messages in a session.
+
+**Query Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `limit` | integer | Max items |
+| `offset` | integer | Items to skip |
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/chat/sessions/{id}/messages?limit=50&offset=0"
+```
+
+### GET /api/chat/search -- Protected
+
+Search across chat messages.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/chat/search?q=authentication"
+```
+
+### POST /api/chat/sessions/backfill-previews -- Protected
+
+Backfill preview data for existing sessions.
+
+```bash
+curl -X POST -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/chat/sessions/backfill-previews
+```
+
+---
+
+## Health Check
+
+### GET /health -- Public
+
+Check if the API is running.
+
+```bash
+curl http://localhost:8080/health
+```
+
+**Response:**
+```json
+{
+  "status": "healthy"
+}
+```
 
 ---
 
@@ -37,28 +270,9 @@ List endpoints support pagination with these query parameters:
 
 ---
 
-## Health Check
-
-### GET /health
-
-Check if the API is running.
-
-```bash
-curl http://localhost:8080/health
-```
-
-**Response:**
-```json
-{
-  "status": "healthy"
-}
-```
-
----
-
 ## Projects
 
-### GET /api/projects
+### GET /api/projects -- Protected
 
 List all projects.
 
@@ -72,7 +286,8 @@ List all projects.
 | `sort_order` | string | `asc` or `desc` |
 
 ```bash
-curl "http://localhost:8080/api/projects?limit=10"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/projects?limit=10"
 ```
 
 **Response:**
@@ -96,12 +311,13 @@ curl "http://localhost:8080/api/projects?limit=10"
 }
 ```
 
-### POST /api/projects
+### POST /api/projects -- Protected
 
 Create a new project.
 
 ```bash
 curl -X POST http://localhost:8080/api/projects \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "My Project",
@@ -121,28 +337,44 @@ curl -X POST http://localhost:8080/api/projects \
 
 **Response:** Created project object.
 
-### GET /api/projects/{slug}
+### GET /api/projects/{slug} -- Protected
 
 Get project details.
 
 ```bash
-curl http://localhost:8080/api/projects/my-project
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/projects/my-project
 ```
 
-### DELETE /api/projects/{slug}
+### PATCH /api/projects/{slug} -- Protected
+
+Update a project's name, description, or root_path.
+
+```bash
+curl -X PATCH http://localhost:8080/api/projects/my-project \
+  -H "Authorization: Bearer <JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"description": "Updated description", "name": "New Name"}'
+```
+
+**Updatable Fields:** `name`, `description`, `root_path`
+
+### DELETE /api/projects/{slug} -- Protected
 
 Delete a project and all associated data.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/projects/my-project
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/projects/my-project
 ```
 
-### POST /api/projects/{slug}/sync
+### POST /api/projects/{slug}/sync -- Protected
 
 Sync project files to the knowledge graph.
 
 ```bash
-curl -X POST http://localhost:8080/api/projects/my-project/sync
+curl -X POST -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/projects/my-project/sync
 ```
 
 **Response:**
@@ -153,28 +385,31 @@ curl -X POST http://localhost:8080/api/projects/my-project/sync
 }
 ```
 
-### GET /api/projects/{slug}/plans
+### GET /api/projects/{slug}/plans -- Protected
 
 List plans associated with a project.
 
 ```bash
-curl http://localhost:8080/api/projects/my-project/plans
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/projects/my-project/plans
 ```
 
-### GET /api/projects/{slug}/code/search
+### GET /api/projects/{slug}/code/search -- Protected
 
 Search code within a specific project.
 
 ```bash
-curl "http://localhost:8080/api/projects/my-project/code/search?q=authentication&limit=10"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/projects/my-project/code/search?q=authentication&limit=10"
 ```
 
-### GET /api/projects/{project_id}/roadmap
+### GET /api/projects/{project_id}/roadmap -- Protected
 
 Get aggregated roadmap view.
 
 ```bash
-curl http://localhost:8080/api/projects/{project_id}/roadmap
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/projects/{project_id}/roadmap
 ```
 
 **Response:**
@@ -196,7 +431,7 @@ curl http://localhost:8080/api/projects/{project_id}/roadmap
 
 Workspaces group related projects together for cross-project coordination.
 
-### GET /api/workspaces
+### GET /api/workspaces -- Protected
 
 List all workspaces.
 
@@ -210,15 +445,17 @@ List all workspaces.
 | `sort_order` | string | `asc` or `desc` |
 
 ```bash
-curl "http://localhost:8080/api/workspaces?limit=10"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/workspaces?limit=10"
 ```
 
-### POST /api/workspaces
+### POST /api/workspaces -- Protected
 
 Create a new workspace.
 
 ```bash
 curl -X POST http://localhost:8080/api/workspaces \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "E-Commerce Platform",
@@ -234,38 +471,42 @@ curl -X POST http://localhost:8080/api/workspaces \
 | `description` | string | No | Workspace description |
 | `slug` | string | No | URL-safe identifier (auto-generated) |
 
-### GET /api/workspaces/{slug}
+### GET /api/workspaces/{slug} -- Protected
 
 Get workspace details.
 
 ```bash
-curl http://localhost:8080/api/workspaces/e-commerce-platform
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspaces/e-commerce-platform
 ```
 
-### PATCH /api/workspaces/{slug}
+### PATCH /api/workspaces/{slug} -- Protected
 
 Update a workspace.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/workspaces/e-commerce-platform \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"description": "Updated description"}'
 ```
 
-### DELETE /api/workspaces/{slug}
+### DELETE /api/workspaces/{slug} -- Protected
 
 Delete a workspace.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/workspaces/e-commerce-platform
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspaces/e-commerce-platform
 ```
 
-### GET /api/workspaces/{slug}/overview
+### GET /api/workspaces/{slug}/overview -- Protected
 
 Get workspace overview with projects, milestones, resources, and components.
 
 ```bash
-curl http://localhost:8080/api/workspaces/e-commerce-platform/overview
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspaces/e-commerce-platform/overview
 ```
 
 **Response:**
@@ -279,30 +520,33 @@ curl http://localhost:8080/api/workspaces/e-commerce-platform/overview
 }
 ```
 
-### GET /api/workspaces/{slug}/projects
+### GET /api/workspaces/{slug}/projects -- Protected
 
 List projects in a workspace.
 
 ```bash
-curl http://localhost:8080/api/workspaces/e-commerce-platform/projects
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspaces/e-commerce-platform/projects
 ```
 
-### POST /api/workspaces/{slug}/projects
+### POST /api/workspaces/{slug}/projects -- Protected
 
 Add a project to a workspace.
 
 ```bash
 curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/projects \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"project_id": "uuid"}'
 ```
 
-### DELETE /api/workspaces/{slug}/projects/{project_id}
+### DELETE /api/workspaces/{slug}/projects/{project_id} -- Protected
 
 Remove a project from a workspace.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/workspaces/e-commerce-platform/projects/{project_id}
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspaces/e-commerce-platform/projects/{project_id}
 ```
 
 ---
@@ -311,20 +555,39 @@ curl -X DELETE http://localhost:8080/api/workspaces/e-commerce-platform/projects
 
 Cross-project milestones for coordinating tasks across multiple projects.
 
-### GET /api/workspaces/{slug}/milestones
+### GET /api/workspace-milestones -- Protected
 
-List workspace milestones.
+List ALL workspace milestones across all workspaces.
+
+**Query Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `workspace_id` | uuid | Filter by workspace |
+| `status` | string | `planned`, `open`, `in_progress`, `completed`, `closed` |
+| `limit` | integer | Max items |
+| `offset` | integer | Items to skip |
 
 ```bash
-curl "http://localhost:8080/api/workspaces/e-commerce-platform/milestones?status=open"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/workspace-milestones?status=open"
 ```
 
-### POST /api/workspaces/{slug}/milestones
+### GET /api/workspaces/{slug}/milestones -- Protected
+
+List workspace milestones for a specific workspace.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/workspaces/e-commerce-platform/milestones?status=open"
+```
+
+### POST /api/workspaces/{slug}/milestones -- Protected
 
 Create a workspace milestone.
 
 ```bash
 curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/milestones \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "Q1 Launch",
@@ -334,48 +597,53 @@ curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/milestones
   }'
 ```
 
-### GET /api/workspace-milestones/{milestone_id}
+### GET /api/workspace-milestones/{milestone_id} -- Protected
 
 Get workspace milestone details.
 
 ```bash
-curl http://localhost:8080/api/workspace-milestones/{milestone_id}
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspace-milestones/{milestone_id}
 ```
 
-### PATCH /api/workspace-milestones/{milestone_id}
+### PATCH /api/workspace-milestones/{milestone_id} -- Protected
 
 Update a workspace milestone.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/workspace-milestones/{milestone_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"status": "closed"}'
 ```
 
-### DELETE /api/workspace-milestones/{milestone_id}
+### DELETE /api/workspace-milestones/{milestone_id} -- Protected
 
 Delete a workspace milestone.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/workspace-milestones/{milestone_id}
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspace-milestones/{milestone_id}
 ```
 
-### POST /api/workspace-milestones/{milestone_id}/tasks
+### POST /api/workspace-milestones/{milestone_id}/tasks -- Protected
 
 Add a task from any project to a workspace milestone.
 
 ```bash
 curl -X POST http://localhost:8080/api/workspace-milestones/{milestone_id}/tasks \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"task_id": "uuid"}'
 ```
 
-### GET /api/workspace-milestones/{milestone_id}/progress
+### GET /api/workspace-milestones/{milestone_id}/progress -- Protected
 
 Get aggregated progress across all projects.
 
 ```bash
-curl http://localhost:8080/api/workspace-milestones/{milestone_id}/progress
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspace-milestones/{milestone_id}/progress
 ```
 
 **Response:**
@@ -395,20 +663,22 @@ curl http://localhost:8080/api/workspace-milestones/{milestone_id}/progress
 
 Shared contracts, schemas, and specifications referenced by multiple projects.
 
-### GET /api/workspaces/{slug}/resources
+### GET /api/workspaces/{slug}/resources -- Protected
 
 List resources in a workspace.
 
 ```bash
-curl "http://localhost:8080/api/workspaces/e-commerce-platform/resources?resource_type=api_contract"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/workspaces/e-commerce-platform/resources?resource_type=api_contract"
 ```
 
-### POST /api/workspaces/{slug}/resources
+### POST /api/workspaces/{slug}/resources -- Protected
 
 Create a shared resource.
 
 ```bash
 curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/resources \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "User API",
@@ -422,38 +692,42 @@ curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/resources 
 
 **Resource Types:** `api_contract`, `protobuf`, `graphql_schema`, `json_schema`, `database_schema`, `shared_types`, `config`, `documentation`, `other`
 
-### GET /api/resources/{resource_id}
+### GET /api/resources/{resource_id} -- Protected
 
 Get resource details.
 
 ```bash
-curl http://localhost:8080/api/resources/{resource_id}
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/resources/{resource_id}
 ```
 
-### PATCH /api/resources/{resource_id}
+### PATCH /api/resources/{resource_id} -- Protected
 
 Update a resource.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/resources/{resource_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"version": "2.0.0"}'
 ```
 
-### DELETE /api/resources/{resource_id}
+### DELETE /api/resources/{resource_id} -- Protected
 
 Delete a resource.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/resources/{resource_id}
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/resources/{resource_id}
 ```
 
-### POST /api/resources/{resource_id}/projects
+### POST /api/resources/{resource_id}/projects -- Protected
 
 Link a project to a resource as implementer or consumer.
 
 ```bash
 curl -X POST http://localhost:8080/api/resources/{resource_id}/projects \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "project_id": "uuid",
@@ -463,34 +737,28 @@ curl -X POST http://localhost:8080/api/resources/{resource_id}/projects \
 
 **Relationship Values:** `implements` (provider), `uses` (consumer)
 
-### GET /api/resources/{resource_id}/projects
-
-Get projects linked to a resource.
-
-```bash
-curl http://localhost:8080/api/resources/{resource_id}/projects
-```
-
 ---
 
 ## Components & Topology
 
 Model deployment architecture with components and their dependencies.
 
-### GET /api/workspaces/{slug}/components
+### GET /api/workspaces/{slug}/components -- Protected
 
 List components in a workspace.
 
 ```bash
-curl "http://localhost:8080/api/workspaces/e-commerce-platform/components?component_type=service"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/workspaces/e-commerce-platform/components?component_type=service"
 ```
 
-### POST /api/workspaces/{slug}/components
+### POST /api/workspaces/{slug}/components -- Protected
 
 Create a deployment component.
 
 ```bash
 curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/components \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "API Gateway",
@@ -504,38 +772,42 @@ curl -X POST http://localhost:8080/api/workspaces/e-commerce-platform/components
 
 **Component Types:** `service`, `frontend`, `worker`, `database`, `message_queue`, `cache`, `gateway`, `external`, `other`
 
-### GET /api/components/{component_id}
+### GET /api/components/{component_id} -- Protected
 
 Get component details.
 
 ```bash
-curl http://localhost:8080/api/components/{component_id}
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/components/{component_id}
 ```
 
-### PATCH /api/components/{component_id}
+### PATCH /api/components/{component_id} -- Protected
 
 Update a component.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/components/{component_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"runtime": "docker"}'
 ```
 
-### DELETE /api/components/{component_id}
+### DELETE /api/components/{component_id} -- Protected
 
 Delete a component.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/components/{component_id}
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/components/{component_id}
 ```
 
-### POST /api/components/{component_id}/dependencies
+### POST /api/components/{component_id}/dependencies -- Protected
 
 Add a dependency between components.
 
 ```bash
 curl -X POST http://localhost:8080/api/components/{component_id}/dependencies \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "depends_on_id": "uuid",
@@ -544,30 +816,33 @@ curl -X POST http://localhost:8080/api/components/{component_id}/dependencies \
   }'
 ```
 
-### DELETE /api/components/{component_id}/dependencies/{dep_id}
+### DELETE /api/components/{component_id}/dependencies/{dep_id} -- Protected
 
 Remove a component dependency.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/components/{component_id}/dependencies/{dep_id}
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/components/{component_id}/dependencies/{dep_id}
 ```
 
-### PUT /api/components/{component_id}/project
+### PUT /api/components/{component_id}/project -- Protected
 
 Map a component to its source code project.
 
 ```bash
 curl -X PUT http://localhost:8080/api/components/{component_id}/project \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"project_id": "uuid"}'
 ```
 
-### GET /api/workspaces/{slug}/topology
+### GET /api/workspaces/{slug}/topology -- Protected
 
 Get full deployment topology graph.
 
 ```bash
-curl http://localhost:8080/api/workspaces/e-commerce-platform/topology
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/workspaces/e-commerce-platform/topology
 ```
 
 **Response:**
@@ -591,7 +866,7 @@ curl http://localhost:8080/api/workspaces/e-commerce-platform/topology
 
 ## Plans
 
-### GET /api/plans
+### GET /api/plans -- Protected
 
 List all plans.
 
@@ -604,15 +879,17 @@ List all plans.
 | `search` | string | Search in title/description |
 
 ```bash
-curl "http://localhost:8080/api/plans?status=in_progress&limit=10"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/plans?status=in_progress&limit=10"
 ```
 
-### POST /api/plans
+### POST /api/plans -- Protected
 
 Create a new plan.
 
 ```bash
 curl -X POST http://localhost:8080/api/plans \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "Implement Feature X",
@@ -630,12 +907,13 @@ curl -X POST http://localhost:8080/api/plans \
 | `priority` | integer | No | Priority (higher = more important) |
 | `project_id` | uuid | No | Associate with a project |
 
-### GET /api/plans/{plan_id}
+### GET /api/plans/{plan_id} -- Protected
 
 Get plan details with tasks, constraints, and decisions.
 
 ```bash
-curl http://localhost:8080/api/plans/{plan_id}
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}
 ```
 
 **Response:**
@@ -654,50 +932,64 @@ curl http://localhost:8080/api/plans/{plan_id}
 }
 ```
 
-### PATCH /api/plans/{plan_id}
+### PATCH /api/plans/{plan_id} -- Protected
 
 Update plan status.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/plans/{plan_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"status": "in_progress"}'
 ```
 
 **Status Values:** `draft`, `approved`, `in_progress`, `completed`, `cancelled`
 
-### PUT /api/plans/{plan_id}/project
+### DELETE /api/plans/{plan_id} -- Protected
+
+Delete a plan and all related data (tasks, steps, decisions, constraints).
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}
+```
+
+### PUT /api/plans/{plan_id}/project -- Protected
 
 Link plan to a project.
 
 ```bash
 curl -X PUT http://localhost:8080/api/plans/{plan_id}/project \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"project_id": "uuid"}'
 ```
 
-### DELETE /api/plans/{plan_id}/project
+### DELETE /api/plans/{plan_id}/project -- Protected
 
 Unlink plan from project.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/plans/{plan_id}/project
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}/project
 ```
 
-### GET /api/plans/{plan_id}/next-task
+### GET /api/plans/{plan_id}/next-task -- Protected
 
 Get next available task (unblocked, highest priority).
 
 ```bash
-curl http://localhost:8080/api/plans/{plan_id}/next-task
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}/next-task
 ```
 
-### GET /api/plans/{plan_id}/dependency-graph
+### GET /api/plans/{plan_id}/dependency-graph -- Protected
 
 Get task dependency graph for visualization.
 
 ```bash
-curl http://localhost:8080/api/plans/{plan_id}/dependency-graph
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}/dependency-graph
 ```
 
 **Response:**
@@ -712,12 +1004,13 @@ curl http://localhost:8080/api/plans/{plan_id}/dependency-graph
 }
 ```
 
-### GET /api/plans/{plan_id}/critical-path
+### GET /api/plans/{plan_id}/critical-path -- Protected
 
 Get longest dependency chain.
 
 ```bash
-curl http://localhost:8080/api/plans/{plan_id}/critical-path
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}/critical-path
 ```
 
 **Response:**
@@ -735,7 +1028,7 @@ curl http://localhost:8080/api/plans/{plan_id}/critical-path
 
 ## Tasks
 
-### GET /api/tasks
+### GET /api/tasks -- Protected
 
 List all tasks across plans.
 
@@ -750,15 +1043,17 @@ List all tasks across plans.
 | `assigned_to` | string | Filter by assignee |
 
 ```bash
-curl "http://localhost:8080/api/tasks?status=in_progress&assigned_to=agent-1"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/tasks?status=in_progress&assigned_to=agent-1"
 ```
 
-### POST /api/plans/{plan_id}/tasks
+### POST /api/plans/{plan_id}/tasks -- Protected
 
 Add a task to a plan.
 
 ```bash
 curl -X POST http://localhost:8080/api/plans/{plan_id}/tasks \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "Implement login",
@@ -782,20 +1077,22 @@ curl -X POST http://localhost:8080/api/plans/{plan_id}/tasks \
 | `affected_files` | string[] | No | Files to be modified |
 | `dependencies` | uuid[] | No | Task UUIDs this depends on |
 
-### GET /api/tasks/{task_id}
+### GET /api/tasks/{task_id} -- Protected
 
 Get task details.
 
 ```bash
-curl http://localhost:8080/api/tasks/{task_id}
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}
 ```
 
-### PATCH /api/tasks/{task_id}
+### PATCH /api/tasks/{task_id} -- Protected
 
 Update a task.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/tasks/{task_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "status": "in_progress",
@@ -807,58 +1104,95 @@ curl -X PATCH http://localhost:8080/api/tasks/{task_id} \
 
 **Status Values:** `pending`, `in_progress`, `blocked`, `completed`, `failed`
 
-### POST /api/tasks/{task_id}/dependencies
+### DELETE /api/tasks/{task_id} -- Protected
+
+Delete a task and all its steps and decisions.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}
+```
+
+### POST /api/tasks/{task_id}/dependencies -- Protected
 
 Add dependencies to a task.
 
 ```bash
 curl -X POST http://localhost:8080/api/tasks/{task_id}/dependencies \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"dependency_ids": ["uuid1", "uuid2"]}'
 ```
 
-### DELETE /api/tasks/{task_id}/dependencies/{dep_id}
+### DELETE /api/tasks/{task_id}/dependencies/{dep_id} -- Protected
 
 Remove a dependency.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/tasks/{task_id}/dependencies/{dep_id}
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}/dependencies/{dep_id}
 ```
 
-### GET /api/tasks/{task_id}/blockers
+### GET /api/tasks/{task_id}/blockers -- Protected
 
 Get tasks blocking this task (uncompleted dependencies).
 
 ```bash
-curl http://localhost:8080/api/tasks/{task_id}/blockers
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}/blockers
 ```
 
-### GET /api/tasks/{task_id}/blocking
+### GET /api/tasks/{task_id}/blocking -- Protected
 
 Get tasks blocked by this task.
 
 ```bash
-curl http://localhost:8080/api/tasks/{task_id}/blocking
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}/blocking
+```
+
+---
+
+## Task Context
+
+### GET /api/plans/{plan_id}/tasks/{task_id}/context -- Protected
+
+Get full context for a task (for agent execution).
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}/tasks/{task_id}/context
+```
+
+### GET /api/plans/{plan_id}/tasks/{task_id}/prompt -- Protected
+
+Get generated prompt for a task.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}/tasks/{task_id}/prompt
 ```
 
 ---
 
 ## Steps
 
-### GET /api/tasks/{task_id}/steps
+### GET /api/tasks/{task_id}/steps -- Protected
 
 List steps for a task.
 
 ```bash
-curl http://localhost:8080/api/tasks/{task_id}/steps
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}/steps
 ```
 
-### POST /api/tasks/{task_id}/steps
+### POST /api/tasks/{task_id}/steps -- Protected
 
 Add a step to a task.
 
 ```bash
 curl -X POST http://localhost:8080/api/tasks/{task_id}/steps \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "description": "Setup JWT library",
@@ -866,24 +1200,44 @@ curl -X POST http://localhost:8080/api/tasks/{task_id}/steps \
   }'
 ```
 
-### PATCH /api/steps/{step_id}
+### GET /api/steps/{step_id} -- Protected
+
+Get a step by ID.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/steps/{step_id}
+```
+
+### PATCH /api/steps/{step_id} -- Protected
 
 Update step status.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/steps/{step_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"status": "completed"}'
 ```
 
 **Status Values:** `pending`, `in_progress`, `completed`, `skipped`
 
-### GET /api/tasks/{task_id}/steps/progress
+### DELETE /api/steps/{step_id} -- Protected
+
+Delete a step.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/steps/{step_id}
+```
+
+### GET /api/tasks/{task_id}/steps/progress -- Protected
 
 Get step completion progress.
 
 ```bash
-curl http://localhost:8080/api/tasks/{task_id}/steps/progress
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}/steps/progress
 ```
 
 **Response:**
@@ -899,20 +1253,22 @@ curl http://localhost:8080/api/tasks/{task_id}/steps/progress
 
 ## Constraints
 
-### GET /api/plans/{plan_id}/constraints
+### GET /api/plans/{plan_id}/constraints -- Protected
 
 List plan constraints.
 
 ```bash
-curl http://localhost:8080/api/plans/{plan_id}/constraints
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}/constraints
 ```
 
-### POST /api/plans/{plan_id}/constraints
+### POST /api/plans/{plan_id}/constraints -- Protected
 
 Add a constraint.
 
 ```bash
 curl -X POST http://localhost:8080/api/plans/{plan_id}/constraints \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "constraint_type": "security",
@@ -925,24 +1281,48 @@ curl -X POST http://localhost:8080/api/plans/{plan_id}/constraints \
 
 **Severity Levels:** `low`, `medium`, `high`, `critical`
 
-### DELETE /api/constraints/{constraint_id}
+### GET /api/constraints/{constraint_id} -- Protected
+
+Get constraint details.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/constraints/{constraint_id}
+```
+
+### PATCH /api/constraints/{constraint_id} -- Protected
+
+Update a constraint.
+
+```bash
+curl -X PATCH http://localhost:8080/api/constraints/{constraint_id} \
+  -H "Authorization: Bearer <JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"description": "Updated constraint description"}'
+```
+
+**Updatable Fields:** `description`, `constraint_type`, `enforced_by`
+
+### DELETE /api/constraints/{constraint_id} -- Protected
 
 Delete a constraint.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/constraints/{constraint_id}
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/constraints/{constraint_id}
 ```
 
 ---
 
 ## Decisions
 
-### POST /api/tasks/{task_id}/decisions
+### POST /api/tasks/{task_id}/decisions -- Protected
 
 Record a decision.
 
 ```bash
 curl -X POST http://localhost:8080/api/tasks/{task_id}/decisions \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "description": "Use JWT for authentication",
@@ -952,32 +1332,66 @@ curl -X POST http://localhost:8080/api/tasks/{task_id}/decisions \
   }'
 ```
 
-### GET /api/decisions/search
+### GET /api/decisions/{decision_id} -- Protected
+
+Get decision details.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/decisions/{decision_id}
+```
+
+### PATCH /api/decisions/{decision_id} -- Protected
+
+Update a decision.
+
+```bash
+curl -X PATCH http://localhost:8080/api/decisions/{decision_id} \
+  -H "Authorization: Bearer <JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"rationale": "Updated rationale"}'
+```
+
+**Updatable Fields:** `description`, `rationale`, `chosen_option`
+
+### DELETE /api/decisions/{decision_id} -- Protected
+
+Delete a decision.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/decisions/{decision_id}
+```
+
+### GET /api/decisions/search -- Protected
 
 Search past decisions.
 
 ```bash
-curl "http://localhost:8080/api/decisions/search?q=authentication&limit=10"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/decisions/search?q=authentication&limit=10"
 ```
 
 ---
 
 ## Releases
 
-### GET /api/projects/{project_id}/releases
+### GET /api/projects/{project_id}/releases -- Protected
 
 List releases for a project.
 
 ```bash
-curl "http://localhost:8080/api/projects/{project_id}/releases?status=planned"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/projects/{project_id}/releases?status=planned"
 ```
 
-### POST /api/projects/{project_id}/releases
+### POST /api/projects/{project_id}/releases -- Protected
 
 Create a release.
 
 ```bash
 curl -X POST http://localhost:8080/api/projects/{project_id}/releases \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "version": "1.0.0",
@@ -987,42 +1401,55 @@ curl -X POST http://localhost:8080/api/projects/{project_id}/releases \
   }'
 ```
 
-### GET /api/releases/{release_id}
+### GET /api/releases/{release_id} -- Protected
 
 Get release details with tasks and commits.
 
 ```bash
-curl http://localhost:8080/api/releases/{release_id}
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/releases/{release_id}
 ```
 
-### PATCH /api/releases/{release_id}
+### PATCH /api/releases/{release_id} -- Protected
 
 Update a release.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/releases/{release_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"status": "released", "released_at": "2024-03-01T12:00:00Z"}'
 ```
 
 **Status Values:** `planned`, `in_progress`, `released`, `cancelled`
 
-### POST /api/releases/{release_id}/tasks
+### DELETE /api/releases/{release_id} -- Protected
+
+Delete a release.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/releases/{release_id}
+```
+
+### POST /api/releases/{release_id}/tasks -- Protected
 
 Add task to release.
 
 ```bash
 curl -X POST http://localhost:8080/api/releases/{release_id}/tasks \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"task_id": "uuid"}'
 ```
 
-### POST /api/releases/{release_id}/commits
+### POST /api/releases/{release_id}/commits -- Protected
 
 Add commit to release.
 
 ```bash
 curl -X POST http://localhost:8080/api/releases/{release_id}/commits \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"commit_sha": "abc123"}'
 ```
@@ -1031,20 +1458,22 @@ curl -X POST http://localhost:8080/api/releases/{release_id}/commits \
 
 ## Milestones
 
-### GET /api/projects/{project_id}/milestones
+### GET /api/projects/{project_id}/milestones -- Protected
 
 List milestones for a project.
 
 ```bash
-curl "http://localhost:8080/api/projects/{project_id}/milestones?status=open"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/projects/{project_id}/milestones?status=open"
 ```
 
-### POST /api/projects/{project_id}/milestones
+### POST /api/projects/{project_id}/milestones -- Protected
 
 Create a milestone.
 
 ```bash
 curl -X POST http://localhost:8080/api/projects/{project_id}/milestones \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "MVP Complete",
@@ -1053,54 +1482,68 @@ curl -X POST http://localhost:8080/api/projects/{project_id}/milestones \
   }'
 ```
 
-### GET /api/milestones/{milestone_id}
+### GET /api/milestones/{milestone_id} -- Protected
 
 Get milestone details with tasks.
 
 ```bash
-curl http://localhost:8080/api/milestones/{milestone_id}
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/milestones/{milestone_id}
 ```
 
-### PATCH /api/milestones/{milestone_id}
+### PATCH /api/milestones/{milestone_id} -- Protected
 
 Update a milestone.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/milestones/{milestone_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"status": "closed"}'
 ```
 
 **Status Values:** `open`, `closed`
 
-### POST /api/milestones/{milestone_id}/tasks
+### DELETE /api/milestones/{milestone_id} -- Protected
+
+Delete a milestone.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/milestones/{milestone_id}
+```
+
+### POST /api/milestones/{milestone_id}/tasks -- Protected
 
 Add task to milestone.
 
 ```bash
 curl -X POST http://localhost:8080/api/milestones/{milestone_id}/tasks \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"task_id": "uuid"}'
 ```
 
-### GET /api/milestones/{milestone_id}/progress
+### GET /api/milestones/{milestone_id}/progress -- Protected
 
 Get milestone completion progress.
 
 ```bash
-curl http://localhost:8080/api/milestones/{milestone_id}/progress
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/milestones/{milestone_id}/progress
 ```
 
 ---
 
 ## Commits
 
-### POST /api/commits
+### POST /api/commits -- Protected
 
 Register a commit.
 
 ```bash
 curl -X POST http://localhost:8080/api/commits \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "sha": "abc123def456",
@@ -1110,38 +1553,42 @@ curl -X POST http://localhost:8080/api/commits \
   }'
 ```
 
-### GET /api/tasks/{task_id}/commits
+### GET /api/tasks/{task_id}/commits -- Protected
 
 Get commits linked to a task.
 
 ```bash
-curl http://localhost:8080/api/tasks/{task_id}/commits
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/tasks/{task_id}/commits
 ```
 
-### POST /api/tasks/{task_id}/commits
+### POST /api/tasks/{task_id}/commits -- Protected
 
 Link commit to task.
 
 ```bash
 curl -X POST http://localhost:8080/api/tasks/{task_id}/commits \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"commit_sha": "abc123"}'
 ```
 
-### GET /api/plans/{plan_id}/commits
+### GET /api/plans/{plan_id}/commits -- Protected
 
 Get commits linked to a plan.
 
 ```bash
-curl http://localhost:8080/api/plans/{plan_id}/commits
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/plans/{plan_id}/commits
 ```
 
-### POST /api/plans/{plan_id}/commits
+### POST /api/plans/{plan_id}/commits -- Protected
 
 Link commit to plan.
 
 ```bash
 curl -X POST http://localhost:8080/api/plans/{plan_id}/commits \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"commit_sha": "abc123"}'
 ```
@@ -1150,12 +1597,13 @@ curl -X POST http://localhost:8080/api/plans/{plan_id}/commits \
 
 ## Code Exploration
 
-### GET /api/code/search
+### GET /api/code/search -- Protected
 
 Semantic code search.
 
 ```bash
-curl "http://localhost:8080/api/code/search?q=error+handling&limit=10&language=rust"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/search?q=error+handling&limit=10&language=rust"
 ```
 
 **Response:**
@@ -1173,12 +1621,13 @@ curl "http://localhost:8080/api/code/search?q=error+handling&limit=10&language=r
 }
 ```
 
-### GET /api/code/symbols/{file_path}
+### GET /api/code/symbols/{file_path} -- Protected
 
 Get symbols in a file.
 
 ```bash
-curl "http://localhost:8080/api/code/symbols/src%2Flib.rs"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/symbols/src%2Flib.rs"
 ```
 
 **Response:**
@@ -1201,20 +1650,22 @@ curl "http://localhost:8080/api/code/symbols/src%2Flib.rs"
 }
 ```
 
-### GET /api/code/references
+### GET /api/code/references -- Protected
 
 Find all references to a symbol.
 
 ```bash
-curl "http://localhost:8080/api/code/references?symbol=AppState&limit=20"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/references?symbol=AppState&limit=20"
 ```
 
-### GET /api/code/dependencies/{file_path}
+### GET /api/code/dependencies/{file_path} -- Protected
 
 Get file imports and dependents.
 
 ```bash
-curl "http://localhost:8080/api/code/dependencies/src%2Flib.rs"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/dependencies/src%2Flib.rs"
 ```
 
 **Response:**
@@ -1226,20 +1677,22 @@ curl "http://localhost:8080/api/code/dependencies/src%2Flib.rs"
 }
 ```
 
-### GET /api/code/callgraph
+### GET /api/code/callgraph -- Protected
 
 Get function call graph.
 
 ```bash
-curl "http://localhost:8080/api/code/callgraph?function=handle_request&depth=2&direction=both"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/callgraph?function=handle_request&depth=2&direction=both"
 ```
 
-### GET /api/code/impact
+### GET /api/code/impact -- Protected
 
 Analyze change impact.
 
 ```bash
-curl "http://localhost:8080/api/code/impact?target=src/models/user.rs&target_type=file"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/impact?target=src/models/user.rs&target_type=file"
 ```
 
 **Response:**
@@ -1253,46 +1706,51 @@ curl "http://localhost:8080/api/code/impact?target=src/models/user.rs&target_typ
 }
 ```
 
-### GET /api/code/architecture
+### GET /api/code/architecture -- Protected
 
 Get codebase architecture overview.
 
 ```bash
-curl http://localhost:8080/api/code/architecture
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/code/architecture
 ```
 
-### POST /api/code/similar
+### POST /api/code/similar -- Protected
 
 Find similar code.
 
 ```bash
 curl -X POST http://localhost:8080/api/code/similar \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"snippet": "async fn handle_error", "limit": 5}'
 ```
 
-### GET /api/code/trait-impls
+### GET /api/code/trait-impls -- Protected
 
 Find trait implementations.
 
 ```bash
-curl "http://localhost:8080/api/code/trait-impls?trait_name=Handler&limit=10"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/trait-impls?trait_name=Handler&limit=10"
 ```
 
-### GET /api/code/type-traits
+### GET /api/code/type-traits -- Protected
 
 Find traits implemented by a type.
 
 ```bash
-curl "http://localhost:8080/api/code/type-traits?type_name=AppState"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/type-traits?type_name=AppState"
 ```
 
-### GET /api/code/impl-blocks
+### GET /api/code/impl-blocks -- Protected
 
 Get impl blocks for a type.
 
 ```bash
-curl "http://localhost:8080/api/code/impl-blocks?type_name=Orchestrator"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/code/impl-blocks?type_name=Orchestrator"
 ```
 
 ---
@@ -1301,7 +1759,7 @@ curl "http://localhost:8080/api/code/impl-blocks?type_name=Orchestrator"
 
 Knowledge Notes capture contextual knowledge about your codebase. See the [Knowledge Notes Guide](../guides/knowledge-notes.md) for detailed usage.
 
-### GET /api/notes
+### GET /api/notes -- Protected
 
 List notes with filters and pagination.
 
@@ -1320,15 +1778,17 @@ List notes with filters and pagination.
 | `offset` | integer | Items to skip |
 
 ```bash
-curl "http://localhost:8080/api/notes?note_type=guideline&status=active&limit=20"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/notes?note_type=guideline&status=active&limit=20"
 ```
 
-### POST /api/notes
+### POST /api/notes -- Protected
 
 Create a new note.
 
 ```bash
 curl -X POST http://localhost:8080/api/notes \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "project_id": "uuid",
@@ -1343,20 +1803,22 @@ curl -X POST http://localhost:8080/api/notes \
 
 **Importance Levels:** `critical`, `high`, `medium`, `low`
 
-### GET /api/notes/{note_id}
+### GET /api/notes/{note_id} -- Protected
 
 Get note details.
 
 ```bash
-curl http://localhost:8080/api/notes/{note_id}
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/notes/{note_id}
 ```
 
-### PATCH /api/notes/{note_id}
+### PATCH /api/notes/{note_id} -- Protected
 
 Update a note.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/notes/{note_id} \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "content": "Updated content",
@@ -1366,20 +1828,22 @@ curl -X PATCH http://localhost:8080/api/notes/{note_id} \
 
 **Updatable Fields:** `content`, `importance`, `status`, `tags`
 
-### DELETE /api/notes/{note_id}
+### DELETE /api/notes/{note_id} -- Protected
 
 Delete a note.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/notes/{note_id}
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/notes/{note_id}
 ```
 
-### GET /api/notes/search
+### GET /api/notes/search -- Protected
 
 Semantic search across notes.
 
 ```bash
-curl "http://localhost:8080/api/notes/search?q=error+handling&limit=10"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/notes/search?q=error+handling&limit=10"
 ```
 
 **Response:**
@@ -1397,12 +1861,13 @@ curl "http://localhost:8080/api/notes/search?q=error+handling&limit=10"
 }
 ```
 
-### GET /api/notes/context
+### GET /api/notes/context -- Protected
 
 Get contextual notes for an entity (direct + propagated through graph).
 
 ```bash
-curl "http://localhost:8080/api/notes/context?entity_type=file&entity_id=src/auth/jwt.rs&max_depth=2"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/notes/context?entity_type=file&entity_id=src/auth/jwt.rs&max_depth=2"
 ```
 
 **Response:**
@@ -1428,46 +1893,60 @@ curl "http://localhost:8080/api/notes/context?entity_type=file&entity_id=src/aut
 }
 ```
 
-### GET /api/notes/needs-review
+### GET /api/notes/propagated -- Protected
+
+Get notes propagated through the graph (not directly attached to the entity).
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/notes/propagated?entity_type=function&entity_id=validate_token&max_depth=3"
+```
+
+### GET /api/notes/needs-review -- Protected
 
 Get notes needing human review (stale or needs_review status).
 
 ```bash
-curl http://localhost:8080/api/notes/needs-review
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/notes/needs-review
 ```
 
-### POST /api/notes/update-staleness
+### POST /api/notes/update-staleness -- Protected
 
 Recalculate staleness scores for all notes.
 
 ```bash
-curl -X POST http://localhost:8080/api/notes/update-staleness
+curl -X POST -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/notes/update-staleness
 ```
 
-### POST /api/notes/{note_id}/confirm
+### POST /api/notes/{note_id}/confirm -- Protected
 
 Confirm a note is still valid (resets staleness).
 
 ```bash
-curl -X POST http://localhost:8080/api/notes/{note_id}/confirm
+curl -X POST -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/notes/{note_id}/confirm
 ```
 
-### POST /api/notes/{note_id}/invalidate
+### POST /api/notes/{note_id}/invalidate -- Protected
 
 Mark a note as obsolete.
 
 ```bash
 curl -X POST http://localhost:8080/api/notes/{note_id}/invalidate \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"reason": "Auth system was refactored to OAuth"}'
 ```
 
-### POST /api/notes/{note_id}/supersede
+### POST /api/notes/{note_id}/supersede -- Protected
 
 Replace a note with a new one (preserves history).
 
 ```bash
 curl -X POST http://localhost:8080/api/notes/{note_id}/supersede \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "note_type": "guideline",
@@ -1476,12 +1955,13 @@ curl -X POST http://localhost:8080/api/notes/{note_id}/supersede \
   }'
 ```
 
-### POST /api/notes/{note_id}/links
+### POST /api/notes/{note_id}/links -- Protected
 
 Link a note to a code entity.
 
 ```bash
 curl -X POST http://localhost:8080/api/notes/{note_id}/links \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "entity_type": "function",
@@ -1491,72 +1971,88 @@ curl -X POST http://localhost:8080/api/notes/{note_id}/links \
 
 **Entity Types:** `file`, `function`, `struct`, `trait`, `module`, `task`, `plan`
 
-### DELETE /api/notes/{note_id}/links/{entity_type}/{entity_id}
+### DELETE /api/notes/{note_id}/links/{entity_type}/{entity_id} -- Protected
 
 Remove a link between a note and entity.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/notes/{note_id}/links/file/src%2Fauth.rs
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/notes/{note_id}/links/file/src%2Fauth.rs
 ```
 
-### GET /api/projects/{project_id}/notes
+### GET /api/entities/{entity_type}/{entity_id}/notes -- Protected
+
+Get notes directly attached to an entity.
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/entities/function/validate_token/notes
+```
+
+### GET /api/projects/{project_id}/notes -- Protected
 
 List notes for a specific project.
 
 ```bash
-curl "http://localhost:8080/api/projects/{project_id}/notes?status=active"
+curl -H "Authorization: Bearer <JWT>" \
+  "http://localhost:8080/api/projects/{project_id}/notes?status=active"
 ```
 
 ---
 
 ## Sync & Watch
 
-### POST /api/sync
+### POST /api/sync -- Protected
 
 Manually sync a directory.
 
 ```bash
 curl -X POST http://localhost:8080/api/sync \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"path": "/path/to/project", "project_id": "optional-uuid"}'
 ```
 
-### GET /api/watch
+### GET /api/watch -- Protected
 
 Get file watcher status.
 
 ```bash
-curl http://localhost:8080/api/watch
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/watch
 ```
 
-### POST /api/watch
+### POST /api/watch -- Protected
 
 Start file watcher.
 
 ```bash
 curl -X POST http://localhost:8080/api/watch \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{"path": "/path/to/project"}'
 ```
 
-### DELETE /api/watch
+### DELETE /api/watch -- Protected
 
 Stop file watcher.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/watch
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/watch
 ```
 
 ---
 
-## Webhooks
+## Webhooks & Internal
 
-### POST /api/wake
+### POST /api/wake -- Protected
 
-Agent completion webhook.
+Agent completion webhook (protected variant).
 
 ```bash
 curl -X POST http://localhost:8080/api/wake \
+  -H "Authorization: Bearer <JWT>" \
   -H "Content-Type: application/json" \
   -d '{
     "task_id": "uuid",
@@ -1566,24 +2062,51 @@ curl -X POST http://localhost:8080/api/wake \
   }'
 ```
 
+### POST /hooks/wake -- Public
+
+Agent completion webhook (public variant, no auth required).
+
+```bash
+curl -X POST http://localhost:8080/hooks/wake \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_id": "uuid",
+    "success": true,
+    "summary": "Implemented authentication",
+    "files_modified": ["src/auth.rs"]
+  }'
+```
+
+### POST /internal/events -- Public
+
+Internal event receiver. Used for inter-service communication.
+
+```bash
+curl -X POST http://localhost:8080/internal/events \
+  -H "Content-Type: application/json" \
+  -d '{"event_type": "task_completed", "payload": {...}}'
+```
+
 ---
 
 ## Meilisearch Maintenance
 
-### GET /api/meilisearch/stats
+### GET /api/meilisearch/stats -- Protected
 
 Get code index statistics.
 
 ```bash
-curl http://localhost:8080/api/meilisearch/stats
+curl -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/meilisearch/stats
 ```
 
-### DELETE /api/meilisearch/orphans
+### DELETE /api/meilisearch/orphans -- Protected
 
 Delete documents without project_id.
 
 ```bash
-curl -X DELETE http://localhost:8080/api/meilisearch/orphans
+curl -X DELETE -H "Authorization: Bearer <JWT>" \
+  http://localhost:8080/api/meilisearch/orphans
 ```
 
 ---
@@ -1604,6 +2127,8 @@ All errors follow this format:
 
 | Code | HTTP Status | Description |
 |------|-------------|-------------|
+| `UNAUTHORIZED` | 401 | Missing or invalid JWT token |
+| `FORBIDDEN` | 403 | Token valid but insufficient permissions |
 | `NOT_FOUND` | 404 | Resource not found |
 | `VALIDATION_ERROR` | 400 | Invalid request data |
 | `CONFLICT` | 409 | Resource already exists |

@@ -33,7 +33,7 @@ Clone and start the orchestrator:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/project-orchestrator.git
+git clone https://github.com/this-rs/project-orchestrator.git
 cd project-orchestrator
 
 # Start Neo4j and Meilisearch
@@ -423,7 +423,7 @@ You've learned the basics! Here's what to explore next:
 ### Deep Dives
 
 - **[API Reference](../api/reference.md)** — Full REST API documentation
-- **[MCP Tools Reference](../api/mcp-tools.md)** — All 62 tools explained
+- **[MCP Tools Reference](../api/mcp-tools.md)** — All 137 tools explained
 
 ### Integration Guides
 

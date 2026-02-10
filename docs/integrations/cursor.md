@@ -6,12 +6,14 @@ Guide to integrating Project Orchestrator with Cursor IDE.
 
 ## Overview
 
-Cursor supports MCP (Model Context Protocol) servers, giving you access to Project Orchestrator's **62 tools** directly in the editor. Use Chat or Composer to:
+Cursor supports MCP (Model Context Protocol) servers, giving you access to Project Orchestrator's **137 tools** directly in the editor. Use Chat or Composer to:
 
 - **Explore code** with semantic search and graph queries
 - **Manage plans and tasks** without leaving your editor
 - **Track decisions** as you work
 - **Analyze impact** before refactoring
+- **Maintain knowledge notes** anchored to code entities
+- **Delegate work** to sub-agents via chat
 
 ---
 
@@ -279,7 +281,7 @@ Record this decision with rationale: better error handling and readability.
 
 ## Available Tools
 
-All 62 Project Orchestrator tools are available in Cursor. Most useful for editor workflows:
+All 137 Project Orchestrator tools are available in Cursor. Most useful for editor workflows:
 
 | Tool | Cursor Use Case |
 |------|-----------------|
@@ -292,8 +294,13 @@ All 62 Project Orchestrator tools are available in Cursor. Most useful for edito
 | `update_task` | Mark progress |
 | `add_decision` | Record architectural choices |
 | `search_decisions` | Review past decisions |
+| `create_note` | Capture knowledge about code patterns |
+| `search_notes` | Find past observations and guidelines |
+| `get_context_notes` | Get notes relevant to a file or function |
+| `chat_send_message` | Delegate a task to a sub-agent |
+| `list_chat_sessions` | Review past sub-agent conversations |
 
-See [Claude Code Integration](./claude-code.md#available-tools-62) for the complete tool list.
+See [Claude Code Integration](./claude-code.md#available-tools-137) for the complete tool list.
 
 ---
 
@@ -395,6 +402,9 @@ Complete configuration for Cursor:
 ## Next Steps
 
 - [Getting Started Tutorial](../guides/getting-started.md)
+- [Authentication Guide](../guides/authentication.md) — OAuth, API keys, and JWT setup
+- [Chat & WebSocket Guide](../guides/chat-websocket.md) — Sub-agent delegation and real-time chat
+- [Knowledge Notes Guide](../guides/knowledge-notes.md) — Persistent notes anchored to code
 - [API Reference](../api/reference.md)
 - [MCP Tools Reference](../api/mcp-tools.md)
 - [Multi-Agent Workflows](../guides/multi-agent-workflow.md)

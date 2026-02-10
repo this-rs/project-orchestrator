@@ -123,9 +123,26 @@ POST /api/wake
 
 ---
 
+## Authentication
+
+If auth is enabled on the server, agents using the REST API need a JWT token:
+
+```bash
+# Get token via Google OAuth flow, then use it:
+curl -H "Authorization: Bearer <JWT_TOKEN>" http://localhost:8080/api/plans
+```
+
+**Note:** MCP server (stdio) does not require auth. WebSocket connections authenticate via first message.
+
+See [Authentication Guide](docs/guides/authentication.md) for details.
+
+---
+
 ## Full Documentation
 
 - [Getting Started](docs/guides/getting-started.md) — Complete tutorial
+- [Authentication](docs/guides/authentication.md) — JWT + Google OAuth setup
+- [Chat & WebSocket](docs/guides/chat-websocket.md) — Real-time chat and events
 - [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) — Coordinating multiple agents
 - [API Reference](docs/api/reference.md) — All REST endpoints
-- [MCP Tools](docs/api/mcp-tools.md) — 62 tools documented
+- [MCP Tools](docs/api/mcp-tools.md) — 137 tools documented

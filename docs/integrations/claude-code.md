@@ -6,12 +6,15 @@ Complete guide to integrating Project Orchestrator with Claude Code (Anthropic's
 
 ## Overview
 
-The integration gives Claude Code access to **62 MCP tools** for:
+The integration gives Claude Code access to **137 MCP tools** for:
 
 - **Project Management** — Create, sync, and explore codebases
 - **Plan & Task Tracking** — Manage development workflows with dependencies
 - **Code Intelligence** — Semantic search, impact analysis, call graphs
 - **Decision Recording** — Track architectural decisions across sessions
+- **Knowledge Notes** — Persistent notes anchored to code entities
+- **Chat** — Delegate tasks to sub-agents via WebSocket or MCP
+- **Authentication** — OAuth (Google) and API key support for the HTTP API
 
 ---
 
@@ -111,7 +114,7 @@ Claude should use the `list_projects` tool and return results.
 
 ---
 
-## Available Tools (62)
+## Available Tools (137)
 
 ### Project Management (6 tools)
 
@@ -230,6 +233,45 @@ Claude should use the `list_projects` tool and return results.
 | `stop_watch` | Stop the file watcher |
 | `watch_status` | Get file watcher status |
 
+### Notes / Knowledge Base (17 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_notes` | List notes with optional filters and pagination |
+| `create_note` | Create a new knowledge note |
+| `get_note` | Get a note by ID |
+| `update_note` | Update a note's content, importance, status, or tags |
+| `delete_note` | Delete a note |
+| `search_notes` | Search notes using semantic search |
+| `confirm_note` | Confirm a note is still valid (resets staleness) |
+| `invalidate_note` | Mark a note as obsolete with a reason |
+| `supersede_note` | Replace an old note with a new one |
+| `link_note_to_entity` | Link a note to a code entity (file, function, struct, etc.) |
+| `unlink_note_from_entity` | Remove a link between a note and an entity |
+| `get_context_notes` | Get contextual notes for an entity (direct + propagated) |
+| `get_notes_needing_review` | Get notes that need human review (stale or needs_review) |
+| `update_staleness_scores` | Update staleness scores for all notes based on time decay |
+| `list_project_notes` | List notes for a specific project |
+| `get_propagated_notes` | Get notes propagated through the graph |
+| `get_entity_notes` | Get notes directly attached to an entity |
+
+### Chat (5 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_chat_sessions` | List chat sessions with optional project filter |
+| `get_chat_session` | Get chat session details by ID |
+| `delete_chat_session` | Delete a chat session |
+| `list_chat_messages` | List message history for a chat session |
+| `chat_send_message` | Send a chat message and wait for the complete response |
+
+### Meilisearch Maintenance (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `get_meilisearch_stats` | Get Meilisearch code index statistics |
+| `delete_meilisearch_orphans` | Delete documents without project_id from Meilisearch |
+
 ---
 
 ## Workflows
@@ -331,6 +373,60 @@ Agent 2: Get the next task (runs in parallel)
 
 Claude: [Uses get_next_task]
         Task: "Implement logout endpoint" (was blocked by login, now available)
+```
+
+### Workflow 5: Authentication Setup
+
+If your deployment uses the HTTP API (not just MCP via stdio), you can set up authentication:
+
+```
+You: Set up Google OAuth for the orchestrator
+
+Claude: The Project Orchestrator HTTP API supports two authentication methods:
+
+        1. **Google OAuth** — For browser-based access (dashboard, WebSocket chat)
+        2. **API Keys** — For programmatic access (CI/CD, scripts)
+
+        To enable Google OAuth:
+
+        1. Create a Google Cloud project and OAuth credentials
+        2. Set the following environment variables:
+           - GOOGLE_CLIENT_ID=your-client-id
+           - GOOGLE_CLIENT_SECRET=your-client-secret
+           - JWT_SECRET=your-jwt-secret
+           - FRONTEND_URL=http://localhost:3000
+
+        3. Restart the server. The auth endpoints will be available:
+           - GET /auth/google — Start OAuth flow
+           - GET /auth/callback — OAuth callback
+           - GET /auth/me — Get current user
+
+        See the Authentication Guide for full details.
+```
+
+> **Note:** MCP tools (via stdio) do not require authentication — they run locally as a child process. Authentication is only needed when accessing the HTTP REST API or WebSocket chat endpoint.
+
+### Workflow 6: Delegating Work via Chat
+
+```
+You: Send a task to a sub-agent to analyze the auth module
+
+Claude: [Uses chat_send_message tool]
+        Sent message: "Analyze the auth module structure and report key findings"
+        Working directory: /Users/me/myapp
+
+        Response from sub-agent:
+        The auth module has 3 main files:
+        - auth/mod.rs - Module entry point
+        - auth/jwt.rs - JWT token handling
+        - auth/middleware.rs - Axum auth middleware
+        ...
+
+You: List all my chat sessions
+
+Claude: [Uses list_chat_sessions tool]
+        1. Session abc-123 (project: myapp) — 5 messages
+        2. Session def-456 (project: myapp) — 12 messages
 ```
 
 ---
@@ -465,6 +561,9 @@ MCP server logs go to stderr. To capture them:
 ## Next Steps
 
 - [Getting Started Tutorial](../guides/getting-started.md) — Full walkthrough
+- [Authentication Guide](../guides/authentication.md) — OAuth, API keys, and JWT setup
+- [Chat & WebSocket Guide](../guides/chat-websocket.md) — Sub-agent delegation and real-time chat
+- [Knowledge Notes Guide](../guides/knowledge-notes.md) — Persistent notes anchored to code
 - [API Reference](../api/reference.md) — REST API documentation
 - [MCP Tools Reference](../api/mcp-tools.md) — Detailed tool documentation
 - [Multi-Agent Workflows](../guides/multi-agent-workflow.md) — Advanced coordination

@@ -9,13 +9,15 @@ For user-facing documentation, see the `docs/` folder:
 - **[Installation Guide](docs/setup/installation.md)** — Full setup instructions
 - **[Getting Started](docs/guides/getting-started.md)** — Tutorial for new users
 - **[API Reference](docs/api/reference.md)** — REST API documentation
-- **[MCP Tools](docs/api/mcp-tools.md)** — All 113 MCP tools documented
+- **[MCP Tools](docs/api/mcp-tools.md)** — All 137 MCP tools documented
 - **Integration Guides:**
   - [Claude Code](docs/integrations/claude-code.md)
   - [OpenAI Agents](docs/integrations/openai.md)
   - [Cursor](docs/integrations/cursor.md)
 - **[Multi-Agent Workflows](docs/guides/multi-agent-workflow.md)** — Advanced coordination
 - **[Knowledge Notes](docs/guides/knowledge-notes.md)** — Contextual knowledge capture system
+- **[Authentication](docs/guides/authentication.md)** — JWT + Google OAuth setup
+- **[Chat & WebSocket](docs/guides/chat-websocket.md)** — Real-time chat and events
 
 ## Project Overview
 
@@ -25,15 +27,18 @@ For user-facing documentation, see the `docs/` folder:
 - Meilisearch for semantic search across code and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
-- MCP server for Claude Code integration (135 tools)
+- MCP server for Claude Code integration (137 tools)
 - File watcher for auto-syncing changes
+- Authentication system: Google OAuth2 + JWT, deny-by-default middleware
+- Chat WebSocket for real-time conversational AI (migrated from SSE)
+- Event system: live CRUD notifications via WebSocket
+- YAML configuration system with env var overrides (priority: env > yaml > default)
 
 ## Build Commands
 
 ```bash
 cargo build --release          # Build release binary
-cargo test                     # Run all tests (70 total)
-cargo test --test api_tests    # API tests only (29 tests)
+cargo test                     # Run all tests (467 total, mock backends)
 cargo clippy                   # Lint
 cargo fmt                      # Format
 ```
@@ -105,7 +110,7 @@ Or use command-line arguments:
 
 ### Available MCP Tools
 
-The MCP server exposes 135 tools organized by category:
+The MCP server exposes 137 tools organized by category:
 
 **Project Management (8 tools)**
 - `list_projects` - List all registered projects
@@ -253,18 +258,28 @@ docs/
 │   └── cursor.md            # Cursor IDE setup
 ├── api/
 │   ├── reference.md         # REST API documentation
-│   └── mcp-tools.md         # MCP tools reference (135 tools)
+│   └── mcp-tools.md         # MCP tools reference (137 tools)
 └── guides/
     ├── getting-started.md   # Tutorial for new users
     ├── multi-agent-workflow.md # Multi-agent coordination
-    └── knowledge-notes.md   # Knowledge Notes system guide
+    ├── knowledge-notes.md   # Knowledge Notes system guide
+    ├── authentication.md    # JWT + Google OAuth guide
+    └── chat-websocket.md    # Chat and events guide
 
 src/
+├── auth/
+│   └── ...              # Authentication: JWT (HS256), Google OAuth2, middleware, extractors
+├── config/
+│   └── ...              # YAML configuration system with env var overrides
+├── events/
+│   └── ...              # EventBus broadcast, EventEmitter trait, WebSocket notifications
 ├── api/
 │   ├── mod.rs           # API module exports
 │   ├── routes.rs        # Route definitions (axum)
 │   ├── handlers.rs      # Plan/Task/Decision handlers
-│   ├── chat_handlers.rs # Chat SSE streaming endpoints
+│   ├── auth_handlers.rs # Google OAuth + JWT endpoints
+│   ├── chat_handlers.rs # Chat WebSocket endpoints
+│   ├── ws_auth.rs       # WebSocket authentication helpers
 │   ├── code_handlers.rs # Code exploration endpoints
 │   ├── note_handlers.rs # Knowledge Notes endpoints
 │   └── workspace_handlers.rs # Workspace endpoints
@@ -276,15 +291,21 @@ src/
 ├── mcp/
 │   ├── mod.rs           # MCP module exports
 │   ├── protocol.rs      # JSON-RPC 2.0 types
-│   ├── tools.rs         # Tool definitions (135 tools)
+│   ├── tools.rs         # Tool definitions (137 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
 ├── neo4j/
 │   ├── client.rs        # Neo4j connection and queries
-│   └── models.rs        # Graph node types
+│   ├── models.rs        # Graph node types
+│   ├── traits.rs        # GraphStore trait (178 methods)
+│   ├── impl_graph_store.rs # Neo4j implementation
+│   └── mock.rs          # MockGraphStore for testing (#[cfg(test)])
 ├── meilisearch/
 │   ├── client.rs        # Meilisearch connection
-│   └── models.rs        # Search document types
+│   ├── models.rs        # Search document types
+│   ├── traits.rs        # SearchStore trait (24 methods)
+│   ├── impl_search_store.rs # Meilisearch implementation
+│   └── mock.rs          # MockSearchStore for testing (#[cfg(test)])
 ├── notes/
 │   ├── mod.rs           # Notes module exports
 │   ├── models.rs        # Note types (NoteType, NoteStatus, etc.)
@@ -304,6 +325,7 @@ src/
 │   └── watcher.rs       # File watcher for auto-sync
 ├── bin/
 │   └── mcp_server.rs    # MCP server binary
+├── test_helpers.rs      # mock_app_state(), test_project(), test_plan()...
 ├── lib.rs               # Library exports
 └── main.rs              # CLI entry point
 
@@ -507,26 +529,30 @@ GET /api/projects/{id}/milestones?status=open&limit=5
 GET /api/projects?search=orchestrator&limit=10
 ```
 
-### Chat (SSE Streaming)
+### Chat (WebSocket)
 
-Conversational interface with Claude Code CLI via Nexus SDK. Uses SSE for real-time streaming.
+Conversational interface with Claude Code CLI via Nexus SDK. Uses WebSocket for real-time streaming.
 
 **Session lifecycle:**
 - `POST /api/chat/sessions` — Create session + send first message → `{ session_id, stream_url }`
-- `GET /api/chat/sessions/{id}/stream` — Subscribe to SSE event stream (Accept: text/event-stream)
+- `GET /ws/chat/{session_id}` — WebSocket connection for real-time streaming
 - `POST /api/chat/sessions/{id}/messages` — Send follow-up message (auto-resumes inactive sessions)
 - `POST /api/chat/sessions/{id}/interrupt` — Interrupt current operation
 
 **Session management:**
 - `GET /api/chat/sessions` — List sessions (pagination, `project_slug` filter)
 - `GET /api/chat/sessions/{id}` — Get session details
+- `GET /api/chat/sessions/{id}/messages` — List message history
 - `DELETE /api/chat/sessions/{id}` — Delete session (closes active process)
 
-**SSE Event types:**
+**WebSocket Event types:**
 ```
 event: assistant_text    → {"content": "..."}
 event: thinking          → {"content": "..."}
+event: stream_delta      → {"content": "..."} (raw streaming text token)
+event: streaming_status  → {"is_streaming": true|false} (stream state change)
 event: tool_use          → {"id": "tu_1", "tool": "create_plan", "input": {...}}
+event: tool_use_input_resolved → {"id": "tu_1", "tool": "...", "input": {...}} (full input resolved)
 event: tool_result       → {"id": "tu_1", "result": {...}, "is_error": false}
 event: permission_request → {"id": "pr_1", "tool": "...", "input": {...}}
 event: input_request     → {"prompt": "...", "options": [...]}
@@ -534,11 +560,22 @@ event: result            → {"session_id": "...", "duration_ms": 5200, "cost_us
 event: error             → {"message": "..."}
 ```
 
-**MCP Chat Tools (4):**
+**MCP Chat Tools (5):**
 - `list_chat_sessions` — List sessions with project filter
 - `get_chat_session` — Get session details
+- `list_chat_messages` — List message history for a session
 - `delete_chat_session` — Delete a session
 - `chat_send_message` — Send message and wait for complete response (non-streaming)
+
+### Authentication
+- `GET /auth/google` — Get Google OAuth authorization URL
+- `POST /auth/google/callback` — Exchange auth code for JWT token
+- `GET /auth/me` — Get authenticated user profile (protected)
+- `POST /auth/refresh` — Refresh JWT token (protected)
+
+### Events WebSocket
+- `GET /ws/events` — CRUD event notifications (entity_types filter, project_id filter)
+- `GET /ws/chat/{session_id}` — Chat WebSocket (auth via first message)
 
 ### Sync & Watch
 - `POST /api/sync` - Manual sync
@@ -572,16 +609,8 @@ event: error             → {"message": "..."}
 ## Testing
 
 ```bash
-# Start server for API tests
-./target/release/orchestrator serve &
-
-# Run tests
-cargo test
-
-# Expected: 70 tests passing
-# - 29 API tests
-# - 8 integration tests
-# - 33 parser tests
+# All tests use mock backends (no Docker required for unit tests)
+cargo test                     # 467 tests passing
 ```
 
 ## Neo4j Graph Relationships
