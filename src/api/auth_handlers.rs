@@ -11,10 +11,7 @@ use crate::auth::extractor::AuthUser;
 use crate::auth::google::GoogleOAuthClient;
 use crate::auth::jwt::encode_jwt;
 use crate::neo4j::models::UserNode;
-use axum::{
-    extract::State,
-    Json,
-};
+use axum::{extract::State, Json};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -78,9 +75,10 @@ impl From<UserNode> for UserResponse {
 pub async fn google_login(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<AuthUrlResponse>, AppError> {
-    let auth_config = state.auth_config.as_ref().ok_or_else(|| {
-        AppError::Forbidden("Authentication not configured".to_string())
-    })?;
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
 
     let client = GoogleOAuthClient::new(auth_config);
     let auth_url = client.auth_url();
@@ -97,9 +95,10 @@ pub async fn google_callback(
     State(state): State<OrchestratorState>,
     Json(req): Json<GoogleCallbackRequest>,
 ) -> Result<Json<AuthTokenResponse>, AppError> {
-    let auth_config = state.auth_config.as_ref().ok_or_else(|| {
-        AppError::Forbidden("Authentication not configured".to_string())
-    })?;
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
 
     // 1. Exchange code for Google user info
     let client = GoogleOAuthClient::new(auth_config);
@@ -130,11 +129,7 @@ pub async fn google_callback(
         last_login_at: now,
     };
 
-    let user = state
-        .orchestrator
-        .neo4j()
-        .upsert_user(&user_node)
-        .await?;
+    let user = state.orchestrator.neo4j().upsert_user(&user_node).await?;
 
     // 4. Generate JWT
     let token = encode_jwt(
@@ -180,9 +175,10 @@ pub async fn refresh_token(
     State(state): State<OrchestratorState>,
     user: AuthUser,
 ) -> Result<Json<RefreshTokenResponse>, AppError> {
-    let auth_config = state.auth_config.as_ref().ok_or_else(|| {
-        AppError::Forbidden("Authentication not configured".to_string())
-    })?;
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
 
     let token = encode_jwt(
         user.user_id,
@@ -235,8 +231,11 @@ mod tests {
     async fn make_server_state(auth_config: Option<AuthConfig>) -> OrchestratorState {
         let state = mock_app_state();
         let event_bus = Arc::new(EventBus::default());
-        let orchestrator =
-            Arc::new(Orchestrator::with_event_bus(state, event_bus.clone()).await.unwrap());
+        let orchestrator = Arc::new(
+            Orchestrator::with_event_bus(state, event_bus.clone())
+                .await
+                .unwrap(),
+        );
         let watcher = FileWatcher::new(orchestrator.clone());
 
         Arc::new(crate::api::handlers::ServerState {
@@ -253,8 +252,7 @@ mod tests {
         let state = make_server_state(auth_config).await;
 
         // Public auth routes (no middleware)
-        let public = Router::new()
-            .route("/auth/google", get(google_login));
+        let public = Router::new().route("/auth/google", get(google_login));
 
         // Protected auth routes (with middleware)
         let protected = Router::new()
@@ -262,9 +260,7 @@ mod tests {
             .route("/auth/refresh", post(refresh_token))
             .layer(from_fn_with_state(state.clone(), require_auth));
 
-        public
-            .merge(protected)
-            .with_state(state)
+        public.merge(protected).with_state(state)
     }
 
     #[tokio::test]
@@ -337,15 +333,18 @@ mod tests {
             created_at: now,
             last_login_at: now,
         };
-        state.orchestrator.neo4j().upsert_user(&user_node).await.unwrap();
-
-        // Generate a valid token for this user
-        let token = encode_jwt(user_id, "alice@ffs.holdings", "Alice", TEST_SECRET, 3600)
+        state
+            .orchestrator
+            .neo4j()
+            .upsert_user(&user_node)
+            .await
             .unwrap();
 
+        // Generate a valid token for this user
+        let token = encode_jwt(user_id, "alice@ffs.holdings", "Alice", TEST_SECRET, 3600).unwrap();
+
         // Build app with same state
-        let public = Router::new()
-            .route("/auth/google", get(google_login));
+        let public = Router::new().route("/auth/google", get(google_login));
         let protected = Router::new()
             .route("/auth/me", get(get_me))
             .route("/auth/refresh", post(refresh_token))
@@ -386,11 +385,15 @@ mod tests {
             created_at: now,
             last_login_at: now,
         };
-        state.orchestrator.neo4j().upsert_user(&user_node).await.unwrap();
+        state
+            .orchestrator
+            .neo4j()
+            .upsert_user(&user_node)
+            .await
+            .unwrap();
 
         // Generate initial token
-        let token = encode_jwt(user_id, "bob@ffs.holdings", "Bob", TEST_SECRET, 3600)
-            .unwrap();
+        let token = encode_jwt(user_id, "bob@ffs.holdings", "Bob", TEST_SECRET, 3600).unwrap();
 
         // Build app
         let protected = Router::new()

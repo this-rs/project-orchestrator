@@ -115,10 +115,7 @@ async fn run_server(config: Config) -> Result<()> {
             if let Some(ref url) = auth.frontend_url {
                 tracing::info!("  Frontend URL (CORS): {}", url);
             }
-            tracing::info!(
-                "  JWT expiry: {}h",
-                auth.jwt_expiry_secs / 3600
-            );
+            tracing::info!("  JWT expiry: {}h", auth.jwt_expiry_secs / 3600);
         }
         None => {
             tracing::warn!(

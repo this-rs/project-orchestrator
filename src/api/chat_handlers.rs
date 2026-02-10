@@ -424,10 +424,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_sessions_empty() {
         let app = test_app().await;
-        let resp = app
-            .oneshot(auth_get("/api/chat/sessions"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -444,10 +441,7 @@ mod tests {
         let s2 = test_chat_session(Some("proj-b"));
         let app = test_app_with_sessions(&[s1, s2]).await;
 
-        let resp = app
-            .oneshot(auth_get("/api/chat/sessions"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -561,7 +555,10 @@ mod tests {
         let app = test_app().await;
 
         let resp = app
-            .oneshot(auth_post("/api/chat/sessions", r#"{"message":"Hello","cwd":"/tmp"}"#))
+            .oneshot(auth_post(
+                "/api/chat/sessions",
+                r#"{"message":"Hello","cwd":"/tmp"}"#,
+            ))
             .await
             .unwrap();
 
@@ -603,7 +600,10 @@ mod tests {
         let fake_id = Uuid::new_v4();
 
         let resp = app
-            .oneshot(auth_get(&format!("/api/chat/sessions/{}/messages", fake_id)))
+            .oneshot(auth_get(&format!(
+                "/api/chat/sessions/{}/messages",
+                fake_id
+            )))
             .await
             .unwrap();
 
@@ -677,10 +677,7 @@ mod tests {
         session.conversation_id = Some("conv-xyz".into());
         let app = test_app_with_sessions(&[session]).await;
 
-        let resp = app
-            .oneshot(auth_get("/api/chat/sessions"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

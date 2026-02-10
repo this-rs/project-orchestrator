@@ -815,7 +815,9 @@ mod tests {
     async fn test_search_code_with_language_filter() {
         let app = test_app_with_code().await;
         let resp = app
-            .oneshot(auth_get("/api/code/search?query=main&limit=10&language=rust"))
+            .oneshot(auth_get(
+                "/api/code/search?query=main&limit=10&language=rust",
+            ))
             .await
             .unwrap();
 
@@ -833,7 +835,9 @@ mod tests {
     async fn test_search_code_language_filter_no_match() {
         let app = test_app_with_code().await;
         let resp = app
-            .oneshot(auth_get("/api/code/search?query=main&limit=10&language=python"))
+            .oneshot(auth_get(
+                "/api/code/search?query=main&limit=10&language=python",
+            ))
             .await
             .unwrap();
 

@@ -160,9 +160,7 @@ mod tests {
 
         assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth"));
         assert!(url.contains("client_id=123456.apps.googleusercontent.com"));
-        assert!(
-            url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fauth%2Fcallback")
-        );
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fauth%2Fcallback"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("scope=openid"));
         assert!(url.contains("email"));
@@ -177,10 +175,7 @@ mod tests {
 
         assert_eq!(client.client_id, "123456.apps.googleusercontent.com");
         assert_eq!(client.client_secret, "secret123");
-        assert_eq!(
-            client.redirect_uri,
-            "http://localhost:3000/auth/callback"
-        );
+        assert_eq!(client.redirect_uri, "http://localhost:3000/auth/callback");
     }
 
     #[test]

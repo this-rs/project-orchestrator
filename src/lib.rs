@@ -190,11 +190,7 @@ impl Config {
                     config
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse {}: {}. Using defaults.",
-                        path.display(),
-                        e
-                    );
+                    tracing::warn!("Failed to parse {}: {}. Using defaults.", path.display(), e);
                     YamlConfig::default()
                 }
             },

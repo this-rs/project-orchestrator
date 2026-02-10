@@ -26,8 +26,7 @@ pub fn create_router(state: OrchestratorState) -> Router {
     let cors = build_cors(&state);
 
     let public = public_routes();
-    let protected = protected_routes()
-        .layer(from_fn_with_state(state.clone(), require_auth));
+    let protected = protected_routes().layer(from_fn_with_state(state.clone(), require_auth));
 
     public
         .merge(protected)
@@ -38,9 +37,7 @@ pub fn create_router(state: OrchestratorState) -> Router {
 
 /// Build CORS layer — restricted to `frontend_url` if configured, otherwise `Any`.
 fn build_cors(state: &OrchestratorState) -> CorsLayer {
-    let cors = CorsLayer::new()
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = CorsLayer::new().allow_methods(Any).allow_headers(Any);
 
     if let Some(ref auth_config) = state.auth_config {
         if let Some(ref frontend_url) = auth_config.frontend_url {

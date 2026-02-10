@@ -3716,7 +3716,10 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().google_id, "gid-004");
 
-        let not_found = store.get_user_by_email("nobody@ffs.holdings").await.unwrap();
+        let not_found = store
+            .get_user_by_email("nobody@ffs.holdings")
+            .await
+            .unwrap();
         assert!(not_found.is_none());
     }
 
@@ -3730,7 +3733,10 @@ mod tests {
         let not_found = store.get_user_by_google_id("nonexistent").await.unwrap();
         assert!(not_found.is_none());
 
-        let not_found = store.get_user_by_email("nonexistent@ffs.holdings").await.unwrap();
+        let not_found = store
+            .get_user_by_email("nonexistent@ffs.holdings")
+            .await
+            .unwrap();
         assert!(not_found.is_none());
     }
 
@@ -3743,9 +3749,18 @@ mod tests {
         assert!(users.is_empty());
 
         // Add 3 users
-        store.upsert_user(&make_user("gid-a", "a@ffs.holdings")).await.unwrap();
-        store.upsert_user(&make_user("gid-b", "b@ffs.holdings")).await.unwrap();
-        store.upsert_user(&make_user("gid-c", "c@ffs.holdings")).await.unwrap();
+        store
+            .upsert_user(&make_user("gid-a", "a@ffs.holdings"))
+            .await
+            .unwrap();
+        store
+            .upsert_user(&make_user("gid-b", "b@ffs.holdings"))
+            .await
+            .unwrap();
+        store
+            .upsert_user(&make_user("gid-c", "c@ffs.holdings"))
+            .await
+            .unwrap();
 
         let users = store.list_users().await.unwrap();
         assert_eq!(users.len(), 3);

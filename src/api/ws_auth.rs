@@ -70,8 +70,11 @@ pub async fn ws_authenticate(
             return Err(format!("WebSocket error: {}", e));
         }
         Err(_) => {
-            send_auth_error(socket, "Authentication timeout — no auth message received within 10s")
-                .await;
+            send_auth_error(
+                socket,
+                "Authentication timeout — no auth message received within 10s",
+            )
+            .await;
             return Err("Auth timeout".to_string());
         }
     };
@@ -80,11 +83,7 @@ pub async fn ws_authenticate(
     let auth_msg: WsAuthMessage = match serde_json::from_str(&first_msg) {
         Ok(msg) => msg,
         Err(e) => {
-            send_auth_error(
-                socket,
-                &format!("Invalid auth message format: {}", e),
-            )
-            .await;
+            send_auth_error(socket, &format!("Invalid auth message format: {}", e)).await;
             return Err(format!("Invalid format: {}", e));
         }
     };
@@ -140,9 +139,7 @@ pub async fn ws_authenticate(
             "name": claims.name,
         }
     });
-    let _ = socket
-        .send(Message::Text(auth_ok.to_string().into()))
-        .await;
+    let _ = socket.send(Message::Text(auth_ok.to_string().into())).await;
 
     debug!(email = %claims.email, "WebSocket authenticated");
     Ok(claims)
@@ -154,9 +151,7 @@ async fn send_auth_error(socket: &mut WebSocket, message: &str) {
         "type": "auth_error",
         "message": message,
     });
-    let _ = socket
-        .send(Message::Text(error.to_string().into()))
-        .await;
+    let _ = socket.send(Message::Text(error.to_string().into())).await;
     let _ = socket.send(Message::Close(None)).await;
 }
 
@@ -207,8 +202,14 @@ mod tests {
     fn test_valid_auth_message_construction() {
         let user_id = Uuid::new_v4();
         let config = test_auth_config();
-        let token =
-            encode_jwt(user_id, "alice@ffs.holdings", "Alice", &config.jwt_secret, 3600).unwrap();
+        let token = encode_jwt(
+            user_id,
+            "alice@ffs.holdings",
+            "Alice",
+            &config.jwt_secret,
+            3600,
+        )
+        .unwrap();
         let msg = auth_message(&token);
         let parsed: WsAuthMessage = serde_json::from_str(&msg).unwrap();
         assert_eq!(parsed.msg_type, "auth");

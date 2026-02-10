@@ -116,8 +116,14 @@ mod tests {
     #[test]
     fn test_invalid_secret_rejected() {
         let user_id = Uuid::new_v4();
-        let token = encode_jwt(user_id, "charlie@ffs.holdings", "Charlie", TEST_SECRET, 3600)
-            .expect("encode should succeed");
+        let token = encode_jwt(
+            user_id,
+            "charlie@ffs.holdings",
+            "Charlie",
+            TEST_SECRET,
+            3600,
+        )
+        .expect("encode should succeed");
 
         let result = decode_jwt(&token, "wrong-secret-that-is-also-32chars!");
         assert!(result.is_err(), "wrong secret should be rejected");

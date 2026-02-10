@@ -98,8 +98,11 @@ mod tests {
     async fn make_server_state(auth_config: Option<AuthConfig>) -> OrchestratorState {
         let state = mock_app_state();
         let event_bus = Arc::new(EventBus::default());
-        let orchestrator =
-            Arc::new(Orchestrator::with_event_bus(state, event_bus.clone()).await.unwrap());
+        let orchestrator = Arc::new(
+            Orchestrator::with_event_bus(state, event_bus.clone())
+                .await
+                .unwrap(),
+        );
         let watcher = FileWatcher::new(orchestrator.clone());
 
         Arc::new(crate::api::handlers::ServerState {
@@ -221,8 +224,7 @@ mod tests {
         let app = test_app(Some(config)).await;
 
         let user_id = uuid::Uuid::new_v4();
-        let token =
-            encode_jwt(user_id, "alice@gmail.com", "Alice", TEST_SECRET, 3600).unwrap();
+        let token = encode_jwt(user_id, "alice@gmail.com", "Alice", TEST_SECRET, 3600).unwrap();
 
         let req = HttpRequest::builder()
             .uri("/test")
@@ -242,8 +244,7 @@ mod tests {
         let app = test_app(Some(config)).await;
 
         let user_id = uuid::Uuid::new_v4();
-        let token =
-            encode_jwt(user_id, "alice@ffs.holdings", "Alice", TEST_SECRET, 3600).unwrap();
+        let token = encode_jwt(user_id, "alice@ffs.holdings", "Alice", TEST_SECRET, 3600).unwrap();
 
         let req = HttpRequest::builder()
             .uri("/test")
