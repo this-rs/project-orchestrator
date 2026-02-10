@@ -1,33 +1,40 @@
 //! Auth middleware for Axum routes.
 //!
 //! Validates JWT Bearer tokens and injects Claims into request extensions.
-//! Implements deny-by-default: if `auth_config` is None, all requests are rejected.
+//! In no-auth mode (auth_config is None), anonymous Claims are injected
+//! and requests pass through freely (open access).
 
 use crate::api::handlers::{AppError, OrchestratorState};
-use crate::auth::jwt::decode_jwt;
+use crate::auth::jwt::{decode_jwt, Claims};
 use axum::{
     extract::{Request, State},
     middleware::Next,
     response::Response,
 };
 
-/// Middleware that requires a valid JWT Bearer token.
+/// Middleware that handles authentication adaptively.
 ///
 /// # Behavior
-/// 1. If `auth_config` is `None` → 403 Forbidden (deny-by-default)
-/// 2. Extract `Authorization: Bearer <token>` header → 401 if missing
-/// 3. Validate JWT with the configured secret → 401 if invalid/expired
-/// 4. Check `allowed_email_domain` if configured → 403 if domain mismatch
-/// 5. Inject `Claims` into request extensions for downstream handlers
+/// 1. If `auth_config` is `None` → **open access** (no-auth mode):
+///    inject anonymous Claims and pass through.
+/// 2. If `auth_config` is `Some(...)` → **JWT required**:
+///    a. Extract `Authorization: Bearer <token>` header → 401 if missing
+///    b. Validate JWT with the configured secret → 401 if invalid/expired
+///    c. Check `allowed_email_domain` if configured → 403 if domain mismatch
+///    d. Inject `Claims` into request extensions for downstream handlers
 pub async fn require_auth(
     State(state): State<OrchestratorState>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    // 1. Deny-by-default if no auth config
-    let auth_config = state.auth_config.as_ref().ok_or_else(|| {
-        AppError::Forbidden("Authentication not configured — access denied".to_string())
-    })?;
+    // 1. No-auth mode: inject anonymous claims and pass through
+    let auth_config = match state.auth_config.as_ref() {
+        Some(config) => config,
+        None => {
+            req.extensions_mut().insert(Claims::anonymous());
+            return Ok(next.run(req).await);
+        }
+    };
 
     // 2. Extract Bearer token from Authorization header
     let auth_header = req
@@ -85,13 +92,16 @@ mod tests {
 
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
-            google_client_id: "test".to_string(),
-            google_client_secret: "test".to_string(),
-            google_redirect_uri: "http://localhost/callback".to_string(),
             jwt_secret: TEST_SECRET.to_string(),
             jwt_expiry_secs: 3600,
             allowed_email_domain: None,
             frontend_url: None,
+            allow_registration: false,
+            root_account: None,
+            oidc: None,
+            google_client_id: Some("test".to_string()),
+            google_client_secret: Some("test".to_string()),
+            google_redirect_uri: Some("http://localhost/callback".to_string()),
         }
     }
 
@@ -130,7 +140,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_auth_config_returns_403() {
+    async fn test_no_auth_config_allows_access() {
+        // No-auth mode: requests pass through freely (open access)
         let app = test_app(None).await;
 
         let req = HttpRequest::builder()
@@ -139,7 +150,57 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_config_injects_anonymous_claims() {
+        // Verify that anonymous Claims are injected in no-auth mode
+        use crate::auth::jwt::ANONYMOUS_USER_ID;
+
+        let state = make_server_state(None).await;
+
+        // Handler that checks the injected claims
+        async fn check_claims(
+            axum::Extension(claims): axum::Extension<Claims>,
+        ) -> String {
+            format!("{}|{}|{}", claims.sub, claims.email, claims.name)
+        }
+
+        let app = Router::new()
+            .route("/test", get(check_claims))
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+
+        let req = HttpRequest::builder()
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains(&ANONYMOUS_USER_ID.to_string()));
+        assert!(body_str.contains("anonymous@local"));
+        assert!(body_str.contains("Anonymous"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_config_still_requires_jwt() {
+        // With auth_config present, requests without a token are rejected
+        let app = test_app(Some(test_auth_config())).await;
+
+        let req = HttpRequest::builder()
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

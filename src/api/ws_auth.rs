@@ -36,21 +36,33 @@ struct WsAuthMessage {
 /// before returning.
 ///
 /// # Behavior
-/// - If `auth_config` is `None` → immediate reject (deny-by-default)
-/// - Waits up to `AUTH_TIMEOUT_SECS` for the first message
-/// - Expects `{ "type": "auth", "token": "<jwt>" }`
-/// - Validates the JWT and optionally checks the email domain
-/// - On success, sends `{ "type": "auth_ok", "user": {...} }`
+/// 1. If `auth_config` is `None` → **open access** (no-auth mode):
+///    send `auth_ok` with anonymous user and return anonymous Claims immediately.
+/// 2. If `auth_config` is `Some(...)` → **JWT required**:
+///    a. Wait up to `AUTH_TIMEOUT_SECS` for the first message
+///    b. Expect `{ "type": "auth", "token": "<jwt>" }`
+///    c. Validate the JWT and optionally check the email domain
+///    d. On success, send `{ "type": "auth_ok", "user": {...} }`
 pub async fn ws_authenticate(
     socket: &mut WebSocket,
     auth_config: &Option<AuthConfig>,
 ) -> Result<Claims, String> {
-    // 1. Deny-by-default if no auth config
+    // 1. No-auth mode: send auth_ok with anonymous user and return immediately
     let config = match auth_config {
         Some(c) => c,
         None => {
-            send_auth_error(socket, "Authentication not configured — access denied").await;
-            return Err("No auth config".to_string());
+            let claims = Claims::anonymous();
+            let auth_ok = serde_json::json!({
+                "type": "auth_ok",
+                "user": {
+                    "id": claims.sub,
+                    "email": claims.email,
+                    "name": claims.name,
+                }
+            });
+            let _ = socket.send(Message::Text(auth_ok.to_string().into())).await;
+            debug!("WebSocket authenticated (anonymous — no-auth mode)");
+            return Ok(claims);
         }
     };
 

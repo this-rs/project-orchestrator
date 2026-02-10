@@ -9,6 +9,10 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Deterministic UUID for the anonymous user (no-auth mode).
+/// Generated from Uuid::nil() — always `00000000-0000-0000-0000-000000000000`.
+pub const ANONYMOUS_USER_ID: Uuid = Uuid::nil();
+
 /// JWT claims payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -22,6 +26,23 @@ pub struct Claims {
     pub iat: i64,
     /// Expiration (Unix timestamp)
     pub exp: i64,
+}
+
+impl Claims {
+    /// Create anonymous claims for no-auth mode.
+    ///
+    /// Uses a deterministic nil UUID so the anonymous user is always
+    /// the same across requests.
+    pub fn anonymous() -> Self {
+        let now = chrono::Utc::now().timestamp();
+        Self {
+            sub: ANONYMOUS_USER_ID.to_string(),
+            email: "anonymous@local".to_string(),
+            name: "Anonymous".to_string(),
+            iat: now,
+            exp: now + 86400 * 365 * 100, // effectively never expires
+        }
+    }
 }
 
 /// Encode a JWT token for the given user.

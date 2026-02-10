@@ -973,17 +973,39 @@ pub trait GraphStore: Send + Sync {
     // User / Auth operations
     // ========================================================================
 
-    /// Upsert a user (create or update by google_id). Returns the resulting UserNode.
+    /// Upsert a user (create or update). Returns the resulting UserNode.
+    ///
+    /// For OIDC users: MERGE on (auth_provider + external_id).
+    /// For password users: MERGE on (auth_provider + email).
     async fn upsert_user(&self, user: &UserNode) -> Result<UserNode>;
 
     /// Get a user by internal ID
     async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>>;
 
-    /// Get a user by Google ID (unique)
-    async fn get_user_by_google_id(&self, google_id: &str) -> Result<Option<UserNode>>;
+    /// Get a user by provider and external ID (for OIDC lookups)
+    async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<UserNode>>;
 
-    /// Get a user by email
+    /// Get a user by email and auth provider
+    async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> Result<Option<UserNode>>;
+
+    /// Get a user by email (any provider)
     async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>>;
+
+    /// Create a password-authenticated user
+    async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<UserNode>;
 
     /// List all users
     async fn list_users(&self) -> Result<Vec<UserNode>>;

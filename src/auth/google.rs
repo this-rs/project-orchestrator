@@ -48,11 +48,23 @@ const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo
 
 impl GoogleOAuthClient {
     /// Create a new Google OAuth client from the auth configuration.
+    ///
+    /// Uses the legacy `google_*` fields from AuthConfig.
+    /// Prefer using `OidcClient` with `AuthConfig::effective_oidc()` for new code.
     pub fn new(config: &AuthConfig) -> Self {
         Self {
-            client_id: config.google_client_id.clone(),
-            client_secret: config.google_client_secret.clone(),
-            redirect_uri: config.google_redirect_uri.clone(),
+            client_id: config
+                .google_client_id
+                .clone()
+                .unwrap_or_default(),
+            client_secret: config
+                .google_client_secret
+                .clone()
+                .unwrap_or_default(),
+            redirect_uri: config
+                .google_redirect_uri
+                .clone()
+                .unwrap_or_default(),
             http_client: reqwest::Client::new(),
         }
     }
@@ -143,13 +155,16 @@ mod tests {
 
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
-            google_client_id: "123456.apps.googleusercontent.com".to_string(),
-            google_client_secret: "secret123".to_string(),
-            google_redirect_uri: "http://localhost:3000/auth/callback".to_string(),
             jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
             jwt_expiry_secs: 28800,
             allowed_email_domain: Some("ffs.holdings".to_string()),
             frontend_url: Some("http://localhost:3000".to_string()),
+            allow_registration: false,
+            root_account: None,
+            oidc: None,
+            google_client_id: Some("123456.apps.googleusercontent.com".to_string()),
+            google_client_secret: Some("secret123".to_string()),
+            google_redirect_uri: Some("http://localhost:3000/auth/callback".to_string()),
         }
     }
 

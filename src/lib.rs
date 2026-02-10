@@ -107,12 +107,23 @@ pub struct ChatYamlConfig {
     pub prompt_builder_model: Option<String>,
 }
 
-/// Authentication configuration — Google OAuth + JWT
+/// Authentication configuration — flexible multi-provider auth.
+///
+/// Supports three modes depending on which sub-sections are present:
+/// - **No-auth**: No `auth` section in YAML → `auth_config = None` → open access
+/// - **Password**: `root_account` present → email/password login (root from config, others from Neo4j)
+/// - **OIDC**: `oidc` present → generic OpenID Connect (Google, Microsoft, Okta, Keycloak…)
+///
+/// Both `root_account` and `oidc` can coexist for maximum flexibility.
+///
+/// ### Backward compatibility
+/// The legacy Google OAuth fields (`google_client_id`, `google_client_secret`,
+/// `google_redirect_uri`) are still accepted. When present, they are automatically
+/// mapped to an equivalent `OidcConfig` via [`AuthConfig::effective_oidc()`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
-    pub google_client_id: String,
-    pub google_client_secret: String,
-    pub google_redirect_uri: String,
+    // ── Common fields ──────────────────────────────────────────────────
+    /// JWT signing secret (HS256, minimum 32 characters)
     pub jwt_secret: String,
     /// JWT token lifetime in seconds (default: 28800 = 8h)
     #[serde(default = "default_jwt_expiry")]
@@ -121,10 +132,133 @@ pub struct AuthConfig {
     pub allowed_email_domain: Option<String>,
     /// Frontend URL for CORS and redirects (e.g. "http://localhost:3000")
     pub frontend_url: Option<String>,
+    /// Allow new user registration via POST /auth/register (default: false)
+    #[serde(default)]
+    pub allow_registration: bool,
+
+    // ── Password auth (root account from config) ───────────────────────
+    /// Root account defined in config.yaml — always available, no DB needed.
+    pub root_account: Option<RootAccountConfig>,
+
+    // ── OIDC auth (generic OpenID Connect) ─────────────────────────────
+    /// Generic OIDC provider configuration.
+    pub oidc: Option<OidcConfig>,
+
+    // ── Legacy Google OAuth fields (backward compat) ───────────────────
+    /// Deprecated: use `oidc.client_id` instead.
+    #[serde(default)]
+    pub google_client_id: Option<String>,
+    /// Deprecated: use `oidc.client_secret` instead.
+    #[serde(default)]
+    pub google_client_secret: Option<String>,
+    /// Deprecated: use `oidc.redirect_uri` instead.
+    #[serde(default)]
+    pub google_redirect_uri: Option<String>,
+}
+
+/// Root account configuration — defined in config.yaml, verified in-memory.
+///
+/// The `password_hash` field can contain either:
+/// - A bcrypt hash (starts with `$2b$` or `$2a$`) → used as-is
+/// - A plaintext password → hashed with bcrypt at startup (with a warning log)
+#[derive(Debug, Clone, Deserialize)]
+pub struct RootAccountConfig {
+    /// Root account email (used as login identifier)
+    pub email: String,
+    /// Root account display name
+    pub name: String,
+    /// Bcrypt hash or plaintext password (hashed at startup if plaintext)
+    pub password_hash: String,
+}
+
+/// OIDC provider configuration — generic OpenID Connect.
+///
+/// Works with any OIDC-compliant provider: Google, Microsoft, Okta, Keycloak, etc.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcConfig {
+    /// OIDC discovery URL (e.g. "https://accounts.google.com/.well-known/openid-configuration").
+    /// If provided, `auth_endpoint` and `token_endpoint` are fetched automatically.
+    pub discovery_url: Option<String>,
+    /// Authorization endpoint (required if no discovery_url)
+    pub auth_endpoint: Option<String>,
+    /// Token endpoint (required if no discovery_url)
+    pub token_endpoint: Option<String>,
+    /// Userinfo endpoint (optional, fetched from discovery if available)
+    pub userinfo_endpoint: Option<String>,
+    /// OAuth2 client ID
+    pub client_id: String,
+    /// OAuth2 client secret
+    pub client_secret: String,
+    /// Redirect URI after auth (e.g. "http://localhost:3000/auth/callback")
+    pub redirect_uri: String,
+    /// Human-readable provider name shown in the UI (e.g. "Google", "Okta")
+    #[serde(default = "default_provider_name")]
+    pub provider_name: String,
+    /// OAuth2 scopes (default: "openid email profile")
+    #[serde(default = "default_scopes")]
+    pub scopes: String,
 }
 
 fn default_jwt_expiry() -> u64 {
     28800 // 8 hours
+}
+
+fn default_provider_name() -> String {
+    "SSO".to_string()
+}
+
+fn default_scopes() -> String {
+    "openid email profile".to_string()
+}
+
+// Google OIDC well-known endpoints (used for legacy config mapping)
+const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_ENDPOINT: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
+
+impl AuthConfig {
+    /// Returns the effective OIDC config, preferring the explicit `oidc` section
+    /// and falling back to legacy `google_*` fields for backward compatibility.
+    pub fn effective_oidc(&self) -> Option<OidcConfig> {
+        // Prefer explicit oidc section
+        if self.oidc.is_some() {
+            return self.oidc.clone();
+        }
+
+        // Fall back to legacy Google fields
+        match (
+            &self.google_client_id,
+            &self.google_client_secret,
+            &self.google_redirect_uri,
+        ) {
+            (Some(client_id), Some(client_secret), Some(redirect_uri))
+                if !client_id.is_empty() =>
+            {
+                Some(OidcConfig {
+                    discovery_url: None,
+                    auth_endpoint: Some(GOOGLE_AUTH_ENDPOINT.to_string()),
+                    token_endpoint: Some(GOOGLE_TOKEN_ENDPOINT.to_string()),
+                    userinfo_endpoint: Some(GOOGLE_USERINFO_ENDPOINT.to_string()),
+                    client_id: client_id.clone(),
+                    client_secret: client_secret.clone(),
+                    redirect_uri: redirect_uri.clone(),
+                    provider_name: "Google".to_string(),
+                    scopes: "openid email profile".to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true if password authentication is available (root account configured).
+    pub fn has_password_auth(&self) -> bool {
+        self.root_account.is_some()
+    }
+
+    /// Returns true if OIDC authentication is available (explicit or legacy Google).
+    pub fn has_oidc(&self) -> bool {
+        self.effective_oidc().is_some()
+    }
 }
 
 // ============================================================================
@@ -284,10 +418,18 @@ auth:
         assert_eq!(config.meilisearch.key, "test-key");
 
         let auth = config.auth.unwrap();
-        assert_eq!(auth.google_client_id, "123.apps.googleusercontent.com");
+        // Legacy Google fields are now Option<String>
+        assert_eq!(
+            auth.google_client_id,
+            Some("123.apps.googleusercontent.com".into())
+        );
         assert_eq!(auth.jwt_expiry_secs, 3600);
         assert_eq!(auth.allowed_email_domain, Some("ffs.holdings".into()));
         assert_eq!(auth.frontend_url, Some("http://localhost:3000".into()));
+        // Backward compat: effective_oidc() builds from legacy fields
+        let oidc = auth.effective_oidc().expect("should have effective OIDC");
+        assert_eq!(oidc.client_id, "123.apps.googleusercontent.com");
+        assert_eq!(oidc.provider_name, "Google");
     }
 
     #[test]
@@ -392,5 +534,160 @@ meilisearch:
         assert_eq!(config.server_port, 8080);
         assert_eq!(config.neo4j_uri, "bolt://localhost:7687");
         assert!(config.auth_config.is_none());
+    }
+
+    // ========================================================================
+    // New auth config format tests
+    // ========================================================================
+
+    #[test]
+    fn test_new_auth_format_root_account_only() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  root_account:
+    email: "admin@example.com"
+    name: "Admin"
+    password_hash: "$2b$12$LJ3m4ys1fFNwNkfMjkLx3u"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(auth.has_password_auth());
+        assert!(!auth.has_oidc());
+        assert!(!auth.allow_registration);
+
+        let root = auth.root_account.unwrap();
+        assert_eq!(root.email, "admin@example.com");
+        assert_eq!(root.name, "Admin");
+        assert!(root.password_hash.starts_with("$2b$"));
+    }
+
+    #[test]
+    fn test_new_auth_format_oidc_only() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  oidc:
+    discovery_url: "https://accounts.google.com/.well-known/openid-configuration"
+    client_id: "my-client-id"
+    client_secret: "my-secret"
+    redirect_uri: "http://localhost:3000/auth/callback"
+    provider_name: "Google"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(!auth.has_password_auth());
+        assert!(auth.has_oidc());
+
+        let oidc = auth.effective_oidc().unwrap();
+        assert_eq!(oidc.client_id, "my-client-id");
+        assert_eq!(oidc.provider_name, "Google");
+        assert_eq!(oidc.scopes, "openid email profile"); // default
+    }
+
+    #[test]
+    fn test_new_auth_format_both_providers() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  allow_registration: true
+  allowed_email_domain: "example.com"
+  frontend_url: "http://localhost:3000"
+  root_account:
+    email: "admin@example.com"
+    name: "Admin"
+    password_hash: "plaintext-will-be-hashed"
+  oidc:
+    client_id: "oidc-client"
+    client_secret: "oidc-secret"
+    redirect_uri: "http://localhost:3000/auth/callback"
+    provider_name: "Okta"
+    auth_endpoint: "https://okta.example.com/authorize"
+    token_endpoint: "https://okta.example.com/token"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(auth.has_password_auth());
+        assert!(auth.has_oidc());
+        assert!(auth.allow_registration);
+        assert_eq!(auth.allowed_email_domain, Some("example.com".into()));
+        assert_eq!(auth.frontend_url, Some("http://localhost:3000".into()));
+
+        let oidc = auth.effective_oidc().unwrap();
+        assert_eq!(oidc.provider_name, "Okta");
+        assert_eq!(
+            oidc.auth_endpoint,
+            Some("https://okta.example.com/authorize".into())
+        );
+    }
+
+    #[test]
+    fn test_retro_compat_google_format() {
+        // Legacy format: google_* fields without oidc section
+        let yaml = r#"
+auth:
+  google_client_id: "legacy-id.apps.googleusercontent.com"
+  google_client_secret: "legacy-secret"
+  google_redirect_uri: "http://localhost:3000/auth/callback"
+  jwt_secret: "super-secret-key-min-32-characters!"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+
+        // No explicit oidc section
+        assert!(auth.oidc.is_none());
+        // But effective_oidc() should build from legacy fields
+        assert!(auth.has_oidc());
+        let oidc = auth.effective_oidc().unwrap();
+        assert_eq!(oidc.client_id, "legacy-id.apps.googleusercontent.com");
+        assert_eq!(oidc.client_secret, "legacy-secret");
+        assert_eq!(oidc.provider_name, "Google");
+        assert!(oidc.auth_endpoint.is_some()); // Google hardcoded URLs
+    }
+
+    #[test]
+    fn test_oidc_takes_priority_over_legacy_google() {
+        // When both oidc and google_* are present, oidc wins
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  google_client_id: "legacy-id"
+  google_client_secret: "legacy-secret"
+  google_redirect_uri: "http://localhost/callback"
+  oidc:
+    client_id: "explicit-oidc-id"
+    client_secret: "explicit-oidc-secret"
+    redirect_uri: "http://localhost:3000/auth/callback"
+    provider_name: "Microsoft"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        let oidc = auth.effective_oidc().unwrap();
+        // Explicit oidc section takes priority
+        assert_eq!(oidc.client_id, "explicit-oidc-id");
+        assert_eq!(oidc.provider_name, "Microsoft");
+    }
+
+    #[test]
+    fn test_allow_registration_default_false() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(!auth.allow_registration);
+    }
+
+    #[test]
+    fn test_no_auth_section_means_open_access() {
+        // No auth section at all → auth_config is None → open access mode
+        let yaml = r#"
+server:
+  port: 8080
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.auth.is_none());
+        // When auth is None, the middleware should allow all requests (no-auth mode)
     }
 }

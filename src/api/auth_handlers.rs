@@ -124,7 +124,9 @@ pub async fn google_callback(
         email: google_user.email.clone(),
         name: google_user.name.clone(),
         picture_url: google_user.picture.clone(),
-        google_id: google_user.google_id.clone(),
+        auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+        external_id: Some(google_user.google_id.clone()),
+        password_hash: None,
         created_at: now,
         last_login_at: now,
     };
@@ -218,13 +220,16 @@ mod tests {
 
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
-            google_client_id: "test-id".to_string(),
-            google_client_secret: "test-secret".to_string(),
-            google_redirect_uri: "http://localhost:3000/auth/callback".to_string(),
             jwt_secret: TEST_SECRET.to_string(),
             jwt_expiry_secs: 28800,
             allowed_email_domain: None,
             frontend_url: None,
+            allow_registration: false,
+            root_account: None,
+            oidc: None,
+            google_client_id: Some("test-id".to_string()),
+            google_client_secret: Some("test-secret".to_string()),
+            google_redirect_uri: Some("http://localhost:3000/auth/callback".to_string()),
         }
     }
 
@@ -329,7 +334,9 @@ mod tests {
             email: "alice@ffs.holdings".to_string(),
             name: "Alice".to_string(),
             picture_url: Some("https://example.com/photo.jpg".to_string()),
-            google_id: "google-123".to_string(),
+            auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+            external_id: Some("google-123".to_string()),
+            password_hash: None,
             created_at: now,
             last_login_at: now,
         };
@@ -381,7 +388,9 @@ mod tests {
             email: "bob@ffs.holdings".to_string(),
             name: "Bob".to_string(),
             picture_url: None,
-            google_id: "google-456".to_string(),
+            auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+            external_id: Some("google-456".to_string()),
+            password_hash: None,
             created_at: now,
             last_login_at: now,
         };

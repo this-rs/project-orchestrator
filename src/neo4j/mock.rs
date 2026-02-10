@@ -3418,12 +3418,33 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
+        use crate::neo4j::models::AuthProvider;
+
         let mut users = self.users.write().await;
-        // Check if a user with this google_id already exists
-        let existing_id = users
-            .values()
-            .find(|u| u.google_id == user.google_id)
-            .map(|u| u.id);
+
+        // Find existing user based on auth provider strategy
+        let existing_id = match user.auth_provider {
+            AuthProvider::Oidc => {
+                // OIDC: match on auth_provider + external_id
+                let ext_id = user.external_id.as_deref().unwrap_or_default();
+                users
+                    .values()
+                    .find(|u| {
+                        u.auth_provider == AuthProvider::Oidc
+                            && u.external_id.as_deref() == Some(ext_id)
+                    })
+                    .map(|u| u.id)
+            }
+            AuthProvider::Password => {
+                // Password: match on auth_provider + email
+                users
+                    .values()
+                    .find(|u| {
+                        u.auth_provider == AuthProvider::Password && u.email == user.email
+                    })
+                    .map(|u| u.id)
+            }
+        };
 
         if let Some(id) = existing_id {
             // Update existing user
@@ -3444,13 +3465,38 @@ impl GraphStore for MockGraphStore {
         Ok(self.users.read().await.get(&id).cloned())
     }
 
-    async fn get_user_by_google_id(&self, google_id: &str) -> Result<Option<UserNode>> {
+    async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<UserNode>> {
+        let provider_parsed: crate::neo4j::models::AuthProvider =
+            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
         Ok(self
             .users
             .read()
             .await
             .values()
-            .find(|u| u.google_id == google_id)
+            .find(|u| {
+                u.auth_provider == provider_parsed
+                    && u.external_id.as_deref() == Some(external_id)
+            })
+            .cloned())
+    }
+
+    async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> Result<Option<UserNode>> {
+        let provider_parsed: crate::neo4j::models::AuthProvider =
+            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.email == email && u.auth_provider == provider_parsed)
             .cloned())
     }
 
@@ -3462,6 +3508,27 @@ impl GraphStore for MockGraphStore {
             .values()
             .find(|u| u.email == email)
             .cloned())
+    }
+
+    async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<UserNode> {
+        let now = chrono::Utc::now();
+        let user = UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: name.to_string(),
+            picture_url: None,
+            auth_provider: crate::neo4j::models::AuthProvider::Password,
+            external_id: None,
+            password_hash: Some(password_hash.to_string()),
+            created_at: now,
+            last_login_at: now,
+        };
+        self.upsert_user(&user).await
     }
 
     async fn list_users(&self) -> Result<Vec<UserNode>> {
@@ -3641,26 +3708,45 @@ mod tests {
     // User / Auth tests
     // ====================================================================
 
-    fn make_user(google_id: &str, email: &str) -> UserNode {
+    use crate::neo4j::models::AuthProvider;
+
+    fn make_oidc_user(external_id: &str, email: &str) -> UserNode {
         UserNode {
             id: Uuid::new_v4(),
             email: email.to_string(),
             name: "Test User".to_string(),
             picture_url: Some("https://example.com/pic.jpg".to_string()),
-            google_id: google_id.to_string(),
+            auth_provider: AuthProvider::Oidc,
+            external_id: Some(external_id.to_string()),
+            password_hash: None,
+            created_at: Utc::now(),
+            last_login_at: Utc::now(),
+        }
+    }
+
+    fn make_password_user(email: &str) -> UserNode {
+        UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: "Test User".to_string(),
+            picture_url: None,
+            auth_provider: AuthProvider::Password,
+            external_id: None,
+            password_hash: Some("$2b$12$fakehash".to_string()),
             created_at: Utc::now(),
             last_login_at: Utc::now(),
         }
     }
 
     #[tokio::test]
-    async fn test_upsert_user_create() {
+    async fn test_upsert_user_create_oidc() {
         let store = MockGraphStore::new();
-        let user = make_user("gid-001", "alice@ffs.holdings");
+        let user = make_oidc_user("gid-001", "alice@ffs.holdings");
 
         let result = store.upsert_user(&user).await.unwrap();
         assert_eq!(result.email, "alice@ffs.holdings");
-        assert_eq!(result.google_id, "gid-001");
+        assert_eq!(result.auth_provider, AuthProvider::Oidc);
+        assert_eq!(result.external_id, Some("gid-001".to_string()));
 
         // Should be retrievable
         let found = store.get_user_by_id(user.id).await.unwrap();
@@ -3669,18 +3755,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upsert_user_update() {
+    async fn test_upsert_user_update_oidc() {
         let store = MockGraphStore::new();
-        let user = make_user("gid-002", "bob@ffs.holdings");
+        let user = make_oidc_user("gid-002", "bob@ffs.holdings");
         store.upsert_user(&user).await.unwrap();
 
-        // Upsert same google_id with updated fields
-        let mut updated = make_user("gid-002", "bob.new@ffs.holdings");
+        // Upsert same external_id with updated fields
+        let mut updated = make_oidc_user("gid-002", "bob.new@ffs.holdings");
         updated.name = "Bob Updated".to_string();
         updated.picture_url = None;
 
         let result = store.upsert_user(&updated).await.unwrap();
-        // Should keep the original id (found by google_id)
+        // Should keep the original id (found by external_id)
         assert_eq!(result.id, user.id);
         // But fields should be updated
         assert_eq!(result.email, "bob.new@ffs.holdings");
@@ -3693,28 +3779,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_user_by_google_id() {
+    async fn test_upsert_user_create_password() {
         let store = MockGraphStore::new();
-        let user = make_user("gid-003", "charlie@ffs.holdings");
+        let user = make_password_user("alice@ffs.holdings");
+
+        let result = store.upsert_user(&user).await.unwrap();
+        assert_eq!(result.email, "alice@ffs.holdings");
+        assert_eq!(result.auth_provider, AuthProvider::Password);
+        assert!(result.password_hash.is_some());
+        assert!(result.external_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_user_update_password() {
+        let store = MockGraphStore::new();
+        let user = make_password_user("carol@ffs.holdings");
         store.upsert_user(&user).await.unwrap();
 
-        let found = store.get_user_by_google_id("gid-003").await.unwrap();
+        // Upsert same email + password provider → should update
+        let mut updated = make_password_user("carol@ffs.holdings");
+        updated.name = "Carol Updated".to_string();
+
+        let result = store.upsert_user(&updated).await.unwrap();
+        assert_eq!(result.id, user.id); // same user
+        assert_eq!(result.name, "Carol Updated");
+
+        let all = store.list_users().await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_provider_id() {
+        let store = MockGraphStore::new();
+        let user = make_oidc_user("gid-003", "charlie@ffs.holdings");
+        store.upsert_user(&user).await.unwrap();
+
+        let found = store
+            .get_user_by_provider_id("oidc", "gid-003")
+            .await
+            .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().email, "charlie@ffs.holdings");
 
-        let not_found = store.get_user_by_google_id("gid-999").await.unwrap();
+        let not_found = store
+            .get_user_by_provider_id("oidc", "gid-999")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_email_and_provider() {
+        let store = MockGraphStore::new();
+        // Create both an OIDC and a password user with the same email
+        let oidc_user = make_oidc_user("gid-005", "dual@ffs.holdings");
+        let password_user = make_password_user("dual@ffs.holdings");
+        store.upsert_user(&oidc_user).await.unwrap();
+        store.upsert_user(&password_user).await.unwrap();
+
+        // Should find the password user
+        let found = store
+            .get_user_by_email_and_provider("dual@ffs.holdings", "password")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().auth_provider, AuthProvider::Password);
+
+        // Should find the OIDC user
+        let found = store
+            .get_user_by_email_and_provider("dual@ffs.holdings", "oidc")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().auth_provider, AuthProvider::Oidc);
+
+        // Should not find non-existent
+        let not_found = store
+            .get_user_by_email_and_provider("nobody@ffs.holdings", "password")
+            .await
+            .unwrap();
         assert!(not_found.is_none());
     }
 
     #[tokio::test]
     async fn test_get_user_by_email() {
         let store = MockGraphStore::new();
-        let user = make_user("gid-004", "diana@ffs.holdings");
+        let user = make_oidc_user("gid-004", "diana@ffs.holdings");
         store.upsert_user(&user).await.unwrap();
 
-        let found = store.get_user_by_email("diana@ffs.holdings").await.unwrap();
+        let found = store
+            .get_user_by_email("diana@ffs.holdings")
+            .await
+            .unwrap();
         assert!(found.is_some());
-        assert_eq!(found.unwrap().google_id, "gid-004");
+        assert_eq!(found.unwrap().external_id, Some("gid-004".to_string()));
 
         let not_found = store
             .get_user_by_email("nobody@ffs.holdings")
@@ -3730,7 +3888,10 @@ mod tests {
         let not_found = store.get_user_by_id(Uuid::new_v4()).await.unwrap();
         assert!(not_found.is_none());
 
-        let not_found = store.get_user_by_google_id("nonexistent").await.unwrap();
+        let not_found = store
+            .get_user_by_provider_id("oidc", "nonexistent")
+            .await
+            .unwrap();
         assert!(not_found.is_none());
 
         let not_found = store
@@ -3741,6 +3902,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_password_user() {
+        let store = MockGraphStore::new();
+
+        let user = store
+            .create_password_user("new@ffs.holdings", "New User", "$2b$12$somehash")
+            .await
+            .unwrap();
+
+        assert_eq!(user.email, "new@ffs.holdings");
+        assert_eq!(user.name, "New User");
+        assert_eq!(user.auth_provider, AuthProvider::Password);
+        assert_eq!(user.password_hash, Some("$2b$12$somehash".to_string()));
+        assert!(user.external_id.is_none());
+
+        // Should be findable
+        let found = store.get_user_by_id(user.id).await.unwrap();
+        assert!(found.is_some());
+    }
+
+    #[tokio::test]
     async fn test_list_users() {
         let store = MockGraphStore::new();
 
@@ -3748,17 +3929,17 @@ mod tests {
         let users = store.list_users().await.unwrap();
         assert!(users.is_empty());
 
-        // Add 3 users
+        // Add 3 users (mix of providers)
         store
-            .upsert_user(&make_user("gid-a", "a@ffs.holdings"))
+            .upsert_user(&make_oidc_user("gid-a", "a@ffs.holdings"))
             .await
             .unwrap();
         store
-            .upsert_user(&make_user("gid-b", "b@ffs.holdings"))
+            .upsert_user(&make_oidc_user("gid-b", "b@ffs.holdings"))
             .await
             .unwrap();
         store
-            .upsert_user(&make_user("gid-c", "c@ffs.holdings"))
+            .upsert_user(&make_password_user("c@ffs.holdings"))
             .await
             .unwrap();
 

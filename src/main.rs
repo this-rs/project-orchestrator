@@ -108,7 +108,28 @@ async fn run_server(config: Config) -> Result<()> {
     // Log auth status
     match &config.auth_config {
         Some(auth) => {
-            tracing::info!("Auth enabled (Google OAuth)");
+            // Determine active auth modes
+            let mut modes = vec![];
+            if auth.has_password_auth() {
+                modes.push("password (root account)");
+            }
+            if auth.has_oidc() {
+                let provider_name = auth
+                    .effective_oidc()
+                    .map(|o| o.provider_name.clone())
+                    .unwrap_or_else(|| "OIDC".to_string());
+                modes.push(Box::leak(
+                    format!("OIDC ({})", provider_name).into_boxed_str(),
+                ));
+            }
+            tracing::info!(
+                "Auth enabled — modes: [{}]",
+                if modes.is_empty() {
+                    "none configured".to_string()
+                } else {
+                    modes.join(", ")
+                }
+            );
             if let Some(ref domain) = auth.allowed_email_domain {
                 tracing::info!("  Email domain restriction: @{}", domain);
             }
@@ -116,10 +137,18 @@ async fn run_server(config: Config) -> Result<()> {
                 tracing::info!("  Frontend URL (CORS): {}", url);
             }
             tracing::info!("  JWT expiry: {}h", auth.jwt_expiry_secs / 3600);
+            tracing::info!(
+                "  Registration: {}",
+                if auth.allow_registration {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
         }
         None => {
-            tracing::warn!(
-                "Auth disabled — deny-by-default active, all /api/* requests will be rejected"
+            tracing::info!(
+                "Auth disabled — open access mode (no auth section in config.yaml)"
             );
         }
     }

@@ -71,6 +71,7 @@ tokio-stream = "0.1"
 
 # Auth
 jsonwebtoken = "9"
+bcrypt = "0.16"
 
 # Config
 dotenvy = "0.15"

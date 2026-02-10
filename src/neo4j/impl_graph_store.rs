@@ -1304,12 +1304,33 @@ impl GraphStore for Neo4jClient {
         self.get_user_by_id(id).await
     }
 
-    async fn get_user_by_google_id(&self, google_id: &str) -> anyhow::Result<Option<UserNode>> {
-        self.get_user_by_google_id(google_id).await
+    async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> anyhow::Result<Option<UserNode>> {
+        self.get_user_by_provider_id(provider, external_id).await
+    }
+
+    async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> anyhow::Result<Option<UserNode>> {
+        self.get_user_by_email_and_provider(email, provider).await
     }
 
     async fn get_user_by_email(&self, email: &str) -> anyhow::Result<Option<UserNode>> {
         self.get_user_by_email(email).await
+    }
+
+    async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> anyhow::Result<UserNode> {
+        self.create_password_user(email, name, password_hash).await
     }
 
     async fn list_users(&self) -> anyhow::Result<Vec<UserNode>> {

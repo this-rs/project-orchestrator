@@ -62,13 +62,16 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
 /// as `auth_config` to avoid deny-by-default 403 rejections.
 pub fn test_auth_config() -> AuthConfig {
     AuthConfig {
-        google_client_id: "test-client-id".to_string(),
-        google_client_secret: "test-client-secret".to_string(),
-        google_redirect_uri: "http://localhost:3000/auth/callback".to_string(),
         jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
         jwt_expiry_secs: 28800,
         allowed_email_domain: None,
         frontend_url: None,
+        allow_registration: false,
+        root_account: None,
+        oidc: None,
+        google_client_id: Some("test-client-id".to_string()),
+        google_client_secret: Some("test-client-secret".to_string()),
+        google_redirect_uri: Some("http://localhost:3000/auth/callback".to_string()),
     }
 }
 
@@ -265,14 +268,16 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
     }
 }
 
-/// Create a test user
+/// Create a test user (OIDC provider)
 pub fn test_user() -> UserNode {
     UserNode {
         id: Uuid::new_v4(),
         email: "test@ffs.holdings".to_string(),
         name: "Test User".to_string(),
         picture_url: Some("https://lh3.googleusercontent.com/test".to_string()),
-        google_id: "google-id-123456".to_string(),
+        auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+        external_id: Some("google-id-123456".to_string()),
+        password_hash: None,
         created_at: chrono::Utc::now(),
         last_login_at: chrono::Utc::now(),
     }

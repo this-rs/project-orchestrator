@@ -40,6 +40,18 @@ impl AuthUser {
             name: claims.name.clone(),
         })
     }
+
+    /// Create an anonymous user for no-auth mode.
+    ///
+    /// Uses a deterministic nil UUID so the anonymous user is always
+    /// identifiable across requests.
+    pub fn anonymous() -> Self {
+        Self {
+            user_id: crate::auth::jwt::ANONYMOUS_USER_ID,
+            email: "anonymous@local".to_string(),
+            name: "Anonymous".to_string(),
+        }
+    }
 }
 
 impl FromRequestParts<OrchestratorState> for AuthUser {
