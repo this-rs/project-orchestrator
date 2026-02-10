@@ -129,8 +129,9 @@ pub async fn get_auth_providers(
 
     let mut providers = vec![];
 
-    // Password auth (root account configured)
-    if auth_config.has_password_auth() {
+    // Password auth: available when root account is configured OR registration is enabled
+    // (registration creates password-based users, so login must be available too)
+    if auth_config.has_password_auth() || auth_config.allow_registration {
         providers.push(AuthProviderInfo {
             id: "password".to_string(),
             name: "Email & Password".to_string(),
@@ -1112,6 +1113,29 @@ mod tests {
         let json = get_providers_json(app).await;
 
         assert_eq!(json["allow_registration"], true);
+    }
+
+    #[tokio::test]
+    async fn test_providers_registration_without_root_account() {
+        // allow_registration = true but NO root_account → password provider should still appear
+        let mut config = test_auth_config();
+        config.root_account = None;
+        config.allow_registration = true;
+        // Remove OIDC too for a clean test
+        config.google_client_id = None;
+        config.google_client_secret = None;
+        config.google_redirect_uri = None;
+        config.oidc = None;
+
+        let app = test_auth_app(Some(config)).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["auth_required"], true);
+        assert_eq!(json["allow_registration"], true);
+        let providers = json["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["id"], "password");
+        assert_eq!(providers[0]["type"], "password");
     }
 
     // ================================================================
