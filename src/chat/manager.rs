@@ -412,9 +412,7 @@ impl ChatManager {
                     for block in blocks {
                         if let ContentBlock::ToolResult(t) = block {
                             let result = match &t.content {
-                                Some(ContentValue::Text(s)) => {
-                                    serde_json::Value::String(s.clone())
-                                }
+                                Some(ContentValue::Text(s)) => serde_json::Value::String(s.clone()),
                                 Some(ContentValue::Structured(v)) => {
                                     serde_json::Value::Array(v.clone())
                                 }
@@ -804,7 +802,10 @@ impl ChatManager {
                             // 2. Second occurrence (AssistantMessage): DON'T re-emit to broadcast
                             //    (clients already have the tool_use), but UPDATE the persisted
                             //    record and streaming_events with the full input.
-                            if let ChatEvent::ToolUse { ref id, ref input, .. } = event {
+                            if let ChatEvent::ToolUse {
+                                ref id, ref input, ..
+                            } = event
+                            {
                                 if let Some(persist_idx) = emitted_tool_use_ids.get(id) {
                                     // Duplicate — update persisted record with full input
                                     let has_real_input = input.is_object()
@@ -859,8 +860,7 @@ impl ChatManager {
                                     });
                                     // Track persist index for ToolUse so we can update later
                                     if let ChatEvent::ToolUse { ref id, .. } = event {
-                                        emitted_tool_use_ids
-                                            .insert(id.clone(), Some(persist_idx));
+                                        emitted_tool_use_ids.insert(id.clone(), Some(persist_idx));
                                     }
                                 }
                             }
