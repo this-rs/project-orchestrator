@@ -378,3 +378,58 @@ jobs:
             release-files/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # Update Homebrew tap - Push new formula after release is published
+  # ==========================================================================
+  update-homebrew:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
+    needs: [release]
+    if: "!contains(github.ref, '-')"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download checksums
+        run: |
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/checksums-sha256.txt" \
+            -o checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Extract SHA256 values
+        id: sha
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "macos_arm64=$(grep "orchestrator-full-${VERSION}-macos-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=$(grep "orchestrator-full-${VERSION}-macos-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(grep "orchestrator-full-${VERSION}-linux-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=$(grep "orchestrator-full-${VERSION}-linux-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Generate updated formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -e "s/VERSION_PLACEHOLDER/${VERSION}/g" \
+              -e "s/SHA256_MACOS_ARM64_PLACEHOLDER/${{ steps.sha.outputs.macos_arm64 }}/g" \
+              -e "s/SHA256_MACOS_X86_64_PLACEHOLDER/${{ steps.sha.outputs.macos_x86_64 }}/g" \
+              -e "s/SHA256_LINUX_ARM64_PLACEHOLDER/${{ steps.sha.outputs.linux_arm64 }}/g" \
+              -e "s/SHA256_LINUX_X86_64_PLACEHOLDER/${{ steps.sha.outputs.linux_x86_64 }}/g" \
+              packaging/homebrew/project-orchestrator.rb > formula.rb
+          cat formula.rb
+
+      - name: Push to Homebrew tap
+        uses: dmnemec/copy_file_to_another_repo_action@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          source_file: formula.rb
+          destination_repo: this-rs/homebrew-tap
+          destination_folder: Formula
+          destination_branch_create: main
+          destination_file: project-orchestrator.rb
+          user_email: "ci@openclaw.ai"
+          user_name: "OpenClaw CI"
+          commit_message: "Update project-orchestrator to v${{ steps.version.outputs.version }}"
