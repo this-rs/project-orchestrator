@@ -713,6 +713,8 @@ mod tests {
             chat_manager: None,
             event_bus: Arc::new(crate::events::EventBus::default()),
             auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
         });
         create_router(state)
     }
@@ -763,6 +765,8 @@ mod tests {
             chat_manager: None,
             event_bus: Arc::new(crate::events::EventBus::default()),
             auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
         });
         create_router(state)
     }

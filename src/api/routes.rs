@@ -19,20 +19,38 @@ use axum::{
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 /// Create the API router with public + protected route groups.
+///
+/// When `state.serve_frontend` is true, a fallback service is attached that
+/// serves the React SPA from `state.frontend_path`. Axum's explicit routes
+/// (/api/*, /auth/*, /ws/*, /health, /hooks/*, /internal/*) always take
+/// priority over the fallback — only unmatched paths hit ServeDir/index.html.
 pub fn create_router(state: OrchestratorState) -> Router {
     let cors = build_cors(&state);
 
     let public = public_routes();
     let protected = protected_routes().layer(from_fn_with_state(state.clone(), require_auth));
 
-    public
+    let router = public
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Conditionally attach frontend static file serving (SPA fallback).
+    // Uses `fallback()` (not `not_found_service()`) to preserve 200 status
+    // on SPA routes — `not_found_service` would force 404 on every fallback.
+    if state.serve_frontend {
+        let index_path = format!("{}/index.html", state.frontend_path);
+        let serve_dir = ServeDir::new(&state.frontend_path)
+            .fallback(ServeFile::new(index_path));
+        router.fallback_service(serve_dir)
+    } else {
+        router
+    }
 }
 
 /// Build CORS layer — restricted to `frontend_url` if configured, otherwise `Any`.
@@ -526,4 +544,209 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/messages",
             get(chat_handlers::list_messages),
         )
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::EventBus;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_auth_config};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt; // for oneshot
+
+    /// Build a test router with serve_frontend enabled, pointing at a temp dir
+    async fn test_app_with_frontend(dir: &std::path::Path) -> Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(handlers::ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(EventBus::default()),
+            auth_config: Some(test_auth_config()),
+            serve_frontend: true,
+            frontend_path: dir.to_str().unwrap().to_string(),
+        });
+        create_router(state)
+    }
+
+    /// Build a test router with serve_frontend disabled
+    async fn test_app_no_frontend() -> Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(handlers::ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(EventBus::default()),
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+        });
+        create_router(state)
+    }
+
+    /// Create a fake dist/ directory with index.html and an asset file
+    fn create_fake_dist() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!DOCTYPE html><html><body>SPA</body></html>",
+        )
+        .unwrap();
+        // Create assets subdirectory with a JS file
+        let assets = dir.path().join("assets");
+        std::fs::create_dir(&assets).unwrap();
+        std::fs::write(assets.join("app.js"), "console.log('hello');").unwrap();
+        dir
+    }
+
+    // ====================================================================
+    // SPA fallback: GET / returns index.html
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_spa_root_returns_index_html() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("SPA"), "Expected index.html content, got: {text}");
+    }
+
+    // ====================================================================
+    // SPA fallback: GET /workspaces (client-side route) returns index.html
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_spa_client_route_returns_index_html() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(
+                Request::get("/workspaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("SPA"), "SPA route should return index.html");
+    }
+
+    // ====================================================================
+    // Static assets: GET /assets/app.js returns the JS file
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_static_asset_served() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(
+                Request::get("/assets/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("console.log"), "Expected JS content");
+    }
+
+    // ====================================================================
+    // API routes NOT intercepted: /health still works
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_health_not_intercepted_by_fallback() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // /health returns JSON with status field, NOT index.html
+        assert!(text.contains("\"status\""), "Expected JSON health response, got: {text}");
+        assert!(!text.contains("SPA"), "Health should NOT return index.html");
+    }
+
+    // ====================================================================
+    // serve_frontend=false: SPA routes return 404
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_no_frontend_no_spa_fallback() {
+        let app = test_app_no_frontend().await;
+
+        let resp = app
+            .oneshot(Request::get("/some-spa-route").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // Without frontend serving, unmatched routes have no fallback.
+        // The response will be either 404 (no route) or 401 (auth middleware rejects).
+        // Either way, it must NOT be 200 with index.html content.
+        let status = resp.status();
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::UNAUTHORIZED,
+            "Expected 404 or 401 without frontend, got: {status}"
+        );
+    }
+
+    // ====================================================================
+    // /auth/callback (React Router route) gets index.html, not 404
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_auth_callback_spa_route_returns_index_html() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(
+                Request::get("/auth/callback")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // /auth/callback is NOT a registered backend route (backend has /auth/oidc/callback POST).
+        // As a GET, it should fall through to the SPA fallback and return index.html.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("SPA"), "/auth/callback GET should return SPA index.html");
+    }
 }

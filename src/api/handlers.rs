@@ -31,6 +31,10 @@ pub struct ServerState {
     pub event_bus: Arc<EventBus>,
     /// Auth config — None means deny-by-default
     pub auth_config: Option<AuthConfig>,
+    /// Whether to serve the frontend static files (SPA fallback)
+    pub serve_frontend: bool,
+    /// Path to the frontend dist/ directory
+    pub frontend_path: String,
 }
 
 /// Shared orchestrator state

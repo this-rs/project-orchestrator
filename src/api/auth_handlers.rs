@@ -630,6 +630,8 @@ mod tests {
             chat_manager: None,
             event_bus,
             auth_config,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
         })
     }
 

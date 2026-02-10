@@ -181,6 +181,8 @@ async fn run_server(mut config: Config) -> Result<()> {
         chat_manager,
         event_bus,
         auth_config: config.auth_config.clone(),
+        serve_frontend: config.serve_frontend,
+        frontend_path: config.frontend_path.clone(),
     });
 
     // Create router
