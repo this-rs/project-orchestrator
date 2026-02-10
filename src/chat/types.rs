@@ -43,6 +43,12 @@ pub enum ChatEvent {
         #[serde(default)]
         is_error: bool,
     },
+    /// Updated input for a tool_use (emitted when AssistantMessage provides full input
+    /// after ContentBlockStart already emitted a ToolUse with empty input)
+    ToolUseInputResolved {
+        id: String,
+        input: serde_json::Value,
+    },
     /// Claude is asking for permission to use a tool
     PermissionRequest {
         id: String,
@@ -79,6 +85,7 @@ impl ChatEvent {
             ChatEvent::Thinking { .. } => "thinking",
             ChatEvent::ToolUse { .. } => "tool_use",
             ChatEvent::ToolResult { .. } => "tool_result",
+            ChatEvent::ToolUseInputResolved { .. } => "tool_use_input_resolved",
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::InputRequest { .. } => "input_request",
             ChatEvent::Result { .. } => "result",
