@@ -3,6 +3,7 @@
 
 mod docker;
 mod setup;
+mod tray;
 
 use project_orchestrator::Config;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -111,6 +112,15 @@ fn main() {
             docker::stop_docker_services,
             docker::get_service_logs,
         ])
+        .setup(|app| {
+            // Create system tray
+            if let Err(e) = tray::create_tray(app.handle()) {
+                tracing::warn!("Failed to create system tray: {}", e);
+            }
+            // Set up minimize-to-tray behavior
+            tray::setup_minimize_to_tray(app.handle());
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("Error while building Tauri application");
 
