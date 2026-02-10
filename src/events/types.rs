@@ -68,9 +68,9 @@ pub struct CrudEvent {
 
 /// Trait for emitting CRUD events.
 ///
-/// Implemented by both `EventBus` (in-process broadcast) and `EventNotifier` (HTTP bridge).
-/// Consumers (PlanManager, NoteManager, Orchestrator) hold `Option<Arc<dyn EventEmitter>>`
-/// so the same code works for both the HTTP server and the MCP server.
+/// Implemented by `HybridEmitter` (local broadcast + optional NATS), `NatsEmitter`
+/// (NATS-only), and `EventBus` (local-only). Consumers (PlanManager, NoteManager,
+/// Orchestrator) hold `Option<Arc<dyn EventEmitter>>` for polymorphic dispatch.
 pub trait EventEmitter: Send + Sync {
     /// Emit a CrudEvent (fire-and-forget)
     fn emit(&self, event: CrudEvent);

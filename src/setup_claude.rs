@@ -28,7 +28,14 @@ pub enum SetupResult {
 // ============================================================================
 
 const MCP_SERVER_NAME: &str = "project-orchestrator";
-const DEFAULT_SSE_URL: &str = "http://localhost:8080/mcp/sse";
+
+/// Build the default SSE URL using the given port.
+///
+/// The MCP server in stdio mode doesn't use this, but the HTTP server's
+/// SSE transport is on `/mcp/sse` at the configured server port.
+fn default_sse_url(port: u16) -> String {
+    format!("http://localhost:{}/mcp/sse", port)
+}
 
 // ============================================================================
 // Public API
@@ -39,8 +46,12 @@ const DEFAULT_SSE_URL: &str = "http://localhost:8080/mcp/sse";
 /// Strategy:
 /// 1. Try `claude mcp add` if CLI is available
 /// 2. Fall back to directly editing `~/.claude/mcp.json`
-pub fn setup_claude_code(server_url: Option<&str>) -> Result<SetupResult> {
-    let url = server_url.unwrap_or(DEFAULT_SSE_URL);
+///
+/// If `server_url` is not provided, the default URL is built from the given
+/// `port` (defaults to 8080 if not specified).
+pub fn setup_claude_code(server_url: Option<&str>, port: Option<u16>) -> Result<SetupResult> {
+    let default_url = default_sse_url(port.unwrap_or(8080));
+    let url = server_url.unwrap_or(&default_url);
 
     // Check if already configured
     if is_already_configured()? {
@@ -70,23 +81,53 @@ pub fn setup_claude_code(server_url: Option<&str>) -> Result<SetupResult> {
 }
 
 /// Detect if Claude Code CLI is installed.
+///
+/// First tries `which claude` (or `where` on Windows). If that fails (common
+/// in macOS .app bundles where PATH is minimal), falls back to checking well-known
+/// installation paths.
 pub fn detect_claude_cli() -> Option<String> {
     #[cfg(unix)]
     let cmd = "which";
     #[cfg(windows)]
     let cmd = "where";
 
-    match std::process::Command::new(cmd).arg("claude").output() {
-        Ok(output) if output.status.success() => {
+    // Try PATH-based lookup first
+    if let Ok(output) = std::process::Command::new(cmd).arg("claude").output() {
+        if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if path.is_empty() {
-                None
-            } else {
-                Some(path)
+            if !path.is_empty() {
+                return Some(path);
             }
         }
-        _ => None,
     }
+
+    // Fallback: check well-known paths (macOS .app bundles have a minimal PATH)
+    let candidates = [
+        // npm global (macOS/Linux)
+        "/usr/local/bin/claude",
+        // Homebrew (Apple Silicon)
+        "/opt/homebrew/bin/claude",
+        // Homebrew (Intel)
+        "/usr/local/bin/claude",
+        // User-local npm global
+        &format!(
+            "{}/.npm-global/bin/claude",
+            std::env::var("HOME").unwrap_or_default()
+        ),
+        // nvm / fnm / volta managed
+        &format!(
+            "{}/.local/bin/claude",
+            std::env::var("HOME").unwrap_or_default()
+        ),
+    ];
+
+    for candidate in &candidates {
+        if std::path::Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
 }
 
 // ============================================================================

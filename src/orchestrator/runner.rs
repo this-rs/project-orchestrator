@@ -103,8 +103,8 @@ impl Orchestrator {
 
     /// Create a new orchestrator with a generic EventEmitter
     ///
-    /// Used by the MCP server — passes an `EventNotifier` that forwards events
-    /// to the HTTP server via POST /internal/events.
+    /// Used by both the HTTP server (with `HybridEmitter`) and the MCP server
+    /// (with `NatsEmitter` for cross-instance sync).
     pub async fn with_event_emitter(
         state: AppState,
         emitter: Arc<dyn EventEmitter>,

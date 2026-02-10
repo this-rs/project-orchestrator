@@ -134,6 +134,7 @@ fn public_routes() -> Router<OrchestratorState> {
         // Webhooks & Internal
         // ================================================================
         .route("/hooks/wake", post(handlers::wake))
+        // DEPRECATED: Use NATS for inter-process events. Kept for backward compatibility.
         .route("/internal/events", post(handlers::receive_event))
 }
 

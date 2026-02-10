@@ -41,6 +41,7 @@
 use anyhow::Result;
 use clap::Parser;
 use project_orchestrator::chat::{ChatConfig, ChatManager};
+#[allow(deprecated)] // EventNotifier kept for legacy MCP_HTTP_URL fallback
 use project_orchestrator::events::{connect_nats, EventNotifier, NatsEmitter};
 use project_orchestrator::mcp::McpServer;
 use project_orchestrator::orchestrator::Orchestrator;
@@ -158,7 +159,8 @@ async fn main() -> Result<()> {
         if let Some(ref nats) = nats_emitter {
             Some(nats.clone() as Arc<dyn project_orchestrator::events::EventEmitter>)
         } else if let Some(ref http_url) = args.http_url {
-            // Legacy fallback: HTTP POST bridge (deprecated)
+            // Legacy fallback: HTTP POST bridge (deprecated — kept for backward compat)
+            #[allow(deprecated)]
             let notifier = Arc::new(EventNotifier::new(http_url));
             warn!(
                 "Using deprecated HTTP event bridge targeting: {} — migrate to NATS_URL",

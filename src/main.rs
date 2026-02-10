@@ -48,9 +48,13 @@ enum Commands {
 
     /// Configure Claude Code to use this server as MCP provider
     SetupClaude {
-        /// MCP server URL (default: http://localhost:8080/mcp/sse)
+        /// MCP server URL (default: http://localhost:{port}/mcp/sse)
         #[arg(long)]
         url: Option<String>,
+
+        /// Port used to build the default MCP server URL (default: from config or 8080)
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -90,18 +94,21 @@ async fn main() -> Result<()> {
         }
         Commands::Sync { path } => run_sync(config, &path).await,
         Commands::Update { check } => run_update(check).await,
-        Commands::SetupClaude { url } => {
-            run_setup_claude(url.as_deref());
+        Commands::SetupClaude { url, port } => {
+            let effective_port = port.unwrap_or(config.server_port);
+            run_setup_claude(url.as_deref(), effective_port);
             Ok(())
         }
     }
 }
 
-fn run_setup_claude(url: Option<&str>) {
+fn run_setup_claude(url: Option<&str>, port: u16) {
     println!("Configuring Claude Code MCP server...");
     println!();
 
-    match setup_claude::setup_claude_code(url) {
+    let default_url = format!("http://localhost:{}/mcp/sse", port);
+
+    match setup_claude::setup_claude_code(url, Some(port)) {
         Ok(setup_claude::SetupResult::ConfiguredViaCli) => {
             println!("  Claude Code configured via CLI.");
             println!();
@@ -119,18 +126,21 @@ fn run_setup_claude(url: Option<&str>) {
             println!("  No changes made.");
         }
         Err(e) => {
+            let fallback_url = url.unwrap_or(&default_url);
             eprintln!("  Failed to configure Claude Code: {}", e);
             eprintln!();
             eprintln!("  You can configure it manually:");
-            eprintln!("    claude mcp add project-orchestrator --transport sse --url {}",
-                url.unwrap_or("http://localhost:8080/mcp/sse"));
+            eprintln!(
+                "    claude mcp add project-orchestrator --transport sse --url {}",
+                fallback_url
+            );
             eprintln!();
             eprintln!("  Or add to ~/.claude/mcp.json:");
             eprintln!("    {{");
             eprintln!("      \"mcpServers\": {{");
             eprintln!("        \"project-orchestrator\": {{");
             eprintln!("          \"type\": \"sse\",");
-            eprintln!("          \"url\": \"{}\"", url.unwrap_or("http://localhost:8080/mcp/sse"));
+            eprintln!("          \"url\": \"{}\"", fallback_url);
             eprintln!("        }}");
             eprintln!("      }}");
             eprintln!("    }}");

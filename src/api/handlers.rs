@@ -624,10 +624,14 @@ pub async fn wake(
 }
 
 // ============================================================================
-// Internal Events (MCP → HTTP bridge)
+// Internal Events (MCP → HTTP bridge) — DEPRECATED, use NATS instead
 // ============================================================================
 
-/// POST /internal/events — Receive a CrudEvent from the MCP server and broadcast it
+/// POST /internal/events — Receive a CrudEvent from the MCP server and broadcast it.
+///
+/// **DEPRECATED**: This endpoint was used by `EventNotifier` (HTTP bridge) before
+/// NATS-based inter-process sync was added. Use `NATS_URL` for cross-instance
+/// event delivery instead. This endpoint will be removed in a future version.
 pub async fn receive_event(
     State(state): State<OrchestratorState>,
     Json(event): Json<crate::events::CrudEvent>,
