@@ -139,7 +139,7 @@ pub async fn google_callback(
         &auth_config.jwt_secret,
         auth_config.jwt_expiry_secs,
     )
-    .map_err(|e| AppError::Internal(e))?;
+    .map_err(AppError::Internal)?;
 
     Ok(Json(AuthTokenResponse {
         token,
@@ -187,7 +187,7 @@ pub async fn refresh_token(
         &auth_config.jwt_secret,
         auth_config.jwt_expiry_secs,
     )
-    .map_err(|e| AppError::Internal(e))?;
+    .map_err(AppError::Internal)?;
 
     Ok(Json(RefreshTokenResponse { token }))
 }

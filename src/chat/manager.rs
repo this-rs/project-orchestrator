@@ -809,7 +809,7 @@ impl ChatManager {
                                 if let Some(persist_idx) = emitted_tool_use_ids.get(id) {
                                     // Duplicate — update persisted record with full input
                                     let has_real_input = input.is_object()
-                                        && input.as_object().map_or(false, |o| !o.is_empty());
+                                        && input.as_object().is_some_and(|o| !o.is_empty());
                                     if has_real_input {
                                         if let Some(idx) = persist_idx {
                                             if let Some(record) = events_to_persist.get_mut(*idx) {

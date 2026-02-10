@@ -45,17 +45,15 @@ impl AuthUser {
 impl FromRequestParts<OrchestratorState> for AuthUser {
     type Rejection = AppError;
 
-    fn from_request_parts(
+    async fn from_request_parts(
         parts: &mut Parts,
         _state: &OrchestratorState,
-    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        async {
-            let claims = parts.extensions.get::<Claims>().ok_or_else(|| {
-                AppError::Unauthorized("Authentication required — no claims in request".to_string())
-            })?;
+    ) -> Result<Self, Self::Rejection> {
+        let claims = parts.extensions.get::<Claims>().ok_or_else(|| {
+            AppError::Unauthorized("Authentication required — no claims in request".to_string())
+        })?;
 
-            Self::from_claims(claims)
-        }
+        Self::from_claims(claims)
     }
 }
 
