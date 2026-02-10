@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use project_orchestrator::{orchestrator::Orchestrator, AppState, Config};
+use project_orchestrator::{orchestrator::Orchestrator, update, AppState, Config};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -37,6 +37,13 @@ enum Commands {
         /// Directory path to sync
         #[arg(short, long, default_value = ".")]
         path: String,
+    },
+
+    /// Check for updates and optionally install them
+    Update {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -75,7 +82,75 @@ async fn main() -> Result<()> {
             project_orchestrator::start_server(config).await
         }
         Commands::Sync { path } => run_sync(config, &path).await,
+        Commands::Update { check } => run_update(check).await,
     }
+}
+
+async fn run_update(check_only: bool) -> Result<()> {
+    println!("Checking for updates...");
+
+    let info = match update::check_for_update().await? {
+        Some(info) => info,
+        None => {
+            println!(
+                "You're already on the latest version (v{}).",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+    };
+
+    println!();
+    println!(
+        "  New version available: v{} (current: v{})",
+        info.latest_version, info.current_version
+    );
+    println!("  Release: {}", info.html_url);
+
+    if let Some(notes) = &info.release_notes {
+        let preview: Vec<&str> = notes.lines().take(10).collect();
+        println!();
+        println!("  Release notes:");
+        for line in &preview {
+            println!("    {}", line);
+        }
+        if notes.lines().count() > 10 {
+            println!("    ...");
+        }
+    }
+
+    if check_only {
+        println!();
+        println!("Run `orchestrator update` to install this update.");
+        return Ok(());
+    }
+
+    // Ask for confirmation
+    println!();
+    print!("  Install update? [Y/n] ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+
+    if !input.is_empty() && input != "y" && input != "yes" {
+        println!("Update cancelled.");
+        return Ok(());
+    }
+
+    println!();
+    match update::perform_update(&info).await? {
+        update::UpdateStatus::Updated { from, to } => {
+            println!("  Successfully updated from v{} to v{}!", from, to);
+            println!("  Please restart orchestrator to use the new version.");
+        }
+        update::UpdateStatus::AlreadyUpToDate => {
+            println!("  Already up to date.");
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_sync(config: Config, path: &str) -> Result<()> {

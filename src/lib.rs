@@ -18,6 +18,7 @@ pub mod notes;
 pub mod orchestrator;
 pub mod parser;
 pub mod plan;
+pub mod update;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
