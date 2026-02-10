@@ -41,6 +41,20 @@ class ProjectOrchestrator < Formula
     bin.install "orchestrator"
   end
 
+  def caveats
+    <<~EOS
+      To start the server:
+        brew services start project-orchestrator
+        # or: orchestrator serve
+
+      To configure Claude Code integration:
+        orchestrator setup-claude
+        (auto-configures the MCP server in Claude Code)
+
+      Before starting, ensure Neo4j and MeiliSearch are running.
+    EOS
+  end
+
   test do
     assert_match version.to_s, shell_output("#{bin}/orchestrator --version")
   end

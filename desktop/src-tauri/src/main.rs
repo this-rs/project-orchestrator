@@ -107,6 +107,7 @@ fn main() {
             setup::get_config_path,
             setup::generate_config,
             setup::detect_claude_code,
+            setup::setup_claude_code,
             // Docker management commands
             docker::check_docker,
             docker::start_docker_services,

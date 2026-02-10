@@ -274,32 +274,59 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
 /// Detect if Claude Code CLI is available on this machine.
 #[tauri::command]
 pub fn detect_claude_code() -> Result<bool, String> {
-    // Try `which claude` on Unix or `where claude` on Windows
-    #[cfg(unix)]
-    let result = std::process::Command::new("which")
-        .arg("claude")
-        .output();
+    Ok(project_orchestrator::setup_claude::detect_claude_cli().is_some())
+}
 
-    #[cfg(windows)]
-    let result = std::process::Command::new("where")
-        .arg("claude")
-        .output();
+/// Result of the Claude Code MCP setup, sent to the frontend.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeSetupResult {
+    pub success: bool,
+    pub method: String, // "cli", "file", "already_configured", "error"
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+}
 
-    match result {
-        Ok(output) => {
-            let found = output.status.success();
-            if found {
-                let path = String::from_utf8_lossy(&output.stdout);
-                tracing::info!("Claude Code CLI found at: {}", path.trim());
-            } else {
-                tracing::info!("Claude Code CLI not found");
+/// Configure Claude Code to use the Project Orchestrator MCP server.
+///
+/// Reuses the shared logic from `project_orchestrator::setup_claude`:
+/// 1. If already configured → returns immediately
+/// 2. Tries `claude mcp add` if CLI is available
+/// 3. Falls back to editing `~/.claude/mcp.json` directly
+#[tauri::command]
+pub fn setup_claude_code(server_url: Option<String>) -> ClaudeSetupResult {
+    match project_orchestrator::setup_claude::setup_claude_code(server_url.as_deref()) {
+        Ok(result) => match result {
+            project_orchestrator::setup_claude::SetupResult::ConfiguredViaCli => ClaudeSetupResult {
+                success: true,
+                method: "cli".into(),
+                message: "Claude Code configured via CLI (claude mcp add)".into(),
+                file_path: None,
+            },
+            project_orchestrator::setup_claude::SetupResult::ConfiguredViaFile { path } => {
+                ClaudeSetupResult {
+                    success: true,
+                    method: "file".into(),
+                    message: format!("Claude Code configured by editing {}", path.display()),
+                    file_path: Some(path.display().to_string()),
+                }
             }
-            Ok(found)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to detect Claude Code: {}", e);
-            Ok(false)
-        }
+            project_orchestrator::setup_claude::SetupResult::AlreadyConfigured => {
+                ClaudeSetupResult {
+                    success: true,
+                    method: "already_configured".into(),
+                    message: "Project Orchestrator is already configured in Claude Code".into(),
+                    file_path: None,
+                }
+            }
+        },
+        Err(e) => ClaudeSetupResult {
+            success: false,
+            method: "error".into(),
+            message: format!("Failed to configure: {}", e),
+            file_path: None,
+        },
     }
 }
 

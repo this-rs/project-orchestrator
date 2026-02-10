@@ -78,6 +78,9 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Home directory detection
+dirs = "6"
+
 # Config
 dotenvy = "0.15"
 urlencoding = "2.1.3"

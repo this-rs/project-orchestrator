@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use project_orchestrator::{orchestrator::Orchestrator, update, AppState, Config};
+use project_orchestrator::{orchestrator::Orchestrator, setup_claude, update, AppState, Config};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -45,6 +45,13 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+
+    /// Configure Claude Code to use this server as MCP provider
+    SetupClaude {
+        /// MCP server URL (default: http://localhost:8080/mcp/sse)
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -83,6 +90,51 @@ async fn main() -> Result<()> {
         }
         Commands::Sync { path } => run_sync(config, &path).await,
         Commands::Update { check } => run_update(check).await,
+        Commands::SetupClaude { url } => {
+            run_setup_claude(url.as_deref());
+            Ok(())
+        }
+    }
+}
+
+fn run_setup_claude(url: Option<&str>) {
+    println!("Configuring Claude Code MCP server...");
+    println!();
+
+    match setup_claude::setup_claude_code(url) {
+        Ok(setup_claude::SetupResult::ConfiguredViaCli) => {
+            println!("  Claude Code configured via CLI.");
+            println!();
+            println!("  The MCP server has been added. You can verify with:");
+            println!("    claude mcp list");
+        }
+        Ok(setup_claude::SetupResult::ConfiguredViaFile { path }) => {
+            println!("  Claude Code configured via {}.", path.display());
+            println!();
+            println!("  The MCP server entry has been added to your mcp.json.");
+            println!("  Restart Claude Code to pick up the changes.");
+        }
+        Ok(setup_claude::SetupResult::AlreadyConfigured) => {
+            println!("  Project Orchestrator is already configured in Claude Code.");
+            println!("  No changes made.");
+        }
+        Err(e) => {
+            eprintln!("  Failed to configure Claude Code: {}", e);
+            eprintln!();
+            eprintln!("  You can configure it manually:");
+            eprintln!("    claude mcp add project-orchestrator --transport sse --url {}",
+                url.unwrap_or("http://localhost:8080/mcp/sse"));
+            eprintln!();
+            eprintln!("  Or add to ~/.claude/mcp.json:");
+            eprintln!("    {{");
+            eprintln!("      \"mcpServers\": {{");
+            eprintln!("        \"project-orchestrator\": {{");
+            eprintln!("          \"type\": \"sse\",");
+            eprintln!("          \"url\": \"{}\"", url.unwrap_or("http://localhost:8080/mcp/sse"));
+            eprintln!("        }}");
+            eprintln!("      }}");
+            eprintln!("    }}");
+        }
     }
 }
 
