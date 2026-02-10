@@ -138,19 +138,25 @@ async fn main() -> Result<()> {
     };
 
     // Create event emitter: prefer NATS, fallback to HTTP (deprecated), or none
-    let event_emitter: Option<Arc<dyn project_orchestrator::events::EventEmitter>> =
-        if let Some(ref nats_url) = args.nats_url {
-            match connect_nats(nats_url).await {
-                Ok(client) => {
-                    let emitter = Arc::new(NatsEmitter::new(client, "events"));
-                    info!("MCP events will be published via NATS");
-                    Some(emitter)
-                }
-                Err(e) => {
-                    warn!("Failed to connect to NATS: {} — events will not be forwarded", e);
-                    None
-                }
+    let nats_emitter: Option<Arc<NatsEmitter>> = if let Some(ref nats_url) = args.nats_url {
+        match connect_nats(nats_url).await {
+            Ok(client) => {
+                let emitter = Arc::new(NatsEmitter::new(client, "events"));
+                info!("MCP events will be published via NATS");
+                Some(emitter)
             }
+            Err(e) => {
+                warn!("Failed to connect to NATS: {} — events will not be forwarded", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let event_emitter: Option<Arc<dyn project_orchestrator::events::EventEmitter>> =
+        if let Some(ref nats) = nats_emitter {
+            Some(nats.clone() as Arc<dyn project_orchestrator::events::EventEmitter>)
         } else if let Some(ref http_url) = args.http_url {
             // Legacy fallback: HTTP POST bridge (deprecated)
             let notifier = Arc::new(EventNotifier::new(http_url));
@@ -180,14 +186,16 @@ async fn main() -> Result<()> {
 
     // Create ChatManager
     let chat_config = ChatConfig::from_env();
-    let chat_manager = Arc::new(
-        ChatManager::new(
-            orchestrator.neo4j_arc(),
-            orchestrator.meili_arc(),
-            chat_config,
-        )
-        .await,
-    );
+    let mut cm = ChatManager::new(
+        orchestrator.neo4j_arc(),
+        orchestrator.meili_arc(),
+        chat_config,
+    )
+    .await;
+    if let Some(ref nats) = nats_emitter {
+        cm = cm.with_nats(nats.clone());
+    }
+    let chat_manager = Arc::new(cm);
     chat_manager.start_cleanup_task();
     info!("Chat manager initialized");
 

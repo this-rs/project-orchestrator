@@ -533,15 +533,17 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Create chat manager (optional — requires Claude CLI)
     let chat_manager = {
         let chat_config = chat::ChatConfig::from_env();
-        let cm = Arc::new(
-            chat::ChatManager::new(
-                orchestrator.neo4j_arc(),
-                orchestrator.meili_arc(),
-                chat_config,
-            )
-            .await
-            .with_event_emitter(event_bus.clone()),
-        );
+        let mut cm = chat::ChatManager::new(
+            orchestrator.neo4j_arc(),
+            orchestrator.meili_arc(),
+            chat_config,
+        )
+        .await
+        .with_event_emitter(event_bus.clone());
+        if let Some(ref nats) = nats_emitter {
+            cm = cm.with_nats(nats.clone());
+        }
+        let cm = Arc::new(cm);
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");
         Some(cm)

@@ -33,6 +33,8 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::expand_tilde;
+
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
 
@@ -77,6 +79,8 @@ pub struct ChatManager {
     pub(crate) memory_config: Option<MemoryConfig>,
     /// Event emitter for CRUD events (streaming status changes)
     pub(crate) event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    /// Optional NATS emitter for cross-instance chat event publishing
+    pub(crate) nats: Option<Arc<crate::events::NatsEmitter>>,
 }
 
 impl ChatManager {
@@ -94,6 +98,7 @@ impl ChatManager {
             context_injector: None,
             memory_config: None,
             event_emitter: None,
+            nats: None,
         }
     }
 
@@ -129,6 +134,7 @@ impl ChatManager {
             context_injector,
             memory_config: Some(memory_config),
             event_emitter: None,
+            nats: None,
         }
     }
 
@@ -136,6 +142,83 @@ impl ChatManager {
     pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
         self.event_emitter = Some(emitter);
         self
+    }
+
+    /// Set the NATS emitter for cross-instance chat event publishing.
+    ///
+    /// When configured, ChatEvents are published to NATS alongside the local
+    /// broadcast channel, enabling multi-instance real-time sync.
+    /// Interrupts are also propagated via NATS to all instances.
+    pub fn with_nats(mut self, nats: Arc<crate::events::NatsEmitter>) -> Self {
+        self.nats = Some(nats);
+        self
+    }
+
+    /// Spawn a background task that listens for NATS interrupt signals for a session.
+    ///
+    /// When another instance publishes an interrupt for this session via NATS,
+    /// the listener sets the local `interrupt_flag` so the stream loop breaks.
+    /// No-op if NATS is not configured.
+    fn spawn_nats_interrupt_listener(
+        &self,
+        session_id: &str,
+        interrupt_flag: Arc<AtomicBool>,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    ) {
+        let Some(ref nats) = self.nats else {
+            return;
+        };
+
+        let nats = nats.clone();
+        let session_id = session_id.to_string();
+
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_interrupt(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(
+                        "Failed to subscribe to NATS interrupt for session {}: {}",
+                        session_id, e
+                    );
+                    return;
+                }
+            };
+
+            while let Some(_msg) = subscriber.next().await {
+                // Check if session is still active — stop listener if session was removed
+                let session_exists = {
+                    let sessions = active_sessions.read().await;
+                    sessions.contains_key(&session_id)
+                };
+                if !session_exists {
+                    debug!(
+                        "Session {} no longer active, stopping NATS interrupt listener",
+                        session_id
+                    );
+                    break;
+                }
+
+                // Guard: don't re-interrupt if the flag is already set
+                if interrupt_flag.load(Ordering::SeqCst) {
+                    debug!(
+                        "Interrupt flag already set for session {}, ignoring NATS interrupt",
+                        session_id
+                    );
+                    continue;
+                }
+
+                info!(
+                    "NATS interrupt received for session {}, setting interrupt flag",
+                    session_id
+                );
+                interrupt_flag.store(true, Ordering::SeqCst);
+            }
+
+            debug!(
+                "NATS interrupt listener stopped for session {}",
+                session_id
+            );
+        });
     }
 
     /// Resolve the model to use: request > config default
@@ -268,6 +351,8 @@ impl ChatManager {
         system_prompt: &str,
         resume_id: Option<&str>,
     ) -> ClaudeCodeOptions {
+        // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
+        let cwd = expand_tilde(cwd);
         let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
 
         let mut env = HashMap::new();
@@ -550,6 +635,13 @@ impl ChatManager {
             interrupt_flag
         };
 
+        // Spawn NATS interrupt listener for cross-instance interrupt support
+        self.spawn_nats_interrupt_listener(
+            &session_id.to_string(),
+            interrupt_flag.clone(),
+            self.active_sessions.clone(),
+        );
+
         // Persist the initial user_message event
         let user_event = ChatEventRecord {
             id: Uuid::new_v4(),
@@ -565,10 +657,14 @@ impl ChatManager {
             .store_chat_events(session_id, vec![user_event])
             .await;
 
-        // Emit user_message on the broadcast (so other WS clients see it)
-        let _ = events_tx.send(ChatEvent::UserMessage {
+        // Emit user_message on local broadcast + NATS (so all clients see it)
+        let user_msg_event = ChatEvent::UserMessage {
             content: request.message.clone(),
-        });
+        };
+        let _ = events_tx.send(user_msg_event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(&session_id.to_string(), user_msg_event);
+        }
 
         // Auto-generate title and preview from the first user message
         {
@@ -607,6 +703,7 @@ impl ChatManager {
         let events_tx_clone = events_tx.clone();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
+        let nats = self.nats.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -625,6 +722,7 @@ impl ChatManager {
                 streaming_text,
                 streaming_events,
                 event_emitter,
+                nats,
             )
             .await;
         });
@@ -653,10 +751,27 @@ impl ChatManager {
         streaming_text: Arc<Mutex<String>>,
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
         event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
     ) {
+        // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
+        let emit_chat = |event: ChatEvent,
+                         tx: &broadcast::Sender<ChatEvent>,
+                         nats: &Option<Arc<crate::events::NatsEmitter>>,
+                         sid: &str| {
+            let _ = tx.send(event.clone());
+            if let Some(ref nats) = nats {
+                nats.publish_chat_event(sid, event);
+            }
+        };
+
         is_streaming.store(true, Ordering::SeqCst);
         // Broadcast streaming_status to all connected clients (multi-tab support)
-        let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: true });
+        emit_chat(
+            ChatEvent::StreamingStatus { is_streaming: true },
+            &events_tx,
+            &nats,
+            &session_id,
+        );
         // Emit CRUD event for session list live refresh
         if let Some(ref emitter) = event_emitter {
             emitter.emit_updated(
@@ -699,9 +814,14 @@ impl ChatManager {
                 Ok(s) => std::pin::pin!(s),
                 Err(e) => {
                     error!("Error starting stream for session {}: {}", session_id, e);
-                    let _ = events_tx.send(ChatEvent::Error {
-                        message: format!("Error: {}", e),
-                    });
+                    emit_chat(
+                        ChatEvent::Error {
+                            message: format!("Error: {}", e),
+                        },
+                        &events_tx,
+                        &nats,
+                        &session_id,
+                    );
                     is_streaming.store(false, Ordering::SeqCst);
                     if let Some(ref emitter) = event_emitter {
                         emitter.emit_updated(
@@ -742,7 +862,12 @@ impl ChatManager {
                         {
                             // Accumulate for mid-stream join snapshot
                             streaming_text.lock().await.push_str(text);
-                            let _ = events_tx.send(ChatEvent::StreamDelta { text: text.clone() });
+                            emit_chat(
+                                ChatEvent::StreamDelta { text: text.clone() },
+                                &events_tx,
+                                &nats,
+                                &session_id,
+                            );
                             continue;
                         }
 
@@ -830,10 +955,15 @@ impl ChatManager {
                                         }
                                         // Emit ToolUseInputResolved so the frontend can
                                         // update the existing tool_use block's input
-                                        let _ = events_tx.send(ChatEvent::ToolUseInputResolved {
-                                            id: id.clone(),
-                                            input: input.clone(),
-                                        });
+                                        emit_chat(
+                                            ChatEvent::ToolUseInputResolved {
+                                                id: id.clone(),
+                                                input: input.clone(),
+                                            },
+                                            &events_tx,
+                                            &nats,
+                                            &session_id,
+                                        );
                                     }
                                     debug!("Skipping duplicate ToolUse broadcast (id={}), sent input_resolved", id);
                                     continue;
@@ -879,14 +1009,19 @@ impl ChatManager {
                                 streaming_events.lock().await.push(event.clone());
                             }
 
-                            let _ = events_tx.send(event);
+                            emit_chat(event, &events_tx, &nats, &session_id);
                         }
                     }
                     Err(e) => {
                         error!("Stream error for session {}: {}", session_id, e);
-                        let _ = events_tx.send(ChatEvent::Error {
-                            message: format!("Error: {}", e),
-                        });
+                        emit_chat(
+                            ChatEvent::Error {
+                                message: format!("Error: {}", e),
+                            },
+                            &events_tx,
+                            &nats,
+                            &session_id,
+                        );
                         break;
                     }
                 }
@@ -944,9 +1079,14 @@ impl ChatManager {
 
         is_streaming.store(false, Ordering::SeqCst);
         // Broadcast streaming_status=false to all connected clients (multi-tab support)
-        let _ = events_tx.send(ChatEvent::StreamingStatus {
-            is_streaming: false,
-        });
+        emit_chat(
+            ChatEvent::StreamingStatus {
+                is_streaming: false,
+            },
+            &events_tx,
+            &nats,
+            &session_id,
+        );
         // Emit CRUD event for session list live refresh
         if let Some(ref emitter) = event_emitter {
             emitter.emit_updated(
@@ -1001,10 +1141,15 @@ impl ChatManager {
                 let _ = graph.store_chat_events(uuid, vec![user_event]).await;
             }
 
-            // Emit user_message on broadcast
-            let _ = events_tx.send(ChatEvent::UserMessage {
-                content: next_msg.clone(),
-            });
+            // Emit user_message on broadcast + NATS
+            emit_chat(
+                ChatEvent::UserMessage {
+                    content: next_msg.clone(),
+                },
+                &events_tx,
+                &nats,
+                &session_id,
+            );
 
             // Recursive call to process the queued message
             // Use Box::pin to handle recursive async
@@ -1024,6 +1169,7 @@ impl ChatManager {
                 streaming_text,
                 streaming_events,
                 event_emitter,
+                nats,
             ))
             .await;
         }
@@ -1112,10 +1258,14 @@ impl ChatManager {
             let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
         }
 
-        // Emit user_message on broadcast (visible to all WS clients)
-        let _ = events_tx.send(ChatEvent::UserMessage {
+        // Emit user_message on local broadcast + NATS (visible to all clients)
+        let user_msg_event = ChatEvent::UserMessage {
             content: message.to_string(),
-        });
+        };
+        let _ = events_tx.send(user_msg_event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, user_msg_event);
+        }
 
         // Start streaming directly
         let session_id_str = session_id.to_string();
@@ -1124,6 +1274,7 @@ impl ChatManager {
         let prompt = message.to_string();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
+        let nats = self.nats.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -1142,6 +1293,7 @@ impl ChatManager {
                 streaming_text,
                 streaming_events,
                 event_emitter,
+                nats,
             )
             .await;
         });
@@ -1149,7 +1301,10 @@ impl ChatManager {
         Ok(())
     }
 
-    /// Resume a previously inactive session by creating a new InteractiveClient with --resume
+    /// Resume a previously inactive session by creating a new InteractiveClient.
+    ///
+    /// If the session has a `cli_session_id`, resumes with `--resume`.
+    /// If not (first message or previous spawn failed), starts fresh without `--resume`.
     pub async fn resume_session(&self, session_id: &str, message: &str) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
@@ -1161,17 +1316,21 @@ impl ChatManager {
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
 
-        let cli_session_id = session_node
-            .cli_session_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("Session {} has no CLI session ID for resume", session_id))?;
+        let cli_session_id = session_node.cli_session_id.as_deref();
 
-        info!(
-            "Resuming session {} with CLI ID {}",
-            session_id, cli_session_id
-        );
+        if let Some(cli_id) = cli_session_id {
+            info!(
+                "Resuming session {} with CLI ID {}",
+                session_id, cli_id
+            );
+        } else {
+            info!(
+                "Starting fresh CLI for session {} (no previous cli_session_id)",
+                session_id
+            );
+        }
 
-        // Build options with resume flag
+        // Build options - with resume flag only if we have a cli_session_id
         let system_prompt = self
             .build_system_prompt(session_node.project_slug.as_deref(), message)
             .await;
@@ -1179,7 +1338,7 @@ impl ChatManager {
             &session_node.cwd,
             &session_node.model,
             &system_prompt,
-            Some(cli_session_id),
+            cli_session_id,
         );
 
         // Create new InteractiveClient with --resume
@@ -1244,7 +1403,7 @@ impl ChatManager {
                 ActiveSession {
                     events_tx: events_tx.clone(),
                     last_activity: Instant::now(),
-                    cli_session_id: Some(cli_session_id.to_string()),
+                    cli_session_id: cli_session_id.map(|s| s.to_string()),
                     client: client.clone(),
                     interrupt_flag: interrupt_flag.clone(),
                     memory_manager: memory_manager.clone(),
@@ -1258,6 +1417,13 @@ impl ChatManager {
             interrupt_flag
         };
 
+        // Spawn NATS interrupt listener for cross-instance interrupt support
+        self.spawn_nats_interrupt_listener(
+            session_id,
+            interrupt_flag.clone(),
+            self.active_sessions.clone(),
+        );
+
         // Persist the user_message event
         let user_event = ChatEventRecord {
             id: Uuid::new_v4(),
@@ -1270,10 +1436,14 @@ impl ChatManager {
         };
         let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
 
-        // Emit user_message on broadcast
-        let _ = events_tx.send(ChatEvent::UserMessage {
+        // Emit user_message on local broadcast + NATS
+        let user_msg_event = ChatEvent::UserMessage {
             content: message.to_string(),
-        });
+        };
+        let _ = events_tx.send(user_msg_event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, user_msg_event);
+        }
 
         // Stream in background
         let session_id_str = session_id.to_string();
@@ -1282,6 +1452,7 @@ impl ChatManager {
         let prompt = message.to_string();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
+        let nats = self.nats.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -1300,6 +1471,7 @@ impl ChatManager {
                 streaming_text,
                 streaming_events,
                 event_emitter,
+                nats,
             )
             .await;
         });
@@ -1617,6 +1789,11 @@ impl ChatManager {
         // Set the flag — the stream loop checks this on every iteration
         // and will break + release the lock + send the actual interrupt signal
         interrupt_flag.store(true, Ordering::SeqCst);
+
+        // Publish interrupt to NATS so other instances can also stop
+        if let Some(ref nats) = self.nats {
+            nats.publish_interrupt(session_id);
+        }
 
         info!("Interrupt flag set for session {}", session_id);
         Ok(())
@@ -2360,7 +2537,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resume_session_no_cli_session_id() {
+    async fn test_resume_session_no_cli_session_id_starts_fresh() {
+        // When a session has no cli_session_id (first message or previous spawn failed),
+        // resume_session should attempt to start a fresh CLI (not error immediately).
+        // In CI without Claude CLI, this will fail at InteractiveClient creation,
+        // but the error should NOT be "no CLI session ID".
         let state = mock_app_state();
         let session = test_chat_session(None); // no cli_session_id
         state.neo4j.create_chat_session(&session).await.unwrap();
@@ -2370,11 +2551,14 @@ mod tests {
         let result = manager
             .resume_session(&session.id.to_string(), "hello")
             .await;
+        // Should fail (CLI not available in test), but NOT with "no CLI session ID"
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no CLI session ID"));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("no CLI session ID"),
+            "Should not fail with 'no CLI session ID', got: {}",
+            err_msg
+        );
     }
 
     // ====================================================================
