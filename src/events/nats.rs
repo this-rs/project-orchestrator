@@ -1,9 +1,12 @@
 //! NATS-based event emitter for inter-process event synchronization
 //!
 //! Publishes CrudEvents to NATS subjects for cross-instance communication.
-//! Fire-and-forget: errors are logged but never block the caller.
+//! Also handles chat event pub/sub and interrupt signaling via NATS.
+//!
+//! Fire-and-forget publishing: errors are logged but never block the caller.
 
 use super::types::{CrudEvent, EventEmitter};
+use crate::chat::types::ChatEvent;
 use tracing::{debug, warn};
 
 /// NATS event emitter that publishes CrudEvents to NATS subjects.
@@ -46,6 +49,136 @@ impl NatsEmitter {
     /// Build the CRUD events subject (e.g. "events.crud").
     fn crud_subject(&self) -> String {
         format!("{}.crud", self.subject_prefix)
+    }
+
+    // ========================================================================
+    // Chat event pub/sub
+    // ========================================================================
+
+    /// Build the chat events subject for a session (e.g. "events.chat.{session_id}").
+    pub fn chat_subject(&self, session_id: &str) -> String {
+        format!("{}.chat.{}", self.subject_prefix, session_id)
+    }
+
+    /// Build the interrupt subject for a session (e.g. "events.chat.{session_id}.interrupt").
+    pub fn interrupt_subject(&self, session_id: &str) -> String {
+        format!("{}.chat.{}.interrupt", self.subject_prefix, session_id)
+    }
+
+    /// Publish a ChatEvent to the session's NATS subject.
+    ///
+    /// Fire-and-forget: errors are logged but never block the caller.
+    pub fn publish_chat_event(&self, session_id: &str, event: ChatEvent) {
+        let client = self.client.clone();
+        let subject = self.chat_subject(session_id);
+
+        tokio::spawn(async move {
+            match serde_json::to_vec(&event) {
+                Ok(payload) => {
+                    if let Err(e) = client.publish(subject.clone(), payload.into()).await {
+                        warn!(
+                            subject = %subject,
+                            event_type = %event.event_type(),
+                            "Failed to publish ChatEvent to NATS: {}",
+                            e
+                        );
+                    } else {
+                        debug!(
+                            subject = %subject,
+                            event_type = %event.event_type(),
+                            "ChatEvent published to NATS"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        event_type = %event.event_type(),
+                        "Failed to serialize ChatEvent for NATS: {}",
+                        e
+                    );
+                }
+            }
+        });
+    }
+
+    /// Publish an interrupt signal for a chat session.
+    ///
+    /// The payload is a simple JSON `{"interrupt": true}` message.
+    /// Fire-and-forget: errors are logged but never block the caller.
+    pub fn publish_interrupt(&self, session_id: &str) {
+        let client = self.client.clone();
+        let subject = self.interrupt_subject(session_id);
+
+        tokio::spawn(async move {
+            let payload = b"{\"interrupt\":true}";
+            if let Err(e) = client
+                .publish(subject.clone(), payload.to_vec().into())
+                .await
+            {
+                warn!(
+                    subject = %subject,
+                    "Failed to publish interrupt to NATS: {}",
+                    e
+                );
+            } else {
+                debug!(
+                    subject = %subject,
+                    "Interrupt published to NATS"
+                );
+            }
+        });
+    }
+
+    /// Subscribe to chat events for a session from NATS.
+    ///
+    /// Returns a NATS subscriber that yields messages on `events.chat.{session_id}`.
+    /// Each message payload is a JSON-serialized `ChatEvent`.
+    pub async fn subscribe_chat_events(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.chat_subject(session_id);
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!("Failed to subscribe to NATS chat events {}: {}", subject, e)
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS chat events");
+        Ok(subscriber)
+    }
+
+    /// Subscribe to interrupt signals for a session from NATS.
+    ///
+    /// Returns a NATS subscriber that yields messages on `events.chat.{session_id}.interrupt`.
+    pub async fn subscribe_interrupt(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.interrupt_subject(session_id);
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to subscribe to NATS interrupt {}: {}",
+                subject,
+                e
+            )
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS interrupt");
+        Ok(subscriber)
+    }
+
+    /// Subscribe to CRUD events from NATS.
+    ///
+    /// Returns a NATS subscriber that yields messages on `events.crud`.
+    /// Each message payload is a JSON-serialized `CrudEvent`.
+    pub async fn subscribe_crud_events(&self) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.crud_subject();
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to subscribe to NATS CRUD events {}: {}",
+                subject,
+                e
+            )
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS CRUD events");
+        Ok(subscriber)
     }
 }
 
@@ -104,18 +237,57 @@ mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType};
 
+    // ========================================================================
+    // Subject construction
+    // ========================================================================
+
     #[test]
     fn test_crud_subject() {
-        // We can't easily create a real async_nats::Client in tests without a server,
-        // but we can test the subject construction logic indirectly.
         let subject_prefix = "events";
         let subject = format!("{}.crud", subject_prefix);
         assert_eq!(subject, "events.crud");
     }
 
     #[test]
+    fn test_subject_prefix_custom() {
+        let prefix = "myapp.events";
+        let subject = format!("{}.crud", prefix);
+        assert_eq!(subject, "myapp.events.crud");
+    }
+
+    #[test]
+    fn test_chat_subject() {
+        let prefix = "events";
+        let session_id = "abc-123";
+        let subject = format!("{}.chat.{}", prefix, session_id);
+        assert_eq!(subject, "events.chat.abc-123");
+    }
+
+    #[test]
+    fn test_interrupt_subject() {
+        let prefix = "events";
+        let session_id = "abc-123";
+        let subject = format!("{}.chat.{}.interrupt", prefix, session_id);
+        assert_eq!(subject, "events.chat.abc-123.interrupt");
+    }
+
+    #[test]
+    fn test_chat_subject_with_custom_prefix() {
+        let prefix = "po.dev";
+        let session_id = "sess-456";
+        let subject = format!("{}.chat.{}", prefix, session_id);
+        assert_eq!(subject, "po.dev.chat.sess-456");
+
+        let interrupt = format!("{}.chat.{}.interrupt", prefix, session_id);
+        assert_eq!(interrupt, "po.dev.chat.sess-456.interrupt");
+    }
+
+    // ========================================================================
+    // Serialization
+    // ========================================================================
+
+    #[test]
     fn test_crud_event_serialization_for_nats() {
-        // Verify that CrudEvent serializes to JSON correctly for NATS transport
         let event = CrudEvent::new(EntityType::Plan, CrudAction::Created, "plan-123")
             .with_payload(serde_json::json!({"title": "Test Plan"}))
             .with_project_id("proj-456");
@@ -130,9 +302,67 @@ mod tests {
     }
 
     #[test]
-    fn test_subject_prefix_custom() {
-        let prefix = "myapp.events";
-        let subject = format!("{}.crud", prefix);
-        assert_eq!(subject, "myapp.events.crud");
+    fn test_chat_event_serialization_for_nats() {
+        // Verify all ChatEvent variants serialize/deserialize correctly for NATS
+        let events = vec![
+            ChatEvent::UserMessage {
+                content: "Hello".into(),
+            },
+            ChatEvent::AssistantText {
+                content: "Hi there!".into(),
+            },
+            ChatEvent::Thinking {
+                content: "Let me think...".into(),
+            },
+            ChatEvent::ToolUse {
+                id: "tu_1".into(),
+                tool: "create_plan".into(),
+                input: serde_json::json!({"title": "Plan"}),
+            },
+            ChatEvent::ToolResult {
+                id: "tu_1".into(),
+                result: serde_json::json!({"id": "abc"}),
+                is_error: false,
+            },
+            ChatEvent::ToolUseInputResolved {
+                id: "tu_1".into(),
+                input: serde_json::json!({"title": "Resolved"}),
+            },
+            ChatEvent::PermissionRequest {
+                id: "pr_1".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            ChatEvent::InputRequest {
+                prompt: "Choose:".into(),
+                options: Some(vec!["A".into(), "B".into()]),
+            },
+            ChatEvent::Result {
+                session_id: "sess-1".into(),
+                duration_ms: 5000,
+                cost_usd: Some(0.15),
+            },
+            ChatEvent::StreamDelta {
+                text: "tok".into(),
+            },
+            ChatEvent::StreamingStatus { is_streaming: true },
+            ChatEvent::Error {
+                message: "fail".into(),
+            },
+        ];
+
+        for event in &events {
+            let payload = serde_json::to_vec(event).unwrap();
+            let deserialized: ChatEvent = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(event.event_type(), deserialized.event_type());
+        }
+    }
+
+    #[test]
+    fn test_interrupt_payload() {
+        // Verify the interrupt payload is valid JSON
+        let payload = b"{\"interrupt\":true}";
+        let parsed: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(parsed["interrupt"], true);
     }
 }
