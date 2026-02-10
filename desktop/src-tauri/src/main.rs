@@ -7,6 +7,7 @@ mod tray;
 mod updater;
 
 use project_orchestrator::Config;
+use tauri::Manager;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Tauri command: get the server port for the frontend to connect to
@@ -41,60 +42,10 @@ fn main() {
     // Initialize Docker manager (shared state for Tauri commands)
     let docker_manager = docker::create_docker_manager();
 
-    // Check if this is first launch (no config.yaml)
-    let has_config = setup::check_config_exists();
-
-    if has_config {
-        // Config exists — load and start the backend server immediately
-        let config = match Config::from_env() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to load config: {}. Please check your config.yaml or env vars.",
-                    e
-                );
-                std::process::exit(1);
-            }
-        };
-
-        let port = config.server_port;
-
-        // Start the backend server in a background thread
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(async {
-                if let Err(e) = project_orchestrator::start_server(config).await {
-                    tracing::error!("Server error: {}", e);
-                }
-            });
-        });
-
-        // Wait for the server to be ready
-        tracing::info!("Waiting for backend server on port {}...", port);
-        let health_url = format!("http://localhost:{}/health", port);
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() > std::time::Duration::from_secs(30) {
-                tracing::error!("Backend server did not start within 30 seconds");
-                break;
-            }
-            if let Ok(resp) = reqwest::blocking::get(&health_url) {
-                if resp.status().is_success() {
-                    tracing::info!("Backend server is ready!");
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-    } else {
-        tracing::info!("No config.yaml found — launching setup wizard");
-        // The frontend will detect the absence of config and show /setup
-    }
-
     // Clone docker manager for the exit handler
     let docker_for_exit = docker_manager.clone();
 
-    // Launch Tauri application
+    // Launch Tauri application (splash screen shows immediately)
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -127,6 +78,66 @@ fn main() {
             tray::setup_minimize_to_tray(app.handle());
             // Check for updates in background
             updater::check_for_updates(app.handle().clone());
+
+            // Start backend server and manage splash → main window transition
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let has_config = setup::check_config_exists();
+
+                if has_config {
+                    // Load config and start server
+                    let config = match Config::from_env() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!("Failed to load config: {}", e);
+                            // Close splash, show main (which will display /setup or error)
+                            show_main_window(&handle);
+                            return;
+                        }
+                    };
+
+                    let port = config.server_port;
+
+                    // Start the backend server
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new()
+                            .expect("Failed to create tokio runtime");
+                        rt.block_on(async {
+                            if let Err(e) = project_orchestrator::start_server(config).await {
+                                tracing::error!("Server error: {}", e);
+                            }
+                        });
+                    });
+
+                    // Wait for the server to be ready
+                    tracing::info!("Waiting for backend server on port {}...", port);
+                    let health_url = format!("http://localhost:{}/health", port);
+                    let start = std::time::Instant::now();
+                    loop {
+                        if start.elapsed() > std::time::Duration::from_secs(30) {
+                            tracing::error!(
+                                "Backend server did not start within 30 seconds"
+                            );
+                            break;
+                        }
+                        if let Ok(resp) = reqwest::blocking::get(&health_url) {
+                            if resp.status().is_success() {
+                                tracing::info!("Backend server is ready!");
+                                break;
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                } else {
+                    tracing::info!("No config.yaml found — launching setup wizard");
+                    // Small delay so splash is visible briefly
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
+
+                // Transition: close splash → show main window
+                show_main_window(&handle);
+            });
+
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -150,4 +161,24 @@ fn main() {
             .ok();
         }
     });
+}
+
+/// Close the splash screen and show the main application window.
+fn show_main_window(handle: &tauri::AppHandle) {
+    // Close splash screen
+    if let Some(splash) = handle.get_webview_window("splashscreen") {
+        if let Err(e) = splash.close() {
+            tracing::warn!("Failed to close splash screen: {}", e);
+        }
+    }
+
+    // Show main window
+    if let Some(main_window) = handle.get_webview_window("main") {
+        if let Err(e) = main_window.show() {
+            tracing::warn!("Failed to show main window: {}", e);
+        }
+        if let Err(e) = main_window.set_focus() {
+            tracing::warn!("Failed to focus main window: {}", e);
+        }
+    }
 }

@@ -10,6 +10,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Project Orchestrator",
         "width": 1280,
         "height": 800,
@@ -17,7 +18,21 @@
         "minHeight": 600,
         "resizable": true,
         "fullscreen": false,
-        "center": true
+        "center": true,
+        "visible": false
+      },
+      {
+        "label": "splashscreen",
+        "title": "Project Orchestrator",
+        "url": "splash.html",
+        "width": 420,
+        "height": 480,
+        "resizable": false,
+        "fullscreen": false,
+        "center": true,
+        "decorations": false,
+        "transparent": false,
+        "alwaysOnTop": true
       }
     ],
     "security": {
@@ -34,9 +49,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [],
-    "copyright": "Copyright 2026 Elun / OpenClaw",
+    "resources": ["splash.html"],
+    "copyright": "Copyright 2026 - Freedom From Scratch",
     "category": "DeveloperTool",
+    "homepage": "https://github.com/this-rs/project-orchestrator",
     "shortDescription": "AI Agent Orchestrator with Knowledge Graph",
     "longDescription": "Project Orchestrator is an AI agent orchestrator with Neo4j knowledge graph, Meilisearch semantic search, and Tree-sitter code parsing. It provides a REST API, WebSocket events, and an embedded React frontend.",
     "macOS": {
