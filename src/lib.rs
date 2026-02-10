@@ -259,6 +259,26 @@ impl AuthConfig {
     pub fn has_oidc(&self) -> bool {
         self.effective_oidc().is_some()
     }
+
+    /// Ensure the root account password is bcrypt-hashed.
+    ///
+    /// If the password_hash field doesn't start with "$2b$" (bcrypt prefix),
+    /// it's treated as plaintext and hashed in-place with bcrypt cost 12.
+    /// Logs a warning when plaintext is detected to encourage using pre-hashed values.
+    pub fn ensure_root_password_hashed(&mut self) -> anyhow::Result<()> {
+        if let Some(ref mut root) = self.root_account {
+            if !root.password_hash.starts_with("$2b$") && !root.password_hash.starts_with("$2a$")
+            {
+                tracing::warn!(
+                    "Root account password is stored as plaintext in config.yaml — hashing at startup. \
+                     Consider pre-hashing with: echo -n 'password' | htpasswd -bnBC 12 '' | cut -d: -f2"
+                );
+                root.password_hash = bcrypt::hash(&root.password_hash, 12)
+                    .map_err(|e| anyhow::anyhow!("Failed to hash root password: {}", e))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================

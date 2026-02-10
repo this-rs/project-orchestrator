@@ -62,8 +62,10 @@ fn public_routes() -> Router<OrchestratorState> {
         // Health check
         .route("/health", get(handlers::health))
         // ================================================================
-        // Auth (public — login flow)
+        // Auth (public — login flow + discovery)
         // ================================================================
+        .route("/auth/providers", get(auth_handlers::get_auth_providers))
+        .route("/auth/login", post(auth_handlers::password_login))
         .route("/auth/google", get(auth_handlers::google_login))
         .route(
             "/auth/google/callback",

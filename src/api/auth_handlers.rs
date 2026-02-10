@@ -1,6 +1,7 @@
-//! Authentication route handlers — Google OAuth, JWT token, user info.
+//! Authentication route handlers — Google OAuth, password login, JWT token, user info.
 //!
 //! Endpoints:
+//! - `POST /auth/login`           — Email/password login (root account + Neo4j users)
 //! - `GET  /auth/google`          — Returns the Google OAuth authorization URL
 //! - `POST /auth/google/callback` — Exchanges auth code for JWT + user info
 //! - `GET  /auth/me`              — Returns the authenticated user (protected)
@@ -19,6 +20,13 @@ use uuid::Uuid;
 // ============================================================================
 // Request / Response types
 // ============================================================================
+
+/// Request body for POST /auth/login
+#[derive(Debug, Deserialize)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
 
 /// Response for GET /auth/google
 #[derive(Serialize)]
@@ -45,6 +53,23 @@ pub struct RefreshTokenResponse {
     pub token: String,
 }
 
+/// A single auth provider available for login
+#[derive(Debug, Serialize)]
+pub struct AuthProviderInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+}
+
+/// Response for GET /auth/providers — discovery endpoint
+#[derive(Debug, Serialize)]
+pub struct AuthProvidersResponse {
+    pub auth_required: bool,
+    pub providers: Vec<AuthProviderInfo>,
+    pub allow_registration: bool,
+}
+
 /// Public user info (safe to send to client)
 #[derive(Debug, Serialize)]
 pub struct UserResponse {
@@ -68,6 +93,150 @@ impl From<UserNode> for UserResponse {
 // ============================================================================
 // Handlers
 // ============================================================================
+
+/// GET /auth/providers — Discovery endpoint for available auth methods.
+///
+/// Returns which authentication providers are configured so the frontend
+/// can adapt its login UI dynamically. This endpoint is always public.
+pub async fn get_auth_providers(
+    State(state): State<OrchestratorState>,
+) -> Json<AuthProvidersResponse> {
+    let auth_config = match state.auth_config.as_ref() {
+        None => {
+            return Json(AuthProvidersResponse {
+                auth_required: false,
+                providers: vec![],
+                allow_registration: false,
+            });
+        }
+        Some(config) => config,
+    };
+
+    let mut providers = vec![];
+
+    // Password auth (root account configured)
+    if auth_config.has_password_auth() {
+        providers.push(AuthProviderInfo {
+            id: "password".to_string(),
+            name: "Email & Password".to_string(),
+            provider_type: "password".to_string(),
+        });
+    }
+
+    // OIDC auth (explicit or legacy Google)
+    if let Some(oidc) = auth_config.effective_oidc() {
+        providers.push(AuthProviderInfo {
+            id: "oidc".to_string(),
+            name: oidc.provider_name.clone(),
+            provider_type: "oidc".to_string(),
+        });
+    }
+
+    Json(AuthProvidersResponse {
+        auth_required: true,
+        providers,
+        allow_registration: auth_config.allow_registration,
+    })
+}
+
+/// POST /auth/login — Email/password authentication.
+///
+/// Flow:
+/// 1. Check that auth is configured and password auth is available
+/// 2. Try root account first (in-memory, no DB hit)
+/// 3. If not root, look up user in Neo4j by email + provider "password"
+/// 4. Verify password with bcrypt
+/// 5. Return JWT + user info
+///
+/// Security: error messages never reveal whether the email exists or not.
+pub async fn password_login(
+    State(state): State<OrchestratorState>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<AuthTokenResponse>, AppError> {
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
+
+    // Ensure password auth is available
+    if !auth_config.has_password_auth() {
+        return Err(AppError::Forbidden(
+            "Password authentication is not configured".to_string(),
+        ));
+    }
+
+    // Generic error to prevent user enumeration
+    let invalid_credentials =
+        || AppError::Unauthorized("Invalid email or password".to_string());
+
+    // 1. Check root account first (in-memory, no DB)
+    if let Some(ref root) = auth_config.root_account {
+        if req.email == root.email {
+            let password_ok = bcrypt::verify(&req.password, &root.password_hash)
+                .unwrap_or(false);
+            if password_ok {
+                // Root user gets a deterministic UUID based on email
+                let root_user_id =
+                    Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes());
+                let token = encode_jwt(
+                    root_user_id,
+                    &root.email,
+                    &root.name,
+                    &auth_config.jwt_secret,
+                    auth_config.jwt_expiry_secs,
+                )
+                .map_err(AppError::Internal)?;
+
+                return Ok(Json(AuthTokenResponse {
+                    token,
+                    user: UserResponse {
+                        id: root_user_id,
+                        email: root.email.clone(),
+                        name: root.name.clone(),
+                        picture_url: None,
+                    },
+                }));
+            } else {
+                return Err(invalid_credentials());
+            }
+        }
+    }
+
+    // 2. Look up user in Neo4j by email + provider "password"
+    let user = state
+        .orchestrator
+        .neo4j()
+        .get_user_by_email_and_provider(&req.email, "password")
+        .await?
+        .ok_or_else(invalid_credentials)?;
+
+    // 3. Verify bcrypt password
+    let password_hash = user
+        .password_hash
+        .as_deref()
+        .ok_or_else(invalid_credentials)?;
+
+    let password_ok =
+        bcrypt::verify(&req.password, password_hash).unwrap_or(false);
+    if !password_ok {
+        return Err(invalid_credentials());
+    }
+
+    // 4. Generate JWT
+    let token = encode_jwt(
+        user.id,
+        &user.email,
+        &user.name,
+        &auth_config.jwt_secret,
+        auth_config.jwt_expiry_secs,
+    )
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(AuthTokenResponse {
+        token,
+        user: UserResponse::from(user),
+    }))
+}
 
 /// GET /auth/google — Returns the Google OAuth authorization URL.
 ///
@@ -257,7 +426,10 @@ mod tests {
         let state = make_server_state(auth_config).await;
 
         // Public auth routes (no middleware)
-        let public = Router::new().route("/auth/google", get(google_login));
+        let public = Router::new()
+            .route("/auth/providers", get(get_auth_providers))
+            .route("/auth/login", post(password_login))
+            .route("/auth/google", get(google_login));
 
         // Protected auth routes (with middleware)
         let protected = Router::new()
@@ -266,6 +438,26 @@ mod tests {
             .layer(from_fn_with_state(state.clone(), require_auth));
 
         public.merge(protected).with_state(state)
+    }
+
+    /// Build a test router with auth routes, returning the state for further setup
+    async fn test_auth_app_with_state(
+        auth_config: Option<AuthConfig>,
+    ) -> (Router, OrchestratorState) {
+        let state = make_server_state(auth_config).await;
+
+        let public = Router::new()
+            .route("/auth/providers", get(get_auth_providers))
+            .route("/auth/login", post(password_login))
+            .route("/auth/google", get(google_login));
+
+        let protected = Router::new()
+            .route("/auth/me", get(get_me))
+            .route("/auth/refresh", post(refresh_token))
+            .layer(from_fn_with_state(state.clone(), require_auth));
+
+        let app = public.merge(protected).with_state(state.clone());
+        (app, state)
     }
 
     #[tokio::test]
@@ -434,5 +626,308 @@ mod tests {
         let claims = crate::auth::jwt::decode_jwt(new_token, TEST_SECRET).unwrap();
         assert_eq!(claims.sub, user_id.to_string());
         assert_eq!(claims.email, "bob@ffs.holdings");
+    }
+
+    // ================================================================
+    // Password login tests
+    // ================================================================
+
+    fn auth_config_with_root() -> AuthConfig {
+        let password_hash = bcrypt::hash("rootpass123", 4).unwrap(); // cost 4 for fast tests
+        AuthConfig {
+            jwt_secret: TEST_SECRET.to_string(),
+            jwt_expiry_secs: 28800,
+            allowed_email_domain: None,
+            frontend_url: None,
+            allow_registration: false,
+            root_account: Some(crate::RootAccountConfig {
+                email: "admin@ffs.holdings".to_string(),
+                name: "Admin".to_string(),
+                password_hash,
+            }),
+            oidc: None,
+            google_client_id: None,
+            google_client_secret: None,
+            google_redirect_uri: None,
+        }
+    }
+
+    fn login_body(email: &str, password: &str) -> Body {
+        Body::from(
+            serde_json::json!({
+                "email": email,
+                "password": password
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_login_root_account_success() {
+        let app = test_auth_app(Some(auth_config_with_root())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("admin@ffs.holdings", "rootpass123"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["token"].as_str().is_some());
+        assert_eq!(json["user"]["email"], "admin@ffs.holdings");
+        assert_eq!(json["user"]["name"], "Admin");
+
+        // Verify the token is valid
+        let token = json["token"].as_str().unwrap();
+        let claims = crate::auth::jwt::decode_jwt(token, TEST_SECRET).unwrap();
+        assert_eq!(claims.email, "admin@ffs.holdings");
+    }
+
+    #[tokio::test]
+    async fn test_login_root_account_wrong_password() {
+        let app = test_auth_app(Some(auth_config_with_root())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("admin@ffs.holdings", "wrongpassword"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_login_neo4j_user_success() {
+        let (app, state) = test_auth_app_with_state(Some(auth_config_with_root())).await;
+
+        // Create a password user in the mock store
+        let password_hash = bcrypt::hash("userpass456", 4).unwrap();
+        state
+            .orchestrator
+            .neo4j()
+            .create_password_user("alice@ffs.holdings", "Alice", &password_hash)
+            .await
+            .unwrap();
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("alice@ffs.holdings", "userpass456"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["user"]["email"], "alice@ffs.holdings");
+        assert_eq!(json["user"]["name"], "Alice");
+    }
+
+    #[tokio::test]
+    async fn test_login_neo4j_user_wrong_password() {
+        let (app, state) = test_auth_app_with_state(Some(auth_config_with_root())).await;
+
+        // Create a password user
+        let password_hash = bcrypt::hash("correctpass", 4).unwrap();
+        state
+            .orchestrator
+            .neo4j()
+            .create_password_user("bob@ffs.holdings", "Bob", &password_hash)
+            .await
+            .unwrap();
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("bob@ffs.holdings", "wrongpass"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_login_unknown_email_returns_401() {
+        let app = test_auth_app(Some(auth_config_with_root())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("nobody@ffs.holdings", "anything"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should be 401 (not 404) — no user enumeration
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_login_no_auth_config_returns_403() {
+        let app = test_auth_app(None).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("admin@ffs.holdings", "pass"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_login_no_password_auth_returns_403() {
+        // Config with OIDC only (no root account)
+        let config = test_auth_config(); // has no root_account
+        let app = test_auth_app(Some(config)).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/json")
+            .body(login_body("admin@ffs.holdings", "pass"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ================================================================
+    // GET /auth/providers tests
+    // ================================================================
+
+    async fn get_providers_json(app: Router) -> serde_json::Value {
+        let req = HttpRequest::builder()
+            .uri("/auth/providers")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_providers_no_auth_config() {
+        let app = test_auth_app(None).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["auth_required"], false);
+        assert_eq!(json["providers"].as_array().unwrap().len(), 0);
+        assert_eq!(json["allow_registration"], false);
+    }
+
+    #[tokio::test]
+    async fn test_providers_password_only() {
+        let config = auth_config_with_root();
+        let app = test_auth_app(Some(config)).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["auth_required"], true);
+        let providers = json["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["id"], "password");
+        assert_eq!(providers[0]["type"], "password");
+        assert_eq!(providers[0]["name"], "Email & Password");
+        assert_eq!(json["allow_registration"], false);
+    }
+
+    #[tokio::test]
+    async fn test_providers_oidc_only() {
+        // test_auth_config has legacy google_* fields → effective_oidc() returns Some
+        let config = test_auth_config();
+        let app = test_auth_app(Some(config)).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["auth_required"], true);
+        let providers = json["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["id"], "oidc");
+        assert_eq!(providers[0]["type"], "oidc");
+        // Legacy google fields → provider_name defaults to "Google"
+        assert_eq!(providers[0]["name"], "Google");
+    }
+
+    #[tokio::test]
+    async fn test_providers_both_password_and_oidc() {
+        let mut config = auth_config_with_root();
+        // Add legacy Google OIDC
+        config.google_client_id = Some("test-id".to_string());
+        config.google_client_secret = Some("test-secret".to_string());
+        config.google_redirect_uri = Some("http://localhost/callback".to_string());
+
+        let app = test_auth_app(Some(config)).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["auth_required"], true);
+        let providers = json["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+
+        let types: Vec<&str> = providers.iter().map(|p| p["type"].as_str().unwrap()).collect();
+        assert!(types.contains(&"password"));
+        assert!(types.contains(&"oidc"));
+    }
+
+    #[tokio::test]
+    async fn test_providers_allow_registration_true() {
+        let mut config = auth_config_with_root();
+        config.allow_registration = true;
+
+        let app = test_auth_app(Some(config)).await;
+        let json = get_providers_json(app).await;
+
+        assert_eq!(json["allow_registration"], true);
+    }
+
+    #[tokio::test]
+    async fn test_providers_explicit_oidc_config() {
+        let config = AuthConfig {
+            jwt_secret: TEST_SECRET.to_string(),
+            jwt_expiry_secs: 28800,
+            allowed_email_domain: None,
+            frontend_url: None,
+            allow_registration: false,
+            root_account: None,
+            oidc: Some(crate::OidcConfig {
+                provider_name: "Okta".to_string(),
+                client_id: "okta-id".to_string(),
+                client_secret: "okta-secret".to_string(),
+                redirect_uri: "http://localhost/callback".to_string(),
+                auth_endpoint: Some("https://okta.example.com/authorize".to_string()),
+                token_endpoint: Some("https://okta.example.com/token".to_string()),
+                userinfo_endpoint: Some("https://okta.example.com/userinfo".to_string()),
+                scopes: "openid email profile".to_string(),
+                discovery_url: None,
+            }),
+            google_client_id: None,
+            google_client_secret: None,
+            google_redirect_uri: None,
+        };
+
+        let app = test_auth_app(Some(config)).await;
+        let json = get_providers_json(app).await;
+
+        let providers = json["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["name"], "Okta");
+        assert_eq!(providers[0]["type"], "oidc");
     }
 }

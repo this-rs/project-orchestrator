@@ -69,8 +69,13 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_server(config: Config) -> Result<()> {
+async fn run_server(mut config: Config) -> Result<()> {
     tracing::info!("Starting Project Orchestrator server...");
+
+    // Hash root account password at startup (if plaintext)
+    if let Some(ref mut auth) = config.auth_config {
+        auth.ensure_root_password_hashed()?;
+    }
 
     // Initialize application state
     tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
