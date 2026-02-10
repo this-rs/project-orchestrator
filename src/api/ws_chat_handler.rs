@@ -18,8 +18,34 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::hash::{Hash, Hasher};
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
+
+/// Compute a fingerprint for a ChatEvent for deduplication.
+///
+/// Events arriving on both local broadcast and NATS produce the same fingerprint,
+/// so we can skip duplicates.
+fn chat_event_fingerprint(event: &crate::chat::types::ChatEvent) -> u64 {
+    use crate::chat::types::ChatEvent;
+    let mut hasher = std::hash::DefaultHasher::new();
+    event.event_type().hash(&mut hasher);
+    match event {
+        ChatEvent::StreamDelta { text } => text.hash(&mut hasher),
+        ChatEvent::UserMessage { content } => content.hash(&mut hasher),
+        ChatEvent::AssistantText { content } => content.hash(&mut hasher),
+        ChatEvent::Error { message } => message.hash(&mut hasher),
+        ChatEvent::ToolUse { id, .. } => id.hash(&mut hasher),
+        ChatEvent::ToolResult { id, .. } => id.hash(&mut hasher),
+        ChatEvent::ToolUseInputResolved { id, .. } => id.hash(&mut hasher),
+        ChatEvent::PermissionRequest { id, .. } => id.hash(&mut hasher),
+        ChatEvent::Thinking { content } => content.hash(&mut hasher),
+        ChatEvent::InputRequest { prompt, .. } => prompt.hash(&mut hasher),
+        ChatEvent::Result { session_id, .. } => session_id.hash(&mut hasher),
+        ChatEvent::StreamingStatus { is_streaming } => is_streaming.hash(&mut hasher),
+    }
+    hasher.finish()
+}
 
 /// Query parameters for the chat WebSocket
 #[derive(Debug, Deserialize, Default)]
@@ -327,6 +353,29 @@ async fn handle_ws_chat(
         }
     };
 
+    // Subscribe to NATS chat events for cross-instance delivery (if NATS configured)
+    let mut nats_chat_sub: Option<async_nats::Subscriber> = if let Some(ref nats) = state.nats_emitter
+    {
+        match nats.subscribe_chat_events(&session_id).await {
+            Ok(sub) => {
+                debug!(session_id = %session_id, "Subscribed to NATS chat events");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(session_id = %session_id, error = %e, "Failed to subscribe to NATS chat events");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Deduplication window for events arriving on both local broadcast and NATS.
+    // Uses a bounded fingerprint set (event_type:timestamp or event_type:content hash).
+    let mut seen_fingerprints: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut fingerprint_queue: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    const DEDUP_WINDOW: usize = 256;
+
     // Ping interval (30s)
     let mut ping_interval = interval(Duration::from_secs(30));
     ping_interval.tick().await; // skip first immediate tick
@@ -334,9 +383,53 @@ async fn handle_ws_chat(
     // ========================================================================
     // Phase 3: Event loop — forward broadcast events + handle client messages
     // ========================================================================
+
+    // Helper: check dedup and send a ChatEvent to the WS client.
+    // Returns false if the client disconnected (caller should break).
+    // Returns true if the event was sent (or skipped as duplicate).
+    macro_rules! send_chat_event {
+        ($event:expr, $ws:expr, $seen:expr, $queue:expr) => {{
+            let fp = chat_event_fingerprint(&$event);
+            if $seen.contains(&fp) {
+                true // duplicate, skip
+            } else {
+                // Track fingerprint in bounded window
+                $seen.insert(fp);
+                $queue.push_back(fp);
+                if $queue.len() > DEDUP_WINDOW {
+                    if let Some(old) = $queue.pop_front() {
+                        $seen.remove(&old);
+                    }
+                }
+
+                // Serialize and send
+                match serde_json::to_value(&$event) {
+                    Ok(mut val) => {
+                        if let Some(obj) = val.as_object_mut() {
+                            obj.insert("seq".to_string(), serde_json::json!(0));
+                        }
+                        if $ws
+                            .send(Message::Text(val.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            false // client disconnected
+                        } else {
+                            true
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to serialize ChatEvent: {}", e);
+                        true
+                    }
+                }
+            }
+        }};
+    }
+
     loop {
         tokio::select! {
-            // Forward broadcast events to the WebSocket client
+            // Forward local broadcast events to the WebSocket client
             event = async {
                 match &mut event_rx {
                     Some(rx) => rx.recv().await,
@@ -348,30 +441,9 @@ async fn handle_ws_chat(
             } => {
                 match event {
                     Ok(chat_event) => {
-                        // Wrap the event with seq (0 for stream_delta)
-                        let seq = match &chat_event {
-                            crate::chat::types::ChatEvent::StreamDelta { .. } => 0i64,
-                            _ => 0i64, // real seq comes from persistence; broadcast events don't carry seq
-                        };
-
-                        // Serialize the chat event and add seq wrapper
-                        match serde_json::to_value(&chat_event) {
-                            Ok(mut val) => {
-                                if let Some(obj) = val.as_object_mut() {
-                                    obj.insert("seq".to_string(), serde_json::json!(seq));
-                                }
-                                if ws_sender
-                                    .send(Message::Text(val.to_string().into()))
-                                    .await
-                                    .is_err()
-                                {
-                                    debug!("WebSocket send failed, client disconnected");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to serialize ChatEvent: {}", e);
-                            }
+                        if !send_chat_event!(chat_event, ws_sender, seen_fingerprints, fingerprint_queue) {
+                            debug!("WebSocket send failed, client disconnected");
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -392,6 +464,35 @@ async fn handle_ws_chat(
                         });
                         let _ = ws_sender.send(Message::Text(msg.to_string().into())).await;
                         break;
+                    }
+                }
+            }
+
+            // Forward NATS chat events to the WebSocket client (cross-instance)
+            nats_msg = async {
+                match &mut nats_chat_sub {
+                    Some(sub) => sub.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match nats_msg {
+                    Some(msg) => {
+                        match serde_json::from_slice::<crate::chat::types::ChatEvent>(&msg.payload) {
+                            Ok(chat_event) => {
+                                if !send_chat_event!(chat_event, ws_sender, seen_fingerprints, fingerprint_queue) {
+                                    debug!("WebSocket send failed (NATS event), client disconnected");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to deserialize NATS ChatEvent: {}", e);
+                            }
+                        }
+                    }
+                    None => {
+                        // NATS subscriber closed
+                        debug!(session_id = %session_id, "NATS chat subscriber closed");
+                        nats_chat_sub = None;
                     }
                 }
             }
