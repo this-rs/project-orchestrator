@@ -746,6 +746,24 @@ pub async fn add_task_to_workspace_milestone(
     Ok(StatusCode::CREATED)
 }
 
+/// List tasks linked to a workspace milestone
+pub async fn list_workspace_milestone_tasks(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<TaskNode>>, AppError> {
+    let id: Uuid = id
+        .parse()
+        .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
+
+    let tasks = state
+        .orchestrator
+        .neo4j()
+        .get_workspace_milestone_tasks(id)
+        .await?;
+
+    Ok(Json(tasks))
+}
+
 /// Get workspace milestone progress
 pub async fn get_workspace_milestone_progress(
     State(state): State<OrchestratorState>,
@@ -1283,6 +1301,186 @@ pub async fn get_workspace_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::ServerState;
+    use crate::api::routes::create_router;
+    use crate::neo4j::models::{MilestoneStatus, WorkspaceMilestoneNode};
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{
+        mock_app_state, test_bearer_token, test_plan, test_task_titled, test_workspace,
+    };
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as HttpStatus};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// Create an authenticated GET request
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Build a test router with mock backends
+    async fn test_app() -> axum::Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::EventBus::default()),
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+        });
+        create_router(state)
+    }
+
+    /// Build a test router pre-seeded with workspace milestone + tasks
+    async fn test_app_with_milestone_tasks() -> (axum::Router, Uuid, Uuid, Uuid) {
+        let app_state = mock_app_state();
+
+        // Create workspace
+        let ws = test_workspace();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+
+        // Create workspace milestone
+        let milestone_id = Uuid::new_v4();
+        let milestone = WorkspaceMilestoneNode {
+            id: milestone_id,
+            workspace_id: ws.id,
+            title: "Test Milestone".to_string(),
+            description: Some("Milestone for testing".to_string()),
+            status: MilestoneStatus::Open,
+            target_date: None,
+            closed_at: None,
+            created_at: chrono::Utc::now(),
+            tags: vec!["test".to_string()],
+        };
+        app_state
+            .neo4j
+            .create_workspace_milestone(&milestone)
+            .await
+            .unwrap();
+
+        // Create a plan (needed to create tasks)
+        let plan = test_plan();
+        app_state.neo4j.create_plan(&plan).await.unwrap();
+
+        // Create two tasks and link them to the milestone
+        let task1 = test_task_titled("Task Alpha");
+        let task2 = test_task_titled("Task Beta");
+        app_state.neo4j.create_task(plan.id, &task1).await.unwrap();
+        app_state.neo4j.create_task(plan.id, &task2).await.unwrap();
+        app_state
+            .neo4j
+            .add_task_to_workspace_milestone(milestone_id, task1.id)
+            .await
+            .unwrap();
+        app_state
+            .neo4j
+            .add_task_to_workspace_milestone(milestone_id, task2.id)
+            .await
+            .unwrap();
+
+        // Create a third task NOT linked to the milestone
+        let task3 = test_task_titled("Task Gamma (not linked)");
+        app_state.neo4j.create_task(plan.id, &task3).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::EventBus::default()),
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+        });
+        (create_router(state), milestone_id, task1.id, task2.id)
+    }
+
+    // ====================================================================
+    // GET /api/workspace-milestones/{id}/tasks
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_list_workspace_milestone_tasks_returns_linked_tasks() {
+        let (app, milestone_id, task1_id, task2_id) = test_app_with_milestone_tasks().await;
+        let uri = format!("/api/workspace-milestones/{}/tasks", milestone_id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tasks: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+        // Should return exactly 2 linked tasks, not the unlinked one
+        assert_eq!(tasks.len(), 2);
+        let ids: Vec<String> = tasks
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&task1_id.to_string()));
+        assert!(ids.contains(&task2_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_milestone_tasks_empty_milestone() {
+        let app = test_app().await;
+        // Use a random UUID for a milestone with no tasks
+        let milestone_id = Uuid::new_v4();
+        let uri = format!("/api/workspace-milestones/{}/tasks", milestone_id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tasks: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_milestone_tasks_invalid_id() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/workspace-milestones/not-a-uuid/tasks"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_milestone_tasks_response_contains_task_fields() {
+        let (app, milestone_id, _, _) = test_app_with_milestone_tasks().await;
+        let uri = format!("/api/workspace-milestones/{}/tasks", milestone_id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tasks: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+        // Verify task structure includes expected fields
+        for task in &tasks {
+            assert!(task["id"].is_string());
+            assert!(task["description"].is_string());
+            assert!(task["status"].is_string());
+            assert!(task.get("created_at").is_some());
+        }
+    }
+
+    // ====================================================================
+    // Existing serialization tests
+    // ====================================================================
 
     #[test]
     fn test_update_resource_request_all_fields() {

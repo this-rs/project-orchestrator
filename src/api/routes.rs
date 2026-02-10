@@ -457,7 +457,8 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/api/workspace-milestones/{id}/tasks",
-            post(workspace_handlers::add_task_to_workspace_milestone),
+            get(workspace_handlers::list_workspace_milestone_tasks)
+                .post(workspace_handlers::add_task_to_workspace_milestone),
         )
         .route(
             "/api/workspace-milestones/{id}/progress",
