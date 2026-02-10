@@ -28,6 +28,14 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Request body for POST /auth/register
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    pub email: String,
+    pub password: String,
+    pub name: String,
+}
+
 /// Response for GET /auth/google
 #[derive(Serialize)]
 pub struct AuthUrlResponse {
@@ -238,6 +246,106 @@ pub async fn password_login(
     }))
 }
 
+/// POST /auth/register — Create a new password-authenticated account.
+///
+/// Only available when `allow_registration` is true in auth config.
+/// Creates a user in Neo4j with bcrypt-hashed password and returns
+/// JWT + user info (auto-login after registration).
+pub async fn register(
+    State(state): State<OrchestratorState>,
+    Json(req): Json<RegisterRequest>,
+) -> Result<Json<AuthTokenResponse>, AppError> {
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
+
+    // 1. Check registration is enabled
+    if !auth_config.allow_registration {
+        return Err(AppError::Forbidden(
+            "Registration is disabled".to_string(),
+        ));
+    }
+
+    // 2. Validate input fields
+    validate_registration(&req, auth_config)?;
+
+    // 3. Check email uniqueness for password provider
+    let existing = state
+        .orchestrator
+        .neo4j()
+        .get_user_by_email_and_provider(&req.email, "password")
+        .await?;
+    if existing.is_some() {
+        return Err(AppError::Conflict(
+            "An account with this email already exists".to_string(),
+        ));
+    }
+
+    // 4. Hash password with bcrypt
+    let password_hash = bcrypt::hash(&req.password, 12)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to hash password: {}", e)))?;
+
+    // 5. Create user in Neo4j
+    let user = state
+        .orchestrator
+        .neo4j()
+        .create_password_user(&req.email, &req.name, &password_hash)
+        .await?;
+
+    // 6. Generate JWT (auto-login)
+    let token = encode_jwt(
+        user.id,
+        &user.email,
+        &user.name,
+        &auth_config.jwt_secret,
+        auth_config.jwt_expiry_secs,
+    )
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(AuthTokenResponse {
+        token,
+        user: UserResponse::from(user),
+    }))
+}
+
+/// Validate registration request fields.
+fn validate_registration(
+    req: &RegisterRequest,
+    auth_config: &crate::AuthConfig,
+) -> Result<(), AppError> {
+    // Name must not be empty
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("Name is required".to_string()));
+    }
+
+    // Email basic validation (contains @ and a dot after @)
+    let email = req.email.trim().to_lowercase();
+    if !email.contains('@') || !email.split('@').nth(1).map_or(false, |d| d.contains('.')) {
+        return Err(AppError::BadRequest("Invalid email format".to_string()));
+    }
+
+    // Password minimum length
+    if req.password.len() < 8 {
+        return Err(AppError::BadRequest(
+            "Password must be at least 8 characters".to_string(),
+        ));
+    }
+
+    // Check allowed email domain (if configured)
+    if let Some(ref domain) = auth_config.allowed_email_domain {
+        if !email.ends_with(&format!("@{}", domain)) {
+            return Err(AppError::Forbidden(format!(
+                "Email domain not allowed (expected @{})",
+                domain
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// GET /auth/google — Returns the Google OAuth authorization URL.
 ///
 /// The frontend redirects the user to this URL to start the OAuth flow.
@@ -429,6 +537,7 @@ mod tests {
         let public = Router::new()
             .route("/auth/providers", get(get_auth_providers))
             .route("/auth/login", post(password_login))
+            .route("/auth/register", post(register))
             .route("/auth/google", get(google_login));
 
         // Protected auth routes (with middleware)
@@ -449,6 +558,7 @@ mod tests {
         let public = Router::new()
             .route("/auth/providers", get(get_auth_providers))
             .route("/auth/login", post(password_login))
+            .route("/auth/register", post(register))
             .route("/auth/google", get(google_login));
 
         let protected = Router::new()
@@ -895,6 +1005,159 @@ mod tests {
         let json = get_providers_json(app).await;
 
         assert_eq!(json["allow_registration"], true);
+    }
+
+    // ================================================================
+    // POST /auth/register tests
+    // ================================================================
+
+    fn auth_config_with_registration() -> AuthConfig {
+        let mut config = auth_config_with_root();
+        config.allow_registration = true;
+        config
+    }
+
+    fn register_body(email: &str, password: &str, name: &str) -> Body {
+        Body::from(
+            serde_json::json!({
+                "email": email,
+                "password": password,
+                "name": name
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_register_success() {
+        let app = test_auth_app(Some(auth_config_with_registration())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(register_body("newuser@ffs.holdings", "securepass123", "New User"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["token"].as_str().is_some());
+        assert_eq!(json["user"]["email"], "newuser@ffs.holdings");
+        assert_eq!(json["user"]["name"], "New User");
+
+        // Verify the token is valid
+        let token = json["token"].as_str().unwrap();
+        let claims = crate::auth::jwt::decode_jwt(token, TEST_SECRET).unwrap();
+        assert_eq!(claims.email, "newuser@ffs.holdings");
+    }
+
+    #[tokio::test]
+    async fn test_register_disabled_returns_403() {
+        // allow_registration = false (default)
+        let app = test_auth_app(Some(auth_config_with_root())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(register_body("newuser@ffs.holdings", "securepass123", "New User"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_register_duplicate_email_returns_409() {
+        let (app, state) =
+            test_auth_app_with_state(Some(auth_config_with_registration())).await;
+
+        // Pre-create a password user
+        let password_hash = bcrypt::hash("existing123", 4).unwrap();
+        state
+            .orchestrator
+            .neo4j()
+            .create_password_user("existing@ffs.holdings", "Existing", &password_hash)
+            .await
+            .unwrap();
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(register_body("existing@ffs.holdings", "newpass123", "Another"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_register_invalid_email() {
+        let app = test_auth_app(Some(auth_config_with_registration())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(register_body("not-an-email", "securepass123", "User"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_register_password_too_short() {
+        let app = test_auth_app(Some(auth_config_with_registration())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(register_body("user@ffs.holdings", "short", "User"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_register_empty_name() {
+        let app = test_auth_app(Some(auth_config_with_registration())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(register_body("user@ffs.holdings", "securepass123", "  "))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_register_wrong_domain() {
+        let mut config = auth_config_with_registration();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+
+        let app = test_auth_app(Some(config)).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(register_body("user@gmail.com", "securepass123", "User"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
