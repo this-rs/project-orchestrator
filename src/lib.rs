@@ -496,10 +496,34 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     let state = AppState::new(config.clone()).await?;
     tracing::info!("Connected to databases");
 
-    // Create event bus for CRUD notifications
-    let event_bus = Arc::new(events::EventBus::default());
+    // Create local event bus for intra-process broadcast
+    let local_bus = Arc::new(events::EventBus::default());
 
-    // Create orchestrator with event bus
+    // Connect to NATS if configured (inter-process event sync)
+    let nats_emitter = if let Some(ref nats_url) = config.nats_url {
+        match events::connect_nats(nats_url).await {
+            Ok(client) => {
+                let emitter = Arc::new(events::NatsEmitter::new(client, "events"));
+                tracing::info!("NATS connected — inter-process event sync enabled");
+                Some(emitter)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to NATS: {} — running in local-only mode", e);
+                None
+            }
+        }
+    } else {
+        tracing::info!("NATS not configured — running in local-only mode");
+        None
+    };
+
+    // Create hybrid emitter (local broadcast + optional NATS)
+    let event_bus = Arc::new(match &nats_emitter {
+        Some(nats) => events::HybridEmitter::with_nats(local_bus, nats.clone()),
+        None => events::HybridEmitter::new(local_bus),
+    });
+
+    // Create orchestrator with hybrid emitter
     let orchestrator =
         Arc::new(orchestrator::Orchestrator::with_event_bus(state, event_bus.clone()).await?);
 
@@ -529,6 +553,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         watcher: Arc::new(RwLock::new(watcher)),
         chat_manager,
         event_bus,
+        nats_emitter,
         auth_config: config.auth_config.clone(),
         serve_frontend: config.serve_frontend,
         frontend_path: config.frontend_path.clone(),

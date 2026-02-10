@@ -92,6 +92,9 @@ pub struct UserResponse {
     pub email: String,
     pub name: String,
     pub picture_url: Option<String>,
+    /// True when this user is the root account (configured in config.yaml).
+    /// Used by the frontend to gate access to the setup wizard reconfiguration.
+    pub is_root: bool,
 }
 
 impl From<UserNode> for UserResponse {
@@ -101,6 +104,7 @@ impl From<UserNode> for UserResponse {
             email: u.email,
             name: u.name,
             picture_url: u.picture_url,
+            is_root: false, // Neo4j users are never root
         }
     }
 }
@@ -206,6 +210,7 @@ pub async fn password_login(
                         email: root.email.clone(),
                         name: root.name.clone(),
                         picture_url: None,
+                        is_root: true,
                     },
                 }));
             } else {
@@ -526,10 +531,20 @@ pub async fn oidc_callback(
 ///
 /// Requires a valid JWT token (via `require_auth` middleware + `AuthUser` extractor).
 /// Falls back to JWT claims when the user isn't found in Neo4j (e.g. root account).
+/// Sets `is_root: true` when the user ID matches the root account's deterministic UUID.
 pub async fn get_me(
     State(state): State<OrchestratorState>,
     user: AuthUser,
 ) -> Result<Json<UserResponse>, AppError> {
+    // Check if this user is the root account (deterministic UUID from email)
+    let is_root = state
+        .auth_config
+        .as_ref()
+        .and_then(|c| c.root_account.as_ref())
+        .is_some_and(|root| {
+            Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes()) == user.user_id
+        });
+
     // Try to fetch full user from Neo4j (may have updated picture, etc.)
     match state
         .orchestrator
@@ -537,13 +552,18 @@ pub async fn get_me(
         .get_user_by_id(user.user_id)
         .await?
     {
-        Some(user_node) => Ok(Json(UserResponse::from(user_node))),
+        Some(user_node) => {
+            let mut resp = UserResponse::from(user_node);
+            resp.is_root = is_root;
+            Ok(Json(resp))
+        }
         // Root account or users not yet in Neo4j — use JWT claims directly
         None => Ok(Json(UserResponse {
             id: user.user_id,
             email: user.email,
             name: user.name,
             picture_url: None,
+            is_root,
         })),
     }
 }
@@ -616,7 +636,7 @@ mod tests {
 
     async fn make_server_state(auth_config: Option<AuthConfig>) -> OrchestratorState {
         let state = mock_app_state();
-        let event_bus = Arc::new(EventBus::default());
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default())));
         let orchestrator = Arc::new(
             Orchestrator::with_event_bus(state, event_bus.clone())
                 .await
@@ -629,9 +649,11 @@ mod tests {
             watcher: Arc::new(RwLock::new(watcher)),
             chat_manager: None,
             event_bus,
+            nats_emitter: None,
             auth_config,
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
+            setup_completed: true,
         })
     }
 

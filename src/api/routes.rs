@@ -72,14 +72,23 @@ fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
     }
 }
 
-/// Build CORS layer — restricted to `frontend_url` if configured, otherwise `Any`.
+/// Build CORS layer — restricted to `frontend_url` + Tauri origin if configured,
+/// otherwise allows any origin.
 fn build_cors(state: &OrchestratorState) -> CorsLayer {
     let cors = CorsLayer::new().allow_methods(Any).allow_headers(Any);
 
     if let Some(ref auth_config) = state.auth_config {
         if let Some(ref frontend_url) = auth_config.frontend_url {
+            let mut origins: Vec<axum::http::HeaderValue> = Vec::new();
             if let Ok(origin) = frontend_url.parse::<axum::http::HeaderValue>() {
-                return cors.allow_origin(origin);
+                origins.push(origin);
+            }
+            // Always allow Tauri desktop app origin
+            if let Ok(tauri_origin) = "tauri://localhost".parse::<axum::http::HeaderValue>() {
+                origins.push(tauri_origin);
+            }
+            if !origins.is_empty() {
+                return cors.allow_origin(origins);
             }
         }
     }
@@ -96,9 +105,10 @@ fn build_cors(state: &OrchestratorState) -> CorsLayer {
 /// Includes: health check, OAuth login/callback, webhook endpoints, internal events.
 fn public_routes() -> Router<OrchestratorState> {
     Router::new()
-        // Health check & version
+        // Health check, version & setup status
         .route("/health", get(handlers::health))
         .route("/api/version", get(handlers::get_version))
+        .route("/api/setup-status", get(handlers::setup_status))
         // ================================================================
         // Auth (public — login flow + discovery)
         // ================================================================
@@ -591,10 +601,12 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(EventBus::default()),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            nats_emitter: None,
             auth_config: Some(test_auth_config()),
             serve_frontend: true,
             frontend_path: dir.to_str().unwrap().to_string(),
+            setup_completed: true,
         });
         create_router(state)
     }
@@ -608,10 +620,12 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(EventBus::default()),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            nats_emitter: None,
             auth_config: Some(test_auth_config()),
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
+            setup_completed: true,
         });
         create_router(state)
     }

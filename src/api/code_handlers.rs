@@ -711,10 +711,12 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::EventBus::default()),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(crate::events::EventBus::default()))),
+            nats_emitter: None,
             auth_config: Some(crate::test_helpers::test_auth_config()),
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
+            setup_completed: true,
         });
         create_router(state)
     }
@@ -763,10 +765,12 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::EventBus::default()),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(crate::events::EventBus::default()))),
+            nats_emitter: None,
             auth_config: Some(crate::test_helpers::test_auth_config()),
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
+            setup_completed: true,
         });
         create_router(state)
     }

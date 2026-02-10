@@ -4,7 +4,7 @@ use crate::api::{
     PaginatedResponse, PaginationParams, PriorityFilter, SearchFilter, StatusFilter, TagsFilter,
 };
 use crate::chat::ChatManager;
-use crate::events::{EventBus, EventEmitter};
+use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
 use crate::neo4j::models::{
     CommitNode, ConstraintNode, DecisionNode, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus,
     ReleaseNode, ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
@@ -28,9 +28,15 @@ pub struct ServerState {
     pub orchestrator: Arc<Orchestrator>,
     pub watcher: Arc<RwLock<FileWatcher>>,
     pub chat_manager: Option<Arc<ChatManager>>,
-    pub event_bus: Arc<EventBus>,
+    pub event_bus: Arc<HybridEmitter>,
+    /// NATS emitter for inter-process chat events and interrupts.
+    /// None when NATS is not configured (local-only mode).
+    pub nats_emitter: Option<Arc<NatsEmitter>>,
     /// Auth config — None means deny-by-default
     pub auth_config: Option<AuthConfig>,
+    /// Whether the app has been fully configured (setup wizard completed).
+    /// When false, the frontend should show the setup wizard.
+    pub setup_completed: bool,
     /// Whether to serve the frontend static files (SPA fallback)
     pub serve_frontend: bool,
     /// Path to the frontend dist/ directory
@@ -101,6 +107,24 @@ pub async fn get_version(State(state): State<OrchestratorState>) -> Json<Version
                 "release"
             },
         },
+    })
+}
+
+// ============================================================================
+// Setup status
+// ============================================================================
+
+/// Setup status response
+#[derive(Serialize)]
+pub struct SetupStatusResponse {
+    /// Whether the setup wizard has been completed
+    pub configured: bool,
+}
+
+/// GET /api/setup-status — public endpoint to check if the app needs initial setup.
+pub async fn setup_status(State(state): State<OrchestratorState>) -> Json<SetupStatusResponse> {
+    Json(SetupStatusResponse {
+        configured: state.setup_completed,
     })
 }
 
@@ -505,6 +529,7 @@ pub async fn search_decisions(
 #[derive(Deserialize)]
 pub struct SyncRequest {
     pub path: String,
+    pub project_id: Option<String>,
 }
 
 /// Sync response
@@ -512,6 +537,8 @@ pub struct SyncRequest {
 pub struct SyncResponse {
     pub files_synced: usize,
     pub files_skipped: usize,
+    pub files_deleted: usize,
+    pub symbols_deleted: usize,
     pub errors: usize,
 }
 
@@ -521,10 +548,41 @@ pub async fn sync_directory(
     Json(req): Json<SyncRequest>,
 ) -> Result<Json<SyncResponse>, AppError> {
     let path = std::path::Path::new(&req.path);
-    let result = state.orchestrator.sync_directory(path).await?;
+
+    // Resolve project context when project_id is provided
+    let (project_id, project_slug) = if let Some(ref pid_str) = req.project_id {
+        let pid = uuid::Uuid::parse_str(pid_str)
+            .map_err(|_| AppError::BadRequest(format!("Invalid project_id: {}", pid_str)))?;
+        let project = state
+            .orchestrator
+            .neo4j()
+            .get_project(pid)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", pid_str)))?;
+        (Some(project.id), Some(project.slug))
+    } else {
+        (None, None)
+    };
+
+    let result = state
+        .orchestrator
+        .sync_directory_for_project(path, project_id, project_slug.as_deref())
+        .await?;
+
+    // Update last_synced when project context is available
+    if let Some(pid) = project_id {
+        state
+            .orchestrator
+            .neo4j()
+            .update_project_synced(pid)
+            .await?;
+    }
+
     Ok(Json(SyncResponse {
         files_synced: result.files_synced,
         files_skipped: result.files_skipped,
+        files_deleted: result.files_deleted,
+        symbols_deleted: result.symbols_deleted,
         errors: result.errors,
     }))
 }
@@ -592,6 +650,7 @@ pub async fn receive_event(
 #[derive(Deserialize)]
 pub struct WatchRequest {
     pub path: String,
+    pub project_id: Option<String>,
 }
 
 /// Watch status response
@@ -608,6 +667,15 @@ pub async fn start_watch(
 ) -> Result<Json<WatchStatusResponse>, AppError> {
     let path = std::path::Path::new(&req.path);
     let mut watcher = state.watcher.write().await;
+
+    // Set project context if project_id is provided
+    if let Some(ref pid_str) = req.project_id {
+        if let Ok(pid) = uuid::Uuid::parse_str(pid_str) {
+            if let Some(project) = state.orchestrator.neo4j().get_project(pid).await? {
+                watcher.set_project_context(project.id, project.slug);
+            }
+        }
+    }
 
     watcher.watch(path).await?;
     watcher.start().await?;
