@@ -569,6 +569,9 @@ jobs:
             desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
             desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip
             desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip.sig
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi.zip
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi.zip.sig
           retention-days: 1
 
   # ==========================================================================
@@ -589,7 +592,7 @@ jobs:
       - name: Collect release files
         run: |
           mkdir -p release-files
-          find artifacts/ -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.exe" -o -name "*.sig" \) -exec cp {} release-files/ \;
+          find artifacts/ -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.exe" -o -name "*.msi" -o -name "*.sig" \) -exec cp {} release-files/ \;
           echo "=== Release artifacts ==="
           ls -la release-files/
 

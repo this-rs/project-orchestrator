@@ -46,7 +46,20 @@
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
-      "timestampUrl": ""
+      "timestampUrl": "http://timestamp.digicert.com",
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "both",
+        "displayLanguageSelector": false,
+        "languages": ["English"],
+        "headerImage": null,
+        "sidebarImage": null
+      },
+      "wix": {
+        "language": ["en-US"]
+      }
     }
   },
   "plugins": {
