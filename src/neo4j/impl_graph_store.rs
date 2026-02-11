@@ -445,6 +445,10 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn cleanup_cross_project_calls(&self) -> anyhow::Result<i64> {
+        self.cleanup_cross_project_calls().await
+    }
+
     async fn get_callees(
         &self,
         function_id: &str,

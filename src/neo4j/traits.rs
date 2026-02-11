@@ -343,6 +343,10 @@ pub trait GraphStore: Send + Sync {
         project_id: Option<Uuid>,
     ) -> Result<()>;
 
+    /// Delete all CALLS relationships where caller and callee belong to different projects.
+    /// Returns the number of deleted relationships.
+    async fn cleanup_cross_project_calls(&self) -> Result<i64>;
+
     /// Get all functions called by a function
     async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>>;
 

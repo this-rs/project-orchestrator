@@ -1174,6 +1174,15 @@ fn meilisearch_tools() -> Vec<ToolDefinition> {
                 required: None,
             },
         },
+        ToolDefinition {
+            name: "cleanup_cross_project_calls".to_string(),
+            description: "Delete CALLS relationships where caller and callee belong to different projects. Returns the number of deleted relationships.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
     ]
 }
 
@@ -2049,7 +2058,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 143, "Expected 143 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 144, "Expected 144 tools, got {}", tools.len());
     }
 
     #[test]

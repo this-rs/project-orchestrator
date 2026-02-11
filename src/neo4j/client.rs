@@ -2578,6 +2578,30 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Delete all CALLS relationships where caller and callee belong to different projects.
+    ///
+    /// Returns the number of deleted relationships.
+    pub async fn cleanup_cross_project_calls(&self) -> Result<i64> {
+        let q = query(
+            r#"
+            MATCH (caller:Function)-[r:CALLS]->(callee:Function)
+            WHERE NOT EXISTS {
+                MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project),
+                      (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+            }
+            DELETE r
+            RETURN count(r) AS deleted
+            "#,
+        );
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let deleted: i64 = row.get("deleted")?;
+            Ok(deleted)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Get all functions called by a function
     pub async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>> {
         let q = query(&format!(

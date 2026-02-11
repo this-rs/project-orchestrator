@@ -154,6 +154,7 @@ impl ToolHandler {
             // Meilisearch
             "get_meilisearch_stats" => self.get_meilisearch_stats(args).await,
             "delete_meilisearch_orphans" => self.delete_meilisearch_orphans(args).await,
+            "cleanup_cross_project_calls" => self.cleanup_cross_project_calls(args).await,
 
             // Notes
             "list_notes" => self.list_notes(args).await,
@@ -1937,6 +1938,11 @@ impl ToolHandler {
     async fn delete_meilisearch_orphans(&self, _args: Value) -> Result<Value> {
         self.meili().delete_orphan_code_documents().await?;
         Ok(json!({"deleted": true}))
+    }
+
+    async fn cleanup_cross_project_calls(&self, _args: Value) -> Result<Value> {
+        let deleted = self.neo4j().cleanup_cross_project_calls().await?;
+        Ok(json!({"deleted_count": deleted}))
     }
 
     // ========================================================================

@@ -1200,6 +1200,68 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn cleanup_cross_project_calls(&self) -> Result<i64> {
+        let mut cr = self.call_relationships.write().await;
+        let functions = self.functions.read().await;
+        let project_files = self.project_files.read().await;
+        let mut deleted = 0i64;
+
+        // Build reverse map: file_path -> project_ids
+        let mut file_to_projects: std::collections::HashMap<&str, Vec<uuid::Uuid>> =
+            std::collections::HashMap::new();
+        for (&pid, paths) in project_files.iter() {
+            for path in paths {
+                file_to_projects.entry(path.as_str()).or_default().push(pid);
+            }
+        }
+
+        // For each caller → callees, check if they share a project
+        let mut to_remove: Vec<(String, Vec<String>)> = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            let caller_file = caller_id.rsplit_once("::").map(|(fp, _)| fp);
+            let caller_projects: Vec<uuid::Uuid> = caller_file
+                .and_then(|fp| file_to_projects.get(fp))
+                .cloned()
+                .unwrap_or_default();
+
+            if caller_projects.is_empty() {
+                continue;
+            }
+
+            let mut bad_callees = Vec::new();
+            for callee_name in callees {
+                let callee_shares_project = functions.values().any(|f| {
+                    if f.name != *callee_name {
+                        return false;
+                    }
+                    let callee_projects = file_to_projects
+                        .get(f.file_path.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    callee_projects
+                        .iter()
+                        .any(|cp| caller_projects.contains(cp))
+                });
+                if !callee_shares_project {
+                    bad_callees.push(callee_name.clone());
+                }
+            }
+            if !bad_callees.is_empty() {
+                to_remove.push((caller_id.clone(), bad_callees));
+            }
+        }
+
+        for (caller_id, bad_callees) in to_remove {
+            if let Some(callees) = cr.get_mut(&caller_id) {
+                for bad in &bad_callees {
+                    callees.retain(|c| c != bad);
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     async fn get_callees(&self, function_id: &str, _depth: u32) -> Result<Vec<FunctionNode>> {
         let cr = self.call_relationships.read().await;
         let functions = self.functions.read().await;
