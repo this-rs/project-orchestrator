@@ -680,11 +680,11 @@ impl Orchestrator {
             }
         }
 
-        // Store function call relationships
+        // Store function call relationships (scoped to project to prevent cross-project pollution)
         for call in &parsed.function_calls {
             self.state
                 .neo4j
-                .create_call_relationship(&call.caller_id, &call.callee_name)
+                .create_call_relationship(&call.caller_id, &call.callee_name, project_id)
                 .await?;
         }
 

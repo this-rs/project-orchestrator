@@ -2542,18 +2542,36 @@ impl Neo4jClient {
     // Function call graph operations
     // ========================================================================
 
-    /// Create a CALLS relationship between functions
-    pub async fn create_call_relationship(&self, caller_id: &str, callee_name: &str) -> Result<()> {
-        // Try to find the callee function by name
-        let q = query(
-            r#"
-            MATCH (caller:Function {id: $caller_id})
-            MATCH (callee:Function {name: $callee_name})
-            MERGE (caller)-[:CALLS]->(callee)
-            "#,
-        )
-        .param("caller_id", caller_id)
-        .param("callee_name", callee_name);
+    /// Create a CALLS relationship between functions, scoped to the same project.
+    /// When project_id is provided, the callee is matched only within the same project
+    /// to prevent cross-project CALLS pollution.
+    pub async fn create_call_relationship(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (caller:Function {id: $caller_id})
+                MATCH (callee:Function {name: $callee_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                MERGE (caller)-[:CALLS]->(callee)
+                "#,
+            )
+            .param("caller_id", caller_id)
+            .param("callee_name", callee_name)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (caller:Function {id: $caller_id})
+                MATCH (callee:Function {name: $callee_name})
+                MERGE (caller)-[:CALLS]->(callee)
+                "#,
+            )
+            .param("caller_id", caller_id)
+            .param("callee_name", callee_name),
+        };
 
         // Ignore errors if callee not found (might be external)
         let _ = self.graph.run(q).await;

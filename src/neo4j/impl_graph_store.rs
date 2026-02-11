@@ -439,8 +439,10 @@ impl GraphStore for Neo4jClient {
         &self,
         caller_id: &str,
         callee_name: &str,
+        project_id: Option<Uuid>,
     ) -> anyhow::Result<()> {
-        self.create_call_relationship(caller_id, callee_name).await
+        self.create_call_relationship(caller_id, callee_name, project_id)
+            .await
     }
 
     async fn get_callees(

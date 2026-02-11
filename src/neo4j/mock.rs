@@ -1163,7 +1163,34 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn create_call_relationship(&self, caller_id: &str, callee_name: &str) -> Result<()> {
+    async fn create_call_relationship(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        // When project_id is provided, only create the relationship if the callee
+        // belongs to a file in the same project (mirrors the Cypher join via File→Project)
+        if let Some(pid) = project_id {
+            let project_files = self.project_files.read().await;
+            let functions = self.functions.read().await;
+
+            let project_file_paths: Vec<&String> = project_files
+                .get(&pid)
+                .map(|files| files.iter().collect())
+                .unwrap_or_default();
+
+            // Check if any function with callee_name belongs to a file in this project
+            let callee_in_project = functions.values().any(|f| {
+                f.name == callee_name && project_file_paths.iter().any(|fp| **fp == f.file_path)
+            });
+
+            if !callee_in_project {
+                // Callee not found in this project — skip (same as Cypher MATCH not matching)
+                return Ok(());
+            }
+        }
+
         self.call_relationships
             .write()
             .await

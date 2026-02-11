@@ -333,8 +333,15 @@ pub trait GraphStore: Send + Sync {
     /// Store an import node (for tracking even unresolved imports)
     async fn upsert_import(&self, import: &ImportNode) -> Result<()>;
 
-    /// Create a CALLS relationship between functions
-    async fn create_call_relationship(&self, caller_id: &str, callee_name: &str) -> Result<()>;
+    /// Create a CALLS relationship between functions, scoped to the same project.
+    /// When project_id is provided, the callee is matched only within the same project
+    /// to prevent cross-project CALLS pollution.
+    async fn create_call_relationship(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
 
     /// Get all functions called by a function
     async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>>;
