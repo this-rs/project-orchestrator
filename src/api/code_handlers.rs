@@ -752,7 +752,9 @@ pub async fn list_feature_graphs(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "feature_graphs": items, "count": items.len() })))
+    Ok(Json(
+        serde_json::json!({ "feature_graphs": items, "count": items.len() }),
+    ))
 }
 
 /// GET /api/feature-graphs/:id
@@ -792,11 +794,7 @@ pub async fn delete_feature_graph(
     State(state): State<OrchestratorState>,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let deleted = state
-        .orchestrator
-        .neo4j()
-        .delete_feature_graph(id)
-        .await?;
+    let deleted = state.orchestrator.neo4j().delete_feature_graph(id).await?;
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 

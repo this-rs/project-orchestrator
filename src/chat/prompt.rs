@@ -329,31 +329,103 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         name: "planning",
         description: "Créer et gérer plans, tâches, étapes",
         keywords: &[
-            "plan", "tâche", "task", "step", "étape", "planifier", "organiser",
-            "dépendance", "priorité", "chemin critique", "bloquer",
+            "plan",
+            "tâche",
+            "task",
+            "step",
+            "étape",
+            "planifier",
+            "organiser",
+            "dépendance",
+            "priorité",
+            "chemin critique",
+            "bloquer",
         ],
         tools: &[
-            ToolRef { name: "create_plan", description: "Créer un plan de développement" },
-            ToolRef { name: "get_plan", description: "Détails d'un plan avec tâches" },
-            ToolRef { name: "list_plans", description: "Lister les plans avec filtres" },
-            ToolRef { name: "update_plan_status", description: "Changer le statut d'un plan" },
-            ToolRef { name: "delete_plan", description: "Supprimer un plan" },
-            ToolRef { name: "link_plan_to_project", description: "Lier un plan à un projet" },
-            ToolRef { name: "unlink_plan_from_project", description: "Délier un plan d'un projet" },
-            ToolRef { name: "create_task", description: "Ajouter une tâche à un plan" },
-            ToolRef { name: "get_task", description: "Détails d'une tâche avec steps" },
-            ToolRef { name: "list_tasks", description: "Lister les tâches avec filtres" },
-            ToolRef { name: "update_task", description: "Mettre à jour statut/assignee" },
-            ToolRef { name: "delete_task", description: "Supprimer une tâche" },
-            ToolRef { name: "get_next_task", description: "Prochaine tâche non bloquée" },
-            ToolRef { name: "add_task_dependencies", description: "Ajouter des dépendances" },
-            ToolRef { name: "remove_task_dependency", description: "Retirer une dépendance" },
-            ToolRef { name: "get_task_blockers", description: "Tâches bloquant celle-ci" },
-            ToolRef { name: "get_tasks_blocked_by", description: "Tâches bloquées par celle-ci" },
-            ToolRef { name: "get_dependency_graph", description: "Graphe de dépendances du plan" },
-            ToolRef { name: "get_critical_path", description: "Chemin critique du plan" },
-            ToolRef { name: "get_task_context", description: "Contexte complet pour exécution" },
-            ToolRef { name: "get_task_prompt", description: "Prompt généré pour une tâche" },
+            ToolRef {
+                name: "create_plan",
+                description: "Créer un plan de développement",
+            },
+            ToolRef {
+                name: "get_plan",
+                description: "Détails d'un plan avec tâches",
+            },
+            ToolRef {
+                name: "list_plans",
+                description: "Lister les plans avec filtres",
+            },
+            ToolRef {
+                name: "update_plan_status",
+                description: "Changer le statut d'un plan",
+            },
+            ToolRef {
+                name: "delete_plan",
+                description: "Supprimer un plan",
+            },
+            ToolRef {
+                name: "link_plan_to_project",
+                description: "Lier un plan à un projet",
+            },
+            ToolRef {
+                name: "unlink_plan_from_project",
+                description: "Délier un plan d'un projet",
+            },
+            ToolRef {
+                name: "create_task",
+                description: "Ajouter une tâche à un plan",
+            },
+            ToolRef {
+                name: "get_task",
+                description: "Détails d'une tâche avec steps",
+            },
+            ToolRef {
+                name: "list_tasks",
+                description: "Lister les tâches avec filtres",
+            },
+            ToolRef {
+                name: "update_task",
+                description: "Mettre à jour statut/assignee",
+            },
+            ToolRef {
+                name: "delete_task",
+                description: "Supprimer une tâche",
+            },
+            ToolRef {
+                name: "get_next_task",
+                description: "Prochaine tâche non bloquée",
+            },
+            ToolRef {
+                name: "add_task_dependencies",
+                description: "Ajouter des dépendances",
+            },
+            ToolRef {
+                name: "remove_task_dependency",
+                description: "Retirer une dépendance",
+            },
+            ToolRef {
+                name: "get_task_blockers",
+                description: "Tâches bloquant celle-ci",
+            },
+            ToolRef {
+                name: "get_tasks_blocked_by",
+                description: "Tâches bloquées par celle-ci",
+            },
+            ToolRef {
+                name: "get_dependency_graph",
+                description: "Graphe de dépendances du plan",
+            },
+            ToolRef {
+                name: "get_critical_path",
+                description: "Chemin critique du plan",
+            },
+            ToolRef {
+                name: "get_task_context",
+                description: "Contexte complet pour exécution",
+            },
+            ToolRef {
+                name: "get_task_prompt",
+                description: "Prompt généré pour une tâche",
+            },
         ],
     },
     // ── Steps (6 tools) ──────────────────────────────────────────────
@@ -362,12 +434,30 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         description: "Sous-étapes atomiques des tâches",
         keywords: &["step", "étape", "sous-étape", "vérification", "progression"],
         tools: &[
-            ToolRef { name: "create_step", description: "Ajouter un step à une tâche" },
-            ToolRef { name: "list_steps", description: "Lister les steps d'une tâche" },
-            ToolRef { name: "get_step", description: "Détails d'un step" },
-            ToolRef { name: "update_step", description: "Changer le statut d'un step" },
-            ToolRef { name: "delete_step", description: "Supprimer un step" },
-            ToolRef { name: "get_step_progress", description: "Progression des steps" },
+            ToolRef {
+                name: "create_step",
+                description: "Ajouter un step à une tâche",
+            },
+            ToolRef {
+                name: "list_steps",
+                description: "Lister les steps d'une tâche",
+            },
+            ToolRef {
+                name: "get_step",
+                description: "Détails d'un step",
+            },
+            ToolRef {
+                name: "update_step",
+                description: "Changer le statut d'un step",
+            },
+            ToolRef {
+                name: "delete_step",
+                description: "Supprimer un step",
+            },
+            ToolRef {
+                name: "get_step_progress",
+                description: "Progression des steps",
+            },
         ],
     },
     // ── Code exploration (12 tools) ──────────────────────────────────
@@ -375,23 +465,71 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         name: "code_exploration",
         description: "Recherche sémantique, graphe d'appels, impact",
         keywords: &[
-            "code", "fonction", "struct", "fichier", "import", "appel",
-            "architecture", "symbole", "trait", "impl", "référence",
-            "dépendance", "impact", "chercher", "explorer",
+            "code",
+            "fonction",
+            "struct",
+            "fichier",
+            "import",
+            "appel",
+            "architecture",
+            "symbole",
+            "trait",
+            "impl",
+            "référence",
+            "dépendance",
+            "impact",
+            "chercher",
+            "explorer",
         ],
         tools: &[
-            ToolRef { name: "search_code", description: "Recherche sémantique cross-projet" },
-            ToolRef { name: "search_project_code", description: "Recherche scopée à un projet" },
-            ToolRef { name: "get_file_symbols", description: "Fonctions/structs d'un fichier" },
-            ToolRef { name: "find_references", description: "Tous les usages d'un symbole" },
-            ToolRef { name: "get_file_dependencies", description: "Imports et dépendants" },
-            ToolRef { name: "get_call_graph", description: "Graphe d'appels d'une fonction" },
-            ToolRef { name: "analyze_impact", description: "Impact d'une modification" },
-            ToolRef { name: "get_architecture", description: "Vue d'ensemble du codebase" },
-            ToolRef { name: "find_similar_code", description: "Code similaire à un snippet" },
-            ToolRef { name: "find_trait_implementations", description: "Types implémentant un trait" },
-            ToolRef { name: "find_type_traits", description: "Traits implémentés par un type" },
-            ToolRef { name: "get_impl_blocks", description: "Blocs impl d'un type" },
+            ToolRef {
+                name: "search_code",
+                description: "Recherche sémantique cross-projet",
+            },
+            ToolRef {
+                name: "search_project_code",
+                description: "Recherche scopée à un projet",
+            },
+            ToolRef {
+                name: "get_file_symbols",
+                description: "Fonctions/structs d'un fichier",
+            },
+            ToolRef {
+                name: "find_references",
+                description: "Tous les usages d'un symbole",
+            },
+            ToolRef {
+                name: "get_file_dependencies",
+                description: "Imports et dépendants",
+            },
+            ToolRef {
+                name: "get_call_graph",
+                description: "Graphe d'appels d'une fonction",
+            },
+            ToolRef {
+                name: "analyze_impact",
+                description: "Impact d'une modification",
+            },
+            ToolRef {
+                name: "get_architecture",
+                description: "Vue d'ensemble du codebase",
+            },
+            ToolRef {
+                name: "find_similar_code",
+                description: "Code similaire à un snippet",
+            },
+            ToolRef {
+                name: "find_trait_implementations",
+                description: "Types implémentant un trait",
+            },
+            ToolRef {
+                name: "find_type_traits",
+                description: "Traits implémentés par un type",
+            },
+            ToolRef {
+                name: "get_impl_blocks",
+                description: "Blocs impl d'un type",
+            },
         ],
     },
     // ── Knowledge / Notes (17 tools) ─────────────────────────────────
@@ -399,27 +537,87 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         name: "knowledge",
         description: "Notes, guidelines, gotchas, patterns",
         keywords: &[
-            "note", "guideline", "gotcha", "pattern", "connaissance", "tip",
-            "observation", "assertion", "savoir", "contexte", "mémoire",
+            "note",
+            "guideline",
+            "gotcha",
+            "pattern",
+            "connaissance",
+            "tip",
+            "observation",
+            "assertion",
+            "savoir",
+            "contexte",
+            "mémoire",
         ],
         tools: &[
-            ToolRef { name: "create_note", description: "Créer une note de connaissance" },
-            ToolRef { name: "get_note", description: "Détails d'une note" },
-            ToolRef { name: "update_note", description: "Modifier contenu/importance/tags" },
-            ToolRef { name: "delete_note", description: "Supprimer une note" },
-            ToolRef { name: "search_notes", description: "Recherche sémantique de notes" },
-            ToolRef { name: "list_notes", description: "Lister avec filtres type/importance" },
-            ToolRef { name: "list_project_notes", description: "Notes d'un projet" },
-            ToolRef { name: "get_context_notes", description: "Notes contextuelles d'une entité" },
-            ToolRef { name: "get_entity_notes", description: "Notes directement attachées" },
-            ToolRef { name: "get_propagated_notes", description: "Notes propagées via le graphe" },
-            ToolRef { name: "link_note_to_entity", description: "Lier note à fichier/fonction/…" },
-            ToolRef { name: "unlink_note_from_entity", description: "Délier une note" },
-            ToolRef { name: "confirm_note", description: "Confirmer validité (reset staleness)" },
-            ToolRef { name: "invalidate_note", description: "Marquer comme obsolète" },
-            ToolRef { name: "supersede_note", description: "Remplacer par une nouvelle note" },
-            ToolRef { name: "get_notes_needing_review", description: "Notes à vérifier" },
-            ToolRef { name: "update_staleness_scores", description: "Recalculer la fraîcheur" },
+            ToolRef {
+                name: "create_note",
+                description: "Créer une note de connaissance",
+            },
+            ToolRef {
+                name: "get_note",
+                description: "Détails d'une note",
+            },
+            ToolRef {
+                name: "update_note",
+                description: "Modifier contenu/importance/tags",
+            },
+            ToolRef {
+                name: "delete_note",
+                description: "Supprimer une note",
+            },
+            ToolRef {
+                name: "search_notes",
+                description: "Recherche sémantique de notes",
+            },
+            ToolRef {
+                name: "list_notes",
+                description: "Lister avec filtres type/importance",
+            },
+            ToolRef {
+                name: "list_project_notes",
+                description: "Notes d'un projet",
+            },
+            ToolRef {
+                name: "get_context_notes",
+                description: "Notes contextuelles d'une entité",
+            },
+            ToolRef {
+                name: "get_entity_notes",
+                description: "Notes directement attachées",
+            },
+            ToolRef {
+                name: "get_propagated_notes",
+                description: "Notes propagées via le graphe",
+            },
+            ToolRef {
+                name: "link_note_to_entity",
+                description: "Lier note à fichier/fonction/…",
+            },
+            ToolRef {
+                name: "unlink_note_from_entity",
+                description: "Délier une note",
+            },
+            ToolRef {
+                name: "confirm_note",
+                description: "Confirmer validité (reset staleness)",
+            },
+            ToolRef {
+                name: "invalidate_note",
+                description: "Marquer comme obsolète",
+            },
+            ToolRef {
+                name: "supersede_note",
+                description: "Remplacer par une nouvelle note",
+            },
+            ToolRef {
+                name: "get_notes_needing_review",
+                description: "Notes à vérifier",
+            },
+            ToolRef {
+                name: "update_staleness_scores",
+                description: "Recalculer la fraîcheur",
+            },
         ],
     },
     // ── Git tracking (5 tools) ───────────────────────────────────────
@@ -428,11 +626,26 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         description: "Enregistrer et lier les commits",
         keywords: &["commit", "git", "branche", "sha", "push"],
         tools: &[
-            ToolRef { name: "create_commit", description: "Enregistrer un commit" },
-            ToolRef { name: "link_commit_to_task", description: "Lier commit → tâche" },
-            ToolRef { name: "link_commit_to_plan", description: "Lier commit → plan" },
-            ToolRef { name: "get_task_commits", description: "Commits d'une tâche" },
-            ToolRef { name: "get_plan_commits", description: "Commits d'un plan" },
+            ToolRef {
+                name: "create_commit",
+                description: "Enregistrer un commit",
+            },
+            ToolRef {
+                name: "link_commit_to_task",
+                description: "Lier commit → tâche",
+            },
+            ToolRef {
+                name: "link_commit_to_plan",
+                description: "Lier commit → plan",
+            },
+            ToolRef {
+                name: "get_task_commits",
+                description: "Commits d'une tâche",
+            },
+            ToolRef {
+                name: "get_plan_commits",
+                description: "Commits d'un plan",
+            },
         ],
     },
     // ── Decisions (5 tools) ──────────────────────────────────────────
@@ -441,24 +654,60 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         description: "Choix architecturaux et alternatives",
         keywords: &["décision", "choix", "alternative", "rationale", "arbitrage"],
         tools: &[
-            ToolRef { name: "add_decision", description: "Enregistrer une décision" },
-            ToolRef { name: "get_decision", description: "Détails d'une décision" },
-            ToolRef { name: "update_decision", description: "Modifier une décision" },
-            ToolRef { name: "delete_decision", description: "Supprimer une décision" },
-            ToolRef { name: "search_decisions", description: "Rechercher les décisions passées" },
+            ToolRef {
+                name: "add_decision",
+                description: "Enregistrer une décision",
+            },
+            ToolRef {
+                name: "get_decision",
+                description: "Détails d'une décision",
+            },
+            ToolRef {
+                name: "update_decision",
+                description: "Modifier une décision",
+            },
+            ToolRef {
+                name: "delete_decision",
+                description: "Supprimer une décision",
+            },
+            ToolRef {
+                name: "search_decisions",
+                description: "Rechercher les décisions passées",
+            },
         ],
     },
     // ── Constraints (5 tools) ────────────────────────────────────────
     ToolGroup {
         name: "constraints",
         description: "Règles et contraintes des plans",
-        keywords: &["contrainte", "règle", "sécurité", "performance", "compatibilité"],
+        keywords: &[
+            "contrainte",
+            "règle",
+            "sécurité",
+            "performance",
+            "compatibilité",
+        ],
         tools: &[
-            ToolRef { name: "add_constraint", description: "Ajouter une contrainte" },
-            ToolRef { name: "get_constraint", description: "Détails d'une contrainte" },
-            ToolRef { name: "update_constraint", description: "Modifier une contrainte" },
-            ToolRef { name: "delete_constraint", description: "Supprimer une contrainte" },
-            ToolRef { name: "list_constraints", description: "Contraintes d'un plan" },
+            ToolRef {
+                name: "add_constraint",
+                description: "Ajouter une contrainte",
+            },
+            ToolRef {
+                name: "get_constraint",
+                description: "Détails d'une contrainte",
+            },
+            ToolRef {
+                name: "update_constraint",
+                description: "Modifier une contrainte",
+            },
+            ToolRef {
+                name: "delete_constraint",
+                description: "Supprimer une contrainte",
+            },
+            ToolRef {
+                name: "list_constraints",
+                description: "Contraintes d'un plan",
+            },
         ],
     },
     // ── Project management (8 tools) ─────────────────────────────────
@@ -467,14 +716,38 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         description: "CRUD projets, sync, roadmap",
         keywords: &["projet", "codebase", "sync", "roadmap", "créer projet"],
         tools: &[
-            ToolRef { name: "list_projects", description: "Lister tous les projets" },
-            ToolRef { name: "create_project", description: "Créer un nouveau projet" },
-            ToolRef { name: "get_project", description: "Détails d'un projet par slug" },
-            ToolRef { name: "update_project", description: "Modifier nom/description/path" },
-            ToolRef { name: "delete_project", description: "Supprimer un projet" },
-            ToolRef { name: "sync_project", description: "Synchroniser le codebase" },
-            ToolRef { name: "get_project_roadmap", description: "Roadmap avec milestones" },
-            ToolRef { name: "list_project_plans", description: "Plans d'un projet" },
+            ToolRef {
+                name: "list_projects",
+                description: "Lister tous les projets",
+            },
+            ToolRef {
+                name: "create_project",
+                description: "Créer un nouveau projet",
+            },
+            ToolRef {
+                name: "get_project",
+                description: "Détails d'un projet par slug",
+            },
+            ToolRef {
+                name: "update_project",
+                description: "Modifier nom/description/path",
+            },
+            ToolRef {
+                name: "delete_project",
+                description: "Supprimer un projet",
+            },
+            ToolRef {
+                name: "sync_project",
+                description: "Synchroniser le codebase",
+            },
+            ToolRef {
+                name: "get_project_roadmap",
+                description: "Roadmap avec milestones",
+            },
+            ToolRef {
+                name: "list_project_plans",
+                description: "Plans d'un projet",
+            },
         ],
     },
     // ── Releases & Milestones (14 tools) ─────────────────────────────
@@ -482,24 +755,72 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         name: "releases_milestones",
         description: "Versions livrables et jalons",
         keywords: &[
-            "release", "milestone", "version", "livrable", "jalon",
-            "livraison", "déploiement", "cible",
+            "release",
+            "milestone",
+            "version",
+            "livrable",
+            "jalon",
+            "livraison",
+            "déploiement",
+            "cible",
         ],
         tools: &[
-            ToolRef { name: "create_release", description: "Créer une release" },
-            ToolRef { name: "get_release", description: "Détails d'une release" },
-            ToolRef { name: "update_release", description: "Modifier une release" },
-            ToolRef { name: "delete_release", description: "Supprimer une release" },
-            ToolRef { name: "list_releases", description: "Releases d'un projet" },
-            ToolRef { name: "add_task_to_release", description: "Lier tâche → release" },
-            ToolRef { name: "add_commit_to_release", description: "Lier commit → release" },
-            ToolRef { name: "create_milestone", description: "Créer un milestone" },
-            ToolRef { name: "get_milestone", description: "Détails d'un milestone" },
-            ToolRef { name: "update_milestone", description: "Modifier un milestone" },
-            ToolRef { name: "delete_milestone", description: "Supprimer un milestone" },
-            ToolRef { name: "list_milestones", description: "Milestones d'un projet" },
-            ToolRef { name: "get_milestone_progress", description: "Progression d'un milestone" },
-            ToolRef { name: "add_task_to_milestone", description: "Lier tâche → milestone" },
+            ToolRef {
+                name: "create_release",
+                description: "Créer une release",
+            },
+            ToolRef {
+                name: "get_release",
+                description: "Détails d'une release",
+            },
+            ToolRef {
+                name: "update_release",
+                description: "Modifier une release",
+            },
+            ToolRef {
+                name: "delete_release",
+                description: "Supprimer une release",
+            },
+            ToolRef {
+                name: "list_releases",
+                description: "Releases d'un projet",
+            },
+            ToolRef {
+                name: "add_task_to_release",
+                description: "Lier tâche → release",
+            },
+            ToolRef {
+                name: "add_commit_to_release",
+                description: "Lier commit → release",
+            },
+            ToolRef {
+                name: "create_milestone",
+                description: "Créer un milestone",
+            },
+            ToolRef {
+                name: "get_milestone",
+                description: "Détails d'un milestone",
+            },
+            ToolRef {
+                name: "update_milestone",
+                description: "Modifier un milestone",
+            },
+            ToolRef {
+                name: "delete_milestone",
+                description: "Supprimer un milestone",
+            },
+            ToolRef {
+                name: "list_milestones",
+                description: "Milestones d'un projet",
+            },
+            ToolRef {
+                name: "get_milestone_progress",
+                description: "Progression d'un milestone",
+            },
+            ToolRef {
+                name: "add_task_to_milestone",
+                description: "Lier tâche → milestone",
+            },
         ],
     },
     // ── Workspace (33 tools) ─────────────────────────────────────────
@@ -507,43 +828,149 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         name: "workspace",
         description: "Multi-projets, topologie, ressources partagées",
         keywords: &[
-            "workspace", "composant", "ressource", "topologie", "service",
-            "multi-projet", "cross-projet", "contrat", "API contract",
+            "workspace",
+            "composant",
+            "ressource",
+            "topologie",
+            "service",
+            "multi-projet",
+            "cross-projet",
+            "contrat",
+            "API contract",
         ],
         tools: &[
-            ToolRef { name: "list_workspaces", description: "Lister les workspaces" },
-            ToolRef { name: "create_workspace", description: "Créer un workspace" },
-            ToolRef { name: "get_workspace", description: "Détails d'un workspace" },
-            ToolRef { name: "update_workspace", description: "Modifier un workspace" },
-            ToolRef { name: "delete_workspace", description: "Supprimer un workspace" },
-            ToolRef { name: "get_workspace_overview", description: "Vue d'ensemble complète" },
-            ToolRef { name: "list_workspace_projects", description: "Projets du workspace" },
-            ToolRef { name: "add_project_to_workspace", description: "Ajouter un projet" },
-            ToolRef { name: "remove_project_from_workspace", description: "Retirer un projet" },
-            ToolRef { name: "search_workspace_code", description: "Recherche cross-projets" },
-            ToolRef { name: "list_workspace_milestones", description: "Milestones cross-projets" },
-            ToolRef { name: "create_workspace_milestone", description: "Créer milestone workspace" },
-            ToolRef { name: "get_workspace_milestone", description: "Détails milestone workspace" },
-            ToolRef { name: "update_workspace_milestone", description: "Modifier milestone workspace" },
-            ToolRef { name: "delete_workspace_milestone", description: "Supprimer milestone workspace" },
-            ToolRef { name: "add_task_to_workspace_milestone", description: "Lier tâche → ws milestone" },
-            ToolRef { name: "get_workspace_milestone_progress", description: "Progression ws milestone" },
-            ToolRef { name: "list_all_workspace_milestones", description: "Tous les ws milestones" },
-            ToolRef { name: "list_resources", description: "Ressources partagées" },
-            ToolRef { name: "create_resource", description: "Créer une ressource" },
-            ToolRef { name: "get_resource", description: "Détails d'une ressource" },
-            ToolRef { name: "update_resource", description: "Modifier une ressource" },
-            ToolRef { name: "delete_resource", description: "Supprimer une ressource" },
-            ToolRef { name: "link_resource_to_project", description: "Lier ressource → projet" },
-            ToolRef { name: "list_components", description: "Composants du workspace" },
-            ToolRef { name: "create_component", description: "Créer un composant" },
-            ToolRef { name: "get_component", description: "Détails d'un composant" },
-            ToolRef { name: "update_component", description: "Modifier un composant" },
-            ToolRef { name: "delete_component", description: "Supprimer un composant" },
-            ToolRef { name: "add_component_dependency", description: "Dépendance entre composants" },
-            ToolRef { name: "remove_component_dependency", description: "Retirer dépendance composant" },
-            ToolRef { name: "map_component_to_project", description: "Lier composant → projet" },
-            ToolRef { name: "get_workspace_topology", description: "Graphe composants + dépendances" },
+            ToolRef {
+                name: "list_workspaces",
+                description: "Lister les workspaces",
+            },
+            ToolRef {
+                name: "create_workspace",
+                description: "Créer un workspace",
+            },
+            ToolRef {
+                name: "get_workspace",
+                description: "Détails d'un workspace",
+            },
+            ToolRef {
+                name: "update_workspace",
+                description: "Modifier un workspace",
+            },
+            ToolRef {
+                name: "delete_workspace",
+                description: "Supprimer un workspace",
+            },
+            ToolRef {
+                name: "get_workspace_overview",
+                description: "Vue d'ensemble complète",
+            },
+            ToolRef {
+                name: "list_workspace_projects",
+                description: "Projets du workspace",
+            },
+            ToolRef {
+                name: "add_project_to_workspace",
+                description: "Ajouter un projet",
+            },
+            ToolRef {
+                name: "remove_project_from_workspace",
+                description: "Retirer un projet",
+            },
+            ToolRef {
+                name: "search_workspace_code",
+                description: "Recherche cross-projets",
+            },
+            ToolRef {
+                name: "list_workspace_milestones",
+                description: "Milestones cross-projets",
+            },
+            ToolRef {
+                name: "create_workspace_milestone",
+                description: "Créer milestone workspace",
+            },
+            ToolRef {
+                name: "get_workspace_milestone",
+                description: "Détails milestone workspace",
+            },
+            ToolRef {
+                name: "update_workspace_milestone",
+                description: "Modifier milestone workspace",
+            },
+            ToolRef {
+                name: "delete_workspace_milestone",
+                description: "Supprimer milestone workspace",
+            },
+            ToolRef {
+                name: "add_task_to_workspace_milestone",
+                description: "Lier tâche → ws milestone",
+            },
+            ToolRef {
+                name: "get_workspace_milestone_progress",
+                description: "Progression ws milestone",
+            },
+            ToolRef {
+                name: "list_all_workspace_milestones",
+                description: "Tous les ws milestones",
+            },
+            ToolRef {
+                name: "list_resources",
+                description: "Ressources partagées",
+            },
+            ToolRef {
+                name: "create_resource",
+                description: "Créer une ressource",
+            },
+            ToolRef {
+                name: "get_resource",
+                description: "Détails d'une ressource",
+            },
+            ToolRef {
+                name: "update_resource",
+                description: "Modifier une ressource",
+            },
+            ToolRef {
+                name: "delete_resource",
+                description: "Supprimer une ressource",
+            },
+            ToolRef {
+                name: "link_resource_to_project",
+                description: "Lier ressource → projet",
+            },
+            ToolRef {
+                name: "list_components",
+                description: "Composants du workspace",
+            },
+            ToolRef {
+                name: "create_component",
+                description: "Créer un composant",
+            },
+            ToolRef {
+                name: "get_component",
+                description: "Détails d'un composant",
+            },
+            ToolRef {
+                name: "update_component",
+                description: "Modifier un composant",
+            },
+            ToolRef {
+                name: "delete_component",
+                description: "Supprimer un composant",
+            },
+            ToolRef {
+                name: "add_component_dependency",
+                description: "Dépendance entre composants",
+            },
+            ToolRef {
+                name: "remove_component_dependency",
+                description: "Retirer dépendance composant",
+            },
+            ToolRef {
+                name: "map_component_to_project",
+                description: "Lier composant → projet",
+            },
+            ToolRef {
+                name: "get_workspace_topology",
+                description: "Graphe composants + dépendances",
+            },
         ],
     },
     // ── Sync & Admin (6 tools) ───────────────────────────────────────
@@ -552,12 +979,30 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         description: "Synchronisation code et administration",
         keywords: &["sync", "watch", "watcher", "meilisearch", "index", "admin"],
         tools: &[
-            ToolRef { name: "sync_directory", description: "Sync manuelle d'un répertoire" },
-            ToolRef { name: "start_watch", description: "Démarrer le file watcher" },
-            ToolRef { name: "stop_watch", description: "Arrêter le file watcher" },
-            ToolRef { name: "watch_status", description: "Statut du file watcher" },
-            ToolRef { name: "get_meilisearch_stats", description: "Stats de l'index Meilisearch" },
-            ToolRef { name: "delete_meilisearch_orphans", description: "Nettoyer docs orphelins" },
+            ToolRef {
+                name: "sync_directory",
+                description: "Sync manuelle d'un répertoire",
+            },
+            ToolRef {
+                name: "start_watch",
+                description: "Démarrer le file watcher",
+            },
+            ToolRef {
+                name: "stop_watch",
+                description: "Arrêter le file watcher",
+            },
+            ToolRef {
+                name: "watch_status",
+                description: "Statut du file watcher",
+            },
+            ToolRef {
+                name: "get_meilisearch_stats",
+                description: "Stats de l'index Meilisearch",
+            },
+            ToolRef {
+                name: "delete_meilisearch_orphans",
+                description: "Nettoyer docs orphelins",
+            },
         ],
     },
     // ── Chat (5 tools) ───────────────────────────────────────────────
@@ -566,11 +1011,26 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         description: "Sessions de conversation et messages",
         keywords: &["chat", "session", "conversation", "message", "historique"],
         tools: &[
-            ToolRef { name: "chat_send_message", description: "Envoyer un message (non-streaming)" },
-            ToolRef { name: "list_chat_sessions", description: "Lister les sessions chat" },
-            ToolRef { name: "get_chat_session", description: "Détails d'une session" },
-            ToolRef { name: "delete_chat_session", description: "Supprimer une session" },
-            ToolRef { name: "list_chat_messages", description: "Historique des messages" },
+            ToolRef {
+                name: "chat_send_message",
+                description: "Envoyer un message (non-streaming)",
+            },
+            ToolRef {
+                name: "list_chat_sessions",
+                description: "Lister les sessions chat",
+            },
+            ToolRef {
+                name: "get_chat_session",
+                description: "Détails d'une session",
+            },
+            ToolRef {
+                name: "delete_chat_session",
+                description: "Supprimer une session",
+            },
+            ToolRef {
+                name: "list_chat_messages",
+                description: "Historique des messages",
+            },
         ],
     },
     // ── Feature Graphs (6 tools) ────────────────────────────────────
@@ -578,16 +1038,41 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         name: "feature_graphs",
         description: "Sous-graphes de code par feature, réutilisables entre sessions",
         keywords: &[
-            "feature", "graphe", "sous-graphe", "subgraph", "feature graph",
-            "exploration", "call graph", "auto-build", "entité",
+            "feature",
+            "graphe",
+            "sous-graphe",
+            "subgraph",
+            "feature graph",
+            "exploration",
+            "call graph",
+            "auto-build",
+            "entité",
         ],
         tools: &[
-            ToolRef { name: "create_feature_graph", description: "Créer un feature graph nommé" },
-            ToolRef { name: "get_feature_graph", description: "Détails avec entités incluses" },
-            ToolRef { name: "list_feature_graphs", description: "Lister les feature graphs" },
-            ToolRef { name: "add_to_feature_graph", description: "Ajouter une entité (file/function/struct)" },
-            ToolRef { name: "auto_build_feature_graph", description: "Construire auto depuis un point d'entrée" },
-            ToolRef { name: "delete_feature_graph", description: "Supprimer un feature graph" },
+            ToolRef {
+                name: "create_feature_graph",
+                description: "Créer un feature graph nommé",
+            },
+            ToolRef {
+                name: "get_feature_graph",
+                description: "Détails avec entités incluses",
+            },
+            ToolRef {
+                name: "list_feature_graphs",
+                description: "Lister les feature graphs",
+            },
+            ToolRef {
+                name: "add_to_feature_graph",
+                description: "Ajouter une entité (file/function/struct)",
+            },
+            ToolRef {
+                name: "auto_build_feature_graph",
+                description: "Construire auto depuis un point d'entrée",
+            },
+            ToolRef {
+                name: "delete_feature_graph",
+                description: "Supprimer un feature graph",
+            },
         ],
     },
 ];
@@ -924,10 +1409,7 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
                 })
             })
             .collect();
-        map.insert(
-            "global_guidelines".into(),
-            serde_json::Value::Array(notes),
-        );
+        map.insert("global_guidelines".into(), serde_json::Value::Array(notes));
     }
 
     if !ctx.global_gotchas.is_empty() {
@@ -1382,11 +1864,8 @@ mod tests {
     #[test]
     fn test_build_refinement_prompt_contains_inputs() {
         let tools_json = tools_catalog_to_json(TOOL_GROUPS);
-        let prompt = build_refinement_prompt(
-            "Implémente le login",
-            r#"{"project":"test"}"#,
-            &tools_json,
-        );
+        let prompt =
+            build_refinement_prompt("Implémente le login", r#"{"project":"test"}"#, &tools_json);
         // User message & context JSON are injected
         assert!(prompt.contains("Implémente le login"));
         assert!(prompt.contains(r#"{"project":"test"}"#));
@@ -1621,8 +2100,16 @@ mod tests {
     #[test]
     fn test_tool_groups_all_have_keywords_and_tools() {
         for group in TOOL_GROUPS {
-            assert!(!group.keywords.is_empty(), "Group '{}' has no keywords", group.name);
-            assert!(!group.tools.is_empty(), "Group '{}' has no tools", group.name);
+            assert!(
+                !group.keywords.is_empty(),
+                "Group '{}' has no keywords",
+                group.name
+            );
+            assert!(
+                !group.tools.is_empty(),
+                "Group '{}' has no tools",
+                group.name
+            );
         }
     }
 
@@ -1653,21 +2140,34 @@ mod tests {
     fn test_select_tool_groups_planning_message() {
         let groups = select_tool_groups_by_keywords("Je veux planifier une nouvelle feature");
         let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
-        assert!(names.contains(&"planning"), "Expected planning group, got {:?}", names);
+        assert!(
+            names.contains(&"planning"),
+            "Expected planning group, got {:?}",
+            names
+        );
     }
 
     #[test]
     fn test_select_tool_groups_code_message() {
-        let groups = select_tool_groups_by_keywords("Explore le code de la fonction handle_request");
+        let groups =
+            select_tool_groups_by_keywords("Explore le code de la fonction handle_request");
         let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
-        assert!(names.contains(&"code_exploration"), "Expected code_exploration, got {:?}", names);
+        assert!(
+            names.contains(&"code_exploration"),
+            "Expected code_exploration, got {:?}",
+            names
+        );
     }
 
     #[test]
     fn test_select_tool_groups_knowledge_message() {
         let groups = select_tool_groups_by_keywords("Crée une note gotcha pour ce pattern");
         let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
-        assert!(names.contains(&"knowledge"), "Expected knowledge, got {:?}", names);
+        assert!(
+            names.contains(&"knowledge"),
+            "Expected knowledge, got {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1675,23 +2175,47 @@ mod tests {
         let groups = select_tool_groups_by_keywords("bonjour comment ça va");
         let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
         // Fallback: planning + code_exploration
-        assert!(names.contains(&"planning"), "Fallback should include planning, got {:?}", names);
-        assert!(names.contains(&"code_exploration"), "Fallback should include code_exploration, got {:?}", names);
+        assert!(
+            names.contains(&"planning"),
+            "Fallback should include planning, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"code_exploration"),
+            "Fallback should include code_exploration, got {:?}",
+            names
+        );
     }
 
     #[test]
     fn test_select_tool_groups_mixed_message() {
-        let groups = select_tool_groups_by_keywords("Planifie le refactoring du code et crée un commit");
+        let groups =
+            select_tool_groups_by_keywords("Planifie le refactoring du code et crée un commit");
         let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
-        assert!(names.contains(&"planning"), "Expected planning, got {:?}", names);
-        assert!(names.contains(&"code_exploration"), "Expected code_exploration, got {:?}", names);
-        assert!(names.contains(&"git_tracking"), "Expected git_tracking, got {:?}", names);
+        assert!(
+            names.contains(&"planning"),
+            "Expected planning, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"code_exploration"),
+            "Expected code_exploration, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"git_tracking"),
+            "Expected git_tracking, got {:?}",
+            names
+        );
     }
 
     #[test]
     fn test_select_tool_groups_always_returns_at_least_one() {
         let groups = select_tool_groups_by_keywords("");
-        assert!(!groups.is_empty(), "Should always return at least one group");
+        assert!(
+            !groups.is_empty(),
+            "Should always return at least one group"
+        );
     }
 
     #[test]

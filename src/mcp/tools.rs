@@ -1215,10 +1215,7 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
                     "anchors": {"type": "array", "description": "Initial anchors to code entities"}
                 })),
-                required: Some(vec![
-                    "note_type".to_string(),
-                    "content".to_string(),
-                ]),
+                required: Some(vec!["note_type".to_string(), "content".to_string()]),
             },
         },
         ToolDefinition {

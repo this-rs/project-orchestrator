@@ -562,7 +562,12 @@ pub struct Note {
 
 impl Note {
     /// Create a new note with minimal fields
-    pub fn new(project_id: Option<Uuid>, note_type: NoteType, content: String, created_by: String) -> Self {
+    pub fn new(
+        project_id: Option<Uuid>,
+        note_type: NoteType,
+        content: String,
+        created_by: String,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),

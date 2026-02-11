@@ -6111,9 +6111,7 @@ impl Neo4jClient {
         .param("id", note.id.to_string())
         .param(
             "project_id",
-            note.project_id
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
+            note.project_id.map(|id| id.to_string()).unwrap_or_default(),
         )
         .param("note_type", note.note_type.to_string())
         .param("status", note.status.to_string())
@@ -6887,10 +6885,13 @@ impl Neo4jClient {
 
         Ok(Note {
             id: node.get::<String>("id")?.parse()?,
-            project_id: node
-                .get::<String>("project_id")
-                .ok()
-                .and_then(|s| if s.is_empty() { None } else { s.parse().ok() }),
+            project_id: node.get::<String>("project_id").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
             note_type: note_type_str.parse().unwrap_or(NoteType::Observation),
             status: status_str.parse().unwrap_or(NoteStatus::Active),
             importance: importance_str.parse().unwrap_or(NoteImportance::Medium),
@@ -7689,8 +7690,7 @@ impl Neo4jClient {
     }
 
     pub async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>> {
-        let q = query("MATCH (fg:FeatureGraph {id: $id}) RETURN fg")
-            .param("id", id.to_string());
+        let q = query("MATCH (fg:FeatureGraph {id: $id}) RETURN fg").param("id", id.to_string());
 
         let rows = self.execute_with_params(q).await?;
         if let Some(row) = rows.first() {
@@ -7701,10 +7701,7 @@ impl Neo4jClient {
         }
     }
 
-    pub async fn get_feature_graph_detail(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<FeatureGraphDetail>> {
+    pub async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
         let fg = self.get_feature_graph(id).await?;
         let Some(fg) = fg else { return Ok(None) };
 
@@ -7818,11 +7815,9 @@ impl Neo4jClient {
             .param("entity_id", entity_id.to_string());
         self.execute_with_params(q).await?;
 
-        let update_q = query(
-            "MATCH (fg:FeatureGraph {id: $id}) SET fg.updated_at = $now",
-        )
-        .param("id", feature_graph_id.to_string())
-        .param("now", chrono::Utc::now().to_rfc3339());
+        let update_q = query("MATCH (fg:FeatureGraph {id: $id}) SET fg.updated_at = $now")
+            .param("id", feature_graph_id.to_string())
+            .param("now", chrono::Utc::now().to_rfc3339());
         self.execute_with_params(update_q).await?;
 
         Ok(())
@@ -7971,10 +7966,13 @@ impl Neo4jClient {
         Ok(FeatureGraphNode {
             id: node.get::<String>("id")?.parse()?,
             name: node.get("name")?,
-            description: node
-                .get::<String>("description")
-                .ok()
-                .and_then(|s| if s.is_empty() { None } else { Some(s) }),
+            description: node.get::<String>("description").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }),
             project_id: node.get::<String>("project_id")?.parse()?,
             created_at: node
                 .get::<String>("created_at")?

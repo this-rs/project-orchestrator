@@ -3608,10 +3608,7 @@ impl GraphStore for MockGraphStore {
         }))
     }
 
-    async fn list_feature_graphs(
-        &self,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<FeatureGraphNode>> {
+    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>> {
         let graphs = self.feature_graphs.read().await;
         let mut result: Vec<FeatureGraphNode> = graphs
             .values()
@@ -3723,9 +3720,7 @@ impl GraphStore for MockGraphStore {
         if all_functions.len() <= 1 {
             // Only entry function found — check it even exists in functions
             let funcs = self.functions.read().await;
-            let exists = funcs
-                .values()
-                .any(|f| f.name == entry_function);
+            let exists = funcs.values().any(|f| f.name == entry_function);
             if !exists {
                 return Err(anyhow::anyhow!(
                     "No function found matching '{}'",

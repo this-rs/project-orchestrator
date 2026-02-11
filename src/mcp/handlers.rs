@@ -3601,10 +3601,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("entry_function is required"))?;
         let description = args.get("description").and_then(|v| v.as_str());
-        let depth = args
-            .get("depth")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(2) as u32;
+        let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
 
         let detail = self
             .neo4j()
