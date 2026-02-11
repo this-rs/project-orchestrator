@@ -221,6 +221,14 @@ impl ToolHandler {
             "chat_send_message" => self.chat_send_message(args).await,
             "list_chat_messages" => self.list_chat_messages(args).await,
 
+            // Feature Graph
+            "create_feature_graph" => self.create_feature_graph(args).await,
+            "get_feature_graph" => self.get_feature_graph(args).await,
+            "list_feature_graphs" => self.list_feature_graphs(args).await,
+            "add_to_feature_graph" => self.add_to_feature_graph(args).await,
+            "auto_build_feature_graph" => self.auto_build_feature_graph(args).await,
+            "delete_feature_graph" => self.delete_feature_graph(args).await,
+
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -3471,6 +3479,164 @@ impl ToolHandler {
             "offset": loaded.offset,
             "limit": loaded.limit,
         }))
+    }
+
+    // ====================================================================
+    // Feature Graph handlers
+    // ====================================================================
+
+    async fn create_feature_graph(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("name is required"))?;
+        let project_id = parse_uuid(&args, "project_id")?;
+        let description = args.get("description").and_then(|v| v.as_str());
+
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: description.map(|d| d.to_string()),
+            project_id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        self.neo4j().create_feature_graph(&fg).await?;
+
+        Ok(json!({
+            "id": fg.id.to_string(),
+            "name": fg.name,
+            "project_id": fg.project_id.to_string(),
+            "created_at": fg.created_at.to_rfc3339(),
+        }))
+    }
+
+    async fn get_feature_graph(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let detail = self
+            .neo4j()
+            .get_feature_graph_detail(id)
+            .await?
+            .ok_or_else(|| anyhow!("Feature graph not found: {}", id))?;
+
+        let entities: Vec<Value> = detail
+            .entities
+            .iter()
+            .map(|e| {
+                json!({
+                    "entity_type": e.entity_type,
+                    "entity_id": e.entity_id,
+                    "name": e.name,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "id": detail.graph.id.to_string(),
+            "name": detail.graph.name,
+            "description": detail.graph.description,
+            "project_id": detail.graph.project_id.to_string(),
+            "created_at": detail.graph.created_at.to_rfc3339(),
+            "updated_at": detail.graph.updated_at.to_rfc3339(),
+            "entities": entities,
+            "entity_count": entities.len(),
+        }))
+    }
+
+    async fn list_feature_graphs(&self, args: Value) -> Result<Value> {
+        let project_id = parse_uuid(&args, "project_id").ok();
+        let graphs = self.neo4j().list_feature_graphs(project_id).await?;
+
+        let items: Vec<Value> = graphs
+            .iter()
+            .map(|fg| {
+                json!({
+                    "id": fg.id.to_string(),
+                    "name": fg.name,
+                    "description": fg.description,
+                    "project_id": fg.project_id.to_string(),
+                    "created_at": fg.created_at.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "feature_graphs": items,
+            "count": items.len(),
+        }))
+    }
+
+    async fn add_to_feature_graph(&self, args: Value) -> Result<Value> {
+        let feature_graph_id = parse_uuid(&args, "feature_graph_id")?;
+        let entity_type = args
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_type is required"))?;
+        let entity_id = args
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entity_id is required"))?;
+
+        self.neo4j()
+            .add_entity_to_feature_graph(feature_graph_id, entity_type, entity_id)
+            .await?;
+
+        Ok(json!({
+            "added": true,
+            "feature_graph_id": feature_graph_id.to_string(),
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+        }))
+    }
+
+    async fn auto_build_feature_graph(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("name is required"))?;
+        let project_id = parse_uuid(&args, "project_id")?;
+        let entry_function = args
+            .get("entry_function")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("entry_function is required"))?;
+        let description = args.get("description").and_then(|v| v.as_str());
+        let depth = args
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as u32;
+
+        let detail = self
+            .neo4j()
+            .auto_build_feature_graph(name, description, project_id, entry_function, depth)
+            .await?;
+
+        let entities: Vec<Value> = detail
+            .entities
+            .iter()
+            .map(|e| {
+                json!({
+                    "entity_type": e.entity_type,
+                    "entity_id": e.entity_id,
+                    "name": e.name,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "id": detail.graph.id.to_string(),
+            "name": detail.graph.name,
+            "description": detail.graph.description,
+            "project_id": detail.graph.project_id.to_string(),
+            "entities": entities,
+            "entity_count": entities.len(),
+        }))
+    }
+
+    async fn delete_feature_graph(&self, args: Value) -> Result<Value> {
+        let id = parse_uuid(&args, "id")?;
+        let deleted = self.neo4j().delete_feature_graph(id).await?;
+        Ok(json!({ "deleted": deleted }))
     }
 }
 

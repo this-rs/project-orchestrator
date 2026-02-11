@@ -573,10 +573,27 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             ToolRef { name: "list_chat_messages", description: "Historique des messages" },
         ],
     },
+    // ── Feature Graphs (6 tools) ────────────────────────────────────
+    ToolGroup {
+        name: "feature_graphs",
+        description: "Sous-graphes de code par feature, réutilisables entre sessions",
+        keywords: &[
+            "feature", "graphe", "sous-graphe", "subgraph", "feature graph",
+            "exploration", "call graph", "auto-build", "entité",
+        ],
+        tools: &[
+            ToolRef { name: "create_feature_graph", description: "Créer un feature graph nommé" },
+            ToolRef { name: "get_feature_graph", description: "Détails avec entités incluses" },
+            ToolRef { name: "list_feature_graphs", description: "Lister les feature graphs" },
+            ToolRef { name: "add_to_feature_graph", description: "Ajouter une entité (file/function/struct)" },
+            ToolRef { name: "auto_build_feature_graph", description: "Construire auto depuis un point d'entrée" },
+            ToolRef { name: "delete_feature_graph", description: "Supprimer un feature graph" },
+        ],
+    },
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 137).
+/// Must match the MCP tools.rs count (currently 143).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -1544,11 +1561,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_137_tools() {
+    fn test_tool_groups_cover_all_143_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 137,
-            "TOOL_GROUPS must cover exactly 137 unique tools (got {}). \
+            count, 143,
+            "TOOL_GROUPS must cover exactly 143 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -1598,7 +1615,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 12, "Expected 12 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 13, "Expected 13 tool groups");
     }
 
     #[test]
