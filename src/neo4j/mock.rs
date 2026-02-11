@@ -3669,6 +3669,122 @@ impl GraphStore for MockGraphStore {
             Ok(false)
         }
     }
+
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+    ) -> Result<FeatureGraphDetail> {
+        let depth = depth.max(1).min(5);
+
+        // Collect callees from the mock call_relationships
+        let cr = self.call_relationships.read().await;
+        let mut all_functions = std::collections::HashSet::new();
+        all_functions.insert(entry_function.to_string());
+
+        // Simple BFS traversal for callees
+        let mut queue: Vec<String> = vec![entry_function.to_string()];
+        for _ in 0..depth {
+            let mut next_queue = Vec::new();
+            for func in &queue {
+                // Check direct name match
+                if let Some(callees) = cr.get(func) {
+                    for callee in callees {
+                        if all_functions.insert(callee.clone()) {
+                            next_queue.push(callee.clone());
+                        }
+                    }
+                }
+                // Check qualified name match (e.g. "module::func")
+                for (caller_id, callees) in cr.iter() {
+                    if caller_id.ends_with(&format!("::{}", func)) {
+                        for callee in callees {
+                            if all_functions.insert(callee.clone()) {
+                                next_queue.push(callee.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            queue = next_queue;
+        }
+
+        // Collect callers
+        for (caller, callees) in cr.iter() {
+            if callees.contains(&entry_function.to_string()) {
+                all_functions.insert(caller.clone());
+            }
+        }
+        drop(cr);
+
+        if all_functions.len() <= 1 {
+            // Only entry function found — check it even exists in functions
+            let funcs = self.functions.read().await;
+            let exists = funcs
+                .values()
+                .any(|f| f.name == entry_function);
+            if !exists {
+                return Err(anyhow::anyhow!(
+                    "No function found matching '{}'",
+                    entry_function
+                ));
+            }
+        }
+
+        // Collect file paths from known functions
+        let funcs = self.functions.read().await;
+        let mut files = std::collections::HashSet::new();
+        for func in &all_functions {
+            for f in funcs.values() {
+                if f.name == *func {
+                    files.insert(f.file_path.clone());
+                }
+            }
+        }
+        drop(funcs);
+
+        // Create the feature graph
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: description.map(|d| d.to_string()),
+            project_id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        self.create_feature_graph(&fg).await?;
+
+        // Add entities
+        let mut entities = Vec::new();
+        for func_name in &all_functions {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "function", func_name)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+            });
+        }
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "file", file_path)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+            });
+        }
+
+        Ok(FeatureGraphDetail {
+            graph: fg,
+            entities,
+        })
+    }
 }
 
 #[cfg(test)]

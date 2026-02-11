@@ -1391,4 +1391,16 @@ impl GraphStore for Neo4jClient {
         self.remove_entity_from_feature_graph(feature_graph_id, entity_type, entity_id)
             .await
     }
+
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+    ) -> anyhow::Result<FeatureGraphDetail> {
+        self.auto_build_feature_graph(name, description, project_id, entry_function, depth)
+            .await
+    }
 }

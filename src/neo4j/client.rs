@@ -7867,6 +7867,106 @@ impl Neo4jClient {
         }
     }
 
+    pub async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+    ) -> Result<FeatureGraphDetail> {
+        // Step 1: Collect all related functions and their files via call graph
+        // We collect the entry function + callers + callees
+        let depth = depth.max(1).min(5); // Clamp 1..5
+
+        let q = query(&format!(
+            r#"
+            MATCH (entry:Function {{name: $name}})
+            OPTIONAL MATCH (entry)-[:CALLS*1..{depth}]->(callee:Function)
+            OPTIONAL MATCH (caller:Function)-[:CALLS*1..{depth}]->(entry)
+            WITH entry,
+                 collect(DISTINCT callee) AS callees_nodes,
+                 collect(DISTINCT caller) AS callers_nodes
+            WITH entry, callees_nodes, callers_nodes,
+                 [entry] + callees_nodes + callers_nodes AS all_funcs
+            UNWIND all_funcs AS f
+            WITH DISTINCT f
+            WHERE f IS NOT NULL
+            RETURN f.name AS func_name, f.file_path AS file_path
+            "#,
+            depth = depth
+        ))
+        .param("name", entry_function);
+
+        let rows = self.execute_with_params(q).await?;
+
+        // Collect unique functions and files
+        let mut functions: Vec<(String, Option<String>)> = Vec::new();
+        let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for row in &rows {
+            if let Ok(func_name) = row.get::<String>("func_name") {
+                let file_path: Option<String> = row.get::<String>("file_path").ok();
+                if let Some(ref fp) = file_path {
+                    if !fp.is_empty() {
+                        files.insert(fp.clone());
+                    }
+                }
+                functions.push((func_name, file_path));
+            }
+        }
+
+        if functions.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No function found matching '{}'",
+                entry_function
+            ));
+        }
+
+        // Step 2: Create the FeatureGraph
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: description.map(|d| d.to_string()),
+            project_id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        self.create_feature_graph(&fg).await?;
+
+        // Step 3: Add all entities
+        let mut entities = Vec::new();
+
+        // Add functions
+        for (func_name, _file_path) in &functions {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "function", func_name)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+            });
+        }
+
+        // Add files
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "file", file_path)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+            });
+        }
+
+        Ok(FeatureGraphDetail {
+            graph: fg,
+            entities,
+        })
+    }
+
     fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {
         Ok(FeatureGraphNode {
             id: node.get::<String>("id")?.parse()?,

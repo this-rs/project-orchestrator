@@ -1055,4 +1055,16 @@ pub trait GraphStore: Send + Sync {
         entity_type: &str,
         entity_id: &str,
     ) -> Result<bool>;
+
+    /// Automatically build a feature graph from a function entry point.
+    /// Uses the call graph (callers + callees) to discover related functions and files,
+    /// creates a FeatureGraph, and populates it with the discovered entities.
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+    ) -> Result<FeatureGraphDetail>;
 }
