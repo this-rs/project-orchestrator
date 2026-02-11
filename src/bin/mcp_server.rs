@@ -103,8 +103,6 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     info!("Starting MCP server for project-orchestrator");
-    info!("Neo4j: {}", args.neo4j_uri);
-    info!("Meilisearch: {}", args.meilisearch_url);
 
     // Deprecation warning for MCP_HTTP_URL
     if args.http_url.is_some() {
@@ -114,21 +112,37 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Create config and app state
-    let config = Config {
-        setup_completed: true,
-        neo4j_uri: args.neo4j_uri,
-        neo4j_user: args.neo4j_user,
-        neo4j_password: args.neo4j_password,
-        meilisearch_url: args.meilisearch_url,
-        meilisearch_key: args.meilisearch_key,
-        nats_url: args.nats_url.clone(),
-        workspace_path: ".".to_string(),
-        server_port: 8080, // Not used in MCP mode
-        auth_config: None, // MCP server doesn't need auth (stdio-based)
-        serve_frontend: false, // MCP server doesn't serve frontend
-        frontend_path: "./dist".to_string(),
-    };
+    // Load config from config.yaml (if present) + env vars, then apply CLI overrides.
+    //
+    // This is critical because Claude Code / Agent SDK may not forward all env vars
+    // from mcp.json to the spawned process (observed: NATS_URL missing). Loading the
+    // YAML config provides a reliable fallback for settings like nats.url.
+    let mut config = Config::from_yaml_and_env(None)?;
+
+    // CLI args override YAML/env when explicitly provided
+    // (clap already resolved env > default, so these are the final values)
+    config.neo4j_uri = args.neo4j_uri;
+    config.neo4j_user = args.neo4j_user;
+    config.neo4j_password = args.neo4j_password;
+    config.meilisearch_url = args.meilisearch_url;
+    config.meilisearch_key = args.meilisearch_key;
+    // nats_url: CLI/env wins if set, otherwise keep YAML value
+    if args.nats_url.is_some() {
+        config.nats_url = args.nats_url.clone();
+    }
+    // MCP server doesn't need auth or frontend
+    config.setup_completed = true;
+    config.auth_config = None;
+    config.serve_frontend = false;
+
+    info!("Neo4j: {}", config.neo4j_uri);
+    info!("Meilisearch: {}", config.meilisearch_url);
+    if let Some(ref nats_url) = config.nats_url {
+        info!("NATS URL: {}", nats_url);
+    }
+
+    // Save values before config is consumed by AppState::new
+    let resolved_nats_url = config.nats_url.clone();
 
     let state = match AppState::new(config).await {
         Ok(s) => s,
@@ -139,7 +153,7 @@ async fn main() -> Result<()> {
     };
 
     // Create event emitter: prefer NATS, fallback to HTTP (deprecated), or none
-    let nats_emitter: Option<Arc<NatsEmitter>> = if let Some(ref nats_url) = args.nats_url {
+    let nats_emitter: Option<Arc<NatsEmitter>> = if let Some(ref nats_url) = resolved_nats_url {
         match connect_nats(nats_url).await {
             Ok(client) => {
                 let emitter = Arc::new(NatsEmitter::new(client, "events"));
