@@ -1,7 +1,10 @@
 //! WebSocket handlers for real-time CRUD event notifications
+//!
+//! Events from both local and remote sources (NATS) arrive via the local
+//! broadcast bus thanks to the NATS→local bridge in `HybridEmitter`.
+//! WS handlers only need to subscribe to the local bus.
 
 use super::handlers::OrchestratorState;
-use crate::events::CrudEvent;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -9,16 +12,12 @@ use axum::{
     },
     response::IntoResponse,
 };
+use crate::events::CrudEvent;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use tokio::time::{interval, Duration};
 use tracing::{debug, warn};
-
-/// Max number of recent event fingerprints kept for deduplication.
-/// Events arriving via both local broadcast and NATS within the window
-/// are sent to the client only once.
-const DEDUP_WINDOW_SIZE: usize = 128;
 
 /// Query parameters for filtering WebSocket events
 #[derive(Debug, Deserialize, Default)]
@@ -45,13 +44,6 @@ pub async fn ws_events(
     let project_filter = query.project_id;
 
     ws.on_upgrade(move |socket| handle_ws(socket, state, entity_filter, project_filter))
-}
-
-/// Build a deduplication fingerprint for a CrudEvent.
-///
-/// Uses timestamp (nanosecond precision) + entity_id to identify duplicates.
-fn event_fingerprint(event: &CrudEvent) -> String {
-    format!("{}:{}", event.timestamp, event.entity_id)
 }
 
 /// Check if the event passes entity_type and project_id filters.
@@ -84,7 +76,10 @@ fn passes_filters(
     true
 }
 
-/// Handle an individual WebSocket connection
+/// Handle an individual WebSocket connection.
+///
+/// All CRUD events (local + remote via NATS bridge) arrive through the
+/// local broadcast bus — no per-connection NATS subscription needed.
 async fn handle_ws(
     mut socket: WebSocket,
     state: OrchestratorState,
@@ -105,26 +100,6 @@ async fn handle_ws(
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut event_rx = state.event_bus.subscribe();
 
-    // Subscribe to NATS CRUD events if available
-    let mut nats_sub = if let Some(ref nats) = state.nats_emitter {
-        match nats.subscribe_crud_events().await {
-            Ok(sub) => {
-                debug!("WS handler: subscribed to NATS CRUD events");
-                Some(sub)
-            }
-            Err(e) => {
-                warn!("WS handler: failed to subscribe to NATS CRUD events: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Deduplication window: recent event fingerprints
-    let mut seen: VecDeque<String> = VecDeque::with_capacity(DEDUP_WINDOW_SIZE);
-    let mut seen_set: HashSet<String> = HashSet::with_capacity(DEDUP_WINDOW_SIZE);
-
     // Ping interval (30s)
     let mut ping_interval = interval(Duration::from_secs(30));
     // Skip the first immediate tick
@@ -134,31 +109,17 @@ async fn handle_ws(
         email = %claims.email,
         entity_filter = ?entity_filter,
         project_filter = ?project_filter,
-        nats = nats_sub.is_some(),
         "WebSocket events client authenticated"
     );
 
     loop {
         tokio::select! {
-            // Forward local broadcast events to the WebSocket client
+            // Forward broadcast events (local + NATS-bridged) to the WebSocket client
             result = event_rx.recv() => {
                 match result {
                     Ok(event) => {
                         if !passes_filters(&event, &entity_filter, &project_filter) {
                             continue;
-                        }
-
-                        // Dedup: mark this event as seen (local events are authoritative)
-                        let fp = event_fingerprint(&event);
-                        if !seen_set.insert(fp.clone()) {
-                            // Already seen (came via NATS first) — skip
-                            continue;
-                        }
-                        seen.push_back(fp.clone());
-                        if seen.len() > DEDUP_WINDOW_SIZE {
-                            if let Some(old) = seen.pop_front() {
-                                seen_set.remove(&old);
-                            }
                         }
 
                         // Serialize and send
@@ -181,55 +142,6 @@ async fn handle_ws(
                         debug!("Event bus closed, shutting down WebSocket");
                         break;
                     }
-                }
-            }
-
-            // Forward NATS CRUD events (from other instances / MCP servers)
-            nats_msg = async {
-                match nats_sub.as_mut() {
-                    Some(sub) => sub.next().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(msg) = nats_msg {
-                    match serde_json::from_slice::<CrudEvent>(&msg.payload) {
-                        Ok(event) => {
-                            if !passes_filters(&event, &entity_filter, &project_filter) {
-                                continue;
-                            }
-
-                            // Dedup: skip if already seen via local broadcast
-                            let fp = event_fingerprint(&event);
-                            if !seen_set.insert(fp.clone()) {
-                                continue;
-                            }
-                            seen.push_back(fp.clone());
-                            if seen.len() > DEDUP_WINDOW_SIZE {
-                                if let Some(old) = seen.pop_front() {
-                                    seen_set.remove(&old);
-                                }
-                            }
-
-                            match serde_json::to_string(&event) {
-                                Ok(json) => {
-                                    if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                                        debug!("WebSocket send failed, client disconnected");
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Failed to serialize NATS CrudEvent: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to deserialize NATS CrudEvent: {}", e);
-                        }
-                    }
-                } else {
-                    // NATS subscriber closed — disable NATS branch
-                    debug!("NATS subscriber closed");
-                    nats_sub = None;
                 }
             }
 
