@@ -96,6 +96,21 @@ impl ChatEvent {
     }
 }
 
+/// Paginated list of chat events (returned by get_session_messages)
+#[derive(Debug, Clone)]
+pub struct ChatEventPage {
+    /// The events in this page (sorted by seq ASC)
+    pub events: Vec<crate::neo4j::models::ChatEventRecord>,
+    /// Total number of events for this session
+    pub total_count: usize,
+    /// Whether there are more events beyond this page
+    pub has_more: bool,
+    /// Current offset
+    pub offset: usize,
+    /// Page size limit
+    pub limit: usize,
+}
+
 /// Messages sent from the client to the server (via POST)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

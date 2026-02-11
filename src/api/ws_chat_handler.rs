@@ -199,33 +199,33 @@ async fn handle_ws_chat(
             .await
         {
             Ok(loaded) => {
-                let messages = loaded.messages_chronological();
                 debug!(
                     session_id = %session_id,
-                    count = messages.len(),
-                    "Replaying Nexus message history"
+                    count = loaded.events.len(),
+                    "Replaying message history (fallback)"
                 );
-                let mut seq = 1i64;
-                for msg in messages {
-                    let event_type = if msg.role == "user" {
-                        "user_message"
-                    } else {
-                        "assistant_text"
+                for event in &loaded.events {
+                    let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
+                        Ok(serde_json::Value::Object(mut obj)) => {
+                            obj.insert("seq".to_string(), serde_json::json!(event.seq));
+                            obj.insert("replaying".to_string(), serde_json::json!(true));
+                            serde_json::Value::Object(obj)
+                        }
+                        _ => {
+                            serde_json::json!({
+                                "seq": event.seq,
+                                "type": event.event_type,
+                                "data": serde_json::Value::String(event.data.clone()),
+                                "replaying": true,
+                            })
+                        }
                     };
-                    let data = serde_json::json!({ "content": msg.content });
-                    let replay_msg = serde_json::json!({
-                        "seq": seq,
-                        "type": event_type,
-                        "data": data,
-                        "replaying": true,
-                    });
-                    seq += 1;
                     if ws_sender
-                        .send(Message::Text(replay_msg.to_string().into()))
+                        .send(Message::Text(msg.to_string().into()))
                         .await
                         .is_err()
                     {
-                        debug!("Client disconnected during Nexus replay");
+                        debug!("Client disconnected during fallback replay");
                         return;
                     }
                 }
@@ -234,7 +234,7 @@ async fn handle_ws_chat(
                 warn!(
                     session_id = %session_id,
                     error = %e,
-                    "Failed to load Nexus message history for replay"
+                    "Failed to load message history for replay"
                 );
             }
         }

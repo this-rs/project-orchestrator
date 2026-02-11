@@ -11,8 +11,8 @@
 
 use super::config::ChatConfig;
 use super::types::{
-    truncate_snippet, ChatEvent, ChatRequest, CreateSessionResponse, MessageSearchHit,
-    MessageSearchResult,
+    truncate_snippet, ChatEvent, ChatEventPage, ChatRequest, CreateSessionResponse,
+    MessageSearchHit, MessageSearchResult,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -21,7 +21,7 @@ use crate::neo4j::GraphStore;
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use nexus_claude::{
-    memory::{ContextInjector, ConversationMemoryManager, LoadedConversation, MemoryConfig},
+    memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
 };
@@ -1907,68 +1907,128 @@ impl ChatManager {
         Ok(())
     }
 
-    /// Retrieve message history for a session, sorted by `created_at` ascending.
+    /// Retrieve full event history for a session (including tool_use, tool_result, etc.).
     ///
-    /// Bypasses the SDK's `load_conversation()` which uses `newest_first(true)` and
-    /// sorts by `turn_index` — both of which produce wrong ordering when a conversation
-    /// spans multiple Claude Code sessions. Instead, we query Meilisearch directly with
-    /// `created_at:asc` so that offset 0 = oldest messages (standard chronological pagination).
+    /// Reads structured `ChatEventRecord` from Neo4j (the same data the WebSocket
+    /// replay uses), so every event type is preserved — not just text.
+    ///
+    /// Falls back to Meilisearch `nexus_messages` for pre-migration sessions that
+    /// have no ChatEvent nodes yet (text only, no tool_use).
     pub async fn get_session_messages(
         &self,
         session_id: &str,
         limit: Option<usize>,
         offset: Option<usize>,
-    ) -> Result<LoadedConversation> {
-        use nexus_claude::memory::MessageDocument;
-
+    ) -> Result<ChatEventPage> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
-        // Fetch conversation_id from Neo4j
-        let session_node = self
-            .graph
+        // Verify session exists
+        self.graph
             .get_chat_session(uuid)
             .await
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
 
-        let conversation_id = session_node
-            .conversation_id
-            .ok_or_else(|| anyhow!("Session {} has no conversation_id", session_id))?;
+        let limit_val = limit.unwrap_or(200) as i64;
+        let offset_val = offset.unwrap_or(0) as i64;
 
-        let limit_val = limit.unwrap_or(50);
-        let offset_val = offset.unwrap_or(0);
+        // Try Neo4j ChatEvent nodes first (new format — has tool_use, etc.)
+        let total_count = self.graph.count_chat_events(uuid).await?;
 
-        // Query Meilisearch directly, sorted by created_at ascending
-        let meili_client = meilisearch_sdk::client::Client::new(
-            &self.config.meilisearch_url,
-            Some(&self.config.meilisearch_key),
-        )
-        .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
+        if total_count > 0 {
+            let events = self
+                .graph
+                .get_chat_events_paginated(uuid, offset_val, limit_val)
+                .await?;
 
-        let index = meili_client.index("nexus_messages");
-        let filter = format!("conversation_id = \"{}\"", conversation_id);
+            let has_more = offset_val + events.len() as i64 > total_count;
 
-        let results: meilisearch_sdk::search::SearchResults<MessageDocument> = index
-            .search()
-            .with_query("")
-            .with_filter(&filter)
-            .with_sort(&["created_at:asc"])
-            .with_limit(limit_val)
-            .with_offset(offset_val)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Meilisearch query failed: {}", e))?;
+            return Ok(ChatEventPage {
+                events,
+                total_count: total_count as usize,
+                has_more,
+                offset: offset_val as usize,
+                limit: limit_val as usize,
+            });
+        }
 
-        let total_count = results.estimated_total_hits.unwrap_or(0);
-        let messages: Vec<MessageDocument> = results.hits.into_iter().map(|h| h.result).collect();
-        let has_more = offset_val + messages.len() < total_count;
+        // Fallback: pre-migration sessions — read from Meilisearch (text only)
+        let session_node = self.graph.get_chat_session(uuid).await?.unwrap();
+        if let Some(conversation_id) = session_node.conversation_id {
+            let meili_client = meilisearch_sdk::client::Client::new(
+                &self.config.meilisearch_url,
+                Some(&self.config.meilisearch_key),
+            )
+            .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
 
-        Ok(LoadedConversation {
-            messages,
-            total_count,
-            has_more,
-            offset: offset_val,
-            limit: limit_val,
+            let index = meili_client.index("nexus_messages");
+            let filter = format!("conversation_id = \"{}\"", conversation_id);
+
+            let results: meilisearch_sdk::search::SearchResults<
+                nexus_claude::memory::MessageDocument,
+            > = index
+                .search()
+                .with_query("")
+                .with_filter(&filter)
+                .with_sort(&["created_at:asc"])
+                .with_limit(limit_val as usize)
+                .with_offset(offset_val as usize)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Meilisearch query failed: {}", e))?;
+
+            let meili_total = results.estimated_total_hits.unwrap_or(0);
+
+            // Convert MessageDocument → ChatEventRecord (text-only approximation)
+            let events: Vec<ChatEventRecord> = results
+                .hits
+                .into_iter()
+                .enumerate()
+                .map(|(i, hit)| {
+                    let msg = hit.result;
+                    let event_type = if msg.role == "user" {
+                        "user_message"
+                    } else {
+                        "assistant_text"
+                    };
+                    let chat_event = if msg.role == "user" {
+                        ChatEvent::UserMessage {
+                            content: msg.content.clone(),
+                        }
+                    } else {
+                        ChatEvent::AssistantText {
+                            content: msg.content.clone(),
+                        }
+                    };
+                    ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: uuid,
+                        seq: (offset_val + i as i64 + 1),
+                        event_type: event_type.to_string(),
+                        data: serde_json::to_string(&chat_event).unwrap_or_default(),
+                        created_at: chrono::Utc::now(),
+                    }
+                })
+                .collect();
+
+            let has_more = offset_val as usize + events.len() < meili_total;
+
+            return Ok(ChatEventPage {
+                events,
+                total_count: meili_total,
+                has_more,
+                offset: offset_val as usize,
+                limit: limit_val as usize,
+            });
+        }
+
+        // No events anywhere
+        Ok(ChatEventPage {
+            events: vec![],
+            total_count: 0,
+            has_more: false,
+            offset: offset_val as usize,
+            limit: limit_val as usize,
         })
     }
 
@@ -3209,6 +3269,199 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Invalid session ID"));
+    }
+
+    // ====================================================================
+    // get_session_messages — returns structured events (tool_use, etc.)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_session_messages_returns_tool_use_events() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_config(),
+        );
+
+        // Create a session
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        // Store events including tool_use and tool_result
+        let events = vec![
+            ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: 1,
+                event_type: "user_message".into(),
+                data: serde_json::to_string(&ChatEvent::UserMessage {
+                    content: "List my plans".into(),
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+            ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: 2,
+                event_type: "tool_use".into(),
+                data: serde_json::to_string(&ChatEvent::ToolUse {
+                    id: "tu_1".into(),
+                    tool: "list_plans".into(),
+                    input: serde_json::json!({"status": "in_progress"}),
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+            ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: 3,
+                event_type: "tool_result".into(),
+                data: serde_json::to_string(&ChatEvent::ToolResult {
+                    id: "tu_1".into(),
+                    result: serde_json::json!({"plans": []}),
+                    is_error: false,
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+            ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: 4,
+                event_type: "assistant_text".into(),
+                data: serde_json::to_string(&ChatEvent::AssistantText {
+                    content: "You have no in-progress plans.".into(),
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+        ];
+        state
+            .neo4j
+            .store_chat_events(session_id, events)
+            .await
+            .unwrap();
+
+        // Retrieve via get_session_messages
+        let page = manager
+            .get_session_messages(&session_id.to_string(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(page.total_count, 4);
+        assert_eq!(page.events.len(), 4);
+
+        // Verify event types are preserved
+        assert_eq!(page.events[0].event_type, "user_message");
+        assert_eq!(page.events[1].event_type, "tool_use");
+        assert_eq!(page.events[2].event_type, "tool_result");
+        assert_eq!(page.events[3].event_type, "assistant_text");
+
+        // Verify tool_use data is intact
+        let tool_use: ChatEvent = serde_json::from_str(&page.events[1].data).unwrap();
+        match tool_use {
+            ChatEvent::ToolUse { id, tool, input } => {
+                assert_eq!(id, "tu_1");
+                assert_eq!(tool, "list_plans");
+                assert_eq!(input, serde_json::json!({"status": "in_progress"}));
+            }
+            _ => panic!("Expected ToolUse event"),
+        }
+
+        // Verify ordering by seq
+        assert_eq!(page.events[0].seq, 1);
+        assert_eq!(page.events[1].seq, 2);
+        assert_eq!(page.events[2].seq, 3);
+        assert_eq!(page.events[3].seq, 4);
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_pagination() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_config(),
+        );
+
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        // Store 5 events
+        let events: Vec<ChatEventRecord> = (1..=5)
+            .map(|i| ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: i,
+                event_type: "assistant_text".into(),
+                data: serde_json::to_string(&ChatEvent::AssistantText {
+                    content: format!("Message {}", i),
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            })
+            .collect();
+        state
+            .neo4j
+            .store_chat_events(session_id, events)
+            .await
+            .unwrap();
+
+        // First page: offset=0, limit=2
+        let page1 = manager
+            .get_session_messages(&session_id.to_string(), Some(2), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(page1.events.len(), 2);
+        assert_eq!(page1.total_count, 5);
+        assert_eq!(page1.events[0].seq, 1);
+        assert_eq!(page1.events[1].seq, 2);
+
+        // Second page: offset=2, limit=2
+        let page2 = manager
+            .get_session_messages(&session_id.to_string(), Some(2), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page2.events.len(), 2);
+        assert_eq!(page2.events[0].seq, 3);
+        assert_eq!(page2.events[1].seq, 4);
+
+        // Last page: offset=4, limit=2
+        let page3 = manager
+            .get_session_messages(&session_id.to_string(), Some(2), Some(4))
+            .await
+            .unwrap();
+        assert_eq!(page3.events.len(), 1);
+        assert_eq!(page3.events[0].seq, 5);
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_empty_session() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_config(),
+        );
+
+        // Create session with no events
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        let page = manager
+            .get_session_messages(&session_id.to_string(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(page.total_count, 0);
+        assert!(page.events.is_empty());
+        assert!(!page.has_more);
     }
 
     // ====================================================================

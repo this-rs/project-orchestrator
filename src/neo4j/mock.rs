@@ -3399,6 +3399,34 @@ impl GraphStore for MockGraphStore {
         Ok(events)
     }
 
+    async fn get_chat_events_paginated(
+        &self,
+        session_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let store = self.chat_events.read().await;
+        let events = store
+            .get(&session_id)
+            .map(|v| {
+                let mut sorted = v.clone();
+                sorted.sort_by_key(|e| e.seq);
+                sorted
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(events)
+    }
+
+    async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
+        let store = self.chat_events.read().await;
+        let count = store.get(&session_id).map(|v| v.len() as i64).unwrap_or(0);
+        Ok(count)
+    }
+
     async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
         let store = self.chat_events.read().await;
         let max_seq = store

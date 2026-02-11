@@ -3442,22 +3442,22 @@ impl ToolHandler {
 
         let loaded = cm.get_session_messages(session_id, limit, offset).await?;
 
-        let messages: Vec<serde_json::Value> = loaded
-            .messages_chronological()
+        let events: Vec<serde_json::Value> = loaded
+            .events
             .iter()
-            .map(|m| {
-                json!({
-                    "id": m.id,
-                    "role": m.role,
-                    "content": m.content,
-                    "turn_index": m.turn_index,
-                    "created_at": m.created_at,
-                })
+            .map(|e| {
+                let mut obj = serde_json::from_str::<serde_json::Value>(&e.data)
+                    .unwrap_or_else(|_| json!({ "type": e.event_type, "raw": e.data }));
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("seq".to_string(), json!(e.seq));
+                    map.insert("created_at".to_string(), json!(e.created_at.to_rfc3339()));
+                }
+                obj
             })
             .collect();
 
         Ok(json!({
-            "messages": messages,
+            "events": events,
             "total_count": loaded.total_count,
             "has_more": loaded.has_more,
             "offset": loaded.offset,
