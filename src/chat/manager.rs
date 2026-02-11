@@ -1541,6 +1541,64 @@ impl ChatManager {
         }
     }
 
+    /// Try to send a message to a session via NATS RPC (cross-instance proxy).
+    ///
+    /// Returns `Ok(true)` if the message was successfully proxied to the owning instance.
+    /// Returns `Ok(false)` if NATS is not configured, no instance responded (timeout),
+    /// or the remote instance reported the session is not active there.
+    ///
+    /// This method has NO side-effects on the local ChatManager — it only communicates
+    /// with remote instances via NATS request/reply.
+    ///
+    /// Callers should fall back to `resume_session()` when this returns `Ok(false)`.
+    pub async fn try_remote_send(
+        &self,
+        session_id: &str,
+        message: &str,
+        message_type: &str,
+    ) -> Result<bool> {
+        let Some(ref nats) = self.nats else {
+            debug!(
+                session_id = %session_id,
+                "No NATS configured, skipping remote send"
+            );
+            return Ok(false);
+        };
+
+        info!(
+            session_id = %session_id,
+            "Attempting NATS RPC send to remote instance"
+        );
+
+        match nats
+            .request_send_message(session_id, message, message_type)
+            .await
+        {
+            Some(response) if response.success => {
+                info!(
+                    session_id = %session_id,
+                    "Message proxied to remote instance via NATS RPC"
+                );
+                Ok(true)
+            }
+            Some(response) => {
+                debug!(
+                    session_id = %session_id,
+                    error = ?response.error,
+                    "Remote instance rejected message (session not active there)"
+                );
+                Ok(false)
+            }
+            None => {
+                debug!(
+                    session_id = %session_id,
+                    "No NATS RPC reply (timeout) — no instance owns this session"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
         // Get session state — NO broadcast replacement, the same channel is reused
