@@ -326,10 +326,7 @@ impl AuthConfig {
     pub fn is_email_allowed(&self, email: &str) -> bool {
         let email_lower = email.to_lowercase();
         let has_domain_filter = self.allowed_email_domain.is_some();
-        let has_emails_filter = self
-            .allowed_emails
-            .as_ref()
-            .is_some_and(|v| !v.is_empty());
+        let has_emails_filter = self.allowed_emails.as_ref().is_some_and(|v| !v.is_empty());
 
         // No restrictions → everyone passes
         if !has_domain_filter && !has_emails_filter {
@@ -436,16 +433,64 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(yaml.server.serve_frontend),
-            frontend_path: std::env::var("FRONTEND_PATH")
-                .unwrap_or(yaml.server.frontend_path),
+            frontend_path: std::env::var("FRONTEND_PATH").unwrap_or(yaml.server.frontend_path),
         })
     }
 
     /// Try to load and parse a YAML config file. Returns defaults on any failure.
+    ///
+    /// Search order when `yaml_path` is `None`:
+    /// 1. `./config.yaml` (current working directory)
+    /// 2. Platform-specific app config dir:
+    ///    - macOS: `~/Library/Application Support/project-orchestrator/config.yaml`
+    ///    - Linux: `~/.config/project-orchestrator/config.yaml`
+    ///    - Windows: `%APPDATA%/ProjectOrchestrator/config.yaml`
+    ///
+    /// This ensures the MCP server binary (which may be spawned with an arbitrary
+    /// CWD by Claude Code) can still find the config written by the desktop app.
     fn load_yaml(yaml_path: Option<&Path>) -> YamlConfig {
-        let default_path = Path::new("config.yaml");
-        let path = yaml_path.unwrap_or(default_path);
+        // If an explicit path was given, use it directly.
+        if let Some(path) = yaml_path {
+            return Self::try_load_yaml(path);
+        }
 
+        // Otherwise, try multiple search paths in priority order.
+        // Platform-specific app config dir is checked FIRST because the MCP
+        // server binary can be spawned with an arbitrary CWD (e.g. "/" when
+        // launched from the macOS dock). The desktop app always writes config
+        // to the platform dir, so it must take priority over CWD.
+        let mut candidates: Vec<std::path::PathBuf> = vec![];
+
+        // 1. Platform-specific app config directory (same as desktop app)
+        if let Some(config_dir) = dirs::config_dir() {
+            #[cfg(target_os = "windows")]
+            let app_dir = config_dir.join("ProjectOrchestrator");
+            #[cfg(not(target_os = "windows"))]
+            let app_dir = config_dir.join("project-orchestrator");
+            candidates.push(app_dir.join("config.yaml"));
+        }
+
+        // 2. CWD fallback (useful for dev / CLI usage)
+        candidates.push(std::path::PathBuf::from("config.yaml"));
+
+        for path in &candidates {
+            if path.exists() {
+                let result = Self::try_load_yaml(path);
+                // try_load_yaml logs on success — return if we got a non-default config
+                // (we always return the first file found, even if it has parse errors)
+                return result;
+            }
+        }
+
+        tracing::debug!(
+            "No config file found in search paths ({:?}), using env vars / defaults",
+            candidates
+        );
+        YamlConfig::default()
+    }
+
+    /// Attempt to load and parse a single YAML config file.
+    fn try_load_yaml(path: &Path) -> YamlConfig {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_yaml::from_str(&contents) {
                 Ok(config) => {
@@ -457,11 +502,8 @@ impl Config {
                     YamlConfig::default()
                 }
             },
-            Err(_) => {
-                tracing::debug!(
-                    "No config file at {}, using env vars / defaults",
-                    path.display()
-                );
+            Err(e) => {
+                tracing::debug!("Could not read {}: {}", path.display(), e);
                 YamlConfig::default()
             }
         }
@@ -563,7 +605,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                 Some(emitter)
             }
             Err(e) => {
-                tracing::warn!("Failed to connect to NATS: {} — running in local-only mode", e);
+                tracing::warn!(
+                    "Failed to connect to NATS: {} — running in local-only mode",
+                    e
+                );
                 None
             }
         }
@@ -592,7 +637,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
     // Create chat manager (optional — requires Claude CLI)
     let chat_manager = {
-        let chat_config = chat::ChatConfig::from_env();
+        let mut chat_config = chat::ChatConfig::from_env();
+        // Ensure NATS URL from config.yaml is forwarded to the MCP server env.
+        // ChatConfig::from_env() reads NATS_URL from the process env, but when
+        // launched from the macOS dock the shell env is not inherited. The YAML
+        // config is the reliable source of truth.
+        if chat_config.nats_url.is_none() {
+            chat_config.nats_url = config.nats_url.clone();
+        }
         let mut cm = chat::ChatManager::new(
             orchestrator.neo4j_arc(),
             orchestrator.meili_arc(),
@@ -627,10 +679,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
     // Log frontend serving mode
     if config.serve_frontend {
-        tracing::info!(
-            "Frontend serving enabled — path: {}",
-            config.frontend_path
-        );
+        tracing::info!("Frontend serving enabled — path: {}", config.frontend_path);
     } else {
         tracing::info!("Frontend serving disabled (API-only mode)");
     }
@@ -1242,5 +1291,4 @@ auth:
         assert!(auth.is_email_allowed("user@ffs.holdings"));
         assert!(!auth.is_email_allowed("user@gmail.com"));
     }
-
 }
