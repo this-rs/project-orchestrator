@@ -1194,6 +1194,7 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "max_staleness": {"type": "number", "description": "Maximum staleness score (0.0-1.0)"},
                     "tags": {"type": "string", "description": "Filter by tags (comma-separated)"},
                     "search": {"type": "string", "description": "Search in content"},
+                    "global_only": {"type": "boolean", "description": "Filter global notes only (no project_id)"},
                     "limit": {"type": "integer", "description": "Max items (default 50)"},
                     "offset": {"type": "integer", "description": "Items to skip"}
                 })),

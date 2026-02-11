@@ -669,6 +669,9 @@ pub struct ProjectContext {
     pub plan_constraints: Vec<ConstraintNode>,
     pub guidelines: Vec<Note>,
     pub gotchas: Vec<Note>,
+    /// Global notes (no project_id) — cross-project knowledge
+    pub global_guidelines: Vec<Note>,
+    pub global_gotchas: Vec<Note>,
     pub milestones: Vec<MilestoneNode>,
     pub releases: Vec<ReleaseNode>,
     pub language_stats: Vec<LanguageStatsNode>,
@@ -753,6 +756,33 @@ pub async fn fetch_project_context(
         .await
         .unwrap_or_default();
     ctx.gotchas = gotchas;
+
+    // 6b. Global guidelines (no project_id, cross-project knowledge)
+    let global_guideline_filters = NoteFilters {
+        note_type: Some(vec![NoteType::Guideline]),
+        importance: Some(vec![NoteImportance::Critical, NoteImportance::High]),
+        status: Some(vec![NoteStatus::Active]),
+        global_only: Some(true),
+        ..Default::default()
+    };
+    let (global_guidelines, _) = graph
+        .list_notes(None, &global_guideline_filters)
+        .await
+        .unwrap_or_default();
+    ctx.global_guidelines = global_guidelines;
+
+    // 6c. Global gotchas
+    let global_gotcha_filters = NoteFilters {
+        note_type: Some(vec![NoteType::Gotcha]),
+        status: Some(vec![NoteStatus::Active]),
+        global_only: Some(true),
+        ..Default::default()
+    };
+    let (global_gotchas, _) = graph
+        .list_notes(None, &global_gotcha_filters)
+        .await
+        .unwrap_or_default();
+    ctx.global_gotchas = global_gotchas;
 
     // 7. Milestones
     ctx.milestones = graph
@@ -864,6 +894,32 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
             .map(|n| serde_json::json!({ "content": n.content }))
             .collect();
         map.insert("gotchas".into(), serde_json::Value::Array(notes));
+    }
+
+    if !ctx.global_guidelines.is_empty() {
+        let notes: Vec<_> = ctx
+            .global_guidelines
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "content": n.content,
+                    "importance": format!("{:?}", n.importance),
+                })
+            })
+            .collect();
+        map.insert(
+            "global_guidelines".into(),
+            serde_json::Value::Array(notes),
+        );
+    }
+
+    if !ctx.global_gotchas.is_empty() {
+        let notes: Vec<_> = ctx
+            .global_gotchas
+            .iter()
+            .map(|n| serde_json::json!({ "content": n.content }))
+            .collect();
+        map.insert("global_gotchas".into(), serde_json::Value::Array(notes));
     }
 
     if !ctx.milestones.is_empty() {
@@ -984,6 +1040,23 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
     if !ctx.gotchas.is_empty() {
         md.push_str("## Gotchas\n");
         for g in &ctx.gotchas {
+            md.push_str(&format!("- {}\n", g.content));
+        }
+        md.push('\n');
+    }
+
+    // Global notes (cross-project knowledge)
+    if !ctx.global_guidelines.is_empty() {
+        md.push_str("## Guidelines globales\n");
+        for g in &ctx.global_guidelines {
+            md.push_str(&format!("- [{:?}] {}\n", g.importance, g.content));
+        }
+        md.push('\n');
+    }
+
+    if !ctx.global_gotchas.is_empty() {
+        md.push_str("## Gotchas globaux\n");
+        for g in &ctx.global_gotchas {
             md.push_str(&format!("- {}\n", g.content));
         }
         md.push('\n');
@@ -1385,6 +1458,85 @@ mod tests {
         assert!(ctx.project.is_some());
         assert!(!ctx.active_plans.is_empty());
         assert_eq!(ctx.active_plans[0].title, plan.title);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_project_context_includes_global_notes() {
+        use crate::notes::{NoteImportance, NoteType};
+        use crate::test_helpers::{mock_app_state, test_project};
+
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        // Create a project-specific guideline (must be Critical/High to be fetched)
+        let mut project_note = crate::notes::Note::new(
+            Some(project.id),
+            NoteType::Guideline,
+            "Project-specific guideline".to_string(),
+            "test".to_string(),
+        );
+        project_note.importance = NoteImportance::High;
+        state.neo4j.create_note(&project_note).await.unwrap();
+
+        // Create a global guideline (no project_id)
+        let mut global_note = crate::notes::Note::new(
+            None,
+            NoteType::Guideline,
+            "Global team convention".to_string(),
+            "test".to_string(),
+        );
+        global_note.importance = NoteImportance::Critical;
+        state.neo4j.create_note(&global_note).await.unwrap();
+
+        let ctx = fetch_project_context(&state.neo4j, &project.slug)
+            .await
+            .unwrap();
+
+        // Project guidelines include only project-specific ones
+        assert_eq!(ctx.guidelines.len(), 1);
+        assert_eq!(ctx.guidelines[0].content, "Project-specific guideline");
+
+        // Global guidelines include only global ones
+        assert_eq!(ctx.global_guidelines.len(), 1);
+        assert_eq!(ctx.global_guidelines[0].content, "Global team convention");
+    }
+
+    #[test]
+    fn test_context_to_markdown_with_global_notes() {
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "TestProj".into(),
+                slug: "test-proj".into(),
+                root_path: "/tmp".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: Some(Utc::now()),
+            }),
+            global_guidelines: vec![{
+                let mut n = crate::notes::Note::new(
+                    None,
+                    crate::notes::NoteType::Guideline,
+                    "Always write tests".to_string(),
+                    "test".to_string(),
+                );
+                n.importance = crate::notes::NoteImportance::Critical;
+                n
+            }],
+            global_gotchas: vec![crate::notes::Note::new(
+                None,
+                crate::notes::NoteType::Gotcha,
+                "Beware of circular deps".to_string(),
+                "test".to_string(),
+            )],
+            ..Default::default()
+        };
+        let md = context_to_markdown(&ctx, None);
+        assert!(md.contains("Guidelines globales"));
+        assert!(md.contains("Always write tests"));
+        assert!(md.contains("Gotchas globaux"));
+        assert!(md.contains("Beware of circular deps"));
     }
 
     // ================================================================

@@ -6264,7 +6264,9 @@ impl Neo4jClient {
     ) -> Result<(Vec<Note>, usize)> {
         let mut where_conditions = Vec::new();
 
-        if let Some(ref pid) = project_id {
+        if filters.global_only == Some(true) {
+            where_conditions.push("(n.project_id IS NULL OR n.project_id = '')".to_string());
+        } else if let Some(ref pid) = project_id {
             where_conditions.push(format!("n.project_id = '{}'", pid));
         }
 

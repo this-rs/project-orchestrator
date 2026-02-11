@@ -752,6 +752,8 @@ pub struct NoteFilters {
     pub min_staleness: Option<f64>,
     /// Maximum staleness score
     pub max_staleness: Option<f64>,
+    /// Filter global notes only (no project_id)
+    pub global_only: Option<bool>,
     /// Pagination: limit
     pub limit: Option<i64>,
     /// Pagination: offset

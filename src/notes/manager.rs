@@ -956,4 +956,116 @@ mod tests {
             ctx.direct_notes.len() + ctx.propagated_notes.len()
         );
     }
+
+    // ====================================================================
+    // Global notes (no project_id)
+    // ====================================================================
+
+    fn make_global_request(content: &str) -> CreateNoteRequest {
+        CreateNoteRequest {
+            project_id: None,
+            note_type: NoteType::Guideline,
+            content: content.to_string(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: Some(vec!["global".to_string()]),
+            anchors: None,
+            assertion_rule: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_global_note() {
+        let state = mock_app_state();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        let req = make_global_request("Always use kebab-case for slugs");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        assert!(note.project_id.is_none());
+        assert_eq!(note.note_type, NoteType::Guideline);
+        assert_eq!(note.content, "Always use kebab-case for slugs");
+    }
+
+    #[tokio::test]
+    async fn test_list_notes_global_only() {
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Create a project note and a global note
+        let project_req = make_create_request(project.id, "Project-specific note");
+        let global_req = make_global_request("Global team convention");
+        mgr.create_note(project_req, "agent-1").await.unwrap();
+        mgr.create_note(global_req, "agent-1").await.unwrap();
+
+        // List all notes — should return both
+        let all_filters = NoteFilters::default();
+        let (all_notes, all_total) = mgr.list_notes(None, &all_filters).await.unwrap();
+        assert_eq!(all_total, 2);
+        assert_eq!(all_notes.len(), 2);
+
+        // List global only — should return only the global one
+        let global_filters = NoteFilters {
+            global_only: Some(true),
+            ..Default::default()
+        };
+        let (global_notes, global_total) = mgr.list_notes(None, &global_filters).await.unwrap();
+        assert_eq!(global_total, 1);
+        assert_eq!(global_notes.len(), 1);
+        assert!(global_notes[0].project_id.is_none());
+        assert_eq!(global_notes[0].content, "Global team convention");
+
+        // List project-specific — should return only the project one
+        let (project_notes, project_total) = mgr
+            .list_notes(Some(project.id), &all_filters)
+            .await
+            .unwrap();
+        assert_eq!(project_total, 1);
+        assert_eq!(project_notes.len(), 1);
+        assert_eq!(project_notes[0].project_id, Some(project.id));
+    }
+
+    #[tokio::test]
+    async fn test_global_notes_still_work_with_project_notes() {
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Create both types
+        let proj_note = mgr
+            .create_note(make_create_request(project.id, "Project rule"), "agent-1")
+            .await
+            .unwrap();
+        let global_note = mgr
+            .create_note(make_global_request("Global rule"), "agent-1")
+            .await
+            .unwrap();
+
+        // Both should be retrievable by ID
+        let fetched_proj = mgr.get_note(proj_note.id).await.unwrap().unwrap();
+        let fetched_global = mgr.get_note(global_note.id).await.unwrap().unwrap();
+
+        assert_eq!(fetched_proj.project_id, Some(project.id));
+        assert!(fetched_global.project_id.is_none());
+
+        // Both should be updatable
+        let update = UpdateNoteRequest {
+            content: Some("Updated global rule".to_string()),
+            importance: None,
+            status: None,
+            tags: None,
+        };
+        let updated = mgr
+            .update_note(global_note.id, update)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.content, "Updated global rule");
+        assert!(updated.project_id.is_none());
+    }
 }

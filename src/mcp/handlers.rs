@@ -1929,6 +1929,14 @@ impl ToolHandler {
                 .map(|s| s.to_string()),
             limit: args.get("limit").and_then(|v| v.as_i64()),
             offset: args.get("offset").and_then(|v| v.as_i64()),
+            global_only: args
+                .get("global_only")
+                .and_then(|v| v.as_bool())
+                .or_else(|| {
+                    args.get("global_only")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == "true")
+                }),
             scope_type: None,
             sort_by: None,
             sort_order: None,

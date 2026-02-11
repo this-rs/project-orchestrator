@@ -33,6 +33,7 @@ pub struct NotesListQuery {
     pub min_staleness: Option<f64>,
     pub max_staleness: Option<f64>,
     pub tags: Option<String>,
+    pub global_only: Option<bool>,
 }
 
 impl NotesListQuery {
@@ -63,6 +64,7 @@ impl NotesListQuery {
             search: self.search_filter.search.clone(),
             limit: Some(self.pagination.validated_limit() as i64),
             offset: Some(self.pagination.offset as i64),
+            global_only: self.global_only,
             scope_type: None,
             sort_by: self.pagination.sort_by.clone(),
             sort_order: Some(self.pagination.sort_order.clone()),

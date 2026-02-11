@@ -3061,7 +3061,11 @@ impl GraphStore for MockGraphStore {
         let filtered: Vec<Note> = notes
             .values()
             .filter(|n| {
-                if let Some(pid) = project_id {
+                if filters.global_only == Some(true) {
+                    if n.project_id.is_some() {
+                        return false;
+                    }
+                } else if let Some(pid) = project_id {
                     if n.project_id != Some(pid) {
                         return false;
                     }
