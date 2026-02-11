@@ -76,6 +76,9 @@ pub struct MockGraphStore {
     pub note_anchors: RwLock<HashMap<Uuid, Vec<NoteAnchor>>>,
     pub note_supersedes: RwLock<HashMap<Uuid, Uuid>>,
     pub users: RwLock<HashMap<Uuid, UserNode>>,
+    pub feature_graphs: RwLock<HashMap<Uuid, FeatureGraphNode>>,
+    /// feature_graph_id -> Vec<(entity_type, entity_id)>
+    pub feature_graph_entities: RwLock<HashMap<Uuid, Vec<(String, String)>>>,
 }
 
 #[allow(dead_code)]
@@ -136,6 +139,8 @@ impl MockGraphStore {
             note_anchors: RwLock::new(HashMap::new()),
             note_supersedes: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
+            feature_graphs: RwLock::new(HashMap::new()),
+            feature_graph_entities: RwLock::new(HashMap::new()),
         }
     }
 
@@ -3562,6 +3567,107 @@ impl GraphStore for MockGraphStore {
 
     async fn list_users(&self) -> Result<Vec<UserNode>> {
         Ok(self.users.read().await.values().cloned().collect())
+    }
+
+    // Feature Graphs
+    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()> {
+        self.feature_graphs
+            .write()
+            .await
+            .insert(graph.id, graph.clone());
+        Ok(())
+    }
+
+    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>> {
+        Ok(self.feature_graphs.read().await.get(&id).cloned())
+    }
+
+    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
+        let graphs = self.feature_graphs.read().await;
+        let Some(fg) = graphs.get(&id).cloned() else {
+            return Ok(None);
+        };
+
+        let fg_entities = self.feature_graph_entities.read().await;
+        let entities = fg_entities
+            .get(&id)
+            .map(|ents| {
+                ents.iter()
+                    .map(|(et, eid)| FeatureGraphEntity {
+                        entity_type: et.clone(),
+                        entity_id: eid.clone(),
+                        name: Some(eid.clone()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Some(FeatureGraphDetail {
+            graph: fg,
+            entities,
+        }))
+    }
+
+    async fn list_feature_graphs(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FeatureGraphNode>> {
+        let graphs = self.feature_graphs.read().await;
+        let mut result: Vec<FeatureGraphNode> = graphs
+            .values()
+            .filter(|fg| {
+                if let Some(pid) = project_id {
+                    fg.project_id == pid
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(result)
+    }
+
+    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool> {
+        let removed = self.feature_graphs.write().await.remove(&id).is_some();
+        self.feature_graph_entities.write().await.remove(&id);
+        Ok(removed)
+    }
+
+    async fn add_entity_to_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()> {
+        let entry = (entity_type.to_string(), entity_id.to_string());
+        let mut entities = self.feature_graph_entities.write().await;
+        let list = entities.entry(feature_graph_id).or_default();
+        if !list.contains(&entry) {
+            list.push(entry);
+        }
+        // Update updated_at
+        if let Some(fg) = self.feature_graphs.write().await.get_mut(&feature_graph_id) {
+            fg.updated_at = chrono::Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn remove_entity_from_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool> {
+        let mut entities = self.feature_graph_entities.write().await;
+        if let Some(list) = entities.get_mut(&feature_graph_id) {
+            let entry = (entity_type.to_string(), entity_id.to_string());
+            let before = list.len();
+            list.retain(|e| e != &entry);
+            Ok(list.len() < before)
+        } else {
+            Ok(false)
+        }
     }
 }
 
