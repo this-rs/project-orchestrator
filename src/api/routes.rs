@@ -393,6 +393,25 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route("/api/code/impl-blocks", get(code_handlers::get_impl_blocks))
         // ================================================================
+        // Feature Graphs
+        // ================================================================
+        .route(
+            "/api/feature-graphs",
+            get(code_handlers::list_feature_graphs).post(code_handlers::create_feature_graph),
+        )
+        .route(
+            "/api/feature-graphs/auto-build",
+            post(code_handlers::auto_build_feature_graph),
+        )
+        .route(
+            "/api/feature-graphs/{id}",
+            get(code_handlers::get_feature_graph).delete(code_handlers::delete_feature_graph),
+        )
+        .route(
+            "/api/feature-graphs/{id}/entities",
+            post(code_handlers::add_entity_to_feature_graph),
+        )
+        // ================================================================
         // Knowledge Notes
         // ================================================================
         // Notes CRUD
