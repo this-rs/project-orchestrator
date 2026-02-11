@@ -1951,7 +1951,7 @@ impl ToolHandler {
     async fn create_note(&self, args: Value) -> Result<Value> {
         use crate::notes::{CreateNoteRequest, NoteImportance, NoteType};
 
-        let project_id = parse_uuid(&args, "project_id")?;
+        let project_id = parse_uuid(&args, "project_id").ok();
         let note_type: NoteType = args
             .get("note_type")
             .and_then(|v| v.as_str())
@@ -2132,7 +2132,7 @@ impl ToolHandler {
         use crate::notes::{CreateNoteRequest, NoteImportance, NoteType};
 
         let old_note_id = parse_uuid(&args, "old_note_id")?;
-        let project_id = parse_uuid(&args, "project_id")?;
+        let project_id = parse_uuid(&args, "project_id").ok();
         let note_type: NoteType = args
             .get("note_type")
             .and_then(|v| v.as_str())

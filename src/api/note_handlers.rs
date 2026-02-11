@@ -97,7 +97,7 @@ pub struct ContextNotesQuery {
 /// Request to create a note
 #[derive(Debug, Deserialize)]
 pub struct CreateNoteBody {
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     pub note_type: NoteType,
     pub content: String,
     pub importance: Option<NoteImportance>,

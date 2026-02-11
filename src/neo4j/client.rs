@@ -6109,7 +6109,12 @@ impl Neo4jClient {
             "#,
         )
         .param("id", note.id.to_string())
-        .param("project_id", note.project_id.to_string())
+        .param(
+            "project_id",
+            note.project_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        )
         .param("note_type", note.note_type.to_string())
         .param("status", note.status.to_string())
         .param("importance", note.importance.to_string())
@@ -6141,18 +6146,20 @@ impl Neo4jClient {
 
         self.graph.run(q).await?;
 
-        // Link to project
-        let link_q = query(
-            r#"
-            MATCH (n:Note {id: $note_id})
-            MATCH (p:Project {id: $project_id})
-            MERGE (p)-[:HAS_NOTE]->(n)
-            "#,
-        )
-        .param("note_id", note.id.to_string())
-        .param("project_id", note.project_id.to_string());
+        // Link to project (only if project_id is present)
+        if let Some(pid) = note.project_id {
+            let link_q = query(
+                r#"
+                MATCH (n:Note {id: $note_id})
+                MATCH (p:Project {id: $project_id})
+                MERGE (p)-[:HAS_NOTE]->(n)
+                "#,
+            )
+            .param("note_id", note.id.to_string())
+            .param("project_id", pid.to_string());
 
-        self.graph.run(link_q).await?;
+            self.graph.run(link_q).await?;
+        }
 
         Ok(())
     }
@@ -6878,7 +6885,10 @@ impl Neo4jClient {
 
         Ok(Note {
             id: node.get::<String>("id")?.parse()?,
-            project_id: node.get::<String>("project_id")?.parse()?,
+            project_id: node
+                .get::<String>("project_id")
+                .ok()
+                .and_then(|s| if s.is_empty() { None } else { s.parse().ok() }),
             note_type: note_type_str.parse().unwrap_or(NoteType::Observation),
             status: status_str.parse().unwrap_or(NoteStatus::Active),
             importance: importance_str.parse().unwrap_or(NoteImportance::Medium),

@@ -226,7 +226,7 @@ pub fn test_workspace() -> WorkspaceNode {
 /// Create a test note
 pub fn test_note(project_id: Uuid, note_type: NoteType, content: &str) -> Note {
     Note::new_full(
-        project_id,
+        Some(project_id),
         note_type,
         NoteImportance::Medium,
         NoteScope::Project,
@@ -364,7 +364,7 @@ mod tests {
         state.neo4j.create_project(&project).await.unwrap();
 
         let req = crate::notes::CreateNoteRequest {
-            project_id: project.id,
+            project_id: Some(project.id),
             note_type: NoteType::Tip,
             content: "Test note content".to_string(),
             importance: Some(NoteImportance::Medium),

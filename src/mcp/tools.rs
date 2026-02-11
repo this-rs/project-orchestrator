@@ -1206,7 +1206,7 @@ fn note_tools() -> Vec<ToolDefinition> {
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
-                    "project_id": {"type": "string", "description": "Project UUID (required)"},
+                    "project_id": {"type": "string", "description": "Project UUID (optional — omit for global/cross-project notes)"},
                     "note_type": {"type": "string", "description": "Type: guideline, gotcha, pattern, context, tip, observation, assertion"},
                     "content": {"type": "string", "description": "Note content"},
                     "importance": {"type": "string", "description": "Importance: critical, high, medium, low"},
@@ -1215,7 +1215,6 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "anchors": {"type": "array", "description": "Initial anchors to code entities"}
                 })),
                 required: Some(vec![
-                    "project_id".to_string(),
                     "note_type".to_string(),
                     "content".to_string(),
                 ]),
@@ -1304,7 +1303,7 @@ fn note_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "old_note_id": {"type": "string", "description": "ID of note to supersede"},
-                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "project_id": {"type": "string", "description": "Project UUID (optional for global notes)"},
                     "note_type": {"type": "string", "description": "Type of new note"},
                     "content": {"type": "string", "description": "Content of new note"},
                     "importance": {"type": "string", "description": "Importance of new note"},
@@ -1312,7 +1311,6 @@ fn note_tools() -> Vec<ToolDefinition> {
                 })),
                 required: Some(vec![
                     "old_note_id".to_string(),
-                    "project_id".to_string(),
                     "note_type".to_string(),
                     "content".to_string(),
                 ]),

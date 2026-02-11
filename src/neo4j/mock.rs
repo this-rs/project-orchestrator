@@ -3062,7 +3062,7 @@ impl GraphStore for MockGraphStore {
             .values()
             .filter(|n| {
                 if let Some(pid) = project_id {
-                    if n.project_id != pid {
+                    if n.project_id != Some(pid) {
                         return false;
                     }
                 }
@@ -3240,7 +3240,7 @@ impl GraphStore for MockGraphStore {
             .values()
             .filter(|n| {
                 if let Some(pid) = project_id {
-                    if n.project_id != pid {
+                    if n.project_id != Some(pid) {
                         return false;
                     }
                 }

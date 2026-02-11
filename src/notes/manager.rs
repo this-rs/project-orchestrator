@@ -94,7 +94,7 @@ impl NoteManager {
                 note.id.to_string(),
             )
             .with_payload(serde_json::json!({"note_type": note.note_type.to_string()}))
-            .with_project_id(note.project_id.to_string()),
+            .with_project_id(note.project_id.map(|id| id.to_string()).unwrap_or_default()),
         );
 
         Ok(note)
@@ -134,7 +134,7 @@ impl NoteManager {
 
             self.emit(
                 CrudEvent::new(EventEntityType::Note, CrudAction::Updated, id.to_string())
-                    .with_project_id(note.project_id.to_string()),
+                    .with_project_id(note.project_id.map(|id| id.to_string()).unwrap_or_default()),
             );
         }
 
@@ -255,7 +255,7 @@ impl NoteManager {
                     note_id.to_string(),
                 )
                 .with_payload(serde_json::json!({"confirmed_by": confirmed_by}))
-                .with_project_id(note.project_id.to_string()),
+                .with_project_id(note.project_id.map(|id| id.to_string()).unwrap_or_default()),
             );
         }
 
@@ -527,11 +527,15 @@ impl NoteManager {
         let slug = if let Some(s) = project_slug {
             s.to_string()
         } else {
-            // Try to get from project
-            if let Ok(Some(project)) = self.neo4j.get_project(note.project_id).await {
-                project.slug
+            // Try to get from project (if project_id is present)
+            if let Some(pid) = note.project_id {
+                if let Ok(Some(project)) = self.neo4j.get_project(pid).await {
+                    project.slug
+                } else {
+                    String::new()
+                }
             } else {
-                String::new()
+                String::new() // Global note, no project slug
             }
         };
 
@@ -548,7 +552,7 @@ impl NoteManager {
 
         Ok(NoteDocument {
             id: note.id.to_string(),
-            project_id: note.project_id.to_string(),
+            project_id: note.project_id.map(|id| id.to_string()).unwrap_or_default(),
             project_slug: slug,
             note_type: note.note_type.to_string(),
             status: note.status.to_string(),
@@ -597,7 +601,7 @@ mod tests {
     /// Helper: build a CreateNoteRequest with minimal required fields.
     fn make_create_request(project_id: Uuid, content: &str) -> CreateNoteRequest {
         CreateNoteRequest {
-            project_id,
+            project_id: Some(project_id),
             note_type: NoteType::Guideline,
             content: content.to_string(),
             importance: Some(NoteImportance::High),
@@ -619,7 +623,7 @@ mod tests {
 
         let note = mgr.create_note(req, "agent-1").await.unwrap();
 
-        assert_eq!(note.project_id, pid);
+        assert_eq!(note.project_id, Some(pid));
         assert_eq!(note.note_type, NoteType::Guideline);
         assert_eq!(note.content, "Always use Result for errors");
         assert_eq!(note.importance, NoteImportance::High);
@@ -745,7 +749,7 @@ mod tests {
 
         assert_eq!(total, 1);
         assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].project_id, project_a.id);
+        assert_eq!(notes[0].project_id, Some(project_a.id));
     }
 
     // ====================================================================
