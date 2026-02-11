@@ -1345,11 +1345,70 @@ impl GraphStore for MockGraphStore {
 
     async fn find_symbol_references(
         &self,
-        _symbol: &str,
-        _limit: usize,
+        symbol: &str,
+        limit: usize,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<SymbolReferenceNode>> {
-        // Simplified: return empty in mock
-        Ok(vec![])
+        let mut references = Vec::new();
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        // Find function callers (via call_relationships)
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+        for (caller_id, callees) in cr.iter() {
+            if callees.contains(&symbol.to_string()) {
+                if let Some(caller_fn) = functions.get(caller_id) {
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    }
+                    references.push(SymbolReferenceNode {
+                        file_path: caller_fn.file_path.clone(),
+                        line: caller_fn.line_start,
+                        context: format!("called from {}", caller_fn.name),
+                        reference_type: "call".to_string(),
+                    });
+                    if references.len() >= limit {
+                        return Ok(references);
+                    }
+                }
+            }
+        }
+
+        // Find struct import usages (via imports)
+        let imports = self.imports.read().await;
+        let structs = self.structs_map.read().await;
+        let has_struct = structs.values().any(|s| s.name == symbol);
+        if has_struct {
+            for import in imports.values() {
+                if import.path.ends_with(symbol) {
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&import.file_path) {
+                            continue;
+                        }
+                    }
+                    references.push(SymbolReferenceNode {
+                        file_path: import.file_path.clone(),
+                        line: import.line,
+                        context: format!("imported via {}", import.path),
+                        reference_type: "import".to_string(),
+                    });
+                    if references.len() >= limit {
+                        return Ok(references);
+                    }
+                }
+            }
+        }
+
+        Ok(references)
     }
 
     async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>> {
@@ -1567,11 +1626,35 @@ impl GraphStore for MockGraphStore {
         })
     }
 
-    async fn get_function_caller_count(&self, function_name: &str) -> Result<i64> {
+    async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<i64> {
         let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
         let mut count = 0i64;
-        for callees in cr.values() {
+        for (caller_id, callees) in cr.iter() {
             if callees.contains(&function_name.to_string()) {
+                // If scoped by project, only count callers whose file is in the project
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller_id) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
                 count += 1;
             }
         }
@@ -2388,15 +2471,34 @@ impl GraphStore for MockGraphStore {
         Ok(dependents)
     }
 
-    async fn find_callers(&self, function_id: &str) -> Result<Vec<FunctionNode>> {
+    async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FunctionNode>> {
         let cr = self.call_relationships.read().await;
         let functions = self.functions.read().await;
         // Extract function name from id
         let func_name = function_id.rsplit("::").next().unwrap_or(function_id);
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
         let mut callers = Vec::new();
         for (caller_id, callees) in cr.iter() {
             if callees.contains(&func_name.to_string()) {
                 if let Some(f) = functions.get(caller_id) {
+                    // If scoped by project, only include callers whose file is in the project
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&f.file_path) {
+                            continue;
+                        }
+                    }
                     callers.push(f.clone());
                 }
             }

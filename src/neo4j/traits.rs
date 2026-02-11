@@ -375,11 +375,13 @@ pub trait GraphStore: Send + Sync {
     /// Get import paths for a file
     async fn get_file_import_paths_list(&self, path: &str) -> Result<Vec<String>>;
 
-    /// Find references to a symbol (function callers, struct importers, file importers)
+    /// Find references to a symbol (function callers, struct importers, file importers).
+    /// When project_id is provided, results are scoped to the same project.
     async fn find_symbol_references(
         &self,
         symbol: &str,
         limit: usize,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<SymbolReferenceNode>>;
 
     /// Get files directly imported by a file
@@ -427,8 +429,13 @@ pub trait GraphStore: Send + Sync {
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
 
-    /// Get the number of callers for a function by name
-    async fn get_function_caller_count(&self, function_name: &str) -> Result<i64>;
+    /// Get the number of callers for a function by name.
+    /// When project_id is provided, only counts callers from the same project.
+    async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<i64>;
 
     /// Get trait info (is_external, source)
     async fn get_trait_info(&self, trait_name: &str) -> Result<Option<TraitInfoNode>>;
@@ -626,7 +633,12 @@ pub trait GraphStore: Send + Sync {
     async fn find_dependent_files(&self, file_path: &str, depth: u32) -> Result<Vec<String>>;
 
     /// Find all functions that call a given function
-    async fn find_callers(&self, function_id: &str) -> Result<Vec<FunctionNode>>;
+    /// When project_id is provided, only return callers from the same project.
+    async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FunctionNode>>;
 
     // ========================================================================
     // Task-file linking

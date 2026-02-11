@@ -501,8 +501,10 @@ impl GraphStore for Neo4jClient {
         &self,
         symbol: &str,
         limit: usize,
+        project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<SymbolReferenceNode>> {
-        self.find_symbol_references(symbol, limit).await
+        self.find_symbol_references(symbol, limit, project_id)
+            .await
     }
 
     async fn get_file_direct_imports(&self, path: &str) -> anyhow::Result<Vec<FileImportNode>> {
@@ -562,8 +564,13 @@ impl GraphStore for Neo4jClient {
         self.get_file_symbol_names(path).await
     }
 
-    async fn get_function_caller_count(&self, function_name: &str) -> anyhow::Result<i64> {
-        self.get_function_caller_count(function_name).await
+    async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<i64> {
+        self.get_function_caller_count(function_name, project_id)
+            .await
     }
 
     async fn get_trait_info(&self, trait_name: &str) -> anyhow::Result<Option<TraitInfoNode>> {
@@ -829,8 +836,12 @@ impl GraphStore for Neo4jClient {
         self.find_dependent_files(file_path, depth).await
     }
 
-    async fn find_callers(&self, function_id: &str) -> anyhow::Result<Vec<FunctionNode>> {
-        self.find_callers(function_id).await
+    async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<FunctionNode>> {
+        self.find_callers(function_id, project_id).await
     }
 
     // ========================================================================

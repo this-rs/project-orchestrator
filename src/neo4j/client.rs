@@ -2871,30 +2871,50 @@ impl Neo4jClient {
         Ok(imports)
     }
 
-    /// Find references to a symbol (function callers, struct importers, file importers)
+    /// Find references to a symbol (function callers, struct importers, file importers).
+    /// When project_id is provided, results are scoped to the same project.
     pub async fn find_symbol_references(
         &self,
         symbol: &str,
         limit: usize,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<SymbolReferenceNode>> {
         let mut references = Vec::new();
         let limit_i64 = limit as i64;
 
         // Find function callers
-        let q = query(
-            r#"
-            MATCH (f:Function {name: $name})
-            OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
-            WHERE caller IS NOT NULL
-            RETURN 'call' AS ref_type,
-                   caller.file_path AS file_path,
-                   caller.line_start AS line,
-                   caller.name AS context
-            LIMIT $limit
-            "#,
-        )
-        .param("name", symbol)
-        .param("limit", limit_i64);
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (f:Function {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+                WHERE caller IS NOT NULL
+                  AND EXISTS { MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                RETURN 'call' AS ref_type,
+                       caller.file_path AS file_path,
+                       caller.line_start AS line,
+                       caller.name AS context
+                LIMIT $limit
+                "#,
+            )
+            .param("name", symbol)
+            .param("limit", limit_i64)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (f:Function {name: $name})
+                OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+                WHERE caller IS NOT NULL
+                RETURN 'call' AS ref_type,
+                       caller.file_path AS file_path,
+                       caller.line_start AS line,
+                       caller.name AS context
+                LIMIT $limit
+                "#,
+            )
+            .param("name", symbol)
+            .param("limit", limit_i64),
+        };
 
         let mut result = self.graph.execute(q).await?;
         while let Some(row) = result.next().await? {
@@ -2913,20 +2933,38 @@ impl Neo4jClient {
         }
 
         // Find struct import usages
-        let q = query(
-            r#"
-            MATCH (s:Struct {name: $name})
-            OPTIONAL MATCH (i:Import)-[:IMPORTS_SYMBOL]->(s)
-            WHERE i IS NOT NULL
-            RETURN 'import' AS ref_type,
-                   i.file_path AS file_path,
-                   i.line AS line,
-                   i.path AS context
-            LIMIT $limit
-            "#,
-        )
-        .param("name", symbol)
-        .param("limit", limit_i64);
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (s:Struct {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                OPTIONAL MATCH (i:Import)-[:IMPORTS_SYMBOL]->(s)
+                WHERE i IS NOT NULL
+                  AND EXISTS { MATCH (:File {path: i.file_path})<-[:CONTAINS]-(p) }
+                RETURN 'import' AS ref_type,
+                       i.file_path AS file_path,
+                       i.line AS line,
+                       i.path AS context
+                LIMIT $limit
+                "#,
+            )
+            .param("name", symbol)
+            .param("limit", limit_i64)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (s:Struct {name: $name})
+                OPTIONAL MATCH (i:Import)-[:IMPORTS_SYMBOL]->(s)
+                WHERE i IS NOT NULL
+                RETURN 'import' AS ref_type,
+                       i.file_path AS file_path,
+                       i.line AS line,
+                       i.path AS context
+                LIMIT $limit
+                "#,
+            )
+            .param("name", symbol)
+            .param("limit", limit_i64),
+        };
 
         let mut result = self.graph.execute(q).await?;
         while let Some(row) = result.next().await? {
@@ -2945,22 +2983,42 @@ impl Neo4jClient {
         }
 
         // Find files importing the symbol's module
-        let q = query(
-            r#"
-            MATCH (s {name: $name})
-            WHERE s:Function OR s:Struct OR s:Trait OR s:Enum
-            MATCH (f:File {path: s.file_path})
-            OPTIONAL MATCH (importer:File)-[:IMPORTS]->(f)
-            WHERE importer IS NOT NULL
-            RETURN 'file_import' AS ref_type,
-                   importer.path AS file_path,
-                   0 AS line,
-                   f.path AS context
-            LIMIT $limit
-            "#,
-        )
-        .param("name", symbol)
-        .param("limit", limit_i64);
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (s {name: $name})
+                WHERE s:Function OR s:Struct OR s:Trait OR s:Enum
+                MATCH (f:File {path: s.file_path})<-[:CONTAINS]-(p:Project {id: $project_id})
+                OPTIONAL MATCH (importer:File)-[:IMPORTS]->(f)
+                WHERE importer IS NOT NULL
+                  AND EXISTS { MATCH (importer)<-[:CONTAINS]-(p) }
+                RETURN 'file_import' AS ref_type,
+                       importer.path AS file_path,
+                       0 AS line,
+                       f.path AS context
+                LIMIT $limit
+                "#,
+            )
+            .param("name", symbol)
+            .param("limit", limit_i64)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (s {name: $name})
+                WHERE s:Function OR s:Struct OR s:Trait OR s:Enum
+                MATCH (f:File {path: s.file_path})
+                OPTIONAL MATCH (importer:File)-[:IMPORTS]->(f)
+                WHERE importer IS NOT NULL
+                RETURN 'file_import' AS ref_type,
+                       importer.path AS file_path,
+                       0 AS line,
+                       f.path AS context
+                LIMIT $limit
+                "#,
+            )
+            .param("name", symbol)
+            .param("limit", limit_i64),
+        };
 
         let mut result = self.graph.execute(q).await?;
         while let Some(row) = result.next().await? {
@@ -3245,16 +3303,34 @@ impl Neo4jClient {
         }
     }
 
-    /// Get the number of callers for a function by name
-    pub async fn get_function_caller_count(&self, function_name: &str) -> Result<i64> {
-        let q = query(
-            r#"
-            MATCH (f:Function {name: $name})
-            OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
-            RETURN count(caller) AS caller_count
-            "#,
-        )
-        .param("name", function_name);
+    /// Get the number of callers for a function by name.
+    /// When project_id is provided, only counts callers from the same project.
+    pub async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<i64> {
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (f:Function {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+                WHERE caller IS NOT NULL
+                  AND EXISTS { MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                RETURN count(caller) AS caller_count
+                "#,
+            )
+            .param("name", function_name)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (f:Function {name: $name})
+                OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+                RETURN count(caller) AS caller_count
+                "#,
+            )
+            .param("name", function_name),
+        };
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -4874,14 +4950,31 @@ impl Neo4jClient {
     }
 
     /// Find all functions that call a given function
-    pub async fn find_callers(&self, function_id: &str) -> Result<Vec<FunctionNode>> {
-        let q = query(
-            r#"
-            MATCH (caller:Function)-[:CALLS]->(f:Function {id: $id})
-            RETURN caller
-            "#,
-        )
-        .param("id", function_id);
+    pub async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FunctionNode>> {
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (caller:Function)-[:CALLS]->(f:Function {id: $id})
+                WHERE EXISTS {
+                    MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                }
+                RETURN caller
+                "#,
+            )
+            .param("id", function_id)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (caller:Function)-[:CALLS]->(f:Function {id: $id})
+                RETURN caller
+                "#,
+            )
+            .param("id", function_id),
+        };
 
         let mut result = self.graph.execute(q).await?;
         let mut functions = Vec::new();

@@ -1630,7 +1630,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("symbol is required"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
-        let refs = self.neo4j().find_symbol_references(symbol, limit).await?;
+        let refs = self.neo4j().find_symbol_references(symbol, limit, None).await?;
         let references: Vec<Value> = refs
             .into_iter()
             .map(|r| {
@@ -1701,7 +1701,7 @@ impl ToolHandler {
         let dependents = self.neo4j().find_dependent_files(target, 3).await?;
 
         // If target is a function, find callers
-        let caller_count = self.neo4j().get_function_caller_count(target).await?;
+        let caller_count = self.neo4j().get_function_caller_count(target, None).await?;
 
         Ok(json!({
             "target": target,

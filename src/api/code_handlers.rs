@@ -180,7 +180,7 @@ pub async fn find_references(
     let ref_nodes = state
         .orchestrator
         .neo4j()
-        .find_symbol_references(&query.symbol, limit)
+        .find_symbol_references(&query.symbol, limit, None)
         .await?;
 
     let references: Vec<SymbolReference> = ref_nodes
@@ -365,7 +365,7 @@ pub async fn analyze_impact(
         let callers = state
             .orchestrator
             .neo4j()
-            .find_callers(&query.target)
+            .find_callers(&query.target, None)
             .await?;
         let direct: Vec<String> = callers.iter().map(|f| f.file_path.clone()).collect();
         (direct.clone(), direct)
