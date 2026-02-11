@@ -221,6 +221,346 @@ impl ChatManager {
         });
     }
 
+    /// Spawn a background task that responds to NATS snapshot requests for a session.
+    ///
+    /// When a remote instance needs to do a mid-stream join, it sends a NATS request
+    /// on `events.chat.{session_id}.snapshot`. This listener replies with the current
+    /// streaming snapshot (partial text + structured events).
+    /// Stops when the session is removed from active_sessions.
+    fn spawn_nats_snapshot_responder(
+        &self,
+        session_id: &str,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    ) {
+        let Some(ref nats) = self.nats else {
+            return;
+        };
+
+        let nats = nats.clone();
+        let session_id = session_id.to_string();
+
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_snapshot_requests(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(
+                        "Failed to subscribe to NATS snapshot requests for session {}: {}",
+                        session_id, e
+                    );
+                    return;
+                }
+            };
+
+            while let Some(msg) = subscriber.next().await {
+                // Build snapshot from active session state
+                let snapshot = {
+                    let sessions = active_sessions.read().await;
+                    match sessions.get(&session_id) {
+                        Some(session) => {
+                            let is_streaming = session.is_streaming.load(Ordering::SeqCst);
+                            let text = session.streaming_text.lock().await.clone();
+                            let events = session.streaming_events.lock().await.clone();
+                            Some(crate::events::StreamingSnapshot {
+                                is_streaming,
+                                partial_text: text,
+                                events,
+                            })
+                        }
+                        None => {
+                            // Session no longer active — stop responder
+                            debug!(
+                                "Session {} no longer active, stopping snapshot responder",
+                                session_id
+                            );
+                            break;
+                        }
+                    }
+                };
+
+                if let Some(snapshot) = snapshot {
+                    // Reply to the requester
+                    if let Some(reply_to) = msg.reply {
+                        match serde_json::to_vec(&snapshot) {
+                            Ok(payload) => {
+                                if let Err(e) = nats
+                                    .client()
+                                    .publish(reply_to, payload.into())
+                                    .await
+                                {
+                                    warn!(
+                                        "Failed to reply with snapshot for session {}: {}",
+                                        session_id, e
+                                    );
+                                } else {
+                                    debug!(
+                                        session_id = %session_id,
+                                        is_streaming = snapshot.is_streaming,
+                                        text_len = snapshot.partial_text.len(),
+                                        events_count = snapshot.events.len(),
+                                        "Replied with streaming snapshot"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to serialize snapshot for session {}: {}",
+                                    session_id, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            debug!(
+                "NATS snapshot responder stopped for session {}",
+                session_id
+            );
+        });
+    }
+
+    /// Spawn a background task that listens for NATS RPC send requests for a session.
+    ///
+    /// When another instance wants to send a message to a session owned by this instance,
+    /// it publishes a `ChatRpcRequest` to `rpc.chat.{session_id}.send`.
+    /// This listener processes the request locally (queue if streaming, or persist+stream)
+    /// and replies with `ChatRpcResponse`.
+    ///
+    /// No-op if NATS is not configured.
+    fn spawn_nats_rpc_listener(
+        &self,
+        session_id: &str,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    ) {
+        let Some(ref nats) = self.nats else {
+            return;
+        };
+
+        let nats = nats.clone();
+        let session_id = session_id.to_string();
+        let graph = self.graph.clone();
+        let context_injector = self.context_injector.clone();
+        let event_emitter = self.event_emitter.clone();
+
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_rpc_send(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(
+                        "Failed to subscribe to NATS RPC send for session {}: {}",
+                        session_id, e
+                    );
+                    return;
+                }
+            };
+
+            info!(
+                session_id = %session_id,
+                "NATS RPC send listener started"
+            );
+
+            while let Some(msg) = subscriber.next().await {
+                // Parse the RPC request
+                let request: crate::events::ChatRpcRequest = match serde_json::from_slice(&msg.payload) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse NATS RPC request for session {}: {}",
+                            session_id, e
+                        );
+                        // Reply with error if possible
+                        if let Some(reply_to) = msg.reply {
+                            let resp = crate::events::ChatRpcResponse {
+                                success: false,
+                                error: Some(format!("Invalid request: {}", e)),
+                            };
+                            if let Ok(payload) = serde_json::to_vec(&resp) {
+                                let _ = nats.client().publish(reply_to, payload.into()).await;
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+                debug!(
+                    session_id = %session_id,
+                    message_type = %request.message_type,
+                    "NATS RPC send request received"
+                );
+
+                // Get session state — check if still active locally
+                let session_state = {
+                    let mut sessions = active_sessions.write().await;
+                    match sessions.get_mut(&session_id) {
+                        Some(session) => {
+                            session.last_activity = Instant::now();
+                            session.interrupt_flag.store(false, Ordering::SeqCst);
+                            Some((
+                                session.client.clone(),
+                                session.events_tx.clone(),
+                                session.interrupt_flag.clone(),
+                                session.memory_manager.clone(),
+                                session.next_seq.clone(),
+                                session.pending_messages.clone(),
+                                session.is_streaming.clone(),
+                                session.streaming_text.clone(),
+                                session.streaming_events.clone(),
+                            ))
+                        }
+                        None => None,
+                    }
+                };
+
+                let response = match session_state {
+                    None => {
+                        // Session no longer active — reply error and stop listener
+                        debug!(
+                            "Session {} no longer active, stopping NATS RPC listener",
+                            session_id
+                        );
+                        let resp = crate::events::ChatRpcResponse {
+                            success: false,
+                            error: Some("Session not active on this instance".to_string()),
+                        };
+                        if let Some(reply_to) = msg.reply {
+                            if let Ok(payload) = serde_json::to_vec(&resp) {
+                                let _ = nats.client().publish(reply_to, payload.into()).await;
+                            }
+                        }
+                        break;
+                    }
+                    Some((
+                        client,
+                        events_tx,
+                        interrupt_flag,
+                        memory_manager,
+                        next_seq,
+                        pending_messages,
+                        is_streaming,
+                        streaming_text,
+                        streaming_events,
+                    )) => {
+                        let message = &request.message;
+
+                        // If streaming → queue the message (will be drained by stream_response)
+                        if is_streaming.load(Ordering::SeqCst) {
+                            info!(
+                                "Stream in progress for session {} (via NATS RPC), queuing message",
+                                session_id
+                            );
+                            let mut queue = pending_messages.lock().await;
+                            queue.push_back(message.clone());
+                            crate::events::ChatRpcResponse {
+                                success: true,
+                                error: None,
+                            }
+                        } else {
+                            // Not streaming — persist user_message, broadcast, spawn stream
+                            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                                // Update message count
+                                if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
+                                    let _ = graph
+                                        .update_chat_session(
+                                            uuid,
+                                            None,
+                                            None,
+                                            Some(node.message_count + 1),
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                }
+
+                                // Persist user_message event
+                                let user_event = crate::neo4j::models::ChatEventRecord {
+                                    id: Uuid::new_v4(),
+                                    session_id: uuid,
+                                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                                    event_type: "user_message".to_string(),
+                                    data: serde_json::to_string(
+                                        &serde_json::json!({"content": message}),
+                                    )
+                                    .unwrap_or_default(),
+                                    created_at: chrono::Utc::now(),
+                                };
+                                let _ = graph.store_chat_events(uuid, vec![user_event]).await;
+                            }
+
+                            // Broadcast user_message locally + NATS
+                            let user_msg_event = ChatEvent::UserMessage {
+                                content: message.clone(),
+                            };
+                            let _ = events_tx.send(user_msg_event.clone());
+                            nats.publish_chat_event(&session_id, user_msg_event);
+
+                            // Spawn stream_response
+                            let session_id_clone = session_id.clone();
+                            let graph_clone = graph.clone();
+                            let active_sessions_clone = active_sessions.clone();
+                            let prompt = message.clone();
+                            let injector = context_injector.clone();
+                            let event_emitter_clone = event_emitter.clone();
+                            let nats_clone = Some(nats.clone());
+
+                            tokio::spawn(async move {
+                                Self::stream_response(
+                                    client,
+                                    events_tx,
+                                    prompt,
+                                    session_id_clone,
+                                    graph_clone,
+                                    active_sessions_clone,
+                                    interrupt_flag,
+                                    memory_manager,
+                                    injector,
+                                    next_seq,
+                                    pending_messages,
+                                    is_streaming,
+                                    streaming_text,
+                                    streaming_events,
+                                    event_emitter_clone,
+                                    nats_clone,
+                                )
+                                .await;
+                            });
+
+                            crate::events::ChatRpcResponse {
+                                success: true,
+                                error: None,
+                            }
+                        }
+                    }
+                };
+
+                // Reply to the requester
+                if let Some(reply_to) = msg.reply {
+                    match serde_json::to_vec(&response) {
+                        Ok(payload) => {
+                            if let Err(e) = nats.client().publish(reply_to, payload.into()).await {
+                                warn!(
+                                    "Failed to reply to NATS RPC for session {}: {}",
+                                    session_id, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to serialize RPC response for session {}: {}",
+                                session_id, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            debug!(
+                "NATS RPC send listener stopped for session {}",
+                session_id
+            );
+        });
+    }
+
     /// Resolve the model to use: request > config default
     pub fn resolve_model(&self, request_model: Option<&str>) -> String {
         request_model
@@ -642,6 +982,18 @@ impl ChatManager {
             self.active_sessions.clone(),
         );
 
+        // Spawn NATS snapshot responder for cross-instance mid-stream join
+        self.spawn_nats_snapshot_responder(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+        );
+
+        // Spawn NATS RPC send listener for cross-instance message routing
+        self.spawn_nats_rpc_listener(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+        );
+
         // Persist the initial user_message event
         let user_event = ChatEventRecord {
             id: Uuid::new_v4(),
@@ -664,6 +1016,20 @@ impl ChatManager {
         let _ = events_tx.send(user_msg_event.clone());
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(&session_id.to_string(), user_msg_event);
+        }
+
+        // Emit CRUD event so other instances (via NATS) know a session was created
+        if let Some(ref emitter) = self.event_emitter {
+            emitter.emit_created(
+                crate::events::EntityType::ChatSession,
+                &session_id.to_string(),
+                serde_json::json!({
+                    "project_slug": request.project_slug,
+                    "cwd": request.cwd,
+                    "model": model,
+                }),
+                None,
+            );
         }
 
         // Auto-generate title and preview from the first user message
@@ -1421,6 +1787,18 @@ impl ChatManager {
         self.spawn_nats_interrupt_listener(
             session_id,
             interrupt_flag.clone(),
+            self.active_sessions.clone(),
+        );
+
+        // Spawn NATS snapshot responder for cross-instance mid-stream join
+        self.spawn_nats_snapshot_responder(
+            session_id,
+            self.active_sessions.clone(),
+        );
+
+        // Spawn NATS RPC send listener for cross-instance message routing
+        self.spawn_nats_rpc_listener(
+            session_id,
             self.active_sessions.clone(),
         );
 
