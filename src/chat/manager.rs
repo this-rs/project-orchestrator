@@ -2216,22 +2216,33 @@ impl ChatManager {
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
         let interrupt_flag = {
             let sessions = self.active_sessions.read().await;
-            let session = sessions
-                .get(session_id)
-                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
-            session.interrupt_flag.clone()
+            sessions.get(session_id).map(|s| s.interrupt_flag.clone())
         };
 
-        // Set the flag — the stream loop checks this on every iteration
-        // and will break + release the lock + send the actual interrupt signal
-        interrupt_flag.store(true, Ordering::SeqCst);
-
-        // Publish interrupt to NATS so other instances can also stop
-        if let Some(ref nats) = self.nats {
-            nats.publish_interrupt(session_id);
+        if let Some(flag) = interrupt_flag {
+            // Session is local — set the flag so the stream loop breaks
+            flag.store(true, Ordering::SeqCst);
+            info!(
+                session_id = %session_id,
+                "Interrupt flag set locally"
+            );
+        } else {
+            debug!(
+                session_id = %session_id,
+                "Session not active locally, interrupt will be routed via NATS only"
+            );
         }
 
-        info!("Interrupt flag set for session {}", session_id);
+        // Always publish interrupt to NATS so the owning instance (if remote) also stops.
+        // This is fire-and-forget — no-op if NATS is not configured.
+        if let Some(ref nats) = self.nats {
+            nats.publish_interrupt(session_id);
+            debug!(
+                session_id = %session_id,
+                "Interrupt published to NATS"
+            );
+        }
+
         Ok(())
     }
 
