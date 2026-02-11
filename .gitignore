@@ -23,3 +23,7 @@ Thumbs.db
 
 /config.yaml
 tarpaulin-report.json
+
+# Desktop (Tauri)
+desktop/src-tauri/target/
+desktop/src-tauri/gen/

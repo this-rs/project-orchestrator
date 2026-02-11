@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod docker;
+mod plugins;
 mod setup;
 mod tray;
 mod updater;
@@ -13,8 +14,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Tauri command: get the server port for the frontend to connect to
 #[tauri::command]
 fn get_server_port() -> u16 {
-    // TODO: read from config
-    8080
+    setup::DEFAULT_DESKTOP_PORT
 }
 
 /// Tauri command: check if the backend is healthy
@@ -25,6 +25,18 @@ async fn check_health(port: u16) -> Result<bool, String> {
         Ok(resp) => Ok(resp.status().is_success()),
         Err(_) => Ok(false),
     }
+}
+
+/// Tauri command: restart the entire application.
+///
+/// Called by the setup wizard after generating config.yaml so the backend
+/// restarts with the new configuration. This is the simplest and safest
+/// approach — the backend thread has no graceful shutdown handle, so we
+/// relaunch the whole process.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    tracing::info!("Restarting application (requested by setup wizard)...");
+    app.restart();
 }
 
 fn main() {
@@ -53,21 +65,29 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_server_port,
             check_health,
+            restart_app,
             // Setup wizard commands
             setup::check_config_exists,
             setup::get_config_path,
             setup::generate_config,
+            setup::read_config,
             setup::detect_claude_code,
             setup::setup_claude_code,
+            setup::verify_oidc_discovery,
             // Docker management commands
             docker::check_docker,
             docker::start_docker_services,
             docker::check_services_health,
             docker::stop_docker_services,
             docker::get_service_logs,
+            docker::test_connection,
             // Auto-update commands
             updater::check_update,
             updater::install_update,
+            // macOS native rounded corners
+            plugins::mac_rounded_corners::enable_rounded_corners,
+            plugins::mac_rounded_corners::enable_modern_window_style,
+            plugins::mac_rounded_corners::reposition_traffic_lights,
         ])
         .setup(|app| {
             // Create system tray
@@ -79,62 +99,108 @@ fn main() {
             // Check for updates in background
             updater::check_for_updates(app.handle().clone());
 
+            // Resolve absolute paths to bundled resources so the backend can find them.
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                // Frontend dist/ for HTTP serving
+                let dist_path = resource_dir.join("dist");
+                if dist_path.exists() {
+                    tracing::info!("Frontend dist path: {}", dist_path.display());
+                    std::env::set_var("FRONTEND_PATH", dist_path.to_str().unwrap_or("./dist"));
+                } else {
+                    tracing::warn!("Bundled dist/ not found at: {}", dist_path.display());
+                }
+
+                // MCP server binary for chat sessions (InteractiveClient / Claude Code CLI)
+                let mcp_path = resource_dir.join("mcp_server");
+                if mcp_path.exists() {
+                    tracing::info!("MCP server path: {}", mcp_path.display());
+                    std::env::set_var("MCP_SERVER_PATH", mcp_path.to_str().unwrap_or("mcp_server"));
+                } else {
+                    tracing::warn!("Bundled mcp_server not found at: {}", mcp_path.display());
+                }
+            }
+
             // Start backend server and manage splash → main window transition
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                let has_config = setup::check_config_exists();
+                // Ensure a config.yaml exists — generate a default one if missing
+                let config_path = setup::config_path();
+                if !config_path.exists() {
+                    tracing::info!("No config.yaml found — generating default (unconfigured) config");
+                    if let Err(e) = setup::generate_default_config() {
+                        tracing::error!("Failed to generate default config: {}", e);
+                        show_main_window(&handle);
+                        return;
+                    }
+                }
 
-                if has_config {
-                    // Load config and start server
-                    let config = match Config::from_env() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!("Failed to load config: {}", e);
-                            // Close splash, show main (which will display /setup or error)
-                            show_main_window(&handle);
-                            return;
+                // Load config from the desktop config path
+                let config = match Config::from_yaml_and_env(Some(&config_path)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Failed to load config: {}", e);
+                        show_main_window(&handle);
+                        return;
+                    }
+                };
+
+                let port = config.server_port;
+                let is_configured = config.setup_completed;
+
+                // Always start the backend server (even in unconfigured mode)
+                // In unconfigured mode it runs no-auth so the setup wizard can load
+                use std::sync::Arc;
+                use std::sync::atomic::{AtomicBool, Ordering};
+
+                let server_started = Arc::new(AtomicBool::new(false));
+                let server_started_clone = server_started.clone();
+
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new()
+                        .expect("Failed to create tokio runtime");
+                    rt.block_on(async {
+                        // Signal that the runtime is up and server is about to start
+                        server_started_clone.store(true, Ordering::SeqCst);
+                        if let Err(e) = project_orchestrator::start_server(config).await {
+                            tracing::error!("Server error: {}", e);
                         }
-                    };
-
-                    let port = config.server_port;
-
-                    // Start the backend server
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("Failed to create tokio runtime");
-                        rt.block_on(async {
-                            if let Err(e) = project_orchestrator::start_server(config).await {
-                                tracing::error!("Server error: {}", e);
-                            }
-                        });
                     });
+                });
 
-                    // Wait for the server to be ready
-                    tracing::info!("Waiting for backend server on port {}...", port);
-                    let health_url = format!("http://localhost:{}/health", port);
-                    let start = std::time::Instant::now();
-                    loop {
-                        if start.elapsed() > std::time::Duration::from_secs(30) {
-                            tracing::error!(
-                                "Backend server did not start within 30 seconds"
+                // Wait for the tokio runtime to start
+                while !server_started.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                // Poll /health until the server is listening.
+                // The frontend has its own retry logic for DB-dependent endpoints,
+                // so we only need to wait for the HTTP listener to be up.
+                tracing::info!(
+                    "Waiting for backend on port {} (configured: {})...",
+                    port,
+                    is_configured
+                );
+                let health_url = format!("http://localhost:{}/health", port);
+                let start = std::time::Instant::now();
+                loop {
+                    if start.elapsed() > std::time::Duration::from_secs(30) {
+                        tracing::error!("Backend did not start within 30 seconds");
+                        break;
+                    }
+                    if let Ok(resp) = reqwest::blocking::get(&health_url) {
+                        if resp.status().is_success() {
+                            tracing::info!(
+                                "Backend ready in {:?}",
+                                start.elapsed()
                             );
                             break;
                         }
-                        if let Ok(resp) = reqwest::blocking::get(&health_url) {
-                            if resp.status().is_success() {
-                                tracing::info!("Backend server is ready!");
-                                break;
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(200));
                     }
-                } else {
-                    tracing::info!("No config.yaml found — launching setup wizard");
-                    // Small delay so splash is visible briefly
-                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
 
                 // Transition: close splash → show main window
+                // The frontend will check /api/setup-status and redirect to /setup if needed
                 show_main_window(&handle);
             });
 
@@ -174,6 +240,61 @@ fn show_main_window(handle: &tauri::AppHandle) {
 
     // Show main window
     if let Some(main_window) = handle.get_webview_window("main") {
+        // On macOS, apply native rounded corners + dark background BEFORE showing
+        // the window to avoid any flash of white/square corners.
+        // This does the same work as the JS `enableModernWindowStyle()` plugin,
+        // but earlier — before the webview JS has a chance to run.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = main_window.with_webview(|webview| {
+                unsafe {
+                    use cocoa::appkit::{
+                        NSColor, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+                    };
+                    use cocoa::base::id;
+                    use objc::{msg_send, sel, sel_impl};
+
+                    let ns_window = webview.ns_window() as id;
+
+                    // 1. Set dark background color matching --surface-base (#0f1117)
+                    let bg_color: id = NSColor::colorWithSRGBRed_green_blue_alpha_(
+                        cocoa::base::nil,
+                        15.0 / 255.0, // 0x0f
+                        17.0 / 255.0, // 0x11
+                        23.0 / 255.0, // 0x17
+                        1.0,
+                    );
+                    ns_window.setBackgroundColor_(bg_color);
+
+                    // 2. Apply modern window style with rounded corners
+                    let mut style_mask = ns_window.styleMask();
+                    style_mask |= NSWindowStyleMask::NSFullSizeContentViewWindowMask;
+                    style_mask |= NSWindowStyleMask::NSTitledWindowMask;
+                    style_mask |= NSWindowStyleMask::NSClosableWindowMask;
+                    style_mask |= NSWindowStyleMask::NSMiniaturizableWindowMask;
+                    style_mask |= NSWindowStyleMask::NSResizableWindowMask;
+                    ns_window.setStyleMask_(style_mask);
+
+                    // 3. Transparent titlebar that blends with content
+                    ns_window.setTitlebarAppearsTransparent_(cocoa::base::YES);
+                    ns_window.setTitleVisibility_(
+                        NSWindowTitleVisibility::NSWindowTitleHidden,
+                    );
+                    ns_window.setHasShadow_(cocoa::base::YES);
+
+                    // 4. Set corner radius on the content view layer
+                    let content_view = ns_window.contentView();
+                    content_view.setWantsLayer(cocoa::base::YES);
+                    let layer: id = msg_send![content_view, layer];
+                    if !layer.is_null() {
+                        let _: () = msg_send![layer, setCornerRadius: 10.0_f64];
+                        let _: () =
+                            msg_send![layer, setMasksToBounds: cocoa::base::YES];
+                    }
+                }
+            });
+        }
+
         if let Err(e) = main_window.show() {
             tracing::warn!("Failed to show main window: {}", e);
         }

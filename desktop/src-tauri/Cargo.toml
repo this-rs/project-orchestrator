@@ -45,8 +45,16 @@ dirs = "5"
 bollard = "0.18"
 futures-util = "0.3"
 
+# URL parsing (for test_connection)
+url = "2"
+
 # Error handling
 anyhow = "1"
+
+# macOS native rounded corners
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
 
 [features]
 default = ["custom-protocol"]

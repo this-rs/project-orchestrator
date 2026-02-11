@@ -66,6 +66,10 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Handle tray menu item clicks.
+///
+/// Any menu item that navigates the frontend must include `?from=tray` in the
+/// URL so that the frontend route guards (SetupGuard, etc.) respect the user's
+/// intended destination instead of auto-redirecting.
 fn handle_menu_event(app: &AppHandle, item_id: &str) {
     match item_id {
         "open" => {
@@ -75,7 +79,7 @@ fn handle_menu_event(app: &AppHandle, item_id: &str) {
             if let Some(window) = app.get_webview_window("main") {
                 window.show().ok();
                 window.set_focus().ok();
-                let _ = window.eval("window.location.href = '/setup'");
+                let _ = window.eval("window.location.href = '/setup?from=tray'");
             }
         }
         "quit" => {
@@ -124,7 +128,7 @@ fn start_status_polling(
                 let (neo4j_text, meili_text) =
                     if let Some(dm) = app.try_state::<SharedDockerManager>() {
                         let mgr = dm.read().await;
-                        let health = mgr.check_health().await;
+                        let health = mgr.check_health(true).await;
                         (
                             format_status("Neo4j", &health.neo4j),
                             format_status("MeiliSearch", &health.meilisearch),
@@ -156,6 +160,7 @@ fn format_status(name: &str, status: &crate::docker::ServiceStatus) -> String {
         crate::docker::ServiceStatus::Starting => format!("{}: ... Starting", name),
         crate::docker::ServiceStatus::Unhealthy => format!("{}: X Unhealthy", name),
         crate::docker::ServiceStatus::NotRunning => format!("{}: X Not Running", name),
+        crate::docker::ServiceStatus::Disabled => format!("{}: - Disabled", name),
         crate::docker::ServiceStatus::Unknown => format!("{}: ? Unknown", name),
     }
 }

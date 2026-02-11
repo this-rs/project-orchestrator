@@ -22,8 +22,11 @@ use tokio::sync::RwLock;
 
 const NEO4J_IMAGE: &str = "neo4j:5-community";
 const MEILISEARCH_IMAGE: &str = "getmeili/meilisearch:latest";
+const NATS_IMAGE: &str = "nats:latest";
 const NEO4J_CONTAINER: &str = "orchestrator-neo4j";
 const MEILISEARCH_CONTAINER: &str = "orchestrator-meilisearch";
+const NATS_CONTAINER: &str = "orchestrator-nats";
+const NATS_PORT: u16 = 4222;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -32,6 +35,7 @@ pub enum ServiceStatus {
     Healthy,
     Unhealthy,
     NotRunning,
+    Disabled,
     Unknown,
 }
 
@@ -40,7 +44,12 @@ pub enum ServiceStatus {
 pub struct ServicesHealth {
     pub neo4j: ServiceStatus,
     pub meilisearch: ServiceStatus,
+    pub nats: ServiceStatus,
     pub docker_available: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +57,8 @@ pub struct ServicesHealth {
 pub struct DockerConfig {
     pub neo4j_password: String,
     pub meilisearch_key: String,
+    #[serde(default = "default_true")]
+    pub nats_enabled: bool,
 }
 
 // ============================================================================
@@ -149,17 +160,21 @@ impl DockerManager {
         }
     }
 
-    /// Start Neo4j and MeiliSearch containers.
+    /// Start Neo4j, MeiliSearch, and optionally NATS containers.
     pub async fn start_services(&self, config: &DockerConfig) -> Result<(), String> {
         let docker = self.docker()?;
 
-        // Pull images in parallel
+        // Pull images in parallel (only pull NATS if enabled)
         let (r1, r2) = tokio::join!(
             self.ensure_image(NEO4J_IMAGE),
             self.ensure_image(MEILISEARCH_IMAGE),
         );
         r1?;
         r2?;
+
+        if config.nats_enabled {
+            self.ensure_image(NATS_IMAGE).await?;
+        }
 
         // --- Neo4j ---
         if !self.container_exists(NEO4J_CONTAINER).await? {
@@ -269,18 +284,74 @@ impl DockerManager {
                 .map_err(|e| format!("Failed to start MeiliSearch: {}", e))?;
         }
 
+        // --- NATS (conditional) ---
+        if config.nats_enabled {
+            if !self.container_exists(NATS_CONTAINER).await? {
+                tracing::info!("Creating NATS container...");
+
+                let mut port_bindings = HashMap::new();
+                port_bindings.insert(
+                    format!("{}/tcp", NATS_PORT),
+                    Some(vec![PortBinding {
+                        host_ip: Some("127.0.0.1".into()),
+                        host_port: Some(NATS_PORT.to_string()),
+                    }]),
+                );
+
+                let container_config = ContainerConfig {
+                    image: Some(NATS_IMAGE.to_string()),
+                    env: Some(vec![]),
+                    host_config: Some(HostConfig {
+                        port_bindings: Some(port_bindings),
+                        restart_policy: Some(bollard::models::RestartPolicy {
+                            name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                            maximum_retry_count: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+
+                docker
+                    .create_container(
+                        Some(CreateContainerOptions {
+                            name: NATS_CONTAINER,
+                            ..Default::default()
+                        }),
+                        container_config,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to create NATS container: {}", e))?;
+            }
+
+            if !self.container_running(NATS_CONTAINER).await? {
+                tracing::info!("Starting NATS...");
+                docker
+                    .start_container::<String>(NATS_CONTAINER, None)
+                    .await
+                    .map_err(|e| format!("Failed to start NATS: {}", e))?;
+            }
+        } else {
+            tracing::info!("NATS disabled — skipping container");
+        }
+
         tracing::info!("All Docker services started");
         Ok(())
     }
 
-    /// Check health of both services.
-    pub async fn check_health(&self) -> ServicesHealth {
+    /// Check health of all services. When `nats_enabled` is false, NATS reports as Disabled.
+    pub async fn check_health(&self, nats_enabled: bool) -> ServicesHealth {
         let docker_available = self.is_available().await;
 
         if !docker_available {
             return ServicesHealth {
                 neo4j: ServiceStatus::Unknown,
                 meilisearch: ServiceStatus::Unknown,
+                nats: if nats_enabled {
+                    ServiceStatus::Unknown
+                } else {
+                    ServiceStatus::Disabled
+                },
                 docker_available: false,
             };
         }
@@ -289,10 +360,16 @@ impl DockerManager {
         let meilisearch = self
             .check_container_health_http(MEILISEARCH_CONTAINER, 7700)
             .await;
+        let nats = if nats_enabled {
+            self.check_container_health(NATS_CONTAINER, NATS_PORT).await
+        } else {
+            ServiceStatus::Disabled
+        };
 
         ServicesHealth {
             neo4j,
             meilisearch,
+            nats,
             docker_available: true,
         }
     }
@@ -329,7 +406,7 @@ impl DockerManager {
     pub async fn stop_services(&self) -> Result<(), String> {
         let docker = self.docker()?;
 
-        for name in [NEO4J_CONTAINER, MEILISEARCH_CONTAINER] {
+        for name in [NEO4J_CONTAINER, MEILISEARCH_CONTAINER, NATS_CONTAINER] {
             if self.container_running(name).await.unwrap_or(false) {
                 tracing::info!("Stopping {}...", name);
                 let opts = StopContainerOptions { t: 10 };
@@ -350,6 +427,7 @@ impl DockerManager {
         let name = match service {
             "neo4j" => NEO4J_CONTAINER,
             "meilisearch" => MEILISEARCH_CONTAINER,
+            "nats" => NATS_CONTAINER,
             _ => return Err(format!("Unknown service: {}", service)),
         };
 
@@ -411,9 +489,10 @@ pub async fn start_docker_services(
 #[tauri::command]
 pub async fn check_services_health(
     docker: tauri::State<'_, SharedDockerManager>,
+    nats_enabled: Option<bool>,
 ) -> Result<ServicesHealth, String> {
     let mgr = docker.read().await;
-    Ok(mgr.check_health().await)
+    Ok(mgr.check_health(nats_enabled.unwrap_or(true)).await)
 }
 
 /// Stop all Docker services.
@@ -434,4 +513,91 @@ pub async fn get_service_logs(
 ) -> Result<Vec<String>, String> {
     let mgr = docker.read().await;
     mgr.get_logs(&service, tail.unwrap_or(100)).await
+}
+
+/// Test connectivity to a service.
+///
+/// Supports three service types:
+/// - `neo4j`: TCP connect to the bolt port (extracted from bolt://host:port URL)
+/// - `meilisearch`: HTTP GET /health
+/// - `nats`: TCP connect to the NATS port (extracted from nats://host:port URL)
+///
+/// Returns `true` if the connection succeeds, `false` otherwise.
+/// Timeout: 5 seconds.
+#[tauri::command]
+pub async fn test_connection(service: String, url: String) -> Result<bool, String> {
+    let timeout = std::time::Duration::from_secs(5);
+
+    match service.as_str() {
+        "neo4j" => {
+            // Parse bolt://host:port → TCP connect
+            let addr = parse_host_port(&url, 7687)?;
+            tracing::info!("Testing Neo4j connection to {}...", addr);
+            match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
+                Ok(Ok(_)) => Ok(true),
+                Ok(Err(e)) => {
+                    tracing::warn!("Neo4j connection failed: {}", e);
+                    Ok(false)
+                }
+                Err(_) => {
+                    tracing::warn!("Neo4j connection timed out");
+                    Ok(false)
+                }
+            }
+        }
+        "meilisearch" => {
+            // HTTP GET /health
+            let health_url = format!("{}/health", url.trim_end_matches('/'));
+            tracing::info!("Testing MeiliSearch connection to {}...", health_url);
+            let client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .map_err(|e| format!("HTTP client error: {}", e))?;
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => Ok(true),
+                Ok(resp) => {
+                    tracing::warn!("MeiliSearch returned status {}", resp.status());
+                    Ok(false)
+                }
+                Err(e) => {
+                    tracing::warn!("MeiliSearch connection failed: {}", e);
+                    Ok(false)
+                }
+            }
+        }
+        "nats" => {
+            // Parse nats://host:port → TCP connect
+            let addr = parse_host_port(&url, 4222)?;
+            tracing::info!("Testing NATS connection to {}...", addr);
+            match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
+                Ok(Ok(_)) => Ok(true),
+                Ok(Err(e)) => {
+                    tracing::warn!("NATS connection failed: {}", e);
+                    Ok(false)
+                }
+                Err(_) => {
+                    tracing::warn!("NATS connection timed out");
+                    Ok(false)
+                }
+            }
+        }
+        _ => Err(format!("Unknown service: {}", service)),
+    }
+}
+
+/// Parse a URL like `bolt://host:port` or `nats://host:port` into `host:port`.
+/// Falls back to the given default port if the URL has no port.
+fn parse_host_port(url: &str, default_port: u16) -> Result<String, String> {
+    // Try to parse as a URL
+    if let Ok(parsed) = url::Url::parse(url) {
+        let host = parsed.host_str().unwrap_or("localhost");
+        let port = parsed.port().unwrap_or(default_port);
+        return Ok(format!("{}:{}", host, port));
+    }
+    // Fallback: treat as host:port or just host
+    if url.contains(':') {
+        Ok(url.to_string())
+    } else {
+        Ok(format!("{}:{}", url, default_port))
+    }
 }
