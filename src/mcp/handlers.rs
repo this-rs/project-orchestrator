@@ -1630,7 +1630,19 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("symbol is required"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
-        let refs = self.neo4j().find_symbol_references(symbol, limit, None).await?;
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            Some(
+                self.neo4j()
+                    .get_project_by_slug(slug)
+                    .await?
+                    .ok_or_else(|| anyhow!("Project not found: {}", slug))?
+                    .id,
+            )
+        } else {
+            None
+        };
+
+        let refs = self.neo4j().find_symbol_references(symbol, limit, project_id).await?;
         let references: Vec<Value> = refs
             .into_iter()
             .map(|r| {
@@ -1675,13 +1687,25 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("function is required"))?;
         let depth = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
 
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            Some(
+                self.neo4j()
+                    .get_project_by_slug(slug)
+                    .await?
+                    .ok_or_else(|| anyhow!("Project not found: {}", slug))?
+                    .id,
+            )
+        } else {
+            None
+        };
+
         let callers = self
             .neo4j()
-            .get_function_callers_by_name(function, depth, None)
+            .get_function_callers_by_name(function, depth, project_id)
             .await?;
         let callees = self
             .neo4j()
-            .get_function_callees_by_name(function, depth, None)
+            .get_function_callees_by_name(function, depth, project_id)
             .await?;
 
         Ok(json!({
@@ -1697,11 +1721,23 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("target is required"))?;
 
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            Some(
+                self.neo4j()
+                    .get_project_by_slug(slug)
+                    .await?
+                    .ok_or_else(|| anyhow!("Project not found: {}", slug))?
+                    .id,
+            )
+        } else {
+            None
+        };
+
         // Find all files that depend on this target (file or symbol)
         let dependents = self.neo4j().find_dependent_files(target, 3).await?;
 
         // If target is a function, find callers
-        let caller_count = self.neo4j().get_function_caller_count(target, None).await?;
+        let caller_count = self.neo4j().get_function_caller_count(target, project_id).await?;
 
         Ok(json!({
             "target": target,
