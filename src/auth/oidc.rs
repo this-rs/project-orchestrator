@@ -303,6 +303,7 @@ mod tests {
     #[test]
     fn test_oidc_from_explicit_config() {
         let config = OidcConfig {
+            provider_key: None,
             provider_name: "Okta".to_string(),
             client_id: "okta-id".to_string(),
             client_secret: "okta-secret".to_string(),
@@ -336,10 +337,12 @@ mod tests {
             jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
             jwt_expiry_secs: 28800,
             allowed_email_domain: None,
+            allowed_emails: None,
             frontend_url: None,
             allow_registration: false,
             root_account: None,
             oidc: Some(OidcConfig {
+                provider_key: None,
                 provider_name: "Microsoft".to_string(),
                 client_id: "ms-id".to_string(),
                 client_secret: "ms-secret".to_string(),

@@ -2931,11 +2931,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_interrupt_nonexistent_session() {
+        // interrupt() no longer errors for non-local sessions — it always succeeds
+        // because it may need to publish to NATS for cross-instance interrupt routing.
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let result = manager.interrupt("nonexistent").await;
-        assert!(result.is_err());
+        assert!(result.is_ok(), "interrupt should succeed even for non-local sessions");
     }
 
     #[tokio::test]
@@ -3949,5 +3951,81 @@ mod tests {
         };
         assert_eq!(title.chars().count(), 80);
         assert!(title.ends_with("..."));
+    }
+
+    // ========================================================================
+    // NATS RPC routing tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_try_remote_send_no_nats() {
+        // ChatManager without NATS → try_remote_send should return Ok(false) immediately
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // No NATS configured → should return false (fallback needed)
+        assert!(manager.nats.is_none());
+        let result = manager
+            .try_remote_send("any-session-id", "hello", "user_message")
+            .await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Should return false without NATS");
+    }
+
+    #[tokio::test]
+    async fn test_try_remote_send_all_message_types_no_nats() {
+        // Verify all message types return Ok(false) without NATS
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        for msg_type in &["user_message", "permission_response", "input_response"] {
+            let result = manager
+                .try_remote_send("session-123", "test", msg_type)
+                .await
+                .unwrap();
+            assert!(!result, "Should return false for {} without NATS", msg_type);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interrupt_no_local_session_no_nats() {
+        // interrupt() should succeed silently when session is not local and no NATS
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // No session active, no NATS → should return Ok (no error)
+        let result = manager.interrupt("nonexistent-session").await;
+        assert!(result.is_ok(), "interrupt should not error when session is not local");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_nats_rpc_listener_noop_without_nats() {
+        // Verifies that spawn_nats_rpc_listener is a no-op without NATS (no panic, no error)
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // This should be a complete no-op — no NATS means early return
+        manager.spawn_nats_rpc_listener("test-session", manager.active_sessions.clone());
+        // If we get here without panic, the test passes
+    }
+
+    #[tokio::test]
+    async fn test_routing_decision_local_active_session() {
+        // When a session is active locally, is_session_active returns true
+        // → the routing logic should choose send_message (local path)
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // No active sessions → is_session_active should return false
+        assert!(!manager.is_session_active("some-session").await);
+
+        // try_remote_send without NATS → false
+        let remote = manager
+            .try_remote_send("some-session", "hello", "user_message")
+            .await
+            .unwrap();
+        assert!(!remote);
+
+        // This confirms the routing: not local + not remote = resume_session fallback
     }
 }

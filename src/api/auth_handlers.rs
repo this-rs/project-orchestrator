@@ -339,14 +339,11 @@ fn validate_registration(
         ));
     }
 
-    // Check allowed email domain (if configured)
-    if let Some(ref domain) = auth_config.allowed_email_domain {
-        if !email.ends_with(&format!("@{}", domain)) {
-            return Err(AppError::Forbidden(format!(
-                "Email domain not allowed (expected @{})",
-                domain
-            )));
-        }
+    // Check email restrictions (domain + individual whitelist)
+    if !auth_config.is_email_allowed(&email) {
+        return Err(AppError::Forbidden(
+            "Email not allowed by server policy".to_string(),
+        ));
     }
 
     Ok(())
@@ -390,14 +387,11 @@ pub async fn google_callback(
         .await
         .map_err(|e| AppError::BadRequest(format!("OAuth code exchange failed: {}", e)))?;
 
-    // 2. Check email domain restriction (if configured)
-    if let Some(ref domain) = auth_config.allowed_email_domain {
-        if !google_user.email.ends_with(&format!("@{}", domain)) {
-            return Err(AppError::Forbidden(format!(
-                "Email domain not allowed (expected @{})",
-                domain
-            )));
-        }
+    // 2. Check email restrictions (domain + individual whitelist)
+    if !auth_config.is_email_allowed(&google_user.email) {
+        return Err(AppError::Forbidden(
+            "Email not allowed by server policy".to_string(),
+        ));
     }
 
     // 3. Upsert user in Neo4j
@@ -485,14 +479,11 @@ pub async fn oidc_callback(
         .await
         .map_err(|e| AppError::BadRequest(format!("OIDC code exchange failed: {}", e)))?;
 
-    // 2. Check email domain restriction
-    if let Some(ref domain) = auth_config.allowed_email_domain {
-        if !oidc_user.email.ends_with(&format!("@{}", domain)) {
-            return Err(AppError::Forbidden(format!(
-                "Email domain not allowed (expected @{})",
-                domain
-            )));
-        }
+    // 2. Check email restrictions (domain + individual whitelist)
+    if !auth_config.is_email_allowed(&oidc_user.email) {
+        return Err(AppError::Forbidden(
+            "Email not allowed by server policy".to_string(),
+        ));
     }
 
     // 3. Upsert user in Neo4j
@@ -624,6 +615,7 @@ mod tests {
             jwt_secret: TEST_SECRET.to_string(),
             jwt_expiry_secs: 28800,
             allowed_email_domain: None,
+            allowed_emails: None,
             frontend_url: None,
             allow_registration: false,
             root_account: None,
@@ -876,6 +868,7 @@ mod tests {
             jwt_secret: TEST_SECRET.to_string(),
             jwt_expiry_secs: 28800,
             allowed_email_domain: None,
+            allowed_emails: None,
             frontend_url: None,
             allow_registration: false,
             root_account: Some(crate::RootAccountConfig {
@@ -1308,10 +1301,12 @@ mod tests {
             jwt_secret: TEST_SECRET.to_string(),
             jwt_expiry_secs: 28800,
             allowed_email_domain: None,
+            allowed_emails: None,
             frontend_url: None,
             allow_registration: false,
             root_account: None,
             oidc: Some(crate::OidcConfig {
+                provider_key: None,
                 provider_name: "Okta".to_string(),
                 client_id: "okta-id".to_string(),
                 client_secret: "okta-secret".to_string(),
