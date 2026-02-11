@@ -1003,39 +1003,58 @@ pub fn context_to_markdown(ctx: &ProjectContext) -> String {
 // ============================================================================
 
 /// Build the prompt sent to the oneshot Opus model for context refinement.
-/// The oneshot analyzes the user's request + raw project context JSON and
-/// produces a concise "## Contexte actif" section (<500 words).
-pub fn build_refinement_prompt(user_message: &str, context_json: &str) -> String {
+/// The oneshot analyzes the user's request + raw project context JSON + tool catalog
+/// and produces a concise "## Contexte actif" section (<500 words) including recommended tools.
+pub fn build_refinement_prompt(
+    user_message: &str,
+    context_json: &str,
+    tools_catalog_json: &str,
+) -> String {
     format!(
         "Tu es un constructeur de contexte pour un agent de développement.\n\
          \n\
-         Voici la demande initiale de l'utilisateur :\n\
+         ## Demande de l'utilisateur\n\
          ---\n\
          {user_message}\n\
          ---\n\
          \n\
-         Voici les données du projet actif (JSON) :\n\
+         ## Données du projet actif (JSON)\n\
          ---\n\
          {context_json}\n\
          ---\n\
          \n\
-         Génère une section \"## Contexte actif\" concise et pertinente pour le prompt système\n\
-         de l'agent qui va traiter cette demande. Inclus UNIQUEMENT les informations utiles\n\
-         pour cette demande spécifique :\n\
+         ## Catalogue des outils MCP disponibles (JSON)\n\
+         ---\n\
+         {tools_catalog_json}\n\
+         ---\n\
          \n\
-         - Infos projet (nom, description, état du sync) si pertinent\n\
-         - Workspace parent si pertinent\n\
-         - Plans en cours avec leur progression si la demande touche à la planification ou l'exécution\n\
-         - Guidelines et gotchas pertinents à la demande\n\
-         - Contraintes actives si pertinent\n\
-         - Milestones/releases avec dates si la demande touche à la roadmap\n\
-         - Stats du code (langages, fichiers clés) si la demande touche au code\n\
-         - Avertissements (sync obsolète, notes à reviewer) si applicable\n\
+         Génère une section unique \"## Contexte actif\" pour le prompt système de l'agent.\n\
+         Cette section doit contenir EXACTEMENT deux parties :\n\
+         \n\
+         **1. Contexte projet** (seulement ce qui est pertinent pour la demande) :\n\
+         - Infos projet (nom, slug, état du sync)\n\
+         - Plans en cours si la demande touche à la planification\n\
+         - Guidelines et gotchas pertinents\n\
+         - Milestones/releases si la demande touche à la roadmap\n\
+         - Stats du code si la demande touche au code\n\
+         \n\
+         **2. Tools recommandés** : sélectionne les groupes d'outils pertinents\n\
+         pour cette demande spécifique dans le catalogue. Pour chaque groupe retenu,\n\
+         liste les outils sous forme `- \\`nom\\` — description`.\n\
+         Inclus TOUJOURS le groupe le plus pertinent. N'inclus PAS les groupes inutiles.\n\
+         Exemples :\n\
+         - Demande sur le code → code_exploration + knowledge\n\
+         - Demande de planification → planning + steps + constraints\n\
+         - Demande de débogage → code_exploration + knowledge + git_tracking\n\
+         - Demande générale/vague → planning + code_exploration\n\
          \n\
          Format : markdown, bullet points, court et actionnable.\n\
-         Ne dépasse pas 500 mots.",
+         Budget total : <500 mots (contexte + tools combinés).\n\
+         Arbitre : si le contexte projet est riche, réduis les descriptions de tools.\n\
+         Si le contexte est pauvre, détaille davantage les tools.",
         user_message = user_message,
         context_json = context_json,
+        tools_catalog_json = tools_catalog_json,
     )
 }
 
@@ -1186,9 +1205,23 @@ mod tests {
 
     #[test]
     fn test_build_refinement_prompt_contains_inputs() {
-        let prompt = build_refinement_prompt("Implémente le login", r#"{"project":"test"}"#);
+        let tools_json = tools_catalog_to_json(TOOL_GROUPS);
+        let prompt = build_refinement_prompt(
+            "Implémente le login",
+            r#"{"project":"test"}"#,
+            &tools_json,
+        );
+        // User message & context JSON are injected
         assert!(prompt.contains("Implémente le login"));
         assert!(prompt.contains(r#"{"project":"test"}"#));
+        // Tools catalog JSON is injected
+        assert!(prompt.contains("planning"));
+        assert!(prompt.contains("code_exploration"));
+        assert!(prompt.contains("create_plan"));
+        // Instructions for Opus to select tool groups
+        assert!(prompt.contains("Tools recommandés"));
+        assert!(prompt.contains("groupes d'outils pertinents"));
+        // Budget constraint
         assert!(prompt.contains("500 mots"));
         assert!(prompt.contains("## Contexte actif"));
     }

@@ -590,10 +590,11 @@ impl ChatManager {
             }
         };
 
-        // Try oneshot Opus refinement
+        // Try oneshot Opus refinement (with tool catalog for tool-aware prompting)
         let context_json = context_to_json(&ctx);
+        let tools_catalog_json = super::prompt::tools_catalog_to_json(super::prompt::TOOL_GROUPS);
         let dynamic_section = match self
-            .refine_context_with_oneshot(user_message, &context_json)
+            .refine_context_with_oneshot(user_message, &context_json, &tools_catalog_json)
             .await
         {
             Ok(refined) => refined,
@@ -615,10 +616,12 @@ impl ChatManager {
         &self,
         user_message: &str,
         context_json: &str,
+        tools_catalog_json: &str,
     ) -> Result<String> {
         use super::prompt::build_refinement_prompt;
 
-        let refinement_prompt = build_refinement_prompt(user_message, context_json);
+        let refinement_prompt =
+            build_refinement_prompt(user_message, context_json, tools_catalog_json);
 
         // Build options: no MCP server, max_turns=1, just text generation
         #[allow(deprecated)]
