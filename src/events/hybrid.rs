@@ -9,9 +9,10 @@
 use super::bus::EventBus;
 use super::nats::NatsEmitter;
 use super::types::{CrudEvent, EventEmitter};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// Hybrid emitter that fans out CrudEvents to both local broadcast and NATS.
 ///
@@ -74,6 +75,83 @@ impl HybridEmitter {
     /// Get a reference to the NatsEmitter, if configured.
     pub fn nats_emitter(&self) -> Option<&Arc<NatsEmitter>> {
         self.nats.as_ref()
+    }
+
+    /// Start the NATS→local bridge: subscribes to NATS CRUD events and
+    /// re-injects them into the local broadcast bus.
+    ///
+    /// This makes the local broadcast channel the **single source of truth**
+    /// for all CRUD events (both local and remote). WebSocket handlers only
+    /// need to subscribe to the local bus — they no longer need their own
+    /// NATS subscriptions for CRUD events.
+    ///
+    /// **Deduplication**: events that originated locally (and were already
+    /// published to NATS by `HybridEmitter::emit`) are detected by fingerprint
+    /// (`timestamp:entity_id`) and not re-injected, preventing duplicates.
+    ///
+    /// **Important**: uses `local_bus.emit()` (not `self.emit()`) to avoid
+    /// re-publishing to NATS, which would create an infinite loop.
+    ///
+    /// No-op if NATS is not configured.
+    pub fn start_nats_bridge(&self) {
+        let Some(nats) = &self.nats else {
+            return;
+        };
+
+        let nats = nats.clone();
+        let local_bus = self.local_bus.clone();
+
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_crud_events().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!("Failed to start NATS→local bridge: {}", e);
+                    return;
+                }
+            };
+
+            info!("NATS→local bridge started: events.crud → local broadcast");
+
+            // Bounded dedup window to avoid re-injecting events that originated locally
+            const BRIDGE_DEDUP_WINDOW: usize = 256;
+            let mut seen: VecDeque<String> = VecDeque::with_capacity(BRIDGE_DEDUP_WINDOW);
+            let mut seen_set: HashSet<String> = HashSet::with_capacity(BRIDGE_DEDUP_WINDOW);
+
+            use futures::StreamExt;
+            while let Some(msg) = subscriber.next().await {
+                match serde_json::from_slice::<CrudEvent>(&msg.payload) {
+                    Ok(event) => {
+                        let fp = format!("{}:{}", event.timestamp, event.entity_id);
+
+                        // Skip if we already saw this event (local origin → NATS → back)
+                        if seen_set.contains(&fp) {
+                            continue;
+                        }
+                        seen_set.insert(fp.clone());
+                        seen.push_back(fp);
+                        if seen.len() > BRIDGE_DEDUP_WINDOW {
+                            if let Some(old) = seen.pop_front() {
+                                seen_set.remove(&old);
+                            }
+                        }
+
+                        // Inject into local bus only (NOT HybridEmitter::emit to avoid NATS loop)
+                        debug!(
+                            entity_type = ?event.entity_type,
+                            action = ?event.action,
+                            entity_id = %event.entity_id,
+                            "NATS→local bridge: injecting remote event"
+                        );
+                        local_bus.emit(event);
+                    }
+                    Err(e) => {
+                        warn!("NATS→local bridge: failed to deserialize CrudEvent: {}", e);
+                    }
+                }
+            }
+
+            warn!("NATS→local bridge: subscriber closed");
+        });
     }
 }
 

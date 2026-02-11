@@ -14,7 +14,7 @@ mod types;
 
 pub use bus::EventBus;
 pub use hybrid::HybridEmitter;
-pub use nats::{connect_nats, NatsEmitter};
+pub use nats::{connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter, StreamingSnapshot};
 #[allow(deprecated)]
 pub use notifier::EventNotifier;
 pub use types::{CrudAction, CrudEvent, EntityType, EventEmitter, RelatedEntity};

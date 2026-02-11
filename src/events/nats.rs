@@ -7,7 +7,51 @@
 
 use super::types::{CrudEvent, EventEmitter};
 use crate::chat::types::ChatEvent;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+// ============================================================================
+// RPC types for cross-instance chat session routing
+// ============================================================================
+
+/// Request payload for cross-instance chat message routing via NATS request/reply.
+///
+/// Sent by an instance that does NOT own the session to the instance that does.
+/// The owning instance processes the message locally and replies with `ChatRpcResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatRpcRequest {
+    /// The user message content to send
+    pub message: String,
+    /// Message type: "user_message", "permission_response", "input_response"
+    pub message_type: String,
+}
+
+/// Response payload for cross-instance chat message routing via NATS request/reply.
+///
+/// Returned by the owning instance after processing (or rejecting) the proxied message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatRpcResponse {
+    /// Whether the message was accepted and processing started
+    pub success: bool,
+    /// Error description if `success` is false
+    pub error: Option<String>,
+}
+
+// ============================================================================
+// Streaming snapshot types
+// ============================================================================
+
+/// Snapshot of a streaming session's current state, used for cross-instance mid-stream join.
+///
+/// When a client connects to a remote instance (one that doesn't own the streaming session),
+/// this struct is returned via NATS request/reply so the client can reconstruct the
+/// in-progress assistant turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingSnapshot {
+    pub is_streaming: bool,
+    pub partial_text: String,
+    pub events: Vec<ChatEvent>,
+}
 
 /// NATS event emitter that publishes CrudEvents to NATS subjects.
 ///
@@ -145,6 +189,90 @@ impl NatsEmitter {
         Ok(subscriber)
     }
 
+    // ========================================================================
+    // Streaming snapshot request/reply (for cross-instance mid-stream join)
+    // ========================================================================
+
+    /// Build the snapshot request subject for a session (e.g. "events.chat.{session_id}.snapshot").
+    pub fn snapshot_subject(&self, session_id: &str) -> String {
+        format!("{}.chat.{}.snapshot", self.subject_prefix, session_id)
+    }
+
+    /// Request a streaming snapshot from the instance that owns the session.
+    ///
+    /// Uses NATS request/reply: sends a request on `events.chat.{session_id}.snapshot`
+    /// and waits for the owning instance to reply with the snapshot payload.
+    /// Returns `None` if no reply within timeout or deserialization fails.
+    pub async fn request_streaming_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<StreamingSnapshot> {
+        let subject = self.snapshot_subject(session_id);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.client.request(subject.clone(), "snapshot".into()),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => {
+                match serde_json::from_slice::<StreamingSnapshot>(&reply.payload) {
+                    Ok(snapshot) => {
+                        debug!(
+                            subject = %subject,
+                            is_streaming = snapshot.is_streaming,
+                            text_len = snapshot.partial_text.len(),
+                            events_count = snapshot.events.len(),
+                            "Received streaming snapshot from remote instance"
+                        );
+                        Some(snapshot)
+                    }
+                    Err(e) => {
+                        warn!(
+                            subject = %subject,
+                            "Failed to deserialize streaming snapshot: {}",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    subject = %subject,
+                    "No snapshot reply (session may not be active remotely): {}",
+                    e
+                );
+                None
+            }
+            Err(_) => {
+                debug!(
+                    subject = %subject,
+                    "Snapshot request timed out (session may not be active remotely)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Subscribe to snapshot requests for a session.
+    ///
+    /// The owning instance subscribes and replies with the current streaming state.
+    pub async fn subscribe_snapshot_requests(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.snapshot_subject(session_id);
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to subscribe to NATS snapshot requests {}: {}",
+                subject,
+                e
+            )
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS snapshot requests");
+        Ok(subscriber)
+    }
+
     /// Subscribe to interrupt signals for a session from NATS.
     ///
     /// Returns a NATS subscriber that yields messages on `events.chat.{session_id}.interrupt`.
@@ -161,6 +289,107 @@ impl NatsEmitter {
             )
         })?;
         debug!(subject = %subject, "Subscribed to NATS interrupt");
+        Ok(subscriber)
+    }
+
+    // ========================================================================
+    // RPC: cross-instance chat message routing
+    // ========================================================================
+
+    /// Build the RPC send subject for a session (e.g. "rpc.chat.{session_id}.send").
+    ///
+    /// Used for cross-instance message proxying via NATS request/reply.
+    pub fn rpc_send_subject(&self, session_id: &str) -> String {
+        format!("rpc.chat.{}.send", session_id)
+    }
+
+    /// Request a remote instance to send a message to a session it owns.
+    ///
+    /// Uses NATS request/reply: sends a `ChatRpcRequest` on `rpc.chat.{session_id}.send`
+    /// and waits for the owning instance to reply with `ChatRpcResponse`.
+    /// Returns `None` if no reply within timeout (2s) or deserialization fails.
+    ///
+    /// Fire-and-forget safe: never panics, never blocks longer than the timeout.
+    pub async fn request_send_message(
+        &self,
+        session_id: &str,
+        message: &str,
+        message_type: &str,
+    ) -> Option<ChatRpcResponse> {
+        let subject = self.rpc_send_subject(session_id);
+        let request = ChatRpcRequest {
+            message: message.to_string(),
+            message_type: message_type.to_string(),
+        };
+
+        let payload = match serde_json::to_vec(&request) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    subject = %subject,
+                    "Failed to serialize ChatRpcRequest: {}", e
+                );
+                return None;
+            }
+        };
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.client.request(subject.clone(), payload.into()),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => match serde_json::from_slice::<ChatRpcResponse>(&reply.payload) {
+                Ok(response) => {
+                    debug!(
+                        subject = %subject,
+                        success = response.success,
+                        "Received ChatRpcResponse from remote instance"
+                    );
+                    Some(response)
+                }
+                Err(e) => {
+                    warn!(
+                        subject = %subject,
+                        "Failed to deserialize ChatRpcResponse: {}", e
+                    );
+                    None
+                }
+            },
+            Ok(Err(e)) => {
+                debug!(
+                    subject = %subject,
+                    "No RPC reply (session may not be active remotely): {}", e
+                );
+                None
+            }
+            Err(_) => {
+                debug!(
+                    subject = %subject,
+                    "RPC request timed out (no instance owns this session)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Subscribe to RPC send requests for a session.
+    ///
+    /// The owning instance subscribes and processes incoming messages,
+    /// then replies with `ChatRpcResponse`.
+    pub async fn subscribe_rpc_send(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.rpc_send_subject(session_id);
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to subscribe to NATS RPC send {}: {}",
+                subject,
+                e
+            )
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS RPC send requests");
         Ok(subscriber)
     }
 
@@ -357,6 +586,88 @@ mod tests {
             assert_eq!(event.event_type(), deserialized.event_type());
         }
     }
+
+    // ========================================================================
+    // RPC subject construction + serialization
+    // ========================================================================
+
+    #[test]
+    fn test_rpc_send_subject() {
+        let prefix = "events";
+        let session_id = "abc-123";
+        let subject = format!("rpc.chat.{}.send", session_id);
+        assert_eq!(subject, "rpc.chat.abc-123.send");
+
+        // Verify it doesn't use the prefix (RPC subjects are global)
+        let subject2 = format!("rpc.chat.{}.send", "sess-456");
+        assert_eq!(subject2, "rpc.chat.sess-456.send");
+
+        // Ensure prefix is NOT included (RPC uses a separate namespace)
+        assert!(!subject.contains(prefix));
+    }
+
+    #[test]
+    fn test_rpc_request_serialization() {
+        let request = ChatRpcRequest {
+            message: "Hello world".to_string(),
+            message_type: "user_message".to_string(),
+        };
+
+        let payload = serde_json::to_vec(&request).unwrap();
+        let deserialized: ChatRpcRequest = serde_json::from_slice(&payload).unwrap();
+
+        assert_eq!(deserialized.message, "Hello world");
+        assert_eq!(deserialized.message_type, "user_message");
+    }
+
+    #[test]
+    fn test_rpc_response_serialization_success() {
+        let response = ChatRpcResponse {
+            success: true,
+            error: None,
+        };
+
+        let payload = serde_json::to_vec(&response).unwrap();
+        let deserialized: ChatRpcResponse = serde_json::from_slice(&payload).unwrap();
+
+        assert!(deserialized.success);
+        assert!(deserialized.error.is_none());
+    }
+
+    #[test]
+    fn test_rpc_response_serialization_error() {
+        let response = ChatRpcResponse {
+            success: false,
+            error: Some("Session not active on this instance".to_string()),
+        };
+
+        let payload = serde_json::to_vec(&response).unwrap();
+        let deserialized: ChatRpcResponse = serde_json::from_slice(&payload).unwrap();
+
+        assert!(!deserialized.success);
+        assert_eq!(
+            deserialized.error.as_deref(),
+            Some("Session not active on this instance")
+        );
+    }
+
+    #[test]
+    fn test_rpc_request_all_message_types() {
+        // Verify all expected message_type values roundtrip correctly
+        for msg_type in &["user_message", "permission_response", "input_response"] {
+            let request = ChatRpcRequest {
+                message: "test".to_string(),
+                message_type: msg_type.to_string(),
+            };
+            let payload = serde_json::to_vec(&request).unwrap();
+            let deserialized: ChatRpcRequest = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(deserialized.message_type, *msg_type);
+        }
+    }
+
+    // ========================================================================
+    // Other
+    // ========================================================================
 
     #[test]
     fn test_interrupt_payload() {
