@@ -207,8 +207,7 @@ fn configure_via_file(url: &str) -> Result<PathBuf> {
 
         // Create backup
         let backup_path = path.with_extension("json.bak");
-        std::fs::copy(&path, &backup_path)
-            .context("Failed to create backup of mcp.json")?;
+        std::fs::copy(&path, &backup_path).context("Failed to create backup of mcp.json")?;
         tracing::info!("Backup created at: {}", backup_path.display());
 
         serde_json::from_str(&content).unwrap_or(Value::Object(Default::default()))
@@ -217,12 +216,11 @@ fn configure_via_file(url: &str) -> Result<PathBuf> {
     };
 
     // Ensure mcpServers object exists
-    let obj = json.as_object_mut().context("mcp.json is not a JSON object")?;
+    let obj = json
+        .as_object_mut()
+        .context("mcp.json is not a JSON object")?;
     if !obj.contains_key("mcpServers") {
-        obj.insert(
-            "mcpServers".to_string(),
-            Value::Object(Default::default()),
-        );
+        obj.insert("mcpServers".to_string(), Value::Object(Default::default()));
     }
 
     let servers = obj

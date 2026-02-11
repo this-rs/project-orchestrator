@@ -173,18 +173,18 @@ fn should_sync_file(path: &Path) -> bool {
 
     // All supported languages — must stay aligned with runner.rs sync_directory_for_project()
     let supported_extensions = [
-        "rs",                                   // Rust
-        "ts", "tsx", "js", "jsx",               // TypeScript/JavaScript
-        "py",                                    // Python
-        "go",                                    // Go
-        "java",                                  // Java
-        "c", "h",                                // C
-        "cpp", "cc", "cxx", "hpp", "hxx",        // C++
-        "rb",                                    // Ruby
-        "php",                                   // PHP
-        "kt", "kts",                             // Kotlin
-        "swift",                                 // Swift
-        "sh", "bash",                            // Bash
+        "rs", // Rust
+        "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
+        "py",   // Python
+        "go",   // Go
+        "java", // Java
+        "c", "h", // C
+        "cpp", "cc", "cxx", "hpp", "hxx", // C++
+        "rb",  // Ruby
+        "php", // PHP
+        "kt", "kts",   // Kotlin
+        "swift", // Swift
+        "sh", "bash", // Bash
     ];
 
     if !supported_extensions.contains(&ext) {

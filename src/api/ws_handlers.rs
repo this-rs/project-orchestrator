@@ -5,6 +5,7 @@
 //! WS handlers only need to subscribe to the local bus.
 
 use super::handlers::OrchestratorState;
+use crate::events::CrudEvent;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -12,7 +13,6 @@ use axum::{
     },
     response::IntoResponse,
 };
-use crate::events::CrudEvent;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;

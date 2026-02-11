@@ -150,7 +150,10 @@ pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
         .await
         .context("Failed to parse GitHub release")?;
 
-    let latest_version = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
+    let latest_version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
 
     if !is_newer(CURRENT_VERSION, latest_version)? {
         return Ok(None);
@@ -164,14 +167,25 @@ pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
         "tar.gz"
     };
     // Look for the "full" variant (with embedded frontend) first, then fall back to light
-    let archive_pattern_full = format!("{}-full-{}-{}-{}.{}", BINARY_NAME, latest_version, os, arch, extension);
-    let archive_pattern_light = format!("{}-{}-{}-{}.{}", BINARY_NAME, latest_version, os, arch, extension);
+    let archive_pattern_full = format!(
+        "{}-full-{}-{}-{}.{}",
+        BINARY_NAME, latest_version, os, arch, extension
+    );
+    let archive_pattern_light = format!(
+        "{}-{}-{}-{}.{}",
+        BINARY_NAME, latest_version, os, arch, extension
+    );
 
     let download_asset = release
         .assets
         .iter()
         .find(|a| a.name == archive_pattern_full)
-        .or_else(|| release.assets.iter().find(|a| a.name == archive_pattern_light));
+        .or_else(|| {
+            release
+                .assets
+                .iter()
+                .find(|a| a.name == archive_pattern_light)
+        });
 
     let download_url = match download_asset {
         Some(asset) => asset.browser_download_url.clone(),
@@ -194,7 +208,10 @@ pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
     };
 
     // Try to find checksums file
-    let checksums_asset = release.assets.iter().find(|a| a.name == "checksums-sha256.txt");
+    let checksums_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == "checksums-sha256.txt");
     let expected_checksum = if let Some(checksums) = checksums_asset {
         let checksums_text = client
             .get(&checksums.browser_download_url)
@@ -245,10 +262,7 @@ pub async fn perform_update(info: &UpdateInfo) -> Result<UpdateStatus> {
         bail!("Download failed with status: {}", response.status());
     }
 
-    let archive_bytes = response
-        .bytes()
-        .await
-        .context("Failed to read download")?;
+    let archive_bytes = response.bytes().await.context("Failed to read download")?;
 
     // Verify checksum if available
     if let Some(expected) = &info.expected_checksum {
@@ -321,10 +335,7 @@ fn extract_from_tar_gz(archive_bytes: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    bail!(
-        "Binary '{}' not found in archive",
-        binary_name
-    );
+    bail!("Binary '{}' not found in archive", binary_name);
 }
 
 #[cfg(target_os = "windows")]
@@ -390,8 +401,7 @@ fn atomic_replace(target: &PathBuf, new_bytes: &[u8]) -> Result<()> {
     if target.exists() {
         // Remove old backup if it exists
         let _ = std::fs::remove_file(&backup_path);
-        std::fs::rename(target, &backup_path)
-            .context("Failed to backup current binary")?;
+        std::fs::rename(target, &backup_path).context("Failed to backup current binary")?;
     }
 
     // Move new binary into place

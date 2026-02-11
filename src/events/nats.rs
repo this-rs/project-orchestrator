@@ -203,10 +203,7 @@ impl NatsEmitter {
     /// Uses NATS request/reply: sends a request on `events.chat.{session_id}.snapshot`
     /// and waits for the owning instance to reply with the snapshot payload.
     /// Returns `None` if no reply within timeout or deserialization fails.
-    pub async fn request_streaming_snapshot(
-        &self,
-        session_id: &str,
-    ) -> Option<StreamingSnapshot> {
+    pub async fn request_streaming_snapshot(&self, session_id: &str) -> Option<StreamingSnapshot> {
         let subject = self.snapshot_subject(session_id);
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -214,28 +211,26 @@ impl NatsEmitter {
         )
         .await
         {
-            Ok(Ok(reply)) => {
-                match serde_json::from_slice::<StreamingSnapshot>(&reply.payload) {
-                    Ok(snapshot) => {
-                        debug!(
-                            subject = %subject,
-                            is_streaming = snapshot.is_streaming,
-                            text_len = snapshot.partial_text.len(),
-                            events_count = snapshot.events.len(),
-                            "Received streaming snapshot from remote instance"
-                        );
-                        Some(snapshot)
-                    }
-                    Err(e) => {
-                        warn!(
-                            subject = %subject,
-                            "Failed to deserialize streaming snapshot: {}",
-                            e
-                        );
-                        None
-                    }
+            Ok(Ok(reply)) => match serde_json::from_slice::<StreamingSnapshot>(&reply.payload) {
+                Ok(snapshot) => {
+                    debug!(
+                        subject = %subject,
+                        is_streaming = snapshot.is_streaming,
+                        text_len = snapshot.partial_text.len(),
+                        events_count = snapshot.events.len(),
+                        "Received streaming snapshot from remote instance"
+                    );
+                    Some(snapshot)
                 }
-            }
+                Err(e) => {
+                    warn!(
+                        subject = %subject,
+                        "Failed to deserialize streaming snapshot: {}",
+                        e
+                    );
+                    None
+                }
+            },
             Ok(Err(e)) => {
                 debug!(
                     subject = %subject,
@@ -282,11 +277,7 @@ impl NatsEmitter {
     ) -> anyhow::Result<async_nats::Subscriber> {
         let subject = self.interrupt_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to subscribe to NATS interrupt {}: {}",
-                subject,
-                e
-            )
+            anyhow::anyhow!("Failed to subscribe to NATS interrupt {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS interrupt");
         Ok(subscriber)
@@ -383,11 +374,7 @@ impl NatsEmitter {
     ) -> anyhow::Result<async_nats::Subscriber> {
         let subject = self.rpc_send_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to subscribe to NATS RPC send {}: {}",
-                subject,
-                e
-            )
+            anyhow::anyhow!("Failed to subscribe to NATS RPC send {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS RPC send requests");
         Ok(subscriber)
@@ -400,11 +387,7 @@ impl NatsEmitter {
     pub async fn subscribe_crud_events(&self) -> anyhow::Result<async_nats::Subscriber> {
         let subject = self.crud_subject();
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to subscribe to NATS CRUD events {}: {}",
-                subject,
-                e
-            )
+            anyhow::anyhow!("Failed to subscribe to NATS CRUD events {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS CRUD events");
         Ok(subscriber)
@@ -454,9 +437,9 @@ impl EventEmitter for NatsEmitter {
 ///
 /// Returns a connected `async_nats::Client` ready for publishing and subscribing.
 pub async fn connect_nats(url: &str) -> anyhow::Result<async_nats::Client> {
-    let client = async_nats::connect(url).await.map_err(|e| {
-        anyhow::anyhow!("Failed to connect to NATS at {}: {}", url, e)
-    })?;
+    let client = async_nats::connect(url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to NATS at {}: {}", url, e))?;
     tracing::info!("Connected to NATS at {}", url);
     Ok(client)
 }
@@ -571,9 +554,7 @@ mod tests {
                 duration_ms: 5000,
                 cost_usd: Some(0.15),
             },
-            ChatEvent::StreamDelta {
-                text: "tok".into(),
-            },
+            ChatEvent::StreamDelta { text: "tok".into() },
             ChatEvent::StreamingStatus { is_streaming: true },
             ChatEvent::Error {
                 message: "fail".into(),

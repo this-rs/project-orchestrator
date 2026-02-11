@@ -54,7 +54,9 @@ pub async fn serve_embedded(uri: Uri) -> impl IntoResponse {
         Some(file) => serve_file("index.html", &file.data),
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from("Frontend not embedded (dist/ was empty at build time)"))
+            .body(Body::from(
+                "Frontend not embedded (dist/ was empty at build time)",
+            ))
             .unwrap(),
     }
 }

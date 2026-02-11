@@ -105,7 +105,9 @@ mod tests {
 
     async fn make_server_state(auth_config: Option<AuthConfig>) -> OrchestratorState {
         let state = mock_app_state();
-        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default())));
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            EventBus::default(),
+        )));
         let orchestrator = Arc::new(
             Orchestrator::with_event_bus(state, event_bus.clone())
                 .await

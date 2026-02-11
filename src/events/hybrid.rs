@@ -263,12 +263,7 @@ mod tests {
         let mut rx = hybrid.subscribe();
 
         // Emit from the clone
-        hybrid2.emit_created(
-            EntityType::Workspace,
-            "ws-1",
-            serde_json::Value::Null,
-            None,
-        );
+        hybrid2.emit_created(EntityType::Workspace, "ws-1", serde_json::Value::Null, None);
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.entity_type, EntityType::Workspace);

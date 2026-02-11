@@ -64,8 +64,7 @@ fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
         // Uses `fallback()` (not `not_found_service()`) to preserve 200 status
         // on SPA routes — `not_found_service` would force 404 on every fallback.
         let index_path = format!("{}/index.html", state.frontend_path);
-        let serve_dir = ServeDir::new(&state.frontend_path)
-            .fallback(ServeFile::new(index_path));
+        let serve_dir = ServeDir::new(&state.frontend_path).fallback(ServeFile::new(index_path));
         router.fallback_service(serve_dir)
     } else {
         router
@@ -602,7 +601,9 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
             nats_emitter: None,
             auth_config: Some(test_auth_config()),
             serve_frontend: true,
@@ -621,7 +622,9 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
             nats_emitter: None,
             auth_config: Some(test_auth_config()),
             serve_frontend: false,
@@ -661,9 +664,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("SPA"), "Expected index.html content, got: {text}");
+        assert!(
+            text.contains("SPA"),
+            "Expected index.html content, got: {text}"
+        );
     }
 
     // ====================================================================
@@ -676,16 +684,14 @@ mod tests {
         let app = test_app_with_frontend(dist.path()).await;
 
         let resp = app
-            .oneshot(
-                Request::get("/workspaces")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/workspaces").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("SPA"), "SPA route should return index.html");
     }
@@ -700,16 +706,14 @@ mod tests {
         let app = test_app_with_frontend(dist.path()).await;
 
         let resp = app
-            .oneshot(
-                Request::get("/assets/app.js")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/assets/app.js").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("console.log"), "Expected JS content");
     }
@@ -729,10 +733,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         // /health returns JSON with status field, NOT index.html
-        assert!(text.contains("\"status\""), "Expected JSON health response, got: {text}");
+        assert!(
+            text.contains("\"status\""),
+            "Expected JSON health response, got: {text}"
+        );
         assert!(!text.contains("SPA"), "Health should NOT return index.html");
     }
 
@@ -769,19 +778,20 @@ mod tests {
         let app = test_app_with_frontend(dist.path()).await;
 
         let resp = app
-            .oneshot(
-                Request::get("/auth/callback")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/auth/callback").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
         // /auth/callback is NOT a registered backend route (backend has /auth/oidc/callback POST).
         // As a GET, it should fall through to the SPA fallback and return index.html.
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("SPA"), "/auth/callback GET should return SPA index.html");
+        assert!(
+            text.contains("SPA"),
+            "/auth/callback GET should return SPA index.html"
+        );
     }
 }
