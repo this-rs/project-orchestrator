@@ -319,7 +319,7 @@ impl ToolHandler {
         let root_path = args
             .get("root_path")
             .and_then(|v| v.as_str())
-            .map(|s| expand_tilde(s));
+            .map(expand_tilde);
 
         self.orchestrator
             .update_project(project.id, name, description, root_path)

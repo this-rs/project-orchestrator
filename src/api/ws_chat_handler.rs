@@ -140,6 +140,11 @@ async fn handle_ws_chat(
         .await
         .unwrap_or_default();
 
+    // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
+    // NATS events don't carry seq numbers, so active dedup uses snapshot_dedup_active flag instead.
+    // Kept for future use if NATS events get seq headers.
+    let mut _max_replayed_seq: i64 = last_event;
+
     if !events.is_empty() {
         // New format: replay ChatEventRecord from Neo4j
         debug!(
@@ -148,13 +153,32 @@ async fn handle_ws_chat(
             "Replaying persisted ChatEventRecord"
         );
         for event in events {
-            let msg = serde_json::json!({
-                "seq": event.seq,
-                "type": event.event_type,
-                "data": serde_json::from_str::<serde_json::Value>(&event.data)
-                    .unwrap_or_else(|_| serde_json::Value::String(event.data.clone())),
-                "replaying": true,
-            });
+            // Track highest seq for diagnostics / future dedup watermark
+            if event.seq > _max_replayed_seq {
+                _max_replayed_seq = event.seq;
+            }
+
+            // Normalize to flat format matching Phase 1.5 / live events.
+            // ChatEventRecord.data is a serde-serialized ChatEvent which already
+            // contains the "type" tag. We parse it, inject seq + replaying, and
+            // send it flat — so the frontend always receives the same JSON shape
+            // regardless of whether the event comes from replay, snapshot, or live.
+            let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
+                Ok(serde_json::Value::Object(mut obj)) => {
+                    obj.insert("seq".to_string(), serde_json::json!(event.seq));
+                    obj.insert("replaying".to_string(), serde_json::json!(true));
+                    serde_json::Value::Object(obj)
+                }
+                _ => {
+                    // Fallback for malformed records: wrap in data field
+                    serde_json::json!({
+                        "seq": event.seq,
+                        "type": event.event_type,
+                        "data": serde_json::Value::String(event.data.clone()),
+                        "replaying": true,
+                    })
+                }
+            };
             if ws_sender
                 .send(Message::Text(msg.to_string().into()))
                 .await
@@ -313,6 +337,13 @@ async fn handle_ws_chat(
         }
     }
 
+    // Dedup flag: if we sent a streaming snapshot (Phase 1.5), structured events
+    // that arrive via NATS in the event loop are duplicates of what we just sent.
+    // We skip them until the current stream ends (Result event clears this flag).
+    // StreamDelta events are NEVER skipped — they're not in the snapshot and are
+    // the real-time text tokens the client needs.
+    let mut snapshot_dedup_active = is_currently_streaming && !streaming_events.is_empty();
+
     // Send replay_complete marker
     let replay_complete = serde_json::json!({ "type": "replay_complete" });
     if ws_sender
@@ -380,13 +411,23 @@ async fn handle_ws_chat(
     // Returns false if the client disconnected (caller should break).
     // Returns true if the event was sent successfully.
     //
-    // NOTE: Deduplication was removed. Previously, a content-based fingerprint was
-    // used to deduplicate events arriving on both local broadcast and NATS. However,
-    // this caused legitimate repeated tokens (e.g. consecutive "\n", " ", "e") to be
-    // dropped because identical StreamDelta payloads produce the same fingerprint.
-    // Since the NATS subscription is now gated (only active when local broadcast is
-    // unavailable), events never arrive from both sources simultaneously, making
-    // deduplication unnecessary and harmful.
+    // NOTE: Cross-instance dedup strategy (updated 2026-02-11):
+    //
+    // When a client joins a session owned by another instance, it receives events
+    // from two sources: Phase 1 replay (Neo4j) + Phase 1.5 snapshot, AND the live
+    // NATS subscription. Without dedup, structured events (tool_use, tool_result,
+    // assistant_text, etc.) appear twice — once from snapshot, once from NATS.
+    //
+    // Previous approach (removed): content-based fingerprint dedup. This caused
+    // legitimate repeated StreamDelta tokens ("\n", " ", "e") to be dropped.
+    //
+    // Current approach: `snapshot_dedup_active` flag. When Phase 1.5 sends a
+    // streaming snapshot, the flag is set. In the NATS branch, structured events
+    // (everything except StreamDelta/StreamingStatus) are skipped while the flag
+    // is active. The flag is cleared when a Result event arrives (stream ends).
+    // StreamDelta tokens always pass through — they're never in the snapshot.
+    //
+    // Same-instance case: local broadcast XOR NATS (never both), so no dedup needed.
     macro_rules! send_chat_event {
         ($event:expr, $ws:expr) => {{
             // Serialize and send
@@ -465,6 +506,31 @@ async fn handle_ws_chat(
                     Some(msg) => {
                         match serde_json::from_slice::<crate::chat::types::ChatEvent>(&msg.payload) {
                             Ok(chat_event) => {
+                                // --- Cross-instance dedup ---
+                                // 1. Snapshot dedup: if we sent a Phase 1.5 snapshot, structured
+                                //    events from the same stream arrive again via NATS — skip them.
+                                //    StreamDelta and StreamingStatus are NEVER in the snapshot, so
+                                //    they always pass through (no content-based dedup needed).
+                                if snapshot_dedup_active {
+                                    match &chat_event {
+                                        // Always forward stream tokens — these are real-time
+                                        crate::chat::types::ChatEvent::StreamDelta { .. }
+                                        | crate::chat::types::ChatEvent::StreamingStatus { .. } => {}
+                                        // Result marks end of stream — forward it and clear dedup
+                                        crate::chat::types::ChatEvent::Result { .. } => {
+                                            snapshot_dedup_active = false;
+                                        }
+                                        // All other structured events were already in the snapshot
+                                        _ => {
+                                            debug!(
+                                                event_type = %chat_event.event_type(),
+                                                "Skipping NATS event (already sent in snapshot)"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 if !send_chat_event!(chat_event, ws_sender) {
                                     debug!("WebSocket send failed (NATS event), client disconnected");
                                     break;

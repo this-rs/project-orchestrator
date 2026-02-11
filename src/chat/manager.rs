@@ -214,10 +214,7 @@ impl ChatManager {
                 interrupt_flag.store(true, Ordering::SeqCst);
             }
 
-            debug!(
-                "NATS interrupt listener stopped for session {}",
-                session_id
-            );
+            debug!("NATS interrupt listener stopped for session {}", session_id);
         });
     }
 
@@ -282,10 +279,8 @@ impl ChatManager {
                     if let Some(reply_to) = msg.reply {
                         match serde_json::to_vec(&snapshot) {
                             Ok(payload) => {
-                                if let Err(e) = nats
-                                    .client()
-                                    .publish(reply_to, payload.into())
-                                    .await
+                                if let Err(e) =
+                                    nats.client().publish(reply_to, payload.into()).await
                                 {
                                     warn!(
                                         "Failed to reply with snapshot for session {}: {}",
@@ -312,10 +307,7 @@ impl ChatManager {
                 }
             }
 
-            debug!(
-                "NATS snapshot responder stopped for session {}",
-                session_id
-            );
+            debug!("NATS snapshot responder stopped for session {}", session_id);
         });
     }
 
@@ -361,26 +353,27 @@ impl ChatManager {
 
             while let Some(msg) = subscriber.next().await {
                 // Parse the RPC request
-                let request: crate::events::ChatRpcRequest = match serde_json::from_slice(&msg.payload) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!(
-                            "Failed to parse NATS RPC request for session {}: {}",
-                            session_id, e
-                        );
-                        // Reply with error if possible
-                        if let Some(reply_to) = msg.reply {
-                            let resp = crate::events::ChatRpcResponse {
-                                success: false,
-                                error: Some(format!("Invalid request: {}", e)),
-                            };
-                            if let Ok(payload) = serde_json::to_vec(&resp) {
-                                let _ = nats.client().publish(reply_to, payload.into()).await;
+                let request: crate::events::ChatRpcRequest =
+                    match serde_json::from_slice(&msg.payload) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse NATS RPC request for session {}: {}",
+                                session_id, e
+                            );
+                            // Reply with error if possible
+                            if let Some(reply_to) = msg.reply {
+                                let resp = crate::events::ChatRpcResponse {
+                                    success: false,
+                                    error: Some(format!("Invalid request: {}", e)),
+                                };
+                                if let Ok(payload) = serde_json::to_vec(&resp) {
+                                    let _ = nats.client().publish(reply_to, payload.into()).await;
+                                }
                             }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
 
                 debug!(
                     session_id = %session_id,
@@ -554,10 +547,7 @@ impl ChatManager {
                 }
             }
 
-            debug!(
-                "NATS RPC send listener stopped for session {}",
-                session_id
-            );
+            debug!("NATS RPC send listener stopped for session {}", session_id);
         });
     }
 
@@ -983,16 +973,10 @@ impl ChatManager {
         );
 
         // Spawn NATS snapshot responder for cross-instance mid-stream join
-        self.spawn_nats_snapshot_responder(
-            &session_id.to_string(),
-            self.active_sessions.clone(),
-        );
+        self.spawn_nats_snapshot_responder(&session_id.to_string(), self.active_sessions.clone());
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(
-            &session_id.to_string(),
-            self.active_sessions.clone(),
-        );
+        self.spawn_nats_rpc_listener(&session_id.to_string(), self.active_sessions.clone());
 
         // Persist the initial user_message event
         let user_event = ChatEventRecord {
@@ -1372,6 +1356,23 @@ impl ChatManager {
                                     | ChatEvent::StreamingStatus { .. }
                                     | ChatEvent::AssistantText { .. }
                             ) {
+                                // Flush accumulated text before non-text events (ToolUse,
+                                // ToolResult, etc.) so the snapshot preserves correct ordering.
+                                // Without this, partial_text would contain "Text A + Text B"
+                                // with no way to know Text A came before ToolUse.
+                                // After flushing, partial_text only contains text streamed
+                                // AFTER the last structured event.
+                                {
+                                    let mut st = streaming_text.lock().await;
+                                    if !st.is_empty() {
+                                        streaming_events.lock().await.push(
+                                            ChatEvent::AssistantText {
+                                                content: st.clone(),
+                                            },
+                                        );
+                                        st.clear();
+                                    }
+                                }
                                 streaming_events.lock().await.push(event.clone());
                             }
 
@@ -1743,10 +1744,7 @@ impl ChatManager {
         let cli_session_id = session_node.cli_session_id.as_deref();
 
         if let Some(cli_id) = cli_session_id {
-            info!(
-                "Resuming session {} with CLI ID {}",
-                session_id, cli_id
-            );
+            info!("Resuming session {} with CLI ID {}", session_id, cli_id);
         } else {
             info!(
                 "Starting fresh CLI for session {} (no previous cli_session_id)",
@@ -1849,16 +1847,10 @@ impl ChatManager {
         );
 
         // Spawn NATS snapshot responder for cross-instance mid-stream join
-        self.spawn_nats_snapshot_responder(
-            session_id,
-            self.active_sessions.clone(),
-        );
+        self.spawn_nats_snapshot_responder(session_id, self.active_sessions.clone());
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(
-            session_id,
-            self.active_sessions.clone(),
-        );
+        self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone());
 
         // Persist the user_message event
         let user_event = ChatEventRecord {
@@ -2324,6 +2316,7 @@ mod tests {
             neo4j_password: "test".into(),
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "key".into(),
+            nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
         }
@@ -2937,7 +2930,10 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let result = manager.interrupt("nonexistent").await;
-        assert!(result.is_ok(), "interrupt should succeed even for non-local sessions");
+        assert!(
+            result.is_ok(),
+            "interrupt should succeed even for non-local sessions"
+        );
     }
 
     #[tokio::test]
@@ -3995,7 +3991,10 @@ mod tests {
 
         // No session active, no NATS → should return Ok (no error)
         let result = manager.interrupt("nonexistent-session").await;
-        assert!(result.is_ok(), "interrupt should not error when session is not local");
+        assert!(
+            result.is_ok(),
+            "interrupt should not error when session is not local"
+        );
     }
 
     #[tokio::test]
