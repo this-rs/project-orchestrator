@@ -41,10 +41,90 @@ pub struct ServerState {
     pub serve_frontend: bool,
     /// Path to the frontend dist/ directory
     pub frontend_path: String,
+    /// Server port (used for building the localhost origin in OAuth whitelist)
+    pub server_port: u16,
+    /// Public URL for reverse-proxy setups (e.g. https://ffs.dev).
+    /// Used for CORS and OAuth origin whitelist when both desktop + web access is needed.
+    pub public_url: Option<String>,
 }
 
 /// Shared orchestrator state
 pub type OrchestratorState = Arc<ServerState>;
+
+impl ServerState {
+    /// Build the list of allowed origins for OAuth redirect_uri validation and CORS.
+    ///
+    /// Always includes:
+    /// - `http://localhost:{server_port}` (desktop / Tauri app)
+    /// - `tauri://localhost` (Tauri webview custom scheme)
+    ///
+    /// Optionally includes:
+    /// - `public_url` from server config (e.g. `https://ffs.dev`)
+    /// - `frontend_url` from auth config (backward compat — many configs use this instead of public_url)
+    pub fn allowed_origins(&self) -> Vec<String> {
+        let mut origins = vec![
+            format!("http://localhost:{}", self.server_port),
+            "tauri://localhost".to_string(),
+        ];
+
+        // Helper to add an origin if not already present
+        let mut add = |url: &str| {
+            let trimmed = url.trim_end_matches('/').to_string();
+            if !trimmed.is_empty() && !origins.contains(&trimmed) {
+                origins.push(trimmed);
+            }
+        };
+
+        // public_url from server config
+        if let Some(ref url) = self.public_url {
+            add(url);
+        }
+
+        // frontend_url from auth config (backward compat: existing configs have
+        // `auth.frontend_url: https://ffs.dev` but no `server.public_url`)
+        if let Some(ref auth_config) = self.auth_config {
+            if let Some(ref frontend_url) = auth_config.frontend_url {
+                add(frontend_url);
+            }
+        }
+
+        origins
+    }
+
+    /// Validate an `origin` parameter and return the **redirect-safe** origin
+    /// to use for constructing OAuth `redirect_uri`.
+    ///
+    /// - If `origin` is `Some`, check it against [`allowed_origins`].
+    /// - Special case: `tauri://localhost` is a valid *browser* origin but OAuth
+    ///   providers only accept `http://` or `https://` redirect URIs, so we map
+    ///   it to `http://localhost:{server_port}` for the redirect_uri.
+    /// - If `origin` is `None`, return `None` — the caller should fall back to the
+    ///   static `redirect_uri` from config for backward compatibility.
+    pub fn validate_origin(&self, origin: Option<&str>) -> Result<Option<String>, AppError> {
+        match origin {
+            None => Ok(None),
+            Some(raw) => {
+                let trimmed = raw.trim_end_matches('/');
+                let allowed = self.allowed_origins();
+                if allowed.iter().any(|a| a == trimmed) {
+                    // tauri://localhost is valid for CORS but OAuth providers
+                    // only accept http/https redirect URIs → map to localhost
+                    if trimmed == "tauri://localhost" {
+                        Ok(Some(format!("http://localhost:{}", self.server_port)))
+                    } else {
+                        Ok(Some(trimmed.to_string()))
+                    }
+                } else {
+                    Err(AppError::BadRequest(format!(
+                        "Unknown origin: {}. Allowed: {}",
+                        trimmed,
+                        allowed.join(", ")
+                    )))
+                }
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Health check
@@ -1841,5 +1921,155 @@ mod tests {
             .filter(|s| !s.is_empty())
             .map(uuid::Uuid::parse_str);
         assert!(parsed.is_none());
+    }
+
+    // ================================================================
+    // Origin validation tests
+    // ================================================================
+
+    /// Build a ServerState for origin validation tests.
+    fn make_origin_test_state(
+        server_port: u16,
+        public_url: Option<&str>,
+        auth_config: Option<crate::AuthConfig>,
+    ) -> ServerState {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = crate::test_helpers::mock_app_state();
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        let orchestrator = rt.block_on(async {
+            Arc::new(
+                crate::orchestrator::Orchestrator::with_event_bus(state, event_bus.clone())
+                    .await
+                    .unwrap(),
+            )
+        });
+        let watcher = crate::orchestrator::FileWatcher::new(orchestrator.clone());
+        ServerState {
+            orchestrator,
+            watcher: Arc::new(tokio::sync::RwLock::new(watcher)),
+            chat_manager: None,
+            event_bus,
+            nats_emitter: None,
+            auth_config,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port,
+            public_url: public_url.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_allowed_origins_without_public_url() {
+        let state = make_origin_test_state(6600, None, None);
+        let origins = state.allowed_origins();
+        assert_eq!(origins, vec!["http://localhost:6600", "tauri://localhost"]);
+    }
+
+    #[test]
+    fn test_allowed_origins_with_public_url() {
+        let state = make_origin_test_state(6600, Some("https://ffs.dev"), None);
+        let origins = state.allowed_origins();
+        assert_eq!(
+            origins,
+            vec![
+                "http://localhost:6600",
+                "tauri://localhost",
+                "https://ffs.dev"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_allowed_origins_with_frontend_url_from_auth_config() {
+        // Simulates the real config: auth.frontend_url is set but server.public_url is not
+        let auth_config = crate::AuthConfig {
+            jwt_secret: "test".to_string(),
+            jwt_expiry_secs: 3600,
+            allowed_email_domain: None,
+            allowed_emails: None,
+            frontend_url: Some("https://ffs.dev".to_string()),
+            allow_registration: false,
+            root_account: None,
+            oidc: None,
+            google_client_id: None,
+            google_client_secret: None,
+            google_redirect_uri: None,
+        };
+        let state = make_origin_test_state(6600, None, Some(auth_config));
+        let origins = state.allowed_origins();
+        assert!(
+            origins.contains(&"https://ffs.dev".to_string()),
+            "frontend_url from auth config should be in allowed origins: {:?}",
+            origins
+        );
+    }
+
+    #[test]
+    fn test_allowed_origins_public_url_trailing_slash() {
+        let state = make_origin_test_state(6600, Some("https://ffs.dev/"), None);
+        let origins = state.allowed_origins();
+        assert!(origins.contains(&"https://ffs.dev".to_string()));
+    }
+
+    #[test]
+    fn test_validate_origin_valid_localhost() {
+        let state = make_origin_test_state(6600, Some("https://ffs.dev"), None);
+        let result = state.validate_origin(Some("http://localhost:6600"));
+        assert_eq!(result.unwrap(), Some("http://localhost:6600".to_string()));
+    }
+
+    #[test]
+    fn test_validate_origin_valid_public_url() {
+        let state = make_origin_test_state(6600, Some("https://ffs.dev"), None);
+        let result = state.validate_origin(Some("https://ffs.dev"));
+        assert_eq!(result.unwrap(), Some("https://ffs.dev".to_string()));
+    }
+
+    #[test]
+    fn test_validate_origin_tauri_maps_to_localhost() {
+        // tauri://localhost is allowed but gets mapped to http://localhost:{port}
+        // because OAuth providers only accept http/https redirect URIs
+        let state = make_origin_test_state(6600, None, None);
+        let result = state.validate_origin(Some("tauri://localhost"));
+        assert_eq!(
+            result.unwrap(),
+            Some("http://localhost:6600".to_string()),
+            "tauri://localhost should be mapped to http://localhost:6600 for OAuth redirect_uri"
+        );
+    }
+
+    #[test]
+    fn test_validate_origin_invalid_returns_error() {
+        let state = make_origin_test_state(6600, Some("https://ffs.dev"), None);
+        let result = state.validate_origin(Some("https://evil.com"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("Unknown origin"));
+                assert!(msg.contains("evil.com"));
+            }
+            _ => panic!("Expected BadRequest, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_validate_origin_none_returns_none() {
+        let state = make_origin_test_state(6600, Some("https://ffs.dev"), None);
+        let result = state.validate_origin(None);
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_validate_origin_strips_trailing_slash() {
+        let state = make_origin_test_state(6600, Some("https://ffs.dev"), None);
+        let result = state.validate_origin(Some("https://ffs.dev/"));
+        assert_eq!(result.unwrap(), Some("https://ffs.dev".to_string()));
     }
 }

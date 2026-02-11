@@ -25,6 +25,7 @@ fn test_config() -> Config {
         auth_config: None,
         serve_frontend: false,
         frontend_path: "./dist".to_string(),
+        public_url: None,
     }
 }
 
