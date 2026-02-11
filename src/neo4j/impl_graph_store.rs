@@ -503,8 +503,7 @@ impl GraphStore for Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<SymbolReferenceNode>> {
-        self.find_symbol_references(symbol, limit, project_id)
-            .await
+        self.find_symbol_references(symbol, limit, project_id).await
     }
 
     async fn get_file_direct_imports(&self, path: &str) -> anyhow::Result<Vec<FileImportNode>> {

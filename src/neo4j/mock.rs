@@ -3954,6 +3954,7 @@ impl GraphStore for MockGraphStore {
 mod tests {
     use super::*;
     use crate::neo4j::traits::GraphStore;
+    use crate::test_helpers::{test_project, test_project_named};
     use chrono::Utc;
 
     fn make_event(session_id: Uuid, seq: i64, event_type: &str, data: &str) -> ChatEventRecord {
@@ -4356,5 +4357,492 @@ mod tests {
 
         let users = store.list_users().await.unwrap();
         assert_eq!(users.len(), 3);
+    }
+
+    // ========================================================================
+    // Call relationship tests — scoping by project
+    // ========================================================================
+
+    fn make_function(name: &str, file_path: &str, line_start: u32) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_path.to_string(),
+            line_start,
+            line_end: line_start + 10,
+            docstring: None,
+        }
+    }
+
+    fn make_file(path: &str, project_id: Option<Uuid>) -> FileNode {
+        FileNode {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            last_parsed: Utc::now(),
+            project_id,
+        }
+    }
+
+    /// Seed a project with files and functions into the mock store
+    async fn seed_project(
+        store: &MockGraphStore,
+        project: &ProjectNode,
+        files_and_fns: &[(&str, &[&str])], // (file_path, [fn_names])
+    ) {
+        store.create_project(project).await.unwrap();
+        for (file_path, fn_names) in files_and_fns {
+            let file = make_file(file_path, Some(project.id));
+            store.upsert_file(&file).await.unwrap();
+            // Also register in project_files (upsert_file doesn't do this)
+            store
+                .project_files
+                .write()
+                .await
+                .entry(project.id)
+                .or_default()
+                .push(file_path.to_string());
+            for (i, fn_name) in fn_names.iter().enumerate() {
+                let func = make_function(fn_name, file_path, (i * 10) as u32);
+                store.upsert_function(&func).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_basic() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(&store, &project, &[("src/main.rs", &["main", "helper"])]).await;
+
+        // Create a call: main -> helper
+        store
+            .create_call_relationship("src/main.rs::main", "helper", Some(project.id))
+            .await
+            .unwrap();
+
+        let cr = store.call_relationships.read().await;
+        let callees = cr.get("src/main.rs::main").unwrap();
+        assert_eq!(callees, &vec!["helper".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_scoped_rejects_cross_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/main.rs", &["process", "validate"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/main.rs", &["process", "transform"])],
+        )
+        .await;
+
+        // Try to create a call from project_a::process -> transform (which only exists in project_b)
+        store
+            .create_call_relationship("a/src/main.rs::process", "transform", Some(project_a.id))
+            .await
+            .unwrap();
+
+        // Should NOT have created the relationship (callee not in same project)
+        let cr = store.call_relationships.read().await;
+        assert!(
+            cr.get("a/src/main.rs::process").is_none(),
+            "Should not create cross-project CALLS"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_without_project_id_allows_all() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(&store, &project_a, &[("a/src/main.rs", &["process"])]).await;
+        seed_project(&store, &project_b, &[("b/src/main.rs", &["transform"])]).await;
+
+        // Without project_id (None), cross-project call is allowed (backward compat)
+        store
+            .create_call_relationship("a/src/main.rs::process", "transform", None)
+            .await
+            .unwrap();
+
+        let cr = store.call_relationships.read().await;
+        let callees = cr.get("a/src/main.rs::process").unwrap();
+        assert_eq!(callees, &vec!["transform".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_find_callers_basic() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(
+            &store,
+            &project,
+            &[("src/lib.rs", &["caller_a", "caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("src/lib.rs::caller_a", "target", Some(project.id))
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("src/lib.rs::caller_b", "target", Some(project.id))
+            .await
+            .unwrap();
+
+        let callers = store
+            .find_callers("src/lib.rs::target", None)
+            .await
+            .unwrap();
+        assert_eq!(callers.len(), 2);
+
+        let names: Vec<&str> = callers.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"caller_a"));
+        assert!(names.contains(&"caller_b"));
+    }
+
+    #[tokio::test]
+    async fn test_find_callers_scoped_by_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        // Both call "target" but via None (unscoped create)
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only caller_a
+        let callers_a = store
+            .find_callers("a/src/lib.rs::target", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_a.len(), 1);
+        assert_eq!(callers_a[0].name, "caller_a");
+
+        // Unscoped: both callers
+        let callers_all = store
+            .find_callers("a/src/lib.rs::target", None)
+            .await
+            .unwrap();
+        assert_eq!(callers_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_callers_by_name_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped: only callers from project_a
+        let callers = store
+            .get_function_callers_by_name("target", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers.len(), 1);
+        assert!(callers[0].contains("caller_a"));
+
+        // Unscoped: both
+        let callers_all = store
+            .get_function_callers_by_name("target", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(callers_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_callees_by_name_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["process", "helper"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["process", "other"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::process", "helper", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::process", "other", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only callees from process in project_a
+        let callees = store
+            .get_function_callees_by_name("process", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0], "helper");
+
+        // Unscoped: callees from both process functions
+        let callees_all = store
+            .get_function_callees_by_name("process", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(callees_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_caller_count_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b1", "caller_b2", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b1", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b2", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: 1 caller
+        let count_a = store
+            .get_function_caller_count("target", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(count_a, 1);
+
+        // Scoped to project_b: 2 callers
+        let count_b = store
+            .get_function_caller_count("target", Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(count_b, 2);
+
+        // Unscoped: 3 callers total
+        let count_all = store
+            .get_function_caller_count("target", None)
+            .await
+            .unwrap();
+        assert_eq!(count_all, 3);
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_with_calls() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(&store, &project, &[("src/lib.rs", &["caller", "target"])]).await;
+
+        store
+            .create_call_relationship("src/lib.rs::caller", "target", Some(project.id))
+            .await
+            .unwrap();
+
+        let refs = store
+            .find_symbol_references("target", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].reference_type, "call");
+        assert_eq!(refs[0].file_path, "src/lib.rs");
+        assert!(refs[0].context.contains("caller"));
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only caller_a
+        let refs_a = store
+            .find_symbol_references("target", 10, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(refs_a.len(), 1);
+        assert!(refs_a[0].context.contains("caller_a"));
+
+        // Unscoped: both
+        let refs_all = store
+            .find_symbol_references("target", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(refs_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cross_project_calls_pollution_prevented() {
+        // This is the core regression test for the cross-project CALLS bug
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        // Both projects have a function named "handle_request" and "validate"
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/handler.rs", &["handle_request", "validate"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/handler.rs", &["handle_request", "validate"])],
+        )
+        .await;
+
+        // Project A: handle_request calls validate (scoped to project A)
+        store
+            .create_call_relationship(
+                "a/src/handler.rs::handle_request",
+                "validate",
+                Some(project_a.id),
+            )
+            .await
+            .unwrap();
+
+        // Project B: handle_request calls validate (scoped to project B)
+        store
+            .create_call_relationship(
+                "b/src/handler.rs::handle_request",
+                "validate",
+                Some(project_b.id),
+            )
+            .await
+            .unwrap();
+
+        // Verify: callers of "validate" scoped to project A = only handle_request from A
+        let callers_a = store
+            .get_function_callers_by_name("validate", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_a.len(), 1);
+        assert!(callers_a[0].contains("a/src/handler.rs"));
+
+        // Verify: callers scoped to project B = only handle_request from B
+        let callers_b = store
+            .get_function_callers_by_name("validate", 2, Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_b.len(), 1);
+        assert!(callers_b[0].contains("b/src/handler.rs"));
+
+        // Verify: caller_count scoped
+        let count_a = store
+            .get_function_caller_count("validate", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(count_a, 1);
+
+        let count_b = store
+            .get_function_caller_count("validate", Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(count_b, 1);
+
+        // Without scoping, both are visible
+        let count_all = store
+            .get_function_caller_count("validate", None)
+            .await
+            .unwrap();
+        assert_eq!(count_all, 2);
     }
 }
