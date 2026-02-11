@@ -58,12 +58,15 @@ Add to your MCP configuration (e.g., `~/.claude/mcp.json`):
         "NEO4J_USER": "neo4j",
         "NEO4J_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
-        "MEILISEARCH_KEY": "orchestrator-meili-key-change-me"
+        "MEILISEARCH_KEY": "orchestrator-meili-key-change-me",
+        "NATS_URL": "nats://localhost:4222"
       }
     }
   }
 }
 ```
+
+> **Note:** `NATS_URL` enables real-time event sync between the MCP server and other instances (desktop app, other agents). Without it, CRUD events from MCP tools won't propagate to the rest of the system. If some env vars are not forwarded by your AI tool, the MCP server also reads `config.yaml` as a fallback (see [Configuration](#configuration)).
 
 ### 3. Create and sync your first project
 
@@ -135,6 +138,47 @@ That's it! Your AI agents now have shared context.
 | [Authentication](docs/guides/authentication.md) | JWT + OAuth/OIDC + Password auth setup |
 | [Chat & WebSocket](docs/guides/chat-websocket.md) | Real-time chat and events |
 | [Knowledge Notes](docs/guides/knowledge-notes.md) | Contextual knowledge capture |
+
+---
+
+## Configuration
+
+The server uses a layered configuration system: **env vars > config.yaml > defaults**.
+
+Copy and edit `config.yaml` at the project root:
+
+```yaml
+server:
+  port: 8080                    # SERVER_PORT
+
+neo4j:
+  uri: "bolt://localhost:7687"  # NEO4J_URI
+  user: "neo4j"                 # NEO4J_USER
+  password: "orchestrator123"   # NEO4J_PASSWORD
+
+meilisearch:
+  url: "http://localhost:7700"              # MEILISEARCH_URL
+  key: "orchestrator-meili-key-change-me"   # MEILISEARCH_KEY
+
+nats:
+  url: "nats://localhost:4222"  # NATS_URL — inter-process event sync
+
+chat:
+  default_model: "claude-opus-4-6"  # CHAT_DEFAULT_MODEL
+```
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `NEO4J_URI` | Neo4j Bolt connection URI | `bolt://localhost:7687` |
+| `NEO4J_USER` | Neo4j username | `neo4j` |
+| `NEO4J_PASSWORD` | Neo4j password | `orchestrator123` |
+| `MEILISEARCH_URL` | Meilisearch HTTP URL | `http://localhost:7700` |
+| `MEILISEARCH_KEY` | Meilisearch API key | `orchestrator-meili-key-change-me` |
+| `NATS_URL` | NATS server URL for event sync | *(optional)* |
+| `CHAT_DEFAULT_MODEL` | Default Claude model for chat | `claude-opus-4-6` |
+| `RUST_LOG` | Log level filter | `info` |
+
+> **Why NATS?** The MCP server runs as a separate process (spawned by Claude Code). NATS is the pub/sub bridge that propagates CRUD events and chat messages between the MCP server, the HTTP backend, and the desktop app. Without NATS, each instance works in isolation.
 
 ---
 
