@@ -3678,7 +3678,7 @@ impl GraphStore for MockGraphStore {
         entry_function: &str,
         depth: u32,
     ) -> Result<FeatureGraphDetail> {
-        let depth = depth.max(1).min(5);
+        let depth = depth.clamp(1, 5);
 
         // Collect callees from the mock call_relationships
         let cr = self.call_relationships.read().await;

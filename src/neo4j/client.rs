@@ -7877,7 +7877,7 @@ impl Neo4jClient {
     ) -> Result<FeatureGraphDetail> {
         // Step 1: Collect all related functions and their files via call graph
         // We collect the entry function + callers + callees
-        let depth = depth.max(1).min(5); // Clamp 1..5
+        let depth = depth.clamp(1, 5);
 
         let q = query(&format!(
             r#"
