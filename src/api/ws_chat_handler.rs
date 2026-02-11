@@ -140,6 +140,11 @@ async fn handle_ws_chat(
         .await
         .unwrap_or_default();
 
+    // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
+    // NATS events don't carry seq numbers, so active dedup uses snapshot_dedup_active flag instead.
+    // Kept for future use if NATS events get seq headers.
+    let mut _max_replayed_seq: i64 = last_event;
+
     if !events.is_empty() {
         // New format: replay ChatEventRecord from Neo4j
         debug!(
@@ -148,13 +153,32 @@ async fn handle_ws_chat(
             "Replaying persisted ChatEventRecord"
         );
         for event in events {
-            let msg = serde_json::json!({
-                "seq": event.seq,
-                "type": event.event_type,
-                "data": serde_json::from_str::<serde_json::Value>(&event.data)
-                    .unwrap_or_else(|_| serde_json::Value::String(event.data.clone())),
-                "replaying": true,
-            });
+            // Track highest seq for diagnostics / future dedup watermark
+            if event.seq > _max_replayed_seq {
+                _max_replayed_seq = event.seq;
+            }
+
+            // Normalize to flat format matching Phase 1.5 / live events.
+            // ChatEventRecord.data is a serde-serialized ChatEvent which already
+            // contains the "type" tag. We parse it, inject seq + replaying, and
+            // send it flat — so the frontend always receives the same JSON shape
+            // regardless of whether the event comes from replay, snapshot, or live.
+            let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
+                Ok(serde_json::Value::Object(mut obj)) => {
+                    obj.insert("seq".to_string(), serde_json::json!(event.seq));
+                    obj.insert("replaying".to_string(), serde_json::json!(true));
+                    serde_json::Value::Object(obj)
+                }
+                _ => {
+                    // Fallback for malformed records: wrap in data field
+                    serde_json::json!({
+                        "seq": event.seq,
+                        "type": event.event_type,
+                        "data": serde_json::Value::String(event.data.clone()),
+                        "replaying": true,
+                    })
+                }
+            };
             if ws_sender
                 .send(Message::Text(msg.to_string().into()))
                 .await
@@ -175,33 +199,33 @@ async fn handle_ws_chat(
             .await
         {
             Ok(loaded) => {
-                let messages = loaded.messages_chronological();
                 debug!(
                     session_id = %session_id,
-                    count = messages.len(),
-                    "Replaying Nexus message history"
+                    count = loaded.events.len(),
+                    "Replaying message history (fallback)"
                 );
-                let mut seq = 1i64;
-                for msg in messages {
-                    let event_type = if msg.role == "user" {
-                        "user_message"
-                    } else {
-                        "assistant_text"
+                for event in &loaded.events {
+                    let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
+                        Ok(serde_json::Value::Object(mut obj)) => {
+                            obj.insert("seq".to_string(), serde_json::json!(event.seq));
+                            obj.insert("replaying".to_string(), serde_json::json!(true));
+                            serde_json::Value::Object(obj)
+                        }
+                        _ => {
+                            serde_json::json!({
+                                "seq": event.seq,
+                                "type": event.event_type,
+                                "data": serde_json::Value::String(event.data.clone()),
+                                "replaying": true,
+                            })
+                        }
                     };
-                    let data = serde_json::json!({ "content": msg.content });
-                    let replay_msg = serde_json::json!({
-                        "seq": seq,
-                        "type": event_type,
-                        "data": data,
-                        "replaying": true,
-                    });
-                    seq += 1;
                     if ws_sender
-                        .send(Message::Text(replay_msg.to_string().into()))
+                        .send(Message::Text(msg.to_string().into()))
                         .await
                         .is_err()
                     {
-                        debug!("Client disconnected during Nexus replay");
+                        debug!("Client disconnected during fallback replay");
                         return;
                     }
                 }
@@ -210,7 +234,7 @@ async fn handle_ws_chat(
                 warn!(
                     session_id = %session_id,
                     error = %e,
-                    "Failed to load Nexus message history for replay"
+                    "Failed to load message history for replay"
                 );
             }
         }
@@ -219,8 +243,21 @@ async fn handle_ws_chat(
     // ========================================================================
     // Phase 1.5: Send streaming snapshot if a stream is in progress
     // ========================================================================
-    let (is_currently_streaming, partial_text, streaming_events) =
+    // First try local snapshot (same instance owns the session)
+    let (mut is_currently_streaming, mut partial_text, mut streaming_events) =
         chat_manager.get_streaming_snapshot(&session_id).await;
+
+    // If local snapshot is empty, try remote snapshot via NATS request/reply.
+    // This handles the cross-instance case where another server owns the streaming session.
+    if !is_currently_streaming {
+        if let Some(ref nats) = state.nats_emitter {
+            if let Some(snapshot) = nats.request_streaming_snapshot(&session_id).await {
+                is_currently_streaming = snapshot.is_streaming;
+                partial_text = snapshot.partial_text;
+                streaming_events = snapshot.events;
+            }
+        }
+    }
 
     info!(
         session_id = %session_id,
@@ -300,6 +337,13 @@ async fn handle_ws_chat(
         }
     }
 
+    // Dedup flag: if we sent a streaming snapshot (Phase 1.5), structured events
+    // that arrive via NATS in the event loop are duplicates of what we just sent.
+    // We skip them until the current stream ends (Result event clears this flag).
+    // StreamDelta events are NEVER skipped — they're not in the snapshot and are
+    // the real-time text tokens the client needs.
+    let mut snapshot_dedup_active = is_currently_streaming && !streaming_events.is_empty();
+
     // Send replay_complete marker
     let replay_complete = serde_json::json!({ "type": "replay_complete" });
     if ws_sender
@@ -327,6 +371,34 @@ async fn handle_ws_chat(
         }
     };
 
+    // Subscribe to NATS chat events for cross-instance delivery (if NATS configured).
+    // IMPORTANT: Only subscribe to NATS if there is NO local broadcast subscription.
+    // When this instance owns the session (event_rx is Some), the ChatManager already
+    // pushes events to the local broadcast channel — subscribing to NATS too would
+    // cause every event to be received twice (local + NATS round-trip), producing
+    // duplicated/interleaved text in the frontend.
+    // NATS is only needed for remote instances that don't have the local broadcast.
+    let mut nats_chat_sub: Option<async_nats::Subscriber> = if event_rx.is_some() {
+        debug!(
+            session_id = %session_id,
+            "Local broadcast active — skipping NATS chat subscription (same instance)"
+        );
+        None
+    } else if let Some(ref nats) = state.nats_emitter {
+        match nats.subscribe_chat_events(&session_id).await {
+            Ok(sub) => {
+                debug!(session_id = %session_id, "Subscribed to NATS chat events (remote instance)");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(session_id = %session_id, error = %e, "Failed to subscribe to NATS chat events");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Ping interval (30s)
     let mut ping_interval = interval(Duration::from_secs(30));
     ping_interval.tick().await; // skip first immediate tick
@@ -334,9 +406,57 @@ async fn handle_ws_chat(
     // ========================================================================
     // Phase 3: Event loop — forward broadcast events + handle client messages
     // ========================================================================
+
+    // Helper: serialize and send a ChatEvent to the WS client.
+    // Returns false if the client disconnected (caller should break).
+    // Returns true if the event was sent successfully.
+    //
+    // NOTE: Cross-instance dedup strategy (updated 2026-02-11):
+    //
+    // When a client joins a session owned by another instance, it receives events
+    // from two sources: Phase 1 replay (Neo4j) + Phase 1.5 snapshot, AND the live
+    // NATS subscription. Without dedup, structured events (tool_use, tool_result,
+    // assistant_text, etc.) appear twice — once from snapshot, once from NATS.
+    //
+    // Previous approach (removed): content-based fingerprint dedup. This caused
+    // legitimate repeated StreamDelta tokens ("\n", " ", "e") to be dropped.
+    //
+    // Current approach: `snapshot_dedup_active` flag. When Phase 1.5 sends a
+    // streaming snapshot, the flag is set. In the NATS branch, structured events
+    // (everything except StreamDelta/StreamingStatus) are skipped while the flag
+    // is active. The flag is cleared when a Result event arrives (stream ends).
+    // StreamDelta tokens always pass through — they're never in the snapshot.
+    //
+    // Same-instance case: local broadcast XOR NATS (never both), so no dedup needed.
+    macro_rules! send_chat_event {
+        ($event:expr, $ws:expr) => {{
+            // Serialize and send
+            match serde_json::to_value(&$event) {
+                Ok(mut val) => {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("seq".to_string(), serde_json::json!(0));
+                    }
+                    if $ws
+                        .send(Message::Text(val.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        false // client disconnected
+                    } else {
+                        true
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to serialize ChatEvent: {}", e);
+                    true
+                }
+            }
+        }};
+    }
+
     loop {
         tokio::select! {
-            // Forward broadcast events to the WebSocket client
+            // Forward local broadcast events to the WebSocket client
             event = async {
                 match &mut event_rx {
                     Some(rx) => rx.recv().await,
@@ -348,30 +468,9 @@ async fn handle_ws_chat(
             } => {
                 match event {
                     Ok(chat_event) => {
-                        // Wrap the event with seq (0 for stream_delta)
-                        let seq = match &chat_event {
-                            crate::chat::types::ChatEvent::StreamDelta { .. } => 0i64,
-                            _ => 0i64, // real seq comes from persistence; broadcast events don't carry seq
-                        };
-
-                        // Serialize the chat event and add seq wrapper
-                        match serde_json::to_value(&chat_event) {
-                            Ok(mut val) => {
-                                if let Some(obj) = val.as_object_mut() {
-                                    obj.insert("seq".to_string(), serde_json::json!(seq));
-                                }
-                                if ws_sender
-                                    .send(Message::Text(val.to_string().into()))
-                                    .await
-                                    .is_err()
-                                {
-                                    debug!("WebSocket send failed, client disconnected");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to serialize ChatEvent: {}", e);
-                            }
+                        if !send_chat_event!(chat_event, ws_sender) {
+                            debug!("WebSocket send failed, client disconnected");
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -396,6 +495,60 @@ async fn handle_ws_chat(
                 }
             }
 
+            // Forward NATS chat events to the WebSocket client (cross-instance)
+            nats_msg = async {
+                match &mut nats_chat_sub {
+                    Some(sub) => sub.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match nats_msg {
+                    Some(msg) => {
+                        match serde_json::from_slice::<crate::chat::types::ChatEvent>(&msg.payload) {
+                            Ok(chat_event) => {
+                                // --- Cross-instance dedup ---
+                                // 1. Snapshot dedup: if we sent a Phase 1.5 snapshot, structured
+                                //    events from the same stream arrive again via NATS — skip them.
+                                //    StreamDelta and StreamingStatus are NEVER in the snapshot, so
+                                //    they always pass through (no content-based dedup needed).
+                                if snapshot_dedup_active {
+                                    match &chat_event {
+                                        // Always forward stream tokens — these are real-time
+                                        crate::chat::types::ChatEvent::StreamDelta { .. }
+                                        | crate::chat::types::ChatEvent::StreamingStatus { .. } => {}
+                                        // Result marks end of stream — forward it and clear dedup
+                                        crate::chat::types::ChatEvent::Result { .. } => {
+                                            snapshot_dedup_active = false;
+                                        }
+                                        // All other structured events were already in the snapshot
+                                        _ => {
+                                            debug!(
+                                                event_type = %chat_event.event_type(),
+                                                "Skipping NATS event (already sent in snapshot)"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                if !send_chat_event!(chat_event, ws_sender) {
+                                    debug!("WebSocket send failed (NATS event), client disconnected");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to deserialize NATS ChatEvent: {}", e);
+                            }
+                        }
+                    }
+                    None => {
+                        // NATS subscriber closed
+                        debug!(session_id = %session_id, "NATS chat subscriber closed");
+                        nats_chat_sub = None;
+                    }
+                }
+            }
+
             // Send periodic pings to detect dead clients
             _ = ping_interval.tick() => {
                 if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
@@ -415,24 +568,49 @@ async fn handle_ws_chat(
                                     WsChatClientMessage::UserMessage { content } => {
                                         debug!(session_id = %session_id, "WS: Received user_message");
 
-                                        // Check if session is active; if not, auto-resume
-                                        let result = if !chat_manager.is_session_active(&session_id).await {
-                                            chat_manager.resume_session(&session_id, &content).await
-                                        } else {
+                                        // 3-branch routing: local → remote (NATS RPC) → fallback resume
+                                        let result = if chat_manager.is_session_active(&session_id).await {
+                                            // Session is local — send directly
                                             chat_manager.send_message(&session_id, &content).await
+                                        } else if chat_manager
+                                            .try_remote_send(&session_id, &content, "user_message")
+                                            .await
+                                            .unwrap_or(false)
+                                        {
+                                            // Message proxied to remote instance via NATS RPC.
+                                            // Ensure we have a NATS subscription to receive the stream.
+                                            if nats_chat_sub.is_none() {
+                                                if let Some(ref nats) = state.nats_emitter {
+                                                    if let Ok(sub) = nats.subscribe_chat_events(&session_id).await {
+                                                        debug!(session_id = %session_id, "Subscribed to NATS chat events after remote send");
+                                                        nats_chat_sub = Some(sub);
+                                                    }
+                                                }
+                                            }
+                                            Ok(())
+                                        } else {
+                                            // No instance owns the session — resume locally (spawns new CLI)
+                                            chat_manager.resume_session(&session_id, &content).await
                                         };
 
                                         match result {
                                             Ok(()) => {
-                                                // If we didn't have a broadcast subscription, get one now
+                                                // If we did a local send/resume and don't have broadcast, subscribe now
                                                 if event_rx.is_none() {
                                                     match chat_manager.subscribe(&session_id).await {
                                                         Ok(rx) => {
                                                             event_rx = Some(rx);
+                                                            // Now that we have local broadcast, drop the NATS
+                                                            // subscription to avoid receiving every event twice.
+                                                            if nats_chat_sub.is_some() {
+                                                                debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active");
+                                                                nats_chat_sub = None;
+                                                            }
                                                             debug!(session_id = %session_id, "Subscribed to broadcast after first message");
                                                         }
                                                         Err(e) => {
-                                                            warn!(session_id = %session_id, error = %e, "Failed to subscribe after send");
+                                                            // May fail if message was proxied remotely (no local session)
+                                                            debug!(session_id = %session_id, error = %e, "No local broadcast (session may be remote)");
                                                         }
                                                     }
                                                 }
@@ -461,14 +639,39 @@ async fn handle_ws_chat(
                                             "Permission {}",
                                             if allow { "granted" } else { "denied" }
                                         );
-                                        if let Err(e) = chat_manager.send_message(&session_id, &msg).await {
+                                        // Try local → remote → error (no resume for responses)
+                                        let send_result = if chat_manager.is_session_active(&session_id).await {
+                                            chat_manager.send_message(&session_id, &msg).await
+                                        } else if chat_manager
+                                            .try_remote_send(&session_id, &msg, "permission_response")
+                                            .await
+                                            .unwrap_or(false)
+                                        {
+                                            Ok(())
+                                        } else {
+                                            // Session not active anywhere — can't deliver permission response
+                                            Err(anyhow::anyhow!("Session not active on any instance"))
+                                        };
+                                        if let Err(e) = send_result {
                                             warn!(session_id = %session_id, error = %e, "Failed to send permission response");
                                         }
                                     }
 
                                     WsChatClientMessage::InputResponse { content, .. } => {
                                         debug!(session_id = %session_id, "WS: Received input_response");
-                                        if let Err(e) = chat_manager.send_message(&session_id, &content).await {
+                                        // Try local → remote → error (no resume for responses)
+                                        let send_result = if chat_manager.is_session_active(&session_id).await {
+                                            chat_manager.send_message(&session_id, &content).await
+                                        } else if chat_manager
+                                            .try_remote_send(&session_id, &content, "input_response")
+                                            .await
+                                            .unwrap_or(false)
+                                        {
+                                            Ok(())
+                                        } else {
+                                            Err(anyhow::anyhow!("Session not active on any instance"))
+                                        };
+                                        if let Err(e) = send_result {
                                             warn!(session_id = %session_id, error = %e, "Failed to send input response");
                                         }
                                     }

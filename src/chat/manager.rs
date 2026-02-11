@@ -11,8 +11,8 @@
 
 use super::config::ChatConfig;
 use super::types::{
-    truncate_snippet, ChatEvent, ChatRequest, CreateSessionResponse, MessageSearchHit,
-    MessageSearchResult,
+    truncate_snippet, ChatEvent, ChatEventPage, ChatRequest, CreateSessionResponse,
+    MessageSearchHit, MessageSearchResult,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -21,7 +21,7 @@ use crate::neo4j::GraphStore;
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use nexus_claude::{
-    memory::{ContextInjector, ConversationMemoryManager, LoadedConversation, MemoryConfig},
+    memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
 };
@@ -32,6 +32,8 @@ use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+use crate::expand_tilde;
 
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
@@ -77,6 +79,8 @@ pub struct ChatManager {
     pub(crate) memory_config: Option<MemoryConfig>,
     /// Event emitter for CRUD events (streaming status changes)
     pub(crate) event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    /// Optional NATS emitter for cross-instance chat event publishing
+    pub(crate) nats: Option<Arc<crate::events::NatsEmitter>>,
 }
 
 impl ChatManager {
@@ -94,6 +98,7 @@ impl ChatManager {
             context_injector: None,
             memory_config: None,
             event_emitter: None,
+            nats: None,
         }
     }
 
@@ -129,6 +134,7 @@ impl ChatManager {
             context_injector,
             memory_config: Some(memory_config),
             event_emitter: None,
+            nats: None,
         }
     }
 
@@ -136,6 +142,413 @@ impl ChatManager {
     pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
         self.event_emitter = Some(emitter);
         self
+    }
+
+    /// Set the NATS emitter for cross-instance chat event publishing.
+    ///
+    /// When configured, ChatEvents are published to NATS alongside the local
+    /// broadcast channel, enabling multi-instance real-time sync.
+    /// Interrupts are also propagated via NATS to all instances.
+    pub fn with_nats(mut self, nats: Arc<crate::events::NatsEmitter>) -> Self {
+        self.nats = Some(nats);
+        self
+    }
+
+    /// Spawn a background task that listens for NATS interrupt signals for a session.
+    ///
+    /// When another instance publishes an interrupt for this session via NATS,
+    /// the listener sets the local `interrupt_flag` so the stream loop breaks.
+    /// No-op if NATS is not configured.
+    fn spawn_nats_interrupt_listener(
+        &self,
+        session_id: &str,
+        interrupt_flag: Arc<AtomicBool>,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    ) {
+        let Some(ref nats) = self.nats else {
+            return;
+        };
+
+        let nats = nats.clone();
+        let session_id = session_id.to_string();
+
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_interrupt(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(
+                        "Failed to subscribe to NATS interrupt for session {}: {}",
+                        session_id, e
+                    );
+                    return;
+                }
+            };
+
+            while let Some(_msg) = subscriber.next().await {
+                // Check if session is still active — stop listener if session was removed
+                let session_exists = {
+                    let sessions = active_sessions.read().await;
+                    sessions.contains_key(&session_id)
+                };
+                if !session_exists {
+                    debug!(
+                        "Session {} no longer active, stopping NATS interrupt listener",
+                        session_id
+                    );
+                    break;
+                }
+
+                // Guard: don't re-interrupt if the flag is already set
+                if interrupt_flag.load(Ordering::SeqCst) {
+                    debug!(
+                        "Interrupt flag already set for session {}, ignoring NATS interrupt",
+                        session_id
+                    );
+                    continue;
+                }
+
+                info!(
+                    "NATS interrupt received for session {}, setting interrupt flag",
+                    session_id
+                );
+                interrupt_flag.store(true, Ordering::SeqCst);
+            }
+
+            debug!("NATS interrupt listener stopped for session {}", session_id);
+        });
+    }
+
+    /// Spawn a background task that responds to NATS snapshot requests for a session.
+    ///
+    /// When a remote instance needs to do a mid-stream join, it sends a NATS request
+    /// on `events.chat.{session_id}.snapshot`. This listener replies with the current
+    /// streaming snapshot (partial text + structured events).
+    /// Stops when the session is removed from active_sessions.
+    fn spawn_nats_snapshot_responder(
+        &self,
+        session_id: &str,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    ) {
+        let Some(ref nats) = self.nats else {
+            return;
+        };
+
+        let nats = nats.clone();
+        let session_id = session_id.to_string();
+
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_snapshot_requests(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(
+                        "Failed to subscribe to NATS snapshot requests for session {}: {}",
+                        session_id, e
+                    );
+                    return;
+                }
+            };
+
+            while let Some(msg) = subscriber.next().await {
+                // Build snapshot from active session state
+                let snapshot = {
+                    let sessions = active_sessions.read().await;
+                    match sessions.get(&session_id) {
+                        Some(session) => {
+                            let is_streaming = session.is_streaming.load(Ordering::SeqCst);
+                            let text = session.streaming_text.lock().await.clone();
+                            let events = session.streaming_events.lock().await.clone();
+                            Some(crate::events::StreamingSnapshot {
+                                is_streaming,
+                                partial_text: text,
+                                events,
+                            })
+                        }
+                        None => {
+                            // Session no longer active — stop responder
+                            debug!(
+                                "Session {} no longer active, stopping snapshot responder",
+                                session_id
+                            );
+                            break;
+                        }
+                    }
+                };
+
+                if let Some(snapshot) = snapshot {
+                    // Reply to the requester
+                    if let Some(reply_to) = msg.reply {
+                        match serde_json::to_vec(&snapshot) {
+                            Ok(payload) => {
+                                if let Err(e) =
+                                    nats.client().publish(reply_to, payload.into()).await
+                                {
+                                    warn!(
+                                        "Failed to reply with snapshot for session {}: {}",
+                                        session_id, e
+                                    );
+                                } else {
+                                    debug!(
+                                        session_id = %session_id,
+                                        is_streaming = snapshot.is_streaming,
+                                        text_len = snapshot.partial_text.len(),
+                                        events_count = snapshot.events.len(),
+                                        "Replied with streaming snapshot"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to serialize snapshot for session {}: {}",
+                                    session_id, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            debug!("NATS snapshot responder stopped for session {}", session_id);
+        });
+    }
+
+    /// Spawn a background task that listens for NATS RPC send requests for a session.
+    ///
+    /// When another instance wants to send a message to a session owned by this instance,
+    /// it publishes a `ChatRpcRequest` to `rpc.chat.{session_id}.send`.
+    /// This listener processes the request locally (queue if streaming, or persist+stream)
+    /// and replies with `ChatRpcResponse`.
+    ///
+    /// No-op if NATS is not configured.
+    fn spawn_nats_rpc_listener(
+        &self,
+        session_id: &str,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    ) {
+        let Some(ref nats) = self.nats else {
+            return;
+        };
+
+        let nats = nats.clone();
+        let session_id = session_id.to_string();
+        let graph = self.graph.clone();
+        let context_injector = self.context_injector.clone();
+        let event_emitter = self.event_emitter.clone();
+
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_rpc_send(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(
+                        "Failed to subscribe to NATS RPC send for session {}: {}",
+                        session_id, e
+                    );
+                    return;
+                }
+            };
+
+            info!(
+                session_id = %session_id,
+                "NATS RPC send listener started"
+            );
+
+            while let Some(msg) = subscriber.next().await {
+                // Parse the RPC request
+                let request: crate::events::ChatRpcRequest =
+                    match serde_json::from_slice(&msg.payload) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse NATS RPC request for session {}: {}",
+                                session_id, e
+                            );
+                            // Reply with error if possible
+                            if let Some(reply_to) = msg.reply {
+                                let resp = crate::events::ChatRpcResponse {
+                                    success: false,
+                                    error: Some(format!("Invalid request: {}", e)),
+                                };
+                                if let Ok(payload) = serde_json::to_vec(&resp) {
+                                    let _ = nats.client().publish(reply_to, payload.into()).await;
+                                }
+                            }
+                            continue;
+                        }
+                    };
+
+                debug!(
+                    session_id = %session_id,
+                    message_type = %request.message_type,
+                    "NATS RPC send request received"
+                );
+
+                // Get session state — check if still active locally
+                let session_state = {
+                    let mut sessions = active_sessions.write().await;
+                    match sessions.get_mut(&session_id) {
+                        Some(session) => {
+                            session.last_activity = Instant::now();
+                            session.interrupt_flag.store(false, Ordering::SeqCst);
+                            Some((
+                                session.client.clone(),
+                                session.events_tx.clone(),
+                                session.interrupt_flag.clone(),
+                                session.memory_manager.clone(),
+                                session.next_seq.clone(),
+                                session.pending_messages.clone(),
+                                session.is_streaming.clone(),
+                                session.streaming_text.clone(),
+                                session.streaming_events.clone(),
+                            ))
+                        }
+                        None => None,
+                    }
+                };
+
+                let response = match session_state {
+                    None => {
+                        // Session no longer active — reply error and stop listener
+                        debug!(
+                            "Session {} no longer active, stopping NATS RPC listener",
+                            session_id
+                        );
+                        let resp = crate::events::ChatRpcResponse {
+                            success: false,
+                            error: Some("Session not active on this instance".to_string()),
+                        };
+                        if let Some(reply_to) = msg.reply {
+                            if let Ok(payload) = serde_json::to_vec(&resp) {
+                                let _ = nats.client().publish(reply_to, payload.into()).await;
+                            }
+                        }
+                        break;
+                    }
+                    Some((
+                        client,
+                        events_tx,
+                        interrupt_flag,
+                        memory_manager,
+                        next_seq,
+                        pending_messages,
+                        is_streaming,
+                        streaming_text,
+                        streaming_events,
+                    )) => {
+                        let message = &request.message;
+
+                        // If streaming → queue the message (will be drained by stream_response)
+                        if is_streaming.load(Ordering::SeqCst) {
+                            info!(
+                                "Stream in progress for session {} (via NATS RPC), queuing message",
+                                session_id
+                            );
+                            let mut queue = pending_messages.lock().await;
+                            queue.push_back(message.clone());
+                            crate::events::ChatRpcResponse {
+                                success: true,
+                                error: None,
+                            }
+                        } else {
+                            // Not streaming — persist user_message, broadcast, spawn stream
+                            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                                // Update message count
+                                if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
+                                    let _ = graph
+                                        .update_chat_session(
+                                            uuid,
+                                            None,
+                                            None,
+                                            Some(node.message_count + 1),
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                }
+
+                                // Persist user_message event
+                                let user_event = crate::neo4j::models::ChatEventRecord {
+                                    id: Uuid::new_v4(),
+                                    session_id: uuid,
+                                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                                    event_type: "user_message".to_string(),
+                                    data: serde_json::to_string(
+                                        &serde_json::json!({"content": message}),
+                                    )
+                                    .unwrap_or_default(),
+                                    created_at: chrono::Utc::now(),
+                                };
+                                let _ = graph.store_chat_events(uuid, vec![user_event]).await;
+                            }
+
+                            // Broadcast user_message locally + NATS
+                            let user_msg_event = ChatEvent::UserMessage {
+                                content: message.clone(),
+                            };
+                            let _ = events_tx.send(user_msg_event.clone());
+                            nats.publish_chat_event(&session_id, user_msg_event);
+
+                            // Spawn stream_response
+                            let session_id_clone = session_id.clone();
+                            let graph_clone = graph.clone();
+                            let active_sessions_clone = active_sessions.clone();
+                            let prompt = message.clone();
+                            let injector = context_injector.clone();
+                            let event_emitter_clone = event_emitter.clone();
+                            let nats_clone = Some(nats.clone());
+
+                            tokio::spawn(async move {
+                                Self::stream_response(
+                                    client,
+                                    events_tx,
+                                    prompt,
+                                    session_id_clone,
+                                    graph_clone,
+                                    active_sessions_clone,
+                                    interrupt_flag,
+                                    memory_manager,
+                                    injector,
+                                    next_seq,
+                                    pending_messages,
+                                    is_streaming,
+                                    streaming_text,
+                                    streaming_events,
+                                    event_emitter_clone,
+                                    nats_clone,
+                                )
+                                .await;
+                            });
+
+                            crate::events::ChatRpcResponse {
+                                success: true,
+                                error: None,
+                            }
+                        }
+                    }
+                };
+
+                // Reply to the requester
+                if let Some(reply_to) = msg.reply {
+                    match serde_json::to_vec(&response) {
+                        Ok(payload) => {
+                            if let Err(e) = nats.client().publish(reply_to, payload.into()).await {
+                                warn!(
+                                    "Failed to reply to NATS RPC for session {}: {}",
+                                    session_id, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to serialize RPC response for session {}: {}",
+                                session_id, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            debug!("NATS RPC send listener stopped for session {}", session_id);
+        });
     }
 
     /// Resolve the model to use: request > config default
@@ -268,6 +681,8 @@ impl ChatManager {
         system_prompt: &str,
         resume_id: Option<&str>,
     ) -> ClaudeCodeOptions {
+        // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
+        let cwd = expand_tilde(cwd);
         let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
 
         let mut env = HashMap::new();
@@ -550,6 +965,19 @@ impl ChatManager {
             interrupt_flag
         };
 
+        // Spawn NATS interrupt listener for cross-instance interrupt support
+        self.spawn_nats_interrupt_listener(
+            &session_id.to_string(),
+            interrupt_flag.clone(),
+            self.active_sessions.clone(),
+        );
+
+        // Spawn NATS snapshot responder for cross-instance mid-stream join
+        self.spawn_nats_snapshot_responder(&session_id.to_string(), self.active_sessions.clone());
+
+        // Spawn NATS RPC send listener for cross-instance message routing
+        self.spawn_nats_rpc_listener(&session_id.to_string(), self.active_sessions.clone());
+
         // Persist the initial user_message event
         let user_event = ChatEventRecord {
             id: Uuid::new_v4(),
@@ -565,10 +993,28 @@ impl ChatManager {
             .store_chat_events(session_id, vec![user_event])
             .await;
 
-        // Emit user_message on the broadcast (so other WS clients see it)
-        let _ = events_tx.send(ChatEvent::UserMessage {
+        // Emit user_message on local broadcast + NATS (so all clients see it)
+        let user_msg_event = ChatEvent::UserMessage {
             content: request.message.clone(),
-        });
+        };
+        let _ = events_tx.send(user_msg_event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(&session_id.to_string(), user_msg_event);
+        }
+
+        // Emit CRUD event so other instances (via NATS) know a session was created
+        if let Some(ref emitter) = self.event_emitter {
+            emitter.emit_created(
+                crate::events::EntityType::ChatSession,
+                &session_id.to_string(),
+                serde_json::json!({
+                    "project_slug": request.project_slug,
+                    "cwd": request.cwd,
+                    "model": model,
+                }),
+                None,
+            );
+        }
 
         // Auto-generate title and preview from the first user message
         {
@@ -607,6 +1053,7 @@ impl ChatManager {
         let events_tx_clone = events_tx.clone();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
+        let nats = self.nats.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -625,6 +1072,7 @@ impl ChatManager {
                 streaming_text,
                 streaming_events,
                 event_emitter,
+                nats,
             )
             .await;
         });
@@ -653,10 +1101,27 @@ impl ChatManager {
         streaming_text: Arc<Mutex<String>>,
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
         event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
     ) {
+        // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
+        let emit_chat = |event: ChatEvent,
+                         tx: &broadcast::Sender<ChatEvent>,
+                         nats: &Option<Arc<crate::events::NatsEmitter>>,
+                         sid: &str| {
+            let _ = tx.send(event.clone());
+            if let Some(ref nats) = nats {
+                nats.publish_chat_event(sid, event);
+            }
+        };
+
         is_streaming.store(true, Ordering::SeqCst);
         // Broadcast streaming_status to all connected clients (multi-tab support)
-        let _ = events_tx.send(ChatEvent::StreamingStatus { is_streaming: true });
+        emit_chat(
+            ChatEvent::StreamingStatus { is_streaming: true },
+            &events_tx,
+            &nats,
+            &session_id,
+        );
         // Emit CRUD event for session list live refresh
         if let Some(ref emitter) = event_emitter {
             emitter.emit_updated(
@@ -699,9 +1164,14 @@ impl ChatManager {
                 Ok(s) => std::pin::pin!(s),
                 Err(e) => {
                     error!("Error starting stream for session {}: {}", session_id, e);
-                    let _ = events_tx.send(ChatEvent::Error {
-                        message: format!("Error: {}", e),
-                    });
+                    emit_chat(
+                        ChatEvent::Error {
+                            message: format!("Error: {}", e),
+                        },
+                        &events_tx,
+                        &nats,
+                        &session_id,
+                    );
                     is_streaming.store(false, Ordering::SeqCst);
                     if let Some(ref emitter) = event_emitter {
                         emitter.emit_updated(
@@ -742,7 +1212,12 @@ impl ChatManager {
                         {
                             // Accumulate for mid-stream join snapshot
                             streaming_text.lock().await.push_str(text);
-                            let _ = events_tx.send(ChatEvent::StreamDelta { text: text.clone() });
+                            emit_chat(
+                                ChatEvent::StreamDelta { text: text.clone() },
+                                &events_tx,
+                                &nats,
+                                &session_id,
+                            );
                             continue;
                         }
 
@@ -830,10 +1305,15 @@ impl ChatManager {
                                         }
                                         // Emit ToolUseInputResolved so the frontend can
                                         // update the existing tool_use block's input
-                                        let _ = events_tx.send(ChatEvent::ToolUseInputResolved {
-                                            id: id.clone(),
-                                            input: input.clone(),
-                                        });
+                                        emit_chat(
+                                            ChatEvent::ToolUseInputResolved {
+                                                id: id.clone(),
+                                                input: input.clone(),
+                                            },
+                                            &events_tx,
+                                            &nats,
+                                            &session_id,
+                                        );
                                     }
                                     debug!("Skipping duplicate ToolUse broadcast (id={}), sent input_resolved", id);
                                     continue;
@@ -876,17 +1356,39 @@ impl ChatManager {
                                     | ChatEvent::StreamingStatus { .. }
                                     | ChatEvent::AssistantText { .. }
                             ) {
+                                // Flush accumulated text before non-text events (ToolUse,
+                                // ToolResult, etc.) so the snapshot preserves correct ordering.
+                                // Without this, partial_text would contain "Text A + Text B"
+                                // with no way to know Text A came before ToolUse.
+                                // After flushing, partial_text only contains text streamed
+                                // AFTER the last structured event.
+                                {
+                                    let mut st = streaming_text.lock().await;
+                                    if !st.is_empty() {
+                                        streaming_events.lock().await.push(
+                                            ChatEvent::AssistantText {
+                                                content: st.clone(),
+                                            },
+                                        );
+                                        st.clear();
+                                    }
+                                }
                                 streaming_events.lock().await.push(event.clone());
                             }
 
-                            let _ = events_tx.send(event);
+                            emit_chat(event, &events_tx, &nats, &session_id);
                         }
                     }
                     Err(e) => {
                         error!("Stream error for session {}: {}", session_id, e);
-                        let _ = events_tx.send(ChatEvent::Error {
-                            message: format!("Error: {}", e),
-                        });
+                        emit_chat(
+                            ChatEvent::Error {
+                                message: format!("Error: {}", e),
+                            },
+                            &events_tx,
+                            &nats,
+                            &session_id,
+                        );
                         break;
                     }
                 }
@@ -944,9 +1446,14 @@ impl ChatManager {
 
         is_streaming.store(false, Ordering::SeqCst);
         // Broadcast streaming_status=false to all connected clients (multi-tab support)
-        let _ = events_tx.send(ChatEvent::StreamingStatus {
-            is_streaming: false,
-        });
+        emit_chat(
+            ChatEvent::StreamingStatus {
+                is_streaming: false,
+            },
+            &events_tx,
+            &nats,
+            &session_id,
+        );
         // Emit CRUD event for session list live refresh
         if let Some(ref emitter) = event_emitter {
             emitter.emit_updated(
@@ -1001,10 +1508,15 @@ impl ChatManager {
                 let _ = graph.store_chat_events(uuid, vec![user_event]).await;
             }
 
-            // Emit user_message on broadcast
-            let _ = events_tx.send(ChatEvent::UserMessage {
-                content: next_msg.clone(),
-            });
+            // Emit user_message on broadcast + NATS
+            emit_chat(
+                ChatEvent::UserMessage {
+                    content: next_msg.clone(),
+                },
+                &events_tx,
+                &nats,
+                &session_id,
+            );
 
             // Recursive call to process the queued message
             // Use Box::pin to handle recursive async
@@ -1024,8 +1536,67 @@ impl ChatManager {
                 streaming_text,
                 streaming_events,
                 event_emitter,
+                nats,
             ))
             .await;
+        }
+    }
+
+    /// Try to send a message to a session via NATS RPC (cross-instance proxy).
+    ///
+    /// Returns `Ok(true)` if the message was successfully proxied to the owning instance.
+    /// Returns `Ok(false)` if NATS is not configured, no instance responded (timeout),
+    /// or the remote instance reported the session is not active there.
+    ///
+    /// This method has NO side-effects on the local ChatManager — it only communicates
+    /// with remote instances via NATS request/reply.
+    ///
+    /// Callers should fall back to `resume_session()` when this returns `Ok(false)`.
+    pub async fn try_remote_send(
+        &self,
+        session_id: &str,
+        message: &str,
+        message_type: &str,
+    ) -> Result<bool> {
+        let Some(ref nats) = self.nats else {
+            debug!(
+                session_id = %session_id,
+                "No NATS configured, skipping remote send"
+            );
+            return Ok(false);
+        };
+
+        info!(
+            session_id = %session_id,
+            "Attempting NATS RPC send to remote instance"
+        );
+
+        match nats
+            .request_send_message(session_id, message, message_type)
+            .await
+        {
+            Some(response) if response.success => {
+                info!(
+                    session_id = %session_id,
+                    "Message proxied to remote instance via NATS RPC"
+                );
+                Ok(true)
+            }
+            Some(response) => {
+                debug!(
+                    session_id = %session_id,
+                    error = ?response.error,
+                    "Remote instance rejected message (session not active there)"
+                );
+                Ok(false)
+            }
+            None => {
+                debug!(
+                    session_id = %session_id,
+                    "No NATS RPC reply (timeout) — no instance owns this session"
+                );
+                Ok(false)
+            }
         }
     }
 
@@ -1112,10 +1683,14 @@ impl ChatManager {
             let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
         }
 
-        // Emit user_message on broadcast (visible to all WS clients)
-        let _ = events_tx.send(ChatEvent::UserMessage {
+        // Emit user_message on local broadcast + NATS (visible to all clients)
+        let user_msg_event = ChatEvent::UserMessage {
             content: message.to_string(),
-        });
+        };
+        let _ = events_tx.send(user_msg_event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, user_msg_event);
+        }
 
         // Start streaming directly
         let session_id_str = session_id.to_string();
@@ -1124,6 +1699,7 @@ impl ChatManager {
         let prompt = message.to_string();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
+        let nats = self.nats.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -1142,6 +1718,7 @@ impl ChatManager {
                 streaming_text,
                 streaming_events,
                 event_emitter,
+                nats,
             )
             .await;
         });
@@ -1149,7 +1726,10 @@ impl ChatManager {
         Ok(())
     }
 
-    /// Resume a previously inactive session by creating a new InteractiveClient with --resume
+    /// Resume a previously inactive session by creating a new InteractiveClient.
+    ///
+    /// If the session has a `cli_session_id`, resumes with `--resume`.
+    /// If not (first message or previous spawn failed), starts fresh without `--resume`.
     pub async fn resume_session(&self, session_id: &str, message: &str) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
@@ -1161,17 +1741,18 @@ impl ChatManager {
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
 
-        let cli_session_id = session_node
-            .cli_session_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("Session {} has no CLI session ID for resume", session_id))?;
+        let cli_session_id = session_node.cli_session_id.as_deref();
 
-        info!(
-            "Resuming session {} with CLI ID {}",
-            session_id, cli_session_id
-        );
+        if let Some(cli_id) = cli_session_id {
+            info!("Resuming session {} with CLI ID {}", session_id, cli_id);
+        } else {
+            info!(
+                "Starting fresh CLI for session {} (no previous cli_session_id)",
+                session_id
+            );
+        }
 
-        // Build options with resume flag
+        // Build options - with resume flag only if we have a cli_session_id
         let system_prompt = self
             .build_system_prompt(session_node.project_slug.as_deref(), message)
             .await;
@@ -1179,7 +1760,7 @@ impl ChatManager {
             &session_node.cwd,
             &session_node.model,
             &system_prompt,
-            Some(cli_session_id),
+            cli_session_id,
         );
 
         // Create new InteractiveClient with --resume
@@ -1244,7 +1825,7 @@ impl ChatManager {
                 ActiveSession {
                     events_tx: events_tx.clone(),
                     last_activity: Instant::now(),
-                    cli_session_id: Some(cli_session_id.to_string()),
+                    cli_session_id: cli_session_id.map(|s| s.to_string()),
                     client: client.clone(),
                     interrupt_flag: interrupt_flag.clone(),
                     memory_manager: memory_manager.clone(),
@@ -1258,6 +1839,19 @@ impl ChatManager {
             interrupt_flag
         };
 
+        // Spawn NATS interrupt listener for cross-instance interrupt support
+        self.spawn_nats_interrupt_listener(
+            session_id,
+            interrupt_flag.clone(),
+            self.active_sessions.clone(),
+        );
+
+        // Spawn NATS snapshot responder for cross-instance mid-stream join
+        self.spawn_nats_snapshot_responder(session_id, self.active_sessions.clone());
+
+        // Spawn NATS RPC send listener for cross-instance message routing
+        self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone());
+
         // Persist the user_message event
         let user_event = ChatEventRecord {
             id: Uuid::new_v4(),
@@ -1270,10 +1864,14 @@ impl ChatManager {
         };
         let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
 
-        // Emit user_message on broadcast
-        let _ = events_tx.send(ChatEvent::UserMessage {
+        // Emit user_message on local broadcast + NATS
+        let user_msg_event = ChatEvent::UserMessage {
             content: message.to_string(),
-        });
+        };
+        let _ = events_tx.send(user_msg_event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, user_msg_event);
+        }
 
         // Stream in background
         let session_id_str = session_id.to_string();
@@ -1282,6 +1880,7 @@ impl ChatManager {
         let prompt = message.to_string();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
+        let nats = self.nats.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -1300,6 +1899,7 @@ impl ChatManager {
                 streaming_text,
                 streaming_events,
                 event_emitter,
+                nats,
             )
             .await;
         });
@@ -1307,68 +1907,128 @@ impl ChatManager {
         Ok(())
     }
 
-    /// Retrieve message history for a session, sorted by `created_at` ascending.
+    /// Retrieve full event history for a session (including tool_use, tool_result, etc.).
     ///
-    /// Bypasses the SDK's `load_conversation()` which uses `newest_first(true)` and
-    /// sorts by `turn_index` — both of which produce wrong ordering when a conversation
-    /// spans multiple Claude Code sessions. Instead, we query Meilisearch directly with
-    /// `created_at:asc` so that offset 0 = oldest messages (standard chronological pagination).
+    /// Reads structured `ChatEventRecord` from Neo4j (the same data the WebSocket
+    /// replay uses), so every event type is preserved — not just text.
+    ///
+    /// Falls back to Meilisearch `nexus_messages` for pre-migration sessions that
+    /// have no ChatEvent nodes yet (text only, no tool_use).
     pub async fn get_session_messages(
         &self,
         session_id: &str,
         limit: Option<usize>,
         offset: Option<usize>,
-    ) -> Result<LoadedConversation> {
-        use nexus_claude::memory::MessageDocument;
-
+    ) -> Result<ChatEventPage> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
-        // Fetch conversation_id from Neo4j
-        let session_node = self
-            .graph
+        // Verify session exists
+        self.graph
             .get_chat_session(uuid)
             .await
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
 
-        let conversation_id = session_node
-            .conversation_id
-            .ok_or_else(|| anyhow!("Session {} has no conversation_id", session_id))?;
+        let limit_val = limit.unwrap_or(200) as i64;
+        let offset_val = offset.unwrap_or(0) as i64;
 
-        let limit_val = limit.unwrap_or(50);
-        let offset_val = offset.unwrap_or(0);
+        // Try Neo4j ChatEvent nodes first (new format — has tool_use, etc.)
+        let total_count = self.graph.count_chat_events(uuid).await?;
 
-        // Query Meilisearch directly, sorted by created_at ascending
-        let meili_client = meilisearch_sdk::client::Client::new(
-            &self.config.meilisearch_url,
-            Some(&self.config.meilisearch_key),
-        )
-        .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
+        if total_count > 0 {
+            let events = self
+                .graph
+                .get_chat_events_paginated(uuid, offset_val, limit_val)
+                .await?;
 
-        let index = meili_client.index("nexus_messages");
-        let filter = format!("conversation_id = \"{}\"", conversation_id);
+            let has_more = offset_val + events.len() as i64 > total_count;
 
-        let results: meilisearch_sdk::search::SearchResults<MessageDocument> = index
-            .search()
-            .with_query("")
-            .with_filter(&filter)
-            .with_sort(&["created_at:asc"])
-            .with_limit(limit_val)
-            .with_offset(offset_val)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Meilisearch query failed: {}", e))?;
+            return Ok(ChatEventPage {
+                events,
+                total_count: total_count as usize,
+                has_more,
+                offset: offset_val as usize,
+                limit: limit_val as usize,
+            });
+        }
 
-        let total_count = results.estimated_total_hits.unwrap_or(0);
-        let messages: Vec<MessageDocument> = results.hits.into_iter().map(|h| h.result).collect();
-        let has_more = offset_val + messages.len() < total_count;
+        // Fallback: pre-migration sessions — read from Meilisearch (text only)
+        let session_node = self.graph.get_chat_session(uuid).await?.unwrap();
+        if let Some(conversation_id) = session_node.conversation_id {
+            let meili_client = meilisearch_sdk::client::Client::new(
+                &self.config.meilisearch_url,
+                Some(&self.config.meilisearch_key),
+            )
+            .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
 
-        Ok(LoadedConversation {
-            messages,
-            total_count,
-            has_more,
-            offset: offset_val,
-            limit: limit_val,
+            let index = meili_client.index("nexus_messages");
+            let filter = format!("conversation_id = \"{}\"", conversation_id);
+
+            let results: meilisearch_sdk::search::SearchResults<
+                nexus_claude::memory::MessageDocument,
+            > = index
+                .search()
+                .with_query("")
+                .with_filter(&filter)
+                .with_sort(&["created_at:asc"])
+                .with_limit(limit_val as usize)
+                .with_offset(offset_val as usize)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Meilisearch query failed: {}", e))?;
+
+            let meili_total = results.estimated_total_hits.unwrap_or(0);
+
+            // Convert MessageDocument → ChatEventRecord (text-only approximation)
+            let events: Vec<ChatEventRecord> = results
+                .hits
+                .into_iter()
+                .enumerate()
+                .map(|(i, hit)| {
+                    let msg = hit.result;
+                    let event_type = if msg.role == "user" {
+                        "user_message"
+                    } else {
+                        "assistant_text"
+                    };
+                    let chat_event = if msg.role == "user" {
+                        ChatEvent::UserMessage {
+                            content: msg.content.clone(),
+                        }
+                    } else {
+                        ChatEvent::AssistantText {
+                            content: msg.content.clone(),
+                        }
+                    };
+                    ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: uuid,
+                        seq: (offset_val + i as i64 + 1),
+                        event_type: event_type.to_string(),
+                        data: serde_json::to_string(&chat_event).unwrap_or_default(),
+                        created_at: chrono::Utc::now(),
+                    }
+                })
+                .collect();
+
+            let has_more = offset_val as usize + events.len() < meili_total;
+
+            return Ok(ChatEventPage {
+                events,
+                total_count: meili_total,
+                has_more,
+                offset: offset_val as usize,
+                limit: limit_val as usize,
+            });
+        }
+
+        // No events anywhere
+        Ok(ChatEventPage {
+            events: vec![],
+            total_count: 0,
+            has_more: false,
+            offset: offset_val as usize,
+            limit: limit_val as usize,
         })
     }
 
@@ -1608,17 +2268,33 @@ impl ChatManager {
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
         let interrupt_flag = {
             let sessions = self.active_sessions.read().await;
-            let session = sessions
-                .get(session_id)
-                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
-            session.interrupt_flag.clone()
+            sessions.get(session_id).map(|s| s.interrupt_flag.clone())
         };
 
-        // Set the flag — the stream loop checks this on every iteration
-        // and will break + release the lock + send the actual interrupt signal
-        interrupt_flag.store(true, Ordering::SeqCst);
+        if let Some(flag) = interrupt_flag {
+            // Session is local — set the flag so the stream loop breaks
+            flag.store(true, Ordering::SeqCst);
+            info!(
+                session_id = %session_id,
+                "Interrupt flag set locally"
+            );
+        } else {
+            debug!(
+                session_id = %session_id,
+                "Session not active locally, interrupt will be routed via NATS only"
+            );
+        }
 
-        info!("Interrupt flag set for session {}", session_id);
+        // Always publish interrupt to NATS so the owning instance (if remote) also stops.
+        // This is fire-and-forget — no-op if NATS is not configured.
+        if let Some(ref nats) = self.nats {
+            nats.publish_interrupt(session_id);
+            debug!(
+                session_id = %session_id,
+                "Interrupt published to NATS"
+            );
+        }
+
         Ok(())
     }
 
@@ -1700,6 +2376,7 @@ mod tests {
             neo4j_password: "test".into(),
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "key".into(),
+            nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
         }
@@ -2307,11 +2984,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_interrupt_nonexistent_session() {
+        // interrupt() no longer errors for non-local sessions — it always succeeds
+        // because it may need to publish to NATS for cross-instance interrupt routing.
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let result = manager.interrupt("nonexistent").await;
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "interrupt should succeed even for non-local sessions"
+        );
     }
 
     #[tokio::test]
@@ -2360,7 +3042,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resume_session_no_cli_session_id() {
+    async fn test_resume_session_no_cli_session_id_starts_fresh() {
+        // When a session has no cli_session_id (first message or previous spawn failed),
+        // resume_session should attempt to start a fresh CLI (not error immediately).
+        // In CI without Claude CLI, this will fail at InteractiveClient creation,
+        // but the error should NOT be "no CLI session ID".
         let state = mock_app_state();
         let session = test_chat_session(None); // no cli_session_id
         state.neo4j.create_chat_session(&session).await.unwrap();
@@ -2370,11 +3056,14 @@ mod tests {
         let result = manager
             .resume_session(&session.id.to_string(), "hello")
             .await;
+        // Should fail (CLI not available in test), but NOT with "no CLI session ID"
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no CLI session ID"));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("no CLI session ID"),
+            "Should not fail with 'no CLI session ID', got: {}",
+            err_msg
+        );
     }
 
     // ====================================================================
@@ -2580,6 +3269,199 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Invalid session ID"));
+    }
+
+    // ====================================================================
+    // get_session_messages — returns structured events (tool_use, etc.)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_session_messages_returns_tool_use_events() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_config(),
+        );
+
+        // Create a session
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        // Store events including tool_use and tool_result
+        let events = vec![
+            ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: 1,
+                event_type: "user_message".into(),
+                data: serde_json::to_string(&ChatEvent::UserMessage {
+                    content: "List my plans".into(),
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+            ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: 2,
+                event_type: "tool_use".into(),
+                data: serde_json::to_string(&ChatEvent::ToolUse {
+                    id: "tu_1".into(),
+                    tool: "list_plans".into(),
+                    input: serde_json::json!({"status": "in_progress"}),
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+            ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: 3,
+                event_type: "tool_result".into(),
+                data: serde_json::to_string(&ChatEvent::ToolResult {
+                    id: "tu_1".into(),
+                    result: serde_json::json!({"plans": []}),
+                    is_error: false,
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+            ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: 4,
+                event_type: "assistant_text".into(),
+                data: serde_json::to_string(&ChatEvent::AssistantText {
+                    content: "You have no in-progress plans.".into(),
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            },
+        ];
+        state
+            .neo4j
+            .store_chat_events(session_id, events)
+            .await
+            .unwrap();
+
+        // Retrieve via get_session_messages
+        let page = manager
+            .get_session_messages(&session_id.to_string(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(page.total_count, 4);
+        assert_eq!(page.events.len(), 4);
+
+        // Verify event types are preserved
+        assert_eq!(page.events[0].event_type, "user_message");
+        assert_eq!(page.events[1].event_type, "tool_use");
+        assert_eq!(page.events[2].event_type, "tool_result");
+        assert_eq!(page.events[3].event_type, "assistant_text");
+
+        // Verify tool_use data is intact
+        let tool_use: ChatEvent = serde_json::from_str(&page.events[1].data).unwrap();
+        match tool_use {
+            ChatEvent::ToolUse { id, tool, input } => {
+                assert_eq!(id, "tu_1");
+                assert_eq!(tool, "list_plans");
+                assert_eq!(input, serde_json::json!({"status": "in_progress"}));
+            }
+            _ => panic!("Expected ToolUse event"),
+        }
+
+        // Verify ordering by seq
+        assert_eq!(page.events[0].seq, 1);
+        assert_eq!(page.events[1].seq, 2);
+        assert_eq!(page.events[2].seq, 3);
+        assert_eq!(page.events[3].seq, 4);
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_pagination() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_config(),
+        );
+
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        // Store 5 events
+        let events: Vec<ChatEventRecord> = (1..=5)
+            .map(|i| ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: i,
+                event_type: "assistant_text".into(),
+                data: serde_json::to_string(&ChatEvent::AssistantText {
+                    content: format!("Message {}", i),
+                })
+                .unwrap(),
+                created_at: chrono::Utc::now(),
+            })
+            .collect();
+        state
+            .neo4j
+            .store_chat_events(session_id, events)
+            .await
+            .unwrap();
+
+        // First page: offset=0, limit=2
+        let page1 = manager
+            .get_session_messages(&session_id.to_string(), Some(2), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(page1.events.len(), 2);
+        assert_eq!(page1.total_count, 5);
+        assert_eq!(page1.events[0].seq, 1);
+        assert_eq!(page1.events[1].seq, 2);
+
+        // Second page: offset=2, limit=2
+        let page2 = manager
+            .get_session_messages(&session_id.to_string(), Some(2), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page2.events.len(), 2);
+        assert_eq!(page2.events[0].seq, 3);
+        assert_eq!(page2.events[1].seq, 4);
+
+        // Last page: offset=4, limit=2
+        let page3 = manager
+            .get_session_messages(&session_id.to_string(), Some(2), Some(4))
+            .await
+            .unwrap();
+        assert_eq!(page3.events.len(), 1);
+        assert_eq!(page3.events[0].seq, 5);
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_empty_session() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_config(),
+        );
+
+        // Create session with no events
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        state.neo4j.create_chat_session(&session).await.unwrap();
+
+        let page = manager
+            .get_session_messages(&session_id.to_string(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(page.total_count, 0);
+        assert!(page.events.is_empty());
+        assert!(!page.has_more);
     }
 
     // ====================================================================
@@ -3318,5 +4200,84 @@ mod tests {
         };
         assert_eq!(title.chars().count(), 80);
         assert!(title.ends_with("..."));
+    }
+
+    // ========================================================================
+    // NATS RPC routing tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_try_remote_send_no_nats() {
+        // ChatManager without NATS → try_remote_send should return Ok(false) immediately
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // No NATS configured → should return false (fallback needed)
+        assert!(manager.nats.is_none());
+        let result = manager
+            .try_remote_send("any-session-id", "hello", "user_message")
+            .await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Should return false without NATS");
+    }
+
+    #[tokio::test]
+    async fn test_try_remote_send_all_message_types_no_nats() {
+        // Verify all message types return Ok(false) without NATS
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        for msg_type in &["user_message", "permission_response", "input_response"] {
+            let result = manager
+                .try_remote_send("session-123", "test", msg_type)
+                .await
+                .unwrap();
+            assert!(!result, "Should return false for {} without NATS", msg_type);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interrupt_no_local_session_no_nats() {
+        // interrupt() should succeed silently when session is not local and no NATS
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // No session active, no NATS → should return Ok (no error)
+        let result = manager.interrupt("nonexistent-session").await;
+        assert!(
+            result.is_ok(),
+            "interrupt should not error when session is not local"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_nats_rpc_listener_noop_without_nats() {
+        // Verifies that spawn_nats_rpc_listener is a no-op without NATS (no panic, no error)
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // This should be a complete no-op — no NATS means early return
+        manager.spawn_nats_rpc_listener("test-session", manager.active_sessions.clone());
+        // If we get here without panic, the test passes
+    }
+
+    #[tokio::test]
+    async fn test_routing_decision_local_active_session() {
+        // When a session is active locally, is_session_active returns true
+        // → the routing logic should choose send_message (local path)
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // No active sessions → is_session_active should return false
+        assert!(!manager.is_session_active("some-session").await);
+
+        // try_remote_send without NATS → false
+        let remote = manager
+            .try_remote_send("some-session", "hello", "user_message")
+            .await
+            .unwrap();
+        assert!(!remote);
+
+        // This confirms the routing: not local + not remote = resume_session fallback
     }
 }

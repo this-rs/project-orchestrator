@@ -128,7 +128,15 @@ POST /api/wake
 If auth is enabled on the server, agents using the REST API need a JWT token:
 
 ```bash
-# Get token via Google OAuth flow, then use it:
+# Check available auth methods
+curl http://localhost:8080/auth/providers
+
+# Login with password (if configured)
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "admin@example.com", "password": "..."}'
+
+# Or use Google OAuth / OIDC flow, then use the token:
 curl -H "Authorization: Bearer <JWT_TOKEN>" http://localhost:8080/api/plans
 ```
 
@@ -141,7 +149,7 @@ See [Authentication Guide](docs/guides/authentication.md) for details.
 ## Full Documentation
 
 - [Getting Started](docs/guides/getting-started.md) — Complete tutorial
-- [Authentication](docs/guides/authentication.md) — JWT + Google OAuth setup
+- [Authentication](docs/guides/authentication.md) — JWT + OAuth/OIDC + Password auth setup
 - [Chat & WebSocket](docs/guides/chat-websocket.md) — Real-time chat and events
 - [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) — Coordinating multiple agents
 - [API Reference](docs/api/reference.md) — All REST endpoints

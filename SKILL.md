@@ -20,9 +20,10 @@ Coordinate multiple AI coding agents with a shared knowledge base.
 - **Tree-sitter**: Precise code parsing for 12 languages
 - **Plan Management**: Structured tasks with dependencies and constraints
 - **MCP Integration**: 137 tools for Claude Code, OpenAI Agents, and Cursor
-- **Authentication**: Google OAuth2 + JWT with deny-by-default security
+- **Authentication**: Google OAuth2, OIDC, and Password login + JWT with deny-by-default security
 - **Chat WebSocket**: Real-time conversational AI via Claude integration
 - **Event System**: CRUD event notifications via WebSocket
+- **NATS Integration**: Inter-process event sync for multi-instance deployments
 - **YAML Configuration**: Hierarchical config with env var overrides
 
 ## Documentation
@@ -39,7 +40,7 @@ Coordinate multiple AI coding agents with a shared knowledge base.
 
 ```bash
 cd {baseDir}
-docker compose up -d neo4j meilisearch
+docker compose up -d
 ```
 
 ### 2. Build and run the orchestrator

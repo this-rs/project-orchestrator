@@ -13,7 +13,7 @@ tokio = { version = "1.49", features = ["full"] }
 # Web framework for webhook listener
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -62,8 +62,8 @@ hex = "0.4"
 futures = "0.3"
 async-trait = "0.1"
 
-# HTTP client (for CLI)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (for CLI) — rustls-only for cross-compilation (no OpenSSL dependency)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
 nexus-claude = { git = "https://github.com/this-rs/nexus.git", branch = "main", features = ["memory"] }
@@ -73,10 +73,29 @@ tokio-stream = "0.1"
 jsonwebtoken = "9"
 bcrypt = "0.16"
 
+# Self-update (archive extraction)
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Home directory detection
+dirs = "6"
+
+# NATS message broker (inter-process event sync)
+async-nats = "0.39"
+
 # Config
 dotenvy = "0.15"
 urlencoding = "2.1.3"
 notify = { version = "8.2.0", features = ["macos_fsevent"] }
+
+# Embedded frontend (optional — compile dist/ into the binary)
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
+
+[features]
+default = []
+embedded-frontend = ["dep:rust-embed", "dep:mime_guess"]
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -93,3 +112,49 @@ path = "src/cli.rs"
 [[bin]]
 name = "mcp_server"
 path = "src/bin/mcp_server.rs"
+
+# =============================================================================
+# Debian packaging (cargo-deb)
+# =============================================================================
+[package.metadata.deb]
+maintainer = "Elun <elun@openclaw.ai>"
+copyright = "2026, Elun / OpenClaw"
+license-file = ["LICENSE", "0"]
+section = "net"
+priority = "optional"
+extended-description = """AI agent orchestrator with Neo4j knowledge graph, \
+Meilisearch semantic search, and Tree-sitter code parsing. \
+Provides a REST API, WebSocket events, and an optional embedded React frontend."""
+depends = "$auto"
+maintainer-scripts = "packaging/debian/"
+assets = [
+    ["target/release/orchestrator", "/usr/bin/orchestrator", "755"],
+    ["target/release/orch", "/usr/bin/orch", "755"],
+    ["target/release/mcp_server", "/usr/bin/orchestrator-mcp", "755"],
+    ["config.yaml.example", "/etc/project-orchestrator/config.yaml.example", "644"],
+    ["packaging/debian/project-orchestrator.service", "/lib/systemd/system/project-orchestrator.service", "644"],
+    ["packaging/debian/docker-compose.services.yml", "/etc/project-orchestrator/docker-compose.services.yml", "644"],
+]
+conf-files = ["/etc/project-orchestrator/config.yaml"]
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "packaging/debian/"
+enable = false
+start = false
+
+# =============================================================================
+# RPM packaging (cargo-generate-rpm)
+# =============================================================================
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/orchestrator", dest = "/usr/bin/orchestrator", mode = "755" },
+    { source = "target/release/orch", dest = "/usr/bin/orch", mode = "755" },
+    { source = "target/release/mcp_server", dest = "/usr/bin/orchestrator-mcp", mode = "755" },
+    { source = "config.yaml.example", dest = "/etc/project-orchestrator/config.yaml.example", mode = "644", config = "noreplace" },
+    { source = "packaging/debian/project-orchestrator.service", dest = "/lib/systemd/system/project-orchestrator.service", mode = "644" },
+    { source = "packaging/debian/docker-compose.services.yml", dest = "/etc/project-orchestrator/docker-compose.services.yml", mode = "644" },
+]
+post_install_script = "packaging/rpm/postinst.sh"
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"

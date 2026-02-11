@@ -1,6 +1,8 @@
 //! Main orchestrator runner
 
-use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventBus, EventEmitter};
+use crate::events::{
+    CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
+};
 use crate::neo4j::models::*;
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
@@ -25,7 +27,7 @@ pub struct Orchestrator {
     parser: Arc<RwLock<CodeParser>>,
     note_manager: Arc<NoteManager>,
     note_lifecycle: Arc<NoteLifecycleManager>,
-    event_bus: Option<Arc<EventBus>>,
+    event_bus: Option<Arc<HybridEmitter>>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
 }
 
@@ -58,10 +60,11 @@ impl Orchestrator {
         })
     }
 
-    /// Create a new orchestrator with an EventBus for CRUD notifications
+    /// Create a new orchestrator with a HybridEmitter for CRUD notifications
     ///
-    /// Used by the HTTP server — the EventBus is kept for `subscribe()` (WebSocket clients).
-    pub async fn with_event_bus(state: AppState, event_bus: Arc<EventBus>) -> Result<Self> {
+    /// Used by the HTTP server — the HybridEmitter provides both local broadcast
+    /// (for WebSocket subscribe) and optional NATS (for inter-process sync).
+    pub async fn with_event_bus(state: AppState, event_bus: Arc<HybridEmitter>) -> Result<Self> {
         let emitter: Arc<dyn EventEmitter> = event_bus.clone();
 
         let plan_manager = Arc::new(PlanManager::with_event_emitter(
@@ -100,8 +103,8 @@ impl Orchestrator {
 
     /// Create a new orchestrator with a generic EventEmitter
     ///
-    /// Used by the MCP server — passes an `EventNotifier` that forwards events
-    /// to the HTTP server via POST /internal/events.
+    /// Used by both the HTTP server (with `HybridEmitter`) and the MCP server
+    /// (with `NatsEmitter` for cross-instance sync).
     pub async fn with_event_emitter(
         state: AppState,
         emitter: Arc<dyn EventEmitter>,
@@ -140,8 +143,8 @@ impl Orchestrator {
         })
     }
 
-    /// Get the event bus (if configured — only available on HTTP server)
-    pub fn event_bus(&self) -> Option<&Arc<EventBus>> {
+    /// Get the hybrid emitter (if configured — only available on HTTP server)
+    pub fn event_bus(&self) -> Option<&Arc<HybridEmitter>> {
         self.event_bus.as_ref()
     }
 
@@ -1657,15 +1660,16 @@ pub struct SyncResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{CrudAction, EntityType as EventEntityType, EventBus};
+    use crate::events::{CrudAction, EntityType as EventEntityType, EventBus, HybridEmitter};
     use crate::test_helpers::*;
 
-    /// Helper: create an Orchestrator with EventBus, return (orchestrator, receiver)
+    /// Helper: create an Orchestrator with HybridEmitter, return (orchestrator, receiver)
     async fn orch_with_bus() -> (Orchestrator, tokio::sync::broadcast::Receiver<CrudEvent>) {
         let state = mock_app_state();
         let bus = Arc::new(EventBus::default());
-        let rx = bus.subscribe();
-        let orch = Orchestrator::with_event_bus(state, bus).await.unwrap();
+        let hybrid = Arc::new(HybridEmitter::new(bus));
+        let rx = hybrid.subscribe();
+        let orch = Orchestrator::with_event_bus(state, hybrid).await.unwrap();
         (orch, rx)
     }
 

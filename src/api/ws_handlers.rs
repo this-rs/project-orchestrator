@@ -1,6 +1,11 @@
 //! WebSocket handlers for real-time CRUD event notifications
+//!
+//! Events from both local and remote sources (NATS) arrive via the local
+//! broadcast bus thanks to the NATS→local bridge in `HybridEmitter`.
+//! WS handlers only need to subscribe to the local bus.
 
 use super::handlers::OrchestratorState;
+use crate::events::CrudEvent;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -41,7 +46,40 @@ pub async fn ws_events(
     ws.on_upgrade(move |socket| handle_ws(socket, state, entity_filter, project_filter))
 }
 
-/// Handle an individual WebSocket connection
+/// Check if the event passes entity_type and project_id filters.
+fn passes_filters(
+    event: &CrudEvent,
+    entity_filter: &Option<HashSet<String>>,
+    project_filter: &Option<String>,
+) -> bool {
+    // Apply entity_type filter
+    if let Some(ref filter) = entity_filter {
+        let entity_str = serde_json::to_value(&event.entity_type)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        if !filter.contains(&entity_str) {
+            return false;
+        }
+    }
+
+    // Apply project_id filter
+    if let Some(ref pid) = project_filter {
+        match &event.project_id {
+            Some(event_pid) if event_pid == pid => {}
+            Some(_) => return false,
+            // Events without project_id pass through (global events)
+            None => {}
+        }
+    }
+
+    true
+}
+
+/// Handle an individual WebSocket connection.
+///
+/// All CRUD events (local + remote via NATS bridge) arrive through the
+/// local broadcast bus — no per-connection NATS subscription needed.
 async fn handle_ws(
     mut socket: WebSocket,
     state: OrchestratorState,
@@ -76,29 +114,12 @@ async fn handle_ws(
 
     loop {
         tokio::select! {
-            // Forward broadcast events to the WebSocket client
+            // Forward broadcast events (local + NATS-bridged) to the WebSocket client
             result = event_rx.recv() => {
                 match result {
                     Ok(event) => {
-                        // Apply entity_type filter
-                        if let Some(ref filter) = entity_filter {
-                            let entity_str = serde_json::to_value(&event.entity_type)
-                                .ok()
-                                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                                .unwrap_or_default();
-                            if !filter.contains(&entity_str) {
-                                continue;
-                            }
-                        }
-
-                        // Apply project_id filter
-                        if let Some(ref pid) = project_filter {
-                            match &event.project_id {
-                                Some(event_pid) if event_pid == pid => {}
-                                Some(_) => continue,
-                                // Events without project_id pass through (global events)
-                                None => {}
-                            }
+                        if !passes_filters(&event, &entity_filter, &project_filter) {
+                            continue;
                         }
 
                         // Serialize and send

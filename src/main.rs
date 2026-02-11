@@ -4,22 +4,18 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use project_orchestrator::{
-    api::{self, handlers::ServerState},
-    chat::{ChatConfig, ChatManager},
-    events::EventBus,
-    orchestrator::{FileWatcher, Orchestrator},
-    AppState, Config,
-};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use project_orchestrator::{orchestrator::Orchestrator, setup_claude, update, AppState, Config};
+use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "orchestrator")]
 #[command(about = "AI Agent Orchestrator Server")]
 struct Cli {
+    /// Path to config.yaml (default: auto-detect)
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -31,6 +27,14 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
+
+        /// Disable serving the frontend static files (API-only mode)
+        #[arg(long)]
+        no_frontend: bool,
+
+        /// Path to the frontend dist/ directory (overrides config.yaml)
+        #[arg(long)]
+        frontend_path: Option<String>,
     },
 
     /// Sync a directory to the knowledge base
@@ -38,6 +42,24 @@ enum Commands {
         /// Directory path to sync
         #[arg(short, long, default_value = ".")]
         path: String,
+    },
+
+    /// Check for updates and optionally install them
+    Update {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Configure Claude Code to use this server as MCP provider
+    SetupClaude {
+        /// MCP server URL (default: http://localhost:{port}/mcp/sse)
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Port used to build the default MCP server URL (default: from config or 8080)
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -57,123 +79,143 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Load configuration
-    let mut config = Config::from_env()?;
+    // Load configuration — explicit --config path wins, otherwise auto-detect
+    let mut config = Config::from_yaml_and_env(cli.config.as_deref())?;
 
     match cli.command {
-        Commands::Serve { port } => {
+        Commands::Serve {
+            port,
+            no_frontend,
+            frontend_path,
+        } => {
             config.server_port = port;
-            run_server(config).await
+            if no_frontend {
+                config.serve_frontend = false;
+            }
+            if let Some(path) = frontend_path {
+                config.frontend_path = path;
+            }
+            project_orchestrator::start_server(config).await
         }
         Commands::Sync { path } => run_sync(config, &path).await,
+        Commands::Update { check } => run_update(check).await,
+        Commands::SetupClaude { url, port } => {
+            let effective_port = port.unwrap_or(config.server_port);
+            run_setup_claude(url.as_deref(), effective_port);
+            Ok(())
+        }
     }
 }
 
-async fn run_server(mut config: Config) -> Result<()> {
-    tracing::info!("Starting Project Orchestrator server...");
+fn run_setup_claude(url: Option<&str>, port: u16) {
+    println!("Configuring Claude Code MCP server...");
+    println!();
 
-    // Hash root account password at startup (if plaintext)
-    if let Some(ref mut auth) = config.auth_config {
-        auth.ensure_root_password_hashed()?;
+    let default_url = format!("http://localhost:{}/mcp/sse", port);
+
+    match setup_claude::setup_claude_code(url, Some(port)) {
+        Ok(setup_claude::SetupResult::ConfiguredViaCli) => {
+            println!("  Claude Code configured via CLI.");
+            println!();
+            println!("  The MCP server has been added. You can verify with:");
+            println!("    claude mcp list");
+        }
+        Ok(setup_claude::SetupResult::ConfiguredViaFile { path }) => {
+            println!("  Claude Code configured via {}.", path.display());
+            println!();
+            println!("  The MCP server entry has been added to your mcp.json.");
+            println!("  Restart Claude Code to pick up the changes.");
+        }
+        Ok(setup_claude::SetupResult::AlreadyConfigured) => {
+            println!("  Project Orchestrator is already configured in Claude Code.");
+            println!("  No changes made.");
+        }
+        Err(e) => {
+            let fallback_url = url.unwrap_or(&default_url);
+            eprintln!("  Failed to configure Claude Code: {}", e);
+            eprintln!();
+            eprintln!("  You can configure it manually:");
+            eprintln!(
+                "    claude mcp add project-orchestrator --transport sse --url {}",
+                fallback_url
+            );
+            eprintln!();
+            eprintln!("  Or add to ~/.claude/mcp.json:");
+            eprintln!("    {{");
+            eprintln!("      \"mcpServers\": {{");
+            eprintln!("        \"project-orchestrator\": {{");
+            eprintln!("          \"type\": \"sse\",");
+            eprintln!("          \"url\": \"{}\"", fallback_url);
+            eprintln!("        }}");
+            eprintln!("      }}");
+            eprintln!("    }}");
+        }
     }
+}
 
-    // Initialize application state
-    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
-    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+async fn run_update(check_only: bool) -> Result<()> {
+    println!("Checking for updates...");
 
-    let state = AppState::new(config.clone()).await?;
-    tracing::info!("Connected to databases");
-
-    // Create event bus for CRUD notifications
-    let event_bus = Arc::new(EventBus::default());
-
-    // Create orchestrator with event bus
-    let orchestrator = Arc::new(Orchestrator::with_event_bus(state, event_bus.clone()).await?);
-
-    // Create file watcher
-    let watcher = FileWatcher::new(orchestrator.clone());
-
-    // Create chat manager (optional — requires Claude CLI)
-    let chat_manager = {
-        let chat_config = ChatConfig::from_env();
-        let cm = Arc::new(
-            ChatManager::new(
-                orchestrator.neo4j_arc(),
-                orchestrator.meili_arc(),
-                chat_config,
-            )
-            .await
-            .with_event_emitter(event_bus.clone()),
-        );
-        cm.start_cleanup_task();
-        tracing::info!("Chat manager initialized");
-        Some(cm)
+    let info = match update::check_for_update().await? {
+        Some(info) => info,
+        None => {
+            println!(
+                "You're already on the latest version (v{}).",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
     };
 
-    // Log auth status
-    match &config.auth_config {
-        Some(auth) => {
-            // Determine active auth modes
-            let mut modes = vec![];
-            if auth.has_password_auth() {
-                modes.push("password (root account)");
-            }
-            if auth.has_oidc() {
-                let provider_name = auth
-                    .effective_oidc()
-                    .map(|o| o.provider_name.clone())
-                    .unwrap_or_else(|| "OIDC".to_string());
-                modes.push(Box::leak(
-                    format!("OIDC ({})", provider_name).into_boxed_str(),
-                ));
-            }
-            tracing::info!(
-                "Auth enabled — modes: [{}]",
-                if modes.is_empty() {
-                    "none configured".to_string()
-                } else {
-                    modes.join(", ")
-                }
-            );
-            if let Some(ref domain) = auth.allowed_email_domain {
-                tracing::info!("  Email domain restriction: @{}", domain);
-            }
-            if let Some(ref url) = auth.frontend_url {
-                tracing::info!("  Frontend URL (CORS): {}", url);
-            }
-            tracing::info!("  JWT expiry: {}h", auth.jwt_expiry_secs / 3600);
-            tracing::info!(
-                "  Registration: {}",
-                if auth.allow_registration {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
+    println!();
+    println!(
+        "  New version available: v{} (current: v{})",
+        info.latest_version, info.current_version
+    );
+    println!("  Release: {}", info.html_url);
+
+    if let Some(notes) = &info.release_notes {
+        let preview: Vec<&str> = notes.lines().take(10).collect();
+        println!();
+        println!("  Release notes:");
+        for line in &preview {
+            println!("    {}", line);
         }
-        None => {
-            tracing::info!("Auth disabled — open access mode (no auth section in config.yaml)");
+        if notes.lines().count() > 10 {
+            println!("    ...");
         }
     }
 
-    // Create server state
-    let server_state = Arc::new(ServerState {
-        orchestrator,
-        watcher: Arc::new(RwLock::new(watcher)),
-        chat_manager,
-        event_bus,
-        auth_config: config.auth_config.clone(),
-    });
+    if check_only {
+        println!();
+        println!("Run `orchestrator update` to install this update.");
+        return Ok(());
+    }
 
-    // Create router
-    let app = api::create_router(server_state);
+    // Ask for confirmation
+    println!();
+    print!("  Install update? [Y/n] ");
+    std::io::Write::flush(&mut std::io::stdout())?;
 
-    // Start server
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
-    tracing::info!("Server listening on {}", addr);
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    if !input.is_empty() && input != "y" && input != "yes" {
+        println!("Update cancelled.");
+        return Ok(());
+    }
+
+    println!();
+    match update::perform_update(&info).await? {
+        update::UpdateStatus::Updated { from, to } => {
+            println!("  Successfully updated from v{} to v{}!", from, to);
+            println!("  Please restart orchestrator to use the new version.");
+        }
+        update::UpdateStatus::AlreadyUpToDate => {
+            println!("  Already up to date.");
+        }
+    }
 
     Ok(())
 }

@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # Stop and disable the service before removal
+        if systemctl is-active --quiet project-orchestrator 2>/dev/null; then
+            systemctl stop project-orchestrator || true
+        fi
+        if systemctl is-enabled --quiet project-orchestrator 2>/dev/null; then
+            systemctl disable project-orchestrator || true
+        fi
+        ;;
+esac
+
+exit 0

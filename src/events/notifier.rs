@@ -1,5 +1,9 @@
 //! HTTP-based event notifier for bridging MCP → HTTP server
 //!
+//! **DEPRECATED**: Use `NatsEmitter` instead for inter-process event sync.
+//! This module is kept for backward compatibility with existing deployments
+//! that haven't migrated to NATS yet. It will be removed in a future version.
+//!
 //! Sends CrudEvents to the HTTP server via POST /internal/events.
 //! Fire-and-forget: errors are logged but never block the caller.
 
@@ -9,14 +13,20 @@ use tracing::warn;
 
 /// HTTP client that forwards CrudEvents to the HTTP server's /internal/events endpoint.
 ///
-/// Used by the MCP server to notify the HTTP server (which owns the WebSocket connections)
-/// of mutations so the frontend receives real-time updates.
+/// **DEPRECATED**: Use `NatsEmitter` instead for inter-process event sync.
+/// This type is kept for backward compatibility with deployments using `MCP_HTTP_URL`.
+/// Migrate to `NATS_URL` for reliable cross-instance communication.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use NatsEmitter with NATS_URL instead. EventNotifier will be removed in a future version."
+)]
 #[derive(Clone)]
 pub struct EventNotifier {
     client: reqwest::Client,
     url: String,
 }
 
+#[allow(deprecated)]
 impl EventNotifier {
     /// Create a new EventNotifier targeting the given base URL
     ///
@@ -33,6 +43,7 @@ impl EventNotifier {
     }
 }
 
+#[allow(deprecated)]
 impl EventEmitter for EventNotifier {
     fn emit(&self, event: CrudEvent) {
         let client = self.client.clone();
@@ -53,6 +64,7 @@ impl EventEmitter for EventNotifier {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::events::EntityType;

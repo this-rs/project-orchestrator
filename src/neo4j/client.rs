@@ -7307,6 +7307,53 @@ impl Neo4jClient {
         Ok(events)
     }
 
+    /// Get chat events with offset-based pagination (for REST/MCP).
+    pub async fn get_chat_events_paginated(
+        &self,
+        session_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+             RETURN e
+             ORDER BY e.seq ASC
+             SKIP $offset
+             LIMIT $limit",
+        )
+        .param("session_id", session_id.to_string())
+        .param("offset", offset)
+        .param("limit", limit);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut events = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("e")?;
+            events.push(Self::parse_chat_event_node(&node)?);
+        }
+
+        Ok(events)
+    }
+
+    /// Count total chat events for a session.
+    pub async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+             RETURN count(e) AS cnt",
+        )
+        .param("session_id", session_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            let cnt: i64 = row.get("cnt").unwrap_or(0);
+            Ok(cnt)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Get the latest sequence number for a session (0 if no events)
     pub async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
         let q = query(

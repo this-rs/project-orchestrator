@@ -13,5 +13,8 @@ pub mod ws_auth;
 pub mod ws_chat_handler;
 pub mod ws_handlers;
 
+#[cfg(feature = "embedded-frontend")]
+pub mod embedded_frontend;
+
 pub use query::*;
 pub use routes::create_router;

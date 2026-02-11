@@ -26,6 +26,12 @@
 server:
   port: 8080                    # SERVER_PORT env override
   workspace_path: "."           # WORKSPACE_PATH env override
+  # Serve the frontend React app as static files (default: true)
+  # Set to false for API-only mode (equivalent to --no-frontend CLI flag)
+  serve_frontend: true          # SERVE_FRONTEND env override
+  # Path to the frontend dist/ directory (default: "./dist")
+  # Ignored when serve_frontend is false or when embedded-frontend feature is active
+  frontend_path: "./dist"       # FRONTEND_PATH env override
 
 # -----------------------------------------------------------------------------
 # Neo4j — Knowledge graph database
@@ -41,6 +47,15 @@ neo4j:
 meilisearch:
   url: "http://localhost:7700"              # MEILISEARCH_URL env override
   key: "orchestrator-meili-key-change-me"   # MEILISEARCH_KEY env override
+
+# -----------------------------------------------------------------------------
+# NATS — Message broker for inter-process event sync (optional)
+# -----------------------------------------------------------------------------
+# Enables real-time event synchronization between multiple instances
+# (e.g. dev server on port 8080 + desktop app on port 6600).
+# If absent or url is null, the system works in local-only mode.
+# nats:
+#   url: "nats://localhost:4222"     # NATS_URL env override
 
 # -----------------------------------------------------------------------------
 # Chat — Claude Code integration (optional, uses env vars)

@@ -1,0 +1,61 @@
+[package]
+name = "project-orchestrator-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Project Orchestrator — Desktop application"
+authors = ["Elun <elun@openclaw.ai>"]
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-shell = "2"
+tauri-plugin-updater = "2"
+
+# Backend (as library)
+project-orchestrator = { path = "../.." }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client (for health check — blocking needed for pre-Tauri startup)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+# YAML config generation
+serde_yaml = "0.9"
+
+# Random secret generation
+rand = "0.8"
+
+# Platform directories (config path)
+dirs = "5"
+
+# Docker management
+bollard = "0.18"
+futures-util = "0.3"
+
+# URL parsing (for test_connection)
+url = "2"
+
+# Error handling
+anyhow = "1"
+
+# macOS native rounded corners
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

@@ -18,6 +18,8 @@ pub mod notes;
 pub mod orchestrator;
 pub mod parser;
 pub mod plan;
+pub mod setup_claude;
+pub mod update;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -27,6 +29,21 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Expand tilde (~) in paths to the user's home directory.
+/// Shell expansion doesn't happen when paths are passed programmatically.
+pub(crate) fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &path[1..]);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.display().to_string();
+        }
+    }
+    path.to_string()
+}
+
 // ============================================================================
 // YAML config structs (deserialization targets)
 // ============================================================================
@@ -35,12 +52,25 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct YamlConfig {
+    /// When false, the app is not yet configured — the frontend shows the setup wizard.
+    /// Defaults to true for backward compat (existing config.yaml files without this field).
+    #[serde(default = "default_true")]
+    pub setup_completed: bool,
+    /// Infrastructure mode: "docker" or "external". Persisted by the setup wizard
+    /// so reconfigure mode can restore the exact wizard state.
+    #[serde(default)]
+    pub infra_mode: Option<String>,
     pub server: ServerYamlConfig,
     pub neo4j: Neo4jYamlConfig,
     pub meilisearch: MeilisearchYamlConfig,
+    pub nats: NatsYamlConfig,
     pub chat: ChatYamlConfig,
     /// Auth section — if absent, auth_config will be None (deny-by-default)
     pub auth: Option<AuthConfig>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Server configuration section
@@ -49,6 +79,14 @@ pub struct YamlConfig {
 pub struct ServerYamlConfig {
     pub port: u16,
     pub workspace_path: String,
+    /// Whether the backend should serve the frontend static files (default: true)
+    pub serve_frontend: bool,
+    /// Path to the frontend dist/ directory (default: "./dist")
+    pub frontend_path: String,
+    /// Public URL for reverse-proxy setups (e.g. https://po.ffs.dev).
+    /// Used for frontend_url, redirect_uri, and CORS when present.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 impl Default for ServerYamlConfig {
@@ -56,6 +94,9 @@ impl Default for ServerYamlConfig {
         Self {
             port: 8080,
             workspace_path: ".".into(),
+            serve_frontend: true,
+            frontend_path: "./dist".into(),
+            public_url: None,
         }
     }
 }
@@ -96,6 +137,14 @@ impl Default for MeilisearchYamlConfig {
     }
 }
 
+/// NATS configuration section (optional — enables inter-process event sync)
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct NatsYamlConfig {
+    /// NATS server URL (e.g. "nats://localhost:4222")
+    pub url: Option<String>,
+}
+
 /// Chat configuration section (YAML only — ChatConfig in chat/config.rs handles full setup)
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -130,6 +179,10 @@ pub struct AuthConfig {
     pub jwt_expiry_secs: u64,
     /// Optional domain restriction (e.g. "ffs.holdings")
     pub allowed_email_domain: Option<String>,
+    /// Optional list of individually whitelisted emails (e.g. ["alice@gmail.com", "bob@ext.com"]).
+    /// An email is allowed if it matches `allowed_email_domain` OR is in `allowed_emails`.
+    #[serde(default)]
+    pub allowed_emails: Option<Vec<String>>,
     /// Frontend URL for CORS and redirects (e.g. "http://localhost:3000")
     pub frontend_url: Option<String>,
     /// Allow new user registration via POST /auth/register (default: false)
@@ -176,6 +229,9 @@ pub struct RootAccountConfig {
 /// Works with any OIDC-compliant provider: Google, Microsoft, Okta, Keycloak, etc.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OidcConfig {
+    /// Provider key for the frontend wizard (google, microsoft, okta, auth0, keycloak, custom).
+    /// Persisted so reconfigure mode can restore the exact provider selection.
+    pub provider_key: Option<String>,
     /// OIDC discovery URL (e.g. "https://accounts.google.com/.well-known/openid-configuration").
     /// If provided, `auth_endpoint` and `token_endpoint` are fetched automatically.
     pub discovery_url: Option<String>,
@@ -233,6 +289,7 @@ impl AuthConfig {
         ) {
             (Some(client_id), Some(client_secret), Some(redirect_uri)) if !client_id.is_empty() => {
                 Some(OidcConfig {
+                    provider_key: Some("google".to_string()),
                     discovery_url: None,
                     auth_endpoint: Some(GOOGLE_AUTH_ENDPOINT.to_string()),
                     token_endpoint: Some(GOOGLE_TOKEN_ENDPOINT.to_string()),
@@ -256,6 +313,41 @@ impl AuthConfig {
     /// Returns true if OIDC authentication is available (explicit or legacy Google).
     pub fn has_oidc(&self) -> bool {
         self.effective_oidc().is_some()
+    }
+
+    /// Check whether a given email is allowed by the configured restrictions.
+    ///
+    /// An email passes if **any** of these conditions hold:
+    /// 1. No restrictions configured (`allowed_email_domain` is None AND `allowed_emails` is None/empty)
+    /// 2. Email domain matches `allowed_email_domain` (e.g. "alice@ffs.holdings" with domain "ffs.holdings")
+    /// 3. Email is in the `allowed_emails` whitelist (case-insensitive)
+    ///
+    /// Otherwise the email is rejected.
+    pub fn is_email_allowed(&self, email: &str) -> bool {
+        let email_lower = email.to_lowercase();
+        let has_domain_filter = self.allowed_email_domain.is_some();
+        let has_emails_filter = self.allowed_emails.as_ref().is_some_and(|v| !v.is_empty());
+
+        // No restrictions → everyone passes
+        if !has_domain_filter && !has_emails_filter {
+            return true;
+        }
+
+        // Check domain match
+        if let Some(ref domain) = self.allowed_email_domain {
+            if email_lower.ends_with(&format!("@{}", domain.to_lowercase())) {
+                return true;
+            }
+        }
+
+        // Check individual email whitelist
+        if let Some(ref emails) = self.allowed_emails {
+            if emails.iter().any(|e| e.to_lowercase() == email_lower) {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Ensure the root account password is bcrypt-hashed.
@@ -285,15 +377,24 @@ impl AuthConfig {
 /// Application configuration
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// When false, the setup wizard should be shown instead of the main app.
+    /// Defaults to true for backward compat.
+    pub setup_completed: bool,
     pub neo4j_uri: String,
     pub neo4j_user: String,
     pub neo4j_password: String,
     pub meilisearch_url: String,
     pub meilisearch_key: String,
+    /// NATS server URL (optional — enables inter-process event sync)
+    pub nats_url: Option<String>,
     pub workspace_path: String,
     pub server_port: u16,
     /// Auth config — None means deny-by-default (no auth section in YAML)
     pub auth_config: Option<AuthConfig>,
+    /// Whether to serve the frontend static files (default: true)
+    pub serve_frontend: bool,
+    /// Path to the frontend dist/ directory (default: "./dist")
+    pub frontend_path: String,
 }
 
 impl Config {
@@ -315,25 +416,81 @@ impl Config {
 
         // 2. Build Config with env var overrides
         Ok(Self {
+            setup_completed: yaml.setup_completed,
             neo4j_uri: std::env::var("NEO4J_URI").unwrap_or(yaml.neo4j.uri),
             neo4j_user: std::env::var("NEO4J_USER").unwrap_or(yaml.neo4j.user),
             neo4j_password: std::env::var("NEO4J_PASSWORD").unwrap_or(yaml.neo4j.password),
             meilisearch_url: std::env::var("MEILISEARCH_URL").unwrap_or(yaml.meilisearch.url),
             meilisearch_key: std::env::var("MEILISEARCH_KEY").unwrap_or(yaml.meilisearch.key),
+            nats_url: std::env::var("NATS_URL").ok().or(yaml.nats.url),
             workspace_path: std::env::var("WORKSPACE_PATH").unwrap_or(yaml.server.workspace_path),
             server_port: std::env::var("SERVER_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(yaml.server.port),
             auth_config: yaml.auth,
+            serve_frontend: std::env::var("SERVE_FRONTEND")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(yaml.server.serve_frontend),
+            frontend_path: std::env::var("FRONTEND_PATH").unwrap_or(yaml.server.frontend_path),
         })
     }
 
     /// Try to load and parse a YAML config file. Returns defaults on any failure.
+    ///
+    /// Search order when `yaml_path` is `None`:
+    /// 1. `./config.yaml` (current working directory)
+    /// 2. Platform-specific app config dir:
+    ///    - macOS: `~/Library/Application Support/project-orchestrator/config.yaml`
+    ///    - Linux: `~/.config/project-orchestrator/config.yaml`
+    ///    - Windows: `%APPDATA%/ProjectOrchestrator/config.yaml`
+    ///
+    /// This ensures the MCP server binary (which may be spawned with an arbitrary
+    /// CWD by Claude Code) can still find the config written by the desktop app.
     fn load_yaml(yaml_path: Option<&Path>) -> YamlConfig {
-        let default_path = Path::new("config.yaml");
-        let path = yaml_path.unwrap_or(default_path);
+        // If an explicit path was given, use it directly.
+        if let Some(path) = yaml_path {
+            return Self::try_load_yaml(path);
+        }
 
+        // Otherwise, try multiple search paths in priority order.
+        // Platform-specific app config dir is checked FIRST because the MCP
+        // server binary can be spawned with an arbitrary CWD (e.g. "/" when
+        // launched from the macOS dock). The desktop app always writes config
+        // to the platform dir, so it must take priority over CWD.
+        let mut candidates: Vec<std::path::PathBuf> = vec![];
+
+        // 1. Platform-specific app config directory (same as desktop app)
+        if let Some(config_dir) = dirs::config_dir() {
+            #[cfg(target_os = "windows")]
+            let app_dir = config_dir.join("ProjectOrchestrator");
+            #[cfg(not(target_os = "windows"))]
+            let app_dir = config_dir.join("project-orchestrator");
+            candidates.push(app_dir.join("config.yaml"));
+        }
+
+        // 2. CWD fallback (useful for dev / CLI usage)
+        candidates.push(std::path::PathBuf::from("config.yaml"));
+
+        for path in &candidates {
+            if path.exists() {
+                let result = Self::try_load_yaml(path);
+                // try_load_yaml logs on success — return if we got a non-default config
+                // (we always return the first file found, even if it has parse errors)
+                return result;
+            }
+        }
+
+        tracing::debug!(
+            "No config file found in search paths ({:?}), using env vars / defaults",
+            candidates
+        );
+        YamlConfig::default()
+    }
+
+    /// Attempt to load and parse a single YAML config file.
+    fn try_load_yaml(path: &Path) -> YamlConfig {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_yaml::from_str(&contents) {
                 Ok(config) => {
@@ -345,11 +502,8 @@ impl Config {
                     YamlConfig::default()
                 }
             },
-            Err(_) => {
-                tracing::debug!(
-                    "No config file at {}, using env vars / defaults",
-                    path.display()
-                );
+            Err(e) => {
+                tracing::debug!("Could not read {}: {}", path.display(), e);
                 YamlConfig::default()
             }
         }
@@ -391,6 +545,221 @@ impl AppState {
             config: Arc::new(config),
         })
     }
+}
+
+// ============================================================================
+// Server entry point (for embedding in Tauri or other hosts)
+// ============================================================================
+
+/// Start the orchestrator server with the given configuration.
+///
+/// This is the main entry point for embedding the server in another application
+/// (e.g., Tauri desktop). It initializes all services, creates the Axum router,
+/// and binds to the configured port.
+///
+/// Returns when the server shuts down (or an error occurs during startup).
+pub async fn start_server(mut config: Config) -> Result<()> {
+    use std::net::SocketAddr;
+
+    // ────────────────────────────────────────────────────────────────────
+    // Setup-only mode: if the wizard hasn't been completed yet, start a
+    // minimal server that only serves /health and /api/setup-status.
+    // This avoids connecting to Neo4j/MeiliSearch (which are likely not
+    // configured yet) and lets the frontend show the setup wizard.
+    // ────────────────────────────────────────────────────────────────────
+    if !config.setup_completed {
+        tracing::info!(
+            "Setup not completed — starting minimal setup-only server on port {}",
+            config.server_port
+        );
+        return start_setup_server(config.server_port).await;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Normal (fully configured) server
+    // ────────────────────────────────────────────────────────────────────
+    use api::handlers::ServerState;
+    use tokio::sync::RwLock;
+
+    // Hash root account password at startup (if plaintext)
+    if let Some(ref mut auth) = config.auth_config {
+        auth.ensure_root_password_hashed()?;
+    }
+
+    // Initialize application state
+    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
+    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+
+    let state = AppState::new(config.clone()).await?;
+    tracing::info!("Connected to databases");
+
+    // Create local event bus for intra-process broadcast
+    let local_bus = Arc::new(events::EventBus::default());
+
+    // Connect to NATS if configured (inter-process event sync)
+    let nats_emitter = if let Some(ref nats_url) = config.nats_url {
+        match events::connect_nats(nats_url).await {
+            Ok(client) => {
+                let emitter = Arc::new(events::NatsEmitter::new(client, "events"));
+                tracing::info!("NATS connected — inter-process event sync enabled");
+                Some(emitter)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to connect to NATS: {} — running in local-only mode",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        tracing::info!("NATS not configured — running in local-only mode");
+        None
+    };
+
+    // Create hybrid emitter (local broadcast + optional NATS)
+    let event_bus = Arc::new(match &nats_emitter {
+        Some(nats) => events::HybridEmitter::with_nats(local_bus, nats.clone()),
+        None => events::HybridEmitter::new(local_bus),
+    });
+
+    // Start NATS→local bridge: subscribes to NATS CRUD events and re-injects
+    // them into the local broadcast bus. This makes the local bus the single
+    // source of truth — WS handlers only need to listen to the local bus.
+    event_bus.start_nats_bridge();
+
+    // Create orchestrator with hybrid emitter
+    let orchestrator =
+        Arc::new(orchestrator::Orchestrator::with_event_bus(state, event_bus.clone()).await?);
+
+    // Create file watcher
+    let watcher = orchestrator::FileWatcher::new(orchestrator.clone());
+
+    // Create chat manager (optional — requires Claude CLI)
+    let chat_manager = {
+        let mut chat_config = chat::ChatConfig::from_env();
+        // Ensure NATS URL from config.yaml is forwarded to the MCP server env.
+        // ChatConfig::from_env() reads NATS_URL from the process env, but when
+        // launched from the macOS dock the shell env is not inherited. The YAML
+        // config is the reliable source of truth.
+        if chat_config.nats_url.is_none() {
+            chat_config.nats_url = config.nats_url.clone();
+        }
+        let mut cm = chat::ChatManager::new(
+            orchestrator.neo4j_arc(),
+            orchestrator.meili_arc(),
+            chat_config,
+        )
+        .await
+        .with_event_emitter(event_bus.clone());
+        if let Some(ref nats) = nats_emitter {
+            cm = cm.with_nats(nats.clone());
+        }
+        let cm = Arc::new(cm);
+        cm.start_cleanup_task();
+        tracing::info!("Chat manager initialized");
+        Some(cm)
+    };
+
+    // Create server state
+    let server_state = Arc::new(ServerState {
+        orchestrator,
+        watcher: Arc::new(RwLock::new(watcher)),
+        chat_manager,
+        event_bus,
+        nats_emitter,
+        auth_config: config.auth_config.clone(),
+        serve_frontend: config.serve_frontend,
+        frontend_path: config.frontend_path.clone(),
+        setup_completed: config.setup_completed,
+    });
+
+    // Create router
+    let app = api::create_router(server_state);
+
+    // Log frontend serving mode
+    if config.serve_frontend {
+        tracing::info!("Frontend serving enabled — path: {}", config.frontend_path);
+    } else {
+        tracing::info!("Frontend serving disabled (API-only mode)");
+    }
+
+    // Start server
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
+    tracing::info!("Server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Start a minimal server for the setup wizard.
+///
+/// Only serves `/health`, `/api/setup-status`, and `/auth/providers`.
+/// No database connections are required — it's a lightweight Axum server
+/// that lets the Tauri frontend display the setup wizard.
+async fn start_setup_server(port: u16) -> Result<()> {
+    use axum::routing::get;
+    use serde::Serialize;
+    use std::net::SocketAddr;
+    use tower_http::cors::{Any, CorsLayer};
+
+    #[derive(Serialize)]
+    struct HealthResp {
+        status: String,
+        version: String,
+    }
+
+    #[derive(Serialize)]
+    struct SetupStatusResp {
+        configured: bool,
+    }
+
+    #[derive(Serialize)]
+    struct AuthProvidersResp {
+        auth_required: bool,
+        providers: Vec<String>,
+        allow_registration: bool,
+    }
+
+    async fn health() -> axum::Json<HealthResp> {
+        axum::Json(HealthResp {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+    }
+
+    async fn setup_status() -> axum::Json<SetupStatusResp> {
+        axum::Json(SetupStatusResp { configured: false })
+    }
+
+    async fn auth_providers() -> axum::Json<AuthProvidersResp> {
+        axum::Json(AuthProvidersResp {
+            auth_required: false,
+            providers: vec![],
+            allow_registration: false,
+        })
+    }
+
+    let cors = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .allow_origin(Any);
+
+    let app = axum::Router::new()
+        .route("/health", get(health))
+        .route("/api/setup-status", get(setup_status))
+        .route("/auth/providers", get(auth_providers))
+        .layer(cors);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!("Setup-only server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
 // ============================================================================
@@ -472,6 +841,34 @@ neo4j:
         assert!(config.auth.is_none());
     }
 
+    /// No config file → setup_completed defaults to false (needs setup wizard).
+    /// With a config.yaml that omits the field → serde default = true (backward compat).
+    #[test]
+    fn test_setup_completed_defaults() {
+        // derive(Default) → false: no config file means setup wizard needed
+        let no_config = YamlConfig::default();
+        assert!(
+            !no_config.setup_completed,
+            "Without config.yaml, setup_completed must be false (needs setup)"
+        );
+
+        // serde default → true: existing config.yaml without the field is already set up
+        let yaml = "server:\n  port: 9090\n";
+        let parsed: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            parsed.setup_completed,
+            "Existing config.yaml missing the field should default to true (backward compat)"
+        );
+
+        // Explicit false in config.yaml → respected
+        let yaml_explicit = "setup_completed: false\n";
+        let parsed_explicit: YamlConfig = serde_yaml::from_str(yaml_explicit).unwrap();
+        assert!(
+            !parsed_explicit.setup_completed,
+            "Explicit setup_completed: false must be respected"
+        );
+    }
+
     #[test]
     fn test_jwt_expiry_default() {
         let yaml = r#"
@@ -502,6 +899,8 @@ auth:
                 "MEILISEARCH_KEY",
                 "WORKSPACE_PATH",
                 "SERVER_PORT",
+                "SERVE_FRONTEND",
+                "FRONTEND_PATH",
             ] {
                 std::env::remove_var(var);
             }
@@ -551,6 +950,97 @@ meilisearch:
         assert_eq!(config.server_port, 8080);
         assert_eq!(config.neo4j_uri, "bolt://localhost:7687");
         assert!(config.auth_config.is_none());
+        // Frontend defaults when no YAML
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+
+        // --- Phase 4: Frontend env var overrides ---
+        let frontend_yaml = r#"
+server:
+  port: 8080
+  serve_frontend: true
+  frontend_path: "./dist"
+"#;
+        let dir2 = tempfile::tempdir().unwrap();
+        let frontend_file = dir2.path().join("config.yaml");
+        let mut f2 = std::fs::File::create(&frontend_file).unwrap();
+        f2.write_all(frontend_yaml.as_bytes()).unwrap();
+
+        clear_env();
+        std::env::set_var("SERVE_FRONTEND", "false");
+        std::env::set_var("FRONTEND_PATH", "/custom/dist");
+
+        let config = Config::from_yaml_and_env(Some(&frontend_file)).unwrap();
+        assert!(!config.serve_frontend);
+        assert_eq!(config.frontend_path, "/custom/dist");
+
+        clear_env();
+
+        // Without env overrides → YAML values used
+        let config = Config::from_yaml_and_env(Some(&frontend_file)).unwrap();
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+
+        clear_env();
+    }
+
+    /// Explicit config path (--config flag) bypasses the platform-specific
+    /// auto-detect order. This is the core guarantee: when a user passes
+    /// `--config ./config.yaml`, they get THAT file regardless of what
+    /// exists in ~/Library/Application Support/.
+    #[test]
+    fn test_explicit_config_path_bypasses_auto_detect() {
+        fn clear_env() {
+            for var in &[
+                "NEO4J_URI",
+                "NEO4J_USER",
+                "NEO4J_PASSWORD",
+                "MEILISEARCH_URL",
+                "MEILISEARCH_KEY",
+                "WORKSPACE_PATH",
+                "SERVER_PORT",
+                "SERVE_FRONTEND",
+                "FRONTEND_PATH",
+            ] {
+                std::env::remove_var(var);
+            }
+        }
+
+        clear_env();
+
+        // Create two config files with distinct values
+        let dir_a = tempfile::tempdir().unwrap();
+        let path_a = dir_a.path().join("config.yaml");
+        std::fs::write(
+            &path_a,
+            "server:\n  port: 1111\nneo4j:\n  uri: bolt://host-a:7687\n",
+        )
+        .unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let path_b = dir_b.path().join("config.yaml");
+        std::fs::write(
+            &path_b,
+            "server:\n  port: 2222\nneo4j:\n  uri: bolt://host-b:7687\n",
+        )
+        .unwrap();
+
+        // Explicit path_a → loads path_a values
+        let config_a = Config::from_yaml_and_env(Some(&path_a)).unwrap();
+        assert_eq!(config_a.server_port, 1111);
+        assert_eq!(config_a.neo4j_uri, "bolt://host-a:7687");
+
+        // Explicit path_b → loads path_b values (not path_a)
+        let config_b = Config::from_yaml_and_env(Some(&path_b)).unwrap();
+        assert_eq!(config_b.server_port, 2222);
+        assert_eq!(config_b.neo4j_uri, "bolt://host-b:7687");
+
+        // Explicit path to non-existent file → falls back to defaults (not auto-detect)
+        let bogus = dir_a.path().join("does-not-exist.yaml");
+        let config_default = Config::from_yaml_and_env(Some(&bogus)).unwrap();
+        assert_eq!(config_default.server_port, 8080); // default, not from path_a or path_b
+
+        clear_env();
     }
 
     // ========================================================================
@@ -706,5 +1196,186 @@ server:
         let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.auth.is_none());
         // When auth is None, the middleware should allow all requests (no-auth mode)
+    }
+
+    // ========================================================================
+    // Frontend serving config tests
+    // ========================================================================
+
+    #[test]
+    fn test_frontend_config_defaults() {
+        let config = ServerYamlConfig::default();
+        assert!(config.serve_frontend);
+        assert_eq!(config.frontend_path, "./dist");
+    }
+
+    #[test]
+    fn test_frontend_config_from_yaml() {
+        let yaml = r#"
+server:
+  port: 8080
+  serve_frontend: false
+  frontend_path: "/var/www/orchestrator/dist"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.server.serve_frontend);
+        assert_eq!(config.server.frontend_path, "/var/www/orchestrator/dist");
+    }
+
+    #[test]
+    fn test_frontend_config_defaults_when_absent() {
+        // serve_frontend and frontend_path should default when not in YAML
+        let yaml = r#"
+server:
+  port: 9090
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.server.serve_frontend); // default true
+        assert_eq!(config.server.frontend_path, "./dist"); // default
+    }
+
+    // ========================================================================
+    // is_email_allowed tests
+    // ========================================================================
+
+    fn base_auth_config() -> AuthConfig {
+        AuthConfig {
+            jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
+            jwt_expiry_secs: 28800,
+            allowed_email_domain: None,
+            allowed_emails: None,
+            frontend_url: None,
+            allow_registration: false,
+            root_account: None,
+            oidc: None,
+            google_client_id: None,
+            google_client_secret: None,
+            google_redirect_uri: None,
+        }
+    }
+
+    #[test]
+    fn test_is_email_allowed_no_restrictions() {
+        // No domain filter and no email list → everyone passes
+        let config = base_auth_config();
+        assert!(config.is_email_allowed("anyone@gmail.com"));
+        assert!(config.is_email_allowed("someone@company.org"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_domain_only() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+
+        assert!(config.is_email_allowed("alice@ffs.holdings"));
+        assert!(!config.is_email_allowed("alice@gmail.com"));
+        // Case-insensitive: uppercase domain still matches
+        assert!(config.is_email_allowed("alice@FFS.HOLDINGS"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_domain_case_insensitive() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("FFS.Holdings".to_string());
+
+        // Both email and domain should compare case-insensitively
+        assert!(config.is_email_allowed("Alice@ffs.holdings"));
+        assert!(config.is_email_allowed("BOB@FFS.HOLDINGS"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_emails_only() {
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec![
+            "special@gmail.com".to_string(),
+            "vip@external.org".to_string(),
+        ]);
+
+        assert!(config.is_email_allowed("special@gmail.com"));
+        assert!(config.is_email_allowed("vip@external.org"));
+        assert!(!config.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_emails_case_insensitive() {
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec!["Alice@Gmail.com".to_string()]);
+
+        assert!(config.is_email_allowed("alice@gmail.com"));
+        assert!(config.is_email_allowed("ALICE@GMAIL.COM"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_combined_domain_and_emails() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+        config.allowed_emails = Some(vec!["partner@external.com".to_string()]);
+
+        // Domain match → OK
+        assert!(config.is_email_allowed("alice@ffs.holdings"));
+        // Email whitelist → OK even if domain doesn't match
+        assert!(config.is_email_allowed("partner@external.com"));
+        // Neither → rejected
+        assert!(!config.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_empty_emails_vec() {
+        // allowed_emails = Some(vec![]) is the same as None (no filter)
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec![]);
+
+        // Only allowed_emails with empty vec, no domain → no restrictions active
+        assert!(config.is_email_allowed("anyone@anywhere.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_empty_emails_with_domain() {
+        // allowed_emails = Some(vec![]) + domain filter → only domain matters
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("company.com".to_string());
+        config.allowed_emails = Some(vec![]);
+
+        assert!(config.is_email_allowed("user@company.com"));
+        assert!(!config.is_email_allowed("user@external.com"));
+    }
+
+    #[test]
+    fn test_allowed_emails_yaml_parsing() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  allowed_email_domain: "ffs.holdings"
+  allowed_emails:
+    - "partner@external.com"
+    - "consultant@agency.io"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.allowed_email_domain, Some("ffs.holdings".into()));
+        let emails = auth.allowed_emails.as_ref().unwrap();
+        assert_eq!(emails.len(), 2);
+        assert_eq!(emails[0], "partner@external.com");
+        assert_eq!(emails[1], "consultant@agency.io");
+
+        assert!(auth.is_email_allowed("alice@ffs.holdings"));
+        assert!(auth.is_email_allowed("partner@external.com"));
+        assert!(!auth.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_allowed_emails_absent_in_yaml() {
+        // When allowed_emails is not in YAML, it should default to None
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  allowed_email_domain: "ffs.holdings"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(auth.allowed_emails.is_none());
+        // Domain still works
+        assert!(auth.is_email_allowed("user@ffs.holdings"));
+        assert!(!auth.is_email_allowed("user@gmail.com"));
     }
 }

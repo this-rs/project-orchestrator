@@ -4,7 +4,7 @@ Complete REST API documentation for Project Orchestrator.
 
 **Base URL:** `http://localhost:8080`
 
-**Total routes:** 148 (7 public + 141 protected)
+**Total routes:** 110 (14 public + 96 protected)
 
 ---
 
@@ -24,7 +24,13 @@ For detailed setup instructions (Google OAuth, JWT configuration, environment va
 | Route Prefix | Access | Notes |
 |--------------|--------|-------|
 | `GET /health` | Public | Health check |
-| `/auth/google`, `/auth/google/callback` | Public | OAuth login flow |
+| `GET /api/version` | Public | Version info and feature flags |
+| `GET /api/setup-status` | Public | Setup wizard status |
+| `/auth/providers` | Public | List available auth methods |
+| `/auth/login` | Public | Password login |
+| `/auth/register` | Public | User registration |
+| `/auth/google`, `/auth/google/callback` | Public | Google OAuth login flow |
+| `/auth/oidc`, `/auth/oidc/callback` | Public | Generic OIDC login flow |
 | `/auth/me`, `/auth/refresh` | **Protected** | User info and token refresh |
 | `/ws/*` | Public | Auth via first WebSocket message |
 | `/hooks/wake` | Public | Agent webhook |
@@ -40,6 +46,98 @@ curl -H "Authorization: Bearer <JWT>" http://localhost:8080/api/plans
 ---
 
 ## Auth Routes
+
+### GET /auth/providers -- Public
+
+List available authentication methods.
+
+```bash
+curl http://localhost:8080/auth/providers
+```
+
+**Response:**
+```json
+{
+  "providers": ["password", "google", "oidc"],
+  "allow_registration": true,
+  "auth_required": true
+}
+```
+
+### POST /auth/login -- Public
+
+Login with email and password.
+
+```bash
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "admin@example.com", "password": "your-password"}'
+```
+
+**Response:**
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "user": {
+    "email": "admin@example.com",
+    "name": "Admin",
+    "is_root": true
+  }
+}
+```
+
+### POST /auth/register -- Public
+
+Register a new user account (requires `allow_registration: true` in config).
+
+```bash
+curl -X POST http://localhost:8080/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "user@example.com",
+    "password": "secure-password",
+    "name": "New User"
+  }'
+```
+
+**Response:**
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "user": {
+    "email": "user@example.com",
+    "name": "New User"
+  }
+}
+```
+
+### GET /auth/oidc -- Public
+
+Start generic OIDC login flow. Redirects to the configured OIDC provider.
+
+```bash
+curl -v http://localhost:8080/auth/oidc
+# Returns 302 redirect to OIDC provider
+```
+
+### GET /auth/oidc/callback -- Public
+
+OIDC callback. Exchanges the authorization code for a JWT token.
+
+```bash
+curl "http://localhost:8080/auth/oidc/callback?code=AUTH_CODE&state=STATE"
+```
+
+**Response:**
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "user": {
+    "email": "user@provider.com",
+    "name": "User Name"
+  }
+}
+```
 
 ### GET /auth/google -- Public
 
@@ -240,6 +338,29 @@ curl http://localhost:8080/health
 ```json
 {
   "status": "healthy"
+}
+```
+
+---
+
+## Version Info
+
+### GET /api/version -- Public
+
+Get server version, build information, and enabled features.
+
+```bash
+curl http://localhost:8080/api/version
+```
+
+**Response:**
+```json
+{
+  "version": "0.1.0",
+  "features": {
+    "embedded_frontend": true,
+    "nats": true
+  }
 }
 ```
 

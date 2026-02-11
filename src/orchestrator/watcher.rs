@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+use uuid::Uuid;
 
 use super::Orchestrator;
 
@@ -18,6 +19,8 @@ pub struct FileWatcher {
     orchestrator: Arc<Orchestrator>,
     watched_paths: Arc<RwLock<HashSet<PathBuf>>>,
     stop_tx: Option<mpsc::Sender<()>>,
+    project_id: Option<Uuid>,
+    project_slug: Option<String>,
 }
 
 impl FileWatcher {
@@ -27,7 +30,15 @@ impl FileWatcher {
             orchestrator,
             watched_paths: Arc::new(RwLock::new(HashSet::new())),
             stop_tx: None,
+            project_id: None,
+            project_slug: None,
         }
+    }
+
+    /// Set project context for Meilisearch indexing and project association
+    pub fn set_project_context(&mut self, project_id: Uuid, slug: String) {
+        self.project_id = Some(project_id);
+        self.project_slug = Some(slug);
     }
 
     /// Start watching a directory
@@ -65,6 +76,8 @@ impl FileWatcher {
 
         let watched_paths = self.watched_paths.clone();
         let orchestrator = self.orchestrator.clone();
+        let project_id = self.project_id;
+        let project_slug = self.project_slug.clone();
 
         // Spawn the file system watcher
         tokio::spawn(async move {
@@ -113,7 +126,14 @@ impl FileWatcher {
                             tokio::time::sleep(Duration::from_millis(500)).await;
 
                             if path.exists() {
-                                if let Err(e) = orchestrator.sync_file(&path).await {
+                                if let Err(e) = orchestrator
+                                    .sync_file_for_project(
+                                        &path,
+                                        project_id,
+                                        project_slug.as_deref(),
+                                    )
+                                    .await
+                                {
                                     tracing::warn!("Failed to sync {}: {}", path.display(), e);
                                 } else {
                                     tracing::info!("Auto-synced: {}", path.display());
@@ -143,13 +163,29 @@ impl FileWatcher {
 }
 
 /// Check if a file should be synced based on extension and path
+///
+/// Supports all 21 extensions matching the main sync engine in runner.rs.
 fn should_sync_file(path: &Path) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or_default();
 
-    let supported_extensions = ["rs", "ts", "tsx", "js", "jsx", "py", "go"];
+    // All supported languages — must stay aligned with runner.rs sync_directory_for_project()
+    let supported_extensions = [
+        "rs", // Rust
+        "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
+        "py",   // Python
+        "go",   // Go
+        "java", // Java
+        "c", "h", // C
+        "cpp", "cc", "cxx", "hpp", "hxx", // C++
+        "rb",  // Ruby
+        "php", // PHP
+        "kt", "kts",   // Kotlin
+        "swift", // Swift
+        "sh", "bash", // Bash
+    ];
 
     if !supported_extensions.contains(&ext) {
         return false;
@@ -206,6 +242,49 @@ mod tests {
     fn test_should_sync_go_files() {
         assert!(should_sync_file(Path::new("/project/main.go")));
         assert!(should_sync_file(Path::new("/project/pkg/handler.go")));
+    }
+
+    #[test]
+    fn test_should_sync_java_files() {
+        assert!(should_sync_file(Path::new("/project/src/Main.java")));
+    }
+
+    #[test]
+    fn test_should_sync_c_cpp_files() {
+        assert!(should_sync_file(Path::new("/project/src/main.c")));
+        assert!(should_sync_file(Path::new("/project/include/header.h")));
+        assert!(should_sync_file(Path::new("/project/src/app.cpp")));
+        assert!(should_sync_file(Path::new("/project/src/lib.cc")));
+        assert!(should_sync_file(Path::new("/project/src/util.cxx")));
+        assert!(should_sync_file(Path::new("/project/include/types.hpp")));
+        assert!(should_sync_file(Path::new("/project/include/utils.hxx")));
+    }
+
+    #[test]
+    fn test_should_sync_ruby_files() {
+        assert!(should_sync_file(Path::new("/project/app.rb")));
+    }
+
+    #[test]
+    fn test_should_sync_php_files() {
+        assert!(should_sync_file(Path::new("/project/index.php")));
+    }
+
+    #[test]
+    fn test_should_sync_kotlin_files() {
+        assert!(should_sync_file(Path::new("/project/src/Main.kt")));
+        assert!(should_sync_file(Path::new("/project/build.gradle.kts")));
+    }
+
+    #[test]
+    fn test_should_sync_swift_files() {
+        assert!(should_sync_file(Path::new("/project/Sources/App.swift")));
+    }
+
+    #[test]
+    fn test_should_sync_bash_files() {
+        assert!(should_sync_file(Path::new("/project/scripts/deploy.sh")));
+        assert!(should_sync_file(Path::new("/project/scripts/setup.bash")));
     }
 
     #[test]

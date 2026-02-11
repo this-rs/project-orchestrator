@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::expand_tilde;
+
 /// Handles MCP tool calls
 pub struct ToolHandler {
     orchestrator: Arc<Orchestrator>,
@@ -270,7 +272,7 @@ impl ToolHandler {
             id: Uuid::new_v4(),
             name: name.to_string(),
             slug,
-            root_path: root_path.to_string(),
+            root_path: expand_tilde(root_path),
             description: description.map(|s| s.to_string()),
             created_at: chrono::Utc::now(),
             last_synced: None,
@@ -317,7 +319,7 @@ impl ToolHandler {
         let root_path = args
             .get("root_path")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(expand_tilde);
 
         self.orchestrator
             .update_project(project.id, name, description, root_path)
@@ -353,7 +355,8 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
 
-        let path = std::path::Path::new(&project.root_path);
+        let expanded = expand_tilde(&project.root_path);
+        let path = std::path::Path::new(&expanded);
         let result = self
             .orchestrator
             .sync_directory_for_project(path, Some(project.id), Some(&project.slug))
@@ -364,6 +367,8 @@ impl ToolHandler {
         Ok(json!({
             "files_synced": result.files_synced,
             "files_skipped": result.files_skipped,
+            "files_deleted": result.files_deleted,
+            "symbols_deleted": result.symbols_deleted,
             "errors": result.errors
         }))
     }
@@ -1819,7 +1824,7 @@ impl ToolHandler {
     // ========================================================================
 
     async fn sync_directory(&self, args: Value) -> Result<Value> {
-        let path = args
+        let path_str = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("path is required"))?;
@@ -1828,15 +1833,30 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok());
 
-        let path = std::path::Path::new(path);
+        // Resolve project slug when project_id is provided (needed for Meilisearch indexing)
+        let project_slug = if let Some(pid) = project_id {
+            self.neo4j().get_project(pid).await?.map(|p| p.slug)
+        } else {
+            None
+        };
+
+        let expanded = expand_tilde(path_str);
+        let path = std::path::Path::new(&expanded);
         let result = self
             .orchestrator
-            .sync_directory_for_project(path, project_id, None)
+            .sync_directory_for_project(path, project_id, project_slug.as_deref())
             .await?;
+
+        // Update last_synced when project context is available
+        if let Some(pid) = project_id {
+            self.neo4j().update_project_synced(pid).await?;
+        }
 
         Ok(json!({
             "files_synced": result.files_synced,
             "files_skipped": result.files_skipped,
+            "files_deleted": result.files_deleted,
+            "symbols_deleted": result.symbols_deleted,
             "errors": result.errors
         }))
     }
@@ -3422,22 +3442,22 @@ impl ToolHandler {
 
         let loaded = cm.get_session_messages(session_id, limit, offset).await?;
 
-        let messages: Vec<serde_json::Value> = loaded
-            .messages_chronological()
+        let events: Vec<serde_json::Value> = loaded
+            .events
             .iter()
-            .map(|m| {
-                json!({
-                    "id": m.id,
-                    "role": m.role,
-                    "content": m.content,
-                    "turn_index": m.turn_index,
-                    "created_at": m.created_at,
-                })
+            .map(|e| {
+                let mut obj = serde_json::from_str::<serde_json::Value>(&e.data)
+                    .unwrap_or_else(|_| json!({ "type": e.event_type, "raw": e.data }));
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("seq".to_string(), json!(e.seq));
+                    map.insert("created_at".to_string(), json!(e.created_at.to_rfc3339()));
+                }
+                obj
             })
             .collect();
 
         Ok(json!({
-            "messages": messages,
+            "events": events,
             "total_count": loaded.total_count,
             "has_more": loaded.has_more,
             "offset": loaded.offset,

@@ -223,13 +223,24 @@ jobs:
           timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
           echo "All services are ready!"
 
+      - name: Write CI config.yaml
+        run: |
+          printf '%s\n' \
+            'setup_completed: true' \
+            'server:' \
+            '  port: 8080' \
+            '  serve_frontend: false' \
+            'neo4j:' \
+            '  uri: "bolt://localhost:7687"' \
+            '  user: "neo4j"' \
+            '  password: "testpassword"' \
+            'meilisearch:' \
+            '  url: "http://localhost:7700"' \
+            '  key: "test-master-key"' \
+            > config.yaml
+
       - name: Start server in background
         env:
-          NEO4J_URI: bolt://localhost:7687
-          NEO4J_USER: neo4j
-          NEO4J_PASSWORD: testpassword
-          MEILISEARCH_URL: http://localhost:7700
-          MEILISEARCH_KEY: test-master-key
           RUST_LOG: info
         run: |
           ./target/release/orchestrator serve --port 8080 &
@@ -238,12 +249,6 @@ jobs:
           echo "Server is ready!"
 
       - name: Run API tests
-        env:
-          NEO4J_URI: bolt://localhost:7687
-          NEO4J_USER: neo4j
-          NEO4J_PASSWORD: testpassword
-          MEILISEARCH_URL: http://localhost:7700
-          MEILISEARCH_KEY: test-master-key
         run: cargo test --test api_tests
 
   # ==========================================================================

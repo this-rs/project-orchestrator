@@ -19,14 +19,16 @@ The chat system is built on the [nexus-claude SDK](https://github.com/anthropics
 
 ```
 Client <--> WebSocket <--> ChatManager <--> nexus-claude SDK <--> Claude
-                                |
-                           Neo4j (sessions, messages, events)
+                                |                    |
+                           Neo4j (sessions,     NATS (cross-instance
+                            messages, events)    chat relay, events)
 ```
 
 - **ChatManager** manages active sessions, broadcast channels, and the nexus-claude SDK integration
 - **Neo4j** persists session metadata, message history, and structured chat events for replay
 - **Meilisearch** indexes messages for full-text search across sessions
-- **EventBus** broadcasts CRUD events to all connected `/ws/events` clients
+- **NATS** enables cross-instance chat relay (RPC send, interrupt forwarding, streaming snapshots) and CRUD event sync
+- **EventBus** broadcasts CRUD events to all connected `/ws/events` clients (local + NATS hybrid)
 
 ---
 
@@ -375,6 +377,22 @@ The chat system is configured via environment variables:
 | `MCP_SERVER_PATH` | Path to the MCP server binary | Auto-detected |
 
 The chat system also inherits Neo4j and Meilisearch connection settings from the main configuration (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `MEILISEARCH_URL`, `MEILISEARCH_KEY`).
+
+### NATS Configuration (Multi-Instance)
+
+When NATS is configured, the chat system supports cross-instance routing:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `NATS_URL` | NATS server URL (e.g., `nats://localhost:4222`) | _(none)_ |
+
+With NATS enabled:
+- **Chat messages** are routed to the instance hosting the active CLI session via request/reply RPC
+- **Interrupt signals** are forwarded across instances
+- **Streaming snapshots** are shared for mid-stream joins from other instances
+- **CRUD events** are published to NATS and broadcast locally via HybridEmitter (with deduplication)
+
+Without NATS, the orchestrator operates in single-instance mode with local broadcasting only.
 
 ---
 

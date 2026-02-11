@@ -79,6 +79,16 @@ You can also pass configuration via arguments:
 }
 ```
 
+### Alternative: Auto-Configure
+
+If you have the `orchestrator` binary installed, you can auto-configure Claude Code:
+
+```bash
+orchestrator setup-claude
+```
+
+This detects your Claude Code installation and adds the MCP server to `~/.claude/mcp.json` automatically.
+
 ### Step 3: Restart Claude Code
 
 After modifying `mcp.json`, restart Claude Code to load the new configuration:
@@ -116,31 +126,34 @@ Claude should use the `list_projects` tool and return results.
 
 ## Available Tools (137)
 
-### Project Management (6 tools)
+### Project Management (7 tools)
 
 | Tool | Description |
 |------|-------------|
 | `list_projects` | List all projects with optional search and pagination |
 | `create_project` | Create a new project to track a codebase |
 | `get_project` | Get project details by slug |
+| `update_project` | Update a project's name, description, or root_path |
 | `delete_project` | Delete a project and all associated data |
 | `sync_project` | Sync a project's codebase (parse files, update graph) |
 | `get_project_roadmap` | Get aggregated roadmap view with milestones and releases |
 
-### Plan Management (8 tools)
+### Plan Management (10 tools)
 
 | Tool | Description |
 |------|-------------|
 | `list_plans` | List plans with optional filters and pagination |
+| `list_project_plans` | List all plans for a specific project |
 | `create_plan` | Create a new development plan |
 | `get_plan` | Get plan details including tasks, constraints, and decisions |
 | `update_plan_status` | Update a plan's status |
+| `delete_plan` | Delete a plan and all its related data |
 | `link_plan_to_project` | Link a plan to a project |
 | `unlink_plan_from_project` | Unlink a plan from its project |
 | `get_dependency_graph` | Get the task dependency graph for a plan |
 | `get_critical_path` | Get the critical path (longest dependency chain) |
 
-### Task Management (12 tools)
+### Task Management (13 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -148,6 +161,7 @@ Claude should use the `list_projects` tool and return results.
 | `create_task` | Add a new task to a plan |
 | `get_task` | Get task details including steps and decisions |
 | `update_task` | Update a task's status, assignee, or other fields |
+| `delete_task` | Delete a task and all its steps and decisions |
 | `get_next_task` | Get the next available task (unblocked, highest priority) |
 | `add_task_dependencies` | Add dependencies to a task |
 | `remove_task_dependency` | Remove a dependency from a task |
@@ -157,24 +171,28 @@ Claude should use the `list_projects` tool and return results.
 | `get_task_prompt` | Get generated prompt for a task |
 | `add_decision` | Record an architectural decision for a task |
 
-### Step Management (4 tools)
+### Step Management (6 tools)
 
 | Tool | Description |
 |------|-------------|
 | `list_steps` | List all steps for a task |
 | `create_step` | Add a step to a task |
+| `get_step` | Get a step by ID |
 | `update_step` | Update a step's status |
+| `delete_step` | Delete a step |
 | `get_step_progress` | Get step completion progress for a task |
 
-### Constraint Management (3 tools)
+### Constraint Management (5 tools)
 
 | Tool | Description |
 |------|-------------|
 | `list_constraints` | List constraints for a plan |
 | `add_constraint` | Add a constraint to a plan |
+| `get_constraint` | Get a constraint by ID |
+| `update_constraint` | Update a constraint's description, type, or enforced_by |
 | `delete_constraint` | Delete a constraint |
 
-### Release Management (5 tools)
+### Release Management (7 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -182,9 +200,11 @@ Claude should use the `list_projects` tool and return results.
 | `create_release` | Create a new release for a project |
 | `get_release` | Get release details with tasks and commits |
 | `update_release` | Update a release |
+| `delete_release` | Delete a release |
 | `add_task_to_release` | Add a task to a release |
+| `add_commit_to_release` | Add a commit to a release |
 
-### Milestone Management (5 tools)
+### Milestone Management (7 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -192,9 +212,11 @@ Claude should use the `list_projects` tool and return results.
 | `create_milestone` | Create a new milestone for a project |
 | `get_milestone` | Get milestone details with tasks |
 | `update_milestone` | Update a milestone |
+| `delete_milestone` | Delete a milestone |
 | `get_milestone_progress` | Get milestone completion progress |
+| `add_task_to_milestone` | Add a task to a milestone |
 
-### Commit Tracking (4 tools)
+### Commit Tracking (5 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -202,13 +224,15 @@ Claude should use the `list_projects` tool and return results.
 | `link_commit_to_task` | Link a commit to a task (RESOLVED_BY) |
 | `link_commit_to_plan` | Link a commit to a plan (RESULTED_IN) |
 | `get_task_commits` | Get commits linked to a task |
+| `get_plan_commits` | Get commits linked to a plan |
 
-### Code Exploration (10 tools)
+### Code Exploration (13 tools)
 
 | Tool | Description |
 |------|-------------|
 | `search_code` | Search code semantically across all projects |
 | `search_project_code` | Search code within a specific project |
+| `search_workspace_code` | Search code across all projects in a workspace |
 | `get_file_symbols` | Get all symbols in a file (functions, structs, traits) |
 | `find_references` | Find all references to a symbol |
 | `get_file_dependencies` | Get file imports and files that depend on it |
@@ -217,12 +241,17 @@ Claude should use the `list_projects` tool and return results.
 | `get_architecture` | Get codebase architecture overview |
 | `find_similar_code` | Find code similar to a given snippet |
 | `find_trait_implementations` | Find all implementations of a trait |
+| `find_type_traits` | Find all traits implemented by a type |
+| `get_impl_blocks` | Get all impl blocks for a type |
 
-### Decision Search (1 tool)
+### Decision Management (4 tools)
 
 | Tool | Description |
 |------|-------------|
 | `search_decisions` | Search architectural decisions |
+| `get_decision` | Get a decision by ID |
+| `update_decision` | Update a decision's description, rationale, or chosen_option |
+| `delete_decision` | Delete a decision |
 
 ### Sync & Watch (4 tools)
 
@@ -549,6 +578,7 @@ MCP server logs go to stderr. To capture them:
         "NEO4J_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me",
+        "NATS_URL": "nats://localhost:4222",
         "RUST_LOG": "info"
       }
     }

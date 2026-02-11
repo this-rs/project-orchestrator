@@ -30,7 +30,8 @@
 //!         "NEO4J_USER": "neo4j",
 //!         "NEO4J_PASSWORD": "your-password",
 //!         "MEILISEARCH_URL": "http://localhost:7700",
-//!         "MEILISEARCH_KEY": "your-key"
+//!         "MEILISEARCH_KEY": "your-key",
+//!         "NATS_URL": "nats://localhost:4222"
 //!       }
 //!     }
 //!   }
@@ -40,12 +41,13 @@
 use anyhow::Result;
 use clap::Parser;
 use project_orchestrator::chat::{ChatConfig, ChatManager};
-use project_orchestrator::events::EventNotifier;
+#[allow(deprecated)] // EventNotifier kept for legacy MCP_HTTP_URL fallback
+use project_orchestrator::events::{connect_nats, EventNotifier, NatsEmitter};
 use project_orchestrator::mcp::McpServer;
 use project_orchestrator::orchestrator::Orchestrator;
 use project_orchestrator::{AppState, Config};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// MCP Server for project-orchestrator
@@ -78,9 +80,13 @@ struct Args {
     )]
     meilisearch_key: String,
 
-    /// HTTP server URL for event forwarding (MCP → HTTP bridge)
-    #[arg(long, env = "MCP_HTTP_URL", default_value = "http://localhost:8080")]
-    http_url: String,
+    /// NATS URL for inter-process event sync
+    #[arg(long, env = "NATS_URL")]
+    nats_url: Option<String>,
+
+    /// [DEPRECATED] HTTP server URL for event forwarding — use NATS_URL instead
+    #[arg(long, env = "MCP_HTTP_URL")]
+    http_url: Option<String>,
 }
 
 #[tokio::main]
@@ -97,20 +103,46 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     info!("Starting MCP server for project-orchestrator");
-    info!("Neo4j: {}", args.neo4j_uri);
-    info!("Meilisearch: {}", args.meilisearch_url);
 
-    // Create config and app state
-    let config = Config {
-        neo4j_uri: args.neo4j_uri,
-        neo4j_user: args.neo4j_user,
-        neo4j_password: args.neo4j_password,
-        meilisearch_url: args.meilisearch_url,
-        meilisearch_key: args.meilisearch_key,
-        workspace_path: ".".to_string(),
-        server_port: 8080, // Not used in MCP mode
-        auth_config: None, // MCP server doesn't need auth (stdio-based)
-    };
+    // Deprecation warning for MCP_HTTP_URL
+    if args.http_url.is_some() {
+        warn!(
+            "MCP_HTTP_URL / --http-url is deprecated and will be removed in a future version. \
+             Use NATS_URL instead for inter-process event sync."
+        );
+    }
+
+    // Load config from config.yaml (if present) + env vars, then apply CLI overrides.
+    //
+    // This is critical because Claude Code / Agent SDK may not forward all env vars
+    // from mcp.json to the spawned process (observed: NATS_URL missing). Loading the
+    // YAML config provides a reliable fallback for settings like nats.url.
+    let mut config = Config::from_yaml_and_env(None)?;
+
+    // CLI args override YAML/env when explicitly provided
+    // (clap already resolved env > default, so these are the final values)
+    config.neo4j_uri = args.neo4j_uri;
+    config.neo4j_user = args.neo4j_user;
+    config.neo4j_password = args.neo4j_password;
+    config.meilisearch_url = args.meilisearch_url;
+    config.meilisearch_key = args.meilisearch_key;
+    // nats_url: CLI/env wins if set, otherwise keep YAML value
+    if args.nats_url.is_some() {
+        config.nats_url = args.nats_url.clone();
+    }
+    // MCP server doesn't need auth or frontend
+    config.setup_completed = true;
+    config.auth_config = None;
+    config.serve_frontend = false;
+
+    info!("Neo4j: {}", config.neo4j_uri);
+    info!("Meilisearch: {}", config.meilisearch_url);
+    if let Some(ref nats_url) = config.nats_url {
+        info!("NATS URL: {}", nats_url);
+    }
+
+    // Save values before config is consumed by AppState::new
+    let resolved_nats_url = config.nats_url.clone();
 
     let state = match AppState::new(config).await {
         Ok(s) => s,
@@ -120,12 +152,50 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Create event notifier for MCP → HTTP bridge
-    let notifier = Arc::new(EventNotifier::new(&args.http_url));
-    info!("Event notifier targeting: {}", args.http_url);
+    // Create event emitter: prefer NATS, fallback to HTTP (deprecated), or none
+    let nats_emitter: Option<Arc<NatsEmitter>> = if let Some(ref nats_url) = resolved_nats_url {
+        match connect_nats(nats_url).await {
+            Ok(client) => {
+                let emitter = Arc::new(NatsEmitter::new(client, "events"));
+                info!("MCP events will be published via NATS");
+                Some(emitter)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to connect to NATS: {} — events will not be forwarded",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    // Create orchestrator with event notifier
-    let orchestrator = match Orchestrator::with_event_emitter(state, notifier).await {
+    let event_emitter: Option<Arc<dyn project_orchestrator::events::EventEmitter>> =
+        if let Some(ref nats) = nats_emitter {
+            Some(nats.clone() as Arc<dyn project_orchestrator::events::EventEmitter>)
+        } else if let Some(ref http_url) = args.http_url {
+            // Legacy fallback: HTTP POST bridge (deprecated — kept for backward compat)
+            #[allow(deprecated)]
+            let notifier = Arc::new(EventNotifier::new(http_url));
+            warn!(
+                "Using deprecated HTTP event bridge targeting: {} — migrate to NATS_URL",
+                http_url
+            );
+            Some(notifier)
+        } else {
+            info!("No NATS_URL configured — MCP events will not be forwarded to HTTP instances");
+            None
+        };
+
+    // Create orchestrator (with or without event emitter)
+    let orchestrator = match event_emitter {
+        Some(emitter) => Orchestrator::with_event_emitter(state, emitter).await,
+        None => Orchestrator::new(state).await,
+    };
+
+    let orchestrator = match orchestrator {
         Ok(o) => Arc::new(o),
         Err(e) => {
             error!("Failed to create orchestrator: {}", e);
@@ -134,15 +204,22 @@ async fn main() -> Result<()> {
     };
 
     // Create ChatManager
-    let chat_config = ChatConfig::from_env();
-    let chat_manager = Arc::new(
-        ChatManager::new(
-            orchestrator.neo4j_arc(),
-            orchestrator.meili_arc(),
-            chat_config,
-        )
-        .await,
-    );
+    let mut chat_config = ChatConfig::from_env();
+    // Forward resolved NATS URL so nested MCP servers (spawned by chat
+    // sessions) also get the NATS connection for event sync.
+    if chat_config.nats_url.is_none() {
+        chat_config.nats_url = resolved_nats_url.clone();
+    }
+    let mut cm = ChatManager::new(
+        orchestrator.neo4j_arc(),
+        orchestrator.meili_arc(),
+        chat_config,
+    )
+    .await;
+    if let Some(ref nats) = nats_emitter {
+        cm = cm.with_nats(nats.clone());
+    }
+    let chat_manager = Arc::new(cm);
     chat_manager.start_cleanup_task();
     info!("Chat manager initialized");
 

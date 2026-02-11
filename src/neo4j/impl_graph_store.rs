@@ -1284,6 +1284,20 @@ impl GraphStore for Neo4jClient {
         self.get_chat_events(session_id, after_seq, limit).await
     }
 
+    async fn get_chat_events_paginated(
+        &self,
+        session_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChatEventRecord>> {
+        self.get_chat_events_paginated(session_id, offset, limit)
+            .await
+    }
+
+    async fn count_chat_events(&self, session_id: Uuid) -> anyhow::Result<i64> {
+        self.count_chat_events(session_id).await
+    }
+
     async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> anyhow::Result<i64> {
         self.get_latest_chat_event_seq(session_id).await
     }

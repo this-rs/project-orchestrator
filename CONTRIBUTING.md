@@ -20,7 +20,7 @@ Thank you for your interest in contributing to Project Orchestrator! This docume
 
 2. **Start the backend services**
    ```bash
-   docker compose up -d neo4j meilisearch
+   docker compose up -d
    ```
 
 3. **Build the project**
@@ -47,7 +47,7 @@ Thank you for your interest in contributing to Project Orchestrator! This docume
 - Ensure all tests pass before submitting a PR: `cargo test`
 - **Unit tests** use mock backends (`MockGraphStore`, `MockSearchStore`) — no external services needed
 - **Integration tests** require Neo4j and Meilisearch running
-- Current test count: **467 tests** (unit + integration)
+- Current test count: **752 tests** (unit + integration)
 
 ### Commit Messages
 
@@ -106,7 +106,7 @@ src/
 ├── auth/          # Authentication: JWT, Google OAuth, middleware
 ├── chat/          # Chat system: WebSocket, sessions, Claude integration
 ├── config/        # YAML configuration system with env var overrides
-├── events/        # Event bus: CRUD notifications via WebSocket
+├── events/        # Event bus: CRUD notifications via WebSocket + NATS inter-process sync
 ├── mcp/           # MCP server and tool definitions (137 tools)
 ├── neo4j/         # Neo4j client, models, GraphStore trait + mock
 ├── meilisearch/   # Search client, SearchStore trait + mock
@@ -123,7 +123,7 @@ tests/
 └── parser_tests.rs      # Parser unit tests
 ```
 
-> **Note:** The project has 467 tests total, including unit tests with mock backends (no external services required).
+> **Note:** The project has 752 tests total, including unit tests with mock backends (no external services required).
 
 ## Adding New Features
 

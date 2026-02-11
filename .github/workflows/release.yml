@@ -1,0 +1,822 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: orchestrator
+  FRONTEND_REPO: this-rs/project-orchestrator-frontend
+
+jobs:
+  # ==========================================================================
+  # Build frontend - Compile React SPA once, share as artifact
+  # ==========================================================================
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout frontend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FRONTEND_REPO }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/
+          retention-days: 1
+
+  # ==========================================================================
+  # Build matrix - Compile for all target platforms (light variant)
+  # ==========================================================================
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            os: macos
+            arch: arm64
+            use_cross: false
+
+          # macOS Intel
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            os: macos
+            arch: x86_64
+            use_cross: false
+
+          # Linux x86_64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            use_cross: true
+
+          # Linux ARM64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: arm64
+            use_cross: true
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: x86_64
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.target }}"
+
+      - name: Install cross-rs
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      # --- Package the binary ---
+
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "staging/${ARCHIVE_NAME}"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "staging/${ARCHIVE_NAME}/"
+          if [ -d "queries" ]; then
+            cp -r queries "staging/${ARCHIVE_NAME}/"
+          fi
+          cd staging
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "ARCHIVE=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "${env:BINARY_NAME}-${version}-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path "staging/${archiveName}"
+          Copy-Item "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" "staging/${archiveName}/"
+          if (Test-Path "queries") {
+            Copy-Item -Recurse "queries" "staging/${archiveName}/"
+          }
+          Compress-Archive -Path "staging/${archiveName}" -DestinationPath "staging/${archiveName}.zip"
+          echo "ARCHIVE=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: staging/${{ env.ARCHIVE }}
+          retention-days: 1
+
+  # ==========================================================================
+  # Build full - Compile with embedded frontend (all-in-one binary)
+  # ==========================================================================
+  build-full:
+    name: Build full ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    needs: [build-frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            os: macos
+            arch: arm64
+            use_cross: false
+
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            os: macos
+            arch: x86_64
+            use_cross: false
+
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            use_cross: true
+
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: arm64
+            use_cross: true
+
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: x86_64
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.target }}"
+
+      - name: Install cross-rs
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with embedded frontend (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --features embedded-frontend --target ${{ matrix.target }}
+
+      - name: Build with embedded frontend (cross)
+        if: matrix.use_cross
+        run: cross build --release --features embedded-frontend --target ${{ matrix.target }}
+
+      # --- Package the binary ---
+
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-full-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "staging/${ARCHIVE_NAME}"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "staging/${ARCHIVE_NAME}/"
+          if [ -d "queries" ]; then
+            cp -r queries "staging/${ARCHIVE_NAME}/"
+          fi
+          cd staging
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "ARCHIVE=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "${env:BINARY_NAME}-full-${version}-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path "staging/${archiveName}"
+          Copy-Item "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" "staging/${archiveName}/"
+          if (Test-Path "queries") {
+            Copy-Item -Recurse "queries" "staging/${archiveName}/"
+          }
+          Compress-Archive -Path "staging/${archiveName}" -DestinationPath "staging/${archiveName}.zip"
+          echo "ARCHIVE=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: staging/${{ env.ARCHIVE }}
+          retention-days: 1
+
+  # ==========================================================================
+  # Package Debian - Build .deb packages for Linux targets
+  # ==========================================================================
+  package-deb:
+    name: Package .deb (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            artifact_os: linux
+            artifact_arch: x86_64
+
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            artifact_os: linux
+            artifact_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}.tar.gz
+          path: artifact/
+
+      - name: Extract binary to target dir
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
+          mkdir -p "target/release"
+          cp "artifact/${ARCHIVE_NAME}/${BINARY_NAME}" "target/release/${BINARY_NAME}"
+          # cargo-deb also needs orch and mcp_server — rebuild them or copy from archive
+          # For now, copy the main binary and let cargo-deb handle what's available
+          cp "target/release/${BINARY_NAME}" "target/release/orch" || true
+          cp "target/release/${BINARY_NAME}" "target/release/mcp_server" || true
+          chmod +x target/release/*
+
+      - name: Build .deb package
+        run: cargo deb --no-build --target ${{ matrix.target }}
+
+      - name: Find and upload .deb
+        run: |
+          DEB_FILE=$(find target/ -name "*.deb" | head -1)
+          DEB_NAME=$(basename "$DEB_FILE")
+          cp "$DEB_FILE" "$DEB_NAME"
+          echo "DEB_NAME=${DEB_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEB_NAME }}
+          path: ${{ env.DEB_NAME }}
+          retention-days: 1
+
+  # ==========================================================================
+  # Package RPM - Build .rpm packages for Linux targets
+  # ==========================================================================
+  package-rpm:
+    name: Package .rpm (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            artifact_os: linux
+            artifact_arch: x86_64
+
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            artifact_os: linux
+            artifact_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}.tar.gz
+          path: artifact/
+
+      - name: Extract binary to target dir
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
+          mkdir -p "target/release"
+          cp "artifact/${ARCHIVE_NAME}/${BINARY_NAME}" "target/release/${BINARY_NAME}"
+          cp "target/release/${BINARY_NAME}" "target/release/orch" || true
+          cp "target/release/${BINARY_NAME}" "target/release/mcp_server" || true
+          chmod +x target/release/*
+
+      - name: Build .rpm package
+        run: cargo generate-rpm --target ${{ matrix.target }}
+
+      - name: Find and upload .rpm
+        run: |
+          RPM_FILE=$(find target/ -name "*.rpm" | head -1)
+          RPM_NAME=$(basename "$RPM_FILE")
+          cp "$RPM_FILE" "$RPM_NAME"
+          echo "RPM_NAME=${RPM_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RPM_NAME }}
+          path: ${{ env.RPM_NAME }}
+          retention-days: 1
+
+  # ==========================================================================
+  # Build Tauri Desktop - Compile signed desktop bundles for all platforms
+  # ==========================================================================
+  build-tauri:
+    name: Tauri ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    needs: [build-frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            tauri_target: aarch64-apple-darwin
+
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            tauri_target: x86_64-apple-darwin
+
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            tauri_target: x86_64-unknown-linux-gnu
+
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            tauri_target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: desktop/dist/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "tauri-${{ matrix.target }}"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
+      # --- macOS Code Signing: import certificate into temp keychain ---
+      - name: Import Apple Developer certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          # Verify
+          security find-identity -v "$KEYCHAIN_PATH"
+
+      - name: Build Tauri bundle
+        working-directory: desktop/src-tauri
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS signing (Tauri reads APPLE_SIGNING_IDENTITY automatically)
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Windows signing
+          TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: cargo tauri build --target ${{ matrix.tauri_target }}
+
+      # --- macOS Notarization: submit to Apple and staple ---
+      - name: Notarize macOS .dmg
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG_PATH=$(find desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
+          if [ -n "$DMG_PATH" ]; then
+            echo "Notarizing $DMG_PATH..."
+            xcrun notarytool submit "$DMG_PATH" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+
+            echo "Stapling notarization ticket..."
+            xcrun stapler staple "$DMG_PATH"
+
+            echo "Verifying..."
+            spctl --assess --type open --context context:primary-signature -v "$DMG_PATH" || true
+          fi
+
+      # --- macOS Cleanup: remove temp keychain ---
+      - name: Cleanup macOS keychain
+        if: runner.os == 'macOS' && always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+
+      - name: Upload Tauri artifacts (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-${{ matrix.target }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+          retention-days: 1
+
+      - name: Upload Tauri artifacts (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-${{ matrix.target }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.tar.gz
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.tar.gz.sig
+          retention-days: 1
+
+      - name: Upload Tauri artifacts (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-${{ matrix.target }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip.sig
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi.zip
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi.zip.sig
+          retention-days: 1
+
+  # ==========================================================================
+  # Release - Collect all artifacts and publish GitHub Release
+  # ==========================================================================
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [build, build-full, build-tauri, package-deb, package-rpm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect release files
+        run: |
+          mkdir -p release-files
+          find artifacts/ -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.exe" -o -name "*.msi" -o -name "*.sig" \) -exec cp {} release-files/ \;
+          echo "=== Release artifacts ==="
+          ls -la release-files/
+
+      - name: Generate checksums
+        working-directory: release-files
+        run: |
+          sha256sum * > checksums-sha256.txt
+          echo "=== Checksums ==="
+          cat checksums-sha256.txt
+
+      - name: Generate Tauri updater latest.json
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          REPO="${{ github.repository }}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${GITHUB_REF_NAME}"
+          NOTES=$(cat <<'EOFNOTES'
+          See release notes at https://github.com/${REPO}/releases/tag/${GITHUB_REF_NAME}
+          EOFNOTES
+          )
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Read signatures from .sig files
+          DARWIN_AARCH64_SIG=""
+          DARWIN_X86_64_SIG=""
+          LINUX_X86_64_SIG=""
+          WINDOWS_X86_64_SIG=""
+
+          # macOS signatures (.app.tar.gz.sig)
+          for f in release-files/*aarch64-apple-darwin*.app.tar.gz.sig release-files/*aarch64*.app.tar.gz.sig; do
+            [ -f "$f" ] && DARWIN_AARCH64_SIG=$(cat "$f") && break
+          done
+          for f in release-files/*x86_64-apple-darwin*.app.tar.gz.sig release-files/*x86_64*.app.tar.gz.sig; do
+            [ -f "$f" ] && DARWIN_X86_64_SIG=$(cat "$f") && break
+          done
+          # Linux signatures (.AppImage.tar.gz.sig)
+          for f in release-files/*x86_64*linux*.AppImage.tar.gz.sig; do
+            [ -f "$f" ] && LINUX_X86_64_SIG=$(cat "$f") && break
+          done
+          # Windows signatures (.nsis.zip.sig)
+          for f in release-files/*x86_64*windows*.nsis.zip.sig; do
+            [ -f "$f" ] && WINDOWS_X86_64_SIG=$(cat "$f") && break
+          done
+
+          # Find the actual artifact filenames for URLs
+          DARWIN_AARCH64_URL=""
+          DARWIN_X86_64_URL=""
+          LINUX_X86_64_URL=""
+          WINDOWS_X86_64_URL=""
+
+          for f in release-files/*aarch64-apple-darwin*.app.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && DARWIN_AARCH64_URL="${BASE_URL}/$(basename "$f")" && break
+          done
+          for f in release-files/*x86_64-apple-darwin*.app.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && DARWIN_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
+          done
+          for f in release-files/*x86_64*linux*.AppImage.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && LINUX_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
+          done
+          for f in release-files/*x86_64*windows*.nsis.zip; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && WINDOWS_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
+          done
+
+          # Build JSON using jq
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "See full release notes on GitHub" \
+            --arg pub_date "$PUB_DATE" \
+            --arg darwin_aarch64_url "$DARWIN_AARCH64_URL" \
+            --arg darwin_aarch64_sig "$DARWIN_AARCH64_SIG" \
+            --arg darwin_x86_64_url "$DARWIN_X86_64_URL" \
+            --arg darwin_x86_64_sig "$DARWIN_X86_64_SIG" \
+            --arg linux_x86_64_url "$LINUX_X86_64_URL" \
+            --arg linux_x86_64_sig "$LINUX_X86_64_SIG" \
+            --arg windows_x86_64_url "$WINDOWS_X86_64_URL" \
+            --arg windows_x86_64_sig "$WINDOWS_X86_64_SIG" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": { url: $darwin_aarch64_url, signature: $darwin_aarch64_sig },
+                "darwin-x86_64": { url: $darwin_x86_64_url, signature: $darwin_x86_64_sig },
+                "linux-x86_64": { url: $linux_x86_64_url, signature: $linux_x86_64_sig },
+                "windows-x86_64": { url: $windows_x86_64_url, signature: $windows_x86_64_sig }
+              }
+            }' > release-files/latest.json
+
+          echo "=== Tauri updater latest.json ==="
+          cat release-files/latest.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # Docker - Build and push multi-arch images to ghcr.io
+  # ==========================================================================
+  docker-publish:
+    name: Docker (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    needs: [build-frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: full
+            include_frontend: "true"
+            suffix: ""
+
+          - variant: api-only
+            include_frontend: "false"
+            suffix: "-api"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        if: matrix.include_frontend == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Create empty frontend dir
+        if: matrix.include_frontend == 'false'
+        run: mkdir -p frontend/dist
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU (for multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=${{ matrix.suffix }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ matrix.variant == 'full' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            FRONTEND_SRC=./frontend
+            INCLUDE_FRONTEND=${{ matrix.include_frontend }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ==========================================================================
+  # Update Homebrew tap - Push new formula after release is published
+  # ==========================================================================
+  update-homebrew:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
+    needs: [release]
+    if: "!contains(github.ref, '-')"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download checksums
+        run: |
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/checksums-sha256.txt" \
+            -o checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Extract SHA256 values
+        id: sha
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "macos_arm64=$(grep "orchestrator-full-${VERSION}-macos-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=$(grep "orchestrator-full-${VERSION}-macos-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(grep "orchestrator-full-${VERSION}-linux-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=$(grep "orchestrator-full-${VERSION}-linux-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Generate updated formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -e "s/VERSION_PLACEHOLDER/${VERSION}/g" \
+              -e "s/SHA256_MACOS_ARM64_PLACEHOLDER/${{ steps.sha.outputs.macos_arm64 }}/g" \
+              -e "s/SHA256_MACOS_X86_64_PLACEHOLDER/${{ steps.sha.outputs.macos_x86_64 }}/g" \
+              -e "s/SHA256_LINUX_ARM64_PLACEHOLDER/${{ steps.sha.outputs.linux_arm64 }}/g" \
+              -e "s/SHA256_LINUX_X86_64_PLACEHOLDER/${{ steps.sha.outputs.linux_x86_64 }}/g" \
+              packaging/homebrew/project-orchestrator.rb > formula.rb
+          cat formula.rb
+
+      - name: Push to Homebrew tap
+        uses: dmnemec/copy_file_to_another_repo_action@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          source_file: formula.rb
+          destination_repo: this-rs/homebrew-tap
+          destination_folder: Formula
+          destination_branch_create: main
+          destination_file: project-orchestrator.rb
+          user_email: "ci@openclaw.ai"
+          user_name: "OpenClaw CI"
+          commit_message: "Update project-orchestrator to v${{ steps.version.outputs.version }}"

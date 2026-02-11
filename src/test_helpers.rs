@@ -24,14 +24,18 @@ pub fn mock_app_state() -> AppState {
         meili: Arc::new(MockSearchStore::new()),
         parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
         config: Arc::new(crate::Config {
+            setup_completed: true,
             neo4j_uri: "bolt://mock:7687".to_string(),
             neo4j_user: "neo4j".to_string(),
             neo4j_password: "mock".to_string(),
             meilisearch_url: "http://mock:7700".to_string(),
             meilisearch_key: "mock-key".to_string(),
+            nats_url: None,
             workspace_path: ".".to_string(),
             server_port: 0,
             auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
         }),
     }
 }
@@ -43,14 +47,18 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
         meili: Arc::new(search),
         parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
         config: Arc::new(crate::Config {
+            setup_completed: true,
             neo4j_uri: "bolt://mock:7687".to_string(),
             neo4j_user: "neo4j".to_string(),
             neo4j_password: "mock".to_string(),
             meilisearch_url: "http://mock:7700".to_string(),
             meilisearch_key: "mock-key".to_string(),
+            nats_url: None,
             workspace_path: ".".to_string(),
             server_port: 0,
             auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
         }),
     }
 }
@@ -65,6 +73,7 @@ pub fn test_auth_config() -> AuthConfig {
         jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
         jwt_expiry_secs: 28800,
         allowed_email_domain: None,
+        allowed_emails: None,
         frontend_url: None,
         allow_registration: false,
         root_account: None,

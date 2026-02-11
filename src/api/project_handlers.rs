@@ -10,6 +10,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::expand_tilde;
+
 use super::handlers::{AppError, OrchestratorState};
 
 // ============================================================================
@@ -137,7 +139,7 @@ pub async fn create_project(
         id: Uuid::new_v4(),
         name: req.name,
         slug: slug.clone(),
-        root_path: req.root_path,
+        root_path: expand_tilde(&req.root_path),
         description: req.description,
         created_at: chrono::Utc::now(),
         last_synced: None,
@@ -252,6 +254,8 @@ pub async fn delete_project(
 pub struct SyncProjectResponse {
     pub files_synced: usize,
     pub files_skipped: usize,
+    pub files_deleted: usize,
+    pub symbols_deleted: usize,
     pub errors: usize,
 }
 
@@ -266,7 +270,8 @@ pub async fn sync_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    let path = std::path::Path::new(&project.root_path);
+    let expanded = expand_tilde(&project.root_path);
+    let path = std::path::Path::new(&expanded);
     let result = state
         .orchestrator
         .sync_directory_for_project(path, Some(project.id), Some(&project.slug))
@@ -282,6 +287,8 @@ pub async fn sync_project(
     Ok(Json(SyncProjectResponse {
         files_synced: result.files_synced,
         files_skipped: result.files_skipped,
+        files_deleted: result.files_deleted,
+        symbols_deleted: result.symbols_deleted,
         errors: result.errors,
     }))
 }

@@ -88,24 +88,29 @@ pub async fn list_messages(
             }
         })?;
 
-    // Messages are already sorted by created_at:asc from Meilisearch (see manager)
-    let messages: Vec<serde_json::Value> = loaded
-        .messages
+    // Events are sorted by seq ASC from Neo4j. Each event's `data` field is
+    // the JSON-serialized ChatEvent (includes type tag, tool_use, tool_result, etc.)
+    let events: Vec<serde_json::Value> = loaded
+        .events
         .iter()
-        .map(|m| {
-            serde_json::json!({
-                "id": m.id,
-                "conversation_id": m.conversation_id,
-                "role": m.role,
-                "content": m.content,
-                "turn_index": m.turn_index,
-                "created_at": m.created_at,
-            })
+        .map(|e| {
+            // Parse the data field back to a JSON object to return structured events
+            let mut obj = serde_json::from_str::<serde_json::Value>(&e.data)
+                .unwrap_or_else(|_| serde_json::json!({ "type": e.event_type, "raw": e.data }));
+            // Inject metadata
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("seq".to_string(), serde_json::json!(e.seq));
+                map.insert(
+                    "created_at".to_string(),
+                    serde_json::json!(e.created_at.to_rfc3339()),
+                );
+            }
+            obj
         })
         .collect();
 
     Ok(Json(serde_json::json!({
-        "messages": messages,
+        "events": events,
         "total_count": loaded.total_count,
         "has_more": loaded.has_more,
         "offset": loaded.offset,
@@ -366,8 +371,14 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::EventBus::default()),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
             auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
         })
     }
 
@@ -393,8 +404,14 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::EventBus::default()),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
             auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
         });
         create_router(state)
     }

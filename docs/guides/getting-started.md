@@ -59,6 +59,18 @@ cargo build --release --bin mcp_server
 
 The binary is at `./target/release/mcp_server`.
 
+**Alternative:** Install the pre-built binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.sh | sh
+```
+
+Then auto-configure Claude Code:
+
+```bash
+orchestrator setup-claude
+```
+
 ---
 
 ## Step 2: Configure Your AI Tool
