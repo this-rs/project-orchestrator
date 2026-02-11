@@ -1434,11 +1434,30 @@ impl GraphStore for MockGraphStore {
         &self,
         function_name: &str,
         _depth: u32,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<String>> {
         let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
         let mut callers = Vec::new();
         for (caller, callees) in cr.iter() {
             if callees.contains(&function_name.to_string()) {
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
                 callers.push(caller.clone());
             }
         }
@@ -1449,15 +1468,35 @@ impl GraphStore for MockGraphStore {
         &self,
         function_name: &str,
         _depth: u32,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<String>> {
         let cr = self.call_relationships.read().await;
-        // Find the caller ID that matches the function name
+        let functions = self.functions.read().await;
+
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        let mut callees_result = Vec::new();
         for (caller_id, callees) in cr.iter() {
             if caller_id.ends_with(&format!("::{}", function_name)) {
-                return Ok(callees.clone());
+                // If scoped, check that the caller belongs to the project
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller_id) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                callees_result.extend(callees.clone());
             }
         }
-        Ok(vec![])
+        Ok(callees_result)
     }
 
     async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>> {

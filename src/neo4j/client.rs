@@ -3062,21 +3062,36 @@ impl Neo4jClient {
         Ok(imports)
     }
 
-    /// Get callers chain for a function name (by name, variable depth)
+    /// Get callers chain for a function name (by name, variable depth).
+    /// When project_id is provided, scopes the start function and callers to the same project.
     pub async fn get_function_callers_by_name(
         &self,
         function_name: &str,
         depth: u32,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<String>> {
-        let q = query(&format!(
-            r#"
-            MATCH (f:Function {{name: $name}})
-            MATCH (caller:Function)-[:CALLS*1..{}]->(f)
-            RETURN DISTINCT caller.name AS name, caller.file_path AS file
-            "#,
-            depth
-        ))
-        .param("name", function_name);
+        let q = match project_id {
+            Some(pid) => query(&format!(
+                r#"
+                MATCH (f:Function {{name: $name}})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {{id: $project_id}})
+                MATCH (caller:Function)-[:CALLS*1..{}]->(f)
+                WHERE EXISTS {{ MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }}
+                RETURN DISTINCT caller.name AS name, caller.file_path AS file
+                "#,
+                depth
+            ))
+            .param("name", function_name)
+            .param("project_id", pid.to_string()),
+            None => query(&format!(
+                r#"
+                MATCH (f:Function {{name: $name}})
+                MATCH (caller:Function)-[:CALLS*1..{}]->(f)
+                RETURN DISTINCT caller.name AS name, caller.file_path AS file
+                "#,
+                depth
+            ))
+            .param("name", function_name),
+        };
 
         let mut result = self.graph.execute(q).await?;
         let mut callers = Vec::new();
@@ -3090,21 +3105,36 @@ impl Neo4jClient {
         Ok(callers)
     }
 
-    /// Get callees chain for a function name (by name, variable depth)
+    /// Get callees chain for a function name (by name, variable depth).
+    /// When project_id is provided, scopes the start function and callees to the same project.
     pub async fn get_function_callees_by_name(
         &self,
         function_name: &str,
         depth: u32,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<String>> {
-        let q = query(&format!(
-            r#"
-            MATCH (f:Function {{name: $name}})
-            MATCH (f)-[:CALLS*1..{}]->(callee:Function)
-            RETURN DISTINCT callee.name AS name, callee.file_path AS file
-            "#,
-            depth
-        ))
-        .param("name", function_name);
+        let q = match project_id {
+            Some(pid) => query(&format!(
+                r#"
+                MATCH (f:Function {{name: $name}})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {{id: $project_id}})
+                MATCH (f)-[:CALLS*1..{}]->(callee:Function)
+                WHERE EXISTS {{ MATCH (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }}
+                RETURN DISTINCT callee.name AS name, callee.file_path AS file
+                "#,
+                depth
+            ))
+            .param("name", function_name)
+            .param("project_id", pid.to_string()),
+            None => query(&format!(
+                r#"
+                MATCH (f:Function {{name: $name}})
+                MATCH (f)-[:CALLS*1..{}]->(callee:Function)
+                RETURN DISTINCT callee.name AS name, callee.file_path AS file
+                "#,
+                depth
+            ))
+            .param("name", function_name),
+        };
 
         let mut result = self.graph.execute(q).await?;
         let mut callees = Vec::new();

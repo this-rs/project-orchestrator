@@ -1677,11 +1677,11 @@ impl ToolHandler {
 
         let callers = self
             .neo4j()
-            .get_function_callers_by_name(function, depth)
+            .get_function_callers_by_name(function, depth, None)
             .await?;
         let callees = self
             .neo4j()
-            .get_function_callees_by_name(function, depth)
+            .get_function_callees_by_name(function, depth, None)
             .await?;
 
         Ok(json!({

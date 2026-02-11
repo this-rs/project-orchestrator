@@ -515,8 +515,9 @@ impl GraphStore for Neo4jClient {
         &self,
         function_name: &str,
         depth: u32,
+        project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<String>> {
-        self.get_function_callers_by_name(function_name, depth)
+        self.get_function_callers_by_name(function_name, depth, project_id)
             .await
     }
 
@@ -524,8 +525,9 @@ impl GraphStore for Neo4jClient {
         &self,
         function_name: &str,
         depth: u32,
+        project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<String>> {
-        self.get_function_callees_by_name(function_name, depth)
+        self.get_function_callees_by_name(function_name, depth, project_id)
             .await
     }
 

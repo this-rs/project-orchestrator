@@ -387,18 +387,22 @@ pub trait GraphStore: Send + Sync {
     /// Get files directly imported by a file
     async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>>;
 
-    /// Get callers chain for a function name (by name, variable depth)
+    /// Get callers chain for a function name (by name, variable depth).
+    /// When project_id is provided, scopes start/end to the same project.
     async fn get_function_callers_by_name(
         &self,
         function_name: &str,
         depth: u32,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<String>>;
 
-    /// Get callees chain for a function name (by name, variable depth)
+    /// Get callees chain for a function name (by name, variable depth).
+    /// When project_id is provided, scopes start/end to the same project.
     async fn get_function_callees_by_name(
         &self,
         function_name: &str,
         depth: u32,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<String>>;
 
     /// Get language statistics across all files

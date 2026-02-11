@@ -299,7 +299,7 @@ pub async fn get_call_graph(
         callers = state
             .orchestrator
             .neo4j()
-            .get_function_callers_by_name(&query.function, depth)
+            .get_function_callers_by_name(&query.function, depth, None)
             .await?;
     }
 
@@ -307,7 +307,7 @@ pub async fn get_call_graph(
         callees = state
             .orchestrator
             .neo4j()
-            .get_function_callees_by_name(&query.function, depth)
+            .get_function_callees_by_name(&query.function, depth, None)
             .await?;
     }
 
