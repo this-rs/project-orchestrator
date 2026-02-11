@@ -76,23 +76,29 @@ fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
 fn build_cors(state: &OrchestratorState) -> CorsLayer {
     let cors = CorsLayer::new().allow_methods(Any).allow_headers(Any);
 
+    // Build allowed origins from ServerState (localhost:{port}, tauri://localhost, public_url)
+    let mut origin_strings = state.allowed_origins();
+
+    // Also include frontend_url from auth config if set (backward compat)
     if let Some(ref auth_config) = state.auth_config {
         if let Some(ref frontend_url) = auth_config.frontend_url {
-            let mut origins: Vec<axum::http::HeaderValue> = Vec::new();
-            if let Ok(origin) = frontend_url.parse::<axum::http::HeaderValue>() {
-                origins.push(origin);
-            }
-            // Always allow Tauri desktop app origin
-            if let Ok(tauri_origin) = "tauri://localhost".parse::<axum::http::HeaderValue>() {
-                origins.push(tauri_origin);
-            }
-            if !origins.is_empty() {
-                return cors.allow_origin(origins);
+            let trimmed = frontend_url.trim_end_matches('/').to_string();
+            if !origin_strings.contains(&trimmed) {
+                origin_strings.push(trimmed);
             }
         }
     }
 
-    cors.allow_origin(Any)
+    let origins: Vec<axum::http::HeaderValue> = origin_strings
+        .iter()
+        .filter_map(|s| s.parse::<axum::http::HeaderValue>().ok())
+        .collect();
+
+    if origins.is_empty() {
+        cors.allow_origin(Any)
+    } else {
+        cors.allow_origin(origins)
+    }
 }
 
 // ============================================================================
@@ -609,6 +615,8 @@ mod tests {
             serve_frontend: true,
             frontend_path: dir.to_str().unwrap().to_string(),
             setup_completed: true,
+            server_port: 6600,
+            public_url: None,
         });
         create_router(state)
     }
@@ -630,6 +638,8 @@ mod tests {
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
+            server_port: 6600,
+            public_url: None,
         });
         create_router(state)
     }

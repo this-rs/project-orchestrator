@@ -379,6 +379,8 @@ mod tests {
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
+            server_port: 6600,
+            public_url: None,
         })
     }
 
@@ -412,6 +414,8 @@ mod tests {
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
+            server_port: 6600,
+            public_url: None,
         });
         create_router(state)
     }

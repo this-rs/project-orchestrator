@@ -13,7 +13,10 @@ use crate::auth::google::GoogleOAuthClient;
 use crate::auth::jwt::encode_jwt;
 use crate::auth::oidc::OidcClient;
 use crate::neo4j::models::UserNode;
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Query as AxumQuery, State},
+    Json,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -43,16 +46,30 @@ pub struct AuthUrlResponse {
     pub auth_url: String,
 }
 
+/// Query parameters for GET /auth/google and GET /auth/oidc
+///
+/// The `origin` param allows the frontend to send its current `window.location.origin`
+/// so the backend can build the correct `redirect_uri` for dual-access setups
+/// (desktop via localhost + web via public domain).
+#[derive(Debug, Deserialize)]
+pub struct OAuthLoginQuery {
+    pub origin: Option<String>,
+}
+
 /// Request body for POST /auth/google/callback
 #[derive(Deserialize)]
 pub struct GoogleCallbackRequest {
     pub code: String,
+    /// The origin used when initiating the OAuth flow (must match for token exchange).
+    pub origin: Option<String>,
 }
 
 /// Request body for POST /auth/oidc/callback
 #[derive(Deserialize)]
 pub struct OidcCallbackRequest {
     pub code: String,
+    /// The origin used when initiating the OAuth flow (must match for token exchange).
+    pub origin: Option<String>,
 }
 
 /// Response for POST /auth/google/callback
@@ -351,9 +368,13 @@ fn validate_registration(
 
 /// GET /auth/google — Returns the Google OAuth authorization URL.
 ///
-/// The frontend redirects the user to this URL to start the OAuth flow.
+/// Accepts an optional `?origin=` query parameter. When provided, the origin is
+/// validated against the allowed origins whitelist and used to build a dynamic
+/// `redirect_uri` (e.g. `https://ffs.dev/auth/callback` for web access).
+/// When omitted, falls back to the static `redirect_uri` from config.
 pub async fn google_login(
     State(state): State<OrchestratorState>,
+    AxumQuery(query): AxumQuery<OAuthLoginQuery>,
 ) -> Result<Json<AuthUrlResponse>, AppError> {
     let auth_config = state
         .auth_config
@@ -361,14 +382,21 @@ pub async fn google_login(
         .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
 
     let client = GoogleOAuthClient::new(auth_config);
-    let auth_url = client.auth_url();
+
+    let auth_url = match state.validate_origin(query.origin.as_deref())? {
+        Some(origin) => {
+            let redirect_uri = format!("{}/auth/callback", origin);
+            client.auth_url_with_redirect(&redirect_uri)
+        }
+        None => client.auth_url(),
+    };
 
     Ok(Json(AuthUrlResponse { auth_url }))
 }
 
 /// POST /auth/google/callback — Exchange authorization code for JWT + user.
 ///
-/// 1. Exchanges the Google auth code for user info
+/// 1. Exchanges the Google auth code for user info (using dynamic redirect_uri if origin provided)
 /// 2. Upserts the user in Neo4j (creates on first login, updates on subsequent)
 /// 3. Returns a JWT token + user info
 pub async fn google_callback(
@@ -380,12 +408,18 @@ pub async fn google_callback(
         .as_ref()
         .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
 
-    // 1. Exchange code for Google user info
+    // 1. Exchange code for Google user info (redirect_uri must match the one used in auth URL)
     let client = GoogleOAuthClient::new(auth_config);
-    let google_user = client
-        .exchange_code(&req.code)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("OAuth code exchange failed: {}", e)))?;
+    let google_user = match state.validate_origin(req.origin.as_deref())? {
+        Some(origin) => {
+            let redirect_uri = format!("{}/auth/callback", origin);
+            client
+                .exchange_code_with_redirect(&req.code, &redirect_uri)
+                .await
+        }
+        None => client.exchange_code(&req.code).await,
+    }
+    .map_err(|e| AppError::BadRequest(format!("OAuth code exchange failed: {}", e)))?;
 
     // 2. Check email restrictions (domain + individual whitelist)
     if !auth_config.is_email_allowed(&google_user.email) {
@@ -430,8 +464,12 @@ pub async fn google_callback(
 ///
 /// Uses the generic OIDC client built from `effective_oidc()` config
 /// or legacy Google fields. The frontend redirects the user to this URL.
+///
+/// Accepts an optional `?origin=` query parameter for dynamic redirect_uri
+/// construction (see `google_login` for details).
 pub async fn oidc_login(
     State(state): State<OrchestratorState>,
+    AxumQuery(query): AxumQuery<OAuthLoginQuery>,
 ) -> Result<Json<AuthUrlResponse>, AppError> {
     let auth_config = state
         .auth_config
@@ -446,14 +484,20 @@ pub async fn oidc_login(
 
     let client = OidcClient::from_auth_config_sync(auth_config).map_err(AppError::Internal)?;
 
-    Ok(Json(AuthUrlResponse {
-        auth_url: client.auth_url(),
-    }))
+    let auth_url = match state.validate_origin(query.origin.as_deref())? {
+        Some(origin) => {
+            let redirect_uri = format!("{}/auth/callback", origin);
+            client.auth_url_with_redirect(&redirect_uri)
+        }
+        None => client.auth_url(),
+    };
+
+    Ok(Json(AuthUrlResponse { auth_url }))
 }
 
 /// POST /auth/oidc/callback — Exchange OIDC authorization code for JWT + user.
 ///
-/// 1. Exchanges the auth code via the generic OIDC client
+/// 1. Exchanges the auth code via the generic OIDC client (using dynamic redirect_uri if origin provided)
 /// 2. Upserts the user in Neo4j with auth_provider="oidc" + external_id=sub
 /// 3. Returns a JWT token + user info
 pub async fn oidc_callback(
@@ -471,13 +515,19 @@ pub async fn oidc_callback(
         ));
     }
 
-    // 1. Build OIDC client and exchange code
+    // 1. Build OIDC client and exchange code (redirect_uri must match the one used in auth URL)
     let client = OidcClient::from_auth_config_sync(auth_config).map_err(AppError::Internal)?;
 
-    let oidc_user = client
-        .exchange_code(&req.code)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("OIDC code exchange failed: {}", e)))?;
+    let oidc_user = match state.validate_origin(req.origin.as_deref())? {
+        Some(origin) => {
+            let redirect_uri = format!("{}/auth/callback", origin);
+            client
+                .exchange_code_with_redirect(&req.code, &redirect_uri)
+                .await
+        }
+        None => client.exchange_code(&req.code).await,
+    }
+    .map_err(|e| AppError::BadRequest(format!("OIDC code exchange failed: {}", e)))?;
 
     // 2. Check email restrictions (domain + individual whitelist)
     if !auth_config.is_email_allowed(&oidc_user.email) {
@@ -648,6 +698,8 @@ mod tests {
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
+            server_port: 6600,
+            public_url: None,
         })
     }
 

@@ -36,6 +36,7 @@ pub fn mock_app_state() -> AppState {
             auth_config: None,
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
+            public_url: None,
         }),
     }
 }
@@ -59,6 +60,7 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             auth_config: None,
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
+            public_url: None,
         }),
     }
 }

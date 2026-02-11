@@ -41,10 +41,65 @@ pub struct ServerState {
     pub serve_frontend: bool,
     /// Path to the frontend dist/ directory
     pub frontend_path: String,
+    /// Server port (used for building the localhost origin in OAuth whitelist)
+    pub server_port: u16,
+    /// Public URL for reverse-proxy setups (e.g. https://ffs.dev).
+    /// Used for CORS and OAuth origin whitelist when both desktop + web access is needed.
+    pub public_url: Option<String>,
 }
 
 /// Shared orchestrator state
 pub type OrchestratorState = Arc<ServerState>;
+
+impl ServerState {
+    /// Build the list of allowed origins for OAuth redirect_uri validation.
+    ///
+    /// Always includes:
+    /// - `http://localhost:{server_port}` (desktop / Tauri app)
+    /// - `tauri://localhost` (Tauri webview custom scheme)
+    ///
+    /// Optionally includes:
+    /// - `public_url` from config (reverse-proxy web access, e.g. `https://ffs.dev`)
+    pub fn allowed_origins(&self) -> Vec<String> {
+        let mut origins = vec![
+            format!("http://localhost:{}", self.server_port),
+            "tauri://localhost".to_string(),
+        ];
+        if let Some(ref url) = self.public_url {
+            // Strip trailing slash for consistent comparison
+            let trimmed = url.trim_end_matches('/').to_string();
+            if !origins.contains(&trimmed) {
+                origins.push(trimmed);
+            }
+        }
+        origins
+    }
+
+    /// Validate an `origin` parameter for OAuth redirect_uri construction.
+    ///
+    /// - If `origin` is `Some`, check it against [`allowed_origins`]. Returns the
+    ///   validated origin on success, or `AppError::BadRequest` if unknown.
+    /// - If `origin` is `None`, return `None` — the caller should fall back to the
+    ///   static `redirect_uri` from config for backward compatibility.
+    pub fn validate_origin(&self, origin: Option<&str>) -> Result<Option<String>, AppError> {
+        match origin {
+            None => Ok(None),
+            Some(raw) => {
+                let trimmed = raw.trim_end_matches('/');
+                let allowed = self.allowed_origins();
+                if allowed.iter().any(|a| a == trimmed) {
+                    Ok(Some(trimmed.to_string()))
+                } else {
+                    Err(AppError::BadRequest(format!(
+                        "Unknown origin: {}. Allowed: {}",
+                        trimmed,
+                        allowed.join(", ")
+                    )))
+                }
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Health check
@@ -1841,5 +1896,123 @@ mod tests {
             .filter(|s| !s.is_empty())
             .map(uuid::Uuid::parse_str);
         assert!(parsed.is_none());
+    }
+
+    // ================================================================
+    // Origin validation tests
+    // ================================================================
+
+    /// Build a minimal ServerState-like struct for origin validation tests.
+    /// We only need server_port and public_url for these tests.
+    fn make_test_server_state(server_port: u16, public_url: Option<&str>) -> ServerState {
+        // We need a real Orchestrator, so use mock_app_state
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = crate::test_helpers::mock_app_state();
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        let orchestrator = rt.block_on(async {
+            Arc::new(
+                crate::orchestrator::Orchestrator::with_event_bus(state, event_bus.clone())
+                    .await
+                    .unwrap(),
+            )
+        });
+        let watcher = crate::orchestrator::FileWatcher::new(orchestrator.clone());
+        ServerState {
+            orchestrator,
+            watcher: Arc::new(tokio::sync::RwLock::new(watcher)),
+            chat_manager: None,
+            event_bus,
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port,
+            public_url: public_url.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_allowed_origins_without_public_url() {
+        let state = make_test_server_state(6600, None);
+        let origins = state.allowed_origins();
+        assert_eq!(origins, vec!["http://localhost:6600", "tauri://localhost"]);
+    }
+
+    #[test]
+    fn test_allowed_origins_with_public_url() {
+        let state = make_test_server_state(6600, Some("https://ffs.dev"));
+        let origins = state.allowed_origins();
+        assert_eq!(
+            origins,
+            vec![
+                "http://localhost:6600",
+                "tauri://localhost",
+                "https://ffs.dev"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_allowed_origins_public_url_trailing_slash() {
+        let state = make_test_server_state(6600, Some("https://ffs.dev/"));
+        let origins = state.allowed_origins();
+        // Trailing slash should be stripped
+        assert!(origins.contains(&"https://ffs.dev".to_string()));
+    }
+
+    #[test]
+    fn test_validate_origin_valid_localhost() {
+        let state = make_test_server_state(6600, Some("https://ffs.dev"));
+        let result = state.validate_origin(Some("http://localhost:6600"));
+        assert_eq!(result.unwrap(), Some("http://localhost:6600".to_string()));
+    }
+
+    #[test]
+    fn test_validate_origin_valid_public_url() {
+        let state = make_test_server_state(6600, Some("https://ffs.dev"));
+        let result = state.validate_origin(Some("https://ffs.dev"));
+        assert_eq!(result.unwrap(), Some("https://ffs.dev".to_string()));
+    }
+
+    #[test]
+    fn test_validate_origin_valid_tauri() {
+        let state = make_test_server_state(6600, None);
+        let result = state.validate_origin(Some("tauri://localhost"));
+        assert_eq!(result.unwrap(), Some("tauri://localhost".to_string()));
+    }
+
+    #[test]
+    fn test_validate_origin_invalid_returns_error() {
+        let state = make_test_server_state(6600, Some("https://ffs.dev"));
+        let result = state.validate_origin(Some("https://evil.com"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("Unknown origin"));
+                assert!(msg.contains("evil.com"));
+            }
+            _ => panic!("Expected BadRequest, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_validate_origin_none_returns_none() {
+        let state = make_test_server_state(6600, Some("https://ffs.dev"));
+        let result = state.validate_origin(None);
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_validate_origin_strips_trailing_slash() {
+        let state = make_test_server_state(6600, Some("https://ffs.dev"));
+        let result = state.validate_origin(Some("https://ffs.dev/"));
+        assert_eq!(result.unwrap(), Some("https://ffs.dev".to_string()));
     }
 }

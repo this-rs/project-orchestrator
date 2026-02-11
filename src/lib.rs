@@ -395,6 +395,9 @@ pub struct Config {
     pub serve_frontend: bool,
     /// Path to the frontend dist/ directory (default: "./dist")
     pub frontend_path: String,
+    /// Public URL for reverse-proxy setups (e.g. https://ffs.dev).
+    /// Used for CORS and OAuth origin whitelist.
+    pub public_url: Option<String>,
 }
 
 impl Config {
@@ -434,6 +437,7 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(yaml.server.serve_frontend),
             frontend_path: std::env::var("FRONTEND_PATH").unwrap_or(yaml.server.frontend_path),
+            public_url: std::env::var("PUBLIC_URL").ok().or(yaml.server.public_url),
         })
     }
 
@@ -672,6 +676,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         serve_frontend: config.serve_frontend,
         frontend_path: config.frontend_path.clone(),
         setup_completed: config.setup_completed,
+        server_port: config.server_port,
+        public_url: config.public_url.clone(),
     });
 
     // Create router

@@ -185,24 +185,42 @@ impl OidcClient {
         Self::from_legacy_google(auth_config)
     }
 
-    /// Generate the OIDC authorization URL.
-    ///
-    /// The user should be redirected to this URL to initiate the OAuth flow.
+    /// Generate the OIDC authorization URL using the configured redirect_uri.
     pub fn auth_url(&self) -> String {
+        self.auth_url_with_redirect(&self.redirect_uri)
+    }
+
+    /// Generate the OIDC authorization URL with a custom redirect_uri.
+    ///
+    /// Used for dynamic origin-based redirect URIs (e.g. desktop vs web access).
+    pub fn auth_url_with_redirect(&self, redirect_uri: &str) -> String {
         format!(
             "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
             self.auth_endpoint,
             urlencoding::encode(&self.client_id),
-            urlencoding::encode(&self.redirect_uri),
+            urlencoding::encode(redirect_uri),
             urlencoding::encode(&self.scopes),
         )
     }
 
-    /// Exchange an authorization code for user information.
+    /// Exchange an authorization code for user information using the configured redirect_uri.
+    pub async fn exchange_code(&self, code: &str) -> Result<OidcUserInfo> {
+        self.exchange_code_with_redirect(code, &self.redirect_uri)
+            .await
+    }
+
+    /// Exchange an authorization code for user information with a custom redirect_uri.
+    ///
+    /// The redirect_uri MUST match the one used in the authorization URL (OAuth providers
+    /// enforce strict matching between the auth step and the token exchange step).
     ///
     /// 1. POST to token endpoint to exchange code for access token
     /// 2. GET userinfo endpoint with access token to retrieve user details
-    pub async fn exchange_code(&self, code: &str) -> Result<OidcUserInfo> {
+    pub async fn exchange_code_with_redirect(
+        &self,
+        code: &str,
+        redirect_uri: &str,
+    ) -> Result<OidcUserInfo> {
         // Step 1: Exchange code for access token
         let token_response = self
             .http_client
@@ -211,7 +229,7 @@ impl OidcClient {
                 ("code", code),
                 ("client_id", &self.client_id),
                 ("client_secret", &self.client_secret),
-                ("redirect_uri", &self.redirect_uri),
+                ("redirect_uri", redirect_uri),
                 ("grant_type", "authorization_code"),
             ])
             .send()
@@ -393,6 +411,24 @@ mod tests {
         let user: OidcUserInfo = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(user.external_id, "1234567890");
         assert!(user.picture.is_none());
+    }
+
+    #[test]
+    fn test_oidc_auth_url_with_redirect() {
+        let config = test_auth_config();
+        let client = OidcClient::from_legacy_google(&config).unwrap();
+
+        let custom_redirect = "https://ffs.dev/auth/callback";
+        let url = client.auth_url_with_redirect(custom_redirect);
+
+        assert!(url.starts_with(GOOGLE_AUTH_URL));
+        assert!(url.contains(&format!(
+            "redirect_uri={}",
+            urlencoding::encode(custom_redirect)
+        )));
+        // Original auth_url() still uses the config redirect_uri
+        let default_url = client.auth_url();
+        assert!(default_url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fauth%2Fcallback"));
     }
 
     #[test]

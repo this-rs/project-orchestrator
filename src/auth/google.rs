@@ -60,26 +60,38 @@ impl GoogleOAuthClient {
         }
     }
 
-    /// Generate the Google OAuth authorization URL.
-    ///
-    /// The user should be redirected to this URL to initiate the OAuth flow.
-    /// After consent, Google redirects back to `redirect_uri` with a `code` parameter.
+    /// Generate the Google OAuth authorization URL using the configured redirect_uri.
     pub fn auth_url(&self) -> String {
+        self.auth_url_with_redirect(&self.redirect_uri)
+    }
+
+    /// Generate the Google OAuth authorization URL with a custom redirect_uri.
+    ///
+    /// Used for dynamic origin-based redirect URIs (e.g. desktop vs web access).
+    pub fn auth_url_with_redirect(&self, redirect_uri: &str) -> String {
         format!(
             "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
             GOOGLE_AUTH_URL,
             urlencoding::encode(&self.client_id),
-            urlencoding::encode(&self.redirect_uri),
+            urlencoding::encode(redirect_uri),
             urlencoding::encode("openid email profile"),
         )
     }
 
-    /// Exchange an authorization code for user information.
-    ///
-    /// This performs two steps:
-    /// 1. POST to Google's token endpoint to exchange the code for an access token
-    /// 2. GET Google's userinfo endpoint with the access token to retrieve user details
+    /// Exchange an authorization code for user information using the configured redirect_uri.
     pub async fn exchange_code(&self, code: &str) -> Result<GoogleUserInfo> {
+        self.exchange_code_with_redirect(code, &self.redirect_uri)
+            .await
+    }
+
+    /// Exchange an authorization code for user information with a custom redirect_uri.
+    ///
+    /// The redirect_uri MUST match the one used in the authorization URL.
+    pub async fn exchange_code_with_redirect(
+        &self,
+        code: &str,
+        redirect_uri: &str,
+    ) -> Result<GoogleUserInfo> {
         // Step 1: Exchange code for access token
         let token_response = self
             .http_client
@@ -88,7 +100,7 @@ impl GoogleOAuthClient {
                 ("code", code),
                 ("client_id", &self.client_id),
                 ("client_secret", &self.client_secret),
-                ("redirect_uri", &self.redirect_uri),
+                ("redirect_uri", redirect_uri),
                 ("grant_type", "authorization_code"),
             ])
             .send()
