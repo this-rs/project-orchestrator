@@ -20,9 +20,10 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 - **Multi-Project Workspaces** — Group related projects with shared context, contracts, and milestones
 - **MCP Integration** — 137 tools available for Claude Code, OpenAI Agents, and Cursor
 - **Auto-Sync** — File watcher keeps the knowledge base updated as you code
-- **Authentication** — Google OAuth2 + JWT with deny-by-default security
+- **Authentication** — Google OAuth2, OIDC, and Password login with deny-by-default security
 - **Chat WebSocket** — Real-time conversational AI via Claude integration
 - **Event System** — Live CRUD notifications via WebSocket
+- **NATS Integration** — Inter-process event sync for multi-instance deployments
 - **YAML Configuration** — Hierarchical config with env var overrides
 
 ---
@@ -35,6 +36,12 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 git clone https://github.com/this-rs/project-orchestrator.git
 cd project-orchestrator
 docker compose up -d
+```
+
+**Or install the pre-built binary:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.sh | sh
 ```
 
 ### 2. Configure your AI tool
@@ -125,7 +132,7 @@ That's it! Your AI agents now have shared context.
 | [MCP Tools](docs/api/mcp-tools.md) | All 137 MCP tools with examples |
 | [Workspaces](docs/guides/workspaces.md) | Multi-project coordination |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
-| [Authentication](docs/guides/authentication.md) | JWT + Google OAuth setup |
+| [Authentication](docs/guides/authentication.md) | JWT + OAuth/OIDC + Password auth setup |
 | [Chat & WebSocket](docs/guides/chat-websocket.md) | Real-time chat and events |
 | [Knowledge Notes](docs/guides/knowledge-notes.md) | Contextual knowledge capture |
 
@@ -146,20 +153,21 @@ That's it! Your AI agents now have shared context.
 │                                                             │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
 │  │   Auth   │  │   Chat   │  │  Events  │  │   Config   │  │
-│  │ OAuth+JWT│  │  Claude  │  │ Live WS  │  │   YAML +   │  │
-│  │          │  │  Streams │  │  CRUD    │  │  env vars  │  │
+│  │OIDC+Pass │  │  Claude  │  │ Live WS  │  │   YAML +   │  │
+│  │  + JWT   │  │  Streams │  │ + NATS   │  │  env vars  │  │
 │  └──────────┘  └──────────┘  └──────────┘  └────────────┘  │
 └─────────────────────────────┬───────────────────────────────┘
                               │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-│    NEO4J      │     │  MEILISEARCH  │     │  TREE-SITTER  │
-│               │     │               │     │               │
-│ • Code graph  │     │ • Code search │     │ • 12 languages│
-│ • Plans       │     │ • Decisions   │     │ • AST parsing │
-│ • Decisions   │     │               │     │ • Symbols     │
-└───────────────┘     └───────────────┘     └───────────────┘
+   ┌──────────────────────────┼──────────────────────────┐
+   ▼                ▼                  ▼                  ▼
+┌──────────┐  ┌──────────┐     ┌──────────┐     ┌──────────────┐
+│  NEO4J   │  │MEILISEARCH│    │  NATS    │     │ TREE-SITTER  │
+│          │  │          │     │          │     │              │
+│• Code    │  │• Code    │     │• Event   │     │• 12 languages│
+│  graph   │  │  search  │     │  sync    │     │• AST parsing │
+│• Plans   │  │• Decisions│    │• Chat    │     │• Symbols     │
+│• Decisions│ │          │     │  relay   │     │              │
+└──────────┘  └──────────┘     └──────────┘     └──────────────┘
 ```
 
 ---

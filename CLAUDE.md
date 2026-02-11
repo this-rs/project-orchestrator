@@ -16,6 +16,7 @@ For user-facing documentation, see the `docs/` folder:
   - [Cursor](docs/integrations/cursor.md)
 - **[Multi-Agent Workflows](docs/guides/multi-agent-workflow.md)** — Advanced coordination
 - **[Knowledge Notes](docs/guides/knowledge-notes.md)** — Contextual knowledge capture system
+- **[Workspaces](docs/guides/workspaces.md)** — Multi-project workspace coordination
 - **[Authentication](docs/guides/authentication.md)** — JWT + Google OAuth setup
 - **[Chat & WebSocket](docs/guides/chat-websocket.md)** — Real-time chat and events
 
@@ -29,7 +30,7 @@ For user-facing documentation, see the `docs/` folder:
 - HTTP API for plans, tasks, decisions, and code exploration
 - MCP server for Claude Code integration (137 tools)
 - File watcher for auto-syncing changes
-- Authentication system: Google OAuth2 + JWT, deny-by-default middleware
+- Authentication system: Google OAuth2, generic OIDC, password login + JWT, deny-by-default middleware
 - Chat WebSocket for real-time conversational AI (migrated from SSE)
 - Event system: live CRUD notifications via WebSocket
 - YAML configuration system with env var overrides (priority: env > yaml > default)
@@ -38,7 +39,7 @@ For user-facing documentation, see the `docs/` folder:
 
 ```bash
 cargo build --release          # Build release binary
-cargo test                     # Run all tests (467 total, mock backends)
+cargo test                     # Run all tests (752 total, mock backends)
 cargo clippy                   # Lint
 cargo fmt                      # Format
 ```
@@ -272,7 +273,7 @@ src/
 ├── config/
 │   └── ...              # YAML configuration system with env var overrides
 ├── events/
-│   └── ...              # EventBus broadcast, EventEmitter trait, WebSocket notifications
+│   └── ...              # EventBus broadcast, EventEmitter trait, NATS emitter, HybridEmitter, WebSocket notifications
 ├── api/
 │   ├── mod.rs           # API module exports
 │   ├── routes.rs        # Route definitions (axum)
@@ -280,6 +281,9 @@ src/
 │   ├── auth_handlers.rs # Google OAuth + JWT endpoints
 │   ├── chat_handlers.rs # Chat WebSocket endpoints
 │   ├── ws_auth.rs       # WebSocket authentication helpers
+│   ├── ws_chat_handler.rs # Chat WebSocket handler (local/NATS/resume routing)
+│   ├── project_handlers.rs # Project-specific endpoints
+│   ├── embedded_frontend.rs # Static SPA serving (rust-embed)
 │   ├── code_handlers.rs # Code exploration endpoints
 │   ├── note_handlers.rs # Knowledge Notes endpoints
 │   └── workspace_handlers.rs # Workspace endpoints
@@ -327,6 +331,8 @@ src/
 │   └── mcp_server.rs    # MCP server binary
 ├── test_helpers.rs      # mock_app_state(), test_project(), test_plan()...
 ├── lib.rs               # Library exports
+├── setup_claude.rs      # Auto-configure Claude Code MCP (setup-claude command)
+├── update.rs            # Self-update via GitHub Releases (update command)
 └── main.rs              # CLI entry point
 
 tests/
@@ -568,14 +574,22 @@ event: error             → {"message": "..."}
 - `chat_send_message` — Send message and wait for complete response (non-streaming)
 
 ### Authentication
+- `GET /auth/providers` — List available auth providers (password, google, oidc)
+- `POST /auth/login` — Password login (root account or Neo4j users)
+- `POST /auth/register` — Register a new user account
 - `GET /auth/google` — Get Google OAuth authorization URL
 - `POST /auth/google/callback` — Exchange auth code for JWT token
+- `GET /auth/oidc` — Start generic OIDC login flow
+- `GET /auth/oidc/callback` — OIDC code exchange callback
 - `GET /auth/me` — Get authenticated user profile (protected)
 - `POST /auth/refresh` — Refresh JWT token (protected)
 
 ### Events WebSocket
 - `GET /ws/events` — CRUD event notifications (entity_types filter, project_id filter)
 - `GET /ws/chat/{session_id}` — Chat WebSocket (auth via first message)
+
+### Version Info
+- `GET /api/version` — Get server version, build info, and enabled features (public)
 
 ### Sync & Watch
 - `POST /api/sync` - Manual sync
@@ -610,7 +624,7 @@ event: error             → {"message": "..."}
 
 ```bash
 # All tests use mock backends (no Docker required for unit tests)
-cargo test                     # 467 tests passing
+cargo test                     # 752 tests passing
 ```
 
 ## Neo4j Graph Relationships
