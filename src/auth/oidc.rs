@@ -428,7 +428,9 @@ mod tests {
         )));
         // Original auth_url() still uses the config redirect_uri
         let default_url = client.auth_url();
-        assert!(default_url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fauth%2Fcallback"));
+        assert!(
+            default_url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fauth%2Fcallback")
+        );
     }
 
     #[test]
