@@ -1020,4 +1020,51 @@ pub trait GraphStore: Send + Sync {
 
     /// List all users
     async fn list_users(&self) -> Result<Vec<UserNode>>;
+
+    // ================================================================
+    // Feature Graphs
+    // ================================================================
+
+    /// Create a feature graph
+    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()>;
+
+    /// Get a feature graph by ID (without entities)
+    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>>;
+
+    /// Get a feature graph with all its included entities
+    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
+
+    /// List feature graphs, optionally filtered by project
+    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>>;
+
+    /// Delete a feature graph and all its INCLUDES_ENTITY relationships
+    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool>;
+
+    /// Add an entity (file, function, struct, trait) to a feature graph
+    async fn add_entity_to_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()>;
+
+    /// Remove an entity from a feature graph
+    async fn remove_entity_from_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool>;
+
+    /// Automatically build a feature graph from a function entry point.
+    /// Uses the call graph (callers + callees) to discover related functions and files,
+    /// creates a FeatureGraph, and populates it with the discovered entities.
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+    ) -> Result<FeatureGraphDetail>;
 }

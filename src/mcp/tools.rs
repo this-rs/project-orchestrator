@@ -1194,6 +1194,7 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "max_staleness": {"type": "number", "description": "Maximum staleness score (0.0-1.0)"},
                     "tags": {"type": "string", "description": "Filter by tags (comma-separated)"},
                     "search": {"type": "string", "description": "Search in content"},
+                    "global_only": {"type": "boolean", "description": "Filter global notes only (no project_id)"},
                     "limit": {"type": "integer", "description": "Max items (default 50)"},
                     "offset": {"type": "integer", "description": "Items to skip"}
                 })),
@@ -1206,7 +1207,7 @@ fn note_tools() -> Vec<ToolDefinition> {
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
-                    "project_id": {"type": "string", "description": "Project UUID (required)"},
+                    "project_id": {"type": "string", "description": "Project UUID (optional — omit for global/cross-project notes)"},
                     "note_type": {"type": "string", "description": "Type: guideline, gotcha, pattern, context, tip, observation, assertion"},
                     "content": {"type": "string", "description": "Note content"},
                     "importance": {"type": "string", "description": "Importance: critical, high, medium, low"},
@@ -1214,11 +1215,7 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
                     "anchors": {"type": "array", "description": "Initial anchors to code entities"}
                 })),
-                required: Some(vec![
-                    "project_id".to_string(),
-                    "note_type".to_string(),
-                    "content".to_string(),
-                ]),
+                required: Some(vec!["note_type".to_string(), "content".to_string()]),
             },
         },
         ToolDefinition {
@@ -1304,7 +1301,7 @@ fn note_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "old_note_id": {"type": "string", "description": "ID of note to supersede"},
-                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "project_id": {"type": "string", "description": "Project UUID (optional for global notes)"},
                     "note_type": {"type": "string", "description": "Type of new note"},
                     "content": {"type": "string", "description": "Content of new note"},
                     "importance": {"type": "string", "description": "Importance of new note"},
@@ -1312,7 +1309,6 @@ fn note_tools() -> Vec<ToolDefinition> {
                 })),
                 required: Some(vec![
                     "old_note_id".to_string(),
-                    "project_id".to_string(),
                     "note_type".to_string(),
                     "content".to_string(),
                 ]),
@@ -1955,6 +1951,91 @@ fn chat_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["message".to_string(), "cwd".to_string()]),
             },
         },
+        // ================================================================
+        // Feature Graph tools (6)
+        // ================================================================
+        ToolDefinition {
+            name: "create_feature_graph".to_string(),
+            description: "Create a named feature graph to capture code entities related to a feature".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "name": {"type": "string", "description": "Feature graph name (e.g. 'SSO', 'chat-streaming')"},
+                    "description": {"type": "string", "description": "Description of what this feature covers"},
+                    "project_id": {"type": "string", "description": "Project UUID"}
+                })),
+                required: Some(vec!["name".to_string(), "project_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_feature_graph".to_string(),
+            description: "Get feature graph details with all included entities (functions, files, structs)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Feature graph UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "list_feature_graphs".to_string(),
+            description: "List feature graphs, optionally filtered by project".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_id": {"type": "string", "description": "Optional project UUID filter"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "add_to_feature_graph".to_string(),
+            description: "Add a code entity (file, function, struct, trait, enum) to a feature graph".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "feature_graph_id": {"type": "string", "description": "Feature graph UUID"},
+                    "entity_type": {"type": "string", "description": "Entity type: file, function, struct, trait, enum"},
+                    "entity_id": {"type": "string", "description": "Entity identifier (file path or symbol name)"}
+                })),
+                required: Some(vec![
+                    "feature_graph_id".to_string(),
+                    "entity_type".to_string(),
+                    "entity_id".to_string(),
+                ]),
+            },
+        },
+        ToolDefinition {
+            name: "auto_build_feature_graph".to_string(),
+            description: "Automatically build a feature graph from a function entry point by traversing the call graph (callers + callees)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "name": {"type": "string", "description": "Name for the feature graph"},
+                    "description": {"type": "string", "description": "Optional description"},
+                    "project_id": {"type": "string", "description": "Project UUID"},
+                    "entry_function": {"type": "string", "description": "Function name to start traversal from"},
+                    "depth": {"type": "integer", "description": "Traversal depth (1-5, default 2)"}
+                })),
+                required: Some(vec![
+                    "name".to_string(),
+                    "project_id".to_string(),
+                    "entry_function".to_string(),
+                ]),
+            },
+        },
+        ToolDefinition {
+            name: "delete_feature_graph".to_string(),
+            description: "Delete a feature graph and all its entity relationships".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "id": {"type": "string", "description": "Feature graph UUID"}
+                })),
+                required: Some(vec!["id".to_string()]),
+            },
+        },
     ]
 }
 
@@ -1965,7 +2046,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 137, "Expected 137 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 143, "Expected 143 tools, got {}", tools.len());
     }
 
     #[test]

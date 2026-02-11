@@ -1350,4 +1350,57 @@ impl GraphStore for Neo4jClient {
     async fn list_users(&self) -> anyhow::Result<Vec<UserNode>> {
         self.list_users().await
     }
+
+    // Feature Graphs
+    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> anyhow::Result<()> {
+        self.create_feature_graph(graph).await
+    }
+    async fn get_feature_graph(&self, id: Uuid) -> anyhow::Result<Option<FeatureGraphNode>> {
+        self.get_feature_graph(id).await
+    }
+    async fn get_feature_graph_detail(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<FeatureGraphDetail>> {
+        self.get_feature_graph_detail(id).await
+    }
+    async fn list_feature_graphs(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<FeatureGraphNode>> {
+        self.list_feature_graphs(project_id).await
+    }
+    async fn delete_feature_graph(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.delete_feature_graph(id).await
+    }
+    async fn add_entity_to_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> anyhow::Result<()> {
+        self.add_entity_to_feature_graph(feature_graph_id, entity_type, entity_id)
+            .await
+    }
+    async fn remove_entity_from_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.remove_entity_from_feature_graph(feature_graph_id, entity_type, entity_id)
+            .await
+    }
+
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+    ) -> anyhow::Result<FeatureGraphDetail> {
+        self.auto_build_feature_graph(name, description, project_id, entry_function, depth)
+            .await
+    }
 }

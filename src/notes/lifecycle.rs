@@ -725,7 +725,7 @@ mod tests {
 
     fn create_test_note(anchors: Vec<NoteAnchor>) -> Note {
         let mut note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Guideline,
             "Test note".to_string(),
             "test".to_string(),
@@ -839,7 +839,7 @@ mod tests {
 
         // Create a note from 100 days ago
         let mut note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Tip, // Base decay: 90 days
             "Test".to_string(),
             "test".to_string(),
@@ -859,7 +859,7 @@ mod tests {
         let manager = NoteLifecycleManager::new();
 
         let mut note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Assertion,
             "Test assertion".to_string(),
             "test".to_string(),
@@ -878,7 +878,7 @@ mod tests {
         let manager = NoteLifecycleManager::new();
 
         let mut note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Context, // Fast decay
             "Test".to_string(),
             "test".to_string(),

@@ -677,6 +677,184 @@ pub async fn get_impl_blocks(
     }))
 }
 
+// ============================================================================
+// Feature Graphs
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct CreateFeatureGraphBody {
+    pub name: String,
+    pub description: Option<String>,
+    pub project_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+pub struct ListFeatureGraphsQuery {
+    pub project_id: Option<uuid::Uuid>,
+}
+
+#[derive(Deserialize)]
+pub struct AddEntityBody {
+    pub entity_type: String,
+    pub entity_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct AutoBuildBody {
+    pub name: String,
+    pub description: Option<String>,
+    pub project_id: uuid::Uuid,
+    pub entry_function: String,
+    pub depth: Option<u32>,
+}
+
+/// POST /api/feature-graphs
+pub async fn create_feature_graph(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<CreateFeatureGraphBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let fg = crate::neo4j::models::FeatureGraphNode {
+        id: uuid::Uuid::new_v4(),
+        name: body.name,
+        description: body.description,
+        project_id: body.project_id,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    state.orchestrator.neo4j().create_feature_graph(&fg).await?;
+    Ok(Json(serde_json::json!({
+        "id": fg.id.to_string(),
+        "name": fg.name,
+        "project_id": fg.project_id.to_string(),
+        "created_at": fg.created_at.to_rfc3339(),
+    })))
+}
+
+/// GET /api/feature-graphs
+pub async fn list_feature_graphs(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ListFeatureGraphsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graphs = state
+        .orchestrator
+        .neo4j()
+        .list_feature_graphs(query.project_id)
+        .await?;
+    let items: Vec<serde_json::Value> = graphs
+        .iter()
+        .map(|fg| {
+            serde_json::json!({
+                "id": fg.id.to_string(),
+                "name": fg.name,
+                "description": fg.description,
+                "project_id": fg.project_id.to_string(),
+                "created_at": fg.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(
+        serde_json::json!({ "feature_graphs": items, "count": items.len() }),
+    ))
+}
+
+/// GET /api/feature-graphs/:id
+pub async fn get_feature_graph(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let detail = state
+        .orchestrator
+        .neo4j()
+        .get_feature_graph_detail(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Feature graph not found: {}", id)))?;
+    let entities: Vec<serde_json::Value> = detail
+        .entities
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "entity_type": e.entity_type,
+                "entity_id": e.entity_id,
+                "name": e.name,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "id": detail.graph.id.to_string(),
+        "name": detail.graph.name,
+        "description": detail.graph.description,
+        "project_id": detail.graph.project_id.to_string(),
+        "entities": entities,
+        "entity_count": entities.len(),
+    })))
+}
+
+/// DELETE /api/feature-graphs/:id
+pub async fn delete_feature_graph(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let deleted = state.orchestrator.neo4j().delete_feature_graph(id).await?;
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+/// POST /api/feature-graphs/:id/entities
+pub async fn add_entity_to_feature_graph(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<AddEntityBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .add_entity_to_feature_graph(id, &body.entity_type, &body.entity_id)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "added": true,
+        "feature_graph_id": id.to_string(),
+        "entity_type": body.entity_type,
+        "entity_id": body.entity_id,
+    })))
+}
+
+/// POST /api/feature-graphs/auto-build
+pub async fn auto_build_feature_graph(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<AutoBuildBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let depth = body.depth.unwrap_or(2);
+    let detail = state
+        .orchestrator
+        .neo4j()
+        .auto_build_feature_graph(
+            &body.name,
+            body.description.as_deref(),
+            body.project_id,
+            &body.entry_function,
+            depth,
+        )
+        .await?;
+    let entities: Vec<serde_json::Value> = detail
+        .entities
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "entity_type": e.entity_type,
+                "entity_id": e.entity_id,
+                "name": e.name,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "id": detail.graph.id.to_string(),
+        "name": detail.graph.name,
+        "description": detail.graph.description,
+        "project_id": detail.graph.project_id.to_string(),
+        "entities": entities,
+        "entity_count": entities.len(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

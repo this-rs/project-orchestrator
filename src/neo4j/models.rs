@@ -717,6 +717,35 @@ pub struct ConnectedFileNode {
     pub dependents: i64,
 }
 
+/// A feature graph — a named subgraph capturing all code entities related to a feature.
+/// Reusable across sessions to avoid re-exploring the same feature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureGraphNode {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub project_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An entity included in a feature graph (file, function, struct, trait).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureGraphEntity {
+    pub entity_type: String,
+    pub entity_id: String,
+    /// Human-readable name (function name, struct name, file path)
+    pub name: Option<String>,
+}
+
+/// Full feature graph with its included entities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureGraphDetail {
+    #[serde(flatten)]
+    pub graph: FeatureGraphNode,
+    pub entities: Vec<FeatureGraphEntity>,
+}
+
 // ============================================================================
 // Relationship types
 // ============================================================================
@@ -776,6 +805,10 @@ pub enum RelationType {
     DependsOnComponent,
     /// Component maps to a project (source code)
     MapsToProject,
+
+    // Feature graphs
+    /// FeatureGraph includes an entity (File, Function, Struct, Trait)
+    IncludesEntity,
 }
 
 // ============================================================================

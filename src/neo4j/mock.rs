@@ -76,6 +76,9 @@ pub struct MockGraphStore {
     pub note_anchors: RwLock<HashMap<Uuid, Vec<NoteAnchor>>>,
     pub note_supersedes: RwLock<HashMap<Uuid, Uuid>>,
     pub users: RwLock<HashMap<Uuid, UserNode>>,
+    pub feature_graphs: RwLock<HashMap<Uuid, FeatureGraphNode>>,
+    /// feature_graph_id -> Vec<(entity_type, entity_id)>
+    pub feature_graph_entities: RwLock<HashMap<Uuid, Vec<(String, String)>>>,
 }
 
 #[allow(dead_code)]
@@ -136,6 +139,8 @@ impl MockGraphStore {
             note_anchors: RwLock::new(HashMap::new()),
             note_supersedes: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
+            feature_graphs: RwLock::new(HashMap::new()),
+            feature_graph_entities: RwLock::new(HashMap::new()),
         }
     }
 
@@ -3061,8 +3066,12 @@ impl GraphStore for MockGraphStore {
         let filtered: Vec<Note> = notes
             .values()
             .filter(|n| {
-                if let Some(pid) = project_id {
-                    if n.project_id != pid {
+                if filters.global_only == Some(true) {
+                    if n.project_id.is_some() {
+                        return false;
+                    }
+                } else if let Some(pid) = project_id {
+                    if n.project_id != Some(pid) {
                         return false;
                     }
                 }
@@ -3240,7 +3249,7 @@ impl GraphStore for MockGraphStore {
             .values()
             .filter(|n| {
                 if let Some(pid) = project_id {
-                    if n.project_id != pid {
+                    if n.project_id != Some(pid) {
                         return false;
                     }
                 }
@@ -3558,6 +3567,218 @@ impl GraphStore for MockGraphStore {
 
     async fn list_users(&self) -> Result<Vec<UserNode>> {
         Ok(self.users.read().await.values().cloned().collect())
+    }
+
+    // Feature Graphs
+    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()> {
+        self.feature_graphs
+            .write()
+            .await
+            .insert(graph.id, graph.clone());
+        Ok(())
+    }
+
+    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>> {
+        Ok(self.feature_graphs.read().await.get(&id).cloned())
+    }
+
+    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
+        let graphs = self.feature_graphs.read().await;
+        let Some(fg) = graphs.get(&id).cloned() else {
+            return Ok(None);
+        };
+
+        let fg_entities = self.feature_graph_entities.read().await;
+        let entities = fg_entities
+            .get(&id)
+            .map(|ents| {
+                ents.iter()
+                    .map(|(et, eid)| FeatureGraphEntity {
+                        entity_type: et.clone(),
+                        entity_id: eid.clone(),
+                        name: Some(eid.clone()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Some(FeatureGraphDetail {
+            graph: fg,
+            entities,
+        }))
+    }
+
+    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>> {
+        let graphs = self.feature_graphs.read().await;
+        let mut result: Vec<FeatureGraphNode> = graphs
+            .values()
+            .filter(|fg| {
+                if let Some(pid) = project_id {
+                    fg.project_id == pid
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(result)
+    }
+
+    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool> {
+        let removed = self.feature_graphs.write().await.remove(&id).is_some();
+        self.feature_graph_entities.write().await.remove(&id);
+        Ok(removed)
+    }
+
+    async fn add_entity_to_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()> {
+        let entry = (entity_type.to_string(), entity_id.to_string());
+        let mut entities = self.feature_graph_entities.write().await;
+        let list = entities.entry(feature_graph_id).or_default();
+        if !list.contains(&entry) {
+            list.push(entry);
+        }
+        // Update updated_at
+        if let Some(fg) = self.feature_graphs.write().await.get_mut(&feature_graph_id) {
+            fg.updated_at = chrono::Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn remove_entity_from_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool> {
+        let mut entities = self.feature_graph_entities.write().await;
+        if let Some(list) = entities.get_mut(&feature_graph_id) {
+            let entry = (entity_type.to_string(), entity_id.to_string());
+            let before = list.len();
+            list.retain(|e| e != &entry);
+            Ok(list.len() < before)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+    ) -> Result<FeatureGraphDetail> {
+        let depth = depth.clamp(1, 5);
+
+        // Collect callees from the mock call_relationships
+        let cr = self.call_relationships.read().await;
+        let mut all_functions = std::collections::HashSet::new();
+        all_functions.insert(entry_function.to_string());
+
+        // Simple BFS traversal for callees
+        let mut queue: Vec<String> = vec![entry_function.to_string()];
+        for _ in 0..depth {
+            let mut next_queue = Vec::new();
+            for func in &queue {
+                // Check direct name match
+                if let Some(callees) = cr.get(func) {
+                    for callee in callees {
+                        if all_functions.insert(callee.clone()) {
+                            next_queue.push(callee.clone());
+                        }
+                    }
+                }
+                // Check qualified name match (e.g. "module::func")
+                for (caller_id, callees) in cr.iter() {
+                    if caller_id.ends_with(&format!("::{}", func)) {
+                        for callee in callees {
+                            if all_functions.insert(callee.clone()) {
+                                next_queue.push(callee.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            queue = next_queue;
+        }
+
+        // Collect callers
+        for (caller, callees) in cr.iter() {
+            if callees.contains(&entry_function.to_string()) {
+                all_functions.insert(caller.clone());
+            }
+        }
+        drop(cr);
+
+        if all_functions.len() <= 1 {
+            // Only entry function found — check it even exists in functions
+            let funcs = self.functions.read().await;
+            let exists = funcs.values().any(|f| f.name == entry_function);
+            if !exists {
+                return Err(anyhow::anyhow!(
+                    "No function found matching '{}'",
+                    entry_function
+                ));
+            }
+        }
+
+        // Collect file paths from known functions
+        let funcs = self.functions.read().await;
+        let mut files = std::collections::HashSet::new();
+        for func in &all_functions {
+            for f in funcs.values() {
+                if f.name == *func {
+                    files.insert(f.file_path.clone());
+                }
+            }
+        }
+        drop(funcs);
+
+        // Create the feature graph
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: description.map(|d| d.to_string()),
+            project_id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        self.create_feature_graph(&fg).await?;
+
+        // Add entities
+        let mut entities = Vec::new();
+        for func_name in &all_functions {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "function", func_name)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+            });
+        }
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "file", file_path)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+            });
+        }
+
+        Ok(FeatureGraphDetail {
+            graph: fg,
+            entities,
+        })
     }
 }
 

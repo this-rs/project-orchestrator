@@ -508,8 +508,8 @@ impl AssertionResult {
 pub struct Note {
     /// Unique identifier
     pub id: Uuid,
-    /// Project this note belongs to
-    pub project_id: Uuid,
+    /// Project this note belongs to (None = global note, cross-project)
+    pub project_id: Option<Uuid>,
     /// Type of note
     pub note_type: NoteType,
     /// Current lifecycle status
@@ -562,7 +562,12 @@ pub struct Note {
 
 impl Note {
     /// Create a new note with minimal fields
-    pub fn new(project_id: Uuid, note_type: NoteType, content: String, created_by: String) -> Self {
+    pub fn new(
+        project_id: Option<Uuid>,
+        note_type: NoteType,
+        content: String,
+        created_by: String,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -589,7 +594,7 @@ impl Note {
 
     /// Create a new note with full configuration
     pub fn new_full(
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         note_type: NoteType,
         importance: NoteImportance,
         scope: NoteScope,
@@ -690,8 +695,8 @@ pub struct PropagatedNote {
 /// Request to create a new note
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateNoteRequest {
-    /// Project ID (required)
-    pub project_id: Uuid,
+    /// Project ID (optional — None for global/cross-project notes)
+    pub project_id: Option<Uuid>,
     /// Type of note
     pub note_type: NoteType,
     /// Content of the note
@@ -752,6 +757,8 @@ pub struct NoteFilters {
     pub min_staleness: Option<f64>,
     /// Maximum staleness score
     pub max_staleness: Option<f64>,
+    /// Filter global notes only (no project_id)
+    pub global_only: Option<bool>,
     /// Pagination: limit
     pub limit: Option<i64>,
     /// Pagination: offset
@@ -856,13 +863,13 @@ mod tests {
     fn test_note_creation() {
         let project_id = Uuid::new_v4();
         let note = Note::new(
-            project_id,
+            Some(project_id),
             NoteType::Guideline,
             "Always use Result for error handling".to_string(),
             "claude".to_string(),
         );
 
-        assert_eq!(note.project_id, project_id);
+        assert_eq!(note.project_id, Some(project_id));
         assert_eq!(note.note_type, NoteType::Guideline);
         assert_eq!(note.status, NoteStatus::Active);
         assert_eq!(note.importance, NoteImportance::Medium);
@@ -875,7 +882,7 @@ mod tests {
     #[test]
     fn test_note_confirm() {
         let mut note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Tip,
             "Use async/await".to_string(),
             "user".to_string(),
@@ -906,7 +913,7 @@ mod tests {
     #[test]
     fn test_note_serialization() {
         let note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Gotcha,
             "Watch out for null".to_string(),
             "agent".to_string(),
@@ -932,19 +939,19 @@ mod tests {
     #[test]
     fn test_base_decay_days() {
         let context_note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Context,
             "temp".into(),
             "user".into(),
         );
         let guideline_note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Guideline,
             "stable".into(),
             "user".into(),
         );
         let assertion_note = Note::new(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             NoteType::Assertion,
             "rule".into(),
             "user".into(),

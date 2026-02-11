@@ -6109,7 +6109,10 @@ impl Neo4jClient {
             "#,
         )
         .param("id", note.id.to_string())
-        .param("project_id", note.project_id.to_string())
+        .param(
+            "project_id",
+            note.project_id.map(|id| id.to_string()).unwrap_or_default(),
+        )
         .param("note_type", note.note_type.to_string())
         .param("status", note.status.to_string())
         .param("importance", note.importance.to_string())
@@ -6141,18 +6144,20 @@ impl Neo4jClient {
 
         self.graph.run(q).await?;
 
-        // Link to project
-        let link_q = query(
-            r#"
-            MATCH (n:Note {id: $note_id})
-            MATCH (p:Project {id: $project_id})
-            MERGE (p)-[:HAS_NOTE]->(n)
-            "#,
-        )
-        .param("note_id", note.id.to_string())
-        .param("project_id", note.project_id.to_string());
+        // Link to project (only if project_id is present)
+        if let Some(pid) = note.project_id {
+            let link_q = query(
+                r#"
+                MATCH (n:Note {id: $note_id})
+                MATCH (p:Project {id: $project_id})
+                MERGE (p)-[:HAS_NOTE]->(n)
+                "#,
+            )
+            .param("note_id", note.id.to_string())
+            .param("project_id", pid.to_string());
 
-        self.graph.run(link_q).await?;
+            self.graph.run(link_q).await?;
+        }
 
         Ok(())
     }
@@ -6257,7 +6262,9 @@ impl Neo4jClient {
     ) -> Result<(Vec<Note>, usize)> {
         let mut where_conditions = Vec::new();
 
-        if let Some(ref pid) = project_id {
+        if filters.global_only == Some(true) {
+            where_conditions.push("(n.project_id IS NULL OR n.project_id = '')".to_string());
+        } else if let Some(ref pid) = project_id {
             where_conditions.push(format!("n.project_id = '{}'", pid));
         }
 
@@ -6878,7 +6885,13 @@ impl Neo4jClient {
 
         Ok(Note {
             id: node.get::<String>("id")?.parse()?,
-            project_id: node.get::<String>("project_id")?.parse()?,
+            project_id: node.get::<String>("project_id").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
             note_type: note_type_str.parse().unwrap_or(NoteType::Observation),
             status: status_str.parse().unwrap_or(NoteStatus::Active),
             importance: importance_str.parse().unwrap_or(NoteImportance::Medium),
@@ -7642,6 +7655,331 @@ impl Neo4jClient {
                 .unwrap_or_else(|_| chrono::Utc::now()),
             last_login_at: node
                 .get::<String>("last_login_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        })
+    }
+
+    // ================================================================
+    // Feature Graphs
+    // ================================================================
+
+    pub async fn create_feature_graph(&self, fg: &FeatureGraphNode) -> Result<()> {
+        let q = query(
+            "CREATE (fg:FeatureGraph {
+                id: $id,
+                name: $name,
+                description: $description,
+                project_id: $project_id,
+                created_at: $created_at,
+                updated_at: $updated_at
+            })
+            WITH fg
+            MATCH (p:Project {id: $project_id})
+            CREATE (fg)-[:BELONGS_TO]->(p)",
+        )
+        .param("id", fg.id.to_string())
+        .param("name", fg.name.clone())
+        .param("description", fg.description.clone().unwrap_or_default())
+        .param("project_id", fg.project_id.to_string())
+        .param("created_at", fg.created_at.to_rfc3339())
+        .param("updated_at", fg.updated_at.to_rfc3339());
+
+        self.execute_with_params(q).await?;
+        Ok(())
+    }
+
+    pub async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>> {
+        let q = query("MATCH (fg:FeatureGraph {id: $id}) RETURN fg").param("id", id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        if let Some(row) = rows.first() {
+            let node: neo4rs::Node = row.get("fg")?;
+            Ok(Some(self.node_to_feature_graph(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
+        let fg = self.get_feature_graph(id).await?;
+        let Some(fg) = fg else { return Ok(None) };
+
+        let q = query(
+            "MATCH (fg:FeatureGraph {id: $id})-[:INCLUDES_ENTITY]->(e)
+             RETURN labels(e)[0] AS entity_type,
+                    COALESCE(e.path, e.id) AS entity_id,
+                    COALESCE(e.name, e.path) AS name",
+        )
+        .param("id", id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        let entities = rows
+            .iter()
+            .map(|row| FeatureGraphEntity {
+                entity_type: row.get::<String>("entity_type").unwrap_or_default(),
+                entity_id: row.get::<String>("entity_id").unwrap_or_default(),
+                name: row.get::<String>("name").ok(),
+            })
+            .collect();
+
+        Ok(Some(FeatureGraphDetail {
+            graph: fg,
+            entities,
+        }))
+    }
+
+    pub async fn list_feature_graphs(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FeatureGraphNode>> {
+        let cypher = if project_id.is_some() {
+            "MATCH (fg:FeatureGraph {project_id: $pid}) RETURN fg ORDER BY fg.updated_at DESC"
+        } else {
+            "MATCH (fg:FeatureGraph) RETURN fg ORDER BY fg.updated_at DESC"
+        };
+
+        let q = query(cypher).param(
+            "pid",
+            project_id.map(|id| id.to_string()).unwrap_or_default(),
+        );
+
+        let rows = self.execute_with_params(q).await?;
+        let mut graphs = Vec::new();
+        for row in &rows {
+            let node: neo4rs::Node = row.get("fg")?;
+            graphs.push(self.node_to_feature_graph(&node)?);
+        }
+        Ok(graphs)
+    }
+
+    pub async fn delete_feature_graph(&self, id: Uuid) -> Result<bool> {
+        let q = query(
+            "MATCH (fg:FeatureGraph {id: $id})
+             DETACH DELETE fg
+             RETURN count(fg) AS deleted",
+        )
+        .param("id", id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        if let Some(row) = rows.first() {
+            let deleted: i64 = row.get("deleted").unwrap_or(0);
+            Ok(deleted > 0)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn add_entity_to_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()> {
+        let cypher = match entity_type.to_lowercase().as_str() {
+            "file" => {
+                "MATCH (fg:FeatureGraph {id: $fg_id})
+                 MATCH (e:File {path: $entity_id})
+                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
+            }
+            "function" => {
+                "MATCH (fg:FeatureGraph {id: $fg_id})
+                 MATCH (e:Function {name: $entity_id})
+                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
+            }
+            "struct" => {
+                "MATCH (fg:FeatureGraph {id: $fg_id})
+                 MATCH (e:Struct {name: $entity_id})
+                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
+            }
+            "trait" => {
+                "MATCH (fg:FeatureGraph {id: $fg_id})
+                 MATCH (e:Trait {name: $entity_id})
+                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
+            }
+            "enum" => {
+                "MATCH (fg:FeatureGraph {id: $fg_id})
+                 MATCH (e:Enum {name: $entity_id})
+                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported entity type for feature graph: {}",
+                    entity_type
+                ));
+            }
+        };
+
+        let q = query(cypher)
+            .param("fg_id", feature_graph_id.to_string())
+            .param("entity_id", entity_id.to_string());
+        self.execute_with_params(q).await?;
+
+        let update_q = query("MATCH (fg:FeatureGraph {id: $id}) SET fg.updated_at = $now")
+            .param("id", feature_graph_id.to_string())
+            .param("now", chrono::Utc::now().to_rfc3339());
+        self.execute_with_params(update_q).await?;
+
+        Ok(())
+    }
+
+    pub async fn remove_entity_from_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool> {
+        let match_prop = match entity_type.to_lowercase().as_str() {
+            "file" => "path",
+            _ => "name",
+        };
+        let label = match entity_type.to_lowercase().as_str() {
+            "file" => "File",
+            "function" => "Function",
+            "struct" => "Struct",
+            "trait" => "Trait",
+            "enum" => "Enum",
+            _ => return Err(anyhow::anyhow!("Unsupported entity type: {}", entity_type)),
+        };
+
+        let cypher = format!(
+            "MATCH (fg:FeatureGraph {{id: $fg_id}})-[r:INCLUDES_ENTITY]->(e:{} {{{}: $entity_id}})
+             DELETE r
+             RETURN count(r) AS deleted",
+            label, match_prop
+        );
+
+        let q = query(&cypher)
+            .param("fg_id", feature_graph_id.to_string())
+            .param("entity_id", entity_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        if let Some(row) = rows.first() {
+            let deleted: i64 = row.get("deleted").unwrap_or(0);
+            Ok(deleted > 0)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+    ) -> Result<FeatureGraphDetail> {
+        // Step 1: Collect all related functions and their files via call graph
+        // We collect the entry function + callers + callees
+        let depth = depth.clamp(1, 5);
+
+        let q = query(&format!(
+            r#"
+            MATCH (entry:Function {{name: $name}})
+            OPTIONAL MATCH (entry)-[:CALLS*1..{depth}]->(callee:Function)
+            OPTIONAL MATCH (caller:Function)-[:CALLS*1..{depth}]->(entry)
+            WITH entry,
+                 collect(DISTINCT callee) AS callees_nodes,
+                 collect(DISTINCT caller) AS callers_nodes
+            WITH entry, callees_nodes, callers_nodes,
+                 [entry] + callees_nodes + callers_nodes AS all_funcs
+            UNWIND all_funcs AS f
+            WITH DISTINCT f
+            WHERE f IS NOT NULL
+            RETURN f.name AS func_name, f.file_path AS file_path
+            "#,
+            depth = depth
+        ))
+        .param("name", entry_function);
+
+        let rows = self.execute_with_params(q).await?;
+
+        // Collect unique functions and files
+        let mut functions: Vec<(String, Option<String>)> = Vec::new();
+        let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for row in &rows {
+            if let Ok(func_name) = row.get::<String>("func_name") {
+                let file_path: Option<String> = row.get::<String>("file_path").ok();
+                if let Some(ref fp) = file_path {
+                    if !fp.is_empty() {
+                        files.insert(fp.clone());
+                    }
+                }
+                functions.push((func_name, file_path));
+            }
+        }
+
+        if functions.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No function found matching '{}'",
+                entry_function
+            ));
+        }
+
+        // Step 2: Create the FeatureGraph
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: description.map(|d| d.to_string()),
+            project_id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        self.create_feature_graph(&fg).await?;
+
+        // Step 3: Add all entities
+        let mut entities = Vec::new();
+
+        // Add functions
+        for (func_name, _file_path) in &functions {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "function", func_name)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+            });
+        }
+
+        // Add files
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "file", file_path)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+            });
+        }
+
+        Ok(FeatureGraphDetail {
+            graph: fg,
+            entities,
+        })
+    }
+
+    fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {
+        Ok(FeatureGraphNode {
+            id: node.get::<String>("id")?.parse()?,
+            name: node.get("name")?,
+            description: node.get::<String>("description").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }),
+            project_id: node.get::<String>("project_id")?.parse()?,
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: node
+                .get::<String>("updated_at")?
                 .parse()
                 .unwrap_or_else(|_| chrono::Utc::now()),
         })

@@ -105,6 +105,15 @@ Workspace
 
 ## 4. Protocole d'exécution de tâche
 
+### Phase 0 — Warm-up (OBLIGATOIRE au début de chaque conversation)
+
+Avant tout travail, charger les connaissances pertinentes :
+1. `search_notes(query)` — chercher les notes liées au sujet de la demande
+2. `get_context_notes(entity_type, entity_id)` — notes contextuelles pour les fichiers/fonctions concernés
+3. `search_decisions(query)` — décisions architecturales passées sur le sujet
+
+Cela évite de refaire un travail déjà documenté ou de violer une convention déjà établie.
+
 ### Phase 1 — Préparation
 
 1. `get_next_task(plan_id)` — récupérer la prochaine tâche non bloquée (priorité la plus haute)
@@ -215,37 +224,69 @@ Exemple de décomposition correcte :
 - `get_file_dependencies(file_path)` → imports et dépendants
 - `get_context_notes(entity_type, entity_id)` → notes pertinentes (guidelines, gotchas...)
 
-### Stratégie de recherche
+### Stratégie de recherche — MCP-first (OBLIGATOIRE)
 
-Choisir le bon outil selon le besoin :
-- **Recherche sémantique** (concept, nom approché) → `search_code(query)` / `search_project_code(slug, query)` — MeiliSearch, cross-fichier, ranking par pertinence
-- **Usages d'un symbole** → `find_references(symbol)` — graphe Neo4j, résolution des imports, plus fiable que grep
-- **Graphe d'appels** → `get_call_graph(function)` — qui appelle cette fonction et qui elle appelle
-- **Impact d'une modification** → `analyze_impact(target)` — fichiers et symboles dépendants
-- **Vue d'ensemble** → `get_architecture(project_slug?)` — fichiers les plus connectés, stats langages
-- **String exacte / regex** → grep/find de Claude Code — quand on cherche une chaîne littérale précise
+**Règle absolue** : TOUJOURS utiliser les outils MCP d'exploration de code EN PREMIER.
+N'utiliser Grep/Read/Glob qu'en dernier recours pour des chaînes littérales exactes.
 
-Préférer les outils MeiliSearch pour les recherches exploratoires et cross-fichier.
+Hiérarchie de recherche (du plus recommandé au moins recommandé) :
 
-### Exploration du code
+1. **Recherche exploratoire** → `search_code(query)` / `search_project_code(slug, query)`
+   - Recherche sémantique MeiliSearch, cross-fichier, ranking par pertinence
+   - Supporte `path_prefix` pour filtrer un sous-répertoire
+   - **Utilise ceci au lieu de** : Grep pour chercher un concept, Task(Explore) pour explorer
 
-- `search_code(query, project_slug?, path_prefix?)` — recherche sémantique, filtrable par projet et répertoire
-- `search_project_code(slug, query, path_prefix?)` — recherche scopée à un projet
-- `search_workspace_code(workspace_slug, query)` — recherche cross-projets dans un workspace
-- `get_file_symbols(file_path)` → fonctions, structs, traits du fichier
-- `find_references(symbol)` → tous les usages d'un symbole
-- `get_call_graph(function)` → graphe d'appels
-- `find_trait_implementations(trait_name)` → implémentations
-- `get_architecture(project_slug?)` → vue d'ensemble (filtrable par projet)
+2. **Usages d'un symbole** → `find_references(symbol)`
+   - Résolution via le graphe Neo4j (imports, exports, appels)
+   - Plus fiable que grep car comprend la structure du code
+   - **Utilise ceci au lieu de** : Grep pour "où est utilisé X"
 
-### Capture des connaissances
+3. **Comprendre un flux** → `get_call_graph(function)`
+   - Qui appelle cette fonction ? Qui elle appelle ?
+   - **Utilise ceci au lieu de** : lire manuellement chaque fichier
 
-- **Notes** : créer quand on découvre une guideline, un gotcha, un pattern
-  - Toujours lier via `link_note_to_entity(note_id, entity_type, entity_id)`
-  - Choisir le bon type et la bonne importance
-- **Décisions** : à chaque choix architectural
-  - Documenter les alternatives considérées + la raison du choix
-  - `add_decision(task_id, description, rationale, alternatives, chosen_option)`
+4. **Avant de modifier** → `analyze_impact(target)`
+   - Fichiers et symboles affectés par un changement
+   - **Utilise ceci au lieu de** : deviner quels fichiers sont impactés
+
+5. **Vue d'ensemble** → `get_architecture(project_slug?)`
+   - Fichiers les plus connectés, stats langages, structure du projet
+   - **Utilise ceci au lieu de** : parcourir manuellement l'arborescence
+
+6. **Symboles d'un fichier** → `get_file_symbols(file_path)`
+   - Toutes les fonctions, structs, traits, enums d'un fichier
+   - **Utilise ceci au lieu de** : lire tout le fichier pour trouver les définitions
+
+7. **Types et traits** → `find_trait_implementations(trait)` / `find_type_traits(type)` / `get_impl_blocks(type)`
+   - Naviguer le système de types via le graphe
+
+8. **Dernier recours** → Grep/Read de Claude Code
+   - UNIQUEMENT pour des chaînes littérales exactes (messages d'erreur, constantes, URLs)
+   - UNIQUEMENT si les outils MCP ci-dessus ne retournent pas de résultat pertinent
+
+### Capture des connaissances (OBLIGATOIRE)
+
+**Règle absolue** : L'agent DOIT créer des notes pour capitaliser les connaissances découvertes.
+Ne JAMAIS terminer une session sans avoir capturé les apprentissages importants.
+
+**Quand créer une note :**
+- Après avoir résolu un bug → `create_note(type: "gotcha", importance: "high")` avec la cause racine et la solution
+- Après avoir découvert un pattern architectural → `create_note(type: "pattern")` avec l'explication
+- Après avoir identifié une convention → `create_note(type: "guideline")` avec la règle
+- Après avoir trouvé un piège/subtilité → `create_note(type: "gotcha")` avec l'avertissement
+- Après avoir trouvé une astuce utile → `create_note(type: "tip")` avec l'explication
+
+**TOUJOURS** lier la note à l'entité concernée :
+```
+create_note(project_id, type, content, importance, tags)
+→ note_id
+link_note_to_entity(note_id, "file", "src/chat/manager.rs")
+link_note_to_entity(note_id, "function", "build_system_prompt")
+```
+
+**Décisions architecturales** : à chaque choix non trivial
+- Documenter les alternatives considérées + la raison du choix
+- `add_decision(task_id, description, rationale, alternatives, chosen_option)`
 
 ### Workspace (multi-projets)
 
@@ -258,6 +299,856 @@ Préférer les outils MeiliSearch pour les recherches exploratoires et cross-fic
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
+
+// ============================================================================
+// Tool catalog — static grouping of MCP tools for meta-prompting
+// ============================================================================
+
+/// A single MCP tool reference with a concise description.
+#[derive(Debug, Clone)]
+pub struct ToolRef {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+/// A semantic group of related MCP tools.
+#[derive(Debug, Clone)]
+pub struct ToolGroup {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub keywords: &'static [&'static str],
+    pub tools: &'static [ToolRef],
+}
+
+/// Static catalog of all 137 MCP tools organized into 12 semantic groups.
+/// Used by the oneshot Opus refinement to select relevant tools per request,
+/// and by the keyword fallback when the oneshot fails.
+pub static TOOL_GROUPS: &[ToolGroup] = &[
+    // ── Planning (21 tools) ──────────────────────────────────────────
+    ToolGroup {
+        name: "planning",
+        description: "Créer et gérer plans, tâches, étapes",
+        keywords: &[
+            "plan",
+            "tâche",
+            "task",
+            "step",
+            "étape",
+            "planifier",
+            "organiser",
+            "dépendance",
+            "priorité",
+            "chemin critique",
+            "bloquer",
+        ],
+        tools: &[
+            ToolRef {
+                name: "create_plan",
+                description: "Créer un plan de développement",
+            },
+            ToolRef {
+                name: "get_plan",
+                description: "Détails d'un plan avec tâches",
+            },
+            ToolRef {
+                name: "list_plans",
+                description: "Lister les plans avec filtres",
+            },
+            ToolRef {
+                name: "update_plan_status",
+                description: "Changer le statut d'un plan",
+            },
+            ToolRef {
+                name: "delete_plan",
+                description: "Supprimer un plan",
+            },
+            ToolRef {
+                name: "link_plan_to_project",
+                description: "Lier un plan à un projet",
+            },
+            ToolRef {
+                name: "unlink_plan_from_project",
+                description: "Délier un plan d'un projet",
+            },
+            ToolRef {
+                name: "create_task",
+                description: "Ajouter une tâche à un plan",
+            },
+            ToolRef {
+                name: "get_task",
+                description: "Détails d'une tâche avec steps",
+            },
+            ToolRef {
+                name: "list_tasks",
+                description: "Lister les tâches avec filtres",
+            },
+            ToolRef {
+                name: "update_task",
+                description: "Mettre à jour statut/assignee",
+            },
+            ToolRef {
+                name: "delete_task",
+                description: "Supprimer une tâche",
+            },
+            ToolRef {
+                name: "get_next_task",
+                description: "Prochaine tâche non bloquée",
+            },
+            ToolRef {
+                name: "add_task_dependencies",
+                description: "Ajouter des dépendances",
+            },
+            ToolRef {
+                name: "remove_task_dependency",
+                description: "Retirer une dépendance",
+            },
+            ToolRef {
+                name: "get_task_blockers",
+                description: "Tâches bloquant celle-ci",
+            },
+            ToolRef {
+                name: "get_tasks_blocked_by",
+                description: "Tâches bloquées par celle-ci",
+            },
+            ToolRef {
+                name: "get_dependency_graph",
+                description: "Graphe de dépendances du plan",
+            },
+            ToolRef {
+                name: "get_critical_path",
+                description: "Chemin critique du plan",
+            },
+            ToolRef {
+                name: "get_task_context",
+                description: "Contexte complet pour exécution",
+            },
+            ToolRef {
+                name: "get_task_prompt",
+                description: "Prompt généré pour une tâche",
+            },
+        ],
+    },
+    // ── Steps (6 tools) ──────────────────────────────────────────────
+    ToolGroup {
+        name: "steps",
+        description: "Sous-étapes atomiques des tâches",
+        keywords: &["step", "étape", "sous-étape", "vérification", "progression"],
+        tools: &[
+            ToolRef {
+                name: "create_step",
+                description: "Ajouter un step à une tâche",
+            },
+            ToolRef {
+                name: "list_steps",
+                description: "Lister les steps d'une tâche",
+            },
+            ToolRef {
+                name: "get_step",
+                description: "Détails d'un step",
+            },
+            ToolRef {
+                name: "update_step",
+                description: "Changer le statut d'un step",
+            },
+            ToolRef {
+                name: "delete_step",
+                description: "Supprimer un step",
+            },
+            ToolRef {
+                name: "get_step_progress",
+                description: "Progression des steps",
+            },
+        ],
+    },
+    // ── Code exploration (12 tools) ──────────────────────────────────
+    ToolGroup {
+        name: "code_exploration",
+        description: "Recherche sémantique, graphe d'appels, impact",
+        keywords: &[
+            "code",
+            "fonction",
+            "struct",
+            "fichier",
+            "import",
+            "appel",
+            "architecture",
+            "symbole",
+            "trait",
+            "impl",
+            "référence",
+            "dépendance",
+            "impact",
+            "chercher",
+            "explorer",
+        ],
+        tools: &[
+            ToolRef {
+                name: "search_code",
+                description: "Recherche sémantique cross-projet",
+            },
+            ToolRef {
+                name: "search_project_code",
+                description: "Recherche scopée à un projet",
+            },
+            ToolRef {
+                name: "get_file_symbols",
+                description: "Fonctions/structs d'un fichier",
+            },
+            ToolRef {
+                name: "find_references",
+                description: "Tous les usages d'un symbole",
+            },
+            ToolRef {
+                name: "get_file_dependencies",
+                description: "Imports et dépendants",
+            },
+            ToolRef {
+                name: "get_call_graph",
+                description: "Graphe d'appels d'une fonction",
+            },
+            ToolRef {
+                name: "analyze_impact",
+                description: "Impact d'une modification",
+            },
+            ToolRef {
+                name: "get_architecture",
+                description: "Vue d'ensemble du codebase",
+            },
+            ToolRef {
+                name: "find_similar_code",
+                description: "Code similaire à un snippet",
+            },
+            ToolRef {
+                name: "find_trait_implementations",
+                description: "Types implémentant un trait",
+            },
+            ToolRef {
+                name: "find_type_traits",
+                description: "Traits implémentés par un type",
+            },
+            ToolRef {
+                name: "get_impl_blocks",
+                description: "Blocs impl d'un type",
+            },
+        ],
+    },
+    // ── Knowledge / Notes (17 tools) ─────────────────────────────────
+    ToolGroup {
+        name: "knowledge",
+        description: "Notes, guidelines, gotchas, patterns",
+        keywords: &[
+            "note",
+            "guideline",
+            "gotcha",
+            "pattern",
+            "connaissance",
+            "tip",
+            "observation",
+            "assertion",
+            "savoir",
+            "contexte",
+            "mémoire",
+        ],
+        tools: &[
+            ToolRef {
+                name: "create_note",
+                description: "Créer une note de connaissance",
+            },
+            ToolRef {
+                name: "get_note",
+                description: "Détails d'une note",
+            },
+            ToolRef {
+                name: "update_note",
+                description: "Modifier contenu/importance/tags",
+            },
+            ToolRef {
+                name: "delete_note",
+                description: "Supprimer une note",
+            },
+            ToolRef {
+                name: "search_notes",
+                description: "Recherche sémantique de notes",
+            },
+            ToolRef {
+                name: "list_notes",
+                description: "Lister avec filtres type/importance",
+            },
+            ToolRef {
+                name: "list_project_notes",
+                description: "Notes d'un projet",
+            },
+            ToolRef {
+                name: "get_context_notes",
+                description: "Notes contextuelles d'une entité",
+            },
+            ToolRef {
+                name: "get_entity_notes",
+                description: "Notes directement attachées",
+            },
+            ToolRef {
+                name: "get_propagated_notes",
+                description: "Notes propagées via le graphe",
+            },
+            ToolRef {
+                name: "link_note_to_entity",
+                description: "Lier note à fichier/fonction/…",
+            },
+            ToolRef {
+                name: "unlink_note_from_entity",
+                description: "Délier une note",
+            },
+            ToolRef {
+                name: "confirm_note",
+                description: "Confirmer validité (reset staleness)",
+            },
+            ToolRef {
+                name: "invalidate_note",
+                description: "Marquer comme obsolète",
+            },
+            ToolRef {
+                name: "supersede_note",
+                description: "Remplacer par une nouvelle note",
+            },
+            ToolRef {
+                name: "get_notes_needing_review",
+                description: "Notes à vérifier",
+            },
+            ToolRef {
+                name: "update_staleness_scores",
+                description: "Recalculer la fraîcheur",
+            },
+        ],
+    },
+    // ── Git tracking (5 tools) ───────────────────────────────────────
+    ToolGroup {
+        name: "git_tracking",
+        description: "Enregistrer et lier les commits",
+        keywords: &["commit", "git", "branche", "sha", "push"],
+        tools: &[
+            ToolRef {
+                name: "create_commit",
+                description: "Enregistrer un commit",
+            },
+            ToolRef {
+                name: "link_commit_to_task",
+                description: "Lier commit → tâche",
+            },
+            ToolRef {
+                name: "link_commit_to_plan",
+                description: "Lier commit → plan",
+            },
+            ToolRef {
+                name: "get_task_commits",
+                description: "Commits d'une tâche",
+            },
+            ToolRef {
+                name: "get_plan_commits",
+                description: "Commits d'un plan",
+            },
+        ],
+    },
+    // ── Decisions (5 tools) ──────────────────────────────────────────
+    ToolGroup {
+        name: "decisions",
+        description: "Choix architecturaux et alternatives",
+        keywords: &["décision", "choix", "alternative", "rationale", "arbitrage"],
+        tools: &[
+            ToolRef {
+                name: "add_decision",
+                description: "Enregistrer une décision",
+            },
+            ToolRef {
+                name: "get_decision",
+                description: "Détails d'une décision",
+            },
+            ToolRef {
+                name: "update_decision",
+                description: "Modifier une décision",
+            },
+            ToolRef {
+                name: "delete_decision",
+                description: "Supprimer une décision",
+            },
+            ToolRef {
+                name: "search_decisions",
+                description: "Rechercher les décisions passées",
+            },
+        ],
+    },
+    // ── Constraints (5 tools) ────────────────────────────────────────
+    ToolGroup {
+        name: "constraints",
+        description: "Règles et contraintes des plans",
+        keywords: &[
+            "contrainte",
+            "règle",
+            "sécurité",
+            "performance",
+            "compatibilité",
+        ],
+        tools: &[
+            ToolRef {
+                name: "add_constraint",
+                description: "Ajouter une contrainte",
+            },
+            ToolRef {
+                name: "get_constraint",
+                description: "Détails d'une contrainte",
+            },
+            ToolRef {
+                name: "update_constraint",
+                description: "Modifier une contrainte",
+            },
+            ToolRef {
+                name: "delete_constraint",
+                description: "Supprimer une contrainte",
+            },
+            ToolRef {
+                name: "list_constraints",
+                description: "Contraintes d'un plan",
+            },
+        ],
+    },
+    // ── Project management (8 tools) ─────────────────────────────────
+    ToolGroup {
+        name: "project_management",
+        description: "CRUD projets, sync, roadmap",
+        keywords: &["projet", "codebase", "sync", "roadmap", "créer projet"],
+        tools: &[
+            ToolRef {
+                name: "list_projects",
+                description: "Lister tous les projets",
+            },
+            ToolRef {
+                name: "create_project",
+                description: "Créer un nouveau projet",
+            },
+            ToolRef {
+                name: "get_project",
+                description: "Détails d'un projet par slug",
+            },
+            ToolRef {
+                name: "update_project",
+                description: "Modifier nom/description/path",
+            },
+            ToolRef {
+                name: "delete_project",
+                description: "Supprimer un projet",
+            },
+            ToolRef {
+                name: "sync_project",
+                description: "Synchroniser le codebase",
+            },
+            ToolRef {
+                name: "get_project_roadmap",
+                description: "Roadmap avec milestones",
+            },
+            ToolRef {
+                name: "list_project_plans",
+                description: "Plans d'un projet",
+            },
+        ],
+    },
+    // ── Releases & Milestones (14 tools) ─────────────────────────────
+    ToolGroup {
+        name: "releases_milestones",
+        description: "Versions livrables et jalons",
+        keywords: &[
+            "release",
+            "milestone",
+            "version",
+            "livrable",
+            "jalon",
+            "livraison",
+            "déploiement",
+            "cible",
+        ],
+        tools: &[
+            ToolRef {
+                name: "create_release",
+                description: "Créer une release",
+            },
+            ToolRef {
+                name: "get_release",
+                description: "Détails d'une release",
+            },
+            ToolRef {
+                name: "update_release",
+                description: "Modifier une release",
+            },
+            ToolRef {
+                name: "delete_release",
+                description: "Supprimer une release",
+            },
+            ToolRef {
+                name: "list_releases",
+                description: "Releases d'un projet",
+            },
+            ToolRef {
+                name: "add_task_to_release",
+                description: "Lier tâche → release",
+            },
+            ToolRef {
+                name: "add_commit_to_release",
+                description: "Lier commit → release",
+            },
+            ToolRef {
+                name: "create_milestone",
+                description: "Créer un milestone",
+            },
+            ToolRef {
+                name: "get_milestone",
+                description: "Détails d'un milestone",
+            },
+            ToolRef {
+                name: "update_milestone",
+                description: "Modifier un milestone",
+            },
+            ToolRef {
+                name: "delete_milestone",
+                description: "Supprimer un milestone",
+            },
+            ToolRef {
+                name: "list_milestones",
+                description: "Milestones d'un projet",
+            },
+            ToolRef {
+                name: "get_milestone_progress",
+                description: "Progression d'un milestone",
+            },
+            ToolRef {
+                name: "add_task_to_milestone",
+                description: "Lier tâche → milestone",
+            },
+        ],
+    },
+    // ── Workspace (33 tools) ─────────────────────────────────────────
+    ToolGroup {
+        name: "workspace",
+        description: "Multi-projets, topologie, ressources partagées",
+        keywords: &[
+            "workspace",
+            "composant",
+            "ressource",
+            "topologie",
+            "service",
+            "multi-projet",
+            "cross-projet",
+            "contrat",
+            "API contract",
+        ],
+        tools: &[
+            ToolRef {
+                name: "list_workspaces",
+                description: "Lister les workspaces",
+            },
+            ToolRef {
+                name: "create_workspace",
+                description: "Créer un workspace",
+            },
+            ToolRef {
+                name: "get_workspace",
+                description: "Détails d'un workspace",
+            },
+            ToolRef {
+                name: "update_workspace",
+                description: "Modifier un workspace",
+            },
+            ToolRef {
+                name: "delete_workspace",
+                description: "Supprimer un workspace",
+            },
+            ToolRef {
+                name: "get_workspace_overview",
+                description: "Vue d'ensemble complète",
+            },
+            ToolRef {
+                name: "list_workspace_projects",
+                description: "Projets du workspace",
+            },
+            ToolRef {
+                name: "add_project_to_workspace",
+                description: "Ajouter un projet",
+            },
+            ToolRef {
+                name: "remove_project_from_workspace",
+                description: "Retirer un projet",
+            },
+            ToolRef {
+                name: "search_workspace_code",
+                description: "Recherche cross-projets",
+            },
+            ToolRef {
+                name: "list_workspace_milestones",
+                description: "Milestones cross-projets",
+            },
+            ToolRef {
+                name: "create_workspace_milestone",
+                description: "Créer milestone workspace",
+            },
+            ToolRef {
+                name: "get_workspace_milestone",
+                description: "Détails milestone workspace",
+            },
+            ToolRef {
+                name: "update_workspace_milestone",
+                description: "Modifier milestone workspace",
+            },
+            ToolRef {
+                name: "delete_workspace_milestone",
+                description: "Supprimer milestone workspace",
+            },
+            ToolRef {
+                name: "add_task_to_workspace_milestone",
+                description: "Lier tâche → ws milestone",
+            },
+            ToolRef {
+                name: "get_workspace_milestone_progress",
+                description: "Progression ws milestone",
+            },
+            ToolRef {
+                name: "list_all_workspace_milestones",
+                description: "Tous les ws milestones",
+            },
+            ToolRef {
+                name: "list_resources",
+                description: "Ressources partagées",
+            },
+            ToolRef {
+                name: "create_resource",
+                description: "Créer une ressource",
+            },
+            ToolRef {
+                name: "get_resource",
+                description: "Détails d'une ressource",
+            },
+            ToolRef {
+                name: "update_resource",
+                description: "Modifier une ressource",
+            },
+            ToolRef {
+                name: "delete_resource",
+                description: "Supprimer une ressource",
+            },
+            ToolRef {
+                name: "link_resource_to_project",
+                description: "Lier ressource → projet",
+            },
+            ToolRef {
+                name: "list_components",
+                description: "Composants du workspace",
+            },
+            ToolRef {
+                name: "create_component",
+                description: "Créer un composant",
+            },
+            ToolRef {
+                name: "get_component",
+                description: "Détails d'un composant",
+            },
+            ToolRef {
+                name: "update_component",
+                description: "Modifier un composant",
+            },
+            ToolRef {
+                name: "delete_component",
+                description: "Supprimer un composant",
+            },
+            ToolRef {
+                name: "add_component_dependency",
+                description: "Dépendance entre composants",
+            },
+            ToolRef {
+                name: "remove_component_dependency",
+                description: "Retirer dépendance composant",
+            },
+            ToolRef {
+                name: "map_component_to_project",
+                description: "Lier composant → projet",
+            },
+            ToolRef {
+                name: "get_workspace_topology",
+                description: "Graphe composants + dépendances",
+            },
+        ],
+    },
+    // ── Sync & Admin (6 tools) ───────────────────────────────────────
+    ToolGroup {
+        name: "sync_admin",
+        description: "Synchronisation code et administration",
+        keywords: &["sync", "watch", "watcher", "meilisearch", "index", "admin"],
+        tools: &[
+            ToolRef {
+                name: "sync_directory",
+                description: "Sync manuelle d'un répertoire",
+            },
+            ToolRef {
+                name: "start_watch",
+                description: "Démarrer le file watcher",
+            },
+            ToolRef {
+                name: "stop_watch",
+                description: "Arrêter le file watcher",
+            },
+            ToolRef {
+                name: "watch_status",
+                description: "Statut du file watcher",
+            },
+            ToolRef {
+                name: "get_meilisearch_stats",
+                description: "Stats de l'index Meilisearch",
+            },
+            ToolRef {
+                name: "delete_meilisearch_orphans",
+                description: "Nettoyer docs orphelins",
+            },
+        ],
+    },
+    // ── Chat (5 tools) ───────────────────────────────────────────────
+    ToolGroup {
+        name: "chat",
+        description: "Sessions de conversation et messages",
+        keywords: &["chat", "session", "conversation", "message", "historique"],
+        tools: &[
+            ToolRef {
+                name: "chat_send_message",
+                description: "Envoyer un message (non-streaming)",
+            },
+            ToolRef {
+                name: "list_chat_sessions",
+                description: "Lister les sessions chat",
+            },
+            ToolRef {
+                name: "get_chat_session",
+                description: "Détails d'une session",
+            },
+            ToolRef {
+                name: "delete_chat_session",
+                description: "Supprimer une session",
+            },
+            ToolRef {
+                name: "list_chat_messages",
+                description: "Historique des messages",
+            },
+        ],
+    },
+    // ── Feature Graphs (6 tools) ────────────────────────────────────
+    ToolGroup {
+        name: "feature_graphs",
+        description: "Sous-graphes de code par feature, réutilisables entre sessions",
+        keywords: &[
+            "feature",
+            "graphe",
+            "sous-graphe",
+            "subgraph",
+            "feature graph",
+            "exploration",
+            "call graph",
+            "auto-build",
+            "entité",
+        ],
+        tools: &[
+            ToolRef {
+                name: "create_feature_graph",
+                description: "Créer un feature graph nommé",
+            },
+            ToolRef {
+                name: "get_feature_graph",
+                description: "Détails avec entités incluses",
+            },
+            ToolRef {
+                name: "list_feature_graphs",
+                description: "Lister les feature graphs",
+            },
+            ToolRef {
+                name: "add_to_feature_graph",
+                description: "Ajouter une entité (file/function/struct)",
+            },
+            ToolRef {
+                name: "auto_build_feature_graph",
+                description: "Construire auto depuis un point d'entrée",
+            },
+            ToolRef {
+                name: "delete_feature_graph",
+                description: "Supprimer un feature graph",
+            },
+        ],
+    },
+];
+
+/// Total number of unique tools across all groups.
+/// Must match the MCP tools.rs count (currently 143).
+pub fn tool_catalog_tool_count() -> usize {
+    let mut names: Vec<&str> = TOOL_GROUPS
+        .iter()
+        .flat_map(|g| g.tools.iter().map(|t| t.name))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.len()
+}
+
+/// Serialize the full tool catalog to compact JSON for the oneshot Opus prompt.
+pub fn tools_catalog_to_json(groups: &[ToolGroup]) -> String {
+    let json_groups: Vec<serde_json::Value> = groups
+        .iter()
+        .map(|g| {
+            let tools: Vec<serde_json::Value> = g
+                .tools
+                .iter()
+                .map(|t| serde_json::json!({ "n": t.name, "d": t.description }))
+                .collect();
+            serde_json::json!({
+                "group": g.name,
+                "desc": g.description,
+                "tools": tools,
+            })
+        })
+        .collect();
+    serde_json::to_string(&json_groups).unwrap_or_default()
+}
+
+/// Format selected tool groups as concise markdown for injection into the system prompt.
+pub fn format_tool_groups_markdown(groups: &[&ToolGroup]) -> String {
+    let mut md = String::from("## Tools recommandés\n\n");
+    for group in groups {
+        md.push_str(&format!("### {}\n", group.description));
+        for tool in group.tools.iter() {
+            md.push_str(&format!("- `{}` — {}\n", tool.name, tool.description));
+        }
+        md.push('\n');
+    }
+    md
+}
+
+/// Keyword-based heuristic fallback for selecting tool groups when the oneshot Opus fails.
+/// Matches words in the user message against each group's keywords (case-insensitive).
+/// Always returns at least one group (`planning` + `code_exploration` as default).
+pub fn select_tool_groups_by_keywords(user_message: &str) -> Vec<&'static ToolGroup> {
+    let msg_lower = user_message.to_lowercase();
+    let words: Vec<&str> = msg_lower.split_whitespace().collect();
+
+    let mut matched: Vec<&'static ToolGroup> = TOOL_GROUPS
+        .iter()
+        .filter(|group| {
+            group
+                .keywords
+                .iter()
+                .any(|kw| words.iter().any(|w| w.contains(kw)))
+        })
+        .collect();
+
+    // Fallback: if nothing matched, return planning + code_exploration
+    if matched.is_empty() {
+        matched = TOOL_GROUPS
+            .iter()
+            .filter(|g| g.name == "planning" || g.name == "code_exploration")
+            .collect();
+    }
+
+    matched
+}
 
 use crate::neo4j::models::{
     ConnectedFileNode, ConstraintNode, LanguageStatsNode, MilestoneNode, PlanNode, ProjectNode,
@@ -280,6 +1171,9 @@ pub struct ProjectContext {
     pub plan_constraints: Vec<ConstraintNode>,
     pub guidelines: Vec<Note>,
     pub gotchas: Vec<Note>,
+    /// Global notes (no project_id) — cross-project knowledge
+    pub global_guidelines: Vec<Note>,
+    pub global_gotchas: Vec<Note>,
     pub milestones: Vec<MilestoneNode>,
     pub releases: Vec<ReleaseNode>,
     pub language_stats: Vec<LanguageStatsNode>,
@@ -364,6 +1258,33 @@ pub async fn fetch_project_context(
         .await
         .unwrap_or_default();
     ctx.gotchas = gotchas;
+
+    // 6b. Global guidelines (no project_id, cross-project knowledge)
+    let global_guideline_filters = NoteFilters {
+        note_type: Some(vec![NoteType::Guideline]),
+        importance: Some(vec![NoteImportance::Critical, NoteImportance::High]),
+        status: Some(vec![NoteStatus::Active]),
+        global_only: Some(true),
+        ..Default::default()
+    };
+    let (global_guidelines, _) = graph
+        .list_notes(None, &global_guideline_filters)
+        .await
+        .unwrap_or_default();
+    ctx.global_guidelines = global_guidelines;
+
+    // 6c. Global gotchas
+    let global_gotcha_filters = NoteFilters {
+        note_type: Some(vec![NoteType::Gotcha]),
+        status: Some(vec![NoteStatus::Active]),
+        global_only: Some(true),
+        ..Default::default()
+    };
+    let (global_gotchas, _) = graph
+        .list_notes(None, &global_gotcha_filters)
+        .await
+        .unwrap_or_default();
+    ctx.global_gotchas = global_gotchas;
 
     // 7. Milestones
     ctx.milestones = graph
@@ -477,6 +1398,29 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
         map.insert("gotchas".into(), serde_json::Value::Array(notes));
     }
 
+    if !ctx.global_guidelines.is_empty() {
+        let notes: Vec<_> = ctx
+            .global_guidelines
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "content": n.content,
+                    "importance": format!("{:?}", n.importance),
+                })
+            })
+            .collect();
+        map.insert("global_guidelines".into(), serde_json::Value::Array(notes));
+    }
+
+    if !ctx.global_gotchas.is_empty() {
+        let notes: Vec<_> = ctx
+            .global_gotchas
+            .iter()
+            .map(|n| serde_json::json!({ "content": n.content }))
+            .collect();
+        map.insert("global_gotchas".into(), serde_json::Value::Array(notes));
+    }
+
     if !ctx.milestones.is_empty() {
         let ms: Vec<_> = ctx
             .milestones
@@ -543,7 +1487,9 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
 
 /// Format ProjectContext as markdown for fallback (when oneshot fails).
 /// Only includes sections that have data.
-pub fn context_to_markdown(ctx: &ProjectContext) -> String {
+/// When `user_message` is provided, appends a "Tools recommandés" section
+/// selected by keyword heuristic matching.
+pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> String {
     let mut md = String::new();
 
     if let Some(ref p) = ctx.project {
@@ -593,6 +1539,23 @@ pub fn context_to_markdown(ctx: &ProjectContext) -> String {
     if !ctx.gotchas.is_empty() {
         md.push_str("## Gotchas\n");
         for g in &ctx.gotchas {
+            md.push_str(&format!("- {}\n", g.content));
+        }
+        md.push('\n');
+    }
+
+    // Global notes (cross-project knowledge)
+    if !ctx.global_guidelines.is_empty() {
+        md.push_str("## Guidelines globales\n");
+        for g in &ctx.global_guidelines {
+            md.push_str(&format!("- [{:?}] {}\n", g.importance, g.content));
+        }
+        md.push('\n');
+    }
+
+    if !ctx.global_gotchas.is_empty() {
+        md.push_str("## Gotchas globaux\n");
+        for g in &ctx.global_gotchas {
             md.push_str(&format!("- {}\n", g.content));
         }
         md.push('\n');
@@ -675,6 +1638,15 @@ pub fn context_to_markdown(ctx: &ProjectContext) -> String {
         }
     }
 
+    // Append keyword-matched tool groups when user message is available
+    if let Some(msg) = user_message {
+        if !msg.is_empty() {
+            let groups = select_tool_groups_by_keywords(msg);
+            let refs: Vec<&ToolGroup> = groups.into_iter().collect();
+            md.push_str(&format_tool_groups_markdown(&refs));
+        }
+    }
+
     md
 }
 
@@ -683,39 +1655,58 @@ pub fn context_to_markdown(ctx: &ProjectContext) -> String {
 // ============================================================================
 
 /// Build the prompt sent to the oneshot Opus model for context refinement.
-/// The oneshot analyzes the user's request + raw project context JSON and
-/// produces a concise "## Contexte actif" section (<500 words).
-pub fn build_refinement_prompt(user_message: &str, context_json: &str) -> String {
+/// The oneshot analyzes the user's request + raw project context JSON + tool catalog
+/// and produces a concise "## Contexte actif" section (<500 words) including recommended tools.
+pub fn build_refinement_prompt(
+    user_message: &str,
+    context_json: &str,
+    tools_catalog_json: &str,
+) -> String {
     format!(
         "Tu es un constructeur de contexte pour un agent de développement.\n\
          \n\
-         Voici la demande initiale de l'utilisateur :\n\
+         ## Demande de l'utilisateur\n\
          ---\n\
          {user_message}\n\
          ---\n\
          \n\
-         Voici les données du projet actif (JSON) :\n\
+         ## Données du projet actif (JSON)\n\
          ---\n\
          {context_json}\n\
          ---\n\
          \n\
-         Génère une section \"## Contexte actif\" concise et pertinente pour le prompt système\n\
-         de l'agent qui va traiter cette demande. Inclus UNIQUEMENT les informations utiles\n\
-         pour cette demande spécifique :\n\
+         ## Catalogue des outils MCP disponibles (JSON)\n\
+         ---\n\
+         {tools_catalog_json}\n\
+         ---\n\
          \n\
-         - Infos projet (nom, description, état du sync) si pertinent\n\
-         - Workspace parent si pertinent\n\
-         - Plans en cours avec leur progression si la demande touche à la planification ou l'exécution\n\
-         - Guidelines et gotchas pertinents à la demande\n\
-         - Contraintes actives si pertinent\n\
-         - Milestones/releases avec dates si la demande touche à la roadmap\n\
-         - Stats du code (langages, fichiers clés) si la demande touche au code\n\
-         - Avertissements (sync obsolète, notes à reviewer) si applicable\n\
+         Génère une section unique \"## Contexte actif\" pour le prompt système de l'agent.\n\
+         Cette section doit contenir EXACTEMENT deux parties :\n\
+         \n\
+         **1. Contexte projet** (seulement ce qui est pertinent pour la demande) :\n\
+         - Infos projet (nom, slug, état du sync)\n\
+         - Plans en cours si la demande touche à la planification\n\
+         - Guidelines et gotchas pertinents\n\
+         - Milestones/releases si la demande touche à la roadmap\n\
+         - Stats du code si la demande touche au code\n\
+         \n\
+         **2. Tools recommandés** : sélectionne les groupes d'outils pertinents\n\
+         pour cette demande spécifique dans le catalogue. Pour chaque groupe retenu,\n\
+         liste les outils sous forme `- \\`nom\\` — description`.\n\
+         Inclus TOUJOURS le groupe le plus pertinent. N'inclus PAS les groupes inutiles.\n\
+         Exemples :\n\
+         - Demande sur le code → code_exploration + knowledge\n\
+         - Demande de planification → planning + steps + constraints\n\
+         - Demande de débogage → code_exploration + knowledge + git_tracking\n\
+         - Demande générale/vague → planning + code_exploration\n\
          \n\
          Format : markdown, bullet points, court et actionnable.\n\
-         Ne dépasse pas 500 mots.",
+         Budget total : <500 mots (contexte + tools combinés).\n\
+         Arbitre : si le contexte projet est riche, réduis les descriptions de tools.\n\
+         Si le contexte est pauvre, détaille davantage les tools.",
         user_message = user_message,
         context_json = context_json,
+        tools_catalog_json = tools_catalog_json,
     )
 }
 
@@ -751,9 +1742,15 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains("Gestion des statuts"));
         assert!(BASE_SYSTEM_PROMPT.contains("Bonnes pratiques"));
         assert!(BASE_SYSTEM_PROMPT.contains("Stratégie de recherche"));
-        assert!(BASE_SYSTEM_PROMPT.contains("search_workspace_code"));
+        assert!(BASE_SYSTEM_PROMPT.contains("MCP-first"));
         assert!(BASE_SYSTEM_PROMPT.contains("path_prefix"));
         assert!(BASE_SYSTEM_PROMPT.contains("Sync incrémentale au commit"));
+        // T6 behavioral directives
+        assert!(BASE_SYSTEM_PROMPT.contains("Warm-up"));
+        assert!(BASE_SYSTEM_PROMPT.contains("search_notes"));
+        assert!(BASE_SYSTEM_PROMPT.contains("Capture des connaissances (OBLIGATOIRE)"));
+        assert!(BASE_SYSTEM_PROMPT.contains("create_note"));
+        assert!(BASE_SYSTEM_PROMPT.contains("link_note_to_entity"));
     }
 
     #[test]
@@ -812,7 +1809,7 @@ mod tests {
     #[test]
     fn test_context_to_markdown_empty() {
         let ctx = ProjectContext::default();
-        let md = context_to_markdown(&ctx);
+        let md = context_to_markdown(&ctx, None);
         assert!(md.is_empty());
     }
 
@@ -830,7 +1827,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let md = context_to_markdown(&ctx);
+        let md = context_to_markdown(&ctx, None);
         assert!(md.contains("MyProject"));
         assert!(md.contains("my-project"));
         assert!(md.contains("Aucun sync"));
@@ -854,7 +1851,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let md = context_to_markdown(&ctx);
+        let md = context_to_markdown(&ctx, None);
         assert!(md.contains("Partial"));
         assert!(md.contains("Rust"));
         assert!(md.contains("42 fichiers"));
@@ -866,9 +1863,20 @@ mod tests {
 
     #[test]
     fn test_build_refinement_prompt_contains_inputs() {
-        let prompt = build_refinement_prompt("Implémente le login", r#"{"project":"test"}"#);
+        let tools_json = tools_catalog_to_json(TOOL_GROUPS);
+        let prompt =
+            build_refinement_prompt("Implémente le login", r#"{"project":"test"}"#, &tools_json);
+        // User message & context JSON are injected
         assert!(prompt.contains("Implémente le login"));
         assert!(prompt.contains(r#"{"project":"test"}"#));
+        // Tools catalog JSON is injected
+        assert!(prompt.contains("planning"));
+        assert!(prompt.contains("code_exploration"));
+        assert!(prompt.contains("create_plan"));
+        // Instructions for Opus to select tool groups
+        assert!(prompt.contains("Tools recommandés"));
+        assert!(prompt.contains("groupes d'outils pertinents"));
+        // Budget constraint
         assert!(prompt.contains("500 mots"));
         assert!(prompt.contains("## Contexte actif"));
     }
@@ -946,5 +1954,287 @@ mod tests {
         assert!(ctx.project.is_some());
         assert!(!ctx.active_plans.is_empty());
         assert_eq!(ctx.active_plans[0].title, plan.title);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_project_context_includes_global_notes() {
+        use crate::notes::{NoteImportance, NoteType};
+        use crate::test_helpers::{mock_app_state, test_project};
+
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        // Create a project-specific guideline (must be Critical/High to be fetched)
+        let mut project_note = crate::notes::Note::new(
+            Some(project.id),
+            NoteType::Guideline,
+            "Project-specific guideline".to_string(),
+            "test".to_string(),
+        );
+        project_note.importance = NoteImportance::High;
+        state.neo4j.create_note(&project_note).await.unwrap();
+
+        // Create a global guideline (no project_id)
+        let mut global_note = crate::notes::Note::new(
+            None,
+            NoteType::Guideline,
+            "Global team convention".to_string(),
+            "test".to_string(),
+        );
+        global_note.importance = NoteImportance::Critical;
+        state.neo4j.create_note(&global_note).await.unwrap();
+
+        let ctx = fetch_project_context(&state.neo4j, &project.slug)
+            .await
+            .unwrap();
+
+        // Project guidelines include only project-specific ones
+        assert_eq!(ctx.guidelines.len(), 1);
+        assert_eq!(ctx.guidelines[0].content, "Project-specific guideline");
+
+        // Global guidelines include only global ones
+        assert_eq!(ctx.global_guidelines.len(), 1);
+        assert_eq!(ctx.global_guidelines[0].content, "Global team convention");
+    }
+
+    #[test]
+    fn test_context_to_markdown_with_global_notes() {
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "TestProj".into(),
+                slug: "test-proj".into(),
+                root_path: "/tmp".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: Some(Utc::now()),
+            }),
+            global_guidelines: vec![{
+                let mut n = crate::notes::Note::new(
+                    None,
+                    crate::notes::NoteType::Guideline,
+                    "Always write tests".to_string(),
+                    "test".to_string(),
+                );
+                n.importance = crate::notes::NoteImportance::Critical;
+                n
+            }],
+            global_gotchas: vec![crate::notes::Note::new(
+                None,
+                crate::notes::NoteType::Gotcha,
+                "Beware of circular deps".to_string(),
+                "test".to_string(),
+            )],
+            ..Default::default()
+        };
+        let md = context_to_markdown(&ctx, None);
+        assert!(md.contains("Guidelines globales"));
+        assert!(md.contains("Always write tests"));
+        assert!(md.contains("Gotchas globaux"));
+        assert!(md.contains("Beware of circular deps"));
+    }
+
+    // ================================================================
+    // Tool catalog tests
+    // ================================================================
+
+    #[test]
+    fn test_tool_groups_cover_all_143_tools() {
+        let count = tool_catalog_tool_count();
+        assert_eq!(
+            count, 143,
+            "TOOL_GROUPS must cover exactly 143 unique tools (got {}). \
+             Update the catalog when adding/removing MCP tools.",
+            count
+        );
+    }
+
+    #[test]
+    fn test_tool_groups_no_duplicates() {
+        let mut all_names: Vec<&str> = TOOL_GROUPS
+            .iter()
+            .flat_map(|g| g.tools.iter().map(|t| t.name))
+            .collect();
+        let total = all_names.len();
+        all_names.sort();
+        all_names.dedup();
+        assert_eq!(
+            all_names.len(),
+            total,
+            "Duplicate tool names found in TOOL_GROUPS"
+        );
+    }
+
+    #[test]
+    fn test_tool_groups_match_mcp_tools() {
+        let mcp_tools = crate::mcp::tools::all_tools();
+        let catalog_set: std::collections::HashSet<&str> = TOOL_GROUPS
+            .iter()
+            .flat_map(|g| g.tools.iter().map(|t| t.name))
+            .collect();
+        let mcp_set: std::collections::HashSet<String> =
+            mcp_tools.iter().map(|t| t.name.clone()).collect();
+
+        for tool in &mcp_tools {
+            assert!(
+                catalog_set.contains(tool.name.as_str()),
+                "MCP tool '{}' missing from TOOL_GROUPS catalog",
+                tool.name
+            );
+        }
+        for name in &catalog_set {
+            assert!(
+                mcp_set.contains(*name),
+                "Catalog tool '{}' not found in MCP all_tools()",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_groups_count() {
+        assert_eq!(TOOL_GROUPS.len(), 13, "Expected 13 tool groups");
+    }
+
+    #[test]
+    fn test_tool_groups_all_have_keywords_and_tools() {
+        for group in TOOL_GROUPS {
+            assert!(
+                !group.keywords.is_empty(),
+                "Group '{}' has no keywords",
+                group.name
+            );
+            assert!(
+                !group.tools.is_empty(),
+                "Group '{}' has no tools",
+                group.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_tools_catalog_to_json() {
+        let json = tools_catalog_to_json(TOOL_GROUPS);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), TOOL_GROUPS.len());
+        assert_eq!(parsed[0]["group"], "planning");
+        assert!(parsed[0]["tools"].as_array().unwrap().len() > 5);
+    }
+
+    #[test]
+    fn test_format_tool_groups_markdown() {
+        let groups: Vec<&ToolGroup> = vec![&TOOL_GROUPS[0], &TOOL_GROUPS[2]];
+        let md = format_tool_groups_markdown(&groups);
+        assert!(md.contains("## Tools recommandés"));
+        assert!(md.contains("create_plan"));
+        assert!(md.contains("search_code"));
+        assert!(!md.contains("create_note")); // knowledge group not included
+    }
+
+    // ================================================================
+    // select_tool_groups_by_keywords tests
+    // ================================================================
+
+    #[test]
+    fn test_select_tool_groups_planning_message() {
+        let groups = select_tool_groups_by_keywords("Je veux planifier une nouvelle feature");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(
+            names.contains(&"planning"),
+            "Expected planning group, got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_code_message() {
+        let groups =
+            select_tool_groups_by_keywords("Explore le code de la fonction handle_request");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(
+            names.contains(&"code_exploration"),
+            "Expected code_exploration, got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_knowledge_message() {
+        let groups = select_tool_groups_by_keywords("Crée une note gotcha pour ce pattern");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(
+            names.contains(&"knowledge"),
+            "Expected knowledge, got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_empty_message_fallback() {
+        let groups = select_tool_groups_by_keywords("bonjour comment ça va");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        // Fallback: planning + code_exploration
+        assert!(
+            names.contains(&"planning"),
+            "Fallback should include planning, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"code_exploration"),
+            "Fallback should include code_exploration, got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_mixed_message() {
+        let groups =
+            select_tool_groups_by_keywords("Planifie le refactoring du code et crée un commit");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(
+            names.contains(&"planning"),
+            "Expected planning, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"code_exploration"),
+            "Expected code_exploration, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"git_tracking"),
+            "Expected git_tracking, got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_always_returns_at_least_one() {
+        let groups = select_tool_groups_by_keywords("");
+        assert!(
+            !groups.is_empty(),
+            "Should always return at least one group"
+        );
+    }
+
+    #[test]
+    fn test_context_to_markdown_with_tools() {
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "TestProj".into(),
+                slug: "test-proj".into(),
+                root_path: "/tmp".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: Some(Utc::now()),
+            }),
+            ..Default::default()
+        };
+        let md = context_to_markdown(&ctx, Some("Explore le code"));
+        assert!(md.contains("TestProj"));
+        assert!(md.contains("## Tools recommandés"));
+        assert!(md.contains("search_code")); // code_exploration group
     }
 }
