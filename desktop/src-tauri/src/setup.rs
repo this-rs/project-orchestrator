@@ -217,12 +217,11 @@ fn random_secret(len: usize) -> String {
     (0..len)
         .map(|_| {
             let idx = rng.gen_range(0..62);
-            let c = match idx {
+            match idx {
                 0..=9 => (b'0' + idx) as char,
                 10..=35 => (b'a' + idx - 10) as char,
                 _ => (b'A' + idx - 36) as char,
-            };
-            c
+            }
         })
         .collect()
 }
@@ -881,7 +880,7 @@ pub async fn verify_oidc_discovery(url: String) -> Result<OidcDiscoveryResponse,
 /// 3. As a last resort, uses the discovery URL itself as both auth + token endpoint
 ///
 /// Returns `(auth_endpoint, token_endpoint, userinfo_endpoint, provider_name)`.
-
+///
 /// Detect a human-friendly provider name from a discovery/issuer URL.
 fn detect_provider_name(url: &str) -> String {
     let lower = url.to_lowercase();
@@ -926,7 +925,7 @@ fn resolve_oidc_endpoints(discovery_url: &str) -> (String, String, String, Strin
                         "Resolved OIDC endpoints from discovery: auth={}, token={}, userinfo={}",
                         auth, token, userinfo
                     );
-                    return (auth, token, userinfo, provider_name.into());
+                    return (auth, token, userinfo, provider_name);
                 }
             }
         }
@@ -949,7 +948,7 @@ fn resolve_oidc_endpoints(discovery_url: &str) -> (String, String, String, Strin
                 url.to_string(),
                 url.to_string(),
                 url.to_string(),
-                provider_name.into(),
+                provider_name,
             )
         }
     }

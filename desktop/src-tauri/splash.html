@@ -14,9 +14,9 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      background: linear-gradient(135deg, #4338ca 0%, #6366f1 50%, #7c3aed 100%);
+      background: #0f1117;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      color: white;
+      color: #f1f5f9;
       overflow: hidden;
       -webkit-user-select: none;
       user-select: none;
@@ -24,106 +24,67 @@
 
     .logo-container {
       position: relative;
-      width: 120px;
-      height: 120px;
-      margin-bottom: 32px;
+      width: 96px;
+      height: 96px;
+      margin-bottom: 28px;
     }
 
-    /* Animated graph network SVG */
-    .logo-svg {
-      width: 120px;
-      height: 120px;
-      animation: fadeInScale 0.6s ease-out;
-    }
-
-    .logo-svg .edge {
-      stroke: rgba(199, 210, 254, 0.4);
-      stroke-width: 2;
-      stroke-linecap: round;
-      animation: edgeDraw 1.2s ease-out forwards;
-      stroke-dasharray: 200;
-      stroke-dashoffset: 200;
-    }
-
-    .logo-svg .edge:nth-child(1) { animation-delay: 0.1s; }
-    .logo-svg .edge:nth-child(2) { animation-delay: 0.15s; }
-    .logo-svg .edge:nth-child(3) { animation-delay: 0.2s; }
-    .logo-svg .edge:nth-child(4) { animation-delay: 0.25s; }
-    .logo-svg .edge:nth-child(5) { animation-delay: 0.3s; }
-    .logo-svg .edge:nth-child(6) { animation-delay: 0.35s; }
-    .logo-svg .edge:nth-child(7) { animation-delay: 0.4s; }
-    .logo-svg .edge:nth-child(8) { animation-delay: 0.45s; }
-
-    .logo-svg .node {
+    .logo-icon {
+      width: 96px;
+      height: 96px;
       opacity: 0;
-      animation: nodeAppear 0.4s ease-out forwards;
+      animation: fadeInScale 0.5s ease-out 0.1s forwards;
     }
-
-    .logo-svg .node:nth-child(1) { animation-delay: 0.5s; }
-    .logo-svg .node:nth-child(2) { animation-delay: 0.55s; }
-    .logo-svg .node:nth-child(3) { animation-delay: 0.6s; }
-    .logo-svg .node:nth-child(4) { animation-delay: 0.65s; }
-    .logo-svg .node:nth-child(5) { animation-delay: 0.7s; }
-    .logo-svg .node:nth-child(6) { animation-delay: 0.75s; }
-    .logo-svg .center-node { animation-delay: 0.4s; }
 
     .title {
-      font-size: 22px;
+      font-size: 20px;
       font-weight: 600;
-      letter-spacing: -0.01em;
-      margin-bottom: 8px;
+      letter-spacing: -0.02em;
+      color: #f1f5f9;
+      margin-bottom: 6px;
       opacity: 0;
-      animation: fadeIn 0.5s ease-out 0.6s forwards;
+      animation: fadeIn 0.4s ease-out 0.4s forwards;
     }
 
     .subtitle {
       font-size: 13px;
-      color: rgba(255, 255, 255, 0.6);
+      color: #64748b;
       margin-bottom: 40px;
       opacity: 0;
-      animation: fadeIn 0.5s ease-out 0.8s forwards;
+      animation: fadeIn 0.4s ease-out 0.6s forwards;
     }
 
     /* Spinner */
     .spinner-container {
       opacity: 0;
-      animation: fadeIn 0.5s ease-out 1s forwards;
+      animation: fadeIn 0.4s ease-out 0.8s forwards;
     }
 
     .spinner {
-      width: 24px;
-      height: 24px;
-      border: 2.5px solid rgba(255, 255, 255, 0.15);
-      border-top-color: rgba(255, 255, 255, 0.8);
+      width: 22px;
+      height: 22px;
+      border: 2.5px solid rgba(99, 102, 241, 0.15);
+      border-top-color: #6366f1;
       border-radius: 50%;
-      animation: spin 0.8s linear infinite;
+      animation: spin 0.7s linear infinite;
     }
 
     .status {
-      margin-top: 16px;
+      margin-top: 14px;
       font-size: 11px;
-      color: rgba(255, 255, 255, 0.4);
+      color: #475569;
       opacity: 0;
-      animation: fadeIn 0.5s ease-out 1.2s forwards;
+      animation: fadeIn 0.4s ease-out 1s forwards;
     }
 
     @keyframes fadeInScale {
-      from { opacity: 0; transform: scale(0.8); }
+      from { opacity: 0; transform: scale(0.85); }
       to { opacity: 1; transform: scale(1); }
     }
 
     @keyframes fadeIn {
       from { opacity: 0; transform: translateY(4px); }
       to { opacity: 1; transform: translateY(0); }
-    }
-
-    @keyframes edgeDraw {
-      to { stroke-dashoffset: 0; }
-    }
-
-    @keyframes nodeAppear {
-      from { opacity: 0; transform: scale(0); }
-      to { opacity: 1; transform: scale(1); }
     }
 
     @keyframes spin {
@@ -133,30 +94,13 @@
 </head>
 <body>
   <div class="logo-container">
-    <svg class="logo-svg" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <!-- Edges -->
-      <g>
-        <line class="edge" x1="60" y1="52" x2="30" y2="30"/>
-        <line class="edge" x1="60" y1="52" x2="90" y2="30"/>
-        <line class="edge" x1="60" y1="52" x2="22" y2="62"/>
-        <line class="edge" x1="60" y1="52" x2="98" y2="62"/>
-        <line class="edge" x1="60" y1="52" x2="36" y2="86"/>
-        <line class="edge" x1="60" y1="52" x2="84" y2="86"/>
-        <line class="edge" x1="30" y1="30" x2="90" y2="30"/>
-        <line class="edge" x1="36" y1="86" x2="84" y2="86"/>
-      </g>
-      <!-- Outer nodes -->
-      <g>
-        <circle class="node" cx="30" cy="30" r="6" fill="rgba(224,231,255,0.9)"/>
-        <circle class="node" cx="90" cy="30" r="6" fill="rgba(224,231,255,0.9)"/>
-        <circle class="node" cx="22" cy="62" r="5" fill="rgba(224,231,255,0.85)"/>
-        <circle class="node" cx="98" cy="62" r="5" fill="rgba(224,231,255,0.85)"/>
-        <circle class="node" cx="36" cy="86" r="5" fill="rgba(224,231,255,0.8)"/>
-        <circle class="node" cx="84" cy="86" r="5" fill="rgba(224,231,255,0.8)"/>
-      </g>
-      <!-- Center node -->
-      <circle class="node center-node" cx="60" cy="52" r="10" fill="white"/>
-      <polygon class="node center-node" points="57,45 57,59 67,52" fill="#4338ca" opacity="0.7"/>
+    <!-- App icon: indigo rounded square with 4-grid pattern -->
+    <svg class="logo-icon" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect x="8" y="8" width="80" height="80" rx="18" fill="#6366f1"/>
+      <rect x="20" y="20" width="24" height="24" rx="6" fill="white"/>
+      <rect x="52" y="20" width="24" height="24" rx="6" fill="white"/>
+      <rect x="20" y="52" width="24" height="24" rx="6" fill="white"/>
+      <rect x="52" y="52" width="24" height="24" rx="6" fill="white"/>
     </svg>
   </div>
   <div class="title">Project Orchestrator</div>
