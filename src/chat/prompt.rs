@@ -620,6 +620,34 @@ pub fn format_tool_groups_markdown(groups: &[&ToolGroup]) -> String {
     md
 }
 
+/// Keyword-based heuristic fallback for selecting tool groups when the oneshot Opus fails.
+/// Matches words in the user message against each group's keywords (case-insensitive).
+/// Always returns at least one group (`planning` + `code_exploration` as default).
+pub fn select_tool_groups_by_keywords(user_message: &str) -> Vec<&'static ToolGroup> {
+    let msg_lower = user_message.to_lowercase();
+    let words: Vec<&str> = msg_lower.split_whitespace().collect();
+
+    let mut matched: Vec<&'static ToolGroup> = TOOL_GROUPS
+        .iter()
+        .filter(|group| {
+            group
+                .keywords
+                .iter()
+                .any(|kw| words.iter().any(|w| w.contains(kw)))
+        })
+        .collect();
+
+    // Fallback: if nothing matched, return planning + code_exploration
+    if matched.is_empty() {
+        matched = TOOL_GROUPS
+            .iter()
+            .filter(|g| g.name == "planning" || g.name == "code_exploration")
+            .collect();
+    }
+
+    matched
+}
+
 use crate::neo4j::models::{
     ConnectedFileNode, ConstraintNode, LanguageStatsNode, MilestoneNode, PlanNode, ProjectNode,
     ReleaseNode, WorkspaceNode,
@@ -904,7 +932,9 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
 
 /// Format ProjectContext as markdown for fallback (when oneshot fails).
 /// Only includes sections that have data.
-pub fn context_to_markdown(ctx: &ProjectContext) -> String {
+/// When `user_message` is provided, appends a "Tools recommandés" section
+/// selected by keyword heuristic matching.
+pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> String {
     let mut md = String::new();
 
     if let Some(ref p) = ctx.project {
@@ -1033,6 +1063,15 @@ pub fn context_to_markdown(ctx: &ProjectContext) -> String {
             None => {
                 md.push_str("⚠️ **Aucun sync** — le code n'a jamais été synchronisé. Lance `sync_project` avant d'explorer le code.\n\n");
             }
+        }
+    }
+
+    // Append keyword-matched tool groups when user message is available
+    if let Some(msg) = user_message {
+        if !msg.is_empty() {
+            let groups = select_tool_groups_by_keywords(msg);
+            let refs: Vec<&ToolGroup> = groups.into_iter().collect();
+            md.push_str(&format_tool_groups_markdown(&refs));
         }
     }
 
@@ -1198,7 +1237,7 @@ mod tests {
     #[test]
     fn test_context_to_markdown_empty() {
         let ctx = ProjectContext::default();
-        let md = context_to_markdown(&ctx);
+        let md = context_to_markdown(&ctx, None);
         assert!(md.is_empty());
     }
 
@@ -1216,7 +1255,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let md = context_to_markdown(&ctx);
+        let md = context_to_markdown(&ctx, None);
         assert!(md.contains("MyProject"));
         assert!(md.contains("my-project"));
         assert!(md.contains("Aucun sync"));
@@ -1240,7 +1279,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let md = context_to_markdown(&ctx);
+        let md = context_to_markdown(&ctx, None);
         assert!(md.contains("Partial"));
         assert!(md.contains("Rust"));
         assert!(md.contains("42 fichiers"));
@@ -1435,5 +1474,74 @@ mod tests {
         assert!(md.contains("create_plan"));
         assert!(md.contains("search_code"));
         assert!(!md.contains("create_note")); // knowledge group not included
+    }
+
+    // ================================================================
+    // select_tool_groups_by_keywords tests
+    // ================================================================
+
+    #[test]
+    fn test_select_tool_groups_planning_message() {
+        let groups = select_tool_groups_by_keywords("Je veux planifier une nouvelle feature");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(names.contains(&"planning"), "Expected planning group, got {:?}", names);
+    }
+
+    #[test]
+    fn test_select_tool_groups_code_message() {
+        let groups = select_tool_groups_by_keywords("Explore le code de la fonction handle_request");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(names.contains(&"code_exploration"), "Expected code_exploration, got {:?}", names);
+    }
+
+    #[test]
+    fn test_select_tool_groups_knowledge_message() {
+        let groups = select_tool_groups_by_keywords("Crée une note gotcha pour ce pattern");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(names.contains(&"knowledge"), "Expected knowledge, got {:?}", names);
+    }
+
+    #[test]
+    fn test_select_tool_groups_empty_message_fallback() {
+        let groups = select_tool_groups_by_keywords("bonjour comment ça va");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        // Fallback: planning + code_exploration
+        assert!(names.contains(&"planning"), "Fallback should include planning, got {:?}", names);
+        assert!(names.contains(&"code_exploration"), "Fallback should include code_exploration, got {:?}", names);
+    }
+
+    #[test]
+    fn test_select_tool_groups_mixed_message() {
+        let groups = select_tool_groups_by_keywords("Planifie le refactoring du code et crée un commit");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(names.contains(&"planning"), "Expected planning, got {:?}", names);
+        assert!(names.contains(&"code_exploration"), "Expected code_exploration, got {:?}", names);
+        assert!(names.contains(&"git_tracking"), "Expected git_tracking, got {:?}", names);
+    }
+
+    #[test]
+    fn test_select_tool_groups_always_returns_at_least_one() {
+        let groups = select_tool_groups_by_keywords("");
+        assert!(!groups.is_empty(), "Should always return at least one group");
+    }
+
+    #[test]
+    fn test_context_to_markdown_with_tools() {
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "TestProj".into(),
+                slug: "test-proj".into(),
+                root_path: "/tmp".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: Some(Utc::now()),
+            }),
+            ..Default::default()
+        };
+        let md = context_to_markdown(&ctx, Some("Explore le code"));
+        assert!(md.contains("TestProj"));
+        assert!(md.contains("## Tools recommandés"));
+        assert!(md.contains("search_code")); // code_exploration group
     }
 }

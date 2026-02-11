@@ -603,7 +603,7 @@ impl ChatManager {
                     "Oneshot context refinement failed: {} — using markdown fallback",
                     e
                 );
-                context_to_markdown(&ctx)
+                context_to_markdown(&ctx, Some(user_message))
             }
         };
 
