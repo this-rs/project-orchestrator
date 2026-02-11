@@ -105,6 +105,15 @@ Workspace
 
 ## 4. Protocole d'exécution de tâche
 
+### Phase 0 — Warm-up (OBLIGATOIRE au début de chaque conversation)
+
+Avant tout travail, charger les connaissances pertinentes :
+1. `search_notes(query)` — chercher les notes liées au sujet de la demande
+2. `get_context_notes(entity_type, entity_id)` — notes contextuelles pour les fichiers/fonctions concernés
+3. `search_decisions(query)` — décisions architecturales passées sur le sujet
+
+Cela évite de refaire un travail déjà documenté ou de violer une convention déjà établie.
+
 ### Phase 1 — Préparation
 
 1. `get_next_task(plan_id)` — récupérer la prochaine tâche non bloquée (priorité la plus haute)
@@ -215,37 +224,69 @@ Exemple de décomposition correcte :
 - `get_file_dependencies(file_path)` → imports et dépendants
 - `get_context_notes(entity_type, entity_id)` → notes pertinentes (guidelines, gotchas...)
 
-### Stratégie de recherche
+### Stratégie de recherche — MCP-first (OBLIGATOIRE)
 
-Choisir le bon outil selon le besoin :
-- **Recherche sémantique** (concept, nom approché) → `search_code(query)` / `search_project_code(slug, query)` — MeiliSearch, cross-fichier, ranking par pertinence
-- **Usages d'un symbole** → `find_references(symbol)` — graphe Neo4j, résolution des imports, plus fiable que grep
-- **Graphe d'appels** → `get_call_graph(function)` — qui appelle cette fonction et qui elle appelle
-- **Impact d'une modification** → `analyze_impact(target)` — fichiers et symboles dépendants
-- **Vue d'ensemble** → `get_architecture(project_slug?)` — fichiers les plus connectés, stats langages
-- **String exacte / regex** → grep/find de Claude Code — quand on cherche une chaîne littérale précise
+**Règle absolue** : TOUJOURS utiliser les outils MCP d'exploration de code EN PREMIER.
+N'utiliser Grep/Read/Glob qu'en dernier recours pour des chaînes littérales exactes.
 
-Préférer les outils MeiliSearch pour les recherches exploratoires et cross-fichier.
+Hiérarchie de recherche (du plus recommandé au moins recommandé) :
 
-### Exploration du code
+1. **Recherche exploratoire** → `search_code(query)` / `search_project_code(slug, query)`
+   - Recherche sémantique MeiliSearch, cross-fichier, ranking par pertinence
+   - Supporte `path_prefix` pour filtrer un sous-répertoire
+   - **Utilise ceci au lieu de** : Grep pour chercher un concept, Task(Explore) pour explorer
 
-- `search_code(query, project_slug?, path_prefix?)` — recherche sémantique, filtrable par projet et répertoire
-- `search_project_code(slug, query, path_prefix?)` — recherche scopée à un projet
-- `search_workspace_code(workspace_slug, query)` — recherche cross-projets dans un workspace
-- `get_file_symbols(file_path)` → fonctions, structs, traits du fichier
-- `find_references(symbol)` → tous les usages d'un symbole
-- `get_call_graph(function)` → graphe d'appels
-- `find_trait_implementations(trait_name)` → implémentations
-- `get_architecture(project_slug?)` → vue d'ensemble (filtrable par projet)
+2. **Usages d'un symbole** → `find_references(symbol)`
+   - Résolution via le graphe Neo4j (imports, exports, appels)
+   - Plus fiable que grep car comprend la structure du code
+   - **Utilise ceci au lieu de** : Grep pour "où est utilisé X"
 
-### Capture des connaissances
+3. **Comprendre un flux** → `get_call_graph(function)`
+   - Qui appelle cette fonction ? Qui elle appelle ?
+   - **Utilise ceci au lieu de** : lire manuellement chaque fichier
 
-- **Notes** : créer quand on découvre une guideline, un gotcha, un pattern
-  - Toujours lier via `link_note_to_entity(note_id, entity_type, entity_id)`
-  - Choisir le bon type et la bonne importance
-- **Décisions** : à chaque choix architectural
-  - Documenter les alternatives considérées + la raison du choix
-  - `add_decision(task_id, description, rationale, alternatives, chosen_option)`
+4. **Avant de modifier** → `analyze_impact(target)`
+   - Fichiers et symboles affectés par un changement
+   - **Utilise ceci au lieu de** : deviner quels fichiers sont impactés
+
+5. **Vue d'ensemble** → `get_architecture(project_slug?)`
+   - Fichiers les plus connectés, stats langages, structure du projet
+   - **Utilise ceci au lieu de** : parcourir manuellement l'arborescence
+
+6. **Symboles d'un fichier** → `get_file_symbols(file_path)`
+   - Toutes les fonctions, structs, traits, enums d'un fichier
+   - **Utilise ceci au lieu de** : lire tout le fichier pour trouver les définitions
+
+7. **Types et traits** → `find_trait_implementations(trait)` / `find_type_traits(type)` / `get_impl_blocks(type)`
+   - Naviguer le système de types via le graphe
+
+8. **Dernier recours** → Grep/Read de Claude Code
+   - UNIQUEMENT pour des chaînes littérales exactes (messages d'erreur, constantes, URLs)
+   - UNIQUEMENT si les outils MCP ci-dessus ne retournent pas de résultat pertinent
+
+### Capture des connaissances (OBLIGATOIRE)
+
+**Règle absolue** : L'agent DOIT créer des notes pour capitaliser les connaissances découvertes.
+Ne JAMAIS terminer une session sans avoir capturé les apprentissages importants.
+
+**Quand créer une note :**
+- Après avoir résolu un bug → `create_note(type: "gotcha", importance: "high")` avec la cause racine et la solution
+- Après avoir découvert un pattern architectural → `create_note(type: "pattern")` avec l'explication
+- Après avoir identifié une convention → `create_note(type: "guideline")` avec la règle
+- Après avoir trouvé un piège/subtilité → `create_note(type: "gotcha")` avec l'avertissement
+- Après avoir trouvé une astuce utile → `create_note(type: "tip")` avec l'explication
+
+**TOUJOURS** lier la note à l'entité concernée :
+```
+create_note(project_id, type, content, importance, tags)
+→ note_id
+link_note_to_entity(note_id, "file", "src/chat/manager.rs")
+link_note_to_entity(note_id, "function", "build_system_prompt")
+```
+
+**Décisions architecturales** : à chaque choix non trivial
+- Documenter les alternatives considérées + la raison du choix
+- `add_decision(task_id, description, rationale, alternatives, chosen_option)`
 
 ### Workspace (multi-projets)
 
@@ -1090,9 +1131,15 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains("Gestion des statuts"));
         assert!(BASE_SYSTEM_PROMPT.contains("Bonnes pratiques"));
         assert!(BASE_SYSTEM_PROMPT.contains("Stratégie de recherche"));
-        assert!(BASE_SYSTEM_PROMPT.contains("search_workspace_code"));
+        assert!(BASE_SYSTEM_PROMPT.contains("MCP-first"));
         assert!(BASE_SYSTEM_PROMPT.contains("path_prefix"));
         assert!(BASE_SYSTEM_PROMPT.contains("Sync incrémentale au commit"));
+        // T6 behavioral directives
+        assert!(BASE_SYSTEM_PROMPT.contains("Warm-up"));
+        assert!(BASE_SYSTEM_PROMPT.contains("search_notes"));
+        assert!(BASE_SYSTEM_PROMPT.contains("Capture des connaissances (OBLIGATOIRE)"));
+        assert!(BASE_SYSTEM_PROMPT.contains("create_note"));
+        assert!(BASE_SYSTEM_PROMPT.contains("link_note_to_entity"));
     }
 
     #[test]
