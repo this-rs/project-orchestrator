@@ -841,6 +841,34 @@ neo4j:
         assert!(config.auth.is_none());
     }
 
+    /// No config file → setup_completed defaults to false (needs setup wizard).
+    /// With a config.yaml that omits the field → serde default = true (backward compat).
+    #[test]
+    fn test_setup_completed_defaults() {
+        // derive(Default) → false: no config file means setup wizard needed
+        let no_config = YamlConfig::default();
+        assert!(
+            !no_config.setup_completed,
+            "Without config.yaml, setup_completed must be false (needs setup)"
+        );
+
+        // serde default → true: existing config.yaml without the field is already set up
+        let yaml = "server:\n  port: 9090\n";
+        let parsed: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            parsed.setup_completed,
+            "Existing config.yaml missing the field should default to true (backward compat)"
+        );
+
+        // Explicit false in config.yaml → respected
+        let yaml_explicit = "setup_completed: false\n";
+        let parsed_explicit: YamlConfig = serde_yaml::from_str(yaml_explicit).unwrap();
+        assert!(
+            !parsed_explicit.setup_completed,
+            "Explicit setup_completed: false must be respected"
+        );
+    }
+
     #[test]
     fn test_jwt_expiry_default() {
         let yaml = r#"
