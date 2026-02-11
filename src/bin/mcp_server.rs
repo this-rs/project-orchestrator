@@ -161,7 +161,10 @@ async fn main() -> Result<()> {
                 Some(emitter)
             }
             Err(e) => {
-                warn!("Failed to connect to NATS: {} — events will not be forwarded", e);
+                warn!(
+                    "Failed to connect to NATS: {} — events will not be forwarded",
+                    e
+                );
                 None
             }
         }
@@ -201,7 +204,12 @@ async fn main() -> Result<()> {
     };
 
     // Create ChatManager
-    let chat_config = ChatConfig::from_env();
+    let mut chat_config = ChatConfig::from_env();
+    // Forward resolved NATS URL so nested MCP servers (spawned by chat
+    // sessions) also get the NATS connection for event sync.
+    if chat_config.nats_url.is_none() {
+        chat_config.nats_url = resolved_nats_url.clone();
+    }
     let mut cm = ChatManager::new(
         orchestrator.neo4j_arc(),
         orchestrator.meili_arc(),

@@ -21,6 +21,8 @@ pub struct ChatConfig {
     /// Meilisearch connection details for MCP server env
     pub meilisearch_url: String,
     pub meilisearch_key: String,
+    /// NATS URL for inter-process event sync (MCP ↔ desktop)
+    pub nats_url: Option<String>,
     /// Maximum number of agentic turns (tool calls) per message
     pub max_turns: i32,
     /// Model used for the oneshot prompt builder (context refinement)
@@ -55,6 +57,7 @@ impl ChatConfig {
                 .unwrap_or_else(|_| "http://localhost:7700".into()),
             meilisearch_key: std::env::var("MEILISEARCH_KEY")
                 .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
+            nats_url: std::env::var("NATS_URL").ok(),
             max_turns: std::env::var("CHAT_MAX_TURNS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -85,16 +88,25 @@ impl ChatConfig {
 
     /// Build the MCP server config JSON for ClaudeCodeOptions
     pub fn mcp_server_config(&self) -> serde_json::Value {
+        let mut env = serde_json::json!({
+            "NEO4J_URI": self.neo4j_uri,
+            "NEO4J_USER": self.neo4j_user,
+            "NEO4J_PASSWORD": self.neo4j_password,
+            "MEILISEARCH_URL": self.meilisearch_url,
+            "MEILISEARCH_KEY": self.meilisearch_key
+        });
+
+        // Forward NATS_URL so the spawned MCP server can sync events back
+        // to the desktop app. Without this, CRUD events from chat sessions
+        // are invisible to the UI when launched from the macOS dock.
+        if let Some(ref nats_url) = self.nats_url {
+            env["NATS_URL"] = serde_json::Value::String(nats_url.clone());
+        }
+
         serde_json::json!({
             "project-orchestrator": {
                 "command": self.mcp_server_path.to_string_lossy(),
-                "env": {
-                    "NEO4J_URI": self.neo4j_uri,
-                    "NEO4J_USER": self.neo4j_user,
-                    "NEO4J_PASSWORD": self.neo4j_password,
-                    "MEILISEARCH_URL": self.meilisearch_url,
-                    "MEILISEARCH_KEY": self.meilisearch_key
-                }
+                "env": env
             }
         })
     }
@@ -122,6 +134,7 @@ mod tests {
             neo4j_password: "test".into(),
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "test-key".into(),
+            nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
         };
@@ -190,6 +203,7 @@ mod tests {
             neo4j_password: "pass".into(),
             meilisearch_url: "http://localhost:7700".into(),
             meilisearch_key: "key".into(),
+            nats_url: Some("nats://localhost:4222".into()),
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
         };
@@ -198,5 +212,30 @@ mod tests {
         let server = &json["project-orchestrator"];
         assert_eq!(server["command"], "/path/to/mcp_server");
         assert_eq!(server["env"]["NEO4J_URI"], "bolt://localhost:7687");
+        assert_eq!(server["env"]["NATS_URL"], "nats://localhost:4222");
+    }
+
+    #[test]
+    fn test_mcp_server_config_without_nats() {
+        let config = ChatConfig {
+            mcp_server_path: PathBuf::from("/path/to/mcp_server"),
+            default_model: "claude-opus-4-6".into(),
+            max_sessions: 10,
+            session_timeout: Duration::from_secs(1800),
+            neo4j_uri: "bolt://localhost:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "pass".into(),
+            meilisearch_url: "http://localhost:7700".into(),
+            meilisearch_key: "key".into(),
+            nats_url: None,
+            max_turns: 10,
+            prompt_builder_model: "claude-opus-4-6".into(),
+        };
+
+        let json = config.mcp_server_config();
+        let server = &json["project-orchestrator"];
+        assert_eq!(server["command"], "/path/to/mcp_server");
+        // NATS_URL should not be present when not configured
+        assert!(server["env"]["NATS_URL"].is_null());
     }
 }
