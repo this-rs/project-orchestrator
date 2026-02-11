@@ -984,6 +984,65 @@ server:
         clear_env();
     }
 
+    /// Explicit config path (--config flag) bypasses the platform-specific
+    /// auto-detect order. This is the core guarantee: when a user passes
+    /// `--config ./config.yaml`, they get THAT file regardless of what
+    /// exists in ~/Library/Application Support/.
+    #[test]
+    fn test_explicit_config_path_bypasses_auto_detect() {
+        fn clear_env() {
+            for var in &[
+                "NEO4J_URI",
+                "NEO4J_USER",
+                "NEO4J_PASSWORD",
+                "MEILISEARCH_URL",
+                "MEILISEARCH_KEY",
+                "WORKSPACE_PATH",
+                "SERVER_PORT",
+                "SERVE_FRONTEND",
+                "FRONTEND_PATH",
+            ] {
+                std::env::remove_var(var);
+            }
+        }
+
+        clear_env();
+
+        // Create two config files with distinct values
+        let dir_a = tempfile::tempdir().unwrap();
+        let path_a = dir_a.path().join("config.yaml");
+        std::fs::write(
+            &path_a,
+            "server:\n  port: 1111\nneo4j:\n  uri: bolt://host-a:7687\n",
+        )
+        .unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let path_b = dir_b.path().join("config.yaml");
+        std::fs::write(
+            &path_b,
+            "server:\n  port: 2222\nneo4j:\n  uri: bolt://host-b:7687\n",
+        )
+        .unwrap();
+
+        // Explicit path_a → loads path_a values
+        let config_a = Config::from_yaml_and_env(Some(&path_a)).unwrap();
+        assert_eq!(config_a.server_port, 1111);
+        assert_eq!(config_a.neo4j_uri, "bolt://host-a:7687");
+
+        // Explicit path_b → loads path_b values (not path_a)
+        let config_b = Config::from_yaml_and_env(Some(&path_b)).unwrap();
+        assert_eq!(config_b.server_port, 2222);
+        assert_eq!(config_b.neo4j_uri, "bolt://host-b:7687");
+
+        // Explicit path to non-existent file → falls back to defaults (not auto-detect)
+        let bogus = dir_a.path().join("does-not-exist.yaml");
+        let config_default = Config::from_yaml_and_env(Some(&bogus)).unwrap();
+        assert_eq!(config_default.server_port, 8080); // default, not from path_a or path_b
+
+        clear_env();
+    }
+
     // ========================================================================
     // New auth config format tests
     // ========================================================================

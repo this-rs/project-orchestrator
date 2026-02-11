@@ -5,12 +5,17 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use project_orchestrator::{orchestrator::Orchestrator, setup_claude, update, AppState, Config};
+use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "orchestrator")]
 #[command(about = "AI Agent Orchestrator Server")]
 struct Cli {
+    /// Path to config.yaml (default: auto-detect)
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -74,8 +79,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Load configuration
-    let mut config = Config::from_env()?;
+    // Load configuration — explicit --config path wins, otherwise auto-detect
+    let mut config = Config::from_yaml_and_env(cli.config.as_deref())?;
 
     match cli.command {
         Commands::Serve {
