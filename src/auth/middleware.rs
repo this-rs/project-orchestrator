@@ -51,14 +51,11 @@ pub async fn require_auth(
     let claims = decode_jwt(token, &auth_config.jwt_secret)
         .map_err(|e| AppError::Unauthorized(format!("Invalid token: {}", e)))?;
 
-    // 4. Check allowed email domain (if configured)
-    if let Some(ref domain) = auth_config.allowed_email_domain {
-        if !claims.email.ends_with(&format!("@{}", domain)) {
-            return Err(AppError::Forbidden(format!(
-                "Email domain not allowed (expected @{})",
-                domain
-            )));
-        }
+    // 4. Check email restrictions (domain + individual whitelist)
+    if !auth_config.is_email_allowed(&claims.email) {
+        return Err(AppError::Forbidden(
+            "Email not allowed by server policy".to_string(),
+        ));
     }
 
     // 5. Inject claims into request extensions
@@ -95,6 +92,7 @@ mod tests {
             jwt_secret: TEST_SECRET.to_string(),
             jwt_expiry_secs: 3600,
             allowed_email_domain: None,
+            allowed_emails: None,
             frontend_url: None,
             allow_registration: false,
             root_account: None,

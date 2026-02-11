@@ -73,6 +73,7 @@ pub fn test_auth_config() -> AuthConfig {
         jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
         jwt_expiry_secs: 28800,
         allowed_email_domain: None,
+        allowed_emails: None,
         frontend_url: None,
         allow_registration: false,
         root_account: None,

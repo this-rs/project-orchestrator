@@ -56,6 +56,10 @@ pub struct YamlConfig {
     /// Defaults to true for backward compat (existing config.yaml files without this field).
     #[serde(default = "default_true")]
     pub setup_completed: bool,
+    /// Infrastructure mode: "docker" or "external". Persisted by the setup wizard
+    /// so reconfigure mode can restore the exact wizard state.
+    #[serde(default)]
+    pub infra_mode: Option<String>,
     pub server: ServerYamlConfig,
     pub neo4j: Neo4jYamlConfig,
     pub meilisearch: MeilisearchYamlConfig,
@@ -79,6 +83,10 @@ pub struct ServerYamlConfig {
     pub serve_frontend: bool,
     /// Path to the frontend dist/ directory (default: "./dist")
     pub frontend_path: String,
+    /// Public URL for reverse-proxy setups (e.g. https://po.ffs.dev).
+    /// Used for frontend_url, redirect_uri, and CORS when present.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 impl Default for ServerYamlConfig {
@@ -88,6 +96,7 @@ impl Default for ServerYamlConfig {
             workspace_path: ".".into(),
             serve_frontend: true,
             frontend_path: "./dist".into(),
+            public_url: None,
         }
     }
 }
@@ -170,6 +179,10 @@ pub struct AuthConfig {
     pub jwt_expiry_secs: u64,
     /// Optional domain restriction (e.g. "ffs.holdings")
     pub allowed_email_domain: Option<String>,
+    /// Optional list of individually whitelisted emails (e.g. ["alice@gmail.com", "bob@ext.com"]).
+    /// An email is allowed if it matches `allowed_email_domain` OR is in `allowed_emails`.
+    #[serde(default)]
+    pub allowed_emails: Option<Vec<String>>,
     /// Frontend URL for CORS and redirects (e.g. "http://localhost:3000")
     pub frontend_url: Option<String>,
     /// Allow new user registration via POST /auth/register (default: false)
@@ -216,6 +229,9 @@ pub struct RootAccountConfig {
 /// Works with any OIDC-compliant provider: Google, Microsoft, Okta, Keycloak, etc.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OidcConfig {
+    /// Provider key for the frontend wizard (google, microsoft, okta, auth0, keycloak, custom).
+    /// Persisted so reconfigure mode can restore the exact provider selection.
+    pub provider_key: Option<String>,
     /// OIDC discovery URL (e.g. "https://accounts.google.com/.well-known/openid-configuration").
     /// If provided, `auth_endpoint` and `token_endpoint` are fetched automatically.
     pub discovery_url: Option<String>,
@@ -273,6 +289,7 @@ impl AuthConfig {
         ) {
             (Some(client_id), Some(client_secret), Some(redirect_uri)) if !client_id.is_empty() => {
                 Some(OidcConfig {
+                    provider_key: Some("google".to_string()),
                     discovery_url: None,
                     auth_endpoint: Some(GOOGLE_AUTH_ENDPOINT.to_string()),
                     token_endpoint: Some(GOOGLE_TOKEN_ENDPOINT.to_string()),
@@ -296,6 +313,44 @@ impl AuthConfig {
     /// Returns true if OIDC authentication is available (explicit or legacy Google).
     pub fn has_oidc(&self) -> bool {
         self.effective_oidc().is_some()
+    }
+
+    /// Check whether a given email is allowed by the configured restrictions.
+    ///
+    /// An email passes if **any** of these conditions hold:
+    /// 1. No restrictions configured (`allowed_email_domain` is None AND `allowed_emails` is None/empty)
+    /// 2. Email domain matches `allowed_email_domain` (e.g. "alice@ffs.holdings" with domain "ffs.holdings")
+    /// 3. Email is in the `allowed_emails` whitelist (case-insensitive)
+    ///
+    /// Otherwise the email is rejected.
+    pub fn is_email_allowed(&self, email: &str) -> bool {
+        let email_lower = email.to_lowercase();
+        let has_domain_filter = self.allowed_email_domain.is_some();
+        let has_emails_filter = self
+            .allowed_emails
+            .as_ref()
+            .is_some_and(|v| !v.is_empty());
+
+        // No restrictions → everyone passes
+        if !has_domain_filter && !has_emails_filter {
+            return true;
+        }
+
+        // Check domain match
+        if let Some(ref domain) = self.allowed_email_domain {
+            if email_lower.ends_with(&format!("@{}", domain.to_lowercase())) {
+                return true;
+            }
+        }
+
+        // Check individual email whitelist
+        if let Some(ref emails) = self.allowed_emails {
+            if emails.iter().any(|e| e.to_lowercase() == email_lower) {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Ensure the root account password is bcrypt-hashed.
@@ -522,6 +577,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         Some(nats) => events::HybridEmitter::with_nats(local_bus, nats.clone()),
         None => events::HybridEmitter::new(local_bus),
     });
+
+    // Start NATS→local bridge: subscribes to NATS CRUD events and re-injects
+    // them into the local broadcast bus. This makes the local bus the single
+    // source of truth — WS handlers only need to listen to the local bus.
+    event_bus.start_nats_bridge();
 
     // Create orchestrator with hybrid emitter
     let orchestrator =
@@ -1036,6 +1096,151 @@ server:
         let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.server.serve_frontend); // default true
         assert_eq!(config.server.frontend_path, "./dist"); // default
+    }
+
+    // ========================================================================
+    // is_email_allowed tests
+    // ========================================================================
+
+    fn base_auth_config() -> AuthConfig {
+        AuthConfig {
+            jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
+            jwt_expiry_secs: 28800,
+            allowed_email_domain: None,
+            allowed_emails: None,
+            frontend_url: None,
+            allow_registration: false,
+            root_account: None,
+            oidc: None,
+            google_client_id: None,
+            google_client_secret: None,
+            google_redirect_uri: None,
+        }
+    }
+
+    #[test]
+    fn test_is_email_allowed_no_restrictions() {
+        // No domain filter and no email list → everyone passes
+        let config = base_auth_config();
+        assert!(config.is_email_allowed("anyone@gmail.com"));
+        assert!(config.is_email_allowed("someone@company.org"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_domain_only() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+
+        assert!(config.is_email_allowed("alice@ffs.holdings"));
+        assert!(!config.is_email_allowed("alice@gmail.com"));
+        // Case-insensitive: uppercase domain still matches
+        assert!(config.is_email_allowed("alice@FFS.HOLDINGS"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_domain_case_insensitive() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("FFS.Holdings".to_string());
+
+        // Both email and domain should compare case-insensitively
+        assert!(config.is_email_allowed("Alice@ffs.holdings"));
+        assert!(config.is_email_allowed("BOB@FFS.HOLDINGS"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_emails_only() {
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec![
+            "special@gmail.com".to_string(),
+            "vip@external.org".to_string(),
+        ]);
+
+        assert!(config.is_email_allowed("special@gmail.com"));
+        assert!(config.is_email_allowed("vip@external.org"));
+        assert!(!config.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_emails_case_insensitive() {
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec!["Alice@Gmail.com".to_string()]);
+
+        assert!(config.is_email_allowed("alice@gmail.com"));
+        assert!(config.is_email_allowed("ALICE@GMAIL.COM"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_combined_domain_and_emails() {
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+        config.allowed_emails = Some(vec!["partner@external.com".to_string()]);
+
+        // Domain match → OK
+        assert!(config.is_email_allowed("alice@ffs.holdings"));
+        // Email whitelist → OK even if domain doesn't match
+        assert!(config.is_email_allowed("partner@external.com"));
+        // Neither → rejected
+        assert!(!config.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_empty_emails_vec() {
+        // allowed_emails = Some(vec![]) is the same as None (no filter)
+        let mut config = base_auth_config();
+        config.allowed_emails = Some(vec![]);
+
+        // Only allowed_emails with empty vec, no domain → no restrictions active
+        assert!(config.is_email_allowed("anyone@anywhere.com"));
+    }
+
+    #[test]
+    fn test_is_email_allowed_empty_emails_with_domain() {
+        // allowed_emails = Some(vec![]) + domain filter → only domain matters
+        let mut config = base_auth_config();
+        config.allowed_email_domain = Some("company.com".to_string());
+        config.allowed_emails = Some(vec![]);
+
+        assert!(config.is_email_allowed("user@company.com"));
+        assert!(!config.is_email_allowed("user@external.com"));
+    }
+
+    #[test]
+    fn test_allowed_emails_yaml_parsing() {
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  allowed_email_domain: "ffs.holdings"
+  allowed_emails:
+    - "partner@external.com"
+    - "consultant@agency.io"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.allowed_email_domain, Some("ffs.holdings".into()));
+        let emails = auth.allowed_emails.as_ref().unwrap();
+        assert_eq!(emails.len(), 2);
+        assert_eq!(emails[0], "partner@external.com");
+        assert_eq!(emails[1], "consultant@agency.io");
+
+        assert!(auth.is_email_allowed("alice@ffs.holdings"));
+        assert!(auth.is_email_allowed("partner@external.com"));
+        assert!(!auth.is_email_allowed("random@gmail.com"));
+    }
+
+    #[test]
+    fn test_allowed_emails_absent_in_yaml() {
+        // When allowed_emails is not in YAML, it should default to None
+        let yaml = r#"
+auth:
+  jwt_secret: "super-secret-key-min-32-characters!"
+  allowed_email_domain: "ffs.holdings"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert!(auth.allowed_emails.is_none());
+        // Domain still works
+        assert!(auth.is_email_allowed("user@ffs.holdings"));
+        assert!(!auth.is_email_allowed("user@gmail.com"));
     }
 
 }

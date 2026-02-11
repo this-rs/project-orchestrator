@@ -130,16 +130,10 @@ pub async fn ws_authenticate(
         }
     };
 
-    // 6. Check email domain restriction (if configured)
-    if let Some(ref domain) = config.allowed_email_domain {
-        if !claims.email.ends_with(&format!("@{}", domain)) {
-            send_auth_error(
-                socket,
-                &format!("Email domain not allowed (expected @{})", domain),
-            )
-            .await;
-            return Err("Email domain not allowed".to_string());
-        }
+    // 6. Check email restrictions (domain + individual whitelist)
+    if !config.is_email_allowed(&claims.email) {
+        send_auth_error(socket, "Email not allowed by server policy").await;
+        return Err("Email not allowed by server policy".to_string());
     }
 
     // 7. Send auth_ok with user info
