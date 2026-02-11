@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./scripts/build-desktop.sh              # Full build (front + back + Tauri)
-#   ./scripts/build-desktop.sh --skip-front # Skip frontend rebuild
+#   ./scripts/build-desktop.sh --skip-front # Skip frontend rebuild (with freshness check)
 #   ./scripts/build-desktop.sh --skip-back  # Skip backend binary rebuild
 
 set -e
@@ -37,7 +37,7 @@ for arg in "$@"; do
         --help|-h)
             echo "Usage: $0 [--skip-front] [--skip-back]"
             echo ""
-            echo "  --skip-front  Skip frontend rebuild (reuse existing desktop/dist/)"
+            echo "  --skip-front  Skip frontend rebuild (with freshness check)"
             echo "  --skip-back   Skip mcp_server binary rebuild"
             exit 0
             ;;
@@ -45,6 +45,23 @@ for arg in "$@"; do
 done
 
 cd "$PROJECT_DIR"
+
+# ── Freshness helper ─────────────────────────────────────────────────────
+# Returns 0 if frontend sources are newer than desktop/dist/index.html.
+is_dist_stale() {
+    local dist_index="$DESKTOP_DIST/index.html"
+    if [ ! -f "$dist_index" ]; then
+        return 0  # No dist = definitely stale
+    fi
+    if [ ! -d "$FRONTEND_DIR/src" ]; then
+        return 1  # Can't check — assume fresh
+    fi
+    # Find any frontend source file newer than dist/index.html
+    local newer
+    newer=$(find "$FRONTEND_DIR/src" "$FRONTEND_DIR/index.html" "$FRONTEND_DIR/vite.config.ts" \
+        -newer "$dist_index" 2>/dev/null | head -1)
+    [ -n "$newer" ]
+}
 
 # ── Step 1: Build frontend ─────────────────────────────────────────────────
 if [ "$SKIP_FRONT" = false ]; then
@@ -72,8 +89,31 @@ if [ "$SKIP_FRONT" = false ]; then
 else
     log_warn "Skipping frontend build (--skip-front)"
     if [ ! -d "$DESKTOP_DIST" ]; then
-        log_err "desktop/dist/ does not exist — cannot skip frontend build"
+        log_err "desktop/dist/ does not exist — run without --skip-front first"
         exit 1
+    fi
+    # Freshness check: warn if sources are newer than dist
+    if is_dist_stale; then
+        echo ""
+        log_warn "⚡ Frontend sources are NEWER than desktop/dist/"
+        log_warn "   Your app may bundle stale assets!"
+        echo -e "   Run without ${CYAN}--skip-front${NC} to rebuild, or press Enter to continue anyway."
+        read -r -p "   Continue with stale dist? [y/N] " response
+        case "$response" in
+            [yY][eE][sS]|[yY]) log_warn "Continuing with potentially stale dist..." ;;
+            *)
+                log_step "Rebuilding frontend (stale dist detected)"
+                (cd "$FRONTEND_DIR" && npm run build)
+                rm -rf "$DESKTOP_DIST"
+                cp -r "$FRONTEND_DIR/dist" "$DESKTOP_DIST"
+                if [ -f "$DESKTOP_DIR/src-tauri/splash.html" ]; then
+                    cp "$DESKTOP_DIR/src-tauri/splash.html" "$DESKTOP_DIST/splash.html"
+                fi
+                log_ok "Frontend rebuilt and dist synced"
+                ;;
+        esac
+    else
+        log_ok "desktop/dist/ appears up-to-date"
     fi
 fi
 
