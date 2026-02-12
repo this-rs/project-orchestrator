@@ -1079,10 +1079,29 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             },
         ],
     },
+    // ── Implementation Planner (1 tool) ─────────────────────────────
+    ToolGroup {
+        name: "implementation_planner",
+        description: "Analyser le graphe de connaissances pour planifier une implémentation",
+        keywords: &[
+            "plan",
+            "implementation",
+            "dag",
+            "phases",
+            "dépendances",
+            "ordre",
+            "planifier",
+            "impact",
+        ],
+        tools: &[ToolRef {
+            name: "plan_implementation",
+            description: "Produire un DAG de phases d'implémentation à partir du graphe",
+        }],
+    },
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 144).
+/// Must match the MCP tools.rs count (currently 145).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2044,11 +2063,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_144_tools() {
+    fn test_tool_groups_cover_all_145_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 144,
-            "TOOL_GROUPS must cover exactly 144 unique tools (got {}). \
+            count, 145,
+            "TOOL_GROUPS must cover exactly 145 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -2098,7 +2117,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 13, "Expected 13 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 14, "Expected 14 tool groups");
     }
 
     #[test]

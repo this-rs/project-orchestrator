@@ -27,6 +27,7 @@ pub struct Orchestrator {
     parser: Arc<RwLock<CodeParser>>,
     note_manager: Arc<NoteManager>,
     note_lifecycle: Arc<NoteLifecycleManager>,
+    planner: Arc<super::ImplementationPlanner>,
     event_bus: Option<Arc<HybridEmitter>>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
 }
@@ -47,6 +48,12 @@ impl Orchestrator {
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
+        let planner = Arc::new(super::ImplementationPlanner::new(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            plan_manager.clone(),
+            note_manager.clone(),
+        ));
 
         Ok(Self {
             state,
@@ -55,6 +62,7 @@ impl Orchestrator {
             parser,
             note_manager,
             note_lifecycle,
+            planner,
             event_bus: None,
             event_emitter: None,
         })
@@ -88,6 +96,12 @@ impl Orchestrator {
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
+        let planner = Arc::new(super::ImplementationPlanner::new(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            plan_manager.clone(),
+            note_manager.clone(),
+        ));
 
         Ok(Self {
             state,
@@ -96,6 +110,7 @@ impl Orchestrator {
             parser,
             note_manager,
             note_lifecycle,
+            planner,
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
         })
@@ -130,6 +145,12 @@ impl Orchestrator {
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
+        let planner = Arc::new(super::ImplementationPlanner::new(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            plan_manager.clone(),
+            note_manager.clone(),
+        ));
 
         Ok(Self {
             state,
@@ -138,6 +159,7 @@ impl Orchestrator {
             parser,
             note_manager,
             note_lifecycle,
+            planner,
             event_bus: None,
             event_emitter: Some(emitter),
         })
@@ -193,6 +215,11 @@ impl Orchestrator {
     /// Get the note lifecycle manager
     pub fn note_lifecycle(&self) -> &Arc<NoteLifecycleManager> {
         &self.note_lifecycle
+    }
+
+    /// Get the implementation planner
+    pub fn planner(&self) -> &Arc<super::ImplementationPlanner> {
+        &self.planner
     }
 
     // ========================================================================
