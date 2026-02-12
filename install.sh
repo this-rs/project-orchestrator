@@ -180,12 +180,15 @@ main() {
   info "Extracting..."
   tar xzf "${TMP_DIR}/${ARCHIVE_FILE}" -C "$TMP_DIR"
 
-  # Install
+  # Install all binaries
   mkdir -p "$INSTALL_DIR"
-  cp "${TMP_DIR}/${ARCHIVE_NAME}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-  chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
-
-  info "Installed ${BOLD}${BINARY_NAME}${RESET} to ${INSTALL_DIR}/${BINARY_NAME}"
+  for bin in orchestrator orch mcp_server; do
+    if [ -f "${TMP_DIR}/${ARCHIVE_NAME}/${bin}" ]; then
+      cp "${TMP_DIR}/${ARCHIVE_NAME}/${bin}" "${INSTALL_DIR}/${bin}"
+      chmod +x "${INSTALL_DIR}/${bin}"
+      info "Installed ${BOLD}${bin}${RESET} to ${INSTALL_DIR}/${bin}"
+    fi
+  done
 
   # Check if install dir is in PATH
   case ":$PATH:" in
