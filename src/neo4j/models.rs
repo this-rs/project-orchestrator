@@ -729,6 +729,24 @@ pub struct FeatureGraphNode {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Role of an entity within a feature graph.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureRole {
+    /// The function used as entry point for the feature
+    EntryPoint,
+    /// Core functions reached via CALLS
+    CoreLogic,
+    /// Structs/enums used in the feature
+    DataModel,
+    /// Traits defining interfaces
+    TraitContract,
+    /// Handlers/routes exposed as API surface
+    ApiSurface,
+    /// Imported files and utility modules
+    Support,
+}
+
 /// An entity included in a feature graph (file, function, struct, trait).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureGraphEntity {
@@ -736,6 +754,9 @@ pub struct FeatureGraphEntity {
     pub entity_id: String,
     /// Human-readable name (function name, struct name, file path)
     pub name: Option<String>,
+    /// Role of this entity in the feature (entry_point, core_logic, data_model, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Full feature graph with its included entities.

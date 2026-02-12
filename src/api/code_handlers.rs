@@ -753,6 +753,7 @@ pub struct ListFeatureGraphsQuery {
 pub struct AddEntityBody {
     pub entity_type: String,
     pub entity_id: String,
+    pub role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -762,6 +763,7 @@ pub struct AutoBuildBody {
     pub project_id: uuid::Uuid,
     pub entry_function: String,
     pub depth: Option<u32>,
+    pub include_relations: Option<Vec<String>>,
 }
 
 /// POST /api/feature-graphs
@@ -863,13 +865,14 @@ pub async fn add_entity_to_feature_graph(
     state
         .orchestrator
         .neo4j()
-        .add_entity_to_feature_graph(id, &body.entity_type, &body.entity_id)
+        .add_entity_to_feature_graph(id, &body.entity_type, &body.entity_id, body.role.as_deref())
         .await?;
     Ok(Json(serde_json::json!({
         "added": true,
         "feature_graph_id": id.to_string(),
         "entity_type": body.entity_type,
         "entity_id": body.entity_id,
+        "role": body.role,
     })))
 }
 
@@ -888,6 +891,7 @@ pub async fn auto_build_feature_graph(
             body.project_id,
             &body.entry_function,
             depth,
+            body.include_relations.as_deref(),
         )
         .await?;
     let entities: Vec<serde_json::Value> = detail
@@ -898,6 +902,7 @@ pub async fn auto_build_feature_graph(
                 "entity_type": e.entity_type,
                 "entity_id": e.entity_id,
                 "name": e.name,
+                "role": e.role,
             })
         })
         .collect();

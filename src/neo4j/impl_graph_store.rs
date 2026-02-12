@@ -1398,8 +1398,9 @@ impl GraphStore for Neo4jClient {
         feature_graph_id: Uuid,
         entity_type: &str,
         entity_id: &str,
+        role: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.add_entity_to_feature_graph(feature_graph_id, entity_type, entity_id)
+        self.add_entity_to_feature_graph(feature_graph_id, entity_type, entity_id, role)
             .await
     }
     async fn remove_entity_from_feature_graph(
@@ -1419,8 +1420,16 @@ impl GraphStore for Neo4jClient {
         project_id: Uuid,
         entry_function: &str,
         depth: u32,
+        include_relations: Option<&[String]>,
     ) -> anyhow::Result<FeatureGraphDetail> {
-        self.auto_build_feature_graph(name, description, project_id, entry_function, depth)
-            .await
+        self.auto_build_feature_graph(
+            name,
+            description,
+            project_id,
+            entry_function,
+            depth,
+            include_relations,
+        )
+        .await
     }
 }
