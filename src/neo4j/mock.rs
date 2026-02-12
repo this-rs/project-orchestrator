@@ -1163,7 +1163,34 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn create_call_relationship(&self, caller_id: &str, callee_name: &str) -> Result<()> {
+    async fn create_call_relationship(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        // When project_id is provided, only create the relationship if the callee
+        // belongs to a file in the same project (mirrors the Cypher join via File→Project)
+        if let Some(pid) = project_id {
+            let project_files = self.project_files.read().await;
+            let functions = self.functions.read().await;
+
+            let project_file_paths: Vec<&String> = project_files
+                .get(&pid)
+                .map(|files| files.iter().collect())
+                .unwrap_or_default();
+
+            // Check if any function with callee_name belongs to a file in this project
+            let callee_in_project = functions.values().any(|f| {
+                f.name == callee_name && project_file_paths.iter().any(|fp| **fp == f.file_path)
+            });
+
+            if !callee_in_project {
+                // Callee not found in this project — skip (same as Cypher MATCH not matching)
+                return Ok(());
+            }
+        }
+
         self.call_relationships
             .write()
             .await
@@ -1171,6 +1198,68 @@ impl GraphStore for MockGraphStore {
             .or_default()
             .push(callee_name.to_string());
         Ok(())
+    }
+
+    async fn cleanup_cross_project_calls(&self) -> Result<i64> {
+        let mut cr = self.call_relationships.write().await;
+        let functions = self.functions.read().await;
+        let project_files = self.project_files.read().await;
+        let mut deleted = 0i64;
+
+        // Build reverse map: file_path -> project_ids
+        let mut file_to_projects: std::collections::HashMap<&str, Vec<uuid::Uuid>> =
+            std::collections::HashMap::new();
+        for (&pid, paths) in project_files.iter() {
+            for path in paths {
+                file_to_projects.entry(path.as_str()).or_default().push(pid);
+            }
+        }
+
+        // For each caller → callees, check if they share a project
+        let mut to_remove: Vec<(String, Vec<String>)> = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            let caller_file = caller_id.rsplit_once("::").map(|(fp, _)| fp);
+            let caller_projects: Vec<uuid::Uuid> = caller_file
+                .and_then(|fp| file_to_projects.get(fp))
+                .cloned()
+                .unwrap_or_default();
+
+            if caller_projects.is_empty() {
+                continue;
+            }
+
+            let mut bad_callees = Vec::new();
+            for callee_name in callees {
+                let callee_shares_project = functions.values().any(|f| {
+                    if f.name != *callee_name {
+                        return false;
+                    }
+                    let callee_projects = file_to_projects
+                        .get(f.file_path.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    callee_projects
+                        .iter()
+                        .any(|cp| caller_projects.contains(cp))
+                });
+                if !callee_shares_project {
+                    bad_callees.push(callee_name.clone());
+                }
+            }
+            if !bad_callees.is_empty() {
+                to_remove.push((caller_id.clone(), bad_callees));
+            }
+        }
+
+        for (caller_id, bad_callees) in to_remove {
+            if let Some(callees) = cr.get_mut(&caller_id) {
+                for bad in &bad_callees {
+                    callees.retain(|c| c != bad);
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     async fn get_callees(&self, function_id: &str, _depth: u32) -> Result<Vec<FunctionNode>> {
@@ -1318,11 +1407,70 @@ impl GraphStore for MockGraphStore {
 
     async fn find_symbol_references(
         &self,
-        _symbol: &str,
-        _limit: usize,
+        symbol: &str,
+        limit: usize,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<SymbolReferenceNode>> {
-        // Simplified: return empty in mock
-        Ok(vec![])
+        let mut references = Vec::new();
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        // Find function callers (via call_relationships)
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+        for (caller_id, callees) in cr.iter() {
+            if callees.contains(&symbol.to_string()) {
+                if let Some(caller_fn) = functions.get(caller_id) {
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    }
+                    references.push(SymbolReferenceNode {
+                        file_path: caller_fn.file_path.clone(),
+                        line: caller_fn.line_start,
+                        context: format!("called from {}", caller_fn.name),
+                        reference_type: "call".to_string(),
+                    });
+                    if references.len() >= limit {
+                        return Ok(references);
+                    }
+                }
+            }
+        }
+
+        // Find struct import usages (via imports)
+        let imports = self.imports.read().await;
+        let structs = self.structs_map.read().await;
+        let has_struct = structs.values().any(|s| s.name == symbol);
+        if has_struct {
+            for import in imports.values() {
+                if import.path.ends_with(symbol) {
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&import.file_path) {
+                            continue;
+                        }
+                    }
+                    references.push(SymbolReferenceNode {
+                        file_path: import.file_path.clone(),
+                        line: import.line,
+                        context: format!("imported via {}", import.path),
+                        reference_type: "import".to_string(),
+                    });
+                    if references.len() >= limit {
+                        return Ok(references);
+                    }
+                }
+            }
+        }
+
+        Ok(references)
     }
 
     async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>> {
@@ -1348,11 +1496,30 @@ impl GraphStore for MockGraphStore {
         &self,
         function_name: &str,
         _depth: u32,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<String>> {
         let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
         let mut callers = Vec::new();
         for (caller, callees) in cr.iter() {
             if callees.contains(&function_name.to_string()) {
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
                 callers.push(caller.clone());
             }
         }
@@ -1363,15 +1530,35 @@ impl GraphStore for MockGraphStore {
         &self,
         function_name: &str,
         _depth: u32,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<String>> {
         let cr = self.call_relationships.read().await;
-        // Find the caller ID that matches the function name
+        let functions = self.functions.read().await;
+
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        let mut callees_result = Vec::new();
         for (caller_id, callees) in cr.iter() {
             if caller_id.ends_with(&format!("::{}", function_name)) {
-                return Ok(callees.clone());
+                // If scoped, check that the caller belongs to the project
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller_id) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                callees_result.extend(callees.clone());
             }
         }
-        Ok(vec![])
+        Ok(callees_result)
     }
 
     async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>> {
@@ -1540,11 +1727,35 @@ impl GraphStore for MockGraphStore {
         })
     }
 
-    async fn get_function_caller_count(&self, function_name: &str) -> Result<i64> {
+    async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<i64> {
         let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
         let mut count = 0i64;
-        for callees in cr.values() {
+        for (caller_id, callees) in cr.iter() {
             if callees.contains(&function_name.to_string()) {
+                // If scoped by project, only count callers whose file is in the project
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller_id) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
                 count += 1;
             }
         }
@@ -2361,15 +2572,34 @@ impl GraphStore for MockGraphStore {
         Ok(dependents)
     }
 
-    async fn find_callers(&self, function_id: &str) -> Result<Vec<FunctionNode>> {
+    async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FunctionNode>> {
         let cr = self.call_relationships.read().await;
         let functions = self.functions.read().await;
         // Extract function name from id
         let func_name = function_id.rsplit("::").next().unwrap_or(function_id);
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
         let mut callers = Vec::new();
         for (caller_id, callees) in cr.iter() {
             if callees.contains(&func_name.to_string()) {
                 if let Some(f) = functions.get(caller_id) {
+                    // If scoped by project, only include callers whose file is in the project
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&f.file_path) {
+                            continue;
+                        }
+                    }
                     callers.push(f.clone());
                 }
             }
@@ -3786,6 +4016,7 @@ impl GraphStore for MockGraphStore {
 mod tests {
     use super::*;
     use crate::neo4j::traits::GraphStore;
+    use crate::test_helpers::{test_project, test_project_named};
     use chrono::Utc;
 
     fn make_event(session_id: Uuid, seq: i64, event_type: &str, data: &str) -> ChatEventRecord {
@@ -4188,5 +4419,492 @@ mod tests {
 
         let users = store.list_users().await.unwrap();
         assert_eq!(users.len(), 3);
+    }
+
+    // ========================================================================
+    // Call relationship tests — scoping by project
+    // ========================================================================
+
+    fn make_function(name: &str, file_path: &str, line_start: u32) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_path.to_string(),
+            line_start,
+            line_end: line_start + 10,
+            docstring: None,
+        }
+    }
+
+    fn make_file(path: &str, project_id: Option<Uuid>) -> FileNode {
+        FileNode {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            last_parsed: Utc::now(),
+            project_id,
+        }
+    }
+
+    /// Seed a project with files and functions into the mock store
+    async fn seed_project(
+        store: &MockGraphStore,
+        project: &ProjectNode,
+        files_and_fns: &[(&str, &[&str])], // (file_path, [fn_names])
+    ) {
+        store.create_project(project).await.unwrap();
+        for (file_path, fn_names) in files_and_fns {
+            let file = make_file(file_path, Some(project.id));
+            store.upsert_file(&file).await.unwrap();
+            // Also register in project_files (upsert_file doesn't do this)
+            store
+                .project_files
+                .write()
+                .await
+                .entry(project.id)
+                .or_default()
+                .push(file_path.to_string());
+            for (i, fn_name) in fn_names.iter().enumerate() {
+                let func = make_function(fn_name, file_path, (i * 10) as u32);
+                store.upsert_function(&func).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_basic() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(&store, &project, &[("src/main.rs", &["main", "helper"])]).await;
+
+        // Create a call: main -> helper
+        store
+            .create_call_relationship("src/main.rs::main", "helper", Some(project.id))
+            .await
+            .unwrap();
+
+        let cr = store.call_relationships.read().await;
+        let callees = cr.get("src/main.rs::main").unwrap();
+        assert_eq!(callees, &vec!["helper".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_scoped_rejects_cross_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/main.rs", &["process", "validate"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/main.rs", &["process", "transform"])],
+        )
+        .await;
+
+        // Try to create a call from project_a::process -> transform (which only exists in project_b)
+        store
+            .create_call_relationship("a/src/main.rs::process", "transform", Some(project_a.id))
+            .await
+            .unwrap();
+
+        // Should NOT have created the relationship (callee not in same project)
+        let cr = store.call_relationships.read().await;
+        assert!(
+            cr.get("a/src/main.rs::process").is_none(),
+            "Should not create cross-project CALLS"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_without_project_id_allows_all() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(&store, &project_a, &[("a/src/main.rs", &["process"])]).await;
+        seed_project(&store, &project_b, &[("b/src/main.rs", &["transform"])]).await;
+
+        // Without project_id (None), cross-project call is allowed (backward compat)
+        store
+            .create_call_relationship("a/src/main.rs::process", "transform", None)
+            .await
+            .unwrap();
+
+        let cr = store.call_relationships.read().await;
+        let callees = cr.get("a/src/main.rs::process").unwrap();
+        assert_eq!(callees, &vec!["transform".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_find_callers_basic() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(
+            &store,
+            &project,
+            &[("src/lib.rs", &["caller_a", "caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("src/lib.rs::caller_a", "target", Some(project.id))
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("src/lib.rs::caller_b", "target", Some(project.id))
+            .await
+            .unwrap();
+
+        let callers = store
+            .find_callers("src/lib.rs::target", None)
+            .await
+            .unwrap();
+        assert_eq!(callers.len(), 2);
+
+        let names: Vec<&str> = callers.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"caller_a"));
+        assert!(names.contains(&"caller_b"));
+    }
+
+    #[tokio::test]
+    async fn test_find_callers_scoped_by_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        // Both call "target" but via None (unscoped create)
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only caller_a
+        let callers_a = store
+            .find_callers("a/src/lib.rs::target", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_a.len(), 1);
+        assert_eq!(callers_a[0].name, "caller_a");
+
+        // Unscoped: both callers
+        let callers_all = store
+            .find_callers("a/src/lib.rs::target", None)
+            .await
+            .unwrap();
+        assert_eq!(callers_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_callers_by_name_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped: only callers from project_a
+        let callers = store
+            .get_function_callers_by_name("target", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers.len(), 1);
+        assert!(callers[0].contains("caller_a"));
+
+        // Unscoped: both
+        let callers_all = store
+            .get_function_callers_by_name("target", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(callers_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_callees_by_name_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["process", "helper"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["process", "other"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::process", "helper", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::process", "other", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only callees from process in project_a
+        let callees = store
+            .get_function_callees_by_name("process", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0], "helper");
+
+        // Unscoped: callees from both process functions
+        let callees_all = store
+            .get_function_callees_by_name("process", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(callees_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_caller_count_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b1", "caller_b2", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b1", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b2", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: 1 caller
+        let count_a = store
+            .get_function_caller_count("target", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(count_a, 1);
+
+        // Scoped to project_b: 2 callers
+        let count_b = store
+            .get_function_caller_count("target", Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(count_b, 2);
+
+        // Unscoped: 3 callers total
+        let count_all = store
+            .get_function_caller_count("target", None)
+            .await
+            .unwrap();
+        assert_eq!(count_all, 3);
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_with_calls() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(&store, &project, &[("src/lib.rs", &["caller", "target"])]).await;
+
+        store
+            .create_call_relationship("src/lib.rs::caller", "target", Some(project.id))
+            .await
+            .unwrap();
+
+        let refs = store
+            .find_symbol_references("target", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].reference_type, "call");
+        assert_eq!(refs[0].file_path, "src/lib.rs");
+        assert!(refs[0].context.contains("caller"));
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only caller_a
+        let refs_a = store
+            .find_symbol_references("target", 10, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(refs_a.len(), 1);
+        assert!(refs_a[0].context.contains("caller_a"));
+
+        // Unscoped: both
+        let refs_all = store
+            .find_symbol_references("target", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(refs_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cross_project_calls_pollution_prevented() {
+        // This is the core regression test for the cross-project CALLS bug
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        // Both projects have a function named "handle_request" and "validate"
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/handler.rs", &["handle_request", "validate"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/handler.rs", &["handle_request", "validate"])],
+        )
+        .await;
+
+        // Project A: handle_request calls validate (scoped to project A)
+        store
+            .create_call_relationship(
+                "a/src/handler.rs::handle_request",
+                "validate",
+                Some(project_a.id),
+            )
+            .await
+            .unwrap();
+
+        // Project B: handle_request calls validate (scoped to project B)
+        store
+            .create_call_relationship(
+                "b/src/handler.rs::handle_request",
+                "validate",
+                Some(project_b.id),
+            )
+            .await
+            .unwrap();
+
+        // Verify: callers of "validate" scoped to project A = only handle_request from A
+        let callers_a = store
+            .get_function_callers_by_name("validate", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_a.len(), 1);
+        assert!(callers_a[0].contains("a/src/handler.rs"));
+
+        // Verify: callers scoped to project B = only handle_request from B
+        let callers_b = store
+            .get_function_callers_by_name("validate", 2, Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_b.len(), 1);
+        assert!(callers_b[0].contains("b/src/handler.rs"));
+
+        // Verify: caller_count scoped
+        let count_a = store
+            .get_function_caller_count("validate", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(count_a, 1);
+
+        let count_b = store
+            .get_function_caller_count("validate", Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(count_b, 1);
+
+        // Without scoping, both are visible
+        let count_all = store
+            .get_function_caller_count("validate", None)
+            .await
+            .unwrap();
+        assert_eq!(count_all, 2);
     }
 }

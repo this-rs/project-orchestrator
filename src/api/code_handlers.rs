@@ -160,6 +160,8 @@ pub struct FindReferencesQuery {
     pub symbol: String,
     /// Limit results
     pub limit: Option<usize>,
+    /// Filter by project slug
+    pub project_slug: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -177,10 +179,24 @@ pub async fn find_references(
 ) -> Result<Json<Vec<SymbolReference>>, AppError> {
     let limit = query.limit.unwrap_or(20);
 
+    let project_id = if let Some(ref slug) = query.project_slug {
+        Some(
+            state
+                .orchestrator
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?
+                .id,
+        )
+    } else {
+        None
+    };
+
     let ref_nodes = state
         .orchestrator
         .neo4j()
-        .find_symbol_references(&query.symbol, limit)
+        .find_symbol_references(&query.symbol, limit, project_id)
         .await?;
 
     let references: Vec<SymbolReference> = ref_nodes
@@ -273,6 +289,8 @@ pub struct CallGraphQuery {
     pub depth: Option<u32>,
     /// Direction: "callers" (who calls this), "callees" (what this calls), "both"
     pub direction: Option<String>,
+    /// Filter by project slug
+    pub project_slug: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +310,20 @@ pub async fn get_call_graph(
     let depth = query.depth.unwrap_or(2);
     let direction = query.direction.as_deref().unwrap_or("both");
 
+    let project_id = if let Some(ref slug) = query.project_slug {
+        Some(
+            state
+                .orchestrator
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?
+                .id,
+        )
+    } else {
+        None
+    };
+
     let mut callers = vec![];
     let mut callees = vec![];
 
@@ -299,7 +331,7 @@ pub async fn get_call_graph(
         callers = state
             .orchestrator
             .neo4j()
-            .get_function_callers_by_name(&query.function, depth)
+            .get_function_callers_by_name(&query.function, depth, project_id)
             .await?;
     }
 
@@ -307,7 +339,7 @@ pub async fn get_call_graph(
         callees = state
             .orchestrator
             .neo4j()
-            .get_function_callees_by_name(&query.function, depth)
+            .get_function_callees_by_name(&query.function, depth, project_id)
             .await?;
     }
 
@@ -330,6 +362,8 @@ pub struct ImpactQuery {
     pub target: String,
     /// "file" or "function"
     pub target_type: Option<String>,
+    /// Filter by project slug
+    pub project_slug: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -349,6 +383,20 @@ pub async fn analyze_impact(
 ) -> Result<Json<ImpactAnalysis>, AppError> {
     let target_type = query.target_type.as_deref().unwrap_or("file");
 
+    let project_id = if let Some(ref slug) = query.project_slug {
+        Some(
+            state
+                .orchestrator
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?
+                .id,
+        )
+    } else {
+        None
+    };
+
     let (directly_affected, transitively_affected) = if target_type == "file" {
         let direct = state
             .orchestrator
@@ -365,7 +413,7 @@ pub async fn analyze_impact(
         let callers = state
             .orchestrator
             .neo4j()
-            .find_callers(&query.target)
+            .find_callers(&query.target, project_id)
             .await?;
         let direct: Vec<String> = callers.iter().map(|f| f.file_path.clone()).collect();
         (direct.clone(), direct)

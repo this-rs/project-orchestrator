@@ -973,7 +973,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             },
         ],
     },
-    // ── Sync & Admin (6 tools) ───────────────────────────────────────
+    // ── Sync & Admin (7 tools) ───────────────────────────────────────
     ToolGroup {
         name: "sync_admin",
         description: "Synchronisation code et administration",
@@ -1002,6 +1002,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             ToolRef {
                 name: "delete_meilisearch_orphans",
                 description: "Nettoyer docs orphelins",
+            },
+            ToolRef {
+                name: "cleanup_cross_project_calls",
+                description: "Supprimer les CALLS cross-projet",
             },
         ],
     },
@@ -1078,7 +1082,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 143).
+/// Must match the MCP tools.rs count (currently 144).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2040,11 +2044,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_143_tools() {
+    fn test_tool_groups_cover_all_144_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 143,
-            "TOOL_GROUPS must cover exactly 143 unique tools (got {}). \
+            count, 144,
+            "TOOL_GROUPS must cover exactly 144 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

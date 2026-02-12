@@ -920,7 +920,8 @@ fn code_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "symbol": {"type": "string", "description": "Symbol name"},
-                    "limit": {"type": "integer", "description": "Max results"}
+                    "limit": {"type": "integer", "description": "Max results"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["symbol".to_string()]),
             },
@@ -943,7 +944,8 @@ fn code_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "function": {"type": "string", "description": "Function name"},
-                    "limit": {"type": "integer", "description": "Max depth/results"}
+                    "limit": {"type": "integer", "description": "Max depth/results"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["function".to_string()]),
             },
@@ -954,7 +956,8 @@ fn code_tools() -> Vec<ToolDefinition> {
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
-                    "target": {"type": "string", "description": "File path or symbol name"}
+                    "target": {"type": "string", "description": "File path or symbol name"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["target".to_string()]),
             },
@@ -1165,6 +1168,15 @@ fn meilisearch_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "delete_meilisearch_orphans".to_string(),
             description: "Delete documents without project_id from Meilisearch".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "cleanup_cross_project_calls".to_string(),
+            description: "Delete CALLS relationships where caller and callee belong to different projects. Returns the number of deleted relationships.".to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({})),
@@ -2046,7 +2058,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 143, "Expected 143 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 144, "Expected 144 tools, got {}", tools.len());
     }
 
     #[test]

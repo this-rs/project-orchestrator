@@ -154,6 +154,7 @@ impl ToolHandler {
             // Meilisearch
             "get_meilisearch_stats" => self.get_meilisearch_stats(args).await,
             "delete_meilisearch_orphans" => self.delete_meilisearch_orphans(args).await,
+            "cleanup_cross_project_calls" => self.cleanup_cross_project_calls(args).await,
 
             // Notes
             "list_notes" => self.list_notes(args).await,
@@ -1630,7 +1631,22 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("symbol is required"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
-        let refs = self.neo4j().find_symbol_references(symbol, limit).await?;
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            Some(
+                self.neo4j()
+                    .get_project_by_slug(slug)
+                    .await?
+                    .ok_or_else(|| anyhow!("Project not found: {}", slug))?
+                    .id,
+            )
+        } else {
+            None
+        };
+
+        let refs = self
+            .neo4j()
+            .find_symbol_references(symbol, limit, project_id)
+            .await?;
         let references: Vec<Value> = refs
             .into_iter()
             .map(|r| {
@@ -1675,13 +1691,25 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("function is required"))?;
         let depth = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
 
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            Some(
+                self.neo4j()
+                    .get_project_by_slug(slug)
+                    .await?
+                    .ok_or_else(|| anyhow!("Project not found: {}", slug))?
+                    .id,
+            )
+        } else {
+            None
+        };
+
         let callers = self
             .neo4j()
-            .get_function_callers_by_name(function, depth)
+            .get_function_callers_by_name(function, depth, project_id)
             .await?;
         let callees = self
             .neo4j()
-            .get_function_callees_by_name(function, depth)
+            .get_function_callees_by_name(function, depth, project_id)
             .await?;
 
         Ok(json!({
@@ -1697,11 +1725,26 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("target is required"))?;
 
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            Some(
+                self.neo4j()
+                    .get_project_by_slug(slug)
+                    .await?
+                    .ok_or_else(|| anyhow!("Project not found: {}", slug))?
+                    .id,
+            )
+        } else {
+            None
+        };
+
         // Find all files that depend on this target (file or symbol)
         let dependents = self.neo4j().find_dependent_files(target, 3).await?;
 
         // If target is a function, find callers
-        let caller_count = self.neo4j().get_function_caller_count(target).await?;
+        let caller_count = self
+            .neo4j()
+            .get_function_caller_count(target, project_id)
+            .await?;
 
         Ok(json!({
             "target": target,
@@ -1895,6 +1938,11 @@ impl ToolHandler {
     async fn delete_meilisearch_orphans(&self, _args: Value) -> Result<Value> {
         self.meili().delete_orphan_code_documents().await?;
         Ok(json!({"deleted": true}))
+    }
+
+    async fn cleanup_cross_project_calls(&self, _args: Value) -> Result<Value> {
+        let deleted = self.neo4j().cleanup_cross_project_calls().await?;
+        Ok(json!({"deleted_count": deleted}))
     }
 
     // ========================================================================
@@ -5571,5 +5619,184 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Call graph / references / impact — project scoping tests
+    // ========================================================================
+
+    use crate::meilisearch::mock::MockSearchStore;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::models::{FileNode, FunctionNode, Visibility};
+    use crate::test_helpers::{mock_app_state_with, test_project_named};
+
+    /// Seed a file + its functions into the MockGraphStore (direct field access).
+    async fn seed_mock_file(
+        store: &MockGraphStore,
+        project_id: uuid::Uuid,
+        file_path: &str,
+        fn_names: &[&str],
+    ) {
+        // Insert file
+        let file = FileNode {
+            path: file_path.to_string(),
+            language: "rust".to_string(),
+            hash: "h".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project_id),
+        };
+        store.upsert_file(&file).await.unwrap();
+
+        // Register file in project_files
+        store
+            .project_files
+            .write()
+            .await
+            .entry(project_id)
+            .or_default()
+            .push(file_path.to_string());
+
+        // Insert functions
+        for (i, name) in fn_names.iter().enumerate() {
+            let func = FunctionNode {
+                name: name.to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: file_path.to_string(),
+                line_start: (i * 10) as u32,
+                line_end: (i * 10 + 5) as u32,
+                docstring: None,
+            };
+            store.upsert_function(&func).await.unwrap();
+        }
+    }
+
+    /// Create a handler pre-seeded with two projects that have homonymous functions.
+    ///
+    /// Seeds the MockGraphStore *before* wrapping in Arc, avoiding the need
+    /// for trait downcasting.
+    async fn create_handler_with_call_data() -> ToolHandler {
+        let graph = MockGraphStore::new();
+
+        // Create two projects
+        let project_a = test_project_named("alpha");
+        let project_b = test_project_named("beta");
+        graph.create_project(&project_a).await.unwrap();
+        graph.create_project(&project_b).await.unwrap();
+
+        // Seed files + functions
+        seed_mock_file(
+            &graph,
+            project_a.id,
+            "a/src/lib.rs",
+            &["handler", "validate"],
+        )
+        .await;
+        seed_mock_file(
+            &graph,
+            project_b.id,
+            "b/src/lib.rs",
+            &["handler", "validate"],
+        )
+        .await;
+
+        // Create CALLS: handler -> validate in each project (unscoped for test setup)
+        graph
+            .create_call_relationship("a/src/lib.rs::handler", "validate", None)
+            .await
+            .unwrap();
+        graph
+            .create_call_relationship("b/src/lib.rs::handler", "validate", None)
+            .await
+            .unwrap();
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    #[tokio::test]
+    async fn test_get_call_graph_handler_unscoped() {
+        let handler = create_handler_with_call_data().await;
+
+        let result = handler
+            .handle("get_call_graph", Some(json!({"function": "validate"})))
+            .await
+            .unwrap();
+
+        let callers = result.get("callers").unwrap().as_array().unwrap();
+        // Unscoped: both handler functions from both projects call validate
+        assert_eq!(callers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_call_graph_handler_scoped() {
+        let handler = create_handler_with_call_data().await;
+
+        let result = handler
+            .handle(
+                "get_call_graph",
+                Some(json!({"function": "validate", "project_slug": "alpha"})),
+            )
+            .await
+            .unwrap();
+
+        let callers = result.get("callers").unwrap().as_array().unwrap();
+        // Scoped to alpha: only 1 caller
+        assert_eq!(callers.len(), 1);
+        assert!(callers[0].as_str().unwrap().contains("a/src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_analyze_impact_handler_scoped() {
+        let handler = create_handler_with_call_data().await;
+
+        // Unscoped
+        let result = handler
+            .handle("analyze_impact", Some(json!({"target": "validate"})))
+            .await
+            .unwrap();
+        let caller_count = result.get("caller_count").unwrap().as_i64().unwrap();
+        assert_eq!(caller_count, 2); // Both projects
+
+        // Scoped to beta
+        let result = handler
+            .handle(
+                "analyze_impact",
+                Some(json!({"target": "validate", "project_slug": "beta"})),
+            )
+            .await
+            .unwrap();
+        let caller_count = result.get("caller_count").unwrap().as_i64().unwrap();
+        assert_eq!(caller_count, 1); // Only beta
+    }
+
+    #[tokio::test]
+    async fn test_find_references_handler_scoped() {
+        let handler = create_handler_with_call_data().await;
+
+        // Unscoped
+        let result = handler
+            .handle("find_references", Some(json!({"symbol": "validate"})))
+            .await
+            .unwrap();
+        let refs = result.get("references").unwrap().as_array().unwrap();
+        assert_eq!(refs.len(), 2); // Both projects
+
+        // Scoped to alpha
+        let result = handler
+            .handle(
+                "find_references",
+                Some(json!({"symbol": "validate", "project_slug": "alpha"})),
+            )
+            .await
+            .unwrap();
+        let refs = result.get("references").unwrap().as_array().unwrap();
+        assert_eq!(refs.len(), 1);
     }
 }
