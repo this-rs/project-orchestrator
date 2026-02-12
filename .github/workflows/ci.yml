@@ -38,6 +38,7 @@ jobs:
           name: build-artifacts
           path: |
             target/release/orchestrator
+            target/release/orch
             target/release/mcp_server
           retention-days: 1
 
@@ -117,7 +118,7 @@ jobs:
           --health-start-period 30s
 
       meilisearch:
-        image: getmeili/meilisearch:v1.6
+        image: getmeili/meilisearch:v1.34
         env:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
@@ -182,7 +183,7 @@ jobs:
           --health-start-period 30s
 
       meilisearch:
-        image: getmeili/meilisearch:v1.6
+        image: getmeili/meilisearch:v1.34
         env:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
@@ -213,7 +214,7 @@ jobs:
           path: target/release/
 
       - name: Make binaries executable
-        run: chmod +x target/release/orchestrator target/release/mcp_server
+        run: chmod +x target/release/orchestrator target/release/orch target/release/mcp_server
 
       - name: Wait for services to be ready
         run: |
