@@ -88,6 +88,8 @@ services:
 
   # ---------------------------------------------------------------------------
   # Orchestrator — Backend + Frontend (ghcr.io image)
+  # Tags: latest (full), latest-api (no frontend), or semver: 1.0.0, 1.0.0-api
+  # Pin to a specific version for reproducible deployments.
   # ---------------------------------------------------------------------------
   orchestrator:
     image: ghcr.io/this-rs/project-orchestrator:${ORCHESTRATOR_IMAGE_TAG:-latest}

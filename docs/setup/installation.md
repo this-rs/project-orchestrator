@@ -289,6 +289,37 @@ For a detailed walkthrough, see the [Authentication Guide](../guides/authenticat
 
 ---
 
+## Docker Images
+
+Pre-built Docker images are published to GitHub Container Registry on each release:
+
+```
+ghcr.io/this-rs/project-orchestrator
+```
+
+### Image variants
+
+| Variant | Tag examples | Description |
+|---------|-------------|-------------|
+| **Full** (recommended) | `:latest`, `:1.0.0`, `:1.0`, `:1` | Backend + embedded React frontend |
+| **API-only** | `:latest-api`, `:1.0.0-api`, `:1.0-api`, `:1-api` | Backend only, no frontend |
+
+### Choosing a tag
+
+- **`:latest`** — always points to the newest full release (convenient, but may break on upgrades)
+- **`:X.Y.Z`** — pinned to a specific version (recommended for production)
+- **`:X.Y`** — receives patch updates automatically
+- **`:X`** — receives minor and patch updates
+
+Use `docker-compose.production.yml` with `ORCHESTRATOR_IMAGE_TAG` to set the version:
+
+```bash
+# Pin to a specific version
+ORCHESTRATOR_IMAGE_TAG=1.0.0 docker compose -f docker-compose.production.yml up -d
+```
+
+---
+
 ## Docker Compose Configuration
 
 The `docker-compose.yml` defines four services:
