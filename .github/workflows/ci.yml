@@ -276,7 +276,11 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Generate coverage report (unit tests)
+      # Coverage includes all #[cfg(test)] modules: mock-based tests (MockGraphStore,
+      # MockSearchStore), MCP handler tests, PlanManager tests, NoteManager tests,
+      # and parser tests. Integration/API tests are excluded because they require
+      # Neo4j and Meilisearch services (covered in separate CI jobs).
+      - name: Generate coverage report (unit + mock tests)
         run: cargo llvm-cov --lib --test parser_tests --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
