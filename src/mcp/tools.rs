@@ -2010,7 +2010,8 @@ fn chat_tools() -> Vec<ToolDefinition> {
                 properties: Some(json!({
                     "feature_graph_id": {"type": "string", "description": "Feature graph UUID"},
                     "entity_type": {"type": "string", "description": "Entity type: file, function, struct, trait, enum"},
-                    "entity_id": {"type": "string", "description": "Entity identifier (file path or symbol name)"}
+                    "entity_id": {"type": "string", "description": "Entity identifier (file path or symbol name)"},
+                    "role": {"type": "string", "description": "Role of the entity in the feature: entry_point, core_logic, data_model, trait_contract, api_surface, support"}
                 })),
                 required: Some(vec![
                     "feature_graph_id".to_string(),
@@ -2029,7 +2030,8 @@ fn chat_tools() -> Vec<ToolDefinition> {
                     "description": {"type": "string", "description": "Optional description"},
                     "project_id": {"type": "string", "description": "Project UUID"},
                     "entry_function": {"type": "string", "description": "Function name to start traversal from"},
-                    "depth": {"type": "integer", "description": "Traversal depth (1-5, default 2)"}
+                    "depth": {"type": "integer", "description": "Traversal depth (1-5, default 2)"},
+                    "include_relations": {"type": "array", "items": {"type": "string"}, "description": "Relation types to traverse (default: all). Options: calls, implements_trait, implements_for, imports"}
                 })),
                 required: Some(vec![
                     "name".to_string(),

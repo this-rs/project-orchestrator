@@ -1420,8 +1420,9 @@ impl GraphStore for Neo4jClient {
         project_id: Uuid,
         entry_function: &str,
         depth: u32,
+        include_relations: Option<&[String]>,
     ) -> anyhow::Result<FeatureGraphDetail> {
-        self.auto_build_feature_graph(name, description, project_id, entry_function, depth)
+        self.auto_build_feature_graph(name, description, project_id, entry_function, depth, include_relations)
             .await
     }
 }

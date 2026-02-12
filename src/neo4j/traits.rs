@@ -1100,5 +1100,6 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
         entry_function: &str,
         depth: u32,
+        include_relations: Option<&[String]>,
     ) -> Result<FeatureGraphDetail>;
 }

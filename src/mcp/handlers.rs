@@ -3643,6 +3643,7 @@ impl ToolHandler {
                     "entity_type": e.entity_type,
                     "entity_id": e.entity_id,
                     "name": e.name,
+                    "role": e.role,
                 })
             })
             .collect();
@@ -3720,10 +3721,25 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("entry_function is required"))?;
         let description = args.get("description").and_then(|v| v.as_str());
         let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
+        let include_relations: Option<Vec<String>> = args
+            .get("include_relations")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
 
         let detail = self
             .neo4j()
-            .auto_build_feature_graph(name, description, project_id, entry_function, depth)
+            .auto_build_feature_graph(
+                name,
+                description,
+                project_id,
+                entry_function,
+                depth,
+                include_relations.as_deref(),
+            )
             .await?;
 
         let entities: Vec<Value> = detail
@@ -3734,6 +3750,7 @@ impl ToolHandler {
                     "entity_type": e.entity_type,
                     "entity_id": e.entity_id,
                     "name": e.name,
+                    "role": e.role,
                 })
             })
             .collect();

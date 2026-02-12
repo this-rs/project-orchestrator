@@ -8069,7 +8069,16 @@ impl Neo4jClient {
         project_id: Uuid,
         entry_function: &str,
         depth: u32,
+        include_relations: Option<&[String]>,
     ) -> Result<FeatureGraphDetail> {
+        // Helper: check if a relation type should be included
+        let should_include = |rel: &str| -> bool {
+            match &include_relations {
+                None => true, // default: include all
+                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
+            }
+        };
+
         // Step 1: Collect all related functions and their files via call graph
         // We collect the entry function + callers + callees
         let depth = depth.clamp(1, 5);
@@ -8125,7 +8134,7 @@ impl Neo4jClient {
         let mut structs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut traits: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        if !files.is_empty() {
+        if !files.is_empty() && (should_include("implements_trait") || should_include("implements_for")) {
             let file_list: Vec<String> = files.iter().cloned().collect();
             let types_q = query(
                 r#"
@@ -8161,7 +8170,7 @@ impl Neo4jClient {
         }
 
         // Step 1c: Expand via IMPORTS — include files imported by the feature's files
-        if !files.is_empty() {
+        if !files.is_empty() && should_include("imports") {
             let file_list: Vec<String> = files.iter().cloned().collect();
             let imports_q = query(
                 r#"

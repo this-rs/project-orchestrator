@@ -3926,7 +3926,14 @@ impl GraphStore for MockGraphStore {
         project_id: Uuid,
         entry_function: &str,
         depth: u32,
+        include_relations: Option<&[String]>,
     ) -> Result<FeatureGraphDetail> {
+        let should_include = |rel: &str| -> bool {
+            match &include_relations {
+                None => true,
+                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
+            }
+        };
         let depth = depth.clamp(1, 5);
 
         // Collect callees from the mock call_relationships
@@ -3997,6 +4004,7 @@ impl GraphStore for MockGraphStore {
         let mut discovered_structs = std::collections::HashSet::new();
         let mut discovered_traits = std::collections::HashSet::new();
 
+        if should_include("implements_trait") || should_include("implements_for") {
         // Find structs in collected files
         let structs_map = self.structs_map.read().await;
         for s in structs_map.values() {
@@ -4025,8 +4033,10 @@ impl GraphStore for MockGraphStore {
             }
         }
         drop(impls_map);
+        } // end if should_include implements_trait/implements_for
 
         // Expand via IMPORTS — include files imported by the feature's files
+        if should_include("imports") {
         let ir = self.import_relationships.read().await;
         let original_files: Vec<String> = files.iter().cloned().collect();
         for file_path in &original_files {
@@ -4037,6 +4047,7 @@ impl GraphStore for MockGraphStore {
             }
         }
         drop(ir);
+        } // end if should_include imports
 
         // Create the feature graph
         let fg = FeatureGraphNode {
@@ -5190,7 +5201,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-fg", None, pid, "handle_request", 2)
+            .auto_build_feature_graph("test-fg", None, pid, "handle_request", 2, None)
             .await
             .unwrap();
 
@@ -5246,7 +5257,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-imports", None, pid, "process", 2)
+            .auto_build_feature_graph("test-imports", None, pid, "process", 2, None)
             .await
             .unwrap();
 
@@ -5299,7 +5310,7 @@ mod tests {
 
         // Build feature graph for project A
         let detail = store
-            .auto_build_feature_graph("test-no-cross", None, pid_a, "shared_func", 2)
+            .auto_build_feature_graph("test-no-cross", None, pid_a, "shared_func", 2, None)
             .await
             .unwrap();
 
@@ -5362,7 +5373,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2)
+            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2, None)
             .await
             .unwrap();
 

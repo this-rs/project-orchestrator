@@ -763,6 +763,7 @@ pub struct AutoBuildBody {
     pub project_id: uuid::Uuid,
     pub entry_function: String,
     pub depth: Option<u32>,
+    pub include_relations: Option<Vec<String>>,
 }
 
 /// POST /api/feature-graphs
@@ -890,6 +891,7 @@ pub async fn auto_build_feature_graph(
             body.project_id,
             &body.entry_function,
             depth,
+            body.include_relations.as_deref(),
         )
         .await?;
     let entities: Vec<serde_json::Value> = detail
@@ -900,6 +902,7 @@ pub async fn auto_build_feature_graph(
                 "entity_type": e.entity_type,
                 "entity_id": e.entity_id,
                 "name": e.name,
+                "role": e.role,
             })
         })
         .collect();
