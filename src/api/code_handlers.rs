@@ -372,6 +372,7 @@ pub struct ImpactAnalysis {
     pub directly_affected: Vec<String>,
     pub transitively_affected: Vec<String>,
     pub test_files_affected: Vec<String>,
+    pub caller_count: i64,
     pub risk_level: String, // "low", "medium", "high"
     pub suggestion: String,
 }
@@ -397,18 +398,19 @@ pub async fn analyze_impact(
         None
     };
 
-    let (directly_affected, transitively_affected) = if target_type == "file" {
+    let (directly_affected, transitively_affected, caller_count) = if target_type == "file" {
         let direct = state
             .orchestrator
             .neo4j()
-            .find_dependent_files(&query.target, 1, None)
+            .find_dependent_files(&query.target, 1, project_id)
             .await?;
         let transitive = state
             .orchestrator
             .neo4j()
-            .find_dependent_files(&query.target, 3, None)
+            .find_dependent_files(&query.target, 3, project_id)
             .await?;
-        (direct, transitive)
+        let count = direct.len() as i64;
+        (direct, transitive, count)
     } else {
         let callers = state
             .orchestrator
@@ -416,7 +418,12 @@ pub async fn analyze_impact(
             .find_callers(&query.target, project_id)
             .await?;
         let direct: Vec<String> = callers.iter().map(|f| f.file_path.clone()).collect();
-        (direct.clone(), direct)
+        let count = state
+            .orchestrator
+            .neo4j()
+            .get_function_caller_count(&query.target, project_id)
+            .await?;
+        (direct.clone(), direct, count)
     };
 
     let test_files: Vec<String> = transitively_affected
@@ -425,9 +432,9 @@ pub async fn analyze_impact(
         .cloned()
         .collect();
 
-    let risk_level = if transitively_affected.len() > 10 {
+    let risk_level = if transitively_affected.len() > 10 || caller_count > 10 {
         "high"
-    } else if transitively_affected.len() > 3 {
+    } else if transitively_affected.len() > 3 || caller_count > 3 {
         "medium"
     } else {
         "low"
@@ -449,6 +456,7 @@ pub async fn analyze_impact(
         directly_affected,
         transitively_affected,
         test_files_affected: test_files,
+        caller_count,
         risk_level: risk_level.to_string(),
         suggestion,
     }))
