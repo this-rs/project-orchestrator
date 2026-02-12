@@ -329,7 +329,9 @@ nats:
   ports:
     - "4222:4222"  # Client connections
     - "8222:8222"  # HTTP monitoring
-  command: ["--jetstream"]
+  command: ["--http_port", "8222", "--jetstream"]
+  volumes:
+    - nats_data:/data/jetstream
 ```
 
 NATS is optional. It enables cross-instance event synchronization and distributed chat relay. If not running, the orchestrator operates in single-instance mode with local event broadcasting only.
@@ -351,7 +353,7 @@ orchestrator:
 ### Network and Volumes
 
 All three services communicate over a dedicated `orchestrator-net` bridge network.
-Data is persisted in four named Docker volumes:
+Data is persisted in five named Docker volumes:
 
 | Volume | Service | Content |
 |--------|---------|---------|

@@ -45,12 +45,14 @@ services:
       - orchestrator-net
 
   nats:
-    image: nats:latest
+    image: nats:2.11-alpine
     container_name: orchestrator-nats
     ports:
       - "4222:4222"   # Client connections
       - "8222:8222"   # HTTP monitoring
-    command: ["--http_port", "8222"]
+    command: ["--http_port", "8222", "--jetstream"]
+    volumes:
+      - nats_data:/data/jetstream
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8222/healthz || exit 1"]
       interval: 10s
@@ -102,6 +104,7 @@ volumes:
   neo4j_data:
   neo4j_logs:
   meilisearch_data:
+  nats_data:
   orchestrator_data:
 
 networks:
