@@ -1672,7 +1672,10 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("file_path is required"))?;
 
         // Get files that depend on this file
-        let dependents = self.neo4j().find_dependent_files(file_path, 3, None).await?;
+        let dependents = self
+            .neo4j()
+            .find_dependent_files(file_path, 3, None)
+            .await?;
 
         // Get files this file imports
         let direct_imports = self.neo4j().get_file_direct_imports(file_path).await?;
@@ -5862,5 +5865,164 @@ mod tests {
             .unwrap();
         let refs = result.get("references").unwrap().as_array().unwrap();
         assert_eq!(refs.len(), 1);
+    }
+
+    // ========================================================================
+    // Enriched analyze_impact handler tests
+    // ========================================================================
+
+    /// Create a handler with file imports for analyze_impact file mode tests
+    async fn create_handler_with_import_data() -> ToolHandler {
+        let graph = MockGraphStore::new();
+
+        let project_a = test_project_named("alpha");
+        graph.create_project(&project_a).await.unwrap();
+
+        seed_mock_file(&graph, project_a.id, "a/src/lib.rs", &["main_fn"]).await;
+        seed_mock_file(&graph, project_a.id, "a/src/handler.rs", &["handle"]).await;
+        seed_mock_file(&graph, project_a.id, "a/src/utils.rs", &["util_fn"]).await;
+        seed_mock_file(&graph, project_a.id, "a/tests/test_lib.rs", &["test_main"]).await;
+
+        // handler.rs imports lib.rs, utils.rs imports lib.rs, test_lib.rs imports lib.rs
+        graph
+            .create_import_relationship("a/src/handler.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("a/src/utils.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("a/tests/test_lib.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    #[tokio::test]
+    async fn test_analyze_impact_file_mode() {
+        let handler = create_handler_with_import_data().await;
+
+        let result = handler
+            .handle(
+                "analyze_impact",
+                Some(json!({"target": "a/src/lib.rs", "project_slug": "alpha"})),
+            )
+            .await
+            .unwrap();
+
+        // target_type should be auto-detected as "file" (contains '/')
+        assert_eq!(result.get("target_type").unwrap().as_str().unwrap(), "file");
+
+        // Should have dependents
+        let directly = result.get("directly_affected").unwrap().as_array().unwrap();
+        let transitively = result
+            .get("transitively_affected")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(!directly.is_empty());
+        assert!(!transitively.is_empty());
+
+        // caller_count = number of direct dependents
+        let caller_count = result.get("caller_count").unwrap().as_i64().unwrap();
+        assert_eq!(caller_count, directly.len() as i64);
+
+        // test_files_affected should contain the test file
+        let test_files = result
+            .get("test_files_affected")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(test_files
+            .iter()
+            .any(|f| f.as_str().unwrap().contains("test")));
+
+        // risk_level and suggestion should be present
+        assert!(result.get("risk_level").is_some());
+        assert!(result.get("suggestion").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_analyze_impact_symbol_mode() {
+        let handler = create_handler_with_call_data().await;
+
+        // "validate" has no '/' or '.' → auto-detected as symbol
+        let result = handler
+            .handle(
+                "analyze_impact",
+                Some(json!({"target": "validate", "project_slug": "alpha"})),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.get("target_type").unwrap().as_str().unwrap(),
+            "symbol"
+        );
+
+        let directly = result.get("directly_affected").unwrap().as_array().unwrap();
+        // In alpha, only "handler" calls "validate" → 1 caller file
+        assert_eq!(directly.len(), 1);
+        assert!(directly[0].as_str().unwrap().contains("a/src/lib.rs"));
+
+        let caller_count = result.get("caller_count").unwrap().as_i64().unwrap();
+        assert_eq!(caller_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_analyze_impact_explicit_target_type() {
+        let handler = create_handler_with_call_data().await;
+
+        // Force target_type=symbol even though target has no special chars
+        let result = handler
+            .handle(
+                "analyze_impact",
+                Some(json!({"target": "validate", "target_type": "symbol"})),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.get("target_type").unwrap().as_str().unwrap(),
+            "symbol"
+        );
+        // Unscoped: both projects
+        let caller_count = result.get("caller_count").unwrap().as_i64().unwrap();
+        assert_eq!(caller_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_analyze_impact_backward_compat_fields() {
+        let handler = create_handler_with_import_data().await;
+
+        let result = handler
+            .handle(
+                "analyze_impact",
+                Some(json!({"target": "a/src/lib.rs", "project_slug": "alpha"})),
+            )
+            .await
+            .unwrap();
+
+        // Backward compat: dependent_files = alias of transitively_affected
+        let dep_files = result.get("dependent_files").unwrap().as_array().unwrap();
+        let transitively = result
+            .get("transitively_affected")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(dep_files, transitively);
+
+        // Backward compat: impact_level = alias of risk_level
+        let impact = result.get("impact_level").unwrap().as_str().unwrap();
+        let risk = result.get("risk_level").unwrap().as_str().unwrap();
+        assert_eq!(impact, risk);
+
+        // Original fields still present
+        assert!(result.get("target").is_some());
+        assert!(result.get("caller_count").is_some());
     }
 }

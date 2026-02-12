@@ -4984,7 +4984,12 @@ impl Neo4jClient {
 
     /// Find all files that depend on a given file.
     /// When project_id is provided, only return dependents from the same project.
-    pub async fn find_dependent_files(&self, file_path: &str, depth: u32, project_id: Option<Uuid>) -> Result<Vec<String>> {
+    pub async fn find_dependent_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
         let q = match project_id {
             Some(pid) => query(&format!(
                 r#"

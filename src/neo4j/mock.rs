@@ -2561,7 +2561,12 @@ impl GraphStore for MockGraphStore {
     // Dependency analysis
     // ========================================================================
 
-    async fn find_dependent_files(&self, file_path: &str, _depth: u32, project_id: Option<Uuid>) -> Result<Vec<String>> {
+    async fn find_dependent_files(
+        &self,
+        file_path: &str,
+        _depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
         let ir = self.import_relationships.read().await;
         let mut dependents = Vec::new();
         for (from, tos) in ir.iter() {
@@ -4917,5 +4922,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count_all, 2);
+    }
+
+    // ========================================================================
+    // find_dependent_files scoping tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_find_dependent_files_scoped_by_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &[]), ("a/src/handler.rs", &[])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &[]), ("b/src/handler.rs", &[])],
+        )
+        .await;
+
+        // a/src/handler.rs imports a/src/lib.rs
+        store
+            .create_import_relationship("a/src/handler.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+        // b/src/handler.rs also imports a/src/lib.rs (cross-project)
+        store
+            .create_import_relationship("b/src/handler.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only a/src/handler.rs should appear
+        let deps_a = store
+            .find_dependent_files("a/src/lib.rs", 3, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(deps_a.len(), 1);
+        assert_eq!(deps_a[0], "a/src/handler.rs");
+
+        // Scoped to project_b: only b/src/handler.rs should appear
+        let deps_b = store
+            .find_dependent_files("a/src/lib.rs", 3, Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(deps_b.len(), 1);
+        assert_eq!(deps_b[0], "b/src/handler.rs");
+    }
+
+    #[tokio::test]
+    async fn test_find_dependent_files_without_project_id() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &[]), ("a/src/consumer.rs", &[])],
+        )
+        .await;
+        seed_project(&store, &project_b, &[("b/src/consumer.rs", &[])]).await;
+
+        store
+            .create_import_relationship("a/src/consumer.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+        store
+            .create_import_relationship("b/src/consumer.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        // Without project_id: all dependents (global fallback)
+        let deps_all = store
+            .find_dependent_files("a/src/lib.rs", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(deps_all.len(), 2);
+        assert!(deps_all.contains(&"a/src/consumer.rs".to_string()));
+        assert!(deps_all.contains(&"b/src/consumer.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_find_dependent_files_unknown_project_returns_empty() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &[]), ("a/src/main.rs", &[])],
+        )
+        .await;
+
+        store
+            .create_import_relationship("a/src/main.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        // Unknown project_id: should return empty
+        let unknown_id = Uuid::new_v4();
+        let deps = store
+            .find_dependent_files("a/src/lib.rs", 3, Some(unknown_id))
+            .await
+            .unwrap();
+        assert!(deps.is_empty());
     }
 }

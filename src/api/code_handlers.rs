@@ -1178,4 +1178,181 @@ mod tests {
         assert_eq!(q.limit, None);
         assert_eq!(q.language, None);
     }
+
+    // ====================================================================
+    // GET /api/code/impact — analyze_impact with caller_count
+    // ====================================================================
+
+    /// Build a test router with seeded import relationships and a project.
+    /// Uses MockGraphStore directly (before Arc wrapping) to access project_files.
+    async fn test_app_with_imports() -> axum::Router {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{FunctionNode, ProjectNode, Visibility};
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+
+        // Create project
+        let project = ProjectNode {
+            id: uuid::Uuid::new_v4(),
+            name: "test-proj".to_string(),
+            slug: "test-proj".to_string(),
+            description: None,
+            root_path: "/tmp/test".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+        };
+        graph.create_project(&project).await.unwrap();
+
+        // Seed files and register in project_files
+        let files = [
+            "src/lib.rs",
+            "src/handler.rs",
+            "src/utils.rs",
+            "tests/test_lib.rs",
+        ];
+        for path in &files {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+            graph
+                .project_files
+                .write()
+                .await
+                .entry(project.id)
+                .or_default()
+                .push(path.to_string());
+        }
+
+        // Seed a function for symbol mode
+        let func = FunctionNode {
+            name: "handle".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/handler.rs".to_string(),
+            line_start: 0,
+            line_end: 10,
+            docstring: None,
+        };
+        graph.upsert_function(&func).await.unwrap();
+
+        // Import relationships: handler.rs → lib.rs, utils.rs → lib.rs, test_lib.rs → lib.rs
+        graph
+            .create_import_relationship("src/handler.rs", "src/lib.rs", "lib")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/utils.rs", "src/lib.rs", "lib")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("tests/test_lib.rs", "src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestrator::FileWatcher::new(orchestrator.clone()),
+        ));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+        });
+        create_router(state)
+    }
+
+    #[tokio::test]
+    async fn test_rest_analyze_impact_includes_caller_count() {
+        let app = test_app_with_imports().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=test-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // caller_count field must be present
+        assert!(
+            json.get("caller_count").is_some(),
+            "Response must include caller_count field"
+        );
+        let caller_count = json["caller_count"].as_i64().unwrap();
+        // 3 files import lib.rs → direct dependents = 3
+        assert_eq!(caller_count, 3);
+
+        // directly_affected should contain the importers
+        let direct = json["directly_affected"].as_array().unwrap();
+        assert_eq!(direct.len(), 3);
+
+        // test_files_affected should contain the test file
+        let test_files = json["test_files_affected"].as_array().unwrap();
+        assert!(test_files
+            .iter()
+            .any(|f| f.as_str().unwrap().contains("test")));
+
+        // risk_level should reflect the count
+        assert!(json.get("risk_level").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rest_analyze_impact_scoped_dependent_files() {
+        let app = test_app_with_imports().await;
+
+        // With project_slug scoping, only files from the project are returned
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=test-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let direct = json["directly_affected"].as_array().unwrap();
+        let transitive = json["transitively_affected"].as_array().unwrap();
+
+        // All returned files should be from the seeded project
+        for file in direct.iter().chain(transitive.iter()) {
+            let path = file.as_str().unwrap();
+            assert!(
+                path.starts_with("src/") || path.starts_with("tests/"),
+                "File {} should be from the seeded project",
+                path
+            );
+        }
+    }
 }
