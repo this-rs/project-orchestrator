@@ -111,7 +111,7 @@ impl ContextBuilder {
         let symbols = self.get_file_symbols(file_path).await?;
 
         // Get dependent files (files that import this file)
-        let dependent_files = self.neo4j.find_dependent_files(file_path, 3).await?;
+        let dependent_files = self.neo4j.find_dependent_files(file_path, 3, None).await?;
 
         // Get files this file imports
         let dependencies = self.get_file_imports(file_path).await?;

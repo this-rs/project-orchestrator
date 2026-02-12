@@ -957,6 +957,7 @@ fn code_tools() -> Vec<ToolDefinition> {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
                     "target": {"type": "string", "description": "File path or symbol name"},
+                    "target_type": {"type": "string", "description": "Target type: 'file' or 'symbol' (auto-detected if omitted)"},
                     "project_slug": {"type": "string", "description": "Filter by project slug"}
                 })),
                 required: Some(vec!["target".to_string()]),

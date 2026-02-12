@@ -837,8 +837,10 @@ impl GraphStore for Neo4jClient {
         &self,
         file_path: &str,
         depth: u32,
+        project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<String>> {
-        self.find_dependent_files(file_path, depth).await
+        self.find_dependent_files(file_path, depth, project_id)
+            .await
     }
 
     async fn find_callers(
