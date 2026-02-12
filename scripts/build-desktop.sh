@@ -6,12 +6,15 @@
 #   ./scripts/build-desktop.sh              # Full build (front + back + Tauri)
 #   ./scripts/build-desktop.sh --skip-front # Skip frontend rebuild (with freshness check)
 #   ./scripts/build-desktop.sh --skip-back  # Skip backend binary rebuild
+#
+# Environment:
+#   FRONTEND_DIR  Path to the frontend repo (default: ../project-orchestrator-frontend)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-FRONTEND_DIR="$HOME/projects/project-orchestrator/frontend"
+FRONTEND_DIR="${FRONTEND_DIR:-$PROJECT_DIR/../project-orchestrator-frontend}"
 DESKTOP_DIR="$PROJECT_DIR/desktop"
 DESKTOP_DIST="$DESKTOP_DIR/dist"
 
@@ -37,8 +40,12 @@ for arg in "$@"; do
         --help|-h)
             echo "Usage: $0 [--skip-front] [--skip-back]"
             echo ""
+            echo "Options:"
             echo "  --skip-front  Skip frontend rebuild (with freshness check)"
             echo "  --skip-back   Skip mcp_server binary rebuild"
+            echo ""
+            echo "Environment variables:"
+            echo "  FRONTEND_DIR  Path to the frontend repo (default: ../project-orchestrator-frontend)"
             exit 0
             ;;
     esac
@@ -69,6 +76,7 @@ if [ "$SKIP_FRONT" = false ]; then
 
     if [ ! -d "$FRONTEND_DIR" ]; then
         log_err "Frontend directory not found: $FRONTEND_DIR"
+        log_err "Set FRONTEND_DIR=/path/to/frontend or clone the frontend repo adjacent to this project."
         exit 1
     fi
 

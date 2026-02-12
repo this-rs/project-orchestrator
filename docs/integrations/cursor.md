@@ -6,7 +6,7 @@ Guide to integrating Project Orchestrator with Cursor IDE.
 
 ## Overview
 
-Cursor supports MCP (Model Context Protocol) servers, giving you access to Project Orchestrator's **137 tools** directly in the editor. Use Chat or Composer to:
+Cursor supports MCP (Model Context Protocol) servers, giving you access to Project Orchestrator's **145 tools** directly in the editor. Use Chat or Composer to:
 
 - **Explore code** with semantic search and graph queries
 - **Manage plans and tasks** without leaving your editor
@@ -281,7 +281,7 @@ Record this decision with rationale: better error handling and readability.
 
 ## Available Tools
 
-All 137 Project Orchestrator tools are available in Cursor. Most useful for editor workflows:
+All 145 Project Orchestrator tools are available in Cursor. Most useful for editor workflows:
 
 | Tool | Cursor Use Case |
 |------|-----------------|
@@ -300,7 +300,7 @@ All 137 Project Orchestrator tools are available in Cursor. Most useful for edit
 | `chat_send_message` | Delegate a task to a sub-agent |
 | `list_chat_sessions` | Review past sub-agent conversations |
 
-See [Claude Code Integration](./claude-code.md#available-tools-137) for the complete tool list.
+See [Claude Code Integration](./claude-code.md#available-tools-145) for the complete tool list.
 
 ---
 

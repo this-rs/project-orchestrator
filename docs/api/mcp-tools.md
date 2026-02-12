@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete documentation for all 137 MCP tools exposed by Project Orchestrator.
+Complete documentation for all 145 MCP tools exposed by Project Orchestrator.
 
 ---
 

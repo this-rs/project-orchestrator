@@ -69,13 +69,15 @@ services:
   # NATS — Message broker for inter-process event sync
   # ---------------------------------------------------------------------------
   nats:
-    image: nats:latest
+    image: nats:2.11-alpine
     container_name: orchestrator-nats
     restart: unless-stopped
     ports:
       - "${NATS_PORT:-4222}:4222"
       - "${NATS_MONITOR_PORT:-8222}:8222"
-    command: ["--http_port", "8222"]
+    command: ["--http_port", "8222", "--jetstream"]
+    volumes:
+      - nats-data:/data/jetstream
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8222/healthz || exit 1"]
       interval: 10s
@@ -86,6 +88,8 @@ services:
 
   # ---------------------------------------------------------------------------
   # Orchestrator — Backend + Frontend (ghcr.io image)
+  # Tags: latest (full), latest-api (no frontend), or semver: 1.0.0, 1.0.0-api
+  # Pin to a specific version for reproducible deployments.
   # ---------------------------------------------------------------------------
   orchestrator:
     image: ghcr.io/this-rs/project-orchestrator:${ORCHESTRATOR_IMAGE_TAG:-latest}
@@ -129,6 +133,7 @@ volumes:
   neo4j-data:
   neo4j-logs:
   meilisearch-data:
+  nats-data:
   orchestrator-data:
 
 networks:

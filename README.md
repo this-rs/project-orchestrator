@@ -18,7 +18,7 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 - **Plan & Task Management** — Structured workflows with dependencies, steps, and progress tracking
 - **Multi-Language Parsing** — Tree-sitter support for Rust, TypeScript, Python, Go, and 8 more languages
 - **Multi-Project Workspaces** — Group related projects with shared context, contracts, and milestones
-- **MCP Integration** — 137 tools available for Claude Code, OpenAI Agents, and Cursor
+- **MCP Integration** — 145 tools available for Claude Code, OpenAI Agents, and Cursor
 - **Auto-Sync** — File watcher keeps the knowledge base updated as you code
 - **Authentication** — Google OAuth2, OIDC, and Password login with deny-by-default security
 - **Chat WebSocket** — Real-time conversational AI via Claude integration
@@ -76,7 +76,7 @@ Add to your MCP configuration (e.g., `~/.claude/mcp.json`):
 # - sync_project: Parse and index your code
 # - create_plan: Start a development plan
 # - create_workspace: Group related projects
-# - And 133 more tools...
+# - And 141 more tools...
 ```
 
 That's it! Your AI agents now have shared context.
@@ -132,7 +132,7 @@ That's it! Your AI agents now have shared context.
 | [Installation](docs/setup/installation.md) | Full setup instructions and configuration |
 | [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
 | [API Reference](docs/api/reference.md) | Complete REST API documentation |
-| [MCP Tools](docs/api/mcp-tools.md) | All 137 MCP tools with examples |
+| [MCP Tools](docs/api/mcp-tools.md) | All 145 MCP tools with examples |
 | [Workspaces](docs/guides/workspaces.md) | Multi-project coordination |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
 | [Authentication](docs/guides/authentication.md) | JWT + OAuth/OIDC + Password auth setup |
@@ -193,7 +193,7 @@ chat:
            ▼                  ▼                   ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  PROJECT ORCHESTRATOR                        │
-│                    (137 MCP Tools)                           │
+│                    (145 MCP Tools)                           │
 │                                                             │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
 │  │   Auth   │  │   Chat   │  │  Events  │  │   Config   │  │

@@ -39,6 +39,8 @@ class ProjectOrchestrator < Formula
 
   def install
     bin.install "orchestrator"
+    bin.install "orch"
+    bin.install "mcp_server"
   end
 
   def caveats
@@ -50,6 +52,9 @@ class ProjectOrchestrator < Formula
       To configure Claude Code integration:
         orchestrator setup-claude
         (auto-configures the MCP server in Claude Code)
+
+      The MCP server binary is at: #{opt_bin}/mcp_server
+      The CLI tool is at: #{opt_bin}/orch
 
       Before starting, ensure Neo4j and MeiliSearch are running.
     EOS

@@ -108,11 +108,11 @@ jobs:
 
       - name: Build (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       # --- Package the binary ---
 
@@ -127,7 +127,9 @@ jobs:
         run: |
           ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
           mkdir -p "staging/${ARCHIVE_NAME}"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "staging/${ARCHIVE_NAME}/"
+          for bin in orchestrator orch mcp_server; do
+            cp "target/${{ matrix.target }}/release/${bin}" "staging/${ARCHIVE_NAME}/"
+          done
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
@@ -142,7 +144,9 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $archiveName = "${env:BINARY_NAME}-${version}-windows-${{ matrix.arch }}"
           New-Item -ItemType Directory -Force -Path "staging/${archiveName}"
-          Copy-Item "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" "staging/${archiveName}/"
+          foreach ($bin in @("orchestrator", "orch", "mcp_server")) {
+            Copy-Item "target/${{ matrix.target }}/release/${bin}.exe" "staging/${archiveName}/"
+          }
           if (Test-Path "queries") {
             Copy-Item -Recurse "queries" "staging/${archiveName}/"
           }
@@ -222,11 +226,11 @@ jobs:
 
       - name: Build with embedded frontend (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --features embedded-frontend --target ${{ matrix.target }}
+        run: cargo build --release --locked --features embedded-frontend --target ${{ matrix.target }}
 
       - name: Build with embedded frontend (cross)
         if: matrix.use_cross
-        run: cross build --release --features embedded-frontend --target ${{ matrix.target }}
+        run: cross build --release --locked --features embedded-frontend --target ${{ matrix.target }}
 
       # --- Package the binary ---
 
@@ -241,7 +245,9 @@ jobs:
         run: |
           ARCHIVE_NAME="${BINARY_NAME}-full-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
           mkdir -p "staging/${ARCHIVE_NAME}"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "staging/${ARCHIVE_NAME}/"
+          for bin in orchestrator orch mcp_server; do
+            cp "target/${{ matrix.target }}/release/${bin}" "staging/${ARCHIVE_NAME}/"
+          done
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
@@ -256,7 +262,9 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $archiveName = "${env:BINARY_NAME}-full-${version}-windows-${{ matrix.arch }}"
           New-Item -ItemType Directory -Force -Path "staging/${archiveName}"
-          Copy-Item "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" "staging/${archiveName}/"
+          foreach ($bin in @("orchestrator", "orch", "mcp_server")) {
+            Copy-Item "target/${{ matrix.target }}/release/${bin}.exe" "staging/${archiveName}/"
+          }
           if (Test-Path "queries") {
             Copy-Item -Recurse "queries" "staging/${archiveName}/"
           }
@@ -312,16 +320,14 @@ jobs:
           name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}.tar.gz
           path: artifact/
 
-      - name: Extract binary to target dir
+      - name: Extract binaries to target dir
         run: |
           ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
           tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
           mkdir -p "target/release"
-          cp "artifact/${ARCHIVE_NAME}/${BINARY_NAME}" "target/release/${BINARY_NAME}"
-          # cargo-deb also needs orch and mcp_server — rebuild them or copy from archive
-          # For now, copy the main binary and let cargo-deb handle what's available
-          cp "target/release/${BINARY_NAME}" "target/release/orch" || true
-          cp "target/release/${BINARY_NAME}" "target/release/mcp_server" || true
+          for bin in orchestrator orch mcp_server; do
+            cp "artifact/${ARCHIVE_NAME}/${bin}" "target/release/${bin}"
+          done
           chmod +x target/release/*
 
       - name: Build .deb package
@@ -383,14 +389,14 @@ jobs:
           name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}.tar.gz
           path: artifact/
 
-      - name: Extract binary to target dir
+      - name: Extract binaries to target dir
         run: |
           ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
           tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
           mkdir -p "target/release"
-          cp "artifact/${ARCHIVE_NAME}/${BINARY_NAME}" "target/release/${BINARY_NAME}"
-          cp "target/release/${BINARY_NAME}" "target/release/orch" || true
-          cp "target/release/${BINARY_NAME}" "target/release/mcp_server" || true
+          for bin in orchestrator orch mcp_server; do
+            cp "artifact/${ARCHIVE_NAME}/${bin}" "target/release/${bin}"
+          done
           chmod +x target/release/*
 
       - name: Build .rpm package

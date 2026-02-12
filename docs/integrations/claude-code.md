@@ -6,7 +6,7 @@ Complete guide to integrating Project Orchestrator with Claude Code (Anthropic's
 
 ## Overview
 
-The integration gives Claude Code access to **137 MCP tools** for:
+The integration gives Claude Code access to **145 MCP tools** for:
 
 - **Project Management** — Create, sync, and explore codebases
 - **Plan & Task Tracking** — Manage development workflows with dependencies
@@ -124,7 +124,7 @@ Claude should use the `list_projects` tool and return results.
 
 ---
 
-## Available Tools (137)
+## Available Tools (145)
 
 ### Project Management (7 tools)
 

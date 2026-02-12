@@ -107,7 +107,7 @@ src/
 ├── chat/          # Chat system: WebSocket, sessions, Claude integration
 ├── config/        # YAML configuration system with env var overrides
 ├── events/        # Event bus: CRUD notifications via WebSocket + NATS inter-process sync
-├── mcp/           # MCP server and tool definitions (137 tools)
+├── mcp/           # MCP server and tool definitions (145 tools)
 ├── neo4j/         # Neo4j client, models, GraphStore trait + mock
 ├── meilisearch/   # Search client, SearchStore trait + mock
 ├── parser/        # Tree-sitter code parsing (12 languages)

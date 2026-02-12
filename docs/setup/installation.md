@@ -44,7 +44,7 @@ This starts:
 - **Neo4j** — Graph database for code structure and relationships
 - **Meilisearch** — Search engine for code and decisions
 - **NATS** — Message broker for inter-process event sync (optional, for multi-instance)
-- **Orchestrator** — API server with 137 MCP tools
+- **Orchestrator** — API server with 145 MCP tools
 
 ### Step 3: Verify the installation
 
@@ -56,18 +56,18 @@ docker compose ps
 curl http://localhost:8080/health
 ```
 
-### Step 4: Build the MCP server binary
+### Step 4: Extract the MCP server binary
 
 ```bash
-# For local MCP integration, build the binary
-docker compose exec orchestrator cat /app/mcp_server > mcp_server
+# For local MCP integration, extract the binary from the running container
+docker cp orchestrator-server:/app/mcp_server ./mcp_server
 chmod +x mcp_server
 
 # Or build from source
 cargo build --release --bin mcp_server
 ```
 
-The MCP server binary is at `./target/release/mcp_server`.
+The MCP server binary is at `./mcp_server` (or `./target/release/mcp_server` if built from source).
 
 ---
 
@@ -289,6 +289,37 @@ For a detailed walkthrough, see the [Authentication Guide](../guides/authenticat
 
 ---
 
+## Docker Images
+
+Pre-built Docker images are published to GitHub Container Registry on each release:
+
+```
+ghcr.io/this-rs/project-orchestrator
+```
+
+### Image variants
+
+| Variant | Tag examples | Description |
+|---------|-------------|-------------|
+| **Full** (recommended) | `:latest`, `:1.0.0`, `:1.0`, `:1` | Backend + embedded React frontend |
+| **API-only** | `:latest-api`, `:1.0.0-api`, `:1.0-api`, `:1-api` | Backend only, no frontend |
+
+### Choosing a tag
+
+- **`:latest`** — always points to the newest full release (convenient, but may break on upgrades)
+- **`:X.Y.Z`** — pinned to a specific version (recommended for production)
+- **`:X.Y`** — receives patch updates automatically
+- **`:X`** — receives minor and patch updates
+
+Use `docker-compose.production.yml` with `ORCHESTRATOR_IMAGE_TAG` to set the version:
+
+```bash
+# Pin to a specific version
+ORCHESTRATOR_IMAGE_TAG=1.0.0 docker compose -f docker-compose.production.yml up -d
+```
+
+---
+
 ## Docker Compose Configuration
 
 The `docker-compose.yml` defines four services:
@@ -329,7 +360,9 @@ nats:
   ports:
     - "4222:4222"  # Client connections
     - "8222:8222"  # HTTP monitoring
-  command: ["--jetstream"]
+  command: ["--http_port", "8222", "--jetstream"]
+  volumes:
+    - nats_data:/data/jetstream
 ```
 
 NATS is optional. It enables cross-instance event synchronization and distributed chat relay. If not running, the orchestrator operates in single-instance mode with local event broadcasting only.
@@ -351,7 +384,7 @@ orchestrator:
 ### Network and Volumes
 
 All three services communicate over a dedicated `orchestrator-net` bridge network.
-Data is persisted in four named Docker volumes:
+Data is persisted in five named Docker volumes:
 
 | Volume | Service | Content |
 |--------|---------|---------|
