@@ -916,6 +916,61 @@ pub async fn auto_build_feature_graph(
     })))
 }
 
+// ============================================================================
+// Implementation Planner
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct PlanImplementationBody {
+    pub project_slug: String,
+    pub description: String,
+    #[serde(default)]
+    pub entry_points: Option<Vec<String>>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub auto_create_plan: Option<bool>,
+}
+
+pub async fn plan_implementation(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<PlanImplementationBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::orchestrator::planner::{PlanRequest, PlanScope};
+
+    // Resolve project slug → project ID
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", body.project_slug))?;
+
+    let scope: Option<PlanScope> = body
+        .scope
+        .as_deref()
+        .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+
+    let request = PlanRequest {
+        project_id: project.id,
+        project_slug: Some(body.project_slug),
+        description: body.description,
+        entry_points: body.entry_points,
+        scope,
+        auto_create_plan: body.auto_create_plan,
+    };
+
+    let plan = state
+        .orchestrator
+        .planner()
+        .plan_implementation(request)
+        .await?;
+
+    Ok(Json(
+        serde_json::to_value(&plan).map_err(anyhow::Error::from)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

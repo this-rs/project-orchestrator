@@ -412,6 +412,13 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(code_handlers::add_entity_to_feature_graph),
         )
         // ================================================================
+        // Implementation Planner
+        // ================================================================
+        .route(
+            "/api/code/plan-implementation",
+            post(code_handlers::plan_implementation),
+        )
+        // ================================================================
         // Knowledge Notes
         // ================================================================
         // Notes CRUD

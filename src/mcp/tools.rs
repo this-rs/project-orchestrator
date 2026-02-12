@@ -2051,6 +2051,27 @@ fn chat_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["id".to_string()]),
             },
         },
+        // ================================================================
+        // Implementation Planner (1)
+        // ================================================================
+        ToolDefinition {
+            name: "plan_implementation".to_string(),
+            description: "Analyze the knowledge graph to produce a DAG of implementation phases (sequential + parallel branches). Given entry points or a description, identifies relevant code zones, expands dependencies, and computes an ordered plan of modifications with risk levels and test files.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Project slug to analyze"},
+                    "description": {"type": "string", "description": "Human description of what to implement"},
+                    "entry_points": {"type": "array", "items": {"type": "string"}, "description": "Explicit entry points (file paths or function names). If omitted, uses semantic search."},
+                    "scope": {"type": "string", "enum": ["file", "module", "project"], "description": "Scope of analysis (default: module)"},
+                    "auto_create_plan": {"type": "boolean", "description": "If true, auto-create a Plan MCP with Tasks/Steps from the result"}
+                })),
+                required: Some(vec![
+                    "project_slug".to_string(),
+                    "description".to_string(),
+                ]),
+            },
+        },
     ]
 }
 
@@ -2061,7 +2082,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 144, "Expected 144 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 145, "Expected 145 tools, got {}", tools.len());
     }
 
     #[test]

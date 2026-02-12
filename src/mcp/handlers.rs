@@ -230,6 +230,9 @@ impl ToolHandler {
             "auto_build_feature_graph" => self.auto_build_feature_graph(args).await,
             "delete_feature_graph" => self.delete_feature_graph(args).await,
 
+            // Implementation Planner
+            "plan_implementation" => self.plan_implementation(args).await,
+
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -3769,6 +3772,63 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let deleted = self.neo4j().delete_feature_graph(id).await?;
         Ok(json!({ "deleted": deleted }))
+    }
+
+    // ========================================================================
+    // Implementation Planner
+    // ========================================================================
+
+    async fn plan_implementation(&self, args: Value) -> Result<Value> {
+        use crate::orchestrator::planner::{PlanRequest, PlanScope};
+
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("project_slug is required"))?;
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("description is required"))?;
+
+        // Resolve project slug → project ID
+        let project = self
+            .neo4j()
+            .get_project_by_slug(project_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project '{}' not found", project_slug))?;
+
+        let entry_points: Option<Vec<String>> = args
+            .get("entry_points")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
+
+        let scope: Option<PlanScope> = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
+
+        let auto_create_plan = args.get("auto_create_plan").and_then(|v| v.as_bool());
+
+        let request = PlanRequest {
+            project_id: project.id,
+            project_slug: Some(project_slug.to_string()),
+            description: description.to_string(),
+            entry_points,
+            scope,
+            auto_create_plan,
+        };
+
+        let plan = self
+            .orchestrator
+            .planner()
+            .plan_implementation(request)
+            .await?;
+
+        Ok(serde_json::to_value(&plan)?)
     }
 }
 
