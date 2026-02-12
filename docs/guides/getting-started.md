@@ -435,7 +435,7 @@ You've learned the basics! Here's what to explore next:
 ### Deep Dives
 
 - **[API Reference](../api/reference.md)** — Full REST API documentation
-- **[MCP Tools Reference](../api/mcp-tools.md)** — All 137 tools explained
+- **[MCP Tools Reference](../api/mcp-tools.md)** — All 145 tools explained
 
 ### Integration Guides
 

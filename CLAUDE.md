@@ -9,7 +9,7 @@ For user-facing documentation, see the `docs/` folder:
 - **[Installation Guide](docs/setup/installation.md)** — Full setup instructions
 - **[Getting Started](docs/guides/getting-started.md)** — Tutorial for new users
 - **[API Reference](docs/api/reference.md)** — REST API documentation
-- **[MCP Tools](docs/api/mcp-tools.md)** — All 137 MCP tools documented
+- **[MCP Tools](docs/api/mcp-tools.md)** — All 145 MCP tools documented
 - **Integration Guides:**
   - [Claude Code](docs/integrations/claude-code.md)
   - [OpenAI Agents](docs/integrations/openai.md)
@@ -28,7 +28,7 @@ For user-facing documentation, see the `docs/` folder:
 - Meilisearch for semantic search across code and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
-- MCP server for Claude Code integration (137 tools)
+- MCP server for Claude Code integration (145 tools)
 - File watcher for auto-syncing changes
 - Authentication system: Google OAuth2, generic OIDC, password login + JWT, deny-by-default middleware
 - Chat WebSocket for real-time conversational AI (migrated from SSE)
@@ -111,7 +111,7 @@ Or use command-line arguments:
 
 ### Available MCP Tools
 
-The MCP server exposes 137 tools organized by category:
+The MCP server exposes 145 tools organized by category:
 
 **Project Management (8 tools)**
 - `list_projects` - List all registered projects
@@ -259,7 +259,7 @@ docs/
 │   └── cursor.md            # Cursor IDE setup
 ├── api/
 │   ├── reference.md         # REST API documentation
-│   └── mcp-tools.md         # MCP tools reference (137 tools)
+│   └── mcp-tools.md         # MCP tools reference (145 tools)
 └── guides/
     ├── getting-started.md   # Tutorial for new users
     ├── multi-agent-workflow.md # Multi-agent coordination
@@ -295,7 +295,7 @@ src/
 ├── mcp/
 │   ├── mod.rs           # MCP module exports
 │   ├── protocol.rs      # JSON-RPC 2.0 types
-│   ├── tools.rs         # Tool definitions (137 tools)
+│   ├── tools.rs         # Tool definitions (145 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
 ├── neo4j/

@@ -153,4 +153,4 @@ See [Authentication Guide](docs/guides/authentication.md) for details.
 - [Chat & WebSocket](docs/guides/chat-websocket.md) — Real-time chat and events
 - [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) — Coordinating multiple agents
 - [API Reference](docs/api/reference.md) — All REST endpoints
-- [MCP Tools](docs/api/mcp-tools.md) — 137 tools documented
+- [MCP Tools](docs/api/mcp-tools.md) — 145 tools documented

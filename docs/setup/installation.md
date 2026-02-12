@@ -44,7 +44,7 @@ This starts:
 - **Neo4j** — Graph database for code structure and relationships
 - **Meilisearch** — Search engine for code and decisions
 - **NATS** — Message broker for inter-process event sync (optional, for multi-instance)
-- **Orchestrator** — API server with 137 MCP tools
+- **Orchestrator** — API server with 145 MCP tools
 
 ### Step 3: Verify the installation
 
