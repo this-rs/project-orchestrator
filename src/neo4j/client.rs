@@ -8060,9 +8060,11 @@ impl Neo4jClient {
 
         let q = query(&format!(
             r#"
-            MATCH (entry:Function {{name: $name}})
+            MATCH (entry:Function {{name: $name}})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {{id: $project_id}})
             OPTIONAL MATCH (entry)-[:CALLS*1..{depth}]->(callee:Function)
+            WHERE EXISTS {{ MATCH (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }}
             OPTIONAL MATCH (caller:Function)-[:CALLS*1..{depth}]->(entry)
+            WHERE EXISTS {{ MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }}
             WITH entry,
                  collect(DISTINCT callee) AS callees_nodes,
                  collect(DISTINCT caller) AS callers_nodes
@@ -8075,7 +8077,8 @@ impl Neo4jClient {
             "#,
             depth = depth
         ))
-        .param("name", entry_function);
+        .param("name", entry_function)
+        .param("project_id", project_id.to_string());
 
         let rows = self.execute_with_params(q).await?;
 
@@ -8100,6 +8103,68 @@ impl Neo4jClient {
                 "No function found matching '{}'",
                 entry_function
             ));
+        }
+
+        // Step 1b: Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR for structs/enums in collected files
+        let mut structs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut traits: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if !files.is_empty() {
+            let file_list: Vec<String> = files.iter().cloned().collect();
+            let types_q = query(
+                r#"
+                MATCH (f:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                WHERE f.path IN $files
+                OPTIONAL MATCH (f)-[:CONTAINS]->(s:Struct)
+                OPTIONAL MATCH (f)-[:CONTAINS]->(e:Enum)
+                WITH collect(DISTINCT s) + collect(DISTINCT e) AS types
+                UNWIND types AS t
+                WITH DISTINCT t WHERE t IS NOT NULL
+                OPTIONAL MATCH (impl:Impl)-[:IMPLEMENTS_FOR]->(t)
+                OPTIONAL MATCH (impl)-[:IMPLEMENTS_TRAIT]->(tr:Trait)
+                RETURN t.name AS type_name, labels(t)[0] AS type_label,
+                       collect(DISTINCT tr.name) AS trait_names
+                "#,
+            )
+            .param("project_id", project_id.to_string())
+            .param("files", file_list);
+
+            let type_rows = self.execute_with_params(types_q).await?;
+            for row in &type_rows {
+                if let Ok(type_name) = row.get::<String>("type_name") {
+                    structs.insert(type_name);
+                }
+                if let Ok(trait_list) = row.get::<Vec<String>>("trait_names") {
+                    for t in trait_list {
+                        if !t.is_empty() {
+                            traits.insert(t);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 1c: Expand via IMPORTS — include files imported by the feature's files
+        if !files.is_empty() {
+            let file_list: Vec<String> = files.iter().cloned().collect();
+            let imports_q = query(
+                r#"
+                MATCH (f:File)-[:IMPORTS]->(imported:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                WHERE f.path IN $files
+                RETURN DISTINCT imported.path AS imported_path
+                "#,
+            )
+            .param("project_id", project_id.to_string())
+            .param("files", file_list);
+
+            let import_rows = self.execute_with_params(imports_q).await?;
+            for row in &import_rows {
+                if let Ok(imported_path) = row.get::<String>("imported_path") {
+                    if !imported_path.is_empty() {
+                        files.insert(imported_path);
+                    }
+                }
+            }
         }
 
         // Step 2: Create the FeatureGraph
@@ -8137,6 +8202,30 @@ impl Neo4jClient {
                 entity_type: "file".to_string(),
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
+            });
+        }
+
+        // Add structs/enums discovered via IMPLEMENTS_FOR
+        for struct_name in &structs {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "struct", struct_name)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "struct".to_string(),
+                entity_id: struct_name.clone(),
+                name: Some(struct_name.clone()),
+            });
+        }
+
+        // Add traits discovered via IMPLEMENTS_TRAIT
+        for trait_name in &traits {
+            let _ = self
+                .add_entity_to_feature_graph(fg.id, "trait", trait_name)
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "trait".to_string(),
+                entity_id: trait_name.clone(),
+                name: Some(trait_name.clone()),
             });
         }
 
