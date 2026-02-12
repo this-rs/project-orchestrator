@@ -56,18 +56,18 @@ docker compose ps
 curl http://localhost:8080/health
 ```
 
-### Step 4: Build the MCP server binary
+### Step 4: Extract the MCP server binary
 
 ```bash
-# For local MCP integration, build the binary
-docker compose exec orchestrator cat /app/mcp_server > mcp_server
+# For local MCP integration, extract the binary from the running container
+docker cp orchestrator-server:/app/mcp_server ./mcp_server
 chmod +x mcp_server
 
 # Or build from source
 cargo build --release --bin mcp_server
 ```
 
-The MCP server binary is at `./target/release/mcp_server`.
+The MCP server binary is at `./mcp_server` (or `./target/release/mcp_server` if built from source).
 
 ---
 
