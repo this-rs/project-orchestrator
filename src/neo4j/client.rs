@@ -8134,7 +8134,9 @@ impl Neo4jClient {
         let mut structs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut traits: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        if !files.is_empty() && (should_include("implements_trait") || should_include("implements_for")) {
+        if !files.is_empty()
+            && (should_include("implements_trait") || should_include("implements_for"))
+        {
             let file_list: Vec<String> = files.iter().cloned().collect();
             let types_q = query(
                 r#"
