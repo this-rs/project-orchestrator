@@ -1737,20 +1737,84 @@ impl ToolHandler {
             None
         };
 
-        // Find all files that depend on this target (file or symbol)
-        let dependents = self.neo4j().find_dependent_files(target, 3, project_id).await?;
+        // Auto-detect target_type: contains '/' or '.' → file, otherwise symbol
+        let target_type = args
+            .get("target_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                if target.contains('/') || target.contains('.') {
+                    "file"
+                } else {
+                    "symbol"
+                }
+            });
 
-        // If target is a function, find callers
-        let caller_count = self
-            .neo4j()
-            .get_function_caller_count(target, project_id)
-            .await?;
+        let (directly_affected, transitively_affected, caller_count) = if target_type == "file" {
+            let direct = self
+                .neo4j()
+                .find_dependent_files(target, 1, project_id)
+                .await?;
+            let transitive = self
+                .neo4j()
+                .find_dependent_files(target, 3, project_id)
+                .await?;
+            let caller_count = direct.len() as i64;
+            (direct, transitive, caller_count)
+        } else {
+            // Symbol mode: use find_callers for direct impact
+            let callers = self.neo4j().find_callers(target, project_id).await?;
+            let direct: Vec<String> = callers.iter().map(|f| f.file_path.clone()).collect();
+            let caller_count = self
+                .neo4j()
+                .get_function_caller_count(target, project_id)
+                .await?;
+            (direct.clone(), direct, caller_count)
+        };
+
+        // Filter test files
+        let test_files: Vec<String> = transitively_affected
+            .iter()
+            .filter(|p| p.contains("test") || p.contains("_test") || p.ends_with("_tests.rs"))
+            .cloned()
+            .collect();
+
+        // Compute risk level
+        let risk_level = if transitively_affected.len() > 10 || caller_count > 10 {
+            "high"
+        } else if transitively_affected.len() > 3 || caller_count > 3 {
+            "medium"
+        } else {
+            "low"
+        };
+
+        // Generate suggestion
+        let suggestion = format!(
+            "Run tests in: {}. Consider reviewing: {}",
+            if test_files.is_empty() {
+                "(no test files found)".to_string()
+            } else {
+                test_files.join(", ")
+            },
+            directly_affected
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         Ok(json!({
             "target": target,
-            "dependent_files": dependents,
+            "target_type": target_type,
+            "directly_affected": directly_affected,
+            "transitively_affected": transitively_affected,
+            "test_files_affected": test_files,
             "caller_count": caller_count,
-            "impact_level": if dependents.len() > 5 || caller_count > 10 { "high" } else if dependents.len() > 2 || caller_count > 3 { "medium" } else { "low" }
+            "risk_level": risk_level,
+            "suggestion": suggestion,
+            // Backward compat aliases
+            "dependent_files": transitively_affected,
+            "impact_level": risk_level
         }))
     }
 
