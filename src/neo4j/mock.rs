@@ -2561,7 +2561,7 @@ impl GraphStore for MockGraphStore {
     // Dependency analysis
     // ========================================================================
 
-    async fn find_dependent_files(&self, file_path: &str, _depth: u32) -> Result<Vec<String>> {
+    async fn find_dependent_files(&self, file_path: &str, _depth: u32, project_id: Option<Uuid>) -> Result<Vec<String>> {
         let ir = self.import_relationships.read().await;
         let mut dependents = Vec::new();
         for (from, tos) in ir.iter() {
@@ -2569,6 +2569,17 @@ impl GraphStore for MockGraphStore {
                 dependents.push(from.clone());
             }
         }
+
+        // Filter by project if project_id is provided
+        if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            if let Some(project_paths) = pf.get(&pid) {
+                dependents.retain(|p| project_paths.contains(p));
+            } else {
+                dependents.clear();
+            }
+        }
+
         Ok(dependents)
     }
 

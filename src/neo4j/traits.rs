@@ -637,8 +637,9 @@ pub trait GraphStore: Send + Sync {
     // Dependency analysis
     // ========================================================================
 
-    /// Find all files that depend on a given file
-    async fn find_dependent_files(&self, file_path: &str, depth: u32) -> Result<Vec<String>>;
+    /// Find all files that depend on a given file.
+    /// When project_id is provided, only return dependents from the same project.
+    async fn find_dependent_files(&self, file_path: &str, depth: u32, project_id: Option<Uuid>) -> Result<Vec<String>>;
 
     /// Find all functions that call a given function
     /// When project_id is provided, only return callers from the same project.

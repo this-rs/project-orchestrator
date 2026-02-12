@@ -245,7 +245,7 @@ pub async fn get_file_dependencies(
     let dependents = state
         .orchestrator
         .neo4j()
-        .find_dependent_files(&file_path, 3)
+        .find_dependent_files(&file_path, 3, None)
         .await?;
 
     let import_nodes = state
@@ -401,12 +401,12 @@ pub async fn analyze_impact(
         let direct = state
             .orchestrator
             .neo4j()
-            .find_dependent_files(&query.target, 1)
+            .find_dependent_files(&query.target, 1, None)
             .await?;
         let transitive = state
             .orchestrator
             .neo4j()
-            .find_dependent_files(&query.target, 3)
+            .find_dependent_files(&query.target, 3, None)
             .await?;
         (direct, transitive)
     } else {

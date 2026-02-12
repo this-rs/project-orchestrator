@@ -1672,7 +1672,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("file_path is required"))?;
 
         // Get files that depend on this file
-        let dependents = self.neo4j().find_dependent_files(file_path, 3).await?;
+        let dependents = self.neo4j().find_dependent_files(file_path, 3, None).await?;
 
         // Get files this file imports
         let direct_imports = self.neo4j().get_file_direct_imports(file_path).await?;
@@ -1738,7 +1738,7 @@ impl ToolHandler {
         };
 
         // Find all files that depend on this target (file or symbol)
-        let dependents = self.neo4j().find_dependent_files(target, 3).await?;
+        let dependents = self.neo4j().find_dependent_files(target, 3, project_id).await?;
 
         // If target is a function, find callers
         let caller_count = self

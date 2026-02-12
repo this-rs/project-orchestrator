@@ -4982,16 +4982,30 @@ impl Neo4jClient {
     // Impact analysis
     // ========================================================================
 
-    /// Find all files that depend on a given file
-    pub async fn find_dependent_files(&self, file_path: &str, depth: u32) -> Result<Vec<String>> {
-        let q = query(&format!(
-            r#"
-            MATCH (f:File {{path: $path}})<-[:IMPORTS*1..{}]-(dependent:File)
-            RETURN DISTINCT dependent.path AS path
-            "#,
-            depth
-        ))
-        .param("path", file_path);
+    /// Find all files that depend on a given file.
+    /// When project_id is provided, only return dependents from the same project.
+    pub async fn find_dependent_files(&self, file_path: &str, depth: u32, project_id: Option<Uuid>) -> Result<Vec<String>> {
+        let q = match project_id {
+            Some(pid) => query(&format!(
+                r#"
+                MATCH (f:File {{path: $path}})<-[:CONTAINS]-(p:Project {{id: $project_id}})
+                MATCH (f)<-[:IMPORTS*1..{}]-(dependent:File)
+                WHERE EXISTS {{ MATCH (dependent)<-[:CONTAINS]-(p) }}
+                RETURN DISTINCT dependent.path AS path
+                "#,
+                depth
+            ))
+            .param("path", file_path)
+            .param("project_id", pid.to_string()),
+            None => query(&format!(
+                r#"
+                MATCH (f:File {{path: $path}})<-[:IMPORTS*1..{}]-(dependent:File)
+                RETURN DISTINCT dependent.path AS path
+                "#,
+                depth
+            ))
+            .param("path", file_path),
+        };
 
         let mut result = self.graph.execute(q).await?;
         let mut paths = Vec::new();
