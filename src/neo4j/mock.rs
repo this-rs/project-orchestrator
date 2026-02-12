@@ -77,7 +77,8 @@ pub struct MockGraphStore {
     pub note_supersedes: RwLock<HashMap<Uuid, Uuid>>,
     pub users: RwLock<HashMap<Uuid, UserNode>>,
     pub feature_graphs: RwLock<HashMap<Uuid, FeatureGraphNode>>,
-    /// feature_graph_id -> Vec<(entity_type, entity_id)>
+    /// feature_graph_id -> Vec<(entity_type, entity_id, role)>
+    #[allow(clippy::type_complexity)]
     pub feature_graph_entities: RwLock<HashMap<Uuid, Vec<(String, String, Option<String>)>>>,
 }
 
@@ -3888,13 +3889,20 @@ impl GraphStore for MockGraphStore {
         let mut entities = self.feature_graph_entities.write().await;
         let list = entities.entry(feature_graph_id).or_default();
         // Check if entity already exists (by type + id)
-        if let Some(existing) = list.iter_mut().find(|(et, eid, _)| et == entity_type && eid == entity_id) {
+        if let Some(existing) = list
+            .iter_mut()
+            .find(|(et, eid, _)| et == entity_type && eid == entity_id)
+        {
             // Update role if provided
             if role.is_some() {
                 existing.2 = role.map(|r| r.to_string());
             }
         } else {
-            list.push((entity_type.to_string(), entity_id.to_string(), role.map(|r| r.to_string())));
+            list.push((
+                entity_type.to_string(),
+                entity_id.to_string(),
+                role.map(|r| r.to_string()),
+            ));
         }
         // Update updated_at
         if let Some(fg) = self.feature_graphs.write().await.get_mut(&feature_graph_id) {
@@ -4005,48 +4013,48 @@ impl GraphStore for MockGraphStore {
         let mut discovered_traits = std::collections::HashSet::new();
 
         if should_include("implements_trait") || should_include("implements_for") {
-        // Find structs in collected files
-        let structs_map = self.structs_map.read().await;
-        for s in structs_map.values() {
-            if files.contains(&s.file_path) {
-                discovered_structs.insert(s.name.clone());
-            }
-        }
-        drop(structs_map);
-
-        // Find enums in collected files
-        let enums_map = self.enums_map.read().await;
-        for e in enums_map.values() {
-            if files.contains(&e.file_path) {
-                discovered_structs.insert(e.name.clone());
-            }
-        }
-        drop(enums_map);
-
-        // Find traits via impls (IMPLEMENTS_TRAIT + IMPLEMENTS_FOR)
-        let impls_map = self.impls_map.read().await;
-        for imp in impls_map.values() {
-            if discovered_structs.contains(&imp.for_type) {
-                if let Some(ref trait_name) = imp.trait_name {
-                    discovered_traits.insert(trait_name.clone());
+            // Find structs in collected files
+            let structs_map = self.structs_map.read().await;
+            for s in structs_map.values() {
+                if files.contains(&s.file_path) {
+                    discovered_structs.insert(s.name.clone());
                 }
             }
-        }
-        drop(impls_map);
+            drop(structs_map);
+
+            // Find enums in collected files
+            let enums_map = self.enums_map.read().await;
+            for e in enums_map.values() {
+                if files.contains(&e.file_path) {
+                    discovered_structs.insert(e.name.clone());
+                }
+            }
+            drop(enums_map);
+
+            // Find traits via impls (IMPLEMENTS_TRAIT + IMPLEMENTS_FOR)
+            let impls_map = self.impls_map.read().await;
+            for imp in impls_map.values() {
+                if discovered_structs.contains(&imp.for_type) {
+                    if let Some(ref trait_name) = imp.trait_name {
+                        discovered_traits.insert(trait_name.clone());
+                    }
+                }
+            }
+            drop(impls_map);
         } // end if should_include implements_trait/implements_for
 
         // Expand via IMPORTS — include files imported by the feature's files
         if should_include("imports") {
-        let ir = self.import_relationships.read().await;
-        let original_files: Vec<String> = files.iter().cloned().collect();
-        for file_path in &original_files {
-            if let Some(imported) = ir.get(file_path) {
-                for imp in imported {
-                    files.insert(imp.clone());
+            let ir = self.import_relationships.read().await;
+            let original_files: Vec<String> = files.iter().cloned().collect();
+            for file_path in &original_files {
+                if let Some(imported) = ir.get(file_path) {
+                    for imp in imported {
+                        files.insert(imp.clone());
+                    }
                 }
             }
-        }
-        drop(ir);
+            drop(ir);
         } // end if should_include imports
 
         // Create the feature graph
@@ -5205,27 +5213,47 @@ mod tests {
             .await
             .unwrap();
 
-        let entity_types: Vec<&str> = detail.entities.iter().map(|e| e.entity_type.as_str()).collect();
-        let entity_ids: Vec<&str> = detail.entities.iter().map(|e| e.entity_id.as_str()).collect();
+        let entity_types: Vec<&str> = detail
+            .entities
+            .iter()
+            .map(|e| e.entity_type.as_str())
+            .collect();
+        let entity_ids: Vec<&str> = detail
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
 
         // Should include the function
-        assert!(entity_ids.contains(&"handle_request"), "should include function");
+        assert!(
+            entity_ids.contains(&"handle_request"),
+            "should include function"
+        );
         // Should include the file
-        assert!(entity_ids.contains(&"src/handler.rs"), "should include file");
+        assert!(
+            entity_ids.contains(&"src/handler.rs"),
+            "should include file"
+        );
         // Should include the struct via IMPLEMENTS_FOR
         assert!(
             entity_types.contains(&"struct"),
             "should include struct entities, got: {:?}",
             entity_types
         );
-        assert!(entity_ids.contains(&"Request"), "should include Request struct");
+        assert!(
+            entity_ids.contains(&"Request"),
+            "should include Request struct"
+        );
         // Should include the trait via IMPLEMENTS_TRAIT
         assert!(
             entity_types.contains(&"trait"),
             "should include trait entities, got: {:?}",
             entity_types
         );
-        assert!(entity_ids.contains(&"Serialize"), "should include Serialize trait");
+        assert!(
+            entity_ids.contains(&"Serialize"),
+            "should include Serialize trait"
+        );
     }
 
     #[tokio::test]
@@ -5244,10 +5272,7 @@ mod tests {
             .await
             .entry(pid)
             .or_default()
-            .extend(vec![
-                "src/main.rs".to_string(),
-                "src/utils.rs".to_string(),
-            ]);
+            .extend(vec!["src/main.rs".to_string(), "src/utils.rs".to_string()]);
 
         // Seed: src/main.rs imports src/utils.rs
         store
@@ -5268,7 +5293,10 @@ mod tests {
             .map(|e| e.entity_id.as_str())
             .collect();
 
-        assert!(file_entities.contains(&"src/main.rs"), "should include source file");
+        assert!(
+            file_entities.contains(&"src/main.rs"),
+            "should include source file"
+        );
         assert!(
             file_entities.contains(&"src/utils.rs"),
             "should include imported file, got: {:?}",
@@ -5330,7 +5358,10 @@ mod tests {
         // Note: The mock currently matches by function name, not by project.
         // This test documents the expected behavior once project scoping is implemented in the mock.
         // For now, we verify the feature graph was built successfully.
-        assert!(detail.entities.len() >= 2, "should have at least function + file");
+        assert!(
+            detail.entities.len() >= 2,
+            "should have at least function + file"
+        );
     }
 
     #[tokio::test]
@@ -5482,10 +5513,18 @@ mod tests {
             .unwrap()
             .expect("should exist");
 
-        let func_a = detail.entities.iter().find(|e| e.entity_id == "func_a").unwrap();
+        let func_a = detail
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "func_a")
+            .unwrap();
         assert_eq!(func_a.role, None, "func_a should have no role");
 
-        let func_b = detail.entities.iter().find(|e| e.entity_id == "func_b").unwrap();
+        let func_b = detail
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "func_b")
+            .unwrap();
         assert_eq!(
             func_b.role,
             Some("entry_point".to_string()),
@@ -5504,7 +5543,11 @@ mod tests {
             .unwrap()
             .expect("should exist");
 
-        let func_a2 = detail2.entities.iter().find(|e| e.entity_id == "func_a").unwrap();
+        let func_a2 = detail2
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "func_a")
+            .unwrap();
         assert_eq!(
             func_a2.role,
             Some("core_logic".to_string()),
@@ -5512,6 +5555,10 @@ mod tests {
         );
 
         // Verify count is still 2 (not duplicated)
-        assert_eq!(detail2.entities.len(), 2, "should still have 2 entities, not duplicated");
+        assert_eq!(
+            detail2.entities.len(),
+            2,
+            "should still have 2 entities, not duplicated"
+        );
     }
 }
