@@ -1079,6 +1079,7 @@ pub trait GraphStore: Send + Sync {
         feature_graph_id: Uuid,
         entity_type: &str,
         entity_id: &str,
+        role: Option<&str>,
     ) -> Result<()>;
 
     /// Remove an entity from a feature graph

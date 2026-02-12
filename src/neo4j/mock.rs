@@ -78,7 +78,7 @@ pub struct MockGraphStore {
     pub users: RwLock<HashMap<Uuid, UserNode>>,
     pub feature_graphs: RwLock<HashMap<Uuid, FeatureGraphNode>>,
     /// feature_graph_id -> Vec<(entity_type, entity_id)>
-    pub feature_graph_entities: RwLock<HashMap<Uuid, Vec<(String, String)>>>,
+    pub feature_graph_entities: RwLock<HashMap<Uuid, Vec<(String, String, Option<String>)>>>,
 }
 
 #[allow(dead_code)]
@@ -3839,10 +3839,11 @@ impl GraphStore for MockGraphStore {
             .get(&id)
             .map(|ents| {
                 ents.iter()
-                    .map(|(et, eid)| FeatureGraphEntity {
+                    .map(|(et, eid, role)| FeatureGraphEntity {
                         entity_type: et.clone(),
                         entity_id: eid.clone(),
                         name: Some(eid.clone()),
+                        role: role.clone(),
                     })
                     .collect()
             })
@@ -3882,12 +3883,18 @@ impl GraphStore for MockGraphStore {
         feature_graph_id: Uuid,
         entity_type: &str,
         entity_id: &str,
+        role: Option<&str>,
     ) -> Result<()> {
-        let entry = (entity_type.to_string(), entity_id.to_string());
         let mut entities = self.feature_graph_entities.write().await;
         let list = entities.entry(feature_graph_id).or_default();
-        if !list.contains(&entry) {
-            list.push(entry);
+        // Check if entity already exists (by type + id)
+        if let Some(existing) = list.iter_mut().find(|(et, eid, _)| et == entity_type && eid == entity_id) {
+            // Update role if provided
+            if role.is_some() {
+                existing.2 = role.map(|r| r.to_string());
+            }
+        } else {
+            list.push((entity_type.to_string(), entity_id.to_string(), role.map(|r| r.to_string())));
         }
         // Update updated_at
         if let Some(fg) = self.feature_graphs.write().await.get_mut(&feature_graph_id) {
@@ -3904,9 +3911,8 @@ impl GraphStore for MockGraphStore {
     ) -> Result<bool> {
         let mut entities = self.feature_graph_entities.write().await;
         if let Some(list) = entities.get_mut(&feature_graph_id) {
-            let entry = (entity_type.to_string(), entity_id.to_string());
             let before = list.len();
-            list.retain(|e| e != &entry);
+            list.retain(|(et, eid, _)| !(et == entity_type && eid == entity_id));
             Ok(list.len() < before)
         } else {
             Ok(false)
@@ -4043,50 +4049,59 @@ impl GraphStore for MockGraphStore {
         };
         self.create_feature_graph(&fg).await?;
 
-        // Add entities
+        // Add entities with auto-assigned roles
         let mut entities = Vec::new();
         for func_name in &all_functions {
+            let role = if func_name == entry_function {
+                "entry_point"
+            } else {
+                "core_logic"
+            };
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "function", func_name)
+                .add_entity_to_feature_graph(fg.id, "function", func_name, Some(role))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
                 entity_id: func_name.clone(),
                 name: Some(func_name.clone()),
+                role: Some(role.to_string()),
             });
         }
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "file", file_path)
+                .add_entity_to_feature_graph(fg.id, "file", file_path, Some("support"))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
+                role: Some("support".to_string()),
             });
         }
 
-        // Add structs/enums discovered via IMPLEMENTS_FOR
+        // Add structs/enums discovered via IMPLEMENTS_FOR with role: data_model
         for struct_name in &discovered_structs {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "struct", struct_name)
+                .add_entity_to_feature_graph(fg.id, "struct", struct_name, Some("data_model"))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
                 entity_id: struct_name.clone(),
                 name: Some(struct_name.clone()),
+                role: Some("data_model".to_string()),
             });
         }
 
-        // Add traits discovered via IMPLEMENTS_TRAIT
+        // Add traits discovered via IMPLEMENTS_TRAIT with role: trait_contract
         for trait_name in &discovered_traits {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "trait", trait_name)
+                .add_entity_to_feature_graph(fg.id, "trait", trait_name, Some("trait_contract"))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
                 entity_id: trait_name.clone(),
                 name: Some(trait_name.clone()),
+                role: Some("trait_contract".to_string()),
             });
         }
 
@@ -5305,5 +5320,187 @@ mod tests {
         // This test documents the expected behavior once project scoping is implemented in the mock.
         // For now, we verify the feature graph was built successfully.
         assert!(detail.entities.len() >= 2, "should have at least function + file");
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_auto_assigns_roles() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed project files first (needed for project-scoped call relationship creation)
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(vec![
+                "src/handler.rs".to_string(),
+                "src/processor.rs".to_string(),
+                "src/serde.rs".to_string(),
+            ]);
+
+        // Seed: entry function "handle_request" calls "process_data"
+        let entry_func = make_function("handle_request", "src/handler.rs", 1);
+        store.upsert_function(&entry_func).await.unwrap();
+        let callee_func = make_function("process_data", "src/processor.rs", 1);
+        store.upsert_function(&callee_func).await.unwrap();
+        store
+            .create_call_relationship("handle_request", "process_data", Some(pid))
+            .await
+            .unwrap();
+
+        // Seed: struct "Request" in handler.rs, implements trait "Serialize"
+        let s = make_fg_struct("Request", "src/handler.rs");
+        store.upsert_struct(&s).await.unwrap();
+        let t = make_fg_trait("Serialize", "src/serde.rs");
+        store.upsert_trait(&t).await.unwrap();
+        let imp = make_fg_impl("Request", Some("Serialize"), "src/handler.rs");
+        store.upsert_impl(&imp).await.unwrap();
+
+        // Build the feature graph
+        let detail = store
+            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2)
+            .await
+            .unwrap();
+
+        // Helper: find entity by id and return its role
+        let find_role = |entity_id: &str| -> Option<String> {
+            detail
+                .entities
+                .iter()
+                .find(|e| e.entity_id == entity_id)
+                .and_then(|e| e.role.clone())
+        };
+
+        // Entry function should have role "entry_point"
+        assert_eq!(
+            find_role("handle_request"),
+            Some("entry_point".to_string()),
+            "entry function should have entry_point role"
+        );
+
+        // Called function should have role "core_logic"
+        assert_eq!(
+            find_role("process_data"),
+            Some("core_logic".to_string()),
+            "callee function should have core_logic role"
+        );
+
+        // Files should have role "support"
+        assert_eq!(
+            find_role("src/handler.rs"),
+            Some("support".to_string()),
+            "file should have support role"
+        );
+
+        // Struct should have role "data_model"
+        assert_eq!(
+            find_role("Request"),
+            Some("data_model".to_string()),
+            "struct should have data_model role"
+        );
+
+        // Trait should have role "trait_contract"
+        assert_eq!(
+            find_role("Serialize"),
+            Some("trait_contract".to_string()),
+            "trait should have trait_contract role"
+        );
+
+        // Verify roles are persisted in the storage via get_feature_graph_detail
+        let detail2 = store
+            .get_feature_graph_detail(detail.graph.id)
+            .await
+            .unwrap()
+            .expect("feature graph detail should exist");
+
+        let find_stored_role = |entity_id: &str| -> Option<String> {
+            detail2
+                .entities
+                .iter()
+                .find(|e| e.entity_id == entity_id)
+                .and_then(|e| e.role.clone())
+        };
+
+        assert_eq!(
+            find_stored_role("handle_request"),
+            Some("entry_point".to_string()),
+            "stored entry function role should persist"
+        );
+        assert_eq!(
+            find_stored_role("Request"),
+            Some("data_model".to_string()),
+            "stored struct role should persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_add_entity_with_role() {
+        let store = MockGraphStore::new();
+
+        // Create a feature graph
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "test-manual".to_string(),
+            description: None,
+            project_id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+
+        // Add entity without role
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "func_a", None)
+            .await
+            .unwrap();
+
+        // Add entity with role
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "func_b", Some("entry_point"))
+            .await
+            .unwrap();
+
+        // Verify via get_feature_graph_detail
+        let detail = store
+            .get_feature_graph_detail(fg.id)
+            .await
+            .unwrap()
+            .expect("should exist");
+
+        let func_a = detail.entities.iter().find(|e| e.entity_id == "func_a").unwrap();
+        assert_eq!(func_a.role, None, "func_a should have no role");
+
+        let func_b = detail.entities.iter().find(|e| e.entity_id == "func_b").unwrap();
+        assert_eq!(
+            func_b.role,
+            Some("entry_point".to_string()),
+            "func_b should have entry_point role"
+        );
+
+        // Update role on existing entity
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "func_a", Some("core_logic"))
+            .await
+            .unwrap();
+
+        let detail2 = store
+            .get_feature_graph_detail(fg.id)
+            .await
+            .unwrap()
+            .expect("should exist");
+
+        let func_a2 = detail2.entities.iter().find(|e| e.entity_id == "func_a").unwrap();
+        assert_eq!(
+            func_a2.role,
+            Some("core_logic".to_string()),
+            "func_a should now have core_logic role after update"
+        );
+
+        // Verify count is still 2 (not duplicated)
+        assert_eq!(detail2.entities.len(), 2, "should still have 2 entities, not duplicated");
     }
 }

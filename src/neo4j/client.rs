@@ -7904,6 +7904,7 @@ impl Neo4jClient {
                 entity_type: row.get::<String>("entity_type").unwrap_or_default(),
                 entity_id: row.get::<String>("entity_id").unwrap_or_default(),
                 name: row.get::<String>("name").ok(),
+                role: row.get::<String>("role").ok(),
             })
             .collect();
 
@@ -7959,33 +7960,45 @@ impl Neo4jClient {
         feature_graph_id: Uuid,
         entity_type: &str,
         entity_id: &str,
+        role: Option<&str>,
     ) -> Result<()> {
+        let role_clause = if role.is_some() {
+            " SET r.role = $role"
+        } else {
+            ""
+        };
+
         let cypher = match entity_type.to_lowercase().as_str() {
-            "file" => {
-                "MATCH (fg:FeatureGraph {id: $fg_id})
-                 MATCH (e:File {path: $entity_id})
-                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
-            }
-            "function" => {
-                "MATCH (fg:FeatureGraph {id: $fg_id})
-                 MATCH (e:Function {name: $entity_id})
-                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
-            }
-            "struct" => {
-                "MATCH (fg:FeatureGraph {id: $fg_id})
-                 MATCH (e:Struct {name: $entity_id})
-                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
-            }
-            "trait" => {
-                "MATCH (fg:FeatureGraph {id: $fg_id})
-                 MATCH (e:Trait {name: $entity_id})
-                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
-            }
-            "enum" => {
-                "MATCH (fg:FeatureGraph {id: $fg_id})
-                 MATCH (e:Enum {name: $entity_id})
-                 MERGE (fg)-[:INCLUDES_ENTITY]->(e)"
-            }
+            "file" => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:File {{path: $entity_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
+            "function" => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:Function {{name: $entity_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
+            "struct" => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:Struct {{name: $entity_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
+            "trait" => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:Trait {{name: $entity_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
+            "enum" => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:Enum {{name: $entity_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
             _ => {
                 return Err(anyhow::anyhow!(
                     "Unsupported entity type for feature graph: {}",
@@ -7994,9 +8007,12 @@ impl Neo4jClient {
             }
         };
 
-        let q = query(cypher)
+        let mut q = query(&cypher)
             .param("fg_id", feature_graph_id.to_string())
             .param("entity_id", entity_id.to_string());
+        if let Some(r) = role {
+            q = q.param("role", r.to_string());
+        }
         self.execute_with_params(q).await?;
 
         let update_q = query("MATCH (fg:FeatureGraph {id: $id}) SET fg.updated_at = $now")
@@ -8178,54 +8194,63 @@ impl Neo4jClient {
         };
         self.create_feature_graph(&fg).await?;
 
-        // Step 3: Add all entities
+        // Step 3: Add all entities with auto-assigned roles
         let mut entities = Vec::new();
 
-        // Add functions
+        // Add functions with role: entry_point for the entry function, core_logic for others
         for (func_name, _file_path) in &functions {
+            let role = if func_name == entry_function {
+                "entry_point"
+            } else {
+                "core_logic"
+            };
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "function", func_name)
+                .add_entity_to_feature_graph(fg.id, "function", func_name, Some(role))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
                 entity_id: func_name.clone(),
                 name: Some(func_name.clone()),
+                role: Some(role.to_string()),
             });
         }
 
-        // Add files
+        // Add files with role: support
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "file", file_path)
+                .add_entity_to_feature_graph(fg.id, "file", file_path, Some("support"))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
+                role: Some("support".to_string()),
             });
         }
 
-        // Add structs/enums discovered via IMPLEMENTS_FOR
+        // Add structs/enums discovered via IMPLEMENTS_FOR with role: data_model
         for struct_name in &structs {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "struct", struct_name)
+                .add_entity_to_feature_graph(fg.id, "struct", struct_name, Some("data_model"))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
                 entity_id: struct_name.clone(),
                 name: Some(struct_name.clone()),
+                role: Some("data_model".to_string()),
             });
         }
 
-        // Add traits discovered via IMPLEMENTS_TRAIT
+        // Add traits discovered via IMPLEMENTS_TRAIT with role: trait_contract
         for trait_name in &traits {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "trait", trait_name)
+                .add_entity_to_feature_graph(fg.id, "trait", trait_name, Some("trait_contract"))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
                 entity_id: trait_name.clone(),
                 name: Some(trait_name.clone()),
+                role: Some("trait_contract".to_string()),
             });
         }
 

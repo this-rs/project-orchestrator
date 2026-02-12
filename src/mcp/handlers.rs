@@ -3693,8 +3693,10 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("entity_id is required"))?;
 
+        let role = args.get("role").and_then(|v| v.as_str());
+
         self.neo4j()
-            .add_entity_to_feature_graph(feature_graph_id, entity_type, entity_id)
+            .add_entity_to_feature_graph(feature_graph_id, entity_type, entity_id, role)
             .await?;
 
         Ok(json!({
@@ -3702,6 +3704,7 @@ impl ToolHandler {
             "feature_graph_id": feature_graph_id.to_string(),
             "entity_type": entity_type,
             "entity_id": entity_id,
+            "role": role,
         }))
     }
 

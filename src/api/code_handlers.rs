@@ -753,6 +753,7 @@ pub struct ListFeatureGraphsQuery {
 pub struct AddEntityBody {
     pub entity_type: String,
     pub entity_id: String,
+    pub role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -863,13 +864,14 @@ pub async fn add_entity_to_feature_graph(
     state
         .orchestrator
         .neo4j()
-        .add_entity_to_feature_graph(id, &body.entity_type, &body.entity_id)
+        .add_entity_to_feature_graph(id, &body.entity_type, &body.entity_id, body.role.as_deref())
         .await?;
     Ok(Json(serde_json::json!({
         "added": true,
         "feature_graph_id": id.to_string(),
         "entity_type": body.entity_type,
         "entity_id": body.entity_id,
+        "role": body.role,
     })))
 }
 
