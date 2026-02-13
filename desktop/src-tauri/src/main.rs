@@ -264,6 +264,7 @@ fn main() {
 
     app.run(move |_app, event| {
         // macOS: clicking the dock icon when the window is hidden should reshow it
+        #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen {
             has_visible_windows, ..
         } = &event
