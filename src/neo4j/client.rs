@@ -7856,7 +7856,10 @@ impl Neo4jClient {
                 description: $description,
                 project_id: $project_id,
                 created_at: $created_at,
-                updated_at: $updated_at
+                updated_at: $updated_at,
+                entry_function: $entry_function,
+                build_depth: $build_depth,
+                include_relations: $include_relations
             })
             WITH fg
             MATCH (p:Project {id: $project_id})
@@ -7867,7 +7870,22 @@ impl Neo4jClient {
         .param("description", fg.description.clone().unwrap_or_default())
         .param("project_id", fg.project_id.to_string())
         .param("created_at", fg.created_at.to_rfc3339())
-        .param("updated_at", fg.updated_at.to_rfc3339());
+        .param("updated_at", fg.updated_at.to_rfc3339())
+        .param(
+            "entry_function",
+            fg.entry_function.clone().unwrap_or_default(),
+        )
+        .param(
+            "build_depth",
+            fg.build_depth.map(|d| d as i64).unwrap_or(0),
+        )
+        .param(
+            "include_relations",
+            fg.include_relations
+                .as_ref()
+                .map(|r| serde_json::to_string(r).unwrap_or_default())
+                .unwrap_or_default(),
+        );
 
         self.execute_with_params(q).await?;
         Ok(())
@@ -8202,7 +8220,7 @@ impl Neo4jClient {
             }
         }
 
-        // Step 2: Create the FeatureGraph
+        // Step 2: Create the FeatureGraph (with build params for refresh)
         let fg = FeatureGraphNode {
             id: Uuid::new_v4(),
             name: name.to_string(),
@@ -8211,6 +8229,10 @@ impl Neo4jClient {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             entity_count: None,
+            entry_function: Some(entry_function.to_string()),
+            build_depth: Some(depth),
+            include_relations: include_relations
+                .map(|r| r.iter().map(|s| s.to_string()).collect()),
         };
         self.create_feature_graph(&fg).await?;
 
@@ -8301,6 +8323,12 @@ impl Neo4jClient {
                 .parse()
                 .unwrap_or_else(|_| chrono::Utc::now()),
             entity_count: None,
+            entry_function: node.get::<String>("entry_function").ok(),
+            build_depth: node.get::<i64>("build_depth").ok().map(|d| d as u32),
+            include_relations: node
+                .get::<String>("include_relations")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok()),
         })
     }
 }

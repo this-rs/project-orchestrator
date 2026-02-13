@@ -3619,6 +3619,9 @@ impl ToolHandler {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
         };
 
         self.neo4j().create_feature_graph(&fg).await?;

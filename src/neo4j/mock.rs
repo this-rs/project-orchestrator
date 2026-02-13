@@ -4064,7 +4064,7 @@ impl GraphStore for MockGraphStore {
             drop(ir);
         } // end if should_include imports
 
-        // Create the feature graph
+        // Create the feature graph (with build params for refresh)
         let fg = FeatureGraphNode {
             id: Uuid::new_v4(),
             name: name.to_string(),
@@ -4073,6 +4073,10 @@ impl GraphStore for MockGraphStore {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             entity_count: None,
+            entry_function: Some(entry_function.to_string()),
+            build_depth: Some(depth),
+            include_relations: include_relations
+                .map(|r| r.iter().map(|s| s.to_string()).collect()),
         };
         self.create_feature_graph(&fg).await?;
 
@@ -5500,6 +5504,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
         };
         store.create_feature_graph(&fg).await.unwrap();
 

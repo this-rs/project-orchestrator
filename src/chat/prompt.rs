@@ -2325,6 +2325,9 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 entity_count: Some((i as i64 + 1) * 10),
+                entry_function: None,
+                build_depth: None,
+                include_relations: None,
             })
             .collect()
     }
@@ -2404,6 +2407,9 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 entity_count: Some(100),
+                entry_function: None,
+                build_depth: None,
+                include_relations: None,
             })
             .collect();
         let ctx = ProjectContext {
