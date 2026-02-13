@@ -1433,10 +1433,7 @@ impl GraphStore for Neo4jClient {
         .await
     }
 
-    async fn refresh_feature_graph(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<FeatureGraphDetail>> {
+    async fn refresh_feature_graph(&self, id: Uuid) -> anyhow::Result<Option<FeatureGraphDetail>> {
         self.refresh_feature_graph(id).await
     }
 }

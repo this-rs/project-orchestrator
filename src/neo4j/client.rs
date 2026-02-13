@@ -7875,10 +7875,7 @@ impl Neo4jClient {
             "entry_function",
             fg.entry_function.clone().unwrap_or_default(),
         )
-        .param(
-            "build_depth",
-            fg.build_depth.map(|d| d as i64).unwrap_or(0),
-        )
+        .param("build_depth", fg.build_depth.map(|d| d as i64).unwrap_or(0))
         .param(
             "include_relations",
             fg.include_relations
@@ -8231,8 +8228,7 @@ impl Neo4jClient {
             entity_count: None,
             entry_function: Some(entry_function.to_string()),
             build_depth: Some(depth),
-            include_relations: include_relations
-                .map(|r| r.iter().map(|s| s.to_string()).collect()),
+            include_relations: include_relations.map(|r| r.iter().map(|s| s.to_string()).collect()),
         };
         self.create_feature_graph(&fg).await?;
 
@@ -8304,10 +8300,7 @@ impl Neo4jClient {
 
     /// Refresh an auto-built feature graph by re-running BFS with stored params.
     /// Returns None if the graph was manually created (no entry_function).
-    pub async fn refresh_feature_graph(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<FeatureGraphDetail>> {
+    pub async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
         // 1. Load the existing feature graph
         let detail = self
             .get_feature_graph_detail(id)

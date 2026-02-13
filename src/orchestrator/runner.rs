@@ -233,11 +233,7 @@ impl Orchestrator {
             for fg in &auto_built {
                 match neo4j.refresh_feature_graph(fg.id).await {
                     Ok(Some(_)) => {
-                        tracing::info!(
-                            "Refreshed feature graph '{}' ({})",
-                            fg.name,
-                            fg.id
-                        );
+                        tracing::info!("Refreshed feature graph '{}' ({})", fg.name, fg.id);
                     }
                     Ok(None) => {
                         // Should not happen since we filtered, but handle gracefully
