@@ -1102,4 +1102,10 @@ pub trait GraphStore: Send + Sync {
         depth: u32,
         include_relations: Option<&[String]>,
     ) -> Result<FeatureGraphDetail>;
+
+    /// Refresh an auto-built feature graph by re-running the BFS with the
+    /// same parameters (entry_function, depth, include_relations).
+    /// Returns None if the graph was manually created (no entry_function).
+    /// Returns Err if the graph doesn't exist.
+    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
 }

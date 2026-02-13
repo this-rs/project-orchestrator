@@ -4141,6 +4141,218 @@ impl GraphStore for MockGraphStore {
             entities,
         })
     }
+
+    async fn refresh_feature_graph(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FeatureGraphDetail>> {
+        // 1. Load the existing feature graph
+        let fg = {
+            let fgs = self.feature_graphs.read().await;
+            fgs.get(&id).cloned()
+        };
+        let fg = match fg {
+            Some(fg) => fg,
+            None => return Err(anyhow::anyhow!("Feature graph {} not found", id)),
+        };
+
+        // 2. Check if it was auto-built (has entry_function)
+        let entry_function = match &fg.entry_function {
+            Some(ef) => ef.clone(),
+            None => return Ok(None), // manually created, skip refresh
+        };
+
+        let depth = fg.build_depth.unwrap_or(2);
+        let include_relations = fg.include_relations.clone();
+        let project_id = fg.project_id;
+
+        let should_include = |rel: &str| -> bool {
+            match &include_relations {
+                None => true,
+                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
+            }
+        };
+
+        // 3. Delete all existing INCLUDES_ENTITY relationships
+        {
+            let mut fge = self.feature_graph_entities.write().await;
+            fge.remove(&id);
+        }
+
+        // 4. Re-run BFS traversal (same logic as auto_build)
+        let depth = depth.clamp(1, 5);
+
+        let cr = self.call_relationships.read().await;
+        let mut all_functions = std::collections::HashSet::new();
+        all_functions.insert(entry_function.clone());
+
+        let mut queue: Vec<String> = vec![entry_function.clone()];
+        for _ in 0..depth {
+            let mut next_queue = Vec::new();
+            for func in &queue {
+                if let Some(callees) = cr.get(func) {
+                    for callee in callees {
+                        if all_functions.insert(callee.clone()) {
+                            next_queue.push(callee.clone());
+                        }
+                    }
+                }
+                for (caller_id, callees) in cr.iter() {
+                    if caller_id.ends_with(&format!("::{}", func)) {
+                        for callee in callees {
+                            if all_functions.insert(callee.clone()) {
+                                next_queue.push(callee.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            queue = next_queue;
+        }
+
+        for (caller, callees) in cr.iter() {
+            if callees.contains(&entry_function) {
+                all_functions.insert(caller.clone());
+            }
+        }
+        drop(cr);
+
+        if all_functions.len() <= 1 {
+            let funcs = self.functions.read().await;
+            let exists = funcs.values().any(|f| f.name == entry_function);
+            if !exists {
+                return Err(anyhow::anyhow!(
+                    "No function found matching '{}' during refresh",
+                    entry_function
+                ));
+            }
+        }
+
+        let funcs = self.functions.read().await;
+        let mut files = std::collections::HashSet::new();
+        for func in &all_functions {
+            for f in funcs.values() {
+                if f.name == *func {
+                    files.insert(f.file_path.clone());
+                }
+            }
+        }
+        drop(funcs);
+
+        // Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR
+        let mut discovered_structs = std::collections::HashSet::new();
+        let mut discovered_traits = std::collections::HashSet::new();
+
+        if should_include("implements_trait") || should_include("implements_for") {
+            let structs_map = self.structs_map.read().await;
+            for s in structs_map.values() {
+                if files.contains(&s.file_path) {
+                    discovered_structs.insert(s.name.clone());
+                }
+            }
+            drop(structs_map);
+
+            let enums_map = self.enums_map.read().await;
+            for e in enums_map.values() {
+                if files.contains(&e.file_path) {
+                    discovered_structs.insert(e.name.clone());
+                }
+            }
+            drop(enums_map);
+
+            let impls_map = self.impls_map.read().await;
+            for imp in impls_map.values() {
+                if discovered_structs.contains(&imp.for_type) {
+                    if let Some(ref trait_name) = imp.trait_name {
+                        discovered_traits.insert(trait_name.clone());
+                    }
+                }
+            }
+            drop(impls_map);
+        }
+
+        // Expand via IMPORTS
+        if should_include("imports") {
+            let ir = self.import_relationships.read().await;
+            let original_files: Vec<String> = files.iter().cloned().collect();
+            for file_path in &original_files {
+                if let Some(imported) = ir.get(file_path) {
+                    for imp in imported {
+                        files.insert(imp.clone());
+                    }
+                }
+            }
+            drop(ir);
+        }
+
+        // 5. Update timestamp
+        {
+            let mut fgs = self.feature_graphs.write().await;
+            if let Some(fg) = fgs.get_mut(&id) {
+                fg.updated_at = chrono::Utc::now();
+            }
+        }
+
+        // 6. Re-add entities with auto-assigned roles
+        let mut entities = Vec::new();
+        for func_name in &all_functions {
+            let role = if *func_name == entry_function {
+                "entry_point"
+            } else {
+                "core_logic"
+            };
+            let _ = self
+                .add_entity_to_feature_graph(id, "function", func_name, Some(role))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+                role: Some(role.to_string()),
+            });
+        }
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(id, "file", file_path, Some("support"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+                role: Some("support".to_string()),
+            });
+        }
+        for struct_name in &discovered_structs {
+            let _ = self
+                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "struct".to_string(),
+                entity_id: struct_name.clone(),
+                name: Some(struct_name.clone()),
+                role: Some("data_model".to_string()),
+            });
+        }
+        for trait_name in &discovered_traits {
+            let _ = self
+                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "trait".to_string(),
+                entity_id: trait_name.clone(),
+                name: Some(trait_name.clone()),
+                role: Some("trait_contract".to_string()),
+            });
+        }
+
+        // Re-read the full detail (converts tuples to FeatureGraphEntity)
+        let detail = self
+            .get_feature_graph_detail(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Feature graph {} disappeared after refresh", id))?;
+
+        Ok(Some(detail))
+    }
 }
 
 #[cfg(test)]

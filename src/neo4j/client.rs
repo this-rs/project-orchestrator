@@ -8302,6 +8302,235 @@ impl Neo4jClient {
         })
     }
 
+    /// Refresh an auto-built feature graph by re-running BFS with stored params.
+    /// Returns None if the graph was manually created (no entry_function).
+    pub async fn refresh_feature_graph(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FeatureGraphDetail>> {
+        // 1. Load the existing feature graph
+        let detail = self
+            .get_feature_graph_detail(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Feature graph {} not found", id))?;
+
+        let fg = &detail.graph;
+
+        // 2. Check if it was auto-built (has entry_function)
+        let entry_function = match &fg.entry_function {
+            Some(ef) => ef.clone(),
+            None => return Ok(None), // manually created, skip refresh
+        };
+
+        let depth = fg.build_depth.unwrap_or(2);
+        let include_relations = fg.include_relations.clone();
+        let project_id = fg.project_id;
+
+        // 3. Delete all existing INCLUDES_ENTITY relationships
+        let delete_q = query(
+            "MATCH (fg:FeatureGraph {id: $fg_id})-[r:INCLUDES_ENTITY]->()
+             DELETE r
+             RETURN count(r) AS deleted",
+        )
+        .param("fg_id", id.to_string());
+        self.execute_with_params(delete_q).await?;
+
+        // 4. Re-run the BFS traversal (same logic as auto_build_feature_graph)
+        let should_include = |rel: &str| -> bool {
+            match &include_relations {
+                None => true,
+                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
+            }
+        };
+
+        let depth = depth.clamp(1, 5);
+
+        // Step 4a: Collect functions via call graph
+        let q = query(&format!(
+            r#"
+            MATCH (entry:Function {{name: $name}})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {{id: $project_id}})
+            OPTIONAL MATCH (entry)-[:CALLS*1..{depth}]->(callee:Function)
+            WHERE EXISTS {{ MATCH (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }}
+            OPTIONAL MATCH (caller:Function)-[:CALLS*1..{depth}]->(entry)
+            WHERE EXISTS {{ MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }}
+            WITH entry,
+                 collect(DISTINCT callee) AS callees_nodes,
+                 collect(DISTINCT caller) AS callers_nodes
+            WITH entry, callees_nodes, callers_nodes,
+                 [entry] + callees_nodes + callers_nodes AS all_funcs
+            UNWIND all_funcs AS f
+            WITH DISTINCT f
+            WHERE f IS NOT NULL
+            RETURN f.name AS func_name, f.file_path AS file_path
+            "#,
+            depth = depth
+        ))
+        .param("name", entry_function.as_str())
+        .param("project_id", project_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+
+        let mut functions: Vec<(String, Option<String>)> = Vec::new();
+        let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for row in &rows {
+            if let Ok(func_name) = row.get::<String>("func_name") {
+                let file_path: Option<String> = row.get::<String>("file_path").ok();
+                if let Some(ref fp) = file_path {
+                    if !fp.is_empty() {
+                        files.insert(fp.clone());
+                    }
+                }
+                functions.push((func_name, file_path));
+            }
+        }
+
+        if functions.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No function found matching '{}' during refresh",
+                entry_function
+            ));
+        }
+
+        // Step 4b: Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR
+        let mut structs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut traits: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if !files.is_empty()
+            && (should_include("implements_trait") || should_include("implements_for"))
+        {
+            let file_list: Vec<String> = files.iter().cloned().collect();
+            let types_q = query(
+                r#"
+                MATCH (f:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                WHERE f.path IN $files
+                OPTIONAL MATCH (f)-[:CONTAINS]->(s:Struct)
+                OPTIONAL MATCH (f)-[:CONTAINS]->(e:Enum)
+                WITH collect(DISTINCT s) + collect(DISTINCT e) AS types
+                UNWIND types AS t
+                WITH DISTINCT t WHERE t IS NOT NULL
+                OPTIONAL MATCH (impl:Impl)-[:IMPLEMENTS_FOR]->(t)
+                OPTIONAL MATCH (impl)-[:IMPLEMENTS_TRAIT]->(tr:Trait)
+                RETURN t.name AS type_name, labels(t)[0] AS type_label,
+                       collect(DISTINCT tr.name) AS trait_names
+                "#,
+            )
+            .param("project_id", project_id.to_string())
+            .param("files", file_list);
+
+            let type_rows = self.execute_with_params(types_q).await?;
+            for row in &type_rows {
+                if let Ok(type_name) = row.get::<String>("type_name") {
+                    structs.insert(type_name);
+                }
+                if let Ok(trait_list) = row.get::<Vec<String>>("trait_names") {
+                    for t in trait_list {
+                        if !t.is_empty() {
+                            traits.insert(t);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 4c: Expand via IMPORTS
+        if !files.is_empty() && should_include("imports") {
+            let file_list: Vec<String> = files.iter().cloned().collect();
+            let imports_q = query(
+                r#"
+                MATCH (f:File)-[:IMPORTS]->(imported:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                WHERE f.path IN $files
+                RETURN DISTINCT imported.path AS imported_path
+                "#,
+            )
+            .param("project_id", project_id.to_string())
+            .param("files", file_list);
+
+            let import_rows = self.execute_with_params(imports_q).await?;
+            for row in &import_rows {
+                if let Ok(imported_path) = row.get::<String>("imported_path") {
+                    if !imported_path.is_empty() {
+                        files.insert(imported_path);
+                    }
+                }
+            }
+        }
+
+        // 5. Update the updated_at timestamp
+        let update_q = query(
+            "MATCH (fg:FeatureGraph {id: $fg_id})
+             SET fg.updated_at = $now
+             RETURN fg",
+        )
+        .param("fg_id", id.to_string())
+        .param("now", chrono::Utc::now().to_rfc3339());
+        self.execute_with_params(update_q).await?;
+
+        // 6. Re-add all entities with auto-assigned roles
+        let mut entities = Vec::new();
+
+        for (func_name, _file_path) in &functions {
+            let role = if *func_name == entry_function {
+                "entry_point"
+            } else {
+                "core_logic"
+            };
+            let _ = self
+                .add_entity_to_feature_graph(id, "function", func_name, Some(role))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+                role: Some(role.to_string()),
+            });
+        }
+
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(id, "file", file_path, Some("support"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+                role: Some("support".to_string()),
+            });
+        }
+
+        for struct_name in &structs {
+            let _ = self
+                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "struct".to_string(),
+                entity_id: struct_name.clone(),
+                name: Some(struct_name.clone()),
+                role: Some("data_model".to_string()),
+            });
+        }
+
+        for trait_name in &traits {
+            let _ = self
+                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "trait".to_string(),
+                entity_id: trait_name.clone(),
+                name: Some(trait_name.clone()),
+                role: Some("trait_contract".to_string()),
+            });
+        }
+
+        // Re-read the graph node to get updated state
+        let updated_graph = self
+            .get_feature_graph_detail(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Feature graph {} disappeared after refresh", id))?;
+
+        Ok(Some(updated_graph))
+    }
+
     fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {
         Ok(FeatureGraphNode {
             id: node.get::<String>("id")?.parse()?,
