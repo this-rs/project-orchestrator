@@ -2314,4 +2314,127 @@ mod tests {
         assert!(md.contains("## Tools recommandés"));
         assert!(md.contains("search_code")); // code_exploration group
     }
+
+    fn make_feature_graphs(count: usize) -> Vec<FeatureGraphNode> {
+        (0..count)
+            .map(|i| FeatureGraphNode {
+                id: uuid::Uuid::new_v4(),
+                name: format!("Feature-{}", i),
+                description: Some(format!("Description for feature graph number {}", i)),
+                project_id: uuid::Uuid::new_v4(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                entity_count: Some((i as i64 + 1) * 10),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_context_to_json_with_feature_graphs() {
+        let ctx = ProjectContext {
+            feature_graphs: make_feature_graphs(3),
+            ..Default::default()
+        };
+        let json = context_to_json(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let fgs = parsed["feature_graphs"].as_array().unwrap();
+        assert_eq!(fgs.len(), 3);
+        assert_eq!(fgs[0]["name"], "Feature-0");
+        assert_eq!(fgs[0]["entity_count"], 10);
+        assert_eq!(fgs[1]["name"], "Feature-1");
+        assert_eq!(fgs[2]["entity_count"], 30);
+        // Verify id is present as a string
+        assert!(fgs[0]["id"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_context_to_markdown_with_feature_graphs() {
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "TestProj".into(),
+                slug: "test-proj".into(),
+                root_path: "/tmp".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: Some(Utc::now()),
+            }),
+            feature_graphs: make_feature_graphs(3),
+            ..Default::default()
+        };
+        let md = context_to_markdown(&ctx, None);
+        assert!(md.contains("## Feature Graphs"));
+        assert!(md.contains("**Feature-0**"));
+        assert!(md.contains("**Feature-1**"));
+        assert!(md.contains("**Feature-2**"));
+        assert!(md.contains("10 entités"));
+        assert!(md.contains("20 entités"));
+        assert!(md.contains("30 entités"));
+        assert!(md.contains("get_feature_graph(id)"));
+    }
+
+    #[test]
+    fn test_context_to_markdown_empty_feature_graphs() {
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "TestProj".into(),
+                slug: "test-proj".into(),
+                root_path: "/tmp".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: Some(Utc::now()),
+            }),
+            ..Default::default()
+        };
+        let md = context_to_markdown(&ctx, None);
+        assert!(!md.contains("Feature Graphs"));
+        assert!(!md.contains("get_feature_graph"));
+    }
+
+    #[test]
+    fn test_feature_graphs_token_budget() {
+        // Build 15 feature graphs with long descriptions
+        let fgs: Vec<FeatureGraphNode> = (0..15)
+            .map(|i| FeatureGraphNode {
+                id: uuid::Uuid::new_v4(),
+                name: format!("Feature-Graph-{}", i),
+                description: Some("A".repeat(200)), // 200 char description, will be truncated
+                project_id: uuid::Uuid::new_v4(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                entity_count: Some(100),
+            })
+            .collect();
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "TestProj".into(),
+                slug: "test-proj".into(),
+                root_path: "/tmp".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: Some(Utc::now()),
+            }),
+            feature_graphs: fgs,
+            ..Default::default()
+        };
+        let md = context_to_markdown(&ctx, None);
+        // Extract only the Feature Graphs section
+        let section_start = md.find("## Feature Graphs").unwrap();
+        let section_end = md[section_start..]
+            .find("\n## ")
+            .or_else(|| md[section_start..].find("\n- **Dernière sync**"))
+            .map(|pos| section_start + pos)
+            .unwrap_or(md.len());
+        let section = &md[section_start..section_end];
+        // ~300 tokens ≈ ~1200 chars. With 15 graphs at 80 char truncated desc, should be well under 2000 chars.
+        assert!(
+            section.len() < 2500,
+            "Feature Graphs section is too large: {} chars (should be < 2500)",
+            section.len()
+        );
+        // Verify descriptions are truncated (original 200 chars → max 80 + "…")
+        assert!(section.contains("…"), "Long descriptions should be truncated with …");
+    }
 }
