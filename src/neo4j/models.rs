@@ -727,6 +727,15 @@ pub struct FeatureGraphNode {
     pub project_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Number of entities included in this feature graph (via INCLUDES_ENTITY).
+    /// Populated by list_feature_graphs; None when not computed.
+    pub entity_count: Option<i64>,
+    /// Entry function used for auto_build (None for manually created graphs).
+    pub entry_function: Option<String>,
+    /// BFS depth used for auto_build.
+    pub build_depth: Option<u32>,
+    /// Relation types traversed during auto_build (None = all).
+    pub include_relations: Option<Vec<String>>,
 }
 
 /// Role of an entity within a feature graph.

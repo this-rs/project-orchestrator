@@ -3858,6 +3858,7 @@ impl GraphStore for MockGraphStore {
 
     async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>> {
         let graphs = self.feature_graphs.read().await;
+        let entities = self.feature_graph_entities.read().await;
         let mut result: Vec<FeatureGraphNode> = graphs
             .values()
             .filter(|fg| {
@@ -3868,6 +3869,10 @@ impl GraphStore for MockGraphStore {
                 }
             })
             .cloned()
+            .map(|mut fg| {
+                fg.entity_count = Some(entities.get(&fg.id).map(|v| v.len() as i64).unwrap_or(0));
+                fg
+            })
             .collect();
         result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(result)
@@ -4057,7 +4062,7 @@ impl GraphStore for MockGraphStore {
             drop(ir);
         } // end if should_include imports
 
-        // Create the feature graph
+        // Create the feature graph (with build params for refresh)
         let fg = FeatureGraphNode {
             id: Uuid::new_v4(),
             name: name.to_string(),
@@ -4065,6 +4070,10 @@ impl GraphStore for MockGraphStore {
             project_id,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: Some(entry_function.to_string()),
+            build_depth: Some(depth),
+            include_relations: include_relations.map(|r| r.iter().map(|s| s.to_string()).collect()),
         };
         self.create_feature_graph(&fg).await?;
 
@@ -4128,6 +4137,264 @@ impl GraphStore for MockGraphStore {
             graph: fg,
             entities,
         })
+    }
+
+    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
+        // 1. Load the existing feature graph
+        let fg = {
+            let fgs = self.feature_graphs.read().await;
+            fgs.get(&id).cloned()
+        };
+        let fg = match fg {
+            Some(fg) => fg,
+            None => return Err(anyhow::anyhow!("Feature graph {} not found", id)),
+        };
+
+        // 2. Check if it was auto-built (has entry_function)
+        let entry_function = match &fg.entry_function {
+            Some(ef) => ef.clone(),
+            None => return Ok(None), // manually created, skip refresh
+        };
+
+        let depth = fg.build_depth.unwrap_or(2);
+        let include_relations = fg.include_relations.clone();
+        let _project_id = fg.project_id;
+
+        let should_include = |rel: &str| -> bool {
+            match &include_relations {
+                None => true,
+                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
+            }
+        };
+
+        // 3. Delete all existing INCLUDES_ENTITY relationships
+        {
+            let mut fge = self.feature_graph_entities.write().await;
+            fge.remove(&id);
+        }
+
+        // 4. Re-run BFS traversal (same logic as auto_build)
+        let depth = depth.clamp(1, 5);
+
+        let cr = self.call_relationships.read().await;
+        let mut all_functions = std::collections::HashSet::new();
+        all_functions.insert(entry_function.clone());
+
+        let mut queue: Vec<String> = vec![entry_function.clone()];
+        for _ in 0..depth {
+            let mut next_queue = Vec::new();
+            for func in &queue {
+                if let Some(callees) = cr.get(func) {
+                    for callee in callees {
+                        if all_functions.insert(callee.clone()) {
+                            next_queue.push(callee.clone());
+                        }
+                    }
+                }
+                for (caller_id, callees) in cr.iter() {
+                    if caller_id.ends_with(&format!("::{}", func)) {
+                        for callee in callees {
+                            if all_functions.insert(callee.clone()) {
+                                next_queue.push(callee.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            queue = next_queue;
+        }
+
+        for (caller, callees) in cr.iter() {
+            if callees.contains(&entry_function) {
+                all_functions.insert(caller.clone());
+            }
+        }
+        drop(cr);
+
+        if all_functions.len() <= 1 {
+            let funcs = self.functions.read().await;
+            let exists = funcs.values().any(|f| f.name == entry_function);
+            if !exists {
+                return Err(anyhow::anyhow!(
+                    "No function found matching '{}' during refresh",
+                    entry_function
+                ));
+            }
+        }
+
+        let funcs = self.functions.read().await;
+        let mut files = std::collections::HashSet::new();
+        for func in &all_functions {
+            for f in funcs.values() {
+                if f.name == *func {
+                    files.insert(f.file_path.clone());
+                }
+            }
+        }
+        drop(funcs);
+
+        // Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR
+        let mut discovered_structs = std::collections::HashSet::new();
+        let mut discovered_traits = std::collections::HashSet::new();
+
+        if should_include("implements_trait") || should_include("implements_for") {
+            let structs_map = self.structs_map.read().await;
+            for s in structs_map.values() {
+                if files.contains(&s.file_path) {
+                    discovered_structs.insert(s.name.clone());
+                }
+            }
+            drop(structs_map);
+
+            let enums_map = self.enums_map.read().await;
+            for e in enums_map.values() {
+                if files.contains(&e.file_path) {
+                    discovered_structs.insert(e.name.clone());
+                }
+            }
+            drop(enums_map);
+
+            let impls_map = self.impls_map.read().await;
+            for imp in impls_map.values() {
+                if discovered_structs.contains(&imp.for_type) {
+                    if let Some(ref trait_name) = imp.trait_name {
+                        discovered_traits.insert(trait_name.clone());
+                    }
+                }
+            }
+            drop(impls_map);
+        }
+
+        // Expand via IMPORTS
+        if should_include("imports") {
+            let ir = self.import_relationships.read().await;
+            let original_files: Vec<String> = files.iter().cloned().collect();
+            for file_path in &original_files {
+                if let Some(imported) = ir.get(file_path) {
+                    for imp in imported {
+                        files.insert(imp.clone());
+                    }
+                }
+            }
+            drop(ir);
+        }
+
+        // 5. Update timestamp
+        {
+            let mut fgs = self.feature_graphs.write().await;
+            if let Some(fg) = fgs.get_mut(&id) {
+                fg.updated_at = chrono::Utc::now();
+            }
+        }
+
+        // 6. Re-add entities with auto-assigned roles
+        let mut entities = Vec::new();
+        for func_name in &all_functions {
+            let role = if *func_name == entry_function {
+                "entry_point"
+            } else {
+                "core_logic"
+            };
+            let _ = self
+                .add_entity_to_feature_graph(id, "function", func_name, Some(role))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+                role: Some(role.to_string()),
+            });
+        }
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(id, "file", file_path, Some("support"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+                role: Some("support".to_string()),
+            });
+        }
+        for struct_name in &discovered_structs {
+            let _ = self
+                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "struct".to_string(),
+                entity_id: struct_name.clone(),
+                name: Some(struct_name.clone()),
+                role: Some("data_model".to_string()),
+            });
+        }
+        for trait_name in &discovered_traits {
+            let _ = self
+                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"))
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "trait".to_string(),
+                entity_id: trait_name.clone(),
+                name: Some(trait_name.clone()),
+                role: Some("trait_contract".to_string()),
+            });
+        }
+
+        // Re-read the full detail (converts tuples to FeatureGraphEntity)
+        let detail = self
+            .get_feature_graph_detail(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Feature graph {} disappeared after refresh", id))?;
+
+        Ok(Some(detail))
+    }
+
+    async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>> {
+        // Collect file paths that belong to this project
+        let files = self.files.read().await;
+        let project_paths: std::collections::HashSet<_> = files
+            .values()
+            .filter(|f| f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+        drop(files);
+
+        // Collect function names that belong to project files
+        let funcs = self.functions.read().await;
+        let project_functions: std::collections::HashSet<String> = funcs
+            .values()
+            .filter(|f| project_paths.contains(&f.file_path))
+            .map(|f| f.name.clone())
+            .collect();
+        drop(funcs);
+
+        // Count callers + callees for each function
+        let cr = self.call_relationships.read().await;
+        let mut connection_counts: HashMap<String, usize> = HashMap::new();
+
+        for func_name in &project_functions {
+            let mut count = 0usize;
+            // Count callees
+            if let Some(callees) = cr.get(func_name) {
+                count += callees.len();
+            }
+            // Count callers
+            for (_caller, callees) in cr.iter() {
+                if callees.contains(func_name) {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                connection_counts.insert(func_name.clone(), count);
+            }
+        }
+        drop(cr);
+
+        // Sort by connection count descending
+        let mut sorted: Vec<_> = connection_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.truncate(limit);
+
+        Ok(sorted.into_iter().map(|(name, _)| name).collect())
     }
 }
 
@@ -5491,6 +5758,10 @@ mod tests {
             project_id: Uuid::new_v4(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
         };
         store.create_feature_graph(&fg).await.unwrap();
 
@@ -5559,6 +5830,169 @@ mod tests {
             detail2.entities.len(),
             2,
             "should still have 2 entities, not duplicated"
+        );
+    }
+
+    // ========================================================================
+    // Feature Graph — refresh tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_auto_built() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed: function "process" in "src/main.rs", calls "helper"
+        let func1 = make_function("process", "src/main.rs", 1);
+        store.upsert_function(&func1).await.unwrap();
+        let func2 = make_function("helper", "src/util.rs", 1);
+        store.upsert_function(&func2).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(["src/main.rs".to_string(), "src/util.rs".to_string()]);
+        store
+            .call_relationships
+            .write()
+            .await
+            .entry("process".to_string())
+            .or_default()
+            .push("helper".to_string());
+
+        // Auto-build the feature graph
+        let detail = store
+            .auto_build_feature_graph("test-refresh", None, pid, "process", 2, None)
+            .await
+            .unwrap();
+        let fg_id = detail.graph.id;
+        let original_entity_count = detail.entities.len();
+
+        // Verify entry_function is persisted
+        assert_eq!(
+            detail.graph.entry_function,
+            Some("process".to_string()),
+            "entry_function should be stored"
+        );
+
+        // Add a new function that "process" now calls
+        let func3 = make_function("new_helper", "src/new.rs", 1);
+        store.upsert_function(&func3).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push("src/new.rs".to_string());
+        store
+            .call_relationships
+            .write()
+            .await
+            .entry("process".to_string())
+            .or_default()
+            .push("new_helper".to_string());
+
+        // Refresh the feature graph
+        let refreshed = store
+            .refresh_feature_graph(fg_id)
+            .await
+            .unwrap()
+            .expect("should return Some for auto-built graph");
+
+        // The refreshed graph should contain the new function
+        let entity_ids: Vec<&str> = refreshed
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        assert!(
+            entity_ids.contains(&"new_helper"),
+            "refreshed graph should contain new_helper, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            entity_ids.contains(&"src/new.rs"),
+            "refreshed graph should contain src/new.rs, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            refreshed.entities.len() > original_entity_count,
+            "refreshed should have more entities ({}) than original ({})",
+            refreshed.entities.len(),
+            original_entity_count
+        );
+
+        // The graph id should be the same
+        assert_eq!(refreshed.graph.id, fg_id, "graph id should be unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_manual_skip() {
+        let project = test_project();
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Create a manual feature graph (no entry_function)
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "manual-graph".to_string(),
+            description: Some("manually created".to_string()),
+            project_id: project.id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+
+        // Add an entity manually
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "my_func", Some("entry_point"))
+            .await
+            .unwrap();
+
+        // Refresh should return None (manual graph, not refreshable)
+        let result = store.refresh_feature_graph(fg.id).await.unwrap();
+        assert!(
+            result.is_none(),
+            "refresh should return None for manual graph"
+        );
+
+        // Entities should still be there (not deleted)
+        let detail = store
+            .get_feature_graph_detail(fg.id)
+            .await
+            .unwrap()
+            .expect("graph should still exist");
+        assert_eq!(
+            detail.entities.len(),
+            1,
+            "manual graph entities should be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_not_found() {
+        let store = MockGraphStore::new();
+        let fake_id = Uuid::new_v4();
+
+        let result = store.refresh_feature_graph(fake_id).await;
+        assert!(
+            result.is_err(),
+            "refresh on non-existent graph should return error"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "error should mention 'not found', got: {}",
+            err_msg
         );
     }
 }

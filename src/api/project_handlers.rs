@@ -284,6 +284,9 @@ pub async fn sync_project(
         .update_project_synced(project.id)
         .await?;
 
+    // Refresh auto-built feature graphs in background (best-effort)
+    state.orchestrator.spawn_refresh_feature_graphs(project.id);
+
     Ok(Json(SyncProjectResponse {
         files_synced: result.files_synced,
         files_skipped: result.files_skipped,
