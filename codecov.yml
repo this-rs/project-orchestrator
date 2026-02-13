@@ -17,8 +17,14 @@ coverage:
         threshold: 5%
 
 ignore:
-  # WebSocket handler — requires live WS connection for testing (integration only)
+  # Desktop Tauri app — separate crate, not compiled by cargo llvm-cov
+  - "desktop/**"
+  # Chat infrastructure — requires live CLI subprocess, WS connections, and
+  # streaming pipelines. Business logic is tested via mock-based unit tests
+  # but the send/stream/persist pipeline is integration-only.
   - "src/api/ws_chat_handler.rs"
+  - "src/api/chat_handlers.rs"
+  - "src/chat/**"
   # Main entry points
   - "src/main.rs"
   - "src/bin/**"
