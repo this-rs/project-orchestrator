@@ -376,6 +376,9 @@ impl ToolHandler {
 
         self.neo4j().update_project_synced(project.id).await?;
 
+        // Refresh auto-built feature graphs in background (best-effort)
+        self.orchestrator.spawn_refresh_feature_graphs(project.id);
+
         Ok(json!({
             "files_synced": result.files_synced,
             "files_skipped": result.files_skipped,

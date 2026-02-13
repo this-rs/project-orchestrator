@@ -197,6 +197,69 @@ impl Orchestrator {
         self.state.neo4j.clone()
     }
 
+    /// Spawn a background task that refreshes all auto-built feature graphs
+    /// for a project. Best-effort: logs info on success, warn on failure.
+    /// Does not block the caller.
+    pub fn spawn_refresh_feature_graphs(&self, project_id: uuid::Uuid) {
+        let neo4j = self.neo4j_arc();
+        tokio::spawn(async move {
+            let graphs = match neo4j.list_feature_graphs(Some(project_id)).await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to list feature graphs for refresh (project {}): {}",
+                        project_id,
+                        e
+                    );
+                    return;
+                }
+            };
+
+            let auto_built: Vec<_> = graphs
+                .into_iter()
+                .filter(|g| g.entry_function.is_some())
+                .collect();
+
+            if auto_built.is_empty() {
+                return;
+            }
+
+            tracing::info!(
+                "Refreshing {} auto-built feature graph(s) for project {}",
+                auto_built.len(),
+                project_id
+            );
+
+            for fg in &auto_built {
+                match neo4j.refresh_feature_graph(fg.id).await {
+                    Ok(Some(_)) => {
+                        tracing::info!(
+                            "Refreshed feature graph '{}' ({})",
+                            fg.name,
+                            fg.id
+                        );
+                    }
+                    Ok(None) => {
+                        // Should not happen since we filtered, but handle gracefully
+                        tracing::debug!(
+                            "Feature graph '{}' ({}) skipped (no entry_function)",
+                            fg.name,
+                            fg.id
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to refresh feature graph '{}' ({}): {}",
+                            fg.name,
+                            fg.id,
+                            e
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// Get the search store
     pub fn meili(&self) -> &dyn crate::meilisearch::SearchStore {
         self.state.meili.as_ref()
