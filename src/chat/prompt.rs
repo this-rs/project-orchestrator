@@ -1673,10 +1673,7 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
             };
             let count = fg.entity_count.unwrap_or(0);
             if desc_display.is_empty() {
-                md.push_str(&format!(
-                    "- **{}** ({} entités)\n",
-                    fg.name, count
-                ));
+                md.push_str(&format!("- **{}** ({} entités)\n", fg.name, count));
             } else {
                 md.push_str(&format!(
                     "- **{}** — {} ({} entités)\n",
@@ -1684,7 +1681,9 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
                 ));
             }
         }
-        md.push_str("\n→ Utiliser `get_feature_graph(id)` pour explorer les entités d'un graph\n\n");
+        md.push_str(
+            "\n→ Utiliser `get_feature_graph(id)` pour explorer les entités d'un graph\n\n",
+        );
     }
 
     // Only show sync warnings if we have a project
@@ -2441,6 +2440,9 @@ mod tests {
             section.len()
         );
         // Verify descriptions are truncated (original 200 chars → max 80 + "…")
-        assert!(section.contains("…"), "Long descriptions should be truncated with …");
+        assert!(
+            section.contains("…"),
+            "Long descriptions should be truncated with …"
+        );
     }
 }

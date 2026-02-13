@@ -3870,9 +3870,7 @@ impl GraphStore for MockGraphStore {
             })
             .cloned()
             .map(|mut fg| {
-                fg.entity_count = Some(
-                    entities.get(&fg.id).map(|v| v.len() as i64).unwrap_or(0),
-                );
+                fg.entity_count = Some(entities.get(&fg.id).map(|v| v.len() as i64).unwrap_or(0));
                 fg
             })
             .collect();
@@ -4075,8 +4073,7 @@ impl GraphStore for MockGraphStore {
             entity_count: None,
             entry_function: Some(entry_function.to_string()),
             build_depth: Some(depth),
-            include_relations: include_relations
-                .map(|r| r.iter().map(|s| s.to_string()).collect()),
+            include_relations: include_relations.map(|r| r.iter().map(|s| s.to_string()).collect()),
         };
         self.create_feature_graph(&fg).await?;
 
@@ -4142,10 +4139,7 @@ impl GraphStore for MockGraphStore {
         })
     }
 
-    async fn refresh_feature_graph(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<FeatureGraphDetail>> {
+    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
         // 1. Load the existing feature graph
         let fg = {
             let fgs = self.feature_graphs.read().await;
@@ -4164,7 +4158,7 @@ impl GraphStore for MockGraphStore {
 
         let depth = fg.build_depth.unwrap_or(2);
         let include_relations = fg.include_relations.clone();
-        let project_id = fg.project_id;
+        let _project_id = fg.project_id;
 
         let should_include = |rel: &str| -> bool {
             match &include_relations {

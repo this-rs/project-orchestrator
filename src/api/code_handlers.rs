@@ -811,6 +811,9 @@ pub async fn list_feature_graphs(
                 "description": fg.description,
                 "project_id": fg.project_id.to_string(),
                 "created_at": fg.created_at.to_rfc3339(),
+                "entity_count": fg.entity_count,
+                "entry_function": fg.entry_function,
+                "build_depth": fg.build_depth,
             })
         })
         .collect();
@@ -838,6 +841,7 @@ pub async fn get_feature_graph(
                 "entity_type": e.entity_type,
                 "entity_id": e.entity_id,
                 "name": e.name,
+                "role": e.role,
             })
         })
         .collect();
