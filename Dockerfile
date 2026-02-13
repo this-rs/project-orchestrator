@@ -33,7 +33,7 @@ RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
 # =============================================================================
 # Stage 2: Build the backend (Rust)
 # =============================================================================
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.93-bookworm AS builder
 
 WORKDIR /app
 

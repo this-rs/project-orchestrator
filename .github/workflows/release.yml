@@ -873,8 +873,8 @@ jobs:
             INCLUDE_FRONTEND=${{ matrix.include_frontend }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=release-docker
+          cache-to: type=gha,mode=max,scope=release-docker
 
   # ==========================================================================
   # Update Homebrew tap - Push new formula after release is published
