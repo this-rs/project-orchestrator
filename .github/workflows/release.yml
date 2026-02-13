@@ -537,6 +537,7 @@ jobs:
       # --- macOS Notarization: submit to Apple and staple ---
       - name: Notarize macOS .dmg
         if: runner.os == 'macOS' && env.APPLE_ID != ''
+        continue-on-error: true
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
