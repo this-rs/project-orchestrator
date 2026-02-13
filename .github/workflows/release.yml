@@ -38,14 +38,6 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Rewrite absolute paths to relative for Tauri compatibility.
-      # Vite defaults to base "/" which breaks in Tauri's asset:// protocol.
-      - name: Fix asset paths for Tauri (absolute → relative)
-        run: |
-          sed -i 's|href="/assets/|href="./assets/|g; s|src="/assets/|src="./assets/|g; s|href="/vite.svg"|href="./vite.svg"|g' dist/index.html
-          echo "Fixed index.html:"
-          cat dist/index.html
-
       - name: Upload frontend dist
         uses: actions/upload-artifact@v4
         with:
@@ -101,6 +93,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject version from git tag
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i.bak "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Injected version ${VERSION}:"
+          grep '^version' Cargo.toml | head -1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -117,18 +123,13 @@ jobs:
 
       - name: Build (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --locked --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }}
 
       # --- Package the binary ---
-
-      - name: Get version from tag
-        id: version
-        shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Package (Unix)
         if: matrix.os != 'windows'
@@ -213,6 +214,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject version from git tag
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i.bak "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Injected version ${VERSION}:"
+          grep '^version' Cargo.toml | head -1
+
       - name: Download frontend dist
         uses: actions/download-artifact@v4
         with:
@@ -235,18 +250,13 @@ jobs:
 
       - name: Build with embedded frontend (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --locked --features embedded-frontend --target ${{ matrix.target }}
+        run: cargo build --release --features embedded-frontend --target ${{ matrix.target }}
 
       - name: Build with embedded frontend (cross)
         if: matrix.use_cross
-        run: cross build --release --locked --features embedded-frontend --target ${{ matrix.target }}
+        run: cross build --release --features embedded-frontend --target ${{ matrix.target }}
 
       # --- Package the binary ---
-
-      - name: Get version from tag
-        id: version
-        shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Package (Unix)
         if: matrix.os != 'windows'
@@ -466,6 +476,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Inject the git tag version into all version files so the built
+      # artifacts (app name, About dialog, --version flag) match the release.
+      - name: Inject version from git tag
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "Injecting version ${VERSION} into project files..."
+
+          # Root Cargo.toml (workspace)
+          sed -i.bak "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+
+          # Desktop Tauri Cargo.toml
+          sed -i.bak "0,/^version = \".*\"/s//version = \"${VERSION}\"/" desktop/src-tauri/Cargo.toml
+          rm -f desktop/src-tauri/Cargo.toml.bak
+
+          # Tauri config JSON
+          sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" desktop/src-tauri/tauri.conf.json
+          rm -f desktop/src-tauri/tauri.conf.json.bak
+
+          echo "Verification:"
+          grep '^version' Cargo.toml | head -1
+          grep '^version' desktop/src-tauri/Cargo.toml | head -1
+          grep '"version"' desktop/src-tauri/tauri.conf.json
+
       - name: Download frontend dist
         uses: actions/download-artifact@v4
         with:
@@ -535,7 +575,7 @@ jobs:
           security find-identity -v "$KEYCHAIN_PATH"
 
       - name: Build mcp_server binary (bundled as Tauri resource)
-        run: cargo build --release --bin mcp_server --locked
+        run: cargo build --release --bin mcp_server
 
       # On Windows, Tauri resource path in tauri.conf.json expects "mcp_server"
       # but cargo produces "mcp_server.exe". Create a copy without .exe extension.

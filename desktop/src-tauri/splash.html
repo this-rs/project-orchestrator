@@ -24,14 +24,14 @@
 
     .logo-container {
       position: relative;
-      width: 96px;
-      height: 96px;
-      margin-bottom: 28px;
+      width: 80px;
+      height: 80px;
+      margin-bottom: 20px;
     }
 
     .logo-icon {
-      width: 96px;
-      height: 96px;
+      width: 80px;
+      height: 80px;
       opacity: 0;
       animation: fadeInScale 0.5s ease-out 0.1s forwards;
     }
@@ -41,7 +41,7 @@
       font-weight: 600;
       letter-spacing: -0.02em;
       color: #f1f5f9;
-      margin-bottom: 6px;
+      margin-bottom: 4px;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 0.4s forwards;
     }
@@ -49,33 +49,120 @@
     .subtitle {
       font-size: 13px;
       color: #64748b;
-      margin-bottom: 40px;
+      margin-bottom: 28px;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 0.6s forwards;
     }
 
-    /* Spinner */
-    .spinner-container {
+    /* ── Checklist ── */
+    .checklist {
+      width: 300px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 0.8s forwards;
     }
 
-    .spinner {
-      width: 22px;
-      height: 22px;
-      border: 2.5px solid rgba(99, 102, 241, 0.15);
+    .check-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      transition: background 0.3s, border-color 0.3s;
+    }
+
+    .check-item.success {
+      border-color: rgba(34, 197, 94, 0.2);
+      background: rgba(34, 197, 94, 0.05);
+    }
+
+    .check-item.error {
+      border-color: rgba(239, 68, 68, 0.2);
+      background: rgba(239, 68, 68, 0.05);
+    }
+
+    .check-item.warning {
+      border-color: rgba(234, 179, 8, 0.2);
+      background: rgba(234, 179, 8, 0.05);
+    }
+
+    .check-icon {
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Spinner for pending state */
+    .check-icon .spinner {
+      width: 16px;
+      height: 16px;
+      border: 2px solid rgba(99, 102, 241, 0.15);
       border-top-color: #6366f1;
       border-radius: 50%;
       animation: spin 0.7s linear infinite;
     }
 
-    .status {
-      margin-top: 14px;
+    .check-icon svg { width: 16px; height: 16px; }
+
+    .check-label {
+      flex: 1;
+      font-size: 13px;
+      color: #cbd5e1;
+    }
+
+    .check-action {
       font-size: 11px;
-      color: #475569;
+      color: #6366f1;
+      text-decoration: none;
+      cursor: pointer;
+      padding: 3px 8px;
+      border-radius: 4px;
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      background: rgba(99, 102, 241, 0.1);
+      transition: background 0.2s;
+    }
+    .check-action:hover {
+      background: rgba(99, 102, 241, 0.2);
+    }
+
+    /* ── Footer actions ── */
+    .footer {
+      margin-top: 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 1s forwards;
     }
+
+    .status-text {
+      font-size: 11px;
+      color: #475569;
+      transition: color 0.3s;
+    }
+
+    .btn-continue {
+      display: none;
+      padding: 6px 20px;
+      font-size: 12px;
+      font-weight: 500;
+      color: #fff;
+      background: #6366f1;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-continue:hover { background: #4f46e5; }
+    .btn-continue.visible { display: inline-block; }
 
     @keyframes fadeInScale {
       from { opacity: 0; transform: scale(0.85); }
@@ -94,7 +181,6 @@
 </head>
 <body>
   <div class="logo-container">
-    <!-- App icon: indigo rounded square with 4-grid pattern -->
     <svg class="logo-icon" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg">
       <rect x="8" y="8" width="80" height="80" rx="18" fill="#6366f1"/>
       <rect x="20" y="20" width="24" height="24" rx="6" fill="white"/>
@@ -105,9 +191,207 @@
   </div>
   <div class="title">Project Orchestrator</div>
   <div class="subtitle">AI Agent Orchestrator</div>
-  <div class="spinner-container">
-    <div class="spinner"></div>
+
+  <div class="checklist">
+    <div class="check-item" id="check-docker">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <span class="check-label">Docker Desktop</span>
+    </div>
+    <div class="check-item" id="check-claude">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <span class="check-label">Claude Code</span>
+    </div>
+    <div class="check-item" id="check-config">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <span class="check-label">Configuration</span>
+    </div>
+    <div class="check-item" id="check-backend">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <span class="check-label">Backend server</span>
+    </div>
   </div>
-  <div class="status">Starting services...</div>
+
+  <div class="footer">
+    <div class="status-text" id="status">Checking dependencies...</div>
+    <button class="btn-continue" id="btn-continue" onclick="continueAnyway()">Continue anyway</button>
+  </div>
+
+  <script>
+    // SVG icons
+    const ICON_OK = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#22c55e" opacity="0.15"/><path d="M5 8l2 2 4-4" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    const ICON_FAIL = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#ef4444" opacity="0.15"/><path d="M6 6l4 4M10 6l-4 4" stroke="#ef4444" stroke-width="1.5" stroke-linecap="round"/></svg>';
+    const ICON_WARN = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#eab308" opacity="0.15"/><path d="M8 5v3M8 10h.01" stroke="#eab308" stroke-width="1.5" stroke-linecap="round"/></svg>';
+    const ICON_SPIN = '<div class="spinner"></div>';
+
+    // Download URLs per platform
+    const DOCKER_URLS = {
+      'macos': 'https://docs.docker.com/desktop/setup/install/mac-install/',
+      'linux': 'https://docs.docker.com/desktop/setup/install/linux/',
+      'windows': 'https://docs.docker.com/desktop/setup/install/windows-install/',
+    };
+    const CLAUDE_URL = 'https://docs.anthropic.com/en/docs/claude-code/overview';
+
+    let platformOs = 'macos';
+    let allCriticalOk = false;
+
+    function setCheck(id, state, actionHtml) {
+      const el = document.getElementById(id);
+      const icon = el.querySelector('.check-icon');
+      el.className = 'check-item ' + state;
+
+      if (state === 'success') icon.innerHTML = ICON_OK;
+      else if (state === 'error') icon.innerHTML = ICON_FAIL;
+      else if (state === 'warning') icon.innerHTML = ICON_WARN;
+      else icon.innerHTML = ICON_SPIN;
+
+      // Remove old action if any
+      const oldAction = el.querySelector('.check-action');
+      if (oldAction) oldAction.remove();
+
+      if (actionHtml) {
+        el.insertAdjacentHTML('beforeend', actionHtml);
+      }
+    }
+
+    function setStatus(text) {
+      document.getElementById('status').textContent = text;
+    }
+
+    function openUrl(url) {
+      // Use Tauri shell plugin to open in default browser
+      if (window.__TAURI__) {
+        window.__TAURI__.shell.open(url);
+      }
+    }
+
+    async function invoke(cmd, args) {
+      if (window.__TAURI__) {
+        return window.__TAURI__.core.invoke(cmd, args || {});
+      }
+      throw new Error('Tauri not available');
+    }
+
+    async function runChecks() {
+      setStatus('Checking dependencies...');
+
+      try {
+        const deps = await invoke('check_dependencies');
+        platformOs = deps.os === 'windows' ? 'windows' : deps.os === 'linux' ? 'linux' : 'macos';
+
+        // Docker
+        if (deps.dockerAvailable) {
+          setCheck('check-docker', 'success');
+        } else {
+          const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
+          setCheck('check-docker', 'error',
+            `<span class="check-action" onclick="openUrl('${url}')">Install</span>`);
+        }
+
+        // Claude Code (optional — warning, not error)
+        if (deps.claudeCodeAvailable) {
+          setCheck('check-claude', 'success');
+        } else {
+          setCheck('check-claude', 'warning',
+            `<span class="check-action" onclick="openUrl('${CLAUDE_URL}')">Install</span>`);
+        }
+
+        // Config
+        if (deps.configExists) {
+          setCheck('check-config', 'success');
+        } else {
+          setCheck('check-config', 'warning');
+          // Config will be created by the setup wizard — not blocking
+        }
+
+        // Check if we should show "Continue anyway" for non-critical missing deps
+        const hasCriticalIssue = !deps.dockerAvailable;
+        const hasWarnings = !deps.claudeCodeAvailable || !deps.configExists;
+
+        if (hasCriticalIssue) {
+          setStatus('Docker is required to run services');
+          document.getElementById('btn-continue').classList.add('visible');
+        }
+
+        // Start backend health polling regardless — backend starts even without Docker
+        await pollBackendHealth();
+
+      } catch (err) {
+        console.error('check_dependencies failed:', err);
+        // Fallback: skip dep checks and just poll backend
+        setCheck('check-docker', 'warning');
+        setCheck('check-claude', 'warning');
+        setCheck('check-config', 'warning');
+        setStatus('Starting backend...');
+        await pollBackendHealth();
+      }
+    }
+
+    async function pollBackendHealth() {
+      setCheck('check-backend', ''); // spinner
+      setStatus('Starting backend...');
+
+      const port = await invoke('get_server_port').catch(() => 6600);
+      const startTime = Date.now();
+      const timeout = 30000; // 30s
+
+      while (Date.now() - startTime < timeout) {
+        try {
+          const healthy = await invoke('check_health', { port });
+          if (healthy) {
+            setCheck('check-backend', 'success');
+            setStatus('Ready');
+
+            // Small delay for visual satisfaction, then auto-transition
+            await new Promise(r => setTimeout(r, 600));
+            transitionToMain();
+            return;
+          }
+        } catch (_) { /* not ready yet */ }
+        await new Promise(r => setTimeout(r, 200));
+      }
+
+      // Timeout
+      setCheck('check-backend', 'error');
+      setStatus('Backend failed to start within 30s');
+      document.getElementById('btn-continue').classList.add('visible');
+    }
+
+    function transitionToMain() {
+      // The backend thread in main.rs handles the actual window transition
+      // via show_main_window(). We don't need to do anything here — the
+      // Rust code polls /health and transitions when ready.
+      // This function is a no-op; the Rust side drives the transition.
+    }
+
+    function continueAnyway() {
+      // User chose to skip — the Rust backend thread will eventually
+      // show the main window when health check passes or times out.
+      setStatus('Waiting for backend...');
+      document.getElementById('btn-continue').classList.remove('visible');
+    }
+
+    // Start checks when Tauri is ready
+    if (window.__TAURI__) {
+      runChecks();
+    } else {
+      window.addEventListener('DOMContentLoaded', () => {
+        // Wait a bit for Tauri to inject __TAURI__
+        setTimeout(() => {
+          if (window.__TAURI__) {
+            runChecks();
+          } else {
+            setStatus('Waiting for Tauri...');
+            // Retry
+            const interval = setInterval(() => {
+              if (window.__TAURI__) {
+                clearInterval(interval);
+                runChecks();
+              }
+            }, 100);
+          }
+        }, 100);
+      });
+    }
+  </script>
 </body>
 </html>

@@ -93,13 +93,6 @@ if [ "$SKIP_FRONT" = false ]; then
         cp "$DESKTOP_DIR/src-tauri/splash.html" "$DESKTOP_DIST/splash.html"
     fi
 
-    # Fix absolute asset paths for Tauri (Vite defaults to base "/", Tauri needs "./")
-    if [ -f "$DESKTOP_DIST/index.html" ]; then
-        sed -i.bak 's|href="/assets/|href="./assets/|g; s|src="/assets/|src="./assets/|g; s|href="/vite.svg"|href="./vite.svg"|g' "$DESKTOP_DIST/index.html"
-        rm -f "$DESKTOP_DIST/index.html.bak"
-        log_ok "Fixed asset paths in index.html (absolute → relative)"
-    fi
-
     log_ok "dist synced to $DESKTOP_DIST"
 else
     log_warn "Skipping frontend build (--skip-front)"

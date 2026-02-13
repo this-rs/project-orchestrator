@@ -66,6 +66,8 @@ fn main() {
             get_server_port,
             check_health,
             restart_app,
+            // Splash screen dependency checks
+            setup::check_dependencies,
             // Setup wizard commands
             setup::check_config_exists,
             setup::get_config_path,
@@ -101,11 +103,16 @@ fn main() {
 
             // Resolve absolute paths to bundled resources so the backend can find them.
             if let Ok(resource_dir) = app.path().resource_dir() {
-                // Frontend dist/ for HTTP serving
+                // Frontend dist/ for HTTP serving.
+                // Force SERVE_FRONTEND=true so the backend also serves the SPA via HTTP.
+                // This is required for OIDC callback: after OAuth redirect to
+                // http://localhost:6600/auth/callback, the backend must serve
+                // index.html as SPA fallback (not just the Tauri protocol).
                 let dist_path = resource_dir.join("dist");
                 if dist_path.exists() {
                     tracing::info!("Frontend dist path: {}", dist_path.display());
                     std::env::set_var("FRONTEND_PATH", dist_path.to_str().unwrap_or("./dist"));
+                    std::env::set_var("SERVE_FRONTEND", "true");
                 } else {
                     tracing::warn!("Bundled dist/ not found at: {}", dist_path.display());
                 }
