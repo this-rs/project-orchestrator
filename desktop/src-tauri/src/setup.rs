@@ -227,6 +227,55 @@ fn random_secret(len: usize) -> String {
 }
 
 // ============================================================================
+// Dependency checks (splash screen)
+// ============================================================================
+
+/// Result of checking all desktop dependencies at once.
+/// Used by the splash screen to show a checklist.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyStatus {
+    pub docker_available: bool,
+    pub claude_code_available: bool,
+    pub config_exists: bool,
+    pub os: String,
+    pub arch: String,
+}
+
+/// Check all dependencies in one call (for the splash screen).
+///
+/// This avoids multiple round-trips between JS and Rust.
+#[tauri::command]
+pub async fn check_dependencies(
+    docker: tauri::State<'_, crate::docker::SharedDockerManager>,
+) -> Result<DependencyStatus, String> {
+    // Docker check (async via bollard)
+    let docker_available = {
+        let mgr = docker.read().await;
+        mgr.is_available().await
+    };
+
+    // Claude Code CLI check
+    let claude_code_available =
+        project_orchestrator::setup_claude::detect_claude_cli().is_some();
+
+    // Config file check
+    let config_exists = config_path().exists();
+
+    // Platform info
+    let os = std::env::consts::OS.to_string();
+    let arch = std::env::consts::ARCH.to_string();
+
+    Ok(DependencyStatus {
+        docker_available,
+        claude_code_available,
+        config_exists,
+        os,
+        arch,
+    })
+}
+
+// ============================================================================
 // Tauri commands
 // ============================================================================
 
