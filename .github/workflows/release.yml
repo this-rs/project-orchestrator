@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,9 +62,9 @@ jobs:
             arch: arm64
             use_cross: false
 
-          # macOS Intel
+          # macOS Intel (macos-14 is ARM64 but can cross-compile x86_64)
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             os: macos
             arch: x86_64
             use_cross: false
@@ -178,7 +179,7 @@ jobs:
             use_cross: false
 
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             os: macos
             arch: x86_64
             use_cross: false
@@ -285,6 +286,7 @@ jobs:
     name: Package .deb (${{ matrix.arch }})
     runs-on: ubuntu-latest
     needs: [build]
+    if: always()
     strategy:
       fail-fast: false
       matrix:
@@ -324,14 +326,22 @@ jobs:
         run: |
           ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
           tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
-          mkdir -p "target/release"
+          # cargo-deb --target expects binaries in target/<triple>/release/
+          mkdir -p "target/${{ matrix.target }}/release"
           for bin in orchestrator orch mcp_server; do
-            cp "artifact/${ARCHIVE_NAME}/${bin}" "target/release/${bin}"
+            cp "artifact/${ARCHIVE_NAME}/${bin}" "target/${{ matrix.target }}/release/${bin}"
           done
-          chmod +x target/release/*
+          chmod +x target/${{ matrix.target }}/release/*
 
       - name: Build .deb package
-        run: cargo deb --no-build --target ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            # Use arm64-cross variant: explicit depends instead of $auto
+            # (dpkg-shlibdeps can't resolve ARM64 libs on x86_64 runner)
+            cargo deb --no-build --no-strip --variant=arm64-cross --target ${{ matrix.target }}
+          else
+            cargo deb --no-build --target ${{ matrix.target }}
+          fi
 
       - name: Find and upload .deb
         run: |
@@ -354,6 +364,7 @@ jobs:
     name: Package .rpm (${{ matrix.arch }})
     runs-on: ubuntu-latest
     needs: [build]
+    if: always()
     strategy:
       fail-fast: false
       matrix:
@@ -393,11 +404,12 @@ jobs:
         run: |
           ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
           tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
-          mkdir -p "target/release"
+          # cargo-generate-rpm --target expects binaries in target/<triple>/release/
+          mkdir -p "target/${{ matrix.target }}/release"
           for bin in orchestrator orch mcp_server; do
-            cp "artifact/${ARCHIVE_NAME}/${bin}" "target/release/${bin}"
+            cp "artifact/${ARCHIVE_NAME}/${bin}" "target/${{ matrix.target }}/release/${bin}"
           done
-          chmod +x target/release/*
+          chmod +x target/${{ matrix.target }}/release/*
 
       - name: Build .rpm package
         run: cargo generate-rpm --target ${{ matrix.target }}
@@ -432,7 +444,7 @@ jobs:
             tauri_target: aarch64-apple-darwin
 
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             tauri_target: x86_64-apple-darwin
 
           - target: x86_64-unknown-linux-gnu
@@ -500,13 +512,23 @@ jobs:
           # Verify
           security find-identity -v "$KEYCHAIN_PATH"
 
+      - name: Build mcp_server binary (bundled as Tauri resource)
+        run: cargo build --release --bin mcp_server --locked
+
+      # On Windows, Tauri resource path in tauri.conf.json expects "mcp_server"
+      # but cargo produces "mcp_server.exe". Create a copy without .exe extension.
+      - name: Fix mcp_server path for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "target\release\mcp_server.exe" "target\release\mcp_server"
+
       - name: Build Tauri bundle
         working-directory: desktop/src-tauri
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS signing (Tauri reads APPLE_SIGNING_IDENTITY automatically)
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # macOS: use real identity if available, otherwise ad-hoc sign (-)
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
           # Windows signing
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
@@ -587,20 +609,39 @@ jobs:
     name: Publish Release
     runs-on: ubuntu-latest
     needs: [build, build-full, build-tauri, package-deb, package-rpm]
+    # Always run: collect whatever artifacts succeeded.
+    # Individual matrix entries may fail/cancel (e.g. macos-13 runner unavailable)
+    # but we still want to publish everything that built successfully.
+    if: always()
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download release artifacts (native builds)
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
+          pattern: orchestrator-*
+
+      - name: Download release artifacts (deb/rpm)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: artifacts/
+          pattern: project-orchestrator*
+
+      - name: Download release artifacts (tauri)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: artifacts/
+          pattern: tauri-*
 
       - name: Collect release files
         run: |
           mkdir -p release-files
           find artifacts/ -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.exe" -o -name "*.msi" -o -name "*.sig" \) -exec cp {} release-files/ \;
           echo "=== Release artifacts ==="
-          ls -la release-files/
+          ls -la release-files/ || echo "No release files found"
 
       - name: Generate checksums
         working-directory: release-files
@@ -797,10 +838,27 @@ jobs:
         id: sha
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          echo "macos_arm64=$(grep "orchestrator-full-${VERSION}-macos-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          echo "macos_x86_64=$(grep "orchestrator-full-${VERSION}-macos-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          echo "linux_arm64=$(grep "orchestrator-full-${VERSION}-linux-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          echo "linux_x86_64=$(grep "orchestrator-full-${VERSION}-linux-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          cat checksums-sha256.txt
+
+          macos_arm64=$(grep "orchestrator-full-${VERSION}-macos-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}' || true)
+          macos_x86_64=$(grep "orchestrator-full-${VERSION}-macos-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}' || true)
+          linux_arm64=$(grep "orchestrator-full-${VERSION}-linux-arm64.tar.gz" checksums-sha256.txt | awk '{print $1}' || true)
+          linux_x86_64=$(grep "orchestrator-full-${VERSION}-linux-x86_64.tar.gz" checksums-sha256.txt | awk '{print $1}' || true)
+
+          # Validate required checksums (at minimum: macOS ARM64 + Linux x86_64)
+          if [ -z "$macos_arm64" ] || [ -z "$linux_x86_64" ]; then
+            echo "::error::Missing required checksums (macos_arm64 or linux_x86_64)"
+            exit 1
+          fi
+
+          # For missing optional platforms, reuse the same-OS alternative
+          [ -z "$macos_x86_64" ] && macos_x86_64="$macos_arm64" && echo "::warning::macOS x86_64 not available, using ARM64 universal"
+          [ -z "$linux_arm64" ] && linux_arm64="$linux_x86_64" && echo "::warning::Linux ARM64 not available, using x86_64"
+
+          echo "macos_arm64=${macos_arm64}" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=${macos_x86_64}" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=${linux_arm64}" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=${linux_x86_64}" >> "$GITHUB_OUTPUT"
 
       - name: Generate updated formula
         run: |
