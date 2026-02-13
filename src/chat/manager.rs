@@ -471,9 +471,9 @@ impl ChatManager {
                                     session_id: uuid,
                                     seq: next_seq.fetch_add(1, Ordering::SeqCst),
                                     event_type: "user_message".to_string(),
-                                    data: serde_json::to_string(
-                                        &serde_json::json!({"content": message}),
-                                    )
+                                    data: serde_json::to_string(&ChatEvent::UserMessage {
+                                        content: message.to_string(),
+                                    })
                                     .unwrap_or_default(),
                                     created_at: chrono::Utc::now(),
                                 };
@@ -987,8 +987,10 @@ impl ChatManager {
             session_id,
             seq: next_seq.fetch_add(1, Ordering::SeqCst),
             event_type: "user_message".to_string(),
-            data: serde_json::to_string(&serde_json::json!({"content": &request.message}))
-                .unwrap_or_default(),
+            data: serde_json::to_string(&ChatEvent::UserMessage {
+                content: request.message.clone(),
+            })
+            .unwrap_or_default(),
             created_at: chrono::Utc::now(),
         };
         let _ = self
@@ -1504,8 +1506,10 @@ impl ChatManager {
                     session_id: uuid,
                     seq: next_seq.fetch_add(1, Ordering::SeqCst),
                     event_type: "user_message".to_string(),
-                    data: serde_json::to_string(&serde_json::json!({"content": &next_msg}))
-                        .unwrap_or_default(),
+                    data: serde_json::to_string(&ChatEvent::UserMessage {
+                        content: next_msg.clone(),
+                    })
+                    .unwrap_or_default(),
                     created_at: chrono::Utc::now(),
                 };
                 let _ = graph.store_chat_events(uuid, vec![user_event]).await;
@@ -1679,8 +1683,10 @@ impl ChatManager {
                 session_id: uuid,
                 seq: next_seq.fetch_add(1, Ordering::SeqCst),
                 event_type: "user_message".to_string(),
-                data: serde_json::to_string(&serde_json::json!({"content": message}))
-                    .unwrap_or_default(),
+                data: serde_json::to_string(&ChatEvent::UserMessage {
+                    content: message.to_string(),
+                })
+                .unwrap_or_default(),
                 created_at: chrono::Utc::now(),
             };
             let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
@@ -1861,8 +1867,10 @@ impl ChatManager {
             session_id: uuid,
             seq: next_seq.fetch_add(1, Ordering::SeqCst),
             event_type: "user_message".to_string(),
-            data: serde_json::to_string(&serde_json::json!({"content": message}))
-                .unwrap_or_default(),
+            data: serde_json::to_string(&ChatEvent::UserMessage {
+                content: message.to_string(),
+            })
+            .unwrap_or_default(),
             created_at: chrono::Utc::now(),
         };
         let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
@@ -1944,7 +1952,7 @@ impl ChatManager {
                 .get_chat_events_paginated(uuid, offset_val, limit_val)
                 .await?;
 
-            let has_more = offset_val + events.len() as i64 > total_count;
+            let has_more = (offset_val + events.len() as i64) < total_count;
 
             return Ok(ChatEventPage {
                 events,

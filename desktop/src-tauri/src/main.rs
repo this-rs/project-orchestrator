@@ -9,6 +9,7 @@ mod updater;
 
 use project_orchestrator::Config;
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Tauri command: get the server port for the frontend to connect to
@@ -25,6 +26,17 @@ async fn check_health(port: u16) -> Result<bool, String> {
         Ok(resp) => Ok(resp.status().is_success()),
         Err(_) => Ok(false),
     }
+}
+
+/// Tauri command: open a URL in the system's default browser.
+///
+/// This is the most reliable way to open external links from the webview.
+/// Called by ExternalLink onClick in Tauri mode.
+#[tauri::command]
+fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 /// Tauri command: restart the entire application.
@@ -60,11 +72,13 @@ fn main() {
     // Launch Tauri application (splash screen shows immediately)
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(docker_manager)
         .invoke_handler(tauri::generate_handler![
             get_server_port,
             check_health,
+            open_url,
             restart_app,
             // Splash screen dependency checks
             setup::check_dependencies,
@@ -126,6 +140,38 @@ fn main() {
                     tracing::warn!("Bundled mcp_server not found at: {}", mcp_path.display());
                 }
             }
+
+            // Create the main window PROGRAMMATICALLY (not from tauri.conf.json)
+            // so we can attach an on_new_window handler that intercepts
+            // target="_blank" links and opens them in the system browser.
+            //
+            // NOTE: We intentionally do NOT use on_navigation here because
+            // the OIDC/SSO flow navigates the webview to the OAuth provider
+            // (e.g. accounts.google.com) and back to localhost:6600/auth/callback.
+            // Blocking external navigations would break SSO.
+            let new_win_handle = app.handle().clone();
+            let _main_window = tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("Project Orchestrator")
+            .inner_size(1280.0, 800.0)
+            .min_inner_size(900.0, 600.0)
+            .resizable(true)
+            .center()
+            .visible(false)
+            .decorations(false)
+            // Intercept target="_blank" / window.open() — open in system browser
+            // instead of creating a new Tauri window. This handles all <a target="_blank">
+            // links in the chat UI (PR links, web search results, etc.).
+            .on_new_window(move |url, _features| {
+                tracing::info!("on_new_window: opening external URL in browser: {}", url);
+                let _ = new_win_handle.opener().open_url(url.as_str(), None::<&str>);
+                tauri::webview::NewWindowResponse::Deny
+            })
+            .build()
+            .expect("Failed to create main window");
 
             // Start backend server and manage splash → main window transition
             let handle = app.handle().clone();
@@ -217,6 +263,16 @@ fn main() {
         .expect("Error while building Tauri application");
 
     app.run(move |_app, event| {
+        // macOS: clicking the dock icon when the window is hidden should reshow it
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows, ..
+        } = &event
+        {
+            if !has_visible_windows {
+                tray::show_main_window(&_app);
+            }
+        }
+
         if let tauri::RunEvent::ExitRequested { .. } = event {
             tracing::info!("Application exiting — stopping Docker services...");
             let dm = docker_for_exit.clone();
@@ -301,6 +357,20 @@ fn show_main_window(handle: &tauri::AppHandle) {
                 }
             });
         }
+
+        // Inject desktop-specific JS before showing the window:
+        // Block Cmd/Ctrl +/-/0 zoom shortcuts to prevent accidental zoom.
+        // (Overscroll bounce and external link handling are managed in the
+        // frontend CSS and React components via @tauri-apps/plugin-shell.)
+        let _ = main_window.eval(r#"
+            (function() {
+                document.addEventListener('keydown', function(e) {
+                    if ((e.metaKey || e.ctrlKey) && (e.key === '+' || e.key === '-' || e.key === '=' || e.key === '0')) {
+                        e.preventDefault();
+                    }
+                }, true);
+            })();
+        "#);
 
         if let Err(e) = main_window.show() {
             tracing::warn!("Failed to show main window: {}", e);

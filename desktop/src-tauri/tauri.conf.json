@@ -10,19 +10,6 @@
   "app": {
     "windows": [
       {
-        "label": "main",
-        "title": "Project Orchestrator",
-        "width": 1280,
-        "height": 800,
-        "minWidth": 900,
-        "minHeight": 600,
-        "resizable": true,
-        "fullscreen": false,
-        "center": true,
-        "visible": false,
-        "decorations": false
-      },
-      {
         "label": "splashscreen",
         "title": "Project Orchestrator",
         "url": "splash.html",
@@ -37,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://localhost:6600 ws://localhost:6600; connect-src 'self' http://localhost:6600 ws://localhost:6600 http://127.0.0.1:6600 ws://127.0.0.1:6600; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self' https: http://localhost:6600 ws://localhost:6600; connect-src 'self' http://localhost:6600 ws://localhost:6600 http://127.0.0.1:6600 ws://127.0.0.1:6600; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {

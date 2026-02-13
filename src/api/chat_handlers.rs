@@ -62,6 +62,10 @@ fn default_messages_limit() -> usize {
 }
 
 /// GET /api/chat/sessions/{id}/messages — Get message history
+///
+/// Returns persisted chat events as `messages`. Each event includes its full
+/// payload (type, content, tool info, etc.) plus injected `seq` and `created_at`
+/// metadata. The frontend reconstructs the ChatMessage UI model from these events.
 pub async fn list_messages(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
@@ -90,19 +94,27 @@ pub async fn list_messages(
 
     // Events are sorted by seq ASC from Neo4j. Each event's `data` field is
     // the JSON-serialized ChatEvent (includes type tag, tool_use, tool_result, etc.)
-    let events: Vec<serde_json::Value> = loaded
+    let messages: Vec<serde_json::Value> = loaded
         .events
         .iter()
         .map(|e| {
             // Parse the data field back to a JSON object to return structured events
             let mut obj = serde_json::from_str::<serde_json::Value>(&e.data)
                 .unwrap_or_else(|_| serde_json::json!({ "type": e.event_type, "raw": e.data }));
-            // Inject metadata
+            // Inject metadata + ensure "type" tag is always present
+            // (legacy user_message events were stored as {"content":"..."} without a type tag)
             if let Some(map) = obj.as_object_mut() {
+                map.entry("type".to_string())
+                    .or_insert_with(|| serde_json::json!(e.event_type));
+                // Only inject the Neo4j UUID as "id" if the event doesn't already have one.
+                // tool_use and tool_result events carry a Claude tool_call_id in their "id" field
+                // which must be preserved for proper tool_use ↔ tool_result matching.
+                map.entry("id".to_string())
+                    .or_insert_with(|| serde_json::json!(e.id.to_string()));
                 map.insert("seq".to_string(), serde_json::json!(e.seq));
                 map.insert(
                     "created_at".to_string(),
-                    serde_json::json!(e.created_at.to_rfc3339()),
+                    serde_json::json!(e.created_at.timestamp()),
                 );
             }
             obj
@@ -110,7 +122,7 @@ pub async fn list_messages(
         .collect();
 
     Ok(Json(serde_json::json!({
-        "events": events,
+        "messages": messages,
         "total_count": loaded.total_count,
         "has_more": loaded.has_more,
         "offset": loaded.offset,
