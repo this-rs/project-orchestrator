@@ -462,7 +462,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: frontend-dist
-          path: desktop/dist/
+          path: frontend-dist/
+
+      # Replicate scripts/build-desktop.sh logic:
+      # 1. Copy dist → desktop/dist/  2. Copy splash.html into dist  3. Build mcp_server  4. cargo tauri build
+      - name: Prepare desktop/dist (copy frontend + splash.html)
+        shell: bash
+        run: |
+          rm -rf desktop/dist
+          cp -r frontend-dist desktop/dist
+          # splash.html must be in desktop/dist/ alongside the frontend assets
+          if [ -f "desktop/src-tauri/splash.html" ]; then
+            cp desktop/src-tauri/splash.html desktop/dist/splash.html
+          fi
+          echo "desktop/dist contents:"
+          ls -la desktop/dist/
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -882,6 +896,6 @@ jobs:
           destination_folder: Formula
           destination_branch_create: main
           destination_file: project-orchestrator.rb
-          user_email: "ci@openclaw.ai"
-          user_name: "OpenClaw CI"
+          user_email: "t@ffs.holdings"
+          user_name: "Théotime Rivière"
           commit_message: "Update project-orchestrator to v${{ steps.version.outputs.version }}"
