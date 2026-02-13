@@ -7,9 +7,12 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
+    html, body {
+      width: 100%;
+      height: 100%;
+    }
+
     body {
-      width: 100vw;
-      height: 100vh;
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -42,6 +45,7 @@
       letter-spacing: -0.02em;
       color: #f1f5f9;
       margin-bottom: 4px;
+      text-align: center;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 0.4s forwards;
     }
@@ -49,7 +53,8 @@
     .subtitle {
       font-size: 13px;
       color: #64748b;
-      margin-bottom: 28px;
+      margin-bottom: 24px;
+      text-align: center;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 0.6s forwards;
     }
@@ -59,7 +64,7 @@
       width: 300px;
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 8px;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 0.8s forwards;
     }
@@ -134,19 +139,24 @@
 
     /* ── Footer actions ── */
     .footer {
-      margin-top: 20px;
+      margin-top: 18px;
       display: flex;
       flex-direction: column;
       align-items: center;
+      justify-content: center;
       gap: 8px;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 1s forwards;
+      text-align: center;
+      width: 300px;
     }
 
     .status-text {
       font-size: 11px;
       color: #475569;
       transition: color 0.3s;
+      text-align: center;
+      width: 100%;
     }
 
     .btn-continue {
