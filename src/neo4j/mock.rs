@@ -5789,4 +5789,167 @@ mod tests {
             "should still have 2 entities, not duplicated"
         );
     }
+
+    // ========================================================================
+    // Feature Graph — refresh tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_auto_built() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed: function "process" in "src/main.rs", calls "helper"
+        let func1 = make_function("process", "src/main.rs", 1);
+        store.upsert_function(&func1).await.unwrap();
+        let func2 = make_function("helper", "src/util.rs", 1);
+        store.upsert_function(&func2).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(["src/main.rs".to_string(), "src/util.rs".to_string()]);
+        store
+            .call_relationships
+            .write()
+            .await
+            .entry("process".to_string())
+            .or_default()
+            .push("helper".to_string());
+
+        // Auto-build the feature graph
+        let detail = store
+            .auto_build_feature_graph("test-refresh", None, pid, "process", 2, None)
+            .await
+            .unwrap();
+        let fg_id = detail.graph.id;
+        let original_entity_count = detail.entities.len();
+
+        // Verify entry_function is persisted
+        assert_eq!(
+            detail.graph.entry_function,
+            Some("process".to_string()),
+            "entry_function should be stored"
+        );
+
+        // Add a new function that "process" now calls
+        let func3 = make_function("new_helper", "src/new.rs", 1);
+        store.upsert_function(&func3).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push("src/new.rs".to_string());
+        store
+            .call_relationships
+            .write()
+            .await
+            .entry("process".to_string())
+            .or_default()
+            .push("new_helper".to_string());
+
+        // Refresh the feature graph
+        let refreshed = store
+            .refresh_feature_graph(fg_id)
+            .await
+            .unwrap()
+            .expect("should return Some for auto-built graph");
+
+        // The refreshed graph should contain the new function
+        let entity_ids: Vec<&str> = refreshed
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        assert!(
+            entity_ids.contains(&"new_helper"),
+            "refreshed graph should contain new_helper, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            entity_ids.contains(&"src/new.rs"),
+            "refreshed graph should contain src/new.rs, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            refreshed.entities.len() > original_entity_count,
+            "refreshed should have more entities ({}) than original ({})",
+            refreshed.entities.len(),
+            original_entity_count
+        );
+
+        // The graph id should be the same
+        assert_eq!(refreshed.graph.id, fg_id, "graph id should be unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_manual_skip() {
+        let project = test_project();
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Create a manual feature graph (no entry_function)
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "manual-graph".to_string(),
+            description: Some("manually created".to_string()),
+            project_id: project.id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+
+        // Add an entity manually
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "my_func", Some("entry_point"))
+            .await
+            .unwrap();
+
+        // Refresh should return None (manual graph, not refreshable)
+        let result = store.refresh_feature_graph(fg.id).await.unwrap();
+        assert!(
+            result.is_none(),
+            "refresh should return None for manual graph"
+        );
+
+        // Entities should still be there (not deleted)
+        let detail = store
+            .get_feature_graph_detail(fg.id)
+            .await
+            .unwrap()
+            .expect("graph should still exist");
+        assert_eq!(
+            detail.entities.len(),
+            1,
+            "manual graph entities should be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_not_found() {
+        let store = MockGraphStore::new();
+        let fake_id = Uuid::new_v4();
+
+        let result = store.refresh_feature_graph(fake_id).await;
+        assert!(
+            result.is_err(),
+            "refresh on non-existent graph should return error"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "error should mention 'not found', got: {}",
+            err_msg
+        );
+    }
 }
