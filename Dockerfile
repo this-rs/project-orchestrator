@@ -1,5 +1,11 @@
 # =============================================================================
-# Stage 1: Build the frontend (React SPA)
+# Stage 1: Prepare the frontend assets
+# =============================================================================
+# This stage handles two scenarios:
+#   A) Pre-built dist/ provided (CI: frontend built by separate job, placed in frontend/dist/)
+#   B) Full frontend source provided (local: frontend repo cloned into ./frontend)
+#
+# In both cases, the output is /app/frontend/dist/ with the built assets.
 # =============================================================================
 FROM node:22-slim AS frontend-builder
 
@@ -8,27 +14,26 @@ WORKDIR /app/frontend
 # Accept frontend source path as build arg (default: ./frontend)
 ARG FRONTEND_SRC=./frontend
 
-# Copy package files first for dependency caching
-COPY ${FRONTEND_SRC}/package.json ${FRONTEND_SRC}/package-lock.json* ./
-
-# Install dependencies
-RUN npm ci --ignore-scripts 2>/dev/null || echo "No frontend dependencies found, skipping"
-
-# Copy the rest of the frontend source
+# Copy everything from the frontend source.
+# Use a wildcard so COPY doesn't fail if only dist/ is present.
 COPY ${FRONTEND_SRC}/ ./
 
-# Build the frontend (produces dist/)
+# Build only if package.json exists (full source scenario).
+# If only dist/ was copied (CI scenario), skip the build entirely.
 RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
-        npm run build; \
+        echo "Frontend source detected — installing dependencies and building..."; \
+        npm ci --ignore-scripts && npm run build; \
+    elif [ -d "dist" ]; then \
+        echo "Pre-built frontend dist/ detected — skipping build"; \
     else \
-        echo "No frontend build script found, creating empty dist/"; \
+        echo "No frontend source or dist/ found — creating empty dist/"; \
         mkdir -p dist; \
     fi
 
 # =============================================================================
 # Stage 2: Build the backend (Rust)
 # =============================================================================
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 

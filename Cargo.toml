@@ -142,6 +142,11 @@ unit-scripts = "packaging/debian/"
 enable = false
 start = false
 
+# Variant for cross-compiled ARM64 builds (dpkg-shlibdeps can't resolve
+# ARM64 shared libraries on an x86_64 runner, so we use explicit depends)
+[package.metadata.deb.variants.arm64-cross]
+depends = "libc6 (>= 2.35), libgcc-s1"
+
 # =============================================================================
 # RPM packaging (cargo-generate-rpm)
 # =============================================================================
