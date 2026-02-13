@@ -1174,8 +1174,8 @@ pub fn select_tool_groups_by_keywords(user_message: &str) -> Vec<&'static ToolGr
 }
 
 use crate::neo4j::models::{
-    ConnectedFileNode, ConstraintNode, LanguageStatsNode, MilestoneNode, PlanNode, ProjectNode,
-    ReleaseNode, WorkspaceNode,
+    ConnectedFileNode, ConstraintNode, FeatureGraphNode, LanguageStatsNode, MilestoneNode,
+    PlanNode, ProjectNode, ReleaseNode, WorkspaceNode,
 };
 use crate::neo4j::GraphStore;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteType};
@@ -1201,6 +1201,7 @@ pub struct ProjectContext {
     pub releases: Vec<ReleaseNode>,
     pub language_stats: Vec<LanguageStatsNode>,
     pub key_files: Vec<ConnectedFileNode>,
+    pub feature_graphs: Vec<FeatureGraphNode>,
     pub last_synced: Option<DateTime<Utc>>,
 }
 
@@ -1330,6 +1331,12 @@ pub async fn fetch_project_context(
     // 10. Key files (most connected, scoped to project)
     ctx.key_files = graph
         .get_most_connected_files_for_project(project_id, 5)
+        .await
+        .unwrap_or_default();
+
+    // 11. Feature graphs (lightweight catalogue for the prompt)
+    ctx.feature_graphs = graph
+        .list_feature_graphs(Some(project_id))
         .await
         .unwrap_or_default();
 
