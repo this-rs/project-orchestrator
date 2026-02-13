@@ -315,11 +315,25 @@ fn show_main_window(handle: &tauri::AppHandle) {
                         NSColor, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
                     };
                     use cocoa::base::id;
-                    use objc::{msg_send, sel, sel_impl};
+                    use cocoa::foundation::NSString;
+                    use objc::{class, msg_send, sel, sel_impl};
 
                     let ns_window = webview.ns_window() as id;
 
-                    // 1. Set dark background color matching --surface-base (#0f1117)
+                    // 1. Force dark appearance on the window.
+                    //    This makes the webview report prefers-color-scheme: dark,
+                    //    so external pages (Google SSO, etc.) render in dark mode.
+                    //    It also prevents white flashes during page transitions.
+                    let dark_appearance: id = msg_send![
+                        class!(NSAppearance),
+                        appearanceNamed: cocoa::foundation::NSString::alloc(cocoa::base::nil)
+                            .init_str("NSAppearanceNameDarkAqua")
+                    ];
+                    if !dark_appearance.is_null() {
+                        let _: () = msg_send![ns_window, setAppearance: dark_appearance];
+                    }
+
+                    // 2. Set dark background color matching --surface-base (#0f1117)
                     let bg_color: id = NSColor::colorWithSRGBRed_green_blue_alpha_(
                         cocoa::base::nil,
                         15.0 / 255.0, // 0x0f
@@ -345,7 +359,15 @@ fn show_main_window(handle: &tauri::AppHandle) {
                     );
                     ns_window.setHasShadow_(cocoa::base::YES);
 
-                    // 4. Set corner radius on the content view layer
+                    // 4. Set dark underPageBackgroundColor on the WKWebView.
+                    //    This is the color shown behind page content — visible
+                    //    during overscroll, navigation transitions, and before a
+                    //    page paints. Setting it to dark prevents white flashes
+                    //    when navigating to external SSO pages.
+                    let wk_webview = webview.inner() as id;
+                    let _: () = msg_send![wk_webview, setUnderPageBackgroundColor: bg_color];
+
+                    // 5. Set corner radius on the content view layer
                     let content_view = ns_window.contentView();
                     content_view.setWantsLayer(cocoa::base::YES);
                     let layer: id = msg_send![content_view, layer];
