@@ -198,7 +198,8 @@ impl Orchestrator {
     }
 
     /// Spawn a background task that refreshes all auto-built feature graphs
-    /// for a project. Best-effort: logs info on success, warn on failure.
+    /// for a project, or auto-generates them if none exist.
+    /// Best-effort: logs info on success, warn on failure.
     /// Does not block the caller.
     pub fn spawn_refresh_feature_graphs(&self, project_id: uuid::Uuid) {
         let neo4j = self.neo4j_arc();
@@ -216,10 +217,69 @@ impl Orchestrator {
             };
 
             let auto_built: Vec<_> = graphs
-                .into_iter()
+                .iter()
                 .filter(|g| g.entry_function.is_some())
                 .collect();
 
+            // --- Auto-generate if no feature graphs exist at all ---
+            if graphs.is_empty() {
+                tracing::info!(
+                    "No feature graphs found for project {} — auto-generating from top entry functions",
+                    project_id
+                );
+
+                let top_functions = match neo4j.get_top_entry_functions(project_id, 10).await {
+                    Ok(fns) => fns,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to get top entry functions for project {}: {}",
+                            project_id,
+                            e
+                        );
+                        return;
+                    }
+                };
+
+                if top_functions.is_empty() {
+                    tracing::info!(
+                        "No connected functions found for project {} — skipping auto-generation",
+                        project_id
+                    );
+                    return;
+                }
+
+                tracing::info!(
+                    "Auto-generating {} feature graph(s) for project {}",
+                    top_functions.len(),
+                    project_id
+                );
+
+                for func_name in &top_functions {
+                    match neo4j
+                        .auto_build_feature_graph(func_name, None, project_id, func_name, 2, None)
+                        .await
+                    {
+                        Ok(detail) => {
+                            tracing::info!(
+                                "Auto-generated feature graph '{}' ({}) with {} entities",
+                                detail.graph.name,
+                                detail.graph.id,
+                                detail.entities.len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to auto-generate feature graph for '{}': {}",
+                                func_name,
+                                e
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+
+            // --- Refresh existing auto-built feature graphs ---
             if auto_built.is_empty() {
                 return;
             }

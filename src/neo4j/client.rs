@@ -8524,6 +8524,41 @@ impl Neo4jClient {
         Ok(Some(updated_graph))
     }
 
+    /// Get the top N most connected functions for a project, ranked by
+    /// (callers + callees). Used for auto-generating feature graphs after sync.
+    pub async fn get_top_entry_functions(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let q = query(
+            r#"
+            MATCH (f:Function)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+            OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+            WITH f, count(DISTINCT callee) AS callees, count(DISTINCT caller) AS callers
+            WITH f, callers + callees AS connections
+            WHERE connections > 0
+            RETURN f.name AS name
+            ORDER BY connections DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut functions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(name) = row.get::<String>("name") {
+                functions.push(name);
+            }
+        }
+
+        Ok(functions)
+    }
+
     fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {
         Ok(FeatureGraphNode {
             id: node.get::<String>("id")?.parse()?,

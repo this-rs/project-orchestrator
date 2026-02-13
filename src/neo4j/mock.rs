@@ -4347,6 +4347,55 @@ impl GraphStore for MockGraphStore {
 
         Ok(Some(detail))
     }
+
+    async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>> {
+        // Collect file paths that belong to this project
+        let files = self.files.read().await;
+        let project_paths: std::collections::HashSet<_> = files
+            .values()
+            .filter(|f| f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+        drop(files);
+
+        // Collect function names that belong to project files
+        let funcs = self.functions.read().await;
+        let project_functions: std::collections::HashSet<String> = funcs
+            .values()
+            .filter(|f| project_paths.contains(&f.file_path))
+            .map(|f| f.name.clone())
+            .collect();
+        drop(funcs);
+
+        // Count callers + callees for each function
+        let cr = self.call_relationships.read().await;
+        let mut connection_counts: HashMap<String, usize> = HashMap::new();
+
+        for func_name in &project_functions {
+            let mut count = 0usize;
+            // Count callees
+            if let Some(callees) = cr.get(func_name) {
+                count += callees.len();
+            }
+            // Count callers
+            for (_caller, callees) in cr.iter() {
+                if callees.contains(func_name) {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                connection_counts.insert(func_name.clone(), count);
+            }
+        }
+        drop(cr);
+
+        // Sort by connection count descending
+        let mut sorted: Vec<_> = connection_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.truncate(limit);
+
+        Ok(sorted.into_iter().map(|(name, _)| name).collect())
+    }
 }
 
 #[cfg(test)]

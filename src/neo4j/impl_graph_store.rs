@@ -1436,4 +1436,12 @@ impl GraphStore for Neo4jClient {
     async fn refresh_feature_graph(&self, id: Uuid) -> anyhow::Result<Option<FeatureGraphDetail>> {
         self.refresh_feature_graph(id).await
     }
+
+    async fn get_top_entry_functions(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        self.get_top_entry_functions(project_id, limit).await
+    }
 }
