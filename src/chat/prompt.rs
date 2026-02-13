@@ -1505,6 +1505,28 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
         map.insert("key_files".into(), serde_json::Value::Array(kf));
     }
 
+    if !ctx.feature_graphs.is_empty() {
+        let fgs: Vec<_> = ctx
+            .feature_graphs
+            .iter()
+            .map(|fg| {
+                let desc = fg.description.as_deref().unwrap_or("");
+                let desc_truncated = if desc.len() > 60 {
+                    format!("{}…", &desc[..desc.floor_char_boundary(60)])
+                } else {
+                    desc.to_string()
+                };
+                serde_json::json!({
+                    "id": fg.id.to_string(),
+                    "name": fg.name,
+                    "description": desc_truncated,
+                    "entity_count": fg.entity_count.unwrap_or(0),
+                })
+            })
+            .collect();
+        map.insert("feature_graphs".into(), serde_json::Value::Array(fgs));
+    }
+
     if let Some(ref ts) = ctx.last_synced {
         map.insert(
             "last_synced".into(),
@@ -1638,6 +1660,31 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
             ));
         }
         md.push('\n');
+    }
+
+    if !ctx.feature_graphs.is_empty() {
+        md.push_str("## Feature Graphs\n");
+        for fg in &ctx.feature_graphs {
+            let desc = fg.description.as_deref().unwrap_or("");
+            let desc_display = if desc.len() > 80 {
+                format!("{}…", &desc[..desc.floor_char_boundary(80)])
+            } else {
+                desc.to_string()
+            };
+            let count = fg.entity_count.unwrap_or(0);
+            if desc_display.is_empty() {
+                md.push_str(&format!(
+                    "- **{}** ({} entités)\n",
+                    fg.name, count
+                ));
+            } else {
+                md.push_str(&format!(
+                    "- **{}** — {} ({} entités)\n",
+                    fg.name, desc_display, count
+                ));
+            }
+        }
+        md.push_str("\n→ Utiliser `get_feature_graph(id)` pour explorer les entités d'un graph\n\n");
     }
 
     // Only show sync warnings if we have a project
