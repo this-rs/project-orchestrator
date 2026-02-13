@@ -38,6 +38,14 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Rewrite absolute paths to relative for Tauri compatibility.
+      # Vite defaults to base "/" which breaks in Tauri's asset:// protocol.
+      - name: Fix asset paths for Tauri (absolute → relative)
+        run: |
+          sed -i 's|href="/assets/|href="./assets/|g; s|src="/assets/|src="./assets/|g; s|href="/vite.svg"|href="./vite.svg"|g' dist/index.html
+          echo "Fixed index.html:"
+          cat dist/index.html
+
       - name: Upload frontend dist
         uses: actions/upload-artifact@v4
         with:
