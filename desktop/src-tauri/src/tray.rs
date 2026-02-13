@@ -103,7 +103,7 @@ fn handle_menu_event(app: &AppHandle, item_id: &str) {
 }
 
 /// Show and focus the main window.
-fn show_main_window(app: &AppHandle) {
+pub fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         window.show().ok();
         window.set_focus().ok();
