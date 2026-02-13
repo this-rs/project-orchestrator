@@ -7919,9 +7919,15 @@ impl Neo4jClient {
         project_id: Option<Uuid>,
     ) -> Result<Vec<FeatureGraphNode>> {
         let cypher = if project_id.is_some() {
-            "MATCH (fg:FeatureGraph {project_id: $pid}) RETURN fg ORDER BY fg.updated_at DESC"
+            "MATCH (fg:FeatureGraph {project_id: $pid})
+             OPTIONAL MATCH (fg)-[:INCLUDES_ENTITY]->(e)
+             RETURN fg, count(e) AS entity_count
+             ORDER BY fg.updated_at DESC"
         } else {
-            "MATCH (fg:FeatureGraph) RETURN fg ORDER BY fg.updated_at DESC"
+            "MATCH (fg:FeatureGraph)
+             OPTIONAL MATCH (fg)-[:INCLUDES_ENTITY]->(e)
+             RETURN fg, count(e) AS entity_count
+             ORDER BY fg.updated_at DESC"
         };
 
         let q = query(cypher).param(
@@ -7933,7 +7939,9 @@ impl Neo4jClient {
         let mut graphs = Vec::new();
         for row in &rows {
             let node: neo4rs::Node = row.get("fg")?;
-            graphs.push(self.node_to_feature_graph(&node)?);
+            let mut fg = self.node_to_feature_graph(&node)?;
+            fg.entity_count = row.get::<i64>("entity_count").ok();
+            graphs.push(fg);
         }
         Ok(graphs)
     }
@@ -8202,6 +8210,7 @@ impl Neo4jClient {
             project_id,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            entity_count: None,
         };
         self.create_feature_graph(&fg).await?;
 
@@ -8291,6 +8300,7 @@ impl Neo4jClient {
                 .get::<String>("updated_at")?
                 .parse()
                 .unwrap_or_else(|_| chrono::Utc::now()),
+            entity_count: None,
         })
     }
 }

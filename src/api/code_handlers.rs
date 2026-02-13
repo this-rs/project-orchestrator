@@ -778,6 +778,7 @@ pub async fn create_feature_graph(
         project_id: body.project_id,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        entity_count: None,
     };
     state.orchestrator.neo4j().create_feature_graph(&fg).await?;
     Ok(Json(serde_json::json!({

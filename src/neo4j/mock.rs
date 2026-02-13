@@ -3858,6 +3858,7 @@ impl GraphStore for MockGraphStore {
 
     async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>> {
         let graphs = self.feature_graphs.read().await;
+        let entities = self.feature_graph_entities.read().await;
         let mut result: Vec<FeatureGraphNode> = graphs
             .values()
             .filter(|fg| {
@@ -3868,6 +3869,12 @@ impl GraphStore for MockGraphStore {
                 }
             })
             .cloned()
+            .map(|mut fg| {
+                fg.entity_count = Some(
+                    entities.get(&fg.id).map(|v| v.len() as i64).unwrap_or(0),
+                );
+                fg
+            })
             .collect();
         result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(result)
@@ -4065,6 +4072,7 @@ impl GraphStore for MockGraphStore {
             project_id,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            entity_count: None,
         };
         self.create_feature_graph(&fg).await?;
 
@@ -5491,6 +5499,7 @@ mod tests {
             project_id: Uuid::new_v4(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            entity_count: None,
         };
         store.create_feature_graph(&fg).await.unwrap();
 

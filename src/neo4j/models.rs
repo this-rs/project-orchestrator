@@ -727,6 +727,9 @@ pub struct FeatureGraphNode {
     pub project_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Number of entities included in this feature graph (via INCLUDES_ENTITY).
+    /// Populated by list_feature_graphs; None when not computed.
+    pub entity_count: Option<i64>,
 }
 
 /// Role of an entity within a feature graph.
