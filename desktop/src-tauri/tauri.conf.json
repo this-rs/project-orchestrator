@@ -76,7 +76,7 @@
       "open": true
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZDQThBRDA5NTMxRTNCMjYKUldRbU94NVRDYTJvYkJUbHZXU1h1bW1ZVHphd3VHMEwyRHVJYlgvWHREWDRvcytMVzBwaWZHOWwK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDUxNkNFNjc0QjAzOUE4QTYKUldTbXFEbXdkT1pzVWE2TFZzK1JJWWx1bFFPNkJQNXlwTE1IUktWTTZLNTRyUXNyN0ZpajBucVMK",
       "endpoints": [
         "https://github.com/this-rs/project-orchestrator/releases/latest/download/latest.json"
       ],
