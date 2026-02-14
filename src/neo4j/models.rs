@@ -73,6 +73,9 @@ pub struct ChatSessionNode {
     /// Preview text (first user message, truncated to ~200 chars)
     #[serde(default)]
     pub preview: Option<String>,
+    /// Permission mode override for this session (None = use global config)
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 // ============================================================================

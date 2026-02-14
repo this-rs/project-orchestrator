@@ -7129,7 +7129,8 @@ impl Neo4jClient {
                     message_count: $message_count,
                     total_cost_usd: $total_cost_usd,
                     conversation_id: $conversation_id,
-                    preview: $preview
+                    preview: $preview,
+                    permission_mode: $permission_mode
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -7153,7 +7154,8 @@ impl Neo4jClient {
                     message_count: $message_count,
                     total_cost_usd: $total_cost_usd,
                     conversation_id: $conversation_id,
-                    preview: $preview
+                    preview: $preview,
+                    permission_mode: $permission_mode
                 })
                 "#,
             )
@@ -7181,7 +7183,11 @@ impl Neo4jClient {
                         "conversation_id",
                         session.conversation_id.clone().unwrap_or_default(),
                     )
-                    .param("preview", session.preview.clone().unwrap_or_default()),
+                    .param("preview", session.preview.clone().unwrap_or_default())
+                    .param(
+                        "permission_mode",
+                        session.permission_mode.clone().unwrap_or_default(),
+                    ),
             )
             .await?;
         Ok(())
@@ -7303,6 +7309,16 @@ impl Neo4jClient {
         }
     }
 
+    /// Update the permission_mode field on a chat session node
+    pub async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) SET s.permission_mode = $mode, s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("mode", mode.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Backfill title and preview for sessions that don't have them yet.
     /// Uses the first user_message event stored in Neo4j.
     /// Returns the number of sessions updated.
@@ -7390,6 +7406,7 @@ impl Neo4jClient {
         let title: String = node.get("title").unwrap_or_default();
         let conversation_id: String = node.get("conversation_id").unwrap_or_default();
         let preview: String = node.get("preview").unwrap_or_default();
+        let permission_mode: String = node.get("permission_mode").unwrap_or_default();
 
         Ok(ChatSessionNode {
             id: node.get::<String>("id")?.parse()?,
@@ -7432,6 +7449,11 @@ impl Neo4jClient {
                 None
             } else {
                 Some(preview)
+            },
+            permission_mode: if permission_mode.is_empty() {
+                None
+            } else {
+                Some(permission_mode)
             },
         })
     }

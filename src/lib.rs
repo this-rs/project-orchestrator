@@ -154,6 +154,10 @@ pub struct ChatYamlConfig {
     pub session_timeout_secs: Option<u64>,
     pub max_turns: Option<i32>,
     pub prompt_builder_model: Option<String>,
+    /// Permission configuration (mode + allowed/disallowed tool patterns).
+    /// When absent, falls back to env vars or defaults (BypassPermissions).
+    #[serde(default)]
+    pub permissions: Option<chat::config::PermissionConfig>,
 }
 
 /// Authentication configuration — flexible multi-provider auth.
@@ -398,6 +402,12 @@ pub struct Config {
     /// Public URL for reverse-proxy setups (e.g. https://ffs.dev).
     /// Used for CORS and OAuth origin whitelist.
     pub public_url: Option<String>,
+    /// Chat permission config from YAML (if present).
+    /// Priority: YAML > env vars > defaults.
+    pub chat_permissions: Option<chat::config::PermissionConfig>,
+    /// Resolved path to the config.yaml file that was loaded (if any).
+    /// Used for persisting runtime changes back to disk.
+    pub config_yaml_path: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -415,7 +425,7 @@ impl Config {
     /// exist, falls back to pure env var / defaults (backward compatible).
     pub fn from_yaml_and_env(yaml_path: Option<&Path>) -> Result<Self> {
         // 1. Load YAML config (or defaults if file not found)
-        let yaml = Self::load_yaml(yaml_path);
+        let (yaml, resolved_path) = Self::load_yaml_with_path(yaml_path);
 
         // 2. Build Config with env var overrides
         Ok(Self {
@@ -438,6 +448,8 @@ impl Config {
                 .unwrap_or(yaml.server.serve_frontend),
             frontend_path: std::env::var("FRONTEND_PATH").unwrap_or(yaml.server.frontend_path),
             public_url: std::env::var("PUBLIC_URL").ok().or(yaml.server.public_url),
+            chat_permissions: yaml.chat.permissions,
+            config_yaml_path: resolved_path,
         })
     }
 
@@ -452,10 +464,13 @@ impl Config {
     ///
     /// This ensures the MCP server binary (which may be spawned with an arbitrary
     /// CWD by Claude Code) can still find the config written by the desktop app.
-    fn load_yaml(yaml_path: Option<&Path>) -> YamlConfig {
+    /// Load and parse a YAML config file, returning both the config and the
+    /// resolved file path (if found). The path is `None` when no config file
+    /// was found on disk.
+    fn load_yaml_with_path(yaml_path: Option<&Path>) -> (YamlConfig, Option<std::path::PathBuf>) {
         // If an explicit path was given, use it directly.
         if let Some(path) = yaml_path {
-            return Self::try_load_yaml(path);
+            return (Self::try_load_yaml(path), Some(path.to_path_buf()));
         }
 
         // Otherwise, try multiple search paths in priority order.
@@ -482,7 +497,7 @@ impl Config {
                 let result = Self::try_load_yaml(path);
                 // try_load_yaml logs on success — return if we got a non-default config
                 // (we always return the first file found, even if it has parse errors)
-                return result;
+                return (result, Some(path.clone()));
             }
         }
 
@@ -490,7 +505,7 @@ impl Config {
             "No config file found in search paths ({:?}), using env vars / defaults",
             candidates
         );
-        YamlConfig::default()
+        (YamlConfig::default(), None)
     }
 
     /// Attempt to load and parse a single YAML config file.
@@ -649,6 +664,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if chat_config.nats_url.is_none() {
             chat_config.nats_url = config.nats_url.clone();
         }
+        // Override permission config from YAML if present.
+        // Priority: YAML > env vars > defaults.
+        // ChatConfig::from_env() already reads CHAT_PERMISSION_MODE etc.,
+        // but YAML config takes precedence when present.
+        if let Some(yaml_permissions) = &config.chat_permissions {
+            chat_config.permission = yaml_permissions.clone();
+        }
         let mut cm = chat::ChatManager::new(
             orchestrator.neo4j_arc(),
             orchestrator.meili_arc(),
@@ -656,6 +678,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         )
         .await
         .with_event_emitter(event_bus.clone());
+        // Pass config.yaml path so permission changes can be persisted to disk
+        if let Some(ref yaml_path) = config.config_yaml_path {
+            cm = cm.with_config_yaml_path(yaml_path.clone());
+        }
         if let Some(ref nats) = nats_emitter {
             cm = cm.with_nats(nats.clone());
         }

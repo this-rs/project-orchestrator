@@ -3613,6 +3613,15 @@ impl GraphStore for MockGraphStore {
         }
     }
 
+    async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.permission_mode = Some(mode.to_string());
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
     async fn backfill_chat_session_previews(&self) -> Result<usize> {
         // Mock: no events stored, nothing to backfill
         Ok(0)

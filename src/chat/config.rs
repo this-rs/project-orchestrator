@@ -1,7 +1,68 @@
 //! Chat configuration
 
+use nexus_claude::PermissionMode;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Permission configuration for the chat system.
+/// Groups the permission mode and tool allow/disallow patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionConfig {
+    /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions"
+    #[serde(default = "PermissionConfig::default_mode")]
+    pub mode: String,
+    /// Tool patterns to explicitly allow (e.g. "Bash(git *)", "mcp__project-orchestrator__*")
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Tool patterns to explicitly disallow (e.g. "Bash(rm -rf *)", "Bash(sudo *)")
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+}
+
+impl PermissionConfig {
+    fn default_mode() -> String {
+        "default".into()
+    }
+
+    /// Convert the string mode to the Nexus SDK `PermissionMode` enum.
+    /// Falls back to `Default` for unknown values (safe-by-default).
+    pub fn to_nexus_mode(&self) -> PermissionMode {
+        match self.mode.as_str() {
+            "default" => PermissionMode::Default,
+            "acceptEdits" => PermissionMode::AcceptEdits,
+            "plan" => PermissionMode::Plan,
+            "bypassPermissions" => PermissionMode::BypassPermissions,
+            _ => {
+                tracing::warn!(
+                    mode = %self.mode,
+                    "Unknown permission mode, falling back to Default"
+                );
+                PermissionMode::Default
+            }
+        }
+    }
+
+    /// List of valid permission mode strings.
+    pub fn valid_modes() -> &'static [&'static str] {
+        &["default", "acceptEdits", "plan", "bypassPermissions"]
+    }
+
+    /// Check if the given mode string is valid.
+    pub fn is_valid_mode(mode: &str) -> bool {
+        Self::valid_modes().contains(&mode)
+    }
+}
+
+impl Default for PermissionConfig {
+    fn default() -> Self {
+        Self {
+            mode: Self::default_mode(),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        }
+    }
+}
 
 /// Configuration for the chat system
 #[derive(Debug, Clone)]
@@ -27,6 +88,8 @@ pub struct ChatConfig {
     pub max_turns: i32,
     /// Model used for the oneshot prompt builder (context refinement)
     pub prompt_builder_model: String,
+    /// Permission configuration (mode + allowed/disallowed tool patterns)
+    pub permission: PermissionConfig,
 }
 
 impl ChatConfig {
@@ -64,6 +127,27 @@ impl ChatConfig {
                 .unwrap_or(50),
             prompt_builder_model: std::env::var("PROMPT_BUILDER_MODEL")
                 .unwrap_or_else(|_| "claude-opus-4-6".into()),
+            permission: PermissionConfig {
+                mode: std::env::var("CHAT_PERMISSION_MODE").unwrap_or_else(|_| "default".into()),
+                allowed_tools: std::env::var("CHAT_ALLOWED_TOOLS")
+                    .ok()
+                    .map(|s| {
+                        s.split(',')
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                disallowed_tools: std::env::var("CHAT_DISALLOWED_TOOLS")
+                    .ok()
+                    .map(|s| {
+                        s.split(',')
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
         }
     }
 
@@ -137,6 +221,7 @@ mod tests {
             nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
+            permission: PermissionConfig::default(),
         };
 
         assert_eq!(config.default_model, "claude-opus-4-6");
@@ -153,17 +238,30 @@ mod tests {
         std::env::remove_var("CHAT_MAX_SESSIONS");
         std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
         std::env::remove_var("MCP_SERVER_PATH");
+        std::env::remove_var("CHAT_PERMISSION_MODE");
+        std::env::remove_var("CHAT_ALLOWED_TOOLS");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
 
         let config = ChatConfig::from_env();
         assert_eq!(config.default_model, "claude-opus-4-6");
         assert_eq!(config.max_sessions, 10);
         assert_eq!(config.session_timeout.as_secs(), 1800);
+        // Permission defaults
+        assert_eq!(config.permission.mode, "default");
+        assert!(config.permission.allowed_tools.is_empty());
+        assert!(config.permission.disallowed_tools.is_empty());
 
         // Phase 2: custom values
         std::env::set_var("CHAT_DEFAULT_MODEL", "claude-sonnet-4-20250514");
         std::env::set_var("CHAT_MAX_SESSIONS", "5");
         std::env::set_var("CHAT_SESSION_TIMEOUT_SECS", "600");
         std::env::set_var("MCP_SERVER_PATH", "/custom/path/mcp_server");
+        std::env::set_var("CHAT_PERMISSION_MODE", "default");
+        std::env::set_var(
+            "CHAT_ALLOWED_TOOLS",
+            "Bash(git *),Read,mcp__project-orchestrator__*",
+        );
+        std::env::set_var("CHAT_DISALLOWED_TOOLS", "Bash(rm -rf *), Bash(sudo *)");
 
         let config = ChatConfig::from_env();
         assert_eq!(config.default_model, "claude-sonnet-4-20250514");
@@ -173,22 +271,57 @@ mod tests {
             config.mcp_server_path,
             PathBuf::from("/custom/path/mcp_server")
         );
+        assert_eq!(config.permission.mode, "default");
+        assert_eq!(
+            config.permission.allowed_tools,
+            vec!["Bash(git *)", "Read", "mcp__project-orchestrator__*"]
+        );
+        assert_eq!(
+            config.permission.disallowed_tools,
+            vec!["Bash(rm -rf *)", "Bash(sudo *)"]
+        );
+
+        // Phase 2b: CSV parsing edge cases for tools
+        std::env::set_var("CHAT_ALLOWED_TOOLS", "Bash(git *), Read, Edit");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        let config = ChatConfig::from_env();
+        assert_eq!(
+            config.permission.allowed_tools,
+            vec!["Bash(git *)", "Read", "Edit"]
+        );
+        assert!(config.permission.disallowed_tools.is_empty());
+
+        // Empty value should produce empty vec
+        std::env::set_var("CHAT_ALLOWED_TOOLS", "");
+        let config = ChatConfig::from_env();
+        assert!(config.permission.allowed_tools.is_empty());
 
         // Phase 3: invalid value falls back to default
         std::env::set_var("CHAT_MAX_SESSIONS", "not_a_number");
         let config = ChatConfig::from_env();
         assert_eq!(config.max_sessions, 10);
 
-        // Phase 4: Default trait
+        // Phase 4: Default trait (clear custom env vars first)
+        std::env::remove_var("CHAT_DEFAULT_MODEL");
+        std::env::remove_var("CHAT_MAX_SESSIONS");
+        std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
+        std::env::remove_var("MCP_SERVER_PATH");
+        std::env::remove_var("CHAT_PERMISSION_MODE");
+        std::env::remove_var("CHAT_ALLOWED_TOOLS");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
         let config = ChatConfig::default();
         assert!(!config.default_model.is_empty());
         assert!(config.max_sessions > 0);
+        assert_eq!(config.permission.mode, "default");
 
         // Cleanup
         std::env::remove_var("CHAT_DEFAULT_MODEL");
         std::env::remove_var("CHAT_MAX_SESSIONS");
         std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
         std::env::remove_var("MCP_SERVER_PATH");
+        std::env::remove_var("CHAT_PERMISSION_MODE");
+        std::env::remove_var("CHAT_ALLOWED_TOOLS");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
     }
 
     #[test]
@@ -206,6 +339,7 @@ mod tests {
             nats_url: Some("nats://localhost:4222".into()),
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
+            permission: PermissionConfig::default(),
         };
 
         let json = config.mcp_server_config();
@@ -230,6 +364,7 @@ mod tests {
             nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
+            permission: PermissionConfig::default(),
         };
 
         let json = config.mcp_server_config();
@@ -237,5 +372,103 @@ mod tests {
         assert_eq!(server["command"], "/path/to/mcp_server");
         // NATS_URL should not be present when not configured
         assert!(server["env"]["NATS_URL"].is_null());
+    }
+
+    #[test]
+    fn test_permission_config_defaults() {
+        let config = PermissionConfig::default();
+        assert_eq!(config.mode, "default");
+        assert!(config.allowed_tools.is_empty());
+        assert!(config.disallowed_tools.is_empty());
+    }
+
+    #[test]
+    fn test_permission_config_to_nexus_mode() {
+        use nexus_claude::PermissionMode;
+
+        // All 4 known modes
+        let config = PermissionConfig {
+            mode: "default".into(),
+            ..Default::default()
+        };
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
+
+        let config = PermissionConfig {
+            mode: "acceptEdits".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.to_nexus_mode(),
+            PermissionMode::AcceptEdits
+        ));
+
+        let config = PermissionConfig {
+            mode: "plan".into(),
+            ..Default::default()
+        };
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Plan));
+
+        let config = PermissionConfig {
+            mode: "bypassPermissions".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.to_nexus_mode(),
+            PermissionMode::BypassPermissions
+        ));
+
+        // Unknown mode falls back to Default (safe-by-default)
+        let config = PermissionConfig {
+            mode: "nonsense".into(),
+            ..Default::default()
+        };
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
+
+        let config = PermissionConfig {
+            mode: "".into(),
+            ..Default::default()
+        };
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
+    }
+
+    #[test]
+    fn test_permission_config_valid_modes() {
+        assert!(PermissionConfig::is_valid_mode("default"));
+        assert!(PermissionConfig::is_valid_mode("acceptEdits"));
+        assert!(PermissionConfig::is_valid_mode("plan"));
+        assert!(PermissionConfig::is_valid_mode("bypassPermissions"));
+        assert!(!PermissionConfig::is_valid_mode("unknown"));
+        assert!(!PermissionConfig::is_valid_mode(""));
+        assert!(!PermissionConfig::is_valid_mode("Default")); // case-sensitive
+    }
+
+    #[test]
+    fn test_permission_config_serde_roundtrip() {
+        let config = PermissionConfig {
+            mode: "acceptEdits".into(),
+            allowed_tools: vec!["Bash(git *)".into(), "Read".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: PermissionConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.mode, "acceptEdits");
+        assert_eq!(deserialized.allowed_tools, vec!["Bash(git *)", "Read"]);
+        assert_eq!(deserialized.disallowed_tools, vec!["Bash(rm -rf *)"]);
+    }
+
+    #[test]
+    fn test_permission_config_serde_defaults() {
+        // Empty JSON should use defaults
+        let config: PermissionConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.mode, "default");
+        assert!(config.allowed_tools.is_empty());
+        assert!(config.disallowed_tools.is_empty());
+
+        // Partial JSON should fill defaults
+        let config: PermissionConfig = serde_json::from_str(r#"{"mode":"default"}"#).unwrap();
+        assert_eq!(config.mode, "default");
+        assert!(config.allowed_tools.is_empty());
     }
 }

@@ -18,7 +18,7 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::models::ChatSessionNode;
 use crate::neo4j::GraphStore;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use nexus_claude::{
     memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -64,6 +65,20 @@ pub struct ActiveSession {
     /// Contains all non-StreamDelta events (ToolUse, ToolResult, AssistantText, etc.)
     /// that haven't been persisted yet. Cleared at stream start/end.
     pub streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
+    /// Current permission mode for this session (updated on mid-session changes)
+    pub permission_mode: Option<String>,
+    /// SDK control receiver for permission requests (`can_use_tool`).
+    /// Taken once from `InteractiveClient::take_sdk_control_receiver()` at session
+    /// creation and reused across all `stream_response` invocations. Wrapped in
+    /// `Arc<Mutex<Option<...>>>` so each `stream_response` can temporarily take
+    /// ownership during streaming, then put it back when the stream ends.
+    pub sdk_control_rx:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>>,
+    /// Cancellation token for NATS listener tasks spawned by this session.
+    /// When the session is replaced (e.g., by `resume_session`), the old token
+    /// is cancelled so that stale NATS listeners (interrupt, snapshot, RPC)
+    /// shut down instead of accumulating across resumes/restarts.
+    pub nats_cancel: CancellationToken,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -81,6 +96,10 @@ pub struct ChatManager {
     pub(crate) event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
     /// Optional NATS emitter for cross-instance chat event publishing
     pub(crate) nats: Option<Arc<crate::events::NatsEmitter>>,
+    /// Runtime-mutable permission config (updated via REST API)
+    pub(crate) permission_config: Arc<RwLock<super::config::PermissionConfig>>,
+    /// Path to config.yaml for persisting permission changes (None = no persistence)
+    pub(crate) config_yaml_path: Option<std::path::PathBuf>,
 }
 
 impl ChatManager {
@@ -90,6 +109,7 @@ impl ChatManager {
         search: Arc<dyn SearchStore>,
         config: ChatConfig,
     ) -> Self {
+        let permission_config = Arc::new(RwLock::new(config.permission.clone()));
         Self {
             graph,
             search,
@@ -99,6 +119,8 @@ impl ChatManager {
             memory_config: None,
             event_emitter: None,
             nats: None,
+            permission_config,
+            config_yaml_path: None,
         }
     }
 
@@ -126,6 +148,7 @@ impl ChatManager {
             }
         };
 
+        let permission_config = Arc::new(RwLock::new(config.permission.clone()));
         Self {
             graph,
             search,
@@ -135,12 +158,20 @@ impl ChatManager {
             memory_config: Some(memory_config),
             event_emitter: None,
             nats: None,
+            permission_config,
+            config_yaml_path: None,
         }
     }
 
     /// Set the event emitter for CRUD events (streaming status notifications)
     pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
         self.event_emitter = Some(emitter);
+        self
+    }
+
+    /// Set the config.yaml path for persisting permission config changes.
+    pub fn with_config_yaml_path(mut self, path: std::path::PathBuf) -> Self {
+        self.config_yaml_path = Some(path);
         self
     }
 
@@ -154,6 +185,128 @@ impl ChatManager {
         self
     }
 
+    // ========================================================================
+    // Runtime permission config (GET / UPDATE via REST API)
+    // ========================================================================
+
+    /// Get a clone of the current runtime permission config.
+    pub async fn get_permission_config(&self) -> super::config::PermissionConfig {
+        self.permission_config.read().await.clone()
+    }
+
+    /// Update the runtime permission config.
+    ///
+    /// Validates the mode string before applying. Returns an error if the mode
+    /// is not one of the valid values ("default", "acceptEdits", "plan", "bypassPermissions").
+    /// New sessions will pick up the updated config immediately.
+    /// Active sessions keep their original config (no mid-session changes).
+    ///
+    /// When a `config_yaml_path` is set, the updated config is also persisted
+    /// to disk atomically (write to .tmp then rename).
+    pub async fn update_permission_config(
+        &self,
+        new_config: super::config::PermissionConfig,
+    ) -> Result<super::config::PermissionConfig> {
+        if !super::config::PermissionConfig::is_valid_mode(&new_config.mode) {
+            return Err(anyhow!(
+                "Invalid permission mode '{}'. Valid modes: {:?}",
+                new_config.mode,
+                super::config::PermissionConfig::valid_modes()
+            ));
+        }
+        let mut perm = self.permission_config.write().await;
+        *perm = new_config;
+        let result = perm.clone();
+        // Drop the lock before doing I/O
+        drop(perm);
+
+        // Persist to config.yaml if a path is configured
+        if let Some(ref yaml_path) = self.config_yaml_path {
+            if let Err(e) = Self::persist_permission_to_yaml(yaml_path, &result) {
+                // Log but don't fail the API call — in-memory update succeeded
+                error!(
+                    path = %yaml_path.display(),
+                    error = %e,
+                    "Failed to persist permission config to config.yaml"
+                );
+            } else {
+                info!(
+                    path = %yaml_path.display(),
+                    mode = %result.mode,
+                    "Permission config persisted to config.yaml"
+                );
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Persist permission config to config.yaml using surgical YAML modification.
+    ///
+    /// Reads the existing file as a `serde_yaml::Value` tree, updates only the
+    /// `chat.permissions` subtree, and writes back atomically (tmp + rename).
+    /// This preserves all other config sections (auth, server, neo4j, etc.)
+    /// without needing `Serialize` on those structs.
+    fn persist_permission_to_yaml(
+        yaml_path: &std::path::Path,
+        permission: &super::config::PermissionConfig,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        // 1. Read existing YAML as a Value tree (or start from empty mapping)
+        let mut doc: serde_yaml::Value = if yaml_path.exists() {
+            let contents = std::fs::read_to_string(yaml_path)
+                .with_context(|| format!("Reading {}", yaml_path.display()))?;
+            serde_yaml::from_str(&contents)
+                .with_context(|| format!("Parsing {}", yaml_path.display()))?
+        } else {
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+        };
+
+        // 2. Ensure doc is a mapping
+        let root = doc
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow!("config.yaml root is not a YAML mapping"))?;
+
+        // 3. Ensure chat section exists as a mapping
+        let chat_key = serde_yaml::Value::String("chat".into());
+        if !root.contains_key(&chat_key) {
+            root.insert(
+                chat_key.clone(),
+                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            );
+        }
+        let chat_section = root
+            .get_mut(&chat_key)
+            .and_then(|v| v.as_mapping_mut())
+            .ok_or_else(|| anyhow!("chat section is not a YAML mapping"))?;
+
+        // 4. Serialize PermissionConfig to a YAML Value and insert
+        let perm_value = serde_yaml::to_value(permission)
+            .context("Serializing PermissionConfig to YAML value")?;
+        chat_section.insert(serde_yaml::Value::String("permissions".into()), perm_value);
+
+        // 5. Serialize the full document back to YAML string
+        let yaml_str =
+            serde_yaml::to_string(&doc).context("Serializing config document to YAML")?;
+
+        // 6. Atomic write: write to .tmp then rename
+        let tmp_path = yaml_path.with_extension("yaml.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp_path)
+                .with_context(|| format!("Creating {}", tmp_path.display()))?;
+            file.write_all(yaml_str.as_bytes())
+                .with_context(|| format!("Writing {}", tmp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("Syncing {}", tmp_path.display()))?;
+        }
+        std::fs::rename(&tmp_path, yaml_path).with_context(|| {
+            format!("Renaming {} → {}", tmp_path.display(), yaml_path.display())
+        })?;
+
+        Ok(())
+    }
+
     /// Spawn a background task that listens for NATS interrupt signals for a session.
     ///
     /// When another instance publishes an interrupt for this session via NATS,
@@ -164,6 +317,7 @@ impl ChatManager {
         session_id: &str,
         interrupt_flag: Arc<AtomicBool>,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
     ) {
         let Some(ref nats) = self.nats else {
             return;
@@ -184,34 +338,47 @@ impl ChatManager {
                 }
             };
 
-            while let Some(_msg) = subscriber.next().await {
-                // Check if session is still active — stop listener if session was removed
-                let session_exists = {
-                    let sessions = active_sessions.read().await;
-                    sessions.contains_key(&session_id)
-                };
-                if !session_exists {
-                    debug!(
-                        "Session {} no longer active, stopping NATS interrupt listener",
-                        session_id
-                    );
-                    break;
-                }
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!(
+                            "NATS interrupt listener cancelled for session {} (session replaced)",
+                            session_id
+                        );
+                        break;
+                    }
+                    msg = subscriber.next() => {
+                        let Some(_msg) = msg else { break; };
 
-                // Guard: don't re-interrupt if the flag is already set
-                if interrupt_flag.load(Ordering::SeqCst) {
-                    debug!(
-                        "Interrupt flag already set for session {}, ignoring NATS interrupt",
-                        session_id
-                    );
-                    continue;
-                }
+                        // Check if session is still active — stop listener if session was removed
+                        let session_exists = {
+                            let sessions = active_sessions.read().await;
+                            sessions.contains_key(&session_id)
+                        };
+                        if !session_exists {
+                            debug!(
+                                "Session {} no longer active, stopping NATS interrupt listener",
+                                session_id
+                            );
+                            break;
+                        }
 
-                info!(
-                    "NATS interrupt received for session {}, setting interrupt flag",
-                    session_id
-                );
-                interrupt_flag.store(true, Ordering::SeqCst);
+                        // Guard: don't re-interrupt if the flag is already set
+                        if interrupt_flag.load(Ordering::SeqCst) {
+                            debug!(
+                                "Interrupt flag already set for session {}, ignoring NATS interrupt",
+                                session_id
+                            );
+                            continue;
+                        }
+
+                        info!(
+                            "NATS interrupt received for session {}, setting interrupt flag",
+                            session_id
+                        );
+                        interrupt_flag.store(true, Ordering::SeqCst);
+                    }
+                }
             }
 
             debug!("NATS interrupt listener stopped for session {}", session_id);
@@ -228,6 +395,7 @@ impl ChatManager {
         &self,
         session_id: &str,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
     ) {
         let Some(ref nats) = self.nats else {
             return;
@@ -248,59 +416,72 @@ impl ChatManager {
                 }
             };
 
-            while let Some(msg) = subscriber.next().await {
-                // Build snapshot from active session state
-                let snapshot = {
-                    let sessions = active_sessions.read().await;
-                    match sessions.get(&session_id) {
-                        Some(session) => {
-                            let is_streaming = session.is_streaming.load(Ordering::SeqCst);
-                            let text = session.streaming_text.lock().await.clone();
-                            let events = session.streaming_events.lock().await.clone();
-                            Some(crate::events::StreamingSnapshot {
-                                is_streaming,
-                                partial_text: text,
-                                events,
-                            })
-                        }
-                        None => {
-                            // Session no longer active — stop responder
-                            debug!(
-                                "Session {} no longer active, stopping snapshot responder",
-                                session_id
-                            );
-                            break;
-                        }
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!(
+                            "NATS snapshot responder cancelled for session {} (session replaced)",
+                            session_id
+                        );
+                        break;
                     }
-                };
+                    msg = subscriber.next() => {
+                        let Some(msg) = msg else { break; };
 
-                if let Some(snapshot) = snapshot {
-                    // Reply to the requester
-                    if let Some(reply_to) = msg.reply {
-                        match serde_json::to_vec(&snapshot) {
-                            Ok(payload) => {
-                                if let Err(e) =
-                                    nats.client().publish(reply_to, payload.into()).await
-                                {
-                                    warn!(
-                                        "Failed to reply with snapshot for session {}: {}",
-                                        session_id, e
-                                    );
-                                } else {
+                        // Build snapshot from active session state
+                        let snapshot = {
+                            let sessions = active_sessions.read().await;
+                            match sessions.get(&session_id) {
+                                Some(session) => {
+                                    let is_streaming = session.is_streaming.load(Ordering::SeqCst);
+                                    let text = session.streaming_text.lock().await.clone();
+                                    let events = session.streaming_events.lock().await.clone();
+                                    Some(crate::events::StreamingSnapshot {
+                                        is_streaming,
+                                        partial_text: text,
+                                        events,
+                                    })
+                                }
+                                None => {
+                                    // Session no longer active — stop responder
                                     debug!(
-                                        session_id = %session_id,
-                                        is_streaming = snapshot.is_streaming,
-                                        text_len = snapshot.partial_text.len(),
-                                        events_count = snapshot.events.len(),
-                                        "Replied with streaming snapshot"
+                                        "Session {} no longer active, stopping snapshot responder",
+                                        session_id
                                     );
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to serialize snapshot for session {}: {}",
-                                    session_id, e
-                                );
+                        };
+
+                        if let Some(snapshot) = snapshot {
+                            // Reply to the requester
+                            if let Some(reply_to) = msg.reply {
+                                match serde_json::to_vec(&snapshot) {
+                                    Ok(payload) => {
+                                        if let Err(e) =
+                                            nats.client().publish(reply_to, payload.into()).await
+                                        {
+                                            warn!(
+                                                "Failed to reply with snapshot for session {}: {}",
+                                                session_id, e
+                                            );
+                                        } else {
+                                            debug!(
+                                                session_id = %session_id,
+                                                is_streaming = snapshot.is_streaming,
+                                                text_len = snapshot.partial_text.len(),
+                                                events_count = snapshot.events.len(),
+                                                "Replied with streaming snapshot"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to serialize snapshot for session {}: {}",
+                                            session_id, e
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -323,6 +504,7 @@ impl ChatManager {
         &self,
         session_id: &str,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
     ) {
         let Some(ref nats) = self.nats else {
             return;
@@ -351,7 +533,22 @@ impl ChatManager {
                 "NATS RPC send listener started"
             );
 
-            while let Some(msg) = subscriber.next().await {
+            loop {
+                let msg = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!(
+                            "NATS RPC listener cancelled for session {} (session replaced)",
+                            session_id
+                        );
+                        break;
+                    }
+                    msg = subscriber.next() => {
+                        match msg {
+                            Some(m) => m,
+                            None => break,
+                        }
+                    }
+                };
                 // Parse the RPC request
                 let request: crate::events::ChatRpcRequest =
                     match serde_json::from_slice(&msg.payload) {
@@ -398,6 +595,7 @@ impl ChatManager {
                                 session.is_streaming.clone(),
                                 session.streaming_text.clone(),
                                 session.streaming_events.clone(),
+                                session.sdk_control_rx.clone(),
                             ))
                         }
                         None => None,
@@ -432,11 +630,39 @@ impl ChatManager {
                         is_streaming,
                         streaming_text,
                         streaming_events,
+                        sdk_control_rx,
                     )) => {
                         let message = &request.message;
 
-                        // If streaming → queue the message (will be drained by stream_response)
-                        if is_streaming.load(Ordering::SeqCst) {
+                        // Route based on message_type
+                        if request.message_type == "control_response" {
+                            // Permission control response — send directly to CLI subprocess
+                            // via SDK control protocol. Do NOT persist or broadcast.
+                            let allow: bool = serde_json::from_str::<serde_json::Value>(message)
+                                .ok()
+                                .and_then(|v| v.get("allow").and_then(|a| a.as_bool()))
+                                .unwrap_or(false);
+
+                            info!(
+                                session_id = %session_id,
+                                allow,
+                                "NATS RPC: Sending permission control response to CLI"
+                            );
+
+                            let response_json = serde_json::json!({ "allow": allow });
+                            let mut cli = client.lock().await;
+                            match cli.send_control_response(response_json).await {
+                                Ok(()) => crate::events::ChatRpcResponse {
+                                    success: true,
+                                    error: None,
+                                },
+                                Err(e) => crate::events::ChatRpcResponse {
+                                    success: false,
+                                    error: Some(format!("Failed to send control response: {}", e)),
+                                },
+                            }
+                        } else if is_streaming.load(Ordering::SeqCst) {
+                            // If streaming → queue the message (will be drained by stream_response)
                             info!(
                                 "Stream in progress for session {} (via NATS RPC), queuing message",
                                 session_id
@@ -514,6 +740,7 @@ impl ChatManager {
                                     streaming_events,
                                     event_emitter_clone,
                                     nats_clone,
+                                    sdk_control_rx,
                                 )
                                 .await;
                             });
@@ -623,7 +850,10 @@ impl ChatManager {
         let refinement_prompt =
             build_refinement_prompt(user_message, context_json, tools_catalog_json);
 
-        // Build options: no MCP server, max_turns=1, just text generation
+        // Build options: no MCP server, max_turns=1, just text generation.
+        // NOTE: Intentionally hardcoded to BypassPermissions — this is an internal
+        // one-shot context refinement call with no user-facing tool interaction.
+        // It must NOT use the user-configured permission mode.
         #[allow(deprecated)]
         let options = ClaudeCodeOptions::builder()
             .model(&self.config.prompt_builder_model)
@@ -675,14 +905,18 @@ impl ChatManager {
     // ClaudeCodeOptions builder
     // ========================================================================
 
-    /// Build `ClaudeCodeOptions` for a new or resumed session
+    /// Build `ClaudeCodeOptions` for a new or resumed session.
+    ///
+    /// `permission_mode_override`: if Some, overrides the global config permission mode
+    /// for this specific session (e.g. user chose a different mode for this session).
     #[allow(deprecated)]
-    pub fn build_options(
+    pub async fn build_options(
         &self,
         cwd: &str,
         model: &str,
         system_prompt: &str,
         resume_id: Option<&str>,
+        permission_mode_override: Option<&str>,
     ) -> ClaudeCodeOptions {
         // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
         let cwd = expand_tilde(cwd);
@@ -707,14 +941,37 @@ impl ChatManager {
             env: Some(env),
         };
 
+        // Read the runtime-mutable permission config (updated via REST API)
+        let perm_config = self.permission_config.read().await;
+
+        // Use per-session override if provided, otherwise use global config
+        let effective_permission = match permission_mode_override {
+            Some(mode_str) => {
+                let override_config = super::config::PermissionConfig {
+                    mode: mode_str.to_string(),
+                    ..Default::default()
+                };
+                override_config.to_nexus_mode()
+            }
+            None => perm_config.to_nexus_mode(),
+        };
+
         let mut builder = ClaudeCodeOptions::builder()
             .model(model)
             .cwd(cwd)
             .system_prompt(system_prompt)
-            .permission_mode(PermissionMode::BypassPermissions)
+            .permission_mode(effective_permission)
             .max_turns(self.config.max_turns)
             .include_partial_messages(true)
             .add_mcp_server("project-orchestrator", mcp_config);
+
+        // Wire allowed/disallowed tool patterns from config
+        if !perm_config.allowed_tools.is_empty() {
+            builder = builder.allowed_tools(perm_config.allowed_tools.clone());
+        }
+        if !perm_config.disallowed_tools.is_empty() {
+            builder = builder.disallowed_tools(perm_config.disallowed_tools.clone());
+        }
 
         if let Some(id) = resume_id {
             builder = builder.resume(id);
@@ -888,6 +1145,7 @@ impl ChatManager {
             total_cost_usd: None,
             conversation_id: None,
             preview: None,
+            permission_mode: request.permission_mode.clone(),
         };
         self.graph
             .create_chat_session(&session_node)
@@ -895,7 +1153,15 @@ impl ChatManager {
             .context("Failed to persist chat session")?;
 
         // Build options and create InteractiveClient
-        let options = self.build_options(&request.cwd, &model, &system_prompt, None);
+        let options = self
+            .build_options(
+                &request.cwd,
+                &model,
+                &system_prompt,
+                None,
+                request.permission_mode.as_deref(),
+            )
+            .await;
         let mut client = InteractiveClient::new(options)
             .map_err(|e| anyhow!("Failed to create InteractiveClient: {}", e))?;
 
@@ -932,6 +1198,13 @@ impl ChatManager {
             None
         };
 
+        // Take the SDK control receiver ONCE at session creation.
+        // This channel receives `can_use_tool` permission requests from the CLI subprocess.
+        // It must be taken before wrapping the client in Arc<Mutex<>> so it can be
+        // reused across all stream_response invocations for this session.
+        let sdk_control_rx = client.take_sdk_control_receiver().await;
+        let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
+
         info!("Created chat session {} with model {}", session_id, model);
 
         // Create broadcast channel
@@ -945,9 +1218,18 @@ impl ChatManager {
         let streaming_text = Arc::new(Mutex::new(String::new()));
         let streaming_events = Arc::new(Mutex::new(Vec::new()));
 
-        // Register active session
+        // Register active session — cancel old NATS listeners if session key already exists
+        let nats_cancel = CancellationToken::new();
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
+            // Cancel stale NATS listeners from a previous session with the same ID
+            if let Some(old_session) = sessions.get(&session_id.to_string()) {
+                info!(
+                    session_id = %session_id,
+                    "Cancelling stale NATS listeners for existing session (create_session replacing)"
+                );
+                old_session.nats_cancel.cancel();
+            }
             let interrupt_flag = Arc::new(AtomicBool::new(false));
             sessions.insert(
                 session_id.to_string(),
@@ -963,6 +1245,9 @@ impl ChatManager {
                     is_streaming: is_streaming.clone(),
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
+                    permission_mode: request.permission_mode.clone(),
+                    sdk_control_rx: sdk_control_rx.clone(),
+                    nats_cancel: nats_cancel.clone(),
                 },
             );
             interrupt_flag
@@ -973,13 +1258,22 @@ impl ChatManager {
             &session_id.to_string(),
             interrupt_flag.clone(),
             self.active_sessions.clone(),
+            nats_cancel.clone(),
         );
 
         // Spawn NATS snapshot responder for cross-instance mid-stream join
-        self.spawn_nats_snapshot_responder(&session_id.to_string(), self.active_sessions.clone());
+        self.spawn_nats_snapshot_responder(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(&session_id.to_string(), self.active_sessions.clone());
+        self.spawn_nats_rpc_listener(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+            nats_cancel,
+        );
 
         // Persist the initial user_message event
         let user_event = ChatEventRecord {
@@ -1078,6 +1372,7 @@ impl ChatManager {
                 streaming_events,
                 event_emitter,
                 nats,
+                sdk_control_rx,
             )
             .await;
         });
@@ -1107,6 +1402,9 @@ impl ChatManager {
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
         event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
         nats: Option<Arc<crate::events::NatsEmitter>>,
+        shared_sdk_control_rx: Arc<
+            tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
+        >,
     ) {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
@@ -1161,6 +1459,13 @@ impl ChatManager {
             std::collections::HashMap::new();
         let session_uuid = Uuid::parse_str(&session_id).ok();
 
+        // Temporarily take the SDK control receiver from the shared slot.
+        // This allows us to listen for control protocol messages (e.g., `can_use_tool`
+        // permission requests) in parallel with the message stream.
+        // The receiver is put back into the shared slot when this stream ends,
+        // so the next stream_response invocation can reuse it.
+        let mut sdk_control_rx = shared_sdk_control_rx.lock().await.take();
+
         {
             let mut c = client.lock().await;
             let stream_result = c.send_and_receive_stream(prompt).await;
@@ -1192,7 +1497,92 @@ impl ChatManager {
                 }
             };
 
-            while let Some(result) = stream.next().await {
+            // Helper closure: process an SDK control message (permission request).
+            // Returns Some(ChatEvent) if a permission_request was parsed, None otherwise.
+            // The caller is responsible for adding the event to streaming_events (async).
+            let handle_control_msg = |control_msg: serde_json::Value,
+                                      events_to_persist: &mut Vec<ChatEventRecord>,
+                                      next_seq: &std::sync::atomic::AtomicI64|
+             -> Option<ChatEvent> {
+                // Extract the request data (may be nested under "request")
+                let request_data = if control_msg.get("request").is_some() {
+                    control_msg
+                        .get("request")
+                        .cloned()
+                        .unwrap_or(control_msg.clone())
+                } else {
+                    control_msg.clone()
+                };
+
+                if request_data.get("subtype").and_then(|v| v.as_str()) == Some("can_use_tool") {
+                    let tool_name = request_data
+                        .get("toolName")
+                        .or_else(|| request_data.get("tool_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let input = request_data
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    // Use request_id as the permission request ID so the
+                    // frontend can correlate response → request.
+                    let request_id = control_msg
+                        .get("requestId")
+                        .or_else(|| control_msg.get("request_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    info!(
+                        session_id = %session_id,
+                        tool = %tool_name,
+                        request_id = %request_id,
+                        "Permission request from CLI"
+                    );
+
+                    let perm_event = ChatEvent::PermissionRequest {
+                        id: request_id,
+                        tool: tool_name,
+                        input,
+                    };
+
+                    // Persist the permission_request event
+                    if let Some(uuid) = session_uuid {
+                        let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                        events_to_persist.push(ChatEventRecord {
+                            id: Uuid::new_v4(),
+                            session_id: uuid,
+                            seq,
+                            event_type: "permission_request".to_string(),
+                            data: serde_json::to_string(&perm_event).unwrap_or_default(),
+                            created_at: chrono::Utc::now(),
+                        });
+                    }
+
+                    // Broadcast to WebSocket clients
+                    emit_chat(perm_event.clone(), &events_tx, &nats, &session_id);
+                    Some(perm_event)
+                } else {
+                    debug!(
+                        "Ignoring non-permission SDK control request: {:?}",
+                        control_msg
+                    );
+                    None
+                }
+            };
+
+            // Main stream loop — uses tokio::select! to listen for BOTH stream
+            // events AND SDK control messages (permission requests) concurrently.
+            //
+            // BUG FIX: Previously used `stream.next().await` followed by
+            // `rx.try_recv()`. When the CLI blocks waiting for permission approval,
+            // it stops sending stream events, so `stream.next()` would never yield
+            // and `try_recv()` was never reached — permission requests were lost.
+            //
+            // Now we select! between the two sources so control messages are
+            // processed even when the stream is idle (waiting for permission).
+            loop {
                 // Check interrupt flag at each iteration
                 if interrupt_flag.load(Ordering::SeqCst) {
                     info!(
@@ -1201,6 +1591,49 @@ impl ChatManager {
                     );
                     break;
                 }
+
+                let result = if let Some(ref mut rx) = sdk_control_rx {
+                    tokio::select! {
+                        biased;  // Prioritize control messages over stream events
+
+                        control_msg = rx.recv() => {
+                            match control_msg {
+                                Some(msg) => {
+                                    if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq) {
+                                        streaming_events.lock().await.push(evt);
+                                    }
+                                    continue; // Go back to select! for next event
+                                }
+                                None => {
+                                    debug!("SDK control channel closed");
+                                    sdk_control_rx = None;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        stream_item = stream.next() => {
+                            match stream_item {
+                                Some(result) => {
+                                    // Also drain any buffered control messages
+                                    while let Ok(msg) = rx.try_recv() {
+                                        if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq) {
+                                            streaming_events.lock().await.push(evt);
+                                        }
+                                    }
+                                    result
+                                }
+                                None => break, // Stream ended
+                            }
+                        }
+                    }
+                } else {
+                    // No control channel — just read from stream
+                    match stream.next().await {
+                        Some(result) => result,
+                        None => break,
+                    }
+                };
 
                 match result {
                     Ok(ref msg) => {
@@ -1400,6 +1833,13 @@ impl ChatManager {
             }
         } // client lock released here
 
+        // Put the SDK control receiver back into the shared slot so the next
+        // stream_response invocation can reuse it (fixes permission requests
+        // being silently lost after the first message in a session).
+        if sdk_control_rx.is_some() {
+            *shared_sdk_control_rx.lock().await = sdk_control_rx;
+        }
+
         // Batch-persist all collected events to Neo4j
         if let Some(uuid) = session_uuid {
             if !events_to_persist.is_empty() {
@@ -1544,6 +1984,7 @@ impl ChatManager {
                 streaming_events,
                 event_emitter,
                 nats,
+                shared_sdk_control_rx,
             ))
             .await;
         }
@@ -1620,6 +2061,7 @@ impl ChatManager {
             is_streaming,
             streaming_text,
             streaming_events,
+            sdk_control_rx,
         ) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
@@ -1640,6 +2082,7 @@ impl ChatManager {
                 session.is_streaming.clone(),
                 session.streaming_text.clone(),
                 session.streaming_events.clone(),
+                session.sdk_control_rx.clone(),
             )
         };
 
@@ -1728,9 +2171,118 @@ impl ChatManager {
                 streaming_events,
                 event_emitter,
                 nats,
+                sdk_control_rx,
             )
             .await;
         });
+
+        Ok(())
+    }
+
+    /// Send a permission response (allow/deny) to the Claude CLI subprocess.
+    ///
+    /// Unlike `send_message`, this does NOT:
+    /// - Persist as a user_message event
+    /// - Broadcast to WebSocket subscribers
+    /// - Trigger a new stream_response
+    ///
+    /// It sends a JSON control response directly to the CLI subprocess via the SDK
+    /// control protocol: `{"type": "control_response", "response": {"allow": true/false}}`.
+    /// This is required for non-BypassPermissions modes where Claude CLI sends
+    /// `can_use_tool` control requests and expects a control_response (not a user message).
+    pub async fn send_permission_response(&self, session_id: &str, allow: bool) -> Result<()> {
+        let client = {
+            let mut sessions = self.active_sessions.write().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            session.last_activity = Instant::now();
+            session.client.clone()
+        };
+
+        let response = serde_json::json!({ "allow": allow });
+
+        info!(
+            session_id = %session_id,
+            allow,
+            "Sending permission control response to CLI"
+        );
+
+        let mut client = client.lock().await;
+        client
+            .send_control_response(response)
+            .await
+            .map_err(|e| anyhow!("Failed to send permission control response: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Change the permission mode of an active CLI session mid-conversation.
+    ///
+    /// Sends a `set_permission_mode` control request to the Claude CLI subprocess,
+    /// updates the in-memory `ActiveSession`, and persists the change to Neo4j.
+    pub async fn set_session_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
+        // Validate mode
+        const VALID_MODES: &[&str] = &["default", "acceptEdits", "bypassPermissions", "plan"];
+        if !VALID_MODES.contains(&mode) {
+            bail!(
+                "Invalid permission mode '{}'. Valid modes: {}",
+                mode,
+                VALID_MODES.join(", ")
+            );
+        }
+
+        // Get session and update in-memory state
+        let (client, old_mode) = {
+            let mut sessions = self.active_sessions.write().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            session.last_activity = Instant::now();
+            let old_mode = session.permission_mode.clone();
+            session.permission_mode = Some(mode.to_string());
+            (session.client.clone(), old_mode)
+        };
+
+        // Send control request to CLI subprocess
+        let mut client = client.lock().await;
+        client
+            .set_permission_mode(mode)
+            .await
+            .map_err(|e| anyhow!("Failed to set permission mode on CLI: {}", e))?;
+        drop(client);
+
+        info!(
+            session_id = %session_id,
+            old_mode = ?old_mode,
+            new_mode = %mode,
+            "Permission mode changed for session"
+        );
+
+        // Persist to Neo4j
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            if let Err(e) = self
+                .graph
+                .update_chat_session_permission_mode(uuid, mode)
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist permission mode change to Neo4j (non-fatal)"
+                );
+            }
+        }
+
+        // Broadcast event to WebSocket clients
+        {
+            let sessions = self.active_sessions.read().await;
+            if let Some(session) = sessions.get(session_id) {
+                let _ = session.events_tx.send(ChatEvent::PermissionModeChanged {
+                    mode: mode.to_string(),
+                });
+            }
+        }
 
         Ok(())
     }
@@ -1765,12 +2317,15 @@ impl ChatManager {
         let system_prompt = self
             .build_system_prompt(session_node.project_slug.as_deref(), message)
             .await;
-        let options = self.build_options(
-            &session_node.cwd,
-            &session_node.model,
-            &system_prompt,
-            cli_session_id,
-        );
+        let options = self
+            .build_options(
+                &session_node.cwd,
+                &session_node.model,
+                &system_prompt,
+                cli_session_id,
+                session_node.permission_mode.as_deref(),
+            )
+            .await;
 
         // Create new InteractiveClient with --resume
         let mut client = InteractiveClient::new(options)
@@ -1780,6 +2335,10 @@ impl ChatManager {
             .connect()
             .await
             .map_err(|e| anyhow!("Failed to connect resumed InteractiveClient: {}", e))?;
+
+        // Take the SDK control receiver ONCE at session resume.
+        let sdk_control_rx = client.take_sdk_control_receiver().await;
+        let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
 
         // Create broadcast channel
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
@@ -1825,9 +2384,23 @@ impl ChatManager {
         let streaming_text = Arc::new(Mutex::new(String::new()));
         let streaming_events = Arc::new(Mutex::new(Vec::new()));
 
-        // Register as active
+        // Register as active — cancel old NATS listeners if session was previously active
+        let nats_cancel = CancellationToken::new();
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
+            // Cancel stale NATS listeners from a previous resume/create of this session.
+            // Without this, each resume_session() spawns 3 new NATS listeners (interrupt,
+            // snapshot, RPC) that accumulate — the old ones never stop because the session
+            // key still exists in the HashMap (insert replaces the value, not the key).
+            // This causes N duplicate stream_response spawns per message, where N is the
+            // number of times the session was resumed.
+            if let Some(old_session) = sessions.get(session_id) {
+                info!(
+                    session_id = %session_id,
+                    "Cancelling stale NATS listeners for session (resume replacing)"
+                );
+                old_session.nats_cancel.cancel();
+            }
             let interrupt_flag = Arc::new(AtomicBool::new(false));
             sessions.insert(
                 session_id.to_string(),
@@ -1843,6 +2416,9 @@ impl ChatManager {
                     is_streaming: is_streaming.clone(),
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
+                    permission_mode: session_node.permission_mode.clone(),
+                    sdk_control_rx: sdk_control_rx.clone(),
+                    nats_cancel: nats_cancel.clone(),
                 },
             );
             interrupt_flag
@@ -1853,13 +2429,18 @@ impl ChatManager {
             session_id,
             interrupt_flag.clone(),
             self.active_sessions.clone(),
+            nats_cancel.clone(),
         );
 
         // Spawn NATS snapshot responder for cross-instance mid-stream join
-        self.spawn_nats_snapshot_responder(session_id, self.active_sessions.clone());
+        self.spawn_nats_snapshot_responder(
+            session_id,
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone());
+        self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone(), nats_cancel);
 
         // Persist the user_message event
         let user_event = ChatEventRecord {
@@ -1911,6 +2492,7 @@ impl ChatManager {
                 streaming_events,
                 event_emitter,
                 nats,
+                sdk_control_rx,
             )
             .await;
         });
@@ -2390,6 +2972,7 @@ mod tests {
             nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
+            permission: crate::chat::config::PermissionConfig::default(),
         }
     }
 
@@ -2410,6 +2993,145 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         assert_eq!(manager.resolve_model(None), "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn test_build_options_uses_config_permission_default() {
+        // Default config uses "default" permission mode (safe-by-default)
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None)
+            .await;
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
+        assert!(opts.allowed_tools.is_empty());
+        assert!(opts.disallowed_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_options_uses_config_permission_custom() {
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.permission = crate::chat::config::PermissionConfig {
+            mode: "default".into(),
+            allowed_tools: vec!["Bash(git *)".into(), "Read".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None)
+            .await;
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
+        assert_eq!(opts.allowed_tools, vec!["Bash(git *)", "Read"]);
+        assert_eq!(opts.disallowed_tools, vec!["Bash(rm -rf *)"]);
+    }
+
+    #[tokio::test]
+    async fn test_build_options_with_permission_override() {
+        // Global config is Default, session overrides to BypassPermissions
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let opts = manager
+            .build_options(
+                "/tmp",
+                "claude-opus-4-6",
+                "prompt",
+                None,
+                Some("bypassPermissions"),
+            )
+            .await;
+        assert!(matches!(
+            opts.permission_mode,
+            PermissionMode::BypassPermissions
+        ));
+
+        // Without override, falls back to global (Default)
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .await;
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
+    }
+
+    #[tokio::test]
+    async fn test_get_permission_config_returns_defaults() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let config = manager.get_permission_config().await;
+        assert_eq!(config.mode, "default");
+        assert!(config.allowed_tools.is_empty());
+        assert!(config.disallowed_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_permission_config_changes_mode() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let new_config = crate::chat::config::PermissionConfig {
+            mode: "default".into(),
+            allowed_tools: vec!["Read".into(), "Bash(git *)".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+        let updated = manager.update_permission_config(new_config).await.unwrap();
+        assert_eq!(updated.mode, "default");
+        assert_eq!(updated.allowed_tools, vec!["Read", "Bash(git *)"]);
+        assert_eq!(updated.disallowed_tools, vec!["Bash(rm -rf *)"]);
+
+        // Verify getter returns the updated config
+        let fetched = manager.get_permission_config().await;
+        assert_eq!(fetched.mode, "default");
+        assert_eq!(fetched.allowed_tools, vec!["Read", "Bash(git *)"]);
+    }
+
+    #[tokio::test]
+    async fn test_update_permission_config_rejects_invalid_mode() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let bad_config = crate::chat::config::PermissionConfig {
+            mode: "yolo".into(),
+            ..Default::default()
+        };
+        let result = manager.update_permission_config(bad_config).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid permission mode 'yolo'"));
+    }
+
+    #[tokio::test]
+    async fn test_update_permission_config_affects_build_options() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // Initially Default (safe-by-default)
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .await;
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
+
+        // Update to BypassPermissions mode at runtime
+        manager
+            .update_permission_config(crate::chat::config::PermissionConfig {
+                mode: "bypassPermissions".into(),
+                allowed_tools: vec![],
+                disallowed_tools: vec![],
+            })
+            .await
+            .unwrap();
+
+        // New build_options should reflect the update
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .await;
+        assert!(matches!(
+            opts.permission_mode,
+            PermissionMode::BypassPermissions
+        ));
+        assert!(opts.allowed_tools.is_empty());
     }
 
     #[tokio::test]
@@ -2454,17 +3176,20 @@ mod tests {
     // build_options
     // ====================================================================
 
-    #[test]
-    fn test_build_options_basic() {
+    #[tokio::test]
+    async fn test_build_options_basic() {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let options = manager.build_options(
-            "/tmp/project",
-            "claude-opus-4-6",
-            "System prompt here",
-            None,
-        );
+        let options = manager
+            .build_options(
+                "/tmp/project",
+                "claude-opus-4-6",
+                "System prompt here",
+                None,
+                None,
+            )
+            .await;
 
         assert_eq!(options.model, Some("claude-opus-4-6".into()));
         assert_eq!(options.cwd, Some(PathBuf::from("/tmp/project")));
@@ -2472,28 +3197,33 @@ mod tests {
         assert!(options.mcp_servers.contains_key("project-orchestrator"));
     }
 
-    #[test]
-    fn test_build_options_with_resume() {
+    #[tokio::test]
+    async fn test_build_options_with_resume() {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let options = manager.build_options(
-            "/tmp/project",
-            "claude-opus-4-6",
-            "System prompt",
-            Some("cli-session-abc"),
-        );
+        let options = manager
+            .build_options(
+                "/tmp/project",
+                "claude-opus-4-6",
+                "System prompt",
+                Some("cli-session-abc"),
+                None,
+            )
+            .await;
 
         assert_eq!(options.resume, Some("cli-session-abc".into()));
     }
 
-    #[test]
-    fn test_build_options_mcp_server_config() {
+    #[tokio::test]
+    async fn test_build_options_mcp_server_config() {
         let state = mock_app_state();
         let config = test_config();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
-        let options = manager.build_options("/tmp", "model", "prompt", None);
+        let options = manager
+            .build_options("/tmp", "model", "prompt", None, None)
+            .await;
 
         let mcp = options.mcp_servers.get("project-orchestrator").unwrap();
         match mcp {
@@ -3228,6 +3958,7 @@ mod tests {
             total_cost_usd: Some(1.50),
             conversation_id: Some("conv-abc-123".into()),
             preview: Some("Hello, can you help me with this?".into()),
+            permission_mode: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3577,6 +4308,7 @@ mod tests {
             total_cost_usd: None,
             conversation_id: Some("conv-serde-test".into()),
             preview: None,
+            permission_mode: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3604,6 +4336,7 @@ mod tests {
             total_cost_usd: None,
             conversation_id: None,
             preview: None,
+            permission_mode: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3659,6 +4392,9 @@ mod tests {
             is_streaming: Arc::new(AtomicBool::new(is_streaming)),
             streaming_text: Arc::new(Mutex::new(streaming_text.to_string())),
             streaming_events: Arc::new(Mutex::new(streaming_events_data)),
+            permission_mode: None,
+            sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
+            nats_cancel: CancellationToken::new(),
         };
 
         Some((session, pending_messages))
@@ -4268,7 +5004,11 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         // This should be a complete no-op — no NATS means early return
-        manager.spawn_nats_rpc_listener("test-session", manager.active_sessions.clone());
+        manager.spawn_nats_rpc_listener(
+            "test-session",
+            manager.active_sessions.clone(),
+            CancellationToken::new(),
+        );
         // If we get here without panic, the test passes
     }
 
@@ -4290,5 +5030,201 @@ mod tests {
         assert!(!remote);
 
         // This confirms the routing: not local + not remote = resume_session fallback
+    }
+
+    // ====================================================================
+    // YAML persistence tests
+    // ====================================================================
+
+    #[test]
+    fn test_persist_permission_to_yaml_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+
+        // Write an existing config.yaml with other sections
+        std::fs::write(
+            &yaml_path,
+            "server:\n  port: 9090\nneo4j:\n  uri: bolt://db:7687\nchat:\n  default_model: claude-sonnet\n",
+        )
+        .unwrap();
+
+        let perm = super::super::config::PermissionConfig {
+            mode: "default".into(),
+            allowed_tools: vec!["Bash(git *)".into(), "Read".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+
+        ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
+
+        // Re-read and verify
+        let contents = std::fs::read_to_string(&yaml_path).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+
+        // Other sections preserved
+        assert_eq!(
+            doc["server"]["port"].as_u64().unwrap(),
+            9090,
+            "server.port should be preserved"
+        );
+        assert_eq!(
+            doc["neo4j"]["uri"].as_str().unwrap(),
+            "bolt://db:7687",
+            "neo4j.uri should be preserved"
+        );
+        // Existing chat fields preserved
+        assert_eq!(
+            doc["chat"]["default_model"].as_str().unwrap(),
+            "claude-sonnet",
+            "chat.default_model should be preserved"
+        );
+        // Permissions written correctly
+        assert_eq!(
+            doc["chat"]["permissions"]["mode"].as_str().unwrap(),
+            "default"
+        );
+        let allowed = doc["chat"]["permissions"]["allowed_tools"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(allowed.len(), 2);
+        assert_eq!(allowed[0].as_str().unwrap(), "Bash(git *)");
+        assert_eq!(allowed[1].as_str().unwrap(), "Read");
+        let disallowed = doc["chat"]["permissions"]["disallowed_tools"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(disallowed.len(), 1);
+        assert_eq!(disallowed[0].as_str().unwrap(), "Bash(rm -rf *)");
+    }
+
+    #[test]
+    fn test_persist_permission_to_yaml_no_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+
+        // File does not exist yet
+        assert!(!yaml_path.exists());
+
+        let perm = super::super::config::PermissionConfig {
+            mode: "acceptEdits".into(),
+            allowed_tools: vec![],
+            disallowed_tools: vec!["Bash(sudo *)".into()],
+        };
+
+        ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
+
+        // File should now exist
+        assert!(yaml_path.exists());
+        let contents = std::fs::read_to_string(&yaml_path).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+
+        assert_eq!(
+            doc["chat"]["permissions"]["mode"].as_str().unwrap(),
+            "acceptEdits"
+        );
+        // Empty allowed_tools should be present as empty sequence
+        assert!(doc["chat"]["permissions"]["allowed_tools"]
+            .as_sequence()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            doc["chat"]["permissions"]["disallowed_tools"]
+                .as_sequence()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_persist_permission_roundtrip_with_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+
+        // Start with a config that has no permissions
+        std::fs::write(
+            &yaml_path,
+            "server:\n  port: 8080\nchat:\n  default_model: claude-opus-4-6\n",
+        )
+        .unwrap();
+
+        // Persist permissions
+        let perm = super::super::config::PermissionConfig {
+            mode: "plan".into(),
+            allowed_tools: vec!["mcp__project-orchestrator__*".into()],
+            disallowed_tools: vec![],
+        };
+        ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
+
+        // Reload via Config::from_yaml_and_env
+        // Clear env vars that would override
+        std::env::remove_var("CHAT_PERMISSION_MODE");
+        std::env::remove_var("CHAT_ALLOWED_TOOLS");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+
+        let config = crate::Config::from_yaml_and_env(Some(&yaml_path)).unwrap();
+        let loaded_perm = config
+            .chat_permissions
+            .expect("chat_permissions should be Some");
+        assert_eq!(loaded_perm.mode, "plan");
+        assert_eq!(
+            loaded_perm.allowed_tools,
+            vec!["mcp__project-orchestrator__*"]
+        );
+        assert!(loaded_perm.disallowed_tools.is_empty());
+
+        // config_yaml_path should be set
+        assert_eq!(
+            config.config_yaml_path.as_deref(),
+            Some(yaml_path.as_path())
+        );
+    }
+
+    #[test]
+    fn test_persist_permission_atomic_no_tmp_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+        let tmp_path = dir.path().join("config.yaml.tmp");
+
+        std::fs::write(&yaml_path, "chat: {}\n").unwrap();
+
+        let perm = super::super::config::PermissionConfig::default();
+        ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
+
+        // .tmp file should not exist after successful rename
+        assert!(
+            !tmp_path.exists(),
+            "Temporary file should be cleaned up after atomic rename"
+        );
+        // Original file should still exist with updated content
+        assert!(yaml_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_update_permission_config_persists_to_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+        std::fs::write(&yaml_path, "chat:\n  default_model: test\n").unwrap();
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_config_yaml_path(yaml_path.clone());
+
+        let new_perm = super::super::config::PermissionConfig {
+            mode: "acceptEdits".into(),
+            allowed_tools: vec!["Read".into()],
+            disallowed_tools: vec![],
+        };
+
+        let result = manager.update_permission_config(new_perm).await.unwrap();
+        assert_eq!(result.mode, "acceptEdits");
+
+        // Verify it was persisted to disk
+        let contents = std::fs::read_to_string(&yaml_path).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        assert_eq!(
+            doc["chat"]["permissions"]["mode"].as_str().unwrap(),
+            "acceptEdits"
+        );
+        // Other chat fields preserved
+        assert_eq!(doc["chat"]["default_model"].as_str().unwrap(), "test");
     }
 }

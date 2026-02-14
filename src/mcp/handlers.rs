@@ -3506,6 +3506,10 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(String::from);
         let model = args.get("model").and_then(|v| v.as_str()).map(String::from);
+        let permission_mode = args
+            .get("permission_mode")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         let request = crate::chat::ChatRequest {
             message: message.to_string(),
@@ -3513,6 +3517,7 @@ impl ToolHandler {
             cwd: cwd.to_string(),
             project_slug,
             model,
+            permission_mode,
         };
 
         // Create session and wait for it to complete (non-streaming for MCP)

@@ -27,6 +27,8 @@ fn test_config() -> Config {
         serve_frontend: false,
         frontend_path: "./dist".to_string(),
         public_url: None,
+        chat_permissions: None,
+        config_yaml_path: None,
     }
 }
 

@@ -9,6 +9,7 @@ license = "MIT AND BUSL-1.1"
 [dependencies]
 # Async runtime
 tokio = { version = "1.49", features = ["full"] }
+tokio-util = "0.7"
 
 # Web framework for webhook listener
 axum = { version = "0.8", features = ["macros", "ws"] }

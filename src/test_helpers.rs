@@ -37,6 +37,8 @@ pub fn mock_app_state() -> AppState {
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             public_url: None,
+            chat_permissions: None,
+            config_yaml_path: None,
         }),
     }
 }
@@ -61,6 +63,8 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             public_url: None,
+            chat_permissions: None,
+            config_yaml_path: None,
         }),
     }
 }
@@ -276,6 +280,7 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         total_cost_usd: None,
         conversation_id: None,
         preview: None,
+        permission_mode: None,
     }
 }
 
