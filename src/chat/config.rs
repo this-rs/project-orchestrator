@@ -22,11 +22,11 @@ pub struct PermissionConfig {
 
 impl PermissionConfig {
     fn default_mode() -> String {
-        "bypassPermissions".into()
+        "default".into()
     }
 
     /// Convert the string mode to the Nexus SDK `PermissionMode` enum.
-    /// Falls back to `BypassPermissions` for unknown values (backward compat).
+    /// Falls back to `Default` for unknown values (safe-by-default).
     pub fn to_nexus_mode(&self) -> PermissionMode {
         match self.mode.as_str() {
             "default" => PermissionMode::Default,
@@ -36,9 +36,9 @@ impl PermissionConfig {
             _ => {
                 tracing::warn!(
                     mode = %self.mode,
-                    "Unknown permission mode, falling back to BypassPermissions"
+                    "Unknown permission mode, falling back to Default"
                 );
-                PermissionMode::BypassPermissions
+                PermissionMode::Default
             }
         }
     }
@@ -128,8 +128,7 @@ impl ChatConfig {
             prompt_builder_model: std::env::var("PROMPT_BUILDER_MODEL")
                 .unwrap_or_else(|_| "claude-opus-4-6".into()),
             permission: PermissionConfig {
-                mode: std::env::var("CHAT_PERMISSION_MODE")
-                    .unwrap_or_else(|_| "bypassPermissions".into()),
+                mode: std::env::var("CHAT_PERMISSION_MODE").unwrap_or_else(|_| "default".into()),
                 allowed_tools: std::env::var("CHAT_ALLOWED_TOOLS")
                     .ok()
                     .map(|s| {
@@ -248,7 +247,7 @@ mod tests {
         assert_eq!(config.max_sessions, 10);
         assert_eq!(config.session_timeout.as_secs(), 1800);
         // Permission defaults
-        assert_eq!(config.permission.mode, "bypassPermissions");
+        assert_eq!(config.permission.mode, "default");
         assert!(config.permission.allowed_tools.is_empty());
         assert!(config.permission.disallowed_tools.is_empty());
 
@@ -313,7 +312,7 @@ mod tests {
         let config = ChatConfig::default();
         assert!(!config.default_model.is_empty());
         assert!(config.max_sessions > 0);
-        assert_eq!(config.permission.mode, "bypassPermissions");
+        assert_eq!(config.permission.mode, "default");
 
         // Cleanup
         std::env::remove_var("CHAT_DEFAULT_MODEL");
@@ -378,7 +377,7 @@ mod tests {
     #[test]
     fn test_permission_config_defaults() {
         let config = PermissionConfig::default();
-        assert_eq!(config.mode, "bypassPermissions");
+        assert_eq!(config.mode, "default");
         assert!(config.allowed_tools.is_empty());
         assert!(config.disallowed_tools.is_empty());
     }
@@ -418,24 +417,18 @@ mod tests {
             PermissionMode::BypassPermissions
         ));
 
-        // Unknown mode falls back to BypassPermissions
+        // Unknown mode falls back to Default (safe-by-default)
         let config = PermissionConfig {
             mode: "nonsense".into(),
             ..Default::default()
         };
-        assert!(matches!(
-            config.to_nexus_mode(),
-            PermissionMode::BypassPermissions
-        ));
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
 
         let config = PermissionConfig {
             mode: "".into(),
             ..Default::default()
         };
-        assert!(matches!(
-            config.to_nexus_mode(),
-            PermissionMode::BypassPermissions
-        ));
+        assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
     }
 
     #[test]
@@ -469,7 +462,7 @@ mod tests {
     fn test_permission_config_serde_defaults() {
         // Empty JSON should use defaults
         let config: PermissionConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.mode, "bypassPermissions");
+        assert_eq!(config.mode, "default");
         assert!(config.allowed_tools.is_empty());
         assert!(config.disallowed_tools.is_empty());
 

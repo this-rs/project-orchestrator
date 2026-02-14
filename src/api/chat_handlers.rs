@@ -828,7 +828,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["mode"], "bypassPermissions");
+        assert_eq!(json["mode"], "default");
         assert_eq!(json["allowed_tools"].as_array().unwrap().len(), 0);
         assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
     }

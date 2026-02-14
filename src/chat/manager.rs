@@ -2796,17 +2796,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_options_uses_config_permission_default() {
-        // Default config (BypassPermissions) — backward compatibility
+        // Default config uses "default" permission mode (safe-by-default)
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
             .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None)
             .await;
-        assert!(matches!(
-            opts.permission_mode,
-            PermissionMode::BypassPermissions
-        ));
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
         assert!(opts.allowed_tools.is_empty());
         assert!(opts.disallowed_tools.is_empty());
     }
@@ -2832,23 +2829,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_options_with_permission_override() {
-        // Global config is BypassPermissions, but session overrides to Default
+        // Global config is Default, session overrides to BypassPermissions
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, Some("default"))
-            .await;
-        assert!(matches!(opts.permission_mode, PermissionMode::Default));
-
-        // Without override, falls back to global (BypassPermissions)
-        let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .build_options(
+                "/tmp",
+                "claude-opus-4-6",
+                "prompt",
+                None,
+                Some("bypassPermissions"),
+            )
             .await;
         assert!(matches!(
             opts.permission_mode,
             PermissionMode::BypassPermissions
         ));
+
+        // Without override, falls back to global (Default)
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .await;
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
     }
 
     #[tokio::test]
@@ -2857,7 +2860,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let config = manager.get_permission_config().await;
-        assert_eq!(config.mode, "bypassPermissions");
+        assert_eq!(config.mode, "default");
         assert!(config.allowed_tools.is_empty());
         assert!(config.disallowed_tools.is_empty());
     }
@@ -2903,20 +2906,17 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        // Initially BypassPermissions
+        // Initially Default (safe-by-default)
         let opts = manager
             .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
             .await;
-        assert!(matches!(
-            opts.permission_mode,
-            PermissionMode::BypassPermissions
-        ));
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
 
-        // Update to Default mode at runtime
+        // Update to BypassPermissions mode at runtime
         manager
             .update_permission_config(crate::chat::config::PermissionConfig {
-                mode: "default".into(),
-                allowed_tools: vec!["Read".into()],
+                mode: "bypassPermissions".into(),
+                allowed_tools: vec![],
                 disallowed_tools: vec![],
             })
             .await
@@ -2926,8 +2926,11 @@ mod tests {
         let opts = manager
             .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
             .await;
-        assert!(matches!(opts.permission_mode, PermissionMode::Default));
-        assert_eq!(opts.allowed_tools, vec!["Read"]);
+        assert!(matches!(
+            opts.permission_mode,
+            PermissionMode::BypassPermissions
+        ));
+        assert!(opts.allowed_tools.is_empty());
     }
 
     #[tokio::test]

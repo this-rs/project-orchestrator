@@ -79,7 +79,7 @@ fn default_max_turns() -> u32 {
 }
 
 fn default_permission_mode() -> String {
-    "bypassPermissions".into()
+    "default".into()
 }
 
 fn default_true() -> bool {
@@ -600,7 +600,7 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             default_model: config.chat_model.clone(),
             max_sessions: config.chat_max_sessions,
             max_turns: config.chat_max_turns,
-            permissions: if config.chat_permission_mode != "bypassPermissions" {
+            permissions: if config.chat_permission_mode != "default" {
                 // Only write permissions section if non-default (keeps config.yaml clean)
                 Some(ChatPermissionsSection {
                     mode: config.chat_permission_mode.clone(),
@@ -838,7 +838,7 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         chat_max_turns: yaml.chat.max_turns.unwrap_or(50) as u32,
         chat_permission_mode: yaml.chat.permissions
             .map(|p| p.mode)
-            .unwrap_or_else(|| "bypassPermissions".into()),
+            .unwrap_or_else(|| "default".into()),
         has_oidc_secret,
         has_neo4j_password,
         has_meilisearch_key,
