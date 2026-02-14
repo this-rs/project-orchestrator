@@ -1277,6 +1277,14 @@ impl GraphStore for Neo4jClient {
         .await
     }
 
+    async fn update_chat_session_permission_mode(
+        &self,
+        id: Uuid,
+        mode: &str,
+    ) -> anyhow::Result<()> {
+        self.update_chat_session_permission_mode(id, mode).await
+    }
+
     async fn backfill_chat_session_previews(&self) -> anyhow::Result<usize> {
         self.backfill_chat_session_previews().await
     }

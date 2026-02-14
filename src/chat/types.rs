@@ -78,6 +78,8 @@ pub enum ChatEvent {
     StreamingStatus { is_streaming: bool },
     /// An error occurred
     Error { message: String },
+    /// Permission mode was changed mid-session
+    PermissionModeChanged { mode: String },
 }
 
 impl ChatEvent {
@@ -96,6 +98,7 @@ impl ChatEvent {
             ChatEvent::StreamDelta { .. } => "stream_delta",
             ChatEvent::StreamingStatus { .. } => "streaming_status",
             ChatEvent::Error { .. } => "error",
+            ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
         }
     }
 }

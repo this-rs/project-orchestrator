@@ -18,7 +18,7 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::models::ChatSessionNode;
 use crate::neo4j::GraphStore;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use nexus_claude::{
     memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
@@ -64,6 +64,8 @@ pub struct ActiveSession {
     /// Contains all non-StreamDelta events (ToolUse, ToolResult, AssistantText, etc.)
     /// that haven't been persisted yet. Cleared at stream start/end.
     pub streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
+    /// Current permission mode for this session (updated on mid-session changes)
+    pub permission_mode: Option<String>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -1167,6 +1169,7 @@ impl ChatManager {
                     is_streaming: is_streaming.clone(),
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
+                    permission_mode: request.permission_mode.clone(),
                 },
             );
             interrupt_flag
@@ -2113,6 +2116,80 @@ impl ChatManager {
         Ok(())
     }
 
+    /// Change the permission mode of an active CLI session mid-conversation.
+    ///
+    /// Sends a `set_permission_mode` control request to the Claude CLI subprocess,
+    /// updates the in-memory `ActiveSession`, and persists the change to Neo4j.
+    pub async fn set_session_permission_mode(
+        &self,
+        session_id: &str,
+        mode: &str,
+    ) -> Result<()> {
+        // Validate mode
+        const VALID_MODES: &[&str] = &["default", "acceptEdits", "bypassPermissions", "plan"];
+        if !VALID_MODES.contains(&mode) {
+            bail!(
+                "Invalid permission mode '{}'. Valid modes: {}",
+                mode,
+                VALID_MODES.join(", ")
+            );
+        }
+
+        // Get session and update in-memory state
+        let (client, old_mode) = {
+            let mut sessions = self.active_sessions.write().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            session.last_activity = Instant::now();
+            let old_mode = session.permission_mode.clone();
+            session.permission_mode = Some(mode.to_string());
+            (session.client.clone(), old_mode)
+        };
+
+        // Send control request to CLI subprocess
+        let mut client = client.lock().await;
+        client
+            .set_permission_mode(mode)
+            .await
+            .map_err(|e| anyhow!("Failed to set permission mode on CLI: {}", e))?;
+        drop(client);
+
+        info!(
+            session_id = %session_id,
+            old_mode = ?old_mode,
+            new_mode = %mode,
+            "Permission mode changed for session"
+        );
+
+        // Persist to Neo4j
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            if let Err(e) = self
+                .graph
+                .update_chat_session_permission_mode(uuid, mode)
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist permission mode change to Neo4j (non-fatal)"
+                );
+            }
+        }
+
+        // Broadcast event to WebSocket clients
+        {
+            let sessions = self.active_sessions.read().await;
+            if let Some(session) = sessions.get(session_id) {
+                let _ = session.events_tx.send(ChatEvent::PermissionModeChanged {
+                    mode: mode.to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Resume a previously inactive session by creating a new InteractiveClient.
     ///
     /// If the session has a `cli_session_id`, resumes with `--resume`.
@@ -2224,6 +2301,7 @@ impl ChatManager {
                     is_streaming: is_streaming.clone(),
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
+                    permission_mode: session_node.permission_mode.clone(),
                 },
             );
             interrupt_flag
@@ -4191,6 +4269,7 @@ mod tests {
             is_streaming: Arc::new(AtomicBool::new(is_streaming)),
             streaming_text: Arc::new(Mutex::new(streaming_text.to_string())),
             streaming_events: Arc::new(Mutex::new(streaming_events_data)),
+            permission_mode: None,
         };
 
         Some((session, pending_messages))

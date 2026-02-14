@@ -51,6 +51,8 @@ pub enum WsChatClientMessage {
         id: Option<String>,
         content: String,
     },
+    /// Change the permission mode of the active session
+    SetPermissionMode { mode: String },
 }
 
 /// WebSocket upgrade handler for `/ws/chat/{session_id}`
@@ -714,6 +716,36 @@ async fn handle_ws_chat(
                                         };
                                         if let Err(e) = send_result {
                                             warn!(session_id = %session_id, error = %e, "Failed to send input response");
+                                        }
+                                    }
+
+                                    WsChatClientMessage::SetPermissionMode { mode } => {
+                                        info!(session_id = %session_id, mode = %mode, "WS: Received set_permission_mode");
+                                        if chat_manager.is_session_active(&session_id).await {
+                                            match chat_manager.set_session_permission_mode(&session_id, &mode).await {
+                                                Ok(()) => {
+                                                    // Send confirmation back to frontend
+                                                    let confirmation = serde_json::json!({
+                                                        "type": "permission_mode_changed",
+                                                        "mode": mode,
+                                                    });
+                                                    let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!(session_id = %session_id, error = %e, "Failed to set permission mode");
+                                                    let err = serde_json::json!({
+                                                        "type": "error",
+                                                        "message": format!("Failed to set permission mode: {}", e),
+                                                    });
+                                                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                                }
+                                            }
+                                        } else {
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "message": "Session not active on this instance",
+                                            });
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                         }
                                     }
                                 }
