@@ -609,8 +609,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Chat permission config (runtime GET/PUT)
         .route(
             "/api/chat/config/permissions",
-            get(chat_handlers::get_chat_permissions)
-                .put(chat_handlers::update_chat_permissions),
+            get(chat_handlers::get_chat_permissions).put(chat_handlers::update_chat_permissions),
         )
 }
 

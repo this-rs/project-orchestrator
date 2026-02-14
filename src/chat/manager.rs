@@ -269,10 +269,7 @@ impl ChatManager {
         // 4. Serialize PermissionConfig to a YAML Value and insert
         let perm_value = serde_yaml::to_value(permission)
             .context("Serializing PermissionConfig to YAML value")?;
-        chat_section.insert(
-            serde_yaml::Value::String("permissions".into()),
-            perm_value,
-        );
+        chat_section.insert(serde_yaml::Value::String("permissions".into()), perm_value);
 
         // 5. Serialize the full document back to YAML string
         let yaml_str =
@@ -289,11 +286,7 @@ impl ChatManager {
                 .with_context(|| format!("Syncing {}", tmp_path.display()))?;
         }
         std::fs::rename(&tmp_path, yaml_path).with_context(|| {
-            format!(
-                "Renaming {} → {}",
-                tmp_path.display(),
-                yaml_path.display()
-            )
+            format!("Renaming {} → {}", tmp_path.display(), yaml_path.display())
         })?;
 
         Ok(())
@@ -1480,8 +1473,7 @@ impl ChatManager {
                                     session_id: uuid,
                                     seq,
                                     event_type: "permission_request".to_string(),
-                                    data: serde_json::to_string(&perm_event)
-                                        .unwrap_or_default(),
+                                    data: serde_json::to_string(&perm_event).unwrap_or_default(),
                                     created_at: chrono::Utc::now(),
                                 });
                             }
@@ -2044,11 +2036,7 @@ impl ChatManager {
     /// control protocol: `{"type": "control_response", "response": {"allow": true/false}}`.
     /// This is required for non-BypassPermissions modes where Claude CLI sends
     /// `can_use_tool` control requests and expects a control_response (not a user message).
-    pub async fn send_permission_response(
-        &self,
-        session_id: &str,
-        allow: bool,
-    ) -> Result<()> {
+    pub async fn send_permission_response(&self, session_id: &str, allow: bool) -> Result<()> {
         let client = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
@@ -4829,7 +4817,10 @@ mod tests {
             "chat.default_model should be preserved"
         );
         // Permissions written correctly
-        assert_eq!(doc["chat"]["permissions"]["mode"].as_str().unwrap(), "default");
+        assert_eq!(
+            doc["chat"]["permissions"]["mode"].as_str().unwrap(),
+            "default"
+        );
         let allowed = doc["chat"]["permissions"]["allowed_tools"]
             .as_sequence()
             .unwrap();
@@ -4864,7 +4855,10 @@ mod tests {
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
         let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
 
-        assert_eq!(doc["chat"]["permissions"]["mode"].as_str().unwrap(), "acceptEdits");
+        assert_eq!(
+            doc["chat"]["permissions"]["mode"].as_str().unwrap(),
+            "acceptEdits"
+        );
         // Empty allowed_tools should be present as empty sequence
         assert!(doc["chat"]["permissions"]["allowed_tools"]
             .as_sequence()
@@ -4906,9 +4900,14 @@ mod tests {
         std::env::remove_var("CHAT_DISALLOWED_TOOLS");
 
         let config = crate::Config::from_yaml_and_env(Some(&yaml_path)).unwrap();
-        let loaded_perm = config.chat_permissions.expect("chat_permissions should be Some");
+        let loaded_perm = config
+            .chat_permissions
+            .expect("chat_permissions should be Some");
         assert_eq!(loaded_perm.mode, "plan");
-        assert_eq!(loaded_perm.allowed_tools, vec!["mcp__project-orchestrator__*"]);
+        assert_eq!(
+            loaded_perm.allowed_tools,
+            vec!["mcp__project-orchestrator__*"]
+        );
         assert!(loaded_perm.disallowed_tools.is_empty());
 
         // config_yaml_path should be set
@@ -4930,7 +4929,10 @@ mod tests {
         ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
 
         // .tmp file should not exist after successful rename
-        assert!(!tmp_path.exists(), "Temporary file should be cleaned up after atomic rename");
+        assert!(
+            !tmp_path.exists(),
+            "Temporary file should be cleaned up after atomic rename"
+        );
         // Original file should still exist with updated content
         assert!(yaml_path.exists());
     }
@@ -4957,7 +4959,10 @@ mod tests {
         // Verify it was persisted to disk
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
         let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
-        assert_eq!(doc["chat"]["permissions"]["mode"].as_str().unwrap(), "acceptEdits");
+        assert_eq!(
+            doc["chat"]["permissions"]["mode"].as_str().unwrap(),
+            "acceptEdits"
+        );
         // Other chat fields preserved
         assert_eq!(doc["chat"]["default_model"].as_str().unwrap(), "test");
     }

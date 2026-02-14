@@ -258,7 +258,10 @@ mod tests {
         std::env::set_var("CHAT_SESSION_TIMEOUT_SECS", "600");
         std::env::set_var("MCP_SERVER_PATH", "/custom/path/mcp_server");
         std::env::set_var("CHAT_PERMISSION_MODE", "default");
-        std::env::set_var("CHAT_ALLOWED_TOOLS", "Bash(git *),Read,mcp__project-orchestrator__*");
+        std::env::set_var(
+            "CHAT_ALLOWED_TOOLS",
+            "Bash(git *),Read,mcp__project-orchestrator__*",
+        );
         std::env::set_var("CHAT_DISALLOWED_TOOLS", "Bash(rm -rf *), Bash(sudo *)");
 
         let config = ChatConfig::from_env();
@@ -385,24 +388,54 @@ mod tests {
         use nexus_claude::PermissionMode;
 
         // All 4 known modes
-        let config = PermissionConfig { mode: "default".into(), ..Default::default() };
+        let config = PermissionConfig {
+            mode: "default".into(),
+            ..Default::default()
+        };
         assert!(matches!(config.to_nexus_mode(), PermissionMode::Default));
 
-        let config = PermissionConfig { mode: "acceptEdits".into(), ..Default::default() };
-        assert!(matches!(config.to_nexus_mode(), PermissionMode::AcceptEdits));
+        let config = PermissionConfig {
+            mode: "acceptEdits".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.to_nexus_mode(),
+            PermissionMode::AcceptEdits
+        ));
 
-        let config = PermissionConfig { mode: "plan".into(), ..Default::default() };
+        let config = PermissionConfig {
+            mode: "plan".into(),
+            ..Default::default()
+        };
         assert!(matches!(config.to_nexus_mode(), PermissionMode::Plan));
 
-        let config = PermissionConfig { mode: "bypassPermissions".into(), ..Default::default() };
-        assert!(matches!(config.to_nexus_mode(), PermissionMode::BypassPermissions));
+        let config = PermissionConfig {
+            mode: "bypassPermissions".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.to_nexus_mode(),
+            PermissionMode::BypassPermissions
+        ));
 
         // Unknown mode falls back to BypassPermissions
-        let config = PermissionConfig { mode: "nonsense".into(), ..Default::default() };
-        assert!(matches!(config.to_nexus_mode(), PermissionMode::BypassPermissions));
+        let config = PermissionConfig {
+            mode: "nonsense".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.to_nexus_mode(),
+            PermissionMode::BypassPermissions
+        ));
 
-        let config = PermissionConfig { mode: "".into(), ..Default::default() };
-        assert!(matches!(config.to_nexus_mode(), PermissionMode::BypassPermissions));
+        let config = PermissionConfig {
+            mode: "".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.to_nexus_mode(),
+            PermissionMode::BypassPermissions
+        ));
     }
 
     #[test]
@@ -445,5 +478,4 @@ mod tests {
         assert_eq!(config.mode, "default");
         assert!(config.allowed_tools.is_empty());
     }
-
 }
