@@ -276,6 +276,7 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         total_cost_usd: None,
         conversation_id: None,
         preview: None,
+        permission_mode: None,
     }
 }
 

@@ -176,6 +176,7 @@ pub async fn list_sessions(
             total_cost_usd: s.total_cost_usd,
             conversation_id: s.conversation_id,
             preview: s.preview,
+            permission_mode: s.permission_mode,
         })
         .collect();
 
@@ -213,6 +214,7 @@ pub async fn get_session(
         total_cost_usd: node.total_cost_usd,
         conversation_id: node.conversation_id,
         preview: node.preview,
+        permission_mode: node.permission_mode,
     }))
 }
 

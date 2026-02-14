@@ -678,7 +678,10 @@ impl ChatManager {
     // ClaudeCodeOptions builder
     // ========================================================================
 
-    /// Build `ClaudeCodeOptions` for a new or resumed session
+    /// Build `ClaudeCodeOptions` for a new or resumed session.
+    ///
+    /// `permission_mode_override`: if Some, overrides the global config permission mode
+    /// for this specific session (e.g. user chose a different mode for this session).
     #[allow(deprecated)]
     pub fn build_options(
         &self,
@@ -686,6 +689,7 @@ impl ChatManager {
         model: &str,
         system_prompt: &str,
         resume_id: Option<&str>,
+        permission_mode_override: Option<&str>,
     ) -> ClaudeCodeOptions {
         // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
         let cwd = expand_tilde(cwd);
@@ -710,11 +714,23 @@ impl ChatManager {
             env: Some(env),
         };
 
+        // Use per-session override if provided, otherwise use global config
+        let effective_permission = match permission_mode_override {
+            Some(mode_str) => {
+                let override_config = super::config::PermissionConfig {
+                    mode: mode_str.to_string(),
+                    ..Default::default()
+                };
+                override_config.to_nexus_mode()
+            }
+            None => self.config.permission.to_nexus_mode(),
+        };
+
         let mut builder = ClaudeCodeOptions::builder()
             .model(model)
             .cwd(cwd)
             .system_prompt(system_prompt)
-            .permission_mode(self.config.permission.to_nexus_mode())
+            .permission_mode(effective_permission)
             .max_turns(self.config.max_turns)
             .include_partial_messages(true)
             .add_mcp_server("project-orchestrator", mcp_config);
@@ -899,6 +915,7 @@ impl ChatManager {
             total_cost_usd: None,
             conversation_id: None,
             preview: None,
+            permission_mode: request.permission_mode.clone(),
         };
         self.graph
             .create_chat_session(&session_node)
@@ -906,7 +923,13 @@ impl ChatManager {
             .context("Failed to persist chat session")?;
 
         // Build options and create InteractiveClient
-        let options = self.build_options(&request.cwd, &model, &system_prompt, None);
+        let options = self.build_options(
+            &request.cwd,
+            &model,
+            &system_prompt,
+            None,
+            request.permission_mode.as_deref(),
+        );
         let mut client = InteractiveClient::new(options)
             .map_err(|e| anyhow!("Failed to create InteractiveClient: {}", e))?;
 
@@ -1781,6 +1804,7 @@ impl ChatManager {
             &session_node.model,
             &system_prompt,
             cli_session_id,
+            session_node.permission_mode.as_deref(),
         );
 
         // Create new InteractiveClient with --resume
@@ -2431,7 +2455,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         #[allow(deprecated)]
-        let opts = manager.build_options("/tmp", "claude-opus-4-6", "test prompt", None);
+        let opts = manager.build_options("/tmp", "claude-opus-4-6", "test prompt", None, None);
         assert!(matches!(
             opts.permission_mode,
             PermissionMode::BypassPermissions
@@ -2452,10 +2476,30 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         #[allow(deprecated)]
-        let opts = manager.build_options("/tmp", "claude-opus-4-6", "test prompt", None);
+        let opts = manager.build_options("/tmp", "claude-opus-4-6", "test prompt", None, None);
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
         assert_eq!(opts.allowed_tools, vec!["Bash(git *)", "Read"]);
         assert_eq!(opts.disallowed_tools, vec!["Bash(rm -rf *)"]);
+    }
+
+    #[test]
+    fn test_build_options_with_permission_override() {
+        // Global config is BypassPermissions, but session overrides to Default
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        #[allow(deprecated)]
+        let opts =
+            manager.build_options("/tmp", "claude-opus-4-6", "prompt", None, Some("default"));
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
+
+        // Without override, falls back to global (BypassPermissions)
+        #[allow(deprecated)]
+        let opts = manager.build_options("/tmp", "claude-opus-4-6", "prompt", None, None);
+        assert!(matches!(
+            opts.permission_mode,
+            PermissionMode::BypassPermissions
+        ));
     }
 
     #[tokio::test]
@@ -2510,6 +2554,7 @@ mod tests {
             "claude-opus-4-6",
             "System prompt here",
             None,
+            None,
         );
 
         assert_eq!(options.model, Some("claude-opus-4-6".into()));
@@ -2528,6 +2573,7 @@ mod tests {
             "claude-opus-4-6",
             "System prompt",
             Some("cli-session-abc"),
+            None,
         );
 
         assert_eq!(options.resume, Some("cli-session-abc".into()));
@@ -2539,7 +2585,7 @@ mod tests {
         let config = test_config();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
-        let options = manager.build_options("/tmp", "model", "prompt", None);
+        let options = manager.build_options("/tmp", "model", "prompt", None, None);
 
         let mcp = options.mcp_servers.get("project-orchestrator").unwrap();
         match mcp {
@@ -3274,6 +3320,7 @@ mod tests {
             total_cost_usd: Some(1.50),
             conversation_id: Some("conv-abc-123".into()),
             preview: Some("Hello, can you help me with this?".into()),
+            permission_mode: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3623,6 +3670,7 @@ mod tests {
             total_cost_usd: None,
             conversation_id: Some("conv-serde-test".into()),
             preview: None,
+            permission_mode: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3650,6 +3698,7 @@ mod tests {
             total_cost_usd: None,
             conversation_id: None,
             preview: None,
+            permission_mode: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();

@@ -18,6 +18,10 @@ pub struct ChatRequest {
     /// Model override (default: from ChatConfig)
     #[serde(default)]
     pub model: Option<String>,
+    /// Permission mode override for this session (default: from ChatConfig)
+    /// Values: "default", "acceptEdits", "plan", "bypassPermissions"
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)
@@ -161,6 +165,9 @@ pub struct ChatSession {
     /// Preview text (first user message, truncated)
     #[serde(default)]
     pub preview: Option<String>,
+    /// Permission mode override for this session (None = global config)
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 /// Response when creating a session
@@ -480,6 +487,7 @@ mod tests {
             total_cost_usd: Some(0.15),
             conversation_id: Some("conv-abc-123".into()),
             preview: Some("Hello, can you help me?".into()),
+            permission_mode: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
