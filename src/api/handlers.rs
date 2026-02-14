@@ -152,9 +152,7 @@ pub struct HealthResponse {
 /// - 200 + `"ok"` if both Neo4j and Meilisearch are connected
 /// - 200 + `"degraded"` if Neo4j is connected but Meilisearch is not
 /// - 503 + `"unhealthy"` if Neo4j is disconnected (critical dependency)
-pub async fn health(
-    State(state): State<OrchestratorState>,
-) -> (StatusCode, Json<HealthResponse>) {
+pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json<HealthResponse>) {
     let neo4j_ok = state
         .orchestrator
         .neo4j()
