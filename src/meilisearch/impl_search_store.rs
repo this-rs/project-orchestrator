@@ -163,4 +163,8 @@ impl SearchStore for MeiliClient {
     async fn get_notes_stats(&self) -> Result<IndexStats> {
         self.get_notes_stats().await
     }
+
+    async fn health_check(&self) -> Result<bool> {
+        Ok(self.is_healthy().await)
+    }
 }

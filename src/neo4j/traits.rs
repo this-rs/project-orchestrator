@@ -1112,4 +1112,12 @@ pub trait GraphStore: Send + Sync {
     /// Get the top N most connected functions for a project, ranked by
     /// (callers + callees). Used for auto-generating feature graphs after sync.
     async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>>;
+
+    // ========================================================================
+    // Health check
+    // ========================================================================
+
+    /// Check connectivity to the graph database.
+    /// Returns Ok(true) if the database is reachable, Ok(false) if not.
+    async fn health_check(&self) -> Result<bool>;
 }

@@ -444,6 +444,10 @@ impl SearchStore for MockSearchStore {
             is_indexing: false,
         })
     }
+
+    async fn health_check(&self) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

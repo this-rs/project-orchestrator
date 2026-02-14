@@ -11,6 +11,14 @@ pub struct MeiliClient {
 }
 
 impl MeiliClient {
+    /// Check if Meilisearch is reachable and healthy.
+    pub async fn is_healthy(&self) -> bool {
+        match self.client.health().await {
+            Ok(h) if h.status == "available" => true,
+            _ => false,
+        }
+    }
+
     /// Create a new Meilisearch client
     pub async fn new(url: &str, api_key: &str) -> Result<Self> {
         let client =

@@ -4396,6 +4396,10 @@ impl GraphStore for MockGraphStore {
 
         Ok(sorted.into_iter().map(|(name, _)| name).collect())
     }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
