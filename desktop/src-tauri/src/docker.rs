@@ -39,6 +39,29 @@ pub enum ServiceStatus {
     Unknown,
 }
 
+/// Overall Docker daemon status — distinguishes "not installed" from "installed but not running".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerStatus {
+    /// Docker daemon is reachable and responding to ping.
+    Running,
+    /// Docker binary/app is present on disk but the daemon is not running
+    /// (e.g. Docker Desktop is installed but closed).
+    Installed,
+    /// No trace of Docker on this machine.
+    NotInstalled,
+}
+
+impl std::fmt::Display for DockerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DockerStatus::Running => write!(f, "running"),
+            DockerStatus::Installed => write!(f, "installed"),
+            DockerStatus::NotInstalled => write!(f, "not_installed"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServicesHealth {
@@ -81,6 +104,79 @@ impl DockerManager {
         match &self.docker {
             Some(docker) => docker.ping().await.is_ok(),
             None => false,
+        }
+    }
+
+    /// Return fine-grained Docker status: Running, Installed, or NotInstalled.
+    ///
+    /// - `Running` → daemon is reachable (ping OK)
+    /// - `Installed` → binary/app exists on disk but daemon is not responding
+    /// - `NotInstalled` → no Docker found on this machine
+    pub async fn status(&self) -> DockerStatus {
+        match &self.docker {
+            Some(docker) => {
+                // bollard connected to the socket — try pinging the daemon
+                if docker.ping().await.is_ok() {
+                    DockerStatus::Running
+                } else {
+                    // Socket exists but daemon not responding → installed but not started
+                    DockerStatus::Installed
+                }
+            }
+            None => {
+                // bollard couldn't connect at all — check if Docker is installed on disk
+                if Self::is_docker_installed_on_disk() {
+                    DockerStatus::Installed
+                } else {
+                    DockerStatus::NotInstalled
+                }
+            }
+        }
+    }
+
+    /// Check if Docker binary or app bundle exists on disk (without requiring the daemon).
+    fn is_docker_installed_on_disk() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            // Docker Desktop for macOS installs to /Applications/Docker.app
+            if std::path::Path::new("/Applications/Docker.app").exists() {
+                return true;
+            }
+            // Also check for docker CLI in PATH (e.g. colima, rancher desktop)
+            std::process::Command::new("which")
+                .arg("docker")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            std::process::Command::new("which")
+                .arg("docker")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Check for Docker Desktop in standard install locations
+            let program_files = std::env::var("ProgramFiles").unwrap_or_default();
+            if std::path::Path::new(&format!("{}\\Docker\\Docker\\Docker Desktop.exe", program_files)).exists() {
+                return true;
+            }
+            // Also check PATH
+            std::process::Command::new("where")
+                .arg("docker")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            false
         }
     }
 
@@ -466,13 +562,31 @@ pub fn create_docker_manager() -> SharedDockerManager {
 // Tauri commands
 // ============================================================================
 
+/// Response from the `check_docker` Tauri command.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckDockerResponse {
+    /// Backward compat: true when Docker daemon is reachable.
+    pub available: bool,
+    /// Fine-grained status: "running", "installed", or "not_installed".
+    pub status: String,
+}
+
 /// Check if Docker is installed and accessible.
+///
+/// Returns both a backward-compatible `available` bool and a fine-grained `status` string
+/// ("running", "installed", "not_installed") so the splash screen can differentiate
+/// "Docker not installed" from "Docker Desktop installed but not started".
 #[tauri::command]
 pub async fn check_docker(
     docker: tauri::State<'_, SharedDockerManager>,
-) -> Result<bool, String> {
+) -> Result<CheckDockerResponse, String> {
     let mgr = docker.read().await;
-    Ok(mgr.is_available().await)
+    let status = mgr.status().await;
+    Ok(CheckDockerResponse {
+        available: status == DockerStatus::Running,
+        status: status.to_string(),
+    })
 }
 
 /// Start Docker services (Neo4j + MeiliSearch).

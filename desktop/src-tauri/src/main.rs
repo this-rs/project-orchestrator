@@ -18,13 +18,24 @@ fn get_server_port() -> u16 {
     setup::DEFAULT_DESKTOP_PORT
 }
 
-/// Tauri command: check if the backend is healthy
+/// Tauri command: check backend health and return the full `/health` response.
+///
+/// Returns the JSON body from the `/health` endpoint, which includes:
+/// - `status`: "ok" | "degraded" | "unhealthy"
+/// - `version`: semver string
+/// - `services.neo4j`: "connected" | "disconnected"
+/// - `services.meilisearch`: "connected" | "disconnected"
+///
+/// Returns `null` if the server is not reachable yet.
 #[tauri::command]
-async fn check_health(port: u16) -> Result<bool, String> {
+async fn check_health(port: u16) -> Result<Option<serde_json::Value>, String> {
     let url = format!("http://localhost:{}/health", port);
     match reqwest::get(&url).await {
-        Ok(resp) => Ok(resp.status().is_success()),
-        Err(_) => Ok(false),
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(body) => Ok(Some(body)),
+            Err(_) => Ok(Some(serde_json::json!({"status": "ok"}))),
+        },
+        Err(_) => Ok(None),
     }
 }
 
@@ -66,8 +77,9 @@ fn main() {
     // Initialize Docker manager (shared state for Tauri commands)
     let docker_manager = docker::create_docker_manager();
 
-    // Clone docker manager for the exit handler
+    // Clone docker manager for the exit handler and for the splash→main transition
     let docker_for_exit = docker_manager.clone();
+    let docker_for_setup = docker_manager.clone();
 
     // Launch Tauri application (splash screen shows immediately)
     let app = tauri::Builder::default()
@@ -105,7 +117,7 @@ fn main() {
             plugins::mac_rounded_corners::enable_modern_window_style,
             plugins::mac_rounded_corners::reposition_traffic_lights,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             // Create system tray
             if let Err(e) = tray::create_tray(app.handle()) {
                 tracing::warn!("Failed to create system tray: {}", e);
@@ -175,6 +187,7 @@ fn main() {
 
             // Start backend server and manage splash → main window transition
             let handle = app.handle().clone();
+            let docker_for_transition = docker_for_setup.clone();
             std::thread::spawn(move || {
                 // Ensure a config.yaml exists — generate a default one if missing
                 let config_path = setup::config_path();
@@ -199,6 +212,20 @@ fn main() {
 
                 let port = config.server_port;
                 let is_configured = config.setup_completed;
+
+                // Read infra_mode from the YAML config (defaults to "docker")
+                let infra_mode = std::fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|contents| serde_yaml::from_str::<serde_yaml::Value>(&contents).ok())
+                    .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
+                    .unwrap_or_else(|| "docker".to_string());
+
+                // Read nats_enabled from the YAML config
+                let nats_enabled = std::fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|contents| serde_yaml::from_str::<serde_yaml::Value>(&contents).ok())
+                    .map(|v| v.get("nats").and_then(|n| n.get("url")).is_some())
+                    .unwrap_or(false);
 
                 // Always start the backend server (even in unconfigured mode)
                 // In unconfigured mode it runs no-auth so the setup wizard can load
@@ -226,30 +253,73 @@ fn main() {
                 }
 
                 // Poll /health until the server is listening.
-                // The frontend has its own retry logic for DB-dependent endpoints,
-                // so we only need to wait for the HTTP listener to be up.
                 tracing::info!(
-                    "Waiting for backend on port {} (configured: {})...",
+                    "Waiting for backend on port {} (configured: {}, infra: {})...",
                     port,
-                    is_configured
+                    is_configured,
+                    infra_mode
                 );
                 let health_url = format!("http://localhost:{}/health", port);
                 let start = std::time::Instant::now();
+                let global_timeout = std::time::Duration::from_secs(120);
+
                 loop {
                     if start.elapsed() > std::time::Duration::from_secs(30) {
-                        tracing::error!("Backend did not start within 30 seconds");
+                        tracing::error!("Backend HTTP listener did not start within 30 seconds");
                         break;
                     }
-                    if let Ok(resp) = reqwest::blocking::get(&health_url) {
-                        if resp.status().is_success() {
-                            tracing::info!(
-                                "Backend ready in {:?}",
-                                start.elapsed()
-                            );
-                            break;
-                        }
+                    // We only check that the HTTP listener is up (any response),
+                    // NOT that services are connected. /health may return 503 when
+                    // Neo4j is still starting — that's fine, the Docker health loop
+                    // below handles service readiness.
+                    if reqwest::blocking::get(&health_url).is_ok() {
+                        tracing::info!(
+                            "Backend HTTP ready in {:?}",
+                            start.elapsed()
+                        );
+                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                // After backend HTTP is up, wait for Docker services if applicable.
+                // In setup mode or external mode, skip this — go straight to main window.
+                if is_configured && infra_mode != "external" {
+                    tracing::info!("Waiting for Docker services to become healthy...");
+                    let rt = tokio::runtime::Runtime::new()
+                        .expect("Failed to create tokio runtime for Docker health check");
+                    rt.block_on(async {
+                        let services_start = std::time::Instant::now();
+                        loop {
+                            if services_start.elapsed() > global_timeout {
+                                tracing::warn!(
+                                    "Docker services did not become healthy within {:?} — proceeding anyway",
+                                    global_timeout
+                                );
+                                break;
+                            }
+
+                            let mgr = docker_for_transition.read().await;
+                            let health = mgr.check_health(nats_enabled).await;
+                            drop(mgr); // release lock quickly
+
+                            let neo4j_ok = health.neo4j == docker::ServiceStatus::Healthy;
+                            let meili_ok = health.meilisearch == docker::ServiceStatus::Healthy;
+                            let nats_ok = !nats_enabled
+                                || health.nats == docker::ServiceStatus::Healthy
+                                || health.nats == docker::ServiceStatus::Disabled;
+
+                            if neo4j_ok && meili_ok && nats_ok {
+                                tracing::info!(
+                                    "All Docker services healthy in {:?}",
+                                    services_start.elapsed()
+                                );
+                                break;
+                            }
+
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    });
                 }
 
                 // Transition: close splash → show main window
@@ -275,20 +345,32 @@ fn main() {
         }
 
         if let tauri::RunEvent::ExitRequested { .. } = event {
-            tracing::info!("Application exiting — stopping Docker services...");
-            let dm = docker_for_exit.clone();
-            // Spawn a blocking task to stop containers
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let mgr = dm.read().await;
-                    if let Err(e) = mgr.stop_services().await {
-                        tracing::warn!("Failed to stop Docker services on exit: {}", e);
-                    }
-                });
-            })
-            .join()
-            .ok();
+            // Only stop Docker containers if infra_mode is "docker" (managed mode).
+            // In "external" mode the user manages their own services — we must NOT
+            // stop containers that the app didn't start.
+            let infra_mode = std::fs::read_to_string(setup::config_path())
+                .ok()
+                .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+                .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
+                .unwrap_or_else(|| "docker".to_string());
+
+            if infra_mode == "external" {
+                tracing::info!("Application exiting — infra_mode is external, skipping Docker stop");
+            } else {
+                tracing::info!("Application exiting — stopping Docker services...");
+                let dm = docker_for_exit.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let mgr = dm.read().await;
+                        if let Err(e) = mgr.stop_services().await {
+                            tracing::warn!("Failed to stop Docker services on exit: {}", e);
+                        }
+                    });
+                })
+                .join()
+                .ok();
+            }
         }
     });
 }

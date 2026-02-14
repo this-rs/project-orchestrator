@@ -133,4 +133,12 @@ pub trait SearchStore: Send + Sync {
 
     /// Get statistics for the notes index
     async fn get_notes_stats(&self) -> Result<IndexStats>;
+
+    // ========================================================================
+    // Health check
+    // ========================================================================
+
+    /// Check connectivity to the search engine.
+    /// Returns Ok(true) if the engine is reachable, Ok(false) if not.
+    async fn health_check(&self) -> Result<bool>;
 }

@@ -86,15 +86,27 @@ fn handle_menu_event(app: &AppHandle, item_id: &str) {
             tracing::info!("Quit requested from tray");
             let app_clone = app.clone();
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(dm) = app_clone.try_state::<SharedDockerManager>() {
-                        let mgr = dm.read().await;
-                        if let Err(e) = mgr.stop_services().await {
-                            tracing::warn!("Failed to stop Docker services: {}", e);
+                // Only stop Docker containers in managed "docker" mode.
+                // In "external" mode, the user's services must not be touched.
+                let infra_mode = std::fs::read_to_string(crate::setup::config_path())
+                    .ok()
+                    .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+                    .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
+                    .unwrap_or_else(|| "docker".to_string());
+
+                if infra_mode != "external" {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        if let Some(dm) = app_clone.try_state::<SharedDockerManager>() {
+                            let mgr = dm.read().await;
+                            if let Err(e) = mgr.stop_services().await {
+                                tracing::warn!("Failed to stop Docker services: {}", e);
+                            }
                         }
-                    }
-                });
+                    });
+                } else {
+                    tracing::info!("Skipping Docker stop — infra_mode is external");
+                }
                 app_clone.exit(0);
             });
         }

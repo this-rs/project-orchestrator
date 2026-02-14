@@ -130,19 +130,75 @@ impl ServerState {
 // Health check
 // ============================================================================
 
+/// Per-service health status in the health response
+#[derive(Serialize)]
+pub struct ServiceHealthStatus {
+    pub neo4j: String,
+    pub meilisearch: String,
+}
+
 /// Health check response
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub services: Option<ServiceHealthStatus>,
 }
 
-/// Health check handler
-pub async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+/// Health check handler — verifies actual connectivity to Neo4j and Meilisearch.
+///
+/// Returns:
+/// - 200 + `"ok"` if both Neo4j and Meilisearch are connected
+/// - 200 + `"degraded"` if Neo4j is connected but Meilisearch is not
+/// - 503 + `"unhealthy"` if Neo4j is disconnected (critical dependency)
+pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json<HealthResponse>) {
+    let neo4j_ok = state
+        .orchestrator
+        .neo4j()
+        .health_check()
+        .await
+        .unwrap_or(false);
+    let meili_ok = state
+        .orchestrator
+        .meili()
+        .health_check()
+        .await
+        .unwrap_or(false);
+
+    let status = if neo4j_ok && meili_ok {
+        "ok"
+    } else if neo4j_ok {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+
+    let http_status = if neo4j_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        http_status,
+        Json(HealthResponse {
+            status: status.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            services: Some(ServiceHealthStatus {
+                neo4j: if neo4j_ok {
+                    "connected".to_string()
+                } else {
+                    "disconnected".to_string()
+                },
+                meilisearch: if meili_ok {
+                    "connected".to_string()
+                } else {
+                    "disconnected".to_string()
+                },
+            }),
+        }),
+    )
 }
 
 // ============================================================================

@@ -67,13 +67,25 @@ pub fn check_for_updates(app: AppHandle) {
                 return;
             }
             Err(e) => {
-                tracing::warn!("Update check failed: {}", e);
-                let _ = app.emit(
-                    "update-error",
-                    UpdateErrorPayload {
-                        message: format!("Update check failed: {}", e),
-                    },
-                );
+                let msg = e.to_string();
+                // Don't emit user-visible errors for known CI/release configuration issues.
+                // "relative URL without a base" means latest.json has empty URLs — this happens
+                // when TAURI_SIGNING_PRIVATE_KEY is not configured in GitHub Actions secrets,
+                // so the updater bundles (.app.tar.gz, .nsis.zip, etc.) are not generated.
+                if msg.contains("relative URL") || msg.contains("empty") {
+                    tracing::info!(
+                        "Update check skipped — release has no updater bundles ({})",
+                        msg
+                    );
+                } else {
+                    tracing::warn!("Update check failed: {}", e);
+                    let _ = app.emit(
+                        "update-error",
+                        UpdateErrorPayload {
+                            message: format!("Update check failed: {}", e),
+                        },
+                    );
+                }
                 return;
             }
         };
@@ -134,7 +146,20 @@ pub async fn check_update(app: AppHandle) -> Result<Option<UpdateAvailablePayloa
             Ok(Some(payload))
         }
         Ok(None) => Ok(None),
-        Err(e) => Err(format!("Update check failed: {}", e)),
+        Err(e) => {
+            let msg = e.to_string();
+            // Gracefully handle missing updater bundles (empty URLs in latest.json).
+            // This is a CI configuration issue, not a user-facing error.
+            if msg.contains("relative URL") || msg.contains("empty") {
+                tracing::info!(
+                    "Manual update check: no updater bundles available ({})",
+                    msg
+                );
+                Ok(None)
+            } else {
+                Err(format!("Update check failed: {}", e))
+            }
+        }
     }
 }
 

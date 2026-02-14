@@ -1444,4 +1444,11 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<String>> {
         self.get_top_entry_functions(project_id, limit).await
     }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        match self.execute("RETURN 1 AS ping").await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
 }
