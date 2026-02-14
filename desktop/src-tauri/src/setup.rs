@@ -235,9 +235,24 @@ fn random_secret(len: usize) -> String {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyStatus {
+    /// Backward compat: true when Docker daemon is reachable.
     pub docker_available: bool,
+    /// Fine-grained Docker status: "running", "installed", or "not_installed".
+    pub docker_status: String,
     pub claude_code_available: bool,
     pub config_exists: bool,
+    /// Whether setup has been completed (from config.yaml).
+    pub setup_completed: bool,
+    /// Infrastructure mode: "docker" or "external" (from config.yaml, defaults to "docker").
+    pub infra_mode: String,
+    /// Whether NATS is enabled (from config.yaml, defaults to true).
+    pub nats_enabled: bool,
+    /// Neo4j password from config.yaml (needed by start_docker_services).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neo4j_password: Option<String>,
+    /// Meilisearch key from config.yaml (needed by start_docker_services).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meilisearch_key: Option<String>,
     pub os: String,
     pub arch: String,
 }
@@ -245,22 +260,65 @@ pub struct DependencyStatus {
 /// Check all dependencies in one call (for the splash screen).
 ///
 /// This avoids multiple round-trips between JS and Rust.
+/// Returns fine-grained Docker status, infra_mode, credentials (for start_docker_services),
+/// and other dependency info.
 #[tauri::command]
 pub async fn check_dependencies(
     docker: tauri::State<'_, crate::docker::SharedDockerManager>,
 ) -> Result<DependencyStatus, String> {
-    // Docker check (async via bollard)
-    let docker_available = {
+    // Docker check — fine-grained status (async via bollard)
+    let docker_status = {
         let mgr = docker.read().await;
-        mgr.is_available().await
+        mgr.status().await
     };
+    let docker_available = docker_status == crate::docker::DockerStatus::Running;
 
     // Claude Code CLI check
     let claude_code_available =
         project_orchestrator::setup_claude::detect_claude_cli().is_some();
 
-    // Config file check
-    let config_exists = config_path().exists();
+    // Config file check + read config for infra_mode, credentials, etc.
+    let config_path = config_path();
+    let config_exists = config_path.exists();
+
+    let (setup_completed, infra_mode, nats_enabled, neo4j_password, meilisearch_key) =
+        if config_exists {
+            match std::fs::read_to_string(&config_path) {
+                Ok(contents) => {
+                    match serde_yaml::from_str::<project_orchestrator::YamlConfig>(&contents) {
+                        Ok(yaml) => {
+                            let setup = yaml.setup_completed;
+                            let mode = yaml
+                                .infra_mode
+                                .clone()
+                                .unwrap_or_else(|| "docker".to_string());
+                            let nats = yaml.nats.url.is_some();
+                            let neo4j_pw = if yaml.neo4j.password.is_empty() {
+                                None
+                            } else {
+                                Some(yaml.neo4j.password.clone())
+                            };
+                            let meili_key = if yaml.meilisearch.key.is_empty() {
+                                None
+                            } else {
+                                Some(yaml.meilisearch.key.clone())
+                            };
+                            (setup, mode, nats, neo4j_pw, meili_key)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse config.yaml: {}", e);
+                            (false, "docker".to_string(), true, None, None)
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read config.yaml: {}", e);
+                    (false, "docker".to_string(), true, None, None)
+                }
+            }
+        } else {
+            (false, "docker".to_string(), true, None, None)
+        };
 
     // Platform info
     let os = std::env::consts::OS.to_string();
@@ -268,8 +326,14 @@ pub async fn check_dependencies(
 
     Ok(DependencyStatus {
         docker_available,
+        docker_status: docker_status.to_string(),
         claude_code_available,
         config_exists,
+        setup_completed,
+        infra_mode,
+        nats_enabled,
+        neo4j_password,
+        meilisearch_key,
         os,
         arch,
     })
