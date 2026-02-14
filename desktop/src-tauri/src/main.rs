@@ -18,17 +18,24 @@ fn get_server_port() -> u16 {
     setup::DEFAULT_DESKTOP_PORT
 }
 
-/// Tauri command: check if the backend HTTP listener is reachable.
+/// Tauri command: check backend health and return the full `/health` response.
 ///
-/// Returns true as soon as the server responds (any HTTP status code).
-/// Service-level health (Neo4j, Meilisearch) is checked separately
-/// by `check_services_health` and the enriched `/health` endpoint.
+/// Returns the JSON body from the `/health` endpoint, which includes:
+/// - `status`: "ok" | "degraded" | "unhealthy"
+/// - `version`: semver string
+/// - `services.neo4j`: "connected" | "disconnected"
+/// - `services.meilisearch`: "connected" | "disconnected"
+///
+/// Returns `null` if the server is not reachable yet.
 #[tauri::command]
-async fn check_health(port: u16) -> Result<bool, String> {
+async fn check_health(port: u16) -> Result<Option<serde_json::Value>, String> {
     let url = format!("http://localhost:{}/health", port);
     match reqwest::get(&url).await {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(body) => Ok(Some(body)),
+            Err(_) => Ok(Some(serde_json::json!({"status": "ok"}))),
+        },
+        Err(_) => Ok(None),
     }
 }
 

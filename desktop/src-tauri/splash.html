@@ -392,15 +392,15 @@
 
         // -- Route based on infra_mode --
         if (deps.infraMode === 'external') {
-          // External mode: skip Docker & services entirely
+          // External mode: skip Docker, but check service connectivity
           setCheck('check-docker', 'skipped', 'External mode');
-          setCheck('check-neo4j', 'skipped', 'Managed externally');
-          setCheck('check-meilisearch', 'skipped', 'Managed externally');
+          setCheck('check-neo4j', '', 'Checking connectivity...');
+          setCheck('check-meilisearch', '', 'Checking connectivity...');
           if (deps.natsEnabled) {
-            setCheck('check-nats', 'skipped', 'Managed externally');
+            setCheck('check-nats', '', 'Checking connectivity...');
           }
-          setStatus('Starting backend...');
-          await pollBackendHealth();
+          setStatus('Checking services...');
+          await pollBackendHealthWithServices(deps.natsEnabled);
           return;
         }
 
@@ -655,8 +655,8 @@
 
       while (!isGlobalTimeout()) {
         try {
-          const healthy = await invoke('check_health', { port });
-          if (healthy) {
+          const health = await invoke('check_health', { port });
+          if (health) {
             setCheck('check-backend', 'success');
             setStatus('Ready');
 
@@ -667,6 +667,50 @@
           }
         } catch (_) { /* not ready yet */ }
         await sleep(200);
+      }
+
+      // Global timeout
+      setCheck('check-backend', 'error', 'Failed to start within timeout');
+      setStatus('Backend did not start in time');
+      document.getElementById('btn-continue').classList.add('visible');
+    }
+
+    // External mode: poll /health and update service check-items from the response
+    async function pollBackendHealthWithServices(natsEnabled) {
+      setCheck('check-backend', '', 'Starting...');
+
+      const port = await invoke('get_server_port').catch(() => 6600);
+
+      while (!isGlobalTimeout()) {
+        try {
+          const health = await invoke('check_health', { port });
+          if (health) {
+            // Update service statuses from the enriched /health response
+            if (health.services) {
+              setCheck('check-neo4j',
+                health.services.neo4j === 'connected' ? 'success' : 'error',
+                health.services.neo4j === 'connected' ? 'Connected' : 'Unreachable');
+              setCheck('check-meilisearch',
+                health.services.meilisearch === 'connected' ? 'success' : 'error',
+                health.services.meilisearch === 'connected' ? 'Connected' : 'Unreachable');
+              if (natsEnabled) {
+                // NATS status is not in /health yet — mark as skipped for now
+                setCheck('check-nats', 'skipped', 'Not checked');
+              }
+            } else {
+              // Fallback for old /health format (no services field)
+              setCheck('check-neo4j', 'skipped', 'Status unavailable');
+              setCheck('check-meilisearch', 'skipped', 'Status unavailable');
+            }
+
+            setCheck('check-backend', 'success');
+            setStatus('Ready');
+            await sleep(500);
+            transitionToMain();
+            return;
+          }
+        } catch (_) { /* not ready yet */ }
+        await sleep(500);
       }
 
       // Global timeout
