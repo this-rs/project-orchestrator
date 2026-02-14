@@ -338,20 +338,32 @@ fn main() {
         }
 
         if let tauri::RunEvent::ExitRequested { .. } = event {
-            tracing::info!("Application exiting — stopping Docker services...");
-            let dm = docker_for_exit.clone();
-            // Spawn a blocking task to stop containers
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let mgr = dm.read().await;
-                    if let Err(e) = mgr.stop_services().await {
-                        tracing::warn!("Failed to stop Docker services on exit: {}", e);
-                    }
-                });
-            })
-            .join()
-            .ok();
+            // Only stop Docker containers if infra_mode is "docker" (managed mode).
+            // In "external" mode the user manages their own services — we must NOT
+            // stop containers that the app didn't start.
+            let infra_mode = std::fs::read_to_string(setup::config_path())
+                .ok()
+                .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+                .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
+                .unwrap_or_else(|| "docker".to_string());
+
+            if infra_mode == "external" {
+                tracing::info!("Application exiting — infra_mode is external, skipping Docker stop");
+            } else {
+                tracing::info!("Application exiting — stopping Docker services...");
+                let dm = docker_for_exit.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let mgr = dm.read().await;
+                        if let Err(e) = mgr.stop_services().await {
+                            tracing::warn!("Failed to stop Docker services on exit: {}", e);
+                        }
+                    });
+                })
+                .join()
+                .ok();
+            }
         }
     });
 }
