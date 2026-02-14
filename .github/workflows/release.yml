@@ -607,7 +607,7 @@ jobs:
 
       # --- macOS Notarization: submit to Apple and staple ---
       - name: Notarize macOS .dmg
-        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        if: runner.os == 'macOS' && secrets.APPLE_ID != ''
         continue-on-error: true
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -617,14 +617,25 @@ jobs:
           DMG_PATH=$(find desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
           if [ -n "$DMG_PATH" ]; then
             echo "Notarizing $DMG_PATH..."
-            xcrun notarytool submit "$DMG_PATH" \
+            SUBMIT_OUTPUT=$(xcrun notarytool submit "$DMG_PATH" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" \
-              --wait
+              --wait 2>&1) || true
+            echo "$SUBMIT_OUTPUT"
+
+            # Extract submission ID and fetch detailed log on failure
+            SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+            if echo "$SUBMIT_OUTPUT" | grep -qi "invalid"; then
+              echo "::warning::Notarization returned Invalid — fetching Apple log..."
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+            fi
 
             echo "Stapling notarization ticket..."
-            xcrun stapler staple "$DMG_PATH"
+            xcrun stapler staple "$DMG_PATH" || true
 
             echo "Verifying..."
             spctl --assess --type open --context context:primary-signature -v "$DMG_PATH" || true
