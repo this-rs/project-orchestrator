@@ -664,11 +664,12 @@ jobs:
           cd -
 
           # Re-sign the .app.tar.gz with Tauri updater key
-          # Always pass --password (even if empty) because the key may be encrypted
           echo "Signing updater bundle with Tauri key..."
-          cargo tauri signer sign "$TAR_PATH" \
-            --private-key "$UPDATER_PRIVATE_KEY" \
-            --password "${UPDATER_PRIVATE_KEY_PASSWORD:-}"
+          SIGNER_ARGS=("$TAR_PATH" --private-key "$UPDATER_PRIVATE_KEY")
+          if [ -n "$UPDATER_PRIVATE_KEY_PASSWORD" ]; then
+            SIGNER_ARGS+=(--password "$UPDATER_PRIVATE_KEY_PASSWORD")
+          fi
+          cargo tauri signer sign "${SIGNER_ARGS[@]}"
           echo "✅ Updater bundle recreated and signed"
 
           # Also re-sign the .dmg with timestamp
