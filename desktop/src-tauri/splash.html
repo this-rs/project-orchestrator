@@ -363,7 +363,9 @@
 
     function openUrl(url) {
       if (window.__TAURI__) {
-        window.__TAURI__.shell.open(url);
+        window.__TAURI__.core.invoke('open_url', { url }).catch(err => {
+          console.error('open_url failed:', err);
+        });
       }
     }
 
