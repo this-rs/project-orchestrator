@@ -461,6 +461,10 @@ jobs:
     name: Tauri ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     needs: [build-frontend]
+    env:
+      # Expose secrets as job-level env so step `if:` conditions can check them
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
     strategy:
       fail-fast: false
       matrix:
@@ -615,7 +619,7 @@ jobs:
 
       # --- macOS Notarization: submit to Apple and staple ---
       - name: Notarize macOS .dmg
-        if: runner.os == 'macOS' && secrets.APPLE_ID != ''
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
         continue-on-error: true
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
