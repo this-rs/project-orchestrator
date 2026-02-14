@@ -232,6 +232,12 @@
         <span class="check-label">Configuration</span>
       </div>
     </div>
+    <div class="check-item" id="check-claude">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <div class="check-content">
+        <span class="check-label">Claude Code CLI</span>
+      </div>
+    </div>
     <div class="check-item" id="check-docker">
       <div class="check-icon"><div class="spinner"></div></div>
       <div class="check-content">
@@ -383,6 +389,13 @@
           setCheck('check-config', 'warning', 'Will be created by setup wizard');
         }
 
+        // -- Claude Code CLI --
+        if (deps.claudeCodeAvailable) {
+          setCheck('check-claude', 'success');
+        } else {
+          setCheck('check-claude', 'warning', 'Chat features require Claude Code CLI');
+        }
+
         // -- NATS visibility --
         if (deps.natsEnabled) {
           showItem('check-nats');
@@ -425,6 +438,7 @@
         console.error('check_dependencies failed:', err);
         // Fallback: skip dep checks and just poll backend
         setCheck('check-config', 'warning');
+        setCheck('check-claude', 'warning', 'Could not check');
         setCheck('check-docker', 'warning', 'Could not check');
         setCheck('check-neo4j', 'warning');
         setCheck('check-meilisearch', 'warning');
