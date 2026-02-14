@@ -104,6 +104,7 @@ fn main() {
             setup::verify_oidc_discovery,
             // Docker management commands
             docker::check_docker,
+            docker::open_docker_desktop,
             docker::start_docker_services,
             docker::check_services_health,
             docker::stop_docker_services,

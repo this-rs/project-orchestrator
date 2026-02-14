@@ -94,8 +94,36 @@ pub struct DockerManager {
 
 impl DockerManager {
     /// Try to connect to Docker. Returns a manager even if Docker is unavailable.
+    ///
+    /// On macOS, Docker Desktop may place its socket in different locations depending
+    /// on the version and architecture. We try multiple paths if the default fails.
     pub fn new() -> Self {
-        let docker = Docker::connect_with_local_defaults().ok();
+        // Try the default first (DOCKER_HOST env var, or /var/run/docker.sock)
+        let docker = Docker::connect_with_local_defaults()
+            .ok()
+            .or_else(|| {
+                // On macOS, Docker Desktop often uses ~/.docker/run/docker.sock
+                // instead of /var/run/docker.sock (especially on newer installs)
+                #[cfg(target_os = "macos")]
+                {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let alt_sockets = [
+                        format!("{}/.docker/run/docker.sock", home),
+                        format!("{}/.docker/desktop/docker.sock", home),
+                        "/var/run/docker.sock.raw".to_string(),
+                    ];
+                    for socket in &alt_sockets {
+                        if std::path::Path::new(socket).exists() {
+                            tracing::info!("Trying Docker socket: {}", socket);
+                            let url = format!("unix://{}", socket);
+                            if let Ok(d) = Docker::connect_with_socket(&url, 5, bollard::API_DEFAULT_VERSION) {
+                                return Some(d);
+                            }
+                        }
+                    }
+                }
+                None
+            });
         Self { docker }
     }
 
@@ -587,6 +615,42 @@ pub async fn check_docker(
         available: status == DockerStatus::Running,
         status: status.to_string(),
     })
+}
+
+/// Attempt to launch Docker Desktop application.
+///
+/// On macOS: `open -a Docker`
+/// On Linux: `systemctl --user start docker-desktop` (or just `docker` if available)
+/// On Windows: starts Docker Desktop from Program Files
+#[tauri::command]
+pub async fn open_docker_desktop() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-a")
+            .arg("Docker")
+            .spawn()
+            .map_err(|e| format!("Failed to open Docker Desktop: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try systemctl first, fall back to direct launch
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "start", "docker-desktop"])
+            .spawn();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let program_files = std::env::var("ProgramFiles").unwrap_or_default();
+        let docker_path = format!("{}\\Docker\\Docker\\Docker Desktop.exe", program_files);
+        std::process::Command::new(&docker_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open Docker Desktop: {}", e))?;
+    }
+
+    Ok(())
 }
 
 /// Start Docker services (Neo4j + MeiliSearch).

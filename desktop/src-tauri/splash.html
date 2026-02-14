@@ -401,7 +401,8 @@
         if (deps.claudeCodeAvailable) {
           setCheck('check-claude', 'success');
         } else {
-          setCheck('check-claude', 'warning', 'Chat features require Claude Code CLI');
+          setCheck('check-claude', 'warning', 'Chat features require Claude Code CLI',
+            `<span class="check-action" onclick="openUrl('https://docs.anthropic.com/en/docs/claude-code/overview')">Install</span>`);
         }
 
         // -- NATS visibility --
@@ -468,7 +469,8 @@
 
       } else if (dockerStatus === 'installed') {
         // Docker Desktop is installed but daemon is not running
-        setCheck('check-docker', 'warning', 'Docker Desktop is not running');
+        setCheck('check-docker', 'warning', 'Docker Desktop is not running',
+          `<span class="check-action" onclick="invoke('open_docker_desktop').catch(()=>{})">Open</span>`);
         setCheck('check-neo4j', '', 'Waiting for Docker...');
         setCheck('check-meilisearch', '', 'Waiting for Docker...');
         if (deps.natsEnabled) {
