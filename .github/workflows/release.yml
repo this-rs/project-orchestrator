@@ -535,6 +535,38 @@ jobs:
           Copy-Item "target/release/mcp_server.exe" "target/release/mcp_server"
           Write-Host "✅ mcp_server extracted to target/release/"
 
+      # --- macOS Code Signing: import certificate into a persistent keychain ---
+      # We manage our own keychain so the certificate stays available for BOTH
+      # the Tauri build step AND the post-build re-sign step (which adds --timestamp).
+      # We do NOT pass APPLE_CERTIFICATE to Tauri — that would make Tauri create
+      # its own temporary keychain, which gets cleaned up before re-sign runs.
+      - name: Import Apple Developer certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Create and configure keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to keychain search list (prepend so it's found first)
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychain -d user | tr -d '"')
+
+          # Verify
+          security find-identity -v "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
       # IMPORTANT: TAURI_SIGNING_PRIVATE_KEY must be set in GitHub Secrets for
       # auto-update to work. Without it, Tauri won't generate the updater bundles
       # (.app.tar.gz, .AppImage.tar.gz, .nsis.zip) nor their .sig files, and
@@ -544,17 +576,16 @@ jobs:
       # Generate a keypair with: cargo tauri signer generate -w ~/.tauri/myapp.key
       # Then set TAURI_SIGNING_PRIVATE_KEY to the contents of the private key file,
       # and update the pubkey in desktop/src-tauri/tauri.conf.json → plugins.updater.pubkey
-      # IMPORTANT: APPLE_CERTIFICATE + APPLE_CERTIFICATE_PASSWORD let Tauri
-      # create its own temporary keychain and import the certificate automatically.
-      # Do NOT create a manual keychain — it conflicts with Tauri's internal one.
+      #
+      # macOS: We pass APPLE_SIGNING_IDENTITY only (NOT APPLE_CERTIFICATE) so Tauri
+      # uses our pre-imported keychain instead of creating its own temporary one.
+      # This keeps the certificate available for the re-sign step that follows.
       - name: Build Tauri bundle
         working-directory: desktop/src-tauri
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS code signing — Tauri handles keychain creation internally
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # macOS — identity only, certificate is in our persistent keychain
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           # Windows signing
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -714,6 +745,13 @@ jobs:
             desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi.zip
             desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi.zip.sig
           retention-days: 1
+
+      # --- macOS Cleanup: remove temp keychain ---
+      - name: Cleanup macOS keychain
+        if: runner.os == 'macOS' && always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
 
   # ==========================================================================
   # Release - Collect all artifacts and publish GitHub Release
