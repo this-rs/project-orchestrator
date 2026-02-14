@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -66,6 +67,11 @@ pub struct ActiveSession {
     pub streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
     /// Current permission mode for this session (updated on mid-session changes)
     pub permission_mode: Option<String>,
+    /// Cancellation token for NATS listener tasks spawned by this session.
+    /// When the session is replaced (e.g., by `resume_session`), the old token
+    /// is cancelled so that stale NATS listeners (interrupt, snapshot, RPC)
+    /// shut down instead of accumulating across resumes/restarts.
+    pub nats_cancel: CancellationToken,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -304,6 +310,7 @@ impl ChatManager {
         session_id: &str,
         interrupt_flag: Arc<AtomicBool>,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
     ) {
         let Some(ref nats) = self.nats else {
             return;
@@ -324,34 +331,47 @@ impl ChatManager {
                 }
             };
 
-            while let Some(_msg) = subscriber.next().await {
-                // Check if session is still active — stop listener if session was removed
-                let session_exists = {
-                    let sessions = active_sessions.read().await;
-                    sessions.contains_key(&session_id)
-                };
-                if !session_exists {
-                    debug!(
-                        "Session {} no longer active, stopping NATS interrupt listener",
-                        session_id
-                    );
-                    break;
-                }
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!(
+                            "NATS interrupt listener cancelled for session {} (session replaced)",
+                            session_id
+                        );
+                        break;
+                    }
+                    msg = subscriber.next() => {
+                        let Some(_msg) = msg else { break; };
 
-                // Guard: don't re-interrupt if the flag is already set
-                if interrupt_flag.load(Ordering::SeqCst) {
-                    debug!(
-                        "Interrupt flag already set for session {}, ignoring NATS interrupt",
-                        session_id
-                    );
-                    continue;
-                }
+                        // Check if session is still active — stop listener if session was removed
+                        let session_exists = {
+                            let sessions = active_sessions.read().await;
+                            sessions.contains_key(&session_id)
+                        };
+                        if !session_exists {
+                            debug!(
+                                "Session {} no longer active, stopping NATS interrupt listener",
+                                session_id
+                            );
+                            break;
+                        }
 
-                info!(
-                    "NATS interrupt received for session {}, setting interrupt flag",
-                    session_id
-                );
-                interrupt_flag.store(true, Ordering::SeqCst);
+                        // Guard: don't re-interrupt if the flag is already set
+                        if interrupt_flag.load(Ordering::SeqCst) {
+                            debug!(
+                                "Interrupt flag already set for session {}, ignoring NATS interrupt",
+                                session_id
+                            );
+                            continue;
+                        }
+
+                        info!(
+                            "NATS interrupt received for session {}, setting interrupt flag",
+                            session_id
+                        );
+                        interrupt_flag.store(true, Ordering::SeqCst);
+                    }
+                }
             }
 
             debug!("NATS interrupt listener stopped for session {}", session_id);
@@ -368,6 +388,7 @@ impl ChatManager {
         &self,
         session_id: &str,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
     ) {
         let Some(ref nats) = self.nats else {
             return;
@@ -388,59 +409,72 @@ impl ChatManager {
                 }
             };
 
-            while let Some(msg) = subscriber.next().await {
-                // Build snapshot from active session state
-                let snapshot = {
-                    let sessions = active_sessions.read().await;
-                    match sessions.get(&session_id) {
-                        Some(session) => {
-                            let is_streaming = session.is_streaming.load(Ordering::SeqCst);
-                            let text = session.streaming_text.lock().await.clone();
-                            let events = session.streaming_events.lock().await.clone();
-                            Some(crate::events::StreamingSnapshot {
-                                is_streaming,
-                                partial_text: text,
-                                events,
-                            })
-                        }
-                        None => {
-                            // Session no longer active — stop responder
-                            debug!(
-                                "Session {} no longer active, stopping snapshot responder",
-                                session_id
-                            );
-                            break;
-                        }
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!(
+                            "NATS snapshot responder cancelled for session {} (session replaced)",
+                            session_id
+                        );
+                        break;
                     }
-                };
+                    msg = subscriber.next() => {
+                        let Some(msg) = msg else { break; };
 
-                if let Some(snapshot) = snapshot {
-                    // Reply to the requester
-                    if let Some(reply_to) = msg.reply {
-                        match serde_json::to_vec(&snapshot) {
-                            Ok(payload) => {
-                                if let Err(e) =
-                                    nats.client().publish(reply_to, payload.into()).await
-                                {
-                                    warn!(
-                                        "Failed to reply with snapshot for session {}: {}",
-                                        session_id, e
-                                    );
-                                } else {
+                        // Build snapshot from active session state
+                        let snapshot = {
+                            let sessions = active_sessions.read().await;
+                            match sessions.get(&session_id) {
+                                Some(session) => {
+                                    let is_streaming = session.is_streaming.load(Ordering::SeqCst);
+                                    let text = session.streaming_text.lock().await.clone();
+                                    let events = session.streaming_events.lock().await.clone();
+                                    Some(crate::events::StreamingSnapshot {
+                                        is_streaming,
+                                        partial_text: text,
+                                        events,
+                                    })
+                                }
+                                None => {
+                                    // Session no longer active — stop responder
                                     debug!(
-                                        session_id = %session_id,
-                                        is_streaming = snapshot.is_streaming,
-                                        text_len = snapshot.partial_text.len(),
-                                        events_count = snapshot.events.len(),
-                                        "Replied with streaming snapshot"
+                                        "Session {} no longer active, stopping snapshot responder",
+                                        session_id
                                     );
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to serialize snapshot for session {}: {}",
-                                    session_id, e
-                                );
+                        };
+
+                        if let Some(snapshot) = snapshot {
+                            // Reply to the requester
+                            if let Some(reply_to) = msg.reply {
+                                match serde_json::to_vec(&snapshot) {
+                                    Ok(payload) => {
+                                        if let Err(e) =
+                                            nats.client().publish(reply_to, payload.into()).await
+                                        {
+                                            warn!(
+                                                "Failed to reply with snapshot for session {}: {}",
+                                                session_id, e
+                                            );
+                                        } else {
+                                            debug!(
+                                                session_id = %session_id,
+                                                is_streaming = snapshot.is_streaming,
+                                                text_len = snapshot.partial_text.len(),
+                                                events_count = snapshot.events.len(),
+                                                "Replied with streaming snapshot"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to serialize snapshot for session {}: {}",
+                                            session_id, e
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -463,6 +497,7 @@ impl ChatManager {
         &self,
         session_id: &str,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
     ) {
         let Some(ref nats) = self.nats else {
             return;
@@ -491,7 +526,22 @@ impl ChatManager {
                 "NATS RPC send listener started"
             );
 
-            while let Some(msg) = subscriber.next().await {
+            loop {
+            let msg = tokio::select! {
+                _ = cancel.cancelled() => {
+                    debug!(
+                        "NATS RPC listener cancelled for session {} (session replaced)",
+                        session_id
+                    );
+                    break;
+                }
+                msg = subscriber.next() => {
+                    match msg {
+                        Some(m) => m,
+                        None => break,
+                    }
+                }
+            };
                 // Parse the RPC request
                 let request: crate::events::ChatRpcRequest =
                     match serde_json::from_slice(&msg.payload) {
@@ -1151,9 +1201,18 @@ impl ChatManager {
         let streaming_text = Arc::new(Mutex::new(String::new()));
         let streaming_events = Arc::new(Mutex::new(Vec::new()));
 
-        // Register active session
+        // Register active session — cancel old NATS listeners if session key already exists
+        let nats_cancel = CancellationToken::new();
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
+            // Cancel stale NATS listeners from a previous session with the same ID
+            if let Some(old_session) = sessions.get(&session_id.to_string()) {
+                info!(
+                    session_id = %session_id,
+                    "Cancelling stale NATS listeners for existing session (create_session replacing)"
+                );
+                old_session.nats_cancel.cancel();
+            }
             let interrupt_flag = Arc::new(AtomicBool::new(false));
             sessions.insert(
                 session_id.to_string(),
@@ -1170,6 +1229,7 @@ impl ChatManager {
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
                     permission_mode: request.permission_mode.clone(),
+                    nats_cancel: nats_cancel.clone(),
                 },
             );
             interrupt_flag
@@ -1180,13 +1240,14 @@ impl ChatManager {
             &session_id.to_string(),
             interrupt_flag.clone(),
             self.active_sessions.clone(),
+            nats_cancel.clone(),
         );
 
         // Spawn NATS snapshot responder for cross-instance mid-stream join
-        self.spawn_nats_snapshot_responder(&session_id.to_string(), self.active_sessions.clone());
+        self.spawn_nats_snapshot_responder(&session_id.to_string(), self.active_sessions.clone(), nats_cancel.clone());
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(&session_id.to_string(), self.active_sessions.clone());
+        self.spawn_nats_rpc_listener(&session_id.to_string(), self.active_sessions.clone(), nats_cancel);
 
         // Persist the initial user_message event
         let user_event = ChatEventRecord {
@@ -2279,9 +2340,23 @@ impl ChatManager {
         let streaming_text = Arc::new(Mutex::new(String::new()));
         let streaming_events = Arc::new(Mutex::new(Vec::new()));
 
-        // Register as active
+        // Register as active — cancel old NATS listeners if session was previously active
+        let nats_cancel = CancellationToken::new();
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
+            // Cancel stale NATS listeners from a previous resume/create of this session.
+            // Without this, each resume_session() spawns 3 new NATS listeners (interrupt,
+            // snapshot, RPC) that accumulate — the old ones never stop because the session
+            // key still exists in the HashMap (insert replaces the value, not the key).
+            // This causes N duplicate stream_response spawns per message, where N is the
+            // number of times the session was resumed.
+            if let Some(old_session) = sessions.get(session_id) {
+                info!(
+                    session_id = %session_id,
+                    "Cancelling stale NATS listeners for session (resume replacing)"
+                );
+                old_session.nats_cancel.cancel();
+            }
             let interrupt_flag = Arc::new(AtomicBool::new(false));
             sessions.insert(
                 session_id.to_string(),
@@ -2298,6 +2373,7 @@ impl ChatManager {
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
                     permission_mode: session_node.permission_mode.clone(),
+                    nats_cancel: nats_cancel.clone(),
                 },
             );
             interrupt_flag
@@ -2308,13 +2384,14 @@ impl ChatManager {
             session_id,
             interrupt_flag.clone(),
             self.active_sessions.clone(),
+            nats_cancel.clone(),
         );
 
         // Spawn NATS snapshot responder for cross-instance mid-stream join
-        self.spawn_nats_snapshot_responder(session_id, self.active_sessions.clone());
+        self.spawn_nats_snapshot_responder(session_id, self.active_sessions.clone(), nats_cancel.clone());
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone());
+        self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone(), nats_cancel);
 
         // Persist the user_message event
         let user_event = ChatEventRecord {
@@ -4266,6 +4343,7 @@ mod tests {
             streaming_text: Arc::new(Mutex::new(streaming_text.to_string())),
             streaming_events: Arc::new(Mutex::new(streaming_events_data)),
             permission_mode: None,
+            nats_cancel: CancellationToken::new(),
         };
 
         Some((session, pending_messages))
@@ -4875,7 +4953,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         // This should be a complete no-op — no NATS means early return
-        manager.spawn_nats_rpc_listener("test-session", manager.active_sessions.clone());
+        manager.spawn_nats_rpc_listener("test-session", manager.active_sessions.clone(), CancellationToken::new());
         // If we get here without panic, the test passes
     }
 
