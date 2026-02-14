@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.0.1) — must already exist"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,6 +18,8 @@ env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: orchestrator
   FRONTEND_REPO: this-rs/project-orchestrator-frontend
+  # Resolve the release tag: use the workflow_dispatch input if provided, otherwise GITHUB_REF_NAME (from tag push)
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   # ==========================================================================
@@ -96,7 +104,7 @@ jobs:
       - name: Get version from tag
         id: version
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Inject version from git tag
         shell: bash
@@ -217,7 +225,7 @@ jobs:
       - name: Get version from tag
         id: version
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Inject version from git tag
         shell: bash
@@ -332,7 +340,7 @@ jobs:
 
       - name: Get version from tag
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
@@ -410,7 +418,7 @@ jobs:
 
       - name: Get version from tag
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
@@ -479,7 +487,7 @@ jobs:
       - name: Get version from tag
         id: version
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       # Inject the git tag version into all version files so the built
       # artifacts (app name, About dialog, --version flag) match the release.
@@ -736,11 +744,11 @@ jobs:
       - name: Generate Tauri updater latest.json
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           REPO="${{ github.repository }}"
-          BASE_URL="https://github.com/${REPO}/releases/download/${GITHUB_REF_NAME}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
           NOTES=$(cat <<'EOFNOTES'
-          See release notes at https://github.com/${REPO}/releases/tag/${GITHUB_REF_NAME}
+          See release notes at https://github.com/${REPO}/releases/tag/${RELEASE_TAG}
           EOFNOTES
           )
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -817,6 +825,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: |
             release-files/*
@@ -909,11 +918,11 @@ jobs:
 
       - name: Get version from tag
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Download checksums
         run: |
-          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/checksums-sha256.txt" \
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/checksums-sha256.txt" \
             -o checksums-sha256.txt
           cat checksums-sha256.txt
 
