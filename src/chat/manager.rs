@@ -623,7 +623,10 @@ impl ChatManager {
         let refinement_prompt =
             build_refinement_prompt(user_message, context_json, tools_catalog_json);
 
-        // Build options: no MCP server, max_turns=1, just text generation
+        // Build options: no MCP server, max_turns=1, just text generation.
+        // NOTE: Intentionally hardcoded to BypassPermissions — this is an internal
+        // one-shot context refinement call with no user-facing tool interaction.
+        // It must NOT use the user-configured permission mode.
         #[allow(deprecated)]
         let options = ClaudeCodeOptions::builder()
             .model(&self.config.prompt_builder_model)
@@ -711,10 +714,18 @@ impl ChatManager {
             .model(model)
             .cwd(cwd)
             .system_prompt(system_prompt)
-            .permission_mode(PermissionMode::BypassPermissions)
+            .permission_mode(self.config.permission.to_nexus_mode())
             .max_turns(self.config.max_turns)
             .include_partial_messages(true)
             .add_mcp_server("project-orchestrator", mcp_config);
+
+        // Wire allowed/disallowed tool patterns from config
+        if !self.config.permission.allowed_tools.is_empty() {
+            builder = builder.allowed_tools(self.config.permission.allowed_tools.clone());
+        }
+        if !self.config.permission.disallowed_tools.is_empty() {
+            builder = builder.disallowed_tools(self.config.permission.disallowed_tools.clone());
+        }
 
         if let Some(id) = resume_id {
             builder = builder.resume(id);
@@ -2411,6 +2422,40 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         assert_eq!(manager.resolve_model(None), "claude-opus-4-6");
+    }
+
+    #[test]
+    fn test_build_options_uses_config_permission_default() {
+        // Default config (BypassPermissions) — backward compatibility
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        #[allow(deprecated)]
+        let opts = manager.build_options("/tmp", "claude-opus-4-6", "test prompt", None);
+        assert!(matches!(
+            opts.permission_mode,
+            PermissionMode::BypassPermissions
+        ));
+        assert!(opts.allowed_tools.is_empty());
+        assert!(opts.disallowed_tools.is_empty());
+    }
+
+    #[test]
+    fn test_build_options_uses_config_permission_custom() {
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.permission = crate::chat::config::PermissionConfig {
+            mode: "default".into(),
+            allowed_tools: vec!["Bash(git *)".into(), "Read".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+
+        #[allow(deprecated)]
+        let opts = manager.build_options("/tmp", "claude-opus-4-6", "test prompt", None);
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
+        assert_eq!(opts.allowed_tools, vec!["Bash(git *)", "Read"]);
+        assert_eq!(opts.disallowed_tools, vec!["Bash(rm -rf *)"]);
     }
 
     #[tokio::test]
