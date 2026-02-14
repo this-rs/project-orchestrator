@@ -527,21 +527,21 @@ impl ChatManager {
             );
 
             loop {
-            let msg = tokio::select! {
-                _ = cancel.cancelled() => {
-                    debug!(
-                        "NATS RPC listener cancelled for session {} (session replaced)",
-                        session_id
-                    );
-                    break;
-                }
-                msg = subscriber.next() => {
-                    match msg {
-                        Some(m) => m,
-                        None => break,
+                let msg = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!(
+                            "NATS RPC listener cancelled for session {} (session replaced)",
+                            session_id
+                        );
+                        break;
                     }
-                }
-            };
+                    msg = subscriber.next() => {
+                        match msg {
+                            Some(m) => m,
+                            None => break,
+                        }
+                    }
+                };
                 // Parse the RPC request
                 let request: crate::events::ChatRpcRequest =
                     match serde_json::from_slice(&msg.payload) {
@@ -1244,10 +1244,18 @@ impl ChatManager {
         );
 
         // Spawn NATS snapshot responder for cross-instance mid-stream join
-        self.spawn_nats_snapshot_responder(&session_id.to_string(), self.active_sessions.clone(), nats_cancel.clone());
+        self.spawn_nats_snapshot_responder(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(&session_id.to_string(), self.active_sessions.clone(), nats_cancel);
+        self.spawn_nats_rpc_listener(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+            nats_cancel,
+        );
 
         // Persist the initial user_message event
         let user_event = ChatEventRecord {
@@ -2388,7 +2396,11 @@ impl ChatManager {
         );
 
         // Spawn NATS snapshot responder for cross-instance mid-stream join
-        self.spawn_nats_snapshot_responder(session_id, self.active_sessions.clone(), nats_cancel.clone());
+        self.spawn_nats_snapshot_responder(
+            session_id,
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn NATS RPC send listener for cross-instance message routing
         self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone(), nats_cancel);
@@ -4953,7 +4965,11 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         // This should be a complete no-op — no NATS means early return
-        manager.spawn_nats_rpc_listener("test-session", manager.active_sessions.clone(), CancellationToken::new());
+        manager.spawn_nats_rpc_listener(
+            "test-session",
+            manager.active_sessions.clone(),
+            CancellationToken::new(),
+        );
         // If we get here without panic, the test passes
     }
 

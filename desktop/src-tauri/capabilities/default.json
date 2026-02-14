@@ -22,6 +22,8 @@
     "core:window:allow-is-fullscreen",
     "core:window:allow-start-dragging",
     "core:event:allow-listen",
-    "core:tray:default"
+    "core:tray:default",
+    "dialog:default",
+    "dialog:allow-open"
   ]
 }

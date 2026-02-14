@@ -50,6 +50,26 @@ fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Tauri command: open a native directory picker dialog.
+///
+/// Returns the selected directory path, or `None` if the user cancelled.
+/// This uses `tauri_plugin_dialog` under the hood but is exposed as a
+/// custom command so the frontend can call it via `invoke()` — which is
+/// more reliable than the JS plugin bindings (no build-time IPC glue needed).
+#[tauri::command]
+async fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog()
+        .file()
+        .set_title("Select project folder")
+        .pick_folder(move |path| {
+            let _ = tx.send(path.map(|p| p.to_string()));
+        });
+    rx.recv()
+        .map_err(|e| format!("Dialog channel error: {}", e))
+}
+
 /// Tauri command: restart the entire application.
 ///
 /// Called by the setup wizard after generating config.yaml so the backend
@@ -85,12 +105,14 @@ fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(docker_manager)
         .invoke_handler(tauri::generate_handler![
             get_server_port,
             check_health,
             open_url,
+            pick_directory,
             restart_app,
             // Splash screen dependency checks
             setup::check_dependencies,

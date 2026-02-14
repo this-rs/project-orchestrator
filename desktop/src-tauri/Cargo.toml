@@ -51,6 +51,7 @@ url = "2"
 # Error handling
 anyhow = "1"
 tauri-plugin-opener = "2.5.3"
+tauri-plugin-dialog = "2"
 
 # macOS native rounded corners
 [target.'cfg(target_os = "macos")'.dependencies]
