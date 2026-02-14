@@ -18,6 +18,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::collections::HashSet;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -403,6 +404,10 @@ async fn handle_ws_chat(
     let mut ping_interval = interval(Duration::from_secs(30));
     ping_interval.tick().await; // skip first immediate tick
 
+    // Track responded permission request IDs to prevent double-click bugs.
+    // If a user clicks Allow/Deny twice, the second response is silently ignored.
+    let mut responded_permission_ids: HashSet<String> = HashSet::new();
+
     // ========================================================================
     // Phase 3: Event loop — forward broadcast events + handle client messages
     // ========================================================================
@@ -633,27 +638,63 @@ async fn handle_ws_chat(
                                         }
                                     }
 
-                                    WsChatClientMessage::PermissionResponse { allow, .. } => {
-                                        debug!(session_id = %session_id, allow, "WS: Received permission_response");
-                                        let msg = format!(
-                                            "Permission {}",
-                                            if allow { "granted" } else { "denied" }
+                                    WsChatClientMessage::PermissionResponse { id, allow } => {
+                                        let request_id = id.clone().unwrap_or_default();
+                                        let decision = if allow { "allow" } else { "deny" };
+
+                                        // Dedup: ignore duplicate responses (double-click protection)
+                                        if !request_id.is_empty() && !responded_permission_ids.insert(request_id.clone()) {
+                                            warn!(
+                                                session_id = %session_id,
+                                                request_id = %request_id,
+                                                decision,
+                                                "Duplicate permission response ignored"
+                                            );
+                                            continue;
+                                        }
+
+                                        // Determine routing: local or remote
+                                        let is_local = chat_manager.is_session_active(&session_id).await;
+                                        let routing = if is_local { "local" } else { "nats" };
+
+                                        info!(
+                                            session_id = %session_id,
+                                            request_id = %request_id,
+                                            decision,
+                                            routing,
+                                            "Permission decision"
                                         );
-                                        // Try local → remote → error (no resume for responses)
-                                        let send_result = if chat_manager.is_session_active(&session_id).await {
-                                            chat_manager.send_message(&session_id, &msg).await
-                                        } else if chat_manager
-                                            .try_remote_send(&session_id, &msg, "permission_response")
-                                            .await
-                                            .unwrap_or(false)
-                                        {
-                                            Ok(())
+
+                                        // Send control protocol response to CLI subprocess.
+                                        // Unlike user messages, permission responses use the SDK
+                                        // control protocol (JSON: {"allow": true/false}) and must
+                                        // NOT be persisted or broadcast as user_message events.
+                                        let send_result = if is_local {
+                                            chat_manager.send_permission_response(&session_id, allow).await
                                         } else {
-                                            // Session not active anywhere — can't deliver permission response
-                                            Err(anyhow::anyhow!("Session not active on any instance"))
+                                            // For remote sessions, proxy the control response via NATS RPC.
+                                            // The message_type "control_response" signals the receiving
+                                            // instance to use send_permission_response instead of send_message.
+                                            let payload = serde_json::json!({ "allow": allow }).to_string();
+                                            if chat_manager
+                                                .try_remote_send(&session_id, &payload, "control_response")
+                                                .await
+                                                .unwrap_or(false)
+                                            {
+                                                Ok(())
+                                            } else {
+                                                Err(anyhow::anyhow!("Session not active on any instance"))
+                                            }
                                         };
                                         if let Err(e) = send_result {
-                                            warn!(session_id = %session_id, error = %e, "Failed to send permission response");
+                                            warn!(
+                                                session_id = %session_id,
+                                                request_id = %request_id,
+                                                decision,
+                                                routing,
+                                                error = %e,
+                                                "Failed to send permission response"
+                                            );
                                         }
                                     }
 

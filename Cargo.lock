@@ -1735,7 +1735,6 @@ dependencies = [
 [[package]]
 name = "nexus-claude"
 version = "0.5.0"
-source = "git+https://github.com/this-rs/nexus.git?branch=main#75b48262ce7edcb82a9ed53eef8c0db5a6292889"
 dependencies = [
  "async-stream",
  "async-trait",

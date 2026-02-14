@@ -472,8 +472,35 @@ impl ChatManager {
                     )) => {
                         let message = &request.message;
 
-                        // If streaming → queue the message (will be drained by stream_response)
-                        if is_streaming.load(Ordering::SeqCst) {
+                        // Route based on message_type
+                        if request.message_type == "control_response" {
+                            // Permission control response — send directly to CLI subprocess
+                            // via SDK control protocol. Do NOT persist or broadcast.
+                            let allow: bool = serde_json::from_str::<serde_json::Value>(message)
+                                .ok()
+                                .and_then(|v| v.get("allow").and_then(|a| a.as_bool()))
+                                .unwrap_or(false);
+
+                            info!(
+                                session_id = %session_id,
+                                allow,
+                                "NATS RPC: Sending permission control response to CLI"
+                            );
+
+                            let response_json = serde_json::json!({ "allow": allow });
+                            let mut cli = client.lock().await;
+                            match cli.send_control_response(response_json).await {
+                                Ok(()) => crate::events::ChatRpcResponse {
+                                    success: true,
+                                    error: None,
+                                },
+                                Err(e) => crate::events::ChatRpcResponse {
+                                    success: false,
+                                    error: Some(format!("Failed to send control response: {}", e)),
+                                },
+                            }
+                        } else if is_streaming.load(Ordering::SeqCst) {
+                            // If streaming → queue the message (will be drained by stream_response)
                             info!(
                                 "Stream in progress for session {} (via NATS RPC), queuing message",
                                 session_id
@@ -1237,6 +1264,14 @@ impl ChatManager {
             std::collections::HashMap::new();
         let session_uuid = Uuid::parse_str(&session_id).ok();
 
+        // Take the SDK control receiver BEFORE locking the client for streaming.
+        // This allows us to listen for control protocol messages (e.g., `can_use_tool`
+        // permission requests) in parallel with the message stream.
+        let mut sdk_control_rx = {
+            let c = client.lock().await;
+            c.take_sdk_control_receiver().await
+        };
+
         {
             let mut c = client.lock().await;
             let stream_result = c.send_and_receive_stream(prompt).await;
@@ -1276,6 +1311,85 @@ impl ChatManager {
                         session_id
                     );
                     break;
+                }
+
+                // Drain SDK control requests (non-blocking) — handles permission
+                // requests that arrive between message stream events.
+                // In non-BypassPermissions modes, Claude CLI sends `can_use_tool`
+                // control requests on a separate channel.
+                if let Some(ref mut rx) = sdk_control_rx {
+                    while let Ok(control_msg) = rx.try_recv() {
+                        // Extract the request data (may be nested under "request")
+                        let request_data = if control_msg.get("request").is_some() {
+                            control_msg
+                                .get("request")
+                                .cloned()
+                                .unwrap_or(control_msg.clone())
+                        } else {
+                            control_msg.clone()
+                        };
+
+                        if request_data.get("subtype").and_then(|v| v.as_str())
+                            == Some("can_use_tool")
+                        {
+                            let tool_name = request_data
+                                .get("toolName")
+                                .or_else(|| request_data.get("tool_name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let input = request_data
+                                .get("input")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            // Use request_id as the permission request ID so the
+                            // frontend can correlate response → request.
+                            let request_id = control_msg
+                                .get("requestId")
+                                .or_else(|| control_msg.get("request_id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            info!(
+                                session_id = %session_id,
+                                tool = %tool_name,
+                                request_id = %request_id,
+                                "Permission request from CLI"
+                            );
+
+                            let perm_event = ChatEvent::PermissionRequest {
+                                id: request_id,
+                                tool: tool_name,
+                                input,
+                            };
+
+                            // Persist the permission_request event
+                            if let Some(uuid) = session_uuid {
+                                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                                events_to_persist.push(ChatEventRecord {
+                                    id: Uuid::new_v4(),
+                                    session_id: uuid,
+                                    seq,
+                                    event_type: "permission_request".to_string(),
+                                    data: serde_json::to_string(&perm_event)
+                                        .unwrap_or_default(),
+                                    created_at: chrono::Utc::now(),
+                                });
+                            }
+
+                            // Add to streaming events for mid-stream join
+                            streaming_events.lock().await.push(perm_event.clone());
+
+                            // Broadcast to WebSocket clients
+                            emit_chat(perm_event, &events_tx, &nats, &session_id);
+                        } else {
+                            debug!(
+                                "Ignoring non-permission SDK control request: {:?}",
+                                control_msg
+                            );
+                        }
+                    }
                 }
 
                 match result {
@@ -1807,6 +1921,48 @@ impl ChatManager {
             )
             .await;
         });
+
+        Ok(())
+    }
+
+    /// Send a permission response (allow/deny) to the Claude CLI subprocess.
+    ///
+    /// Unlike `send_message`, this does NOT:
+    /// - Persist as a user_message event
+    /// - Broadcast to WebSocket subscribers
+    /// - Trigger a new stream_response
+    ///
+    /// It sends a JSON control response directly to the CLI subprocess via the SDK
+    /// control protocol: `{"type": "control_response", "response": {"allow": true/false}}`.
+    /// This is required for non-BypassPermissions modes where Claude CLI sends
+    /// `can_use_tool` control requests and expects a control_response (not a user message).
+    pub async fn send_permission_response(
+        &self,
+        session_id: &str,
+        allow: bool,
+    ) -> Result<()> {
+        let client = {
+            let mut sessions = self.active_sessions.write().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            session.last_activity = Instant::now();
+            session.client.clone()
+        };
+
+        let response = serde_json::json!({ "allow": allow });
+
+        info!(
+            session_id = %session_id,
+            allow,
+            "Sending permission control response to CLI"
+        );
+
+        let mut client = client.lock().await;
+        client
+            .send_control_response(response)
+            .await
+            .map_err(|e| anyhow!("Failed to send permission control response: {}", e))?;
 
         Ok(())
     }
