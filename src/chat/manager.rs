@@ -67,6 +67,13 @@ pub struct ActiveSession {
     pub streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
     /// Current permission mode for this session (updated on mid-session changes)
     pub permission_mode: Option<String>,
+    /// SDK control receiver for permission requests (`can_use_tool`).
+    /// Taken once from `InteractiveClient::take_sdk_control_receiver()` at session
+    /// creation and reused across all `stream_response` invocations. Wrapped in
+    /// `Arc<Mutex<Option<...>>>` so each `stream_response` can temporarily take
+    /// ownership during streaming, then put it back when the stream ends.
+    pub sdk_control_rx:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>>,
     /// Cancellation token for NATS listener tasks spawned by this session.
     /// When the session is replaced (e.g., by `resume_session`), the old token
     /// is cancelled so that stale NATS listeners (interrupt, snapshot, RPC)
@@ -588,6 +595,7 @@ impl ChatManager {
                                 session.is_streaming.clone(),
                                 session.streaming_text.clone(),
                                 session.streaming_events.clone(),
+                                session.sdk_control_rx.clone(),
                             ))
                         }
                         None => None,
@@ -622,6 +630,7 @@ impl ChatManager {
                         is_streaming,
                         streaming_text,
                         streaming_events,
+                        sdk_control_rx,
                     )) => {
                         let message = &request.message;
 
@@ -731,6 +740,7 @@ impl ChatManager {
                                     streaming_events,
                                     event_emitter_clone,
                                     nats_clone,
+                                    sdk_control_rx,
                                 )
                                 .await;
                             });
@@ -1188,6 +1198,13 @@ impl ChatManager {
             None
         };
 
+        // Take the SDK control receiver ONCE at session creation.
+        // This channel receives `can_use_tool` permission requests from the CLI subprocess.
+        // It must be taken before wrapping the client in Arc<Mutex<>> so it can be
+        // reused across all stream_response invocations for this session.
+        let sdk_control_rx = client.take_sdk_control_receiver().await;
+        let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
+
         info!("Created chat session {} with model {}", session_id, model);
 
         // Create broadcast channel
@@ -1229,6 +1246,7 @@ impl ChatManager {
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
                     permission_mode: request.permission_mode.clone(),
+                    sdk_control_rx: sdk_control_rx.clone(),
                     nats_cancel: nats_cancel.clone(),
                 },
             );
@@ -1354,6 +1372,7 @@ impl ChatManager {
                 streaming_events,
                 event_emitter,
                 nats,
+                sdk_control_rx,
             )
             .await;
         });
@@ -1383,6 +1402,9 @@ impl ChatManager {
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
         event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
         nats: Option<Arc<crate::events::NatsEmitter>>,
+        shared_sdk_control_rx: Arc<
+            tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
+        >,
     ) {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
@@ -1437,13 +1459,12 @@ impl ChatManager {
             std::collections::HashMap::new();
         let session_uuid = Uuid::parse_str(&session_id).ok();
 
-        // Take the SDK control receiver BEFORE locking the client for streaming.
+        // Temporarily take the SDK control receiver from the shared slot.
         // This allows us to listen for control protocol messages (e.g., `can_use_tool`
         // permission requests) in parallel with the message stream.
-        let mut sdk_control_rx = {
-            let c = client.lock().await;
-            c.take_sdk_control_receiver().await
-        };
+        // The receiver is put back into the shared slot when this stream ends,
+        // so the next stream_response invocation can reuse it.
+        let mut sdk_control_rx = shared_sdk_control_rx.lock().await.take();
 
         {
             let mut c = client.lock().await;
@@ -1812,6 +1833,13 @@ impl ChatManager {
             }
         } // client lock released here
 
+        // Put the SDK control receiver back into the shared slot so the next
+        // stream_response invocation can reuse it (fixes permission requests
+        // being silently lost after the first message in a session).
+        if sdk_control_rx.is_some() {
+            *shared_sdk_control_rx.lock().await = sdk_control_rx;
+        }
+
         // Batch-persist all collected events to Neo4j
         if let Some(uuid) = session_uuid {
             if !events_to_persist.is_empty() {
@@ -1956,6 +1984,7 @@ impl ChatManager {
                 streaming_events,
                 event_emitter,
                 nats,
+                shared_sdk_control_rx,
             ))
             .await;
         }
@@ -2032,6 +2061,7 @@ impl ChatManager {
             is_streaming,
             streaming_text,
             streaming_events,
+            sdk_control_rx,
         ) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
@@ -2052,6 +2082,7 @@ impl ChatManager {
                 session.is_streaming.clone(),
                 session.streaming_text.clone(),
                 session.streaming_events.clone(),
+                session.sdk_control_rx.clone(),
             )
         };
 
@@ -2140,6 +2171,7 @@ impl ChatManager {
                 streaming_events,
                 event_emitter,
                 nats,
+                sdk_control_rx,
             )
             .await;
         });
@@ -2304,6 +2336,10 @@ impl ChatManager {
             .await
             .map_err(|e| anyhow!("Failed to connect resumed InteractiveClient: {}", e))?;
 
+        // Take the SDK control receiver ONCE at session resume.
+        let sdk_control_rx = client.take_sdk_control_receiver().await;
+        let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
+
         // Create broadcast channel
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let client = Arc::new(Mutex::new(client));
@@ -2381,6 +2417,7 @@ impl ChatManager {
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
                     permission_mode: session_node.permission_mode.clone(),
+                    sdk_control_rx: sdk_control_rx.clone(),
                     nats_cancel: nats_cancel.clone(),
                 },
             );
@@ -2455,6 +2492,7 @@ impl ChatManager {
                 streaming_events,
                 event_emitter,
                 nats,
+                sdk_control_rx,
             )
             .await;
         });
@@ -4355,6 +4393,7 @@ mod tests {
             streaming_text: Arc::new(Mutex::new(streaming_text.to_string())),
             streaming_events: Arc::new(Mutex::new(streaming_events_data)),
             permission_mode: None,
+            sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
             nats_cancel: CancellationToken::new(),
         };
 
