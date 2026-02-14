@@ -332,6 +332,44 @@ pub async fn backfill_previews(
     })))
 }
 
+// ============================================================================
+// Permission config (runtime GET/PUT)
+// ============================================================================
+
+/// GET /api/chat/config/permissions — Return current runtime permission config
+pub async fn get_chat_permissions(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<crate::chat::PermissionConfig>, AppError> {
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    let config = chat_manager.get_permission_config().await;
+    Ok(Json(config))
+}
+
+/// PUT /api/chat/config/permissions — Update runtime permission config
+///
+/// Accepts a JSON body with `mode`, `allowed_tools`, and `disallowed_tools`.
+/// Validates the mode string before applying. Returns the updated config.
+pub async fn update_chat_permissions(
+    State(state): State<OrchestratorState>,
+    Json(new_config): Json<crate::chat::PermissionConfig>,
+) -> Result<Json<crate::chat::PermissionConfig>, AppError> {
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    let updated = chat_manager
+        .update_permission_config(new_config)
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    Ok(Json(updated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +758,187 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["items"][0]["conversation_id"], "conv-xyz");
+    }
+
+    // ====================================================================
+    // Permission config helpers
+    // ====================================================================
+
+    /// Create an authenticated PUT request with JSON body
+    fn auth_put(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Build an OrchestratorState with a ChatManager (using mock backends)
+    async fn mock_server_state_with_chat() -> OrchestratorState {
+        let app_state = mock_app_state();
+        let chat_config = crate::chat::config::ChatConfig::default();
+        let chat_manager = Arc::new(crate::chat::ChatManager::new_without_memory(
+            app_state.neo4j.clone(),
+            app_state.meili.clone(),
+            chat_config,
+        ));
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: Some(chat_manager),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+        })
+    }
+
+    /// Build a test router with ChatManager
+    async fn test_app_with_chat() -> axum::Router {
+        let state = mock_server_state_with_chat().await;
+        create_router(state)
+    }
+
+    // ====================================================================
+    // GET /api/chat/config/permissions — returns defaults
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_chat_permissions_returns_defaults() {
+        let app = test_app_with_chat().await;
+        let resp = app
+            .oneshot(auth_get("/api/chat/config/permissions"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "bypassPermissions");
+        assert_eq!(json["allowed_tools"].as_array().unwrap().len(), 0);
+        assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
+    }
+
+    // ====================================================================
+    // GET /api/chat/config/permissions — no chat_manager returns 500
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_chat_permissions_no_chat_manager() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/chat/config/permissions"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ====================================================================
+    // PUT /api/chat/config/permissions — updates config
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_update_chat_permissions_changes_mode() {
+        let state = mock_server_state_with_chat().await;
+        let app = create_router(state.clone());
+
+        // PUT to update
+        let resp = app
+            .oneshot(auth_put(
+                "/api/chat/config/permissions",
+                r#"{"mode":"default","allowed_tools":["Read","Bash(git *)"],"disallowed_tools":[]}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "default");
+        assert_eq!(json["allowed_tools"][0], "Read");
+        assert_eq!(json["allowed_tools"][1], "Bash(git *)");
+
+        // Verify GET reflects the update
+        let app2 = create_router(state);
+        let resp = app2
+            .oneshot(auth_get("/api/chat/config/permissions"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "default");
+        assert_eq!(json["allowed_tools"].as_array().unwrap().len(), 2);
+    }
+
+    // ====================================================================
+    // PUT /api/chat/config/permissions — rejects invalid mode
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_update_chat_permissions_rejects_invalid_mode() {
+        let app = test_app_with_chat().await;
+
+        let resp = app
+            .oneshot(auth_put(
+                "/api/chat/config/permissions",
+                r#"{"mode":"yolo","allowed_tools":[],"disallowed_tools":[]}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Invalid permission mode"));
+    }
+
+    // ====================================================================
+    // PUT /api/chat/config/permissions — partial JSON uses serde defaults
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_update_chat_permissions_partial_json() {
+        let app = test_app_with_chat().await;
+
+        // Only set mode, allowed_tools/disallowed_tools default to empty
+        let resp = app
+            .oneshot(auth_put(
+                "/api/chat/config/permissions",
+                r#"{"mode":"acceptEdits"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "acceptEdits");
+        assert_eq!(json["allowed_tools"].as_array().unwrap().len(), 0);
+        assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
     }
 }

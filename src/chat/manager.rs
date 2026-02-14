@@ -81,6 +81,8 @@ pub struct ChatManager {
     pub(crate) event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
     /// Optional NATS emitter for cross-instance chat event publishing
     pub(crate) nats: Option<Arc<crate::events::NatsEmitter>>,
+    /// Runtime-mutable permission config (updated via REST API)
+    pub(crate) permission_config: Arc<RwLock<super::config::PermissionConfig>>,
 }
 
 impl ChatManager {
@@ -90,6 +92,7 @@ impl ChatManager {
         search: Arc<dyn SearchStore>,
         config: ChatConfig,
     ) -> Self {
+        let permission_config = Arc::new(RwLock::new(config.permission.clone()));
         Self {
             graph,
             search,
@@ -99,6 +102,7 @@ impl ChatManager {
             memory_config: None,
             event_emitter: None,
             nats: None,
+            permission_config,
         }
     }
 
@@ -126,6 +130,7 @@ impl ChatManager {
             }
         };
 
+        let permission_config = Arc::new(RwLock::new(config.permission.clone()));
         Self {
             graph,
             search,
@@ -135,6 +140,7 @@ impl ChatManager {
             memory_config: Some(memory_config),
             event_emitter: None,
             nats: None,
+            permission_config,
         }
     }
 
@@ -152,6 +158,37 @@ impl ChatManager {
     pub fn with_nats(mut self, nats: Arc<crate::events::NatsEmitter>) -> Self {
         self.nats = Some(nats);
         self
+    }
+
+    // ========================================================================
+    // Runtime permission config (GET / UPDATE via REST API)
+    // ========================================================================
+
+    /// Get a clone of the current runtime permission config.
+    pub async fn get_permission_config(&self) -> super::config::PermissionConfig {
+        self.permission_config.read().await.clone()
+    }
+
+    /// Update the runtime permission config.
+    ///
+    /// Validates the mode string before applying. Returns an error if the mode
+    /// is not one of the valid values ("default", "acceptEdits", "plan", "bypassPermissions").
+    /// New sessions will pick up the updated config immediately.
+    /// Active sessions keep their original config (no mid-session changes).
+    pub async fn update_permission_config(
+        &self,
+        new_config: super::config::PermissionConfig,
+    ) -> Result<super::config::PermissionConfig> {
+        if !super::config::PermissionConfig::is_valid_mode(&new_config.mode) {
+            return Err(anyhow!(
+                "Invalid permission mode '{}'. Valid modes: {:?}",
+                new_config.mode,
+                super::config::PermissionConfig::valid_modes()
+            ));
+        }
+        let mut perm = self.permission_config.write().await;
+        *perm = new_config;
+        Ok(perm.clone())
     }
 
     /// Spawn a background task that listens for NATS interrupt signals for a session.
@@ -683,7 +720,7 @@ impl ChatManager {
     /// `permission_mode_override`: if Some, overrides the global config permission mode
     /// for this specific session (e.g. user chose a different mode for this session).
     #[allow(deprecated)]
-    pub fn build_options(
+    pub async fn build_options(
         &self,
         cwd: &str,
         model: &str,
@@ -714,6 +751,9 @@ impl ChatManager {
             env: Some(env),
         };
 
+        // Read the runtime-mutable permission config (updated via REST API)
+        let perm_config = self.permission_config.read().await;
+
         // Use per-session override if provided, otherwise use global config
         let effective_permission = match permission_mode_override {
             Some(mode_str) => {
@@ -723,7 +763,7 @@ impl ChatManager {
                 };
                 override_config.to_nexus_mode()
             }
-            None => self.config.permission.to_nexus_mode(),
+            None => perm_config.to_nexus_mode(),
         };
 
         let mut builder = ClaudeCodeOptions::builder()
@@ -736,11 +776,11 @@ impl ChatManager {
             .add_mcp_server("project-orchestrator", mcp_config);
 
         // Wire allowed/disallowed tool patterns from config
-        if !self.config.permission.allowed_tools.is_empty() {
-            builder = builder.allowed_tools(self.config.permission.allowed_tools.clone());
+        if !perm_config.allowed_tools.is_empty() {
+            builder = builder.allowed_tools(perm_config.allowed_tools.clone());
         }
-        if !self.config.permission.disallowed_tools.is_empty() {
-            builder = builder.disallowed_tools(self.config.permission.disallowed_tools.clone());
+        if !perm_config.disallowed_tools.is_empty() {
+            builder = builder.disallowed_tools(perm_config.disallowed_tools.clone());
         }
 
         if let Some(id) = resume_id {
@@ -923,13 +963,15 @@ impl ChatManager {
             .context("Failed to persist chat session")?;
 
         // Build options and create InteractiveClient
-        let options = self.build_options(
-            &request.cwd,
-            &model,
-            &system_prompt,
-            None,
-            request.permission_mode.as_deref(),
-        );
+        let options = self
+            .build_options(
+                &request.cwd,
+                &model,
+                &system_prompt,
+                None,
+                request.permission_mode.as_deref(),
+            )
+            .await;
         let mut client = InteractiveClient::new(options)
             .map_err(|e| anyhow!("Failed to create InteractiveClient: {}", e))?;
 
@@ -1799,13 +1841,15 @@ impl ChatManager {
         let system_prompt = self
             .build_system_prompt(session_node.project_slug.as_deref(), message)
             .await;
-        let options = self.build_options(
-            &session_node.cwd,
-            &session_node.model,
-            &system_prompt,
-            cli_session_id,
-            session_node.permission_mode.as_deref(),
-        );
+        let options = self
+            .build_options(
+                &session_node.cwd,
+                &session_node.model,
+                &system_prompt,
+                cli_session_id,
+                session_node.permission_mode.as_deref(),
+            )
+            .await;
 
         // Create new InteractiveClient with --resume
         let mut client = InteractiveClient::new(options)
@@ -2448,14 +2492,15 @@ mod tests {
         assert_eq!(manager.resolve_model(None), "claude-opus-4-6");
     }
 
-    #[test]
-    fn test_build_options_uses_config_permission_default() {
+    #[tokio::test]
+    async fn test_build_options_uses_config_permission_default() {
         // Default config (BypassPermissions) — backward compatibility
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        #[allow(deprecated)]
-        let opts = manager.build_options("/tmp", "claude-opus-4-6", "test prompt", None, None);
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None)
+            .await;
         assert!(matches!(
             opts.permission_mode,
             PermissionMode::BypassPermissions
@@ -2464,8 +2509,8 @@ mod tests {
         assert!(opts.disallowed_tools.is_empty());
     }
 
-    #[test]
-    fn test_build_options_uses_config_permission_custom() {
+    #[tokio::test]
+    async fn test_build_options_uses_config_permission_custom() {
         let state = mock_app_state();
         let mut config = test_config();
         config.permission = crate::chat::config::PermissionConfig {
@@ -2475,31 +2520,112 @@ mod tests {
         };
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
-        #[allow(deprecated)]
-        let opts = manager.build_options("/tmp", "claude-opus-4-6", "test prompt", None, None);
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None)
+            .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
         assert_eq!(opts.allowed_tools, vec!["Bash(git *)", "Read"]);
         assert_eq!(opts.disallowed_tools, vec!["Bash(rm -rf *)"]);
     }
 
-    #[test]
-    fn test_build_options_with_permission_override() {
+    #[tokio::test]
+    async fn test_build_options_with_permission_override() {
         // Global config is BypassPermissions, but session overrides to Default
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        #[allow(deprecated)]
-        let opts =
-            manager.build_options("/tmp", "claude-opus-4-6", "prompt", None, Some("default"));
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, Some("default"))
+            .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
 
         // Without override, falls back to global (BypassPermissions)
-        #[allow(deprecated)]
-        let opts = manager.build_options("/tmp", "claude-opus-4-6", "prompt", None, None);
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .await;
         assert!(matches!(
             opts.permission_mode,
             PermissionMode::BypassPermissions
         ));
+    }
+
+    #[tokio::test]
+    async fn test_get_permission_config_returns_defaults() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let config = manager.get_permission_config().await;
+        assert_eq!(config.mode, "bypassPermissions");
+        assert!(config.allowed_tools.is_empty());
+        assert!(config.disallowed_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_permission_config_changes_mode() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let new_config = crate::chat::config::PermissionConfig {
+            mode: "default".into(),
+            allowed_tools: vec!["Read".into(), "Bash(git *)".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+        let updated = manager.update_permission_config(new_config).await.unwrap();
+        assert_eq!(updated.mode, "default");
+        assert_eq!(updated.allowed_tools, vec!["Read", "Bash(git *)"]);
+        assert_eq!(updated.disallowed_tools, vec!["Bash(rm -rf *)"]);
+
+        // Verify getter returns the updated config
+        let fetched = manager.get_permission_config().await;
+        assert_eq!(fetched.mode, "default");
+        assert_eq!(fetched.allowed_tools, vec!["Read", "Bash(git *)"]);
+    }
+
+    #[tokio::test]
+    async fn test_update_permission_config_rejects_invalid_mode() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let bad_config = crate::chat::config::PermissionConfig {
+            mode: "yolo".into(),
+            ..Default::default()
+        };
+        let result = manager.update_permission_config(bad_config).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid permission mode 'yolo'"));
+    }
+
+    #[tokio::test]
+    async fn test_update_permission_config_affects_build_options() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // Initially BypassPermissions
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .await;
+        assert!(matches!(
+            opts.permission_mode,
+            PermissionMode::BypassPermissions
+        ));
+
+        // Update to Default mode at runtime
+        manager
+            .update_permission_config(crate::chat::config::PermissionConfig {
+                mode: "default".into(),
+                allowed_tools: vec!["Read".into()],
+                disallowed_tools: vec![],
+            })
+            .await
+            .unwrap();
+
+        // New build_options should reflect the update
+        let opts = manager
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .await;
+        assert!(matches!(opts.permission_mode, PermissionMode::Default));
+        assert_eq!(opts.allowed_tools, vec!["Read"]);
     }
 
     #[tokio::test]
@@ -2544,18 +2670,20 @@ mod tests {
     // build_options
     // ====================================================================
 
-    #[test]
-    fn test_build_options_basic() {
+    #[tokio::test]
+    async fn test_build_options_basic() {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let options = manager.build_options(
-            "/tmp/project",
-            "claude-opus-4-6",
-            "System prompt here",
-            None,
-            None,
-        );
+        let options = manager
+            .build_options(
+                "/tmp/project",
+                "claude-opus-4-6",
+                "System prompt here",
+                None,
+                None,
+            )
+            .await;
 
         assert_eq!(options.model, Some("claude-opus-4-6".into()));
         assert_eq!(options.cwd, Some(PathBuf::from("/tmp/project")));
@@ -2563,29 +2691,33 @@ mod tests {
         assert!(options.mcp_servers.contains_key("project-orchestrator"));
     }
 
-    #[test]
-    fn test_build_options_with_resume() {
+    #[tokio::test]
+    async fn test_build_options_with_resume() {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let options = manager.build_options(
-            "/tmp/project",
-            "claude-opus-4-6",
-            "System prompt",
-            Some("cli-session-abc"),
-            None,
-        );
+        let options = manager
+            .build_options(
+                "/tmp/project",
+                "claude-opus-4-6",
+                "System prompt",
+                Some("cli-session-abc"),
+                None,
+            )
+            .await;
 
         assert_eq!(options.resume, Some("cli-session-abc".into()));
     }
 
-    #[test]
-    fn test_build_options_mcp_server_config() {
+    #[tokio::test]
+    async fn test_build_options_mcp_server_config() {
         let state = mock_app_state();
         let config = test_config();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
-        let options = manager.build_options("/tmp", "model", "prompt", None, None);
+        let options = manager
+            .build_options("/tmp", "model", "prompt", None, None)
+            .await;
 
         let mcp = options.mcp_servers.get("project-orchestrator").unwrap();
         match mcp {
