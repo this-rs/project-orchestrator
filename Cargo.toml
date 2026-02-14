@@ -3,8 +3,8 @@ name = "project-orchestrator"
 version = "0.1.0"
 edition = "2021"
 description = "AI agent orchestrator with Neo4j knowledge graph, Meilisearch, and Tree-sitter parsing"
-authors = ["Elun <elun@openclaw.ai>"]
-license = "MIT"
+authors = ["Elun <contact@ffs.holdings>"]
+license = "MIT AND BUSL-1.1"
 
 [dependencies]
 # Async runtime
@@ -117,8 +117,8 @@ path = "src/bin/mcp_server.rs"
 # Debian packaging (cargo-deb)
 # =============================================================================
 [package.metadata.deb]
-maintainer = "Elun <elun@openclaw.ai>"
-copyright = "2026, Elun / OpenClaw"
+maintainer = "Elun <contact@ffs.holdings>"
+copyright = "2026, Freedom From Scratch"
 license-file = ["LICENSE", "0"]
 section = "net"
 priority = "optional"
