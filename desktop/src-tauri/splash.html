@@ -59,12 +59,12 @@
       animation: fadeIn 0.4s ease-out 0.6s forwards;
     }
 
-    /* ── Checklist ── */
+    /* -- Checklist -- */
     .checklist {
       width: 300px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 6px;
       opacity: 0;
       animation: fadeIn 0.4s ease-out 0.8s forwards;
     }
@@ -73,11 +73,12 @@
       display: flex;
       align-items: center;
       gap: 10px;
-      padding: 8px 12px;
+      padding: 7px 12px;
       border-radius: 8px;
       background: rgba(255, 255, 255, 0.03);
       border: 1px solid rgba(255, 255, 255, 0.06);
       transition: background 0.3s, border-color 0.3s;
+      min-height: 34px;
     }
 
     .check-item.success {
@@ -91,8 +92,17 @@
     }
 
     .check-item.warning {
-      border-color: rgba(234, 179, 8, 0.2);
-      background: rgba(234, 179, 8, 0.05);
+      border-color: rgba(245, 158, 11, 0.2);
+      background: rgba(245, 158, 11, 0.05);
+    }
+
+    .check-item.skipped {
+      border-color: rgba(107, 114, 128, 0.2);
+      background: rgba(107, 114, 128, 0.03);
+    }
+
+    .check-item.hidden {
+      display: none;
     }
 
     .check-icon {
@@ -116,10 +126,27 @@
 
     .check-icon svg { width: 16px; height: 16px; }
 
-    .check-label {
+    .check-content {
       flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .check-label {
       font-size: 13px;
       color: #cbd5e1;
+    }
+
+    .check-subtext {
+      font-size: 10px;
+      color: #64748b;
+      line-height: 1.3;
+    }
+
+    .check-subtext.error-text {
+      color: #f87171;
     }
 
     .check-action {
@@ -132,14 +159,16 @@
       border: 1px solid rgba(99, 102, 241, 0.3);
       background: rgba(99, 102, 241, 0.1);
       transition: background 0.2s;
+      flex-shrink: 0;
+      white-space: nowrap;
     }
     .check-action:hover {
       background: rgba(99, 102, 241, 0.2);
     }
 
-    /* ── Footer actions ── */
+    /* -- Footer actions -- */
     .footer {
-      margin-top: 18px;
+      margin-top: 14px;
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -197,21 +226,41 @@
   <div class="subtitle">AI Agent Orchestrator</div>
 
   <div class="checklist">
-    <div class="check-item" id="check-docker">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <span class="check-label">Docker Desktop</span>
-    </div>
-    <div class="check-item" id="check-claude">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <span class="check-label">Claude Code</span>
-    </div>
     <div class="check-item" id="check-config">
       <div class="check-icon"><div class="spinner"></div></div>
-      <span class="check-label">Configuration</span>
+      <div class="check-content">
+        <span class="check-label">Configuration</span>
+      </div>
+    </div>
+    <div class="check-item" id="check-docker">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <div class="check-content">
+        <span class="check-label">Docker Desktop</span>
+      </div>
+    </div>
+    <div class="check-item" id="check-neo4j">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <div class="check-content">
+        <span class="check-label">Neo4j</span>
+      </div>
+    </div>
+    <div class="check-item" id="check-meilisearch">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <div class="check-content">
+        <span class="check-label">Meilisearch</span>
+      </div>
+    </div>
+    <div class="check-item hidden" id="check-nats">
+      <div class="check-icon"><div class="spinner"></div></div>
+      <div class="check-content">
+        <span class="check-label">NATS</span>
+      </div>
     </div>
     <div class="check-item" id="check-backend">
       <div class="check-icon"><div class="spinner"></div></div>
-      <span class="check-label">Backend server</span>
+      <div class="check-content">
+        <span class="check-label">Backend server</span>
+      </div>
     </div>
   </div>
 
@@ -221,10 +270,13 @@
   </div>
 
   <script>
+    // ========================================================================
     // SVG icons
-    const ICON_OK = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#22c55e" opacity="0.15"/><path d="M5 8l2 2 4-4" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    // ========================================================================
+    const ICON_OK   = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#22c55e" opacity="0.15"/><path d="M5 8l2 2 4-4" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     const ICON_FAIL = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#ef4444" opacity="0.15"/><path d="M6 6l4 4M10 6l-4 4" stroke="#ef4444" stroke-width="1.5" stroke-linecap="round"/></svg>';
-    const ICON_WARN = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#eab308" opacity="0.15"/><path d="M8 5v3M8 10h.01" stroke="#eab308" stroke-width="1.5" stroke-linecap="round"/></svg>';
+    const ICON_WARN = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#f59e0b" opacity="0.15"/><path d="M8 5v3M8 10h.01" stroke="#f59e0b" stroke-width="1.5" stroke-linecap="round"/></svg>';
+    const ICON_SKIP = '<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" fill="#6b7280" opacity="0.15"/><path d="M5 8h6" stroke="#6b7280" stroke-width="1.5" stroke-linecap="round"/></svg>';
     const ICON_SPIN = '<div class="spinner"></div>';
 
     // Download URLs per platform
@@ -233,20 +285,44 @@
       'linux': 'https://docs.docker.com/desktop/setup/install/linux/',
       'windows': 'https://docs.docker.com/desktop/setup/install/windows-install/',
     };
-    const CLAUDE_URL = 'https://docs.anthropic.com/en/docs/claude-code/overview';
 
     let platformOs = 'macos';
-    let allCriticalOk = false;
+    let globalStartTime = Date.now();
+    const GLOBAL_TIMEOUT = 120000; // 120s
 
-    function setCheck(id, state, actionHtml) {
+    // ========================================================================
+    // UI helpers
+    // ========================================================================
+
+    function setCheck(id, state, subtext, actionHtml) {
       const el = document.getElementById(id);
+      if (!el) return;
       const icon = el.querySelector('.check-icon');
+      const content = el.querySelector('.check-content');
+
+      // Update state class
       el.className = 'check-item ' + state;
 
+      // Update icon
       if (state === 'success') icon.innerHTML = ICON_OK;
       else if (state === 'error') icon.innerHTML = ICON_FAIL;
       else if (state === 'warning') icon.innerHTML = ICON_WARN;
-      else icon.innerHTML = ICON_SPIN;
+      else if (state === 'skipped') icon.innerHTML = ICON_SKIP;
+      else icon.innerHTML = ICON_SPIN; // pending / spinner
+
+      // Update subtext
+      let subtextEl = content.querySelector('.check-subtext');
+      if (subtext) {
+        if (!subtextEl) {
+          subtextEl = document.createElement('span');
+          subtextEl.className = 'check-subtext';
+          content.appendChild(subtextEl);
+        }
+        subtextEl.textContent = subtext;
+        subtextEl.className = 'check-subtext' + (state === 'error' ? ' error-text' : '');
+      } else if (subtextEl) {
+        subtextEl.remove();
+      }
 
       // Remove old action if any
       const oldAction = el.querySelector('.check-action');
@@ -257,12 +333,21 @@
       }
     }
 
+    function showItem(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove('hidden');
+    }
+
+    function hideItem(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.add('hidden');
+    }
+
     function setStatus(text) {
       document.getElementById('status').textContent = text;
     }
 
     function openUrl(url) {
-      // Use Tauri shell plugin to open in default browser
       if (window.__TAURI__) {
         window.__TAURI__.shell.open(url);
       }
@@ -275,117 +360,353 @@
       throw new Error('Tauri not available');
     }
 
+    function isGlobalTimeout() {
+      return (Date.now() - globalStartTime) > GLOBAL_TIMEOUT;
+    }
+
+    // ========================================================================
+    // Main flow
+    // ========================================================================
+
     async function runChecks() {
+      globalStartTime = Date.now();
       setStatus('Checking dependencies...');
 
       try {
         const deps = await invoke('check_dependencies');
         platformOs = deps.os === 'windows' ? 'windows' : deps.os === 'linux' ? 'linux' : 'macos';
 
-        // Docker
-        if (deps.dockerAvailable) {
-          setCheck('check-docker', 'success');
-        } else {
-          const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
-          setCheck('check-docker', 'error',
-            `<span class="check-action" onclick="openUrl('${url}')">Install</span>`);
-        }
-
-        // Claude Code (optional — warning, not error)
-        if (deps.claudeCodeAvailable) {
-          setCheck('check-claude', 'success');
-        } else {
-          setCheck('check-claude', 'warning',
-            `<span class="check-action" onclick="openUrl('${CLAUDE_URL}')">Install</span>`);
-        }
-
-        // Config
+        // -- Configuration --
         if (deps.configExists) {
           setCheck('check-config', 'success');
         } else {
-          setCheck('check-config', 'warning');
-          // Config will be created by the setup wizard — not blocking
+          setCheck('check-config', 'warning', 'Will be created by setup wizard');
         }
 
-        // Check if we should show "Continue anyway" for non-critical missing deps
-        const hasCriticalIssue = !deps.dockerAvailable;
-        const hasWarnings = !deps.claudeCodeAvailable || !deps.configExists;
-
-        if (hasCriticalIssue) {
-          setStatus('Docker is required to run services');
-          document.getElementById('btn-continue').classList.add('visible');
+        // -- NATS visibility --
+        if (deps.natsEnabled) {
+          showItem('check-nats');
+        } else {
+          hideItem('check-nats');
         }
 
-        // Start backend health polling regardless — backend starts even without Docker
-        await pollBackendHealth();
+        // -- Route based on infra_mode --
+        if (deps.infraMode === 'external') {
+          // External mode: skip Docker & services entirely
+          setCheck('check-docker', 'skipped', 'External mode');
+          setCheck('check-neo4j', 'skipped', 'Managed externally');
+          setCheck('check-meilisearch', 'skipped', 'Managed externally');
+          if (deps.natsEnabled) {
+            setCheck('check-nats', 'skipped', 'Managed externally');
+          }
+          setStatus('Starting backend...');
+          await pollBackendHealth();
+          return;
+        }
+
+        // -- First-time setup (no config yet) --
+        if (!deps.setupCompleted) {
+          // Backend runs in minimal mode (no DB), skip service checks
+          setCheck('check-docker', 'skipped', 'Setup pending');
+          setCheck('check-neo4j', 'skipped', 'Setup pending');
+          setCheck('check-meilisearch', 'skipped', 'Setup pending');
+          if (deps.natsEnabled) {
+            setCheck('check-nats', 'skipped', 'Setup pending');
+          }
+          setStatus('Starting backend (setup mode)...');
+          await pollBackendHealth();
+          return;
+        }
+
+        // -- Docker mode: check Docker status --
+        await handleDockerMode(deps);
 
       } catch (err) {
         console.error('check_dependencies failed:', err);
         // Fallback: skip dep checks and just poll backend
-        setCheck('check-docker', 'warning');
-        setCheck('check-claude', 'warning');
         setCheck('check-config', 'warning');
+        setCheck('check-docker', 'warning', 'Could not check');
+        setCheck('check-neo4j', 'warning');
+        setCheck('check-meilisearch', 'warning');
         setStatus('Starting backend...');
         await pollBackendHealth();
       }
     }
 
+    // ========================================================================
+    // Docker mode handling
+    // ========================================================================
+
+    async function handleDockerMode(deps) {
+      const dockerStatus = deps.dockerStatus; // "running", "installed", "not_installed"
+
+      if (dockerStatus === 'running') {
+        setCheck('check-docker', 'success');
+        await startServices(deps);
+
+      } else if (dockerStatus === 'installed') {
+        // Docker Desktop is installed but daemon is not running
+        setCheck('check-docker', 'warning', 'Docker Desktop is not running');
+        setCheck('check-neo4j', '', 'Waiting for Docker...');
+        setCheck('check-meilisearch', '', 'Waiting for Docker...');
+        if (deps.natsEnabled) {
+          setCheck('check-nats', '', 'Waiting for Docker...');
+        }
+        setStatus('Please start Docker Desktop');
+
+        // Poll until Docker daemon comes up
+        await pollDockerAvailability(deps);
+
+      } else {
+        // Docker not installed
+        const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
+        setCheck('check-docker', 'error', 'Docker is required to run services',
+          `<span class="check-action" onclick="openUrl('${url}')">Install</span>`);
+        setCheck('check-neo4j', 'error', 'Requires Docker');
+        setCheck('check-meilisearch', 'error', 'Requires Docker');
+        if (deps.natsEnabled) {
+          setCheck('check-nats', 'error', 'Requires Docker');
+        }
+        setStatus('Docker is required');
+        document.getElementById('btn-continue').classList.add('visible');
+
+        // Still poll in case user installs Docker while splash is shown
+        await pollDockerInstall(deps);
+      }
+    }
+
+    // ========================================================================
+    // Poll for Docker daemon availability (installed but not running)
+    // ========================================================================
+
+    async function pollDockerAvailability(deps) {
+      while (!isGlobalTimeout()) {
+        await sleep(3000);
+        try {
+          const freshDeps = await invoke('check_dependencies');
+          if (freshDeps.dockerStatus === 'running') {
+            setCheck('check-docker', 'success');
+            // Use fresh deps for credentials (may have changed)
+            await startServices(freshDeps);
+            return;
+          }
+        } catch (_) { /* continue polling */ }
+      }
+
+      // Global timeout reached
+      setCheck('check-docker', 'error', 'Docker did not start in time');
+      setStatus('Timed out waiting for Docker');
+      document.getElementById('btn-continue').classList.add('visible');
+    }
+
+    // ========================================================================
+    // Poll for Docker installation (not installed)
+    // ========================================================================
+
+    async function pollDockerInstall(deps) {
+      while (!isGlobalTimeout()) {
+        await sleep(5000);
+        try {
+          const freshDeps = await invoke('check_dependencies');
+          if (freshDeps.dockerStatus === 'running') {
+            setCheck('check-docker', 'success');
+            await startServices(freshDeps);
+            return;
+          } else if (freshDeps.dockerStatus === 'installed') {
+            // User installed Docker but hasn't started it yet
+            setCheck('check-docker', 'warning', 'Docker Desktop is not running');
+            setStatus('Please start Docker Desktop');
+            await pollDockerAvailability(freshDeps);
+            return;
+          }
+        } catch (_) { /* continue polling */ }
+      }
+    }
+
+    // ========================================================================
+    // Start Docker services and poll their health
+    // ========================================================================
+
+    async function startServices(deps) {
+      setCheck('check-neo4j', '', 'Starting...');
+      setCheck('check-meilisearch', '', 'Starting...');
+      if (deps.natsEnabled) {
+        setCheck('check-nats', '', 'Starting...');
+      }
+      setStatus('Starting services...');
+
+      // Build config for start_docker_services
+      const config = {
+        neo4jPassword: deps.neo4jPassword || '',
+        meilisearchKey: deps.meilisearchKey || '',
+        natsEnabled: deps.natsEnabled,
+      };
+
+      try {
+        await invoke('start_docker_services', { config });
+      } catch (err) {
+        console.error('start_docker_services failed:', err);
+        setCheck('check-docker', 'error', 'Failed to start services: ' + err);
+        setStatus('Service startup failed');
+        document.getElementById('btn-continue').classList.add('visible');
+        // Still try polling health — services might have started partially
+      }
+
+      // Poll individual service health
+      await pollServicesHealth(deps.natsEnabled);
+    }
+
+    // ========================================================================
+    // Poll individual services health
+    // ========================================================================
+
+    async function pollServicesHealth(natsEnabled) {
+      setStatus('Waiting for services...');
+      const serviceStartTime = Date.now();
+      const SERVICE_TIMEOUT = 60000; // 60s per-service warning
+
+      let neo4jReady = false;
+      let meiliReady = false;
+      let natsReady = !natsEnabled; // skip if disabled
+
+      while (!isGlobalTimeout()) {
+        try {
+          const health = await invoke('check_services_health', { natsEnabled });
+
+          // -- Neo4j --
+          if (!neo4jReady) {
+            if (health.neo4j === 'healthy') {
+              setCheck('check-neo4j', 'success');
+              neo4jReady = true;
+            } else if (health.neo4j === 'starting' || health.neo4j === 'notrunning') {
+              const elapsed = Date.now() - serviceStartTime;
+              if (elapsed > SERVICE_TIMEOUT) {
+                setCheck('check-neo4j', 'warning', 'Taking longer than expected...');
+              } else {
+                setCheck('check-neo4j', '', 'Starting...');
+              }
+            } else if (health.neo4j === 'unhealthy') {
+              setCheck('check-neo4j', 'error', 'Unhealthy');
+            }
+          }
+
+          // -- Meilisearch --
+          if (!meiliReady) {
+            if (health.meilisearch === 'healthy') {
+              setCheck('check-meilisearch', 'success');
+              meiliReady = true;
+            } else if (health.meilisearch === 'starting' || health.meilisearch === 'notrunning') {
+              const elapsed = Date.now() - serviceStartTime;
+              if (elapsed > SERVICE_TIMEOUT) {
+                setCheck('check-meilisearch', 'warning', 'Taking longer than expected...');
+              } else {
+                setCheck('check-meilisearch', '', 'Starting...');
+              }
+            } else if (health.meilisearch === 'unhealthy') {
+              setCheck('check-meilisearch', 'error', 'Unhealthy');
+            }
+          }
+
+          // -- NATS --
+          if (natsEnabled && !natsReady) {
+            if (health.nats === 'healthy') {
+              setCheck('check-nats', 'success');
+              natsReady = true;
+            } else if (health.nats === 'disabled') {
+              setCheck('check-nats', 'skipped', 'Disabled');
+              natsReady = true;
+            } else if (health.nats === 'starting' || health.nats === 'notrunning') {
+              setCheck('check-nats', '', 'Starting...');
+            } else if (health.nats === 'unhealthy') {
+              setCheck('check-nats', 'error', 'Unhealthy');
+            }
+          }
+
+          // All services ready?
+          if (neo4jReady && meiliReady && natsReady) {
+            setStatus('Services ready, starting backend...');
+            await pollBackendHealth();
+            return;
+          }
+
+        } catch (err) {
+          console.error('check_services_health error:', err);
+        }
+
+        await sleep(2000);
+      }
+
+      // Global timeout
+      setStatus('Services took too long to start');
+      document.getElementById('btn-continue').classList.add('visible');
+      // Still poll backend — it might work with partial services
+      await pollBackendHealth();
+    }
+
+    // ========================================================================
+    // Poll backend /health
+    // ========================================================================
+
     async function pollBackendHealth() {
-      setCheck('check-backend', ''); // spinner
+      setCheck('check-backend', '', 'Starting...');
       setStatus('Starting backend...');
 
       const port = await invoke('get_server_port').catch(() => 6600);
-      const startTime = Date.now();
-      const timeout = 30000; // 30s
 
-      while (Date.now() - startTime < timeout) {
+      while (!isGlobalTimeout()) {
         try {
           const healthy = await invoke('check_health', { port });
           if (healthy) {
             setCheck('check-backend', 'success');
             setStatus('Ready');
 
-            // Small delay for visual satisfaction, then auto-transition
-            await new Promise(r => setTimeout(r, 600));
+            // Small delay for visual satisfaction
+            await sleep(500);
             transitionToMain();
             return;
           }
         } catch (_) { /* not ready yet */ }
-        await new Promise(r => setTimeout(r, 200));
+        await sleep(200);
       }
 
-      // Timeout
-      setCheck('check-backend', 'error');
-      setStatus('Backend failed to start within 30s');
+      // Global timeout
+      setCheck('check-backend', 'error', 'Failed to start within timeout');
+      setStatus('Backend did not start in time');
       document.getElementById('btn-continue').classList.add('visible');
     }
 
+    // ========================================================================
+    // Transition & utility
+    // ========================================================================
+
     function transitionToMain() {
       // The backend thread in main.rs handles the actual window transition
-      // via show_main_window(). We don't need to do anything here — the
-      // Rust code polls /health and transitions when ready.
-      // This function is a no-op; the Rust side drives the transition.
+      // via show_main_window(). This function is intentionally a no-op.
+      // The Rust side drives the transition (decision 0218a69c).
     }
 
     function continueAnyway() {
-      // User chose to skip — the Rust backend thread will eventually
-      // show the main window when health check passes or times out.
       setStatus('Waiting for backend...');
       document.getElementById('btn-continue').classList.remove('visible');
     }
 
-    // Start checks when Tauri is ready
+    function sleep(ms) {
+      return new Promise(r => setTimeout(r, ms));
+    }
+
+    // ========================================================================
+    // Start
+    // ========================================================================
+
     if (window.__TAURI__) {
       runChecks();
     } else {
       window.addEventListener('DOMContentLoaded', () => {
-        // Wait a bit for Tauri to inject __TAURI__
         setTimeout(() => {
           if (window.__TAURI__) {
             runChecks();
           } else {
             setStatus('Waiting for Tauri...');
-            // Retry
             const interval = setInterval(() => {
               if (window.__TAURI__) {
                 clearInterval(interval);
