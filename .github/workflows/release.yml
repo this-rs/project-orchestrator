@@ -584,6 +584,15 @@ jobs:
         shell: pwsh
         run: Copy-Item "target\release\mcp_server.exe" "target\release\mcp_server"
 
+      # IMPORTANT: TAURI_SIGNING_PRIVATE_KEY must be set in GitHub Secrets for
+      # auto-update to work. Without it, Tauri won't generate the updater bundles
+      # (.app.tar.gz, .AppImage.tar.gz, .nsis.zip) nor their .sig files, and
+      # latest.json will have empty URLs — causing "relative URL without a base"
+      # errors on the client.
+      #
+      # Generate a keypair with: cargo tauri signer generate -w ~/.tauri/myapp.key
+      # Then set TAURI_SIGNING_PRIVATE_KEY to the contents of the private key file,
+      # and update the pubkey in desktop/src-tauri/tauri.conf.json → plugins.updater.pubkey
       - name: Build Tauri bundle
         working-directory: desktop/src-tauri
         env:
