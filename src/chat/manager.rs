@@ -2390,6 +2390,7 @@ mod tests {
             nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
+            permission: crate::chat::config::PermissionConfig::default(),
         }
     }
 

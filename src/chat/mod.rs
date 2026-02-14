@@ -8,6 +8,6 @@ pub mod manager;
 pub mod prompt;
 pub mod types;
 
-pub use config::ChatConfig;
+pub use config::{ChatConfig, PermissionConfig};
 pub use manager::ChatManager;
 pub use types::{ChatEvent, ChatRequest, ChatSession, ClientMessage};
