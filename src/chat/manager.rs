@@ -1404,7 +1404,92 @@ impl ChatManager {
                 }
             };
 
-            while let Some(result) = stream.next().await {
+            // Helper closure: process an SDK control message (permission request).
+            // Returns Some(ChatEvent) if a permission_request was parsed, None otherwise.
+            // The caller is responsible for adding the event to streaming_events (async).
+            let handle_control_msg = |control_msg: serde_json::Value,
+                                      events_to_persist: &mut Vec<ChatEventRecord>,
+                                      next_seq: &std::sync::atomic::AtomicI64|
+             -> Option<ChatEvent> {
+                // Extract the request data (may be nested under "request")
+                let request_data = if control_msg.get("request").is_some() {
+                    control_msg
+                        .get("request")
+                        .cloned()
+                        .unwrap_or(control_msg.clone())
+                } else {
+                    control_msg.clone()
+                };
+
+                if request_data.get("subtype").and_then(|v| v.as_str()) == Some("can_use_tool") {
+                    let tool_name = request_data
+                        .get("toolName")
+                        .or_else(|| request_data.get("tool_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let input = request_data
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    // Use request_id as the permission request ID so the
+                    // frontend can correlate response → request.
+                    let request_id = control_msg
+                        .get("requestId")
+                        .or_else(|| control_msg.get("request_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    info!(
+                        session_id = %session_id,
+                        tool = %tool_name,
+                        request_id = %request_id,
+                        "Permission request from CLI"
+                    );
+
+                    let perm_event = ChatEvent::PermissionRequest {
+                        id: request_id,
+                        tool: tool_name,
+                        input,
+                    };
+
+                    // Persist the permission_request event
+                    if let Some(uuid) = session_uuid {
+                        let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                        events_to_persist.push(ChatEventRecord {
+                            id: Uuid::new_v4(),
+                            session_id: uuid,
+                            seq,
+                            event_type: "permission_request".to_string(),
+                            data: serde_json::to_string(&perm_event).unwrap_or_default(),
+                            created_at: chrono::Utc::now(),
+                        });
+                    }
+
+                    // Broadcast to WebSocket clients
+                    emit_chat(perm_event.clone(), &events_tx, &nats, &session_id);
+                    Some(perm_event)
+                } else {
+                    debug!(
+                        "Ignoring non-permission SDK control request: {:?}",
+                        control_msg
+                    );
+                    None
+                }
+            };
+
+            // Main stream loop — uses tokio::select! to listen for BOTH stream
+            // events AND SDK control messages (permission requests) concurrently.
+            //
+            // BUG FIX: Previously used `stream.next().await` followed by
+            // `rx.try_recv()`. When the CLI blocks waiting for permission approval,
+            // it stops sending stream events, so `stream.next()` would never yield
+            // and `try_recv()` was never reached — permission requests were lost.
+            //
+            // Now we select! between the two sources so control messages are
+            // processed even when the stream is idle (waiting for permission).
+            loop {
                 // Check interrupt flag at each iteration
                 if interrupt_flag.load(Ordering::SeqCst) {
                     info!(
@@ -1414,83 +1499,48 @@ impl ChatManager {
                     break;
                 }
 
-                // Drain SDK control requests (non-blocking) — handles permission
-                // requests that arrive between message stream events.
-                // In non-BypassPermissions modes, Claude CLI sends `can_use_tool`
-                // control requests on a separate channel.
-                if let Some(ref mut rx) = sdk_control_rx {
-                    while let Ok(control_msg) = rx.try_recv() {
-                        // Extract the request data (may be nested under "request")
-                        let request_data = if control_msg.get("request").is_some() {
-                            control_msg
-                                .get("request")
-                                .cloned()
-                                .unwrap_or(control_msg.clone())
-                        } else {
-                            control_msg.clone()
-                        };
+                let result = if let Some(ref mut rx) = sdk_control_rx {
+                    tokio::select! {
+                        biased;  // Prioritize control messages over stream events
 
-                        if request_data.get("subtype").and_then(|v| v.as_str())
-                            == Some("can_use_tool")
-                        {
-                            let tool_name = request_data
-                                .get("toolName")
-                                .or_else(|| request_data.get("tool_name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let input = request_data
-                                .get("input")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            // Use request_id as the permission request ID so the
-                            // frontend can correlate response → request.
-                            let request_id = control_msg
-                                .get("requestId")
-                                .or_else(|| control_msg.get("request_id"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-
-                            info!(
-                                session_id = %session_id,
-                                tool = %tool_name,
-                                request_id = %request_id,
-                                "Permission request from CLI"
-                            );
-
-                            let perm_event = ChatEvent::PermissionRequest {
-                                id: request_id,
-                                tool: tool_name,
-                                input,
-                            };
-
-                            // Persist the permission_request event
-                            if let Some(uuid) = session_uuid {
-                                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-                                events_to_persist.push(ChatEventRecord {
-                                    id: Uuid::new_v4(),
-                                    session_id: uuid,
-                                    seq,
-                                    event_type: "permission_request".to_string(),
-                                    data: serde_json::to_string(&perm_event).unwrap_or_default(),
-                                    created_at: chrono::Utc::now(),
-                                });
+                        control_msg = rx.recv() => {
+                            match control_msg {
+                                Some(msg) => {
+                                    if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq) {
+                                        streaming_events.lock().await.push(evt);
+                                    }
+                                    continue; // Go back to select! for next event
+                                }
+                                None => {
+                                    debug!("SDK control channel closed");
+                                    sdk_control_rx = None;
+                                    continue;
+                                }
                             }
+                        }
 
-                            // Add to streaming events for mid-stream join
-                            streaming_events.lock().await.push(perm_event.clone());
-
-                            // Broadcast to WebSocket clients
-                            emit_chat(perm_event, &events_tx, &nats, &session_id);
-                        } else {
-                            debug!(
-                                "Ignoring non-permission SDK control request: {:?}",
-                                control_msg
-                            );
+                        stream_item = stream.next() => {
+                            match stream_item {
+                                Some(result) => {
+                                    // Also drain any buffered control messages
+                                    while let Ok(msg) = rx.try_recv() {
+                                        if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq) {
+                                            streaming_events.lock().await.push(evt);
+                                        }
+                                    }
+                                    result
+                                }
+                                None => break, // Stream ended
+                            }
                         }
                     }
-                }
+                } else {
+                    // No control channel — just read from stream
+                    match stream.next().await {
+                        Some(result) => result,
+                        None => break,
+                    }
+                };
 
                 match result {
                     Ok(ref msg) => {
