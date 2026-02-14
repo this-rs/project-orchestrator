@@ -54,11 +54,13 @@ jobs:
           retention-days: 1
 
   # ==========================================================================
-  # Build matrix - Compile for all target platforms (light variant)
+  # Build backend - Compile light + full variants in a single job per target
+  # (shares compiled dependencies between the two variants for ~50% faster CI)
   # ==========================================================================
-  build:
+  build-backend:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    needs: [build-frontend]
     strategy:
       fail-fast: false
       matrix:
@@ -129,17 +131,17 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build (native)
+      # --- Light variant (no embedded frontend) ---
+
+      - name: Build light variant (native)
         if: "!matrix.use_cross"
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (cross)
+      - name: Build light variant (cross)
         if: matrix.use_cross
         run: cross build --release --target ${{ matrix.target }}
 
-      # --- Package the binary ---
-
-      - name: Package (Unix)
+      - name: Package light (Unix)
         if: matrix.os != 'windows'
         shell: bash
         run: |
@@ -153,9 +155,9 @@ jobs:
           fi
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
-          echo "ARCHIVE=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+          echo "ARCHIVE_LIGHT=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
 
-      - name: Package (Windows)
+      - name: Package light (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
@@ -169,72 +171,18 @@ jobs:
             Copy-Item -Recurse "queries" "staging/${archiveName}/"
           }
           Compress-Archive -Path "staging/${archiveName}" -DestinationPath "staging/${archiveName}.zip"
-          echo "ARCHIVE=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "ARCHIVE_LIGHT=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload artifact
+      - name: Upload light artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARCHIVE }}
-          path: staging/${{ env.ARCHIVE }}
+          name: ${{ env.ARCHIVE_LIGHT }}
+          path: staging/${{ env.ARCHIVE_LIGHT }}
           retention-days: 1
 
-  # ==========================================================================
-  # Build full - Compile with embedded frontend (all-in-one binary)
-  # ==========================================================================
-  build-full:
-    name: Build full ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    needs: [build-frontend]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            runner: macos-14
-            os: macos
-            arch: arm64
-            use_cross: false
-
-          - target: x86_64-apple-darwin
-            runner: macos-14
-            os: macos
-            arch: x86_64
-            use_cross: false
-
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            os: linux
-            arch: x86_64
-            use_cross: true
-
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            os: linux
-            arch: arm64
-            use_cross: true
-
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            os: windows
-            arch: x86_64
-            use_cross: false
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Get version from tag
-        id: version
-        shell: bash
-        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Inject version from git tag
-        shell: bash
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          sed -i.bak "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
-          rm -f Cargo.toml.bak
-          echo "Injected version ${VERSION}:"
-          grep '^version' Cargo.toml | head -1
+      # --- Full variant (with embedded frontend) ---
+      # Incremental build: only crates affected by the `embedded-frontend` feature
+      # are recompiled (~2 min instead of full ~10 min).
 
       - name: Download frontend dist
         uses: actions/download-artifact@v4
@@ -242,31 +190,15 @@ jobs:
           name: frontend-dist
           path: dist/
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "release-${{ matrix.target }}"
-
-      - name: Install cross-rs
-        if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build with embedded frontend (native)
+      - name: Build full variant (native)
         if: "!matrix.use_cross"
         run: cargo build --release --features embedded-frontend --target ${{ matrix.target }}
 
-      - name: Build with embedded frontend (cross)
+      - name: Build full variant (cross)
         if: matrix.use_cross
         run: cross build --release --features embedded-frontend --target ${{ matrix.target }}
 
-      # --- Package the binary ---
-
-      - name: Package (Unix)
+      - name: Package full (Unix)
         if: matrix.os != 'windows'
         shell: bash
         run: |
@@ -280,9 +212,9 @@ jobs:
           fi
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
-          echo "ARCHIVE=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+          echo "ARCHIVE_FULL=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
 
-      - name: Package (Windows)
+      - name: Package full (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
@@ -296,13 +228,13 @@ jobs:
             Copy-Item -Recurse "queries" "staging/${archiveName}/"
           }
           Compress-Archive -Path "staging/${archiveName}" -DestinationPath "staging/${archiveName}.zip"
-          echo "ARCHIVE=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "ARCHIVE_FULL=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload artifact
+      - name: Upload full artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARCHIVE }}
-          path: staging/${{ env.ARCHIVE }}
+          name: ${{ env.ARCHIVE_FULL }}
+          path: staging/${{ env.ARCHIVE_FULL }}
           retention-days: 1
 
   # ==========================================================================
@@ -311,7 +243,7 @@ jobs:
   package-deb:
     name: Package .deb (${{ matrix.arch }})
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [build-backend]
     if: always()
     strategy:
       fail-fast: false
@@ -389,7 +321,7 @@ jobs:
   package-rpm:
     name: Package .rpm (${{ matrix.arch }})
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [build-backend]
     if: always()
     strategy:
       fail-fast: false
@@ -460,7 +392,7 @@ jobs:
   build-tauri:
     name: Tauri ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    needs: [build-frontend]
+    needs: [build-frontend, build-backend]
     env:
       # Expose secrets as job-level env so step `if:` conditions can check them
       APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -472,18 +404,26 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
             tauri_target: aarch64-apple-darwin
+            artifact_os: macos
+            artifact_arch: arm64
 
           - target: x86_64-apple-darwin
             runner: macos-14
             tauri_target: x86_64-apple-darwin
+            artifact_os: macos
+            artifact_arch: x86_64
 
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             tauri_target: x86_64-unknown-linux-gnu
+            artifact_os: linux
+            artifact_arch: x86_64
 
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             tauri_target: x86_64-pc-windows-msvc
+            artifact_os: windows
+            artifact_arch: x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -562,39 +502,38 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2"
 
-      # --- macOS Code Signing: import certificate into temp keychain ---
-      - name: Import Apple Developer certificate
-        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      # Reuse the mcp_server binary already compiled by build-backend
+      # (same code, same target, same release profile — no need to compile again)
+      - name: Download pre-built mcp_server
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}${{ matrix.artifact_os == 'windows' && '.zip' || '.tar.gz' }}
+          path: mcp-artifact/
+
+      - name: Extract mcp_server to target/release (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          # Create temporary keychain
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          ARCHIVE_NAME="${BINARY_NAME}-${{ steps.version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          tar xzf "mcp-artifact/${ARCHIVE_NAME}.tar.gz" -C mcp-artifact/
+          mkdir -p target/release
+          cp "mcp-artifact/${ARCHIVE_NAME}/mcp_server" target/release/mcp_server
+          chmod +x target/release/mcp_server
+          echo "✅ mcp_server extracted to target/release/"
+          ls -la target/release/mcp_server
 
-          # Import certificate
-          CERT_PATH=$RUNNER_TEMP/certificate.p12
-          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
-          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-
-          # Verify
-          security find-identity -v "$KEYCHAIN_PATH"
-
-      - name: Build mcp_server binary (bundled as Tauri resource)
-        run: cargo build --release --bin mcp_server
-
-      # On Windows, Tauri resource path in tauri.conf.json expects "mcp_server"
-      # but cargo produces "mcp_server.exe". Create a copy without .exe extension.
-      - name: Fix mcp_server path for Windows
+      - name: Extract mcp_server to target/release (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Copy-Item "target\release\mcp_server.exe" "target\release\mcp_server"
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "${env:BINARY_NAME}-${version}-windows-${{ matrix.artifact_arch }}"
+          Expand-Archive -Path "mcp-artifact/${archiveName}.zip" -DestinationPath "mcp-artifact/"
+          New-Item -ItemType Directory -Force -Path "target/release"
+          Copy-Item "mcp-artifact/${archiveName}/mcp_server.exe" "target/release/mcp_server.exe"
+          # Tauri resource path expects "mcp_server" without .exe extension
+          Copy-Item "target/release/mcp_server.exe" "target/release/mcp_server"
+          Write-Host "✅ mcp_server extracted to target/release/"
 
       # IMPORTANT: TAURI_SIGNING_PRIVATE_KEY must be set in GitHub Secrets for
       # auto-update to work. Without it, Tauri won't generate the updater bundles
@@ -605,17 +544,103 @@ jobs:
       # Generate a keypair with: cargo tauri signer generate -w ~/.tauri/myapp.key
       # Then set TAURI_SIGNING_PRIVATE_KEY to the contents of the private key file,
       # and update the pubkey in desktop/src-tauri/tauri.conf.json → plugins.updater.pubkey
+      # IMPORTANT: APPLE_CERTIFICATE + APPLE_CERTIFICATE_PASSWORD let Tauri
+      # create its own temporary keychain and import the certificate automatically.
+      # Do NOT create a manual keychain — it conflicts with Tauri's internal one.
       - name: Build Tauri bundle
         working-directory: desktop/src-tauri
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS: use real identity if available, otherwise ad-hoc sign (-)
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          # macOS code signing — Tauri handles keychain creation internally
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           # Windows signing
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: cargo tauri build --target ${{ matrix.tauri_target }}
+
+      # --- macOS: Re-sign with --timestamp for notarization ---
+      # Tauri's built-in codesign does NOT pass --timestamp to codesign (bug in
+      # tauri-macos-sign). Apple requires a secure timestamp for notarization.
+      # We re-sign everything after the Tauri build with --timestamp added.
+      - name: Re-sign macOS bundle with timestamp
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::warning::No .app bundle found — skipping re-sign"
+            exit 0
+          fi
+
+          echo "Re-signing $APP_PATH with --timestamp..."
+
+          # Sign deepest binaries first (inside-out order required by codesign)
+          # 1. Sign all nested frameworks and dylibs
+          find "$APP_PATH/Contents/Frameworks" -type f -perm +111 2>/dev/null | while read binary; do
+            echo "  Signing framework: $(basename "$binary")"
+            codesign --force --timestamp --options runtime \
+              --sign "$APPLE_SIGNING_IDENTITY" "$binary" || true
+          done
+
+          # 2. Sign all nested executables (helpers, etc.)
+          find "$APP_PATH/Contents/MacOS" -type f -perm +111 | while read binary; do
+            echo "  Signing executable: $(basename "$binary")"
+            codesign --force --timestamp --options runtime \
+              --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          done
+
+          # 3. Sign the .app bundle itself (must be last)
+          codesign --force --timestamp --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
+
+          # 4. Verify the signature
+          echo "Verifying signature..."
+          codesign --verify --deep --strict "$APP_PATH"
+          echo "✅ Re-sign with timestamp successful"
+
+      # --- macOS: Rebuild updater bundles after re-sign ---
+      # The .app.tar.gz and .sig generated by Tauri are now stale (different codesign).
+      # Recreate them with the re-signed .app.
+      - name: Rebuild updater bundles after re-sign
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          APP_NAME=$(basename "$APP_PATH")
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::warning::No .app bundle found — skipping updater rebuild"
+            exit 0
+          fi
+
+          # Recreate .app.tar.gz
+          TAR_PATH="$BUNDLE_DIR/macos/${APP_NAME}.tar.gz"
+          echo "Recreating $TAR_PATH..."
+          cd "$BUNDLE_DIR/macos"
+          rm -f "$(basename "$TAR_PATH")" "$(basename "$TAR_PATH").sig"
+          tar czf "$(basename "$TAR_PATH")" "$APP_NAME"
+          cd -
+
+          # Re-sign the .app.tar.gz with Tauri updater key
+          echo "Signing updater bundle with Tauri key..."
+          cargo tauri signer sign "$TAR_PATH" --private-key-path <(echo "$TAURI_SIGNING_PRIVATE_KEY") ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+--password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"}
+          echo "✅ Updater bundle recreated and signed"
+
+          # Also re-sign the .dmg with timestamp
+          DMG_PATH=$(find "$BUNDLE_DIR/dmg" -name "*.dmg" | head -1)
+          if [ -n "$DMG_PATH" ]; then
+            echo "Re-signing DMG with timestamp..."
+            codesign --force --timestamp --sign "${{ secrets.APPLE_SIGNING_IDENTITY }}" "$DMG_PATH" || true
+          fi
 
       # --- macOS Notarization: submit to Apple and staple ---
       - name: Notarize macOS .dmg
@@ -639,26 +664,19 @@ jobs:
             # Extract submission ID and fetch detailed log on failure
             SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
             if echo "$SUBMIT_OUTPUT" | grep -qi "invalid"; then
-              echo "::warning::Notarization returned Invalid — fetching Apple log..."
+              echo "::error::Notarization returned Invalid — fetching Apple log..."
               xcrun notarytool log "$SUBMISSION_ID" \
                 --apple-id "$APPLE_ID" \
                 --password "$APPLE_PASSWORD" \
                 --team-id "$APPLE_TEAM_ID" || true
+            elif echo "$SUBMIT_OUTPUT" | grep -qi "accepted"; then
+              echo "✅ Notarization accepted!"
+              echo "Stapling notarization ticket..."
+              xcrun stapler staple "$DMG_PATH"
+              echo "Verifying..."
+              spctl --assess --type open --context context:primary-signature -v "$DMG_PATH" || true
             fi
-
-            echo "Stapling notarization ticket..."
-            xcrun stapler staple "$DMG_PATH" || true
-
-            echo "Verifying..."
-            spctl --assess --type open --context context:primary-signature -v "$DMG_PATH" || true
           fi
-
-      # --- macOS Cleanup: remove temp keychain ---
-      - name: Cleanup macOS keychain
-        if: runner.os == 'macOS' && always()
-        run: |
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
 
       - name: Upload Tauri artifacts (macOS)
         if: runner.os == 'macOS'
@@ -703,7 +721,7 @@ jobs:
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [build, build-full, build-tauri, package-deb, package-rpm]
+    needs: [build-backend, build-tauri, package-deb, package-rpm]
     # Always run: collect whatever artifacts succeeded.
     # Individual matrix entries may fail/cancel (e.g. macos-13 runner unavailable)
     # but we still want to publish everything that built successfully.
@@ -890,10 +908,11 @@ jobs:
           flavor: |
             suffix=${{ matrix.suffix }}
           tags: |
+            type=raw,value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest,enable=${{ matrix.variant == 'full' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ matrix.variant == 'full' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -916,7 +935,8 @@ jobs:
     name: Update Homebrew Formula
     runs-on: ubuntu-latest
     needs: [release]
-    if: "!contains(github.ref, '-')"
+    # Skip pre-releases (e.g. v0.0.1-beta). Works for both tag push and workflow_dispatch.
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
     steps:
       - uses: actions/checkout@v4
 
