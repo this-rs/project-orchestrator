@@ -7310,11 +7310,7 @@ impl Neo4jClient {
     }
 
     /// Update the permission_mode field on a chat session node
-    pub async fn update_chat_session_permission_mode(
-        &self,
-        id: Uuid,
-        mode: &str,
-    ) -> Result<()> {
+    pub async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
         let cypher = "MATCH (s:ChatSession {id: $id}) SET s.permission_mode = $mode, s.updated_at = datetime()";
         let q = query(cypher)
             .param("id", id.to_string())

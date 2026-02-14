@@ -2120,11 +2120,7 @@ impl ChatManager {
     ///
     /// Sends a `set_permission_mode` control request to the Claude CLI subprocess,
     /// updates the in-memory `ActiveSession`, and persists the change to Neo4j.
-    pub async fn set_session_permission_mode(
-        &self,
-        session_id: &str,
-        mode: &str,
-    ) -> Result<()> {
+    pub async fn set_session_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
         // Validate mode
         const VALID_MODES: &[&str] = &["default", "acceptEdits", "bypassPermissions", "plan"];
         if !VALID_MODES.contains(&mode) {

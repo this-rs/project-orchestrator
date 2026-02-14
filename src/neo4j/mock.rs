@@ -3613,11 +3613,7 @@ impl GraphStore for MockGraphStore {
         }
     }
 
-    async fn update_chat_session_permission_mode(
-        &self,
-        id: Uuid,
-        mode: &str,
-    ) -> Result<()> {
+    async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
         let mut sessions = self.chat_sessions.write().await;
         if let Some(session) = sessions.get_mut(&id) {
             session.permission_mode = Some(mode.to_string());
