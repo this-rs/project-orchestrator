@@ -1049,7 +1049,7 @@ jobs:
           source_file: formula.rb
           destination_repo: this-rs/homebrew-tap
           destination_folder: Formula
-          destination_branch_create: main
+          destination_branch: main
           destination_file: project-orchestrator.rb
           user_email: "t@ffs.holdings"
           user_name: "Théotime Rivière"
