@@ -619,14 +619,21 @@ jobs:
               --sign "$APPLE_SIGNING_IDENTITY" "$binary" || true
           done
 
-          # 2. Sign all nested executables (helpers, etc.)
+          # 2. Sign resource binaries (e.g. mcp_server bundled as Tauri resource)
+          find "$APP_PATH/Contents/Resources" -type f -perm +111 2>/dev/null | while read binary; do
+            echo "  Signing resource: $(basename "$binary")"
+            codesign --force --timestamp --options runtime \
+              --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          done
+
+          # 3. Sign all nested executables (helpers, etc.)
           find "$APP_PATH/Contents/MacOS" -type f -perm +111 | while read binary; do
             echo "  Signing executable: $(basename "$binary")"
             codesign --force --timestamp --options runtime \
               --sign "$APPLE_SIGNING_IDENTITY" "$binary"
           done
 
-          # 3. Sign the .app bundle itself (must be last)
+          # 4. Sign the .app bundle itself (must be last)
           codesign --force --timestamp --options runtime \
             --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
 
