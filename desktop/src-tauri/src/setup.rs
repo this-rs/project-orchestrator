@@ -67,6 +67,12 @@ pub struct SetupConfig {
     // Chat
     pub chat_model: String,
     pub chat_max_sessions: u32,
+    #[serde(default = "default_max_turns")]
+    pub chat_max_turns: u32,
+}
+
+fn default_max_turns() -> u32 {
+    50
 }
 
 fn default_true() -> bool {
@@ -124,6 +130,7 @@ struct MeilisearchSection {
 struct ChatSection {
     default_model: String,
     max_sessions: u32,
+    max_turns: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -578,6 +585,7 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
         chat: Some(ChatSection {
             default_model: config.chat_model.clone(),
             max_sessions: config.chat_max_sessions,
+            max_turns: config.chat_max_turns,
         }),
         auth,
     };
@@ -805,6 +813,7 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         nats_enabled,
         chat_model: yaml.chat.default_model.unwrap_or_else(|| "sonnet-4-5".into()),
         chat_max_sessions: yaml.chat.max_sessions.unwrap_or(3) as u32,
+        chat_max_turns: yaml.chat.max_turns.unwrap_or(50) as u32,
         has_oidc_secret,
         has_neo4j_password,
         has_meilisearch_key,
@@ -849,6 +858,7 @@ pub struct ReadConfigResponse {
     pub nats_enabled: bool,
     pub chat_model: String,
     pub chat_max_sessions: u32,
+    pub chat_max_turns: u32,
     // Indicators for existing secrets (reconfigure mode)
     pub has_oidc_secret: bool,
     pub has_neo4j_password: bool,
