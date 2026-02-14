@@ -18,12 +18,16 @@ fn get_server_port() -> u16 {
     setup::DEFAULT_DESKTOP_PORT
 }
 
-/// Tauri command: check if the backend is healthy
+/// Tauri command: check if the backend HTTP listener is reachable.
+///
+/// Returns true as soon as the server responds (any HTTP status code).
+/// Service-level health (Neo4j, Meilisearch) is checked separately
+/// by `check_services_health` and the enriched `/health` endpoint.
 #[tauri::command]
 async fn check_health(port: u16) -> Result<bool, String> {
     let url = format!("http://localhost:{}/health", port);
     match reqwest::get(&url).await {
-        Ok(resp) => Ok(resp.status().is_success()),
+        Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
 }
@@ -257,14 +261,16 @@ fn main() {
                         tracing::error!("Backend HTTP listener did not start within 30 seconds");
                         break;
                     }
-                    if let Ok(resp) = reqwest::blocking::get(&health_url) {
-                        if resp.status().is_success() {
-                            tracing::info!(
-                                "Backend HTTP ready in {:?}",
-                                start.elapsed()
-                            );
-                            break;
-                        }
+                    // We only check that the HTTP listener is up (any response),
+                    // NOT that services are connected. /health may return 503 when
+                    // Neo4j is still starting — that's fine, the Docker health loop
+                    // below handles service readiness.
+                    if reqwest::blocking::get(&health_url).is_ok() {
+                        tracing::info!(
+                            "Backend HTTP ready in {:?}",
+                            start.elapsed()
+                        );
+                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
