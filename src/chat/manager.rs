@@ -83,6 +83,8 @@ pub struct ChatManager {
     pub(crate) nats: Option<Arc<crate::events::NatsEmitter>>,
     /// Runtime-mutable permission config (updated via REST API)
     pub(crate) permission_config: Arc<RwLock<super::config::PermissionConfig>>,
+    /// Path to config.yaml for persisting permission changes (None = no persistence)
+    pub(crate) config_yaml_path: Option<std::path::PathBuf>,
 }
 
 impl ChatManager {
@@ -103,6 +105,7 @@ impl ChatManager {
             event_emitter: None,
             nats: None,
             permission_config,
+            config_yaml_path: None,
         }
     }
 
@@ -141,12 +144,19 @@ impl ChatManager {
             event_emitter: None,
             nats: None,
             permission_config,
+            config_yaml_path: None,
         }
     }
 
     /// Set the event emitter for CRUD events (streaming status notifications)
     pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
         self.event_emitter = Some(emitter);
+        self
+    }
+
+    /// Set the config.yaml path for persisting permission config changes.
+    pub fn with_config_yaml_path(mut self, path: std::path::PathBuf) -> Self {
+        self.config_yaml_path = Some(path);
         self
     }
 
@@ -175,6 +185,9 @@ impl ChatManager {
     /// is not one of the valid values ("default", "acceptEdits", "plan", "bypassPermissions").
     /// New sessions will pick up the updated config immediately.
     /// Active sessions keep their original config (no mid-session changes).
+    ///
+    /// When a `config_yaml_path` is set, the updated config is also persisted
+    /// to disk atomically (write to .tmp then rename).
     pub async fn update_permission_config(
         &self,
         new_config: super::config::PermissionConfig,
@@ -188,7 +201,102 @@ impl ChatManager {
         }
         let mut perm = self.permission_config.write().await;
         *perm = new_config;
-        Ok(perm.clone())
+        let result = perm.clone();
+        // Drop the lock before doing I/O
+        drop(perm);
+
+        // Persist to config.yaml if a path is configured
+        if let Some(ref yaml_path) = self.config_yaml_path {
+            if let Err(e) = Self::persist_permission_to_yaml(yaml_path, &result) {
+                // Log but don't fail the API call — in-memory update succeeded
+                error!(
+                    path = %yaml_path.display(),
+                    error = %e,
+                    "Failed to persist permission config to config.yaml"
+                );
+            } else {
+                info!(
+                    path = %yaml_path.display(),
+                    mode = %result.mode,
+                    "Permission config persisted to config.yaml"
+                );
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Persist permission config to config.yaml using surgical YAML modification.
+    ///
+    /// Reads the existing file as a `serde_yaml::Value` tree, updates only the
+    /// `chat.permissions` subtree, and writes back atomically (tmp + rename).
+    /// This preserves all other config sections (auth, server, neo4j, etc.)
+    /// without needing `Serialize` on those structs.
+    fn persist_permission_to_yaml(
+        yaml_path: &std::path::Path,
+        permission: &super::config::PermissionConfig,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        // 1. Read existing YAML as a Value tree (or start from empty mapping)
+        let mut doc: serde_yaml::Value = if yaml_path.exists() {
+            let contents = std::fs::read_to_string(yaml_path)
+                .with_context(|| format!("Reading {}", yaml_path.display()))?;
+            serde_yaml::from_str(&contents)
+                .with_context(|| format!("Parsing {}", yaml_path.display()))?
+        } else {
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+        };
+
+        // 2. Ensure doc is a mapping
+        let root = doc
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow!("config.yaml root is not a YAML mapping"))?;
+
+        // 3. Ensure chat section exists as a mapping
+        let chat_key = serde_yaml::Value::String("chat".into());
+        if !root.contains_key(&chat_key) {
+            root.insert(
+                chat_key.clone(),
+                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            );
+        }
+        let chat_section = root
+            .get_mut(&chat_key)
+            .and_then(|v| v.as_mapping_mut())
+            .ok_or_else(|| anyhow!("chat section is not a YAML mapping"))?;
+
+        // 4. Serialize PermissionConfig to a YAML Value and insert
+        let perm_value = serde_yaml::to_value(permission)
+            .context("Serializing PermissionConfig to YAML value")?;
+        chat_section.insert(
+            serde_yaml::Value::String("permissions".into()),
+            perm_value,
+        );
+
+        // 5. Serialize the full document back to YAML string
+        let yaml_str =
+            serde_yaml::to_string(&doc).context("Serializing config document to YAML")?;
+
+        // 6. Atomic write: write to .tmp then rename
+        let tmp_path = yaml_path.with_extension("yaml.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp_path)
+                .with_context(|| format!("Creating {}", tmp_path.display()))?;
+            file.write_all(yaml_str.as_bytes())
+                .with_context(|| format!("Writing {}", tmp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("Syncing {}", tmp_path.display()))?;
+        }
+        std::fs::rename(&tmp_path, yaml_path).with_context(|| {
+            format!(
+                "Renaming {} → {}",
+                tmp_path.display(),
+                yaml_path.display()
+            )
+        })?;
+
+        Ok(())
     }
 
     /// Spawn a background task that listens for NATS interrupt signals for a session.
@@ -4673,5 +4781,184 @@ mod tests {
         assert!(!remote);
 
         // This confirms the routing: not local + not remote = resume_session fallback
+    }
+
+    // ====================================================================
+    // YAML persistence tests
+    // ====================================================================
+
+    #[test]
+    fn test_persist_permission_to_yaml_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+
+        // Write an existing config.yaml with other sections
+        std::fs::write(
+            &yaml_path,
+            "server:\n  port: 9090\nneo4j:\n  uri: bolt://db:7687\nchat:\n  default_model: claude-sonnet\n",
+        )
+        .unwrap();
+
+        let perm = super::super::config::PermissionConfig {
+            mode: "default".into(),
+            allowed_tools: vec!["Bash(git *)".into(), "Read".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+
+        ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
+
+        // Re-read and verify
+        let contents = std::fs::read_to_string(&yaml_path).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+
+        // Other sections preserved
+        assert_eq!(
+            doc["server"]["port"].as_u64().unwrap(),
+            9090,
+            "server.port should be preserved"
+        );
+        assert_eq!(
+            doc["neo4j"]["uri"].as_str().unwrap(),
+            "bolt://db:7687",
+            "neo4j.uri should be preserved"
+        );
+        // Existing chat fields preserved
+        assert_eq!(
+            doc["chat"]["default_model"].as_str().unwrap(),
+            "claude-sonnet",
+            "chat.default_model should be preserved"
+        );
+        // Permissions written correctly
+        assert_eq!(doc["chat"]["permissions"]["mode"].as_str().unwrap(), "default");
+        let allowed = doc["chat"]["permissions"]["allowed_tools"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(allowed.len(), 2);
+        assert_eq!(allowed[0].as_str().unwrap(), "Bash(git *)");
+        assert_eq!(allowed[1].as_str().unwrap(), "Read");
+        let disallowed = doc["chat"]["permissions"]["disallowed_tools"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(disallowed.len(), 1);
+        assert_eq!(disallowed[0].as_str().unwrap(), "Bash(rm -rf *)");
+    }
+
+    #[test]
+    fn test_persist_permission_to_yaml_no_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+
+        // File does not exist yet
+        assert!(!yaml_path.exists());
+
+        let perm = super::super::config::PermissionConfig {
+            mode: "acceptEdits".into(),
+            allowed_tools: vec![],
+            disallowed_tools: vec!["Bash(sudo *)".into()],
+        };
+
+        ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
+
+        // File should now exist
+        assert!(yaml_path.exists());
+        let contents = std::fs::read_to_string(&yaml_path).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+
+        assert_eq!(doc["chat"]["permissions"]["mode"].as_str().unwrap(), "acceptEdits");
+        // Empty allowed_tools should be present as empty sequence
+        assert!(doc["chat"]["permissions"]["allowed_tools"]
+            .as_sequence()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            doc["chat"]["permissions"]["disallowed_tools"]
+                .as_sequence()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_persist_permission_roundtrip_with_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+
+        // Start with a config that has no permissions
+        std::fs::write(
+            &yaml_path,
+            "server:\n  port: 8080\nchat:\n  default_model: claude-opus-4-6\n",
+        )
+        .unwrap();
+
+        // Persist permissions
+        let perm = super::super::config::PermissionConfig {
+            mode: "plan".into(),
+            allowed_tools: vec!["mcp__project-orchestrator__*".into()],
+            disallowed_tools: vec![],
+        };
+        ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
+
+        // Reload via Config::from_yaml_and_env
+        // Clear env vars that would override
+        std::env::remove_var("CHAT_PERMISSION_MODE");
+        std::env::remove_var("CHAT_ALLOWED_TOOLS");
+        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+
+        let config = crate::Config::from_yaml_and_env(Some(&yaml_path)).unwrap();
+        let loaded_perm = config.chat_permissions.expect("chat_permissions should be Some");
+        assert_eq!(loaded_perm.mode, "plan");
+        assert_eq!(loaded_perm.allowed_tools, vec!["mcp__project-orchestrator__*"]);
+        assert!(loaded_perm.disallowed_tools.is_empty());
+
+        // config_yaml_path should be set
+        assert_eq!(
+            config.config_yaml_path.as_deref(),
+            Some(yaml_path.as_path())
+        );
+    }
+
+    #[test]
+    fn test_persist_permission_atomic_no_tmp_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+        let tmp_path = dir.path().join("config.yaml.tmp");
+
+        std::fs::write(&yaml_path, "chat: {}\n").unwrap();
+
+        let perm = super::super::config::PermissionConfig::default();
+        ChatManager::persist_permission_to_yaml(&yaml_path, &perm).unwrap();
+
+        // .tmp file should not exist after successful rename
+        assert!(!tmp_path.exists(), "Temporary file should be cleaned up after atomic rename");
+        // Original file should still exist with updated content
+        assert!(yaml_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_update_permission_config_persists_to_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("config.yaml");
+        std::fs::write(&yaml_path, "chat:\n  default_model: test\n").unwrap();
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_config_yaml_path(yaml_path.clone());
+
+        let new_perm = super::super::config::PermissionConfig {
+            mode: "acceptEdits".into(),
+            allowed_tools: vec!["Read".into()],
+            disallowed_tools: vec![],
+        };
+
+        let result = manager.update_permission_config(new_perm).await.unwrap();
+        assert_eq!(result.mode, "acceptEdits");
+
+        // Verify it was persisted to disk
+        let contents = std::fs::read_to_string(&yaml_path).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        assert_eq!(doc["chat"]["permissions"]["mode"].as_str().unwrap(), "acceptEdits");
+        // Other chat fields preserved
+        assert_eq!(doc["chat"]["default_model"].as_str().unwrap(), "test");
     }
 }
