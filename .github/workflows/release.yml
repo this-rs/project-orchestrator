@@ -641,8 +641,10 @@ jobs:
       - name: Rebuild updater bundles after re-sign
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Use a custom name to avoid conflict with `cargo tauri signer` which
+          # auto-reads TAURI_SIGNING_PRIVATE_KEY and clashes with --private-key flag
+          UPDATER_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          UPDATER_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
           APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
@@ -661,9 +663,17 @@ jobs:
           tar czf "$(basename "$TAR_PATH")" "$APP_NAME"
           cd -
 
+          # Write private key to a temp file for cargo tauri signer
+          KEY_FILE=$(mktemp)
+          echo "$UPDATER_PRIVATE_KEY" > "$KEY_FILE"
+
           # Re-sign the .app.tar.gz with Tauri updater key
           echo "Signing updater bundle with Tauri key..."
-          cargo tauri signer sign "$TAR_PATH" --private-key-path <(echo "$TAURI_SIGNING_PRIVATE_KEY") ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+--password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"}
+          cargo tauri signer sign "$TAR_PATH" \
+            --private-key-path "$KEY_FILE" \
+            ${UPDATER_PRIVATE_KEY_PASSWORD:+--password "$UPDATER_PRIVATE_KEY_PASSWORD"}
+
+          rm -f "$KEY_FILE"
           echo "✅ Updater bundle recreated and signed"
 
           # Also re-sign the .dmg with timestamp
