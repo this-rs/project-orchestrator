@@ -8,6 +8,7 @@
     "devUrl": "http://localhost:3002"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "splashscreen",
