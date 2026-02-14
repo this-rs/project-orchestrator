@@ -1,6 +1,12 @@
-# Project Orchestrator
+<p align="center">
+  <img src="desktop/dist/logo-512.png" alt="Project Orchestrator" width="128" />
+</p>
 
-**Coordinate AI coding agents with a shared knowledge graph.**
+<h1 align="center">Project Orchestrator</h1>
+
+<p align="center">
+  <strong>Coordinate AI coding agents with a shared knowledge graph.</strong>
+</p>
 
 Project Orchestrator gives your AI agents a shared brain. Instead of each agent starting from scratch, they share code understanding, plans, decisions, and progress through a central knowledge base.
 
