@@ -13,12 +13,12 @@ use super::workspace_handlers;
 use super::ws_chat_handler;
 use super::ws_handlers;
 use crate::auth::middleware::require_auth;
+use axum::http::{header, Method};
 use axum::{
     middleware::from_fn_with_state,
     routing::{get, post},
     Router,
 };
-use axum::http::{header, Method};
 use tower_http::cors::CorsLayer;
 #[cfg(not(feature = "embedded-frontend"))]
 use tower_http::services::{ServeDir, ServeFile};

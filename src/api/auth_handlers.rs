@@ -147,8 +147,8 @@ async fn create_refresh_token_and_cookie(
 ) -> Result<axum::http::HeaderValue, AppError> {
     let raw_token = refresh::generate_token();
     let token_hash = refresh::hash_token(&raw_token);
-    let expires_at = Utc::now()
-        + chrono::Duration::seconds(auth_config.refresh_token_expiry_secs as i64);
+    let expires_at =
+        Utc::now() + chrono::Duration::seconds(auth_config.refresh_token_expiry_secs as i64);
 
     state
         .orchestrator
@@ -170,11 +170,7 @@ fn auth_response_with_cookie(
     json_body: AuthTokenResponse,
     cookie: axum::http::HeaderValue,
 ) -> Response {
-    (
-        [(SET_COOKIE, cookie)],
-        Json(json_body),
-    )
-        .into_response()
+    ([(SET_COOKIE, cookie)], Json(json_body)).into_response()
 }
 
 // ============================================================================
@@ -272,7 +268,8 @@ pub async fn password_login(
                 .map_err(AppError::Internal)?;
 
                 // 5. Generate refresh token + Set-Cookie
-                let cookie = create_refresh_token_and_cookie(&state, auth_config, root_user_id).await?;
+                let cookie =
+                    create_refresh_token_and_cookie(&state, auth_config, root_user_id).await?;
 
                 return Ok(auth_response_with_cookie(
                     AuthTokenResponse {
@@ -725,9 +722,7 @@ pub async fn refresh_token(
         .neo4j()
         .validate_refresh_token(&token_hash)
         .await?
-        .ok_or_else(|| {
-            AppError::Unauthorized("Invalid or expired refresh token".to_string())
-        })?;
+        .ok_or_else(|| AppError::Unauthorized("Invalid or expired refresh token".to_string()))?;
 
     // 3. Revoke old refresh token (rotation — each token is single-use)
     state
@@ -776,7 +771,9 @@ pub async fn refresh_token(
 
     Ok((
         [(SET_COOKIE, cookie)],
-        Json(RefreshTokenResponse { token: access_token }),
+        Json(RefreshTokenResponse {
+            token: access_token,
+        }),
     )
         .into_response())
 }
@@ -823,7 +820,11 @@ pub async fn logout(
     let is_secure = refresh::should_set_secure(state.public_url.as_deref());
     let clear_cookie = refresh::build_clear_cookie(is_secure);
 
-    Ok(([(SET_COOKIE, clear_cookie)], axum::http::StatusCode::NO_CONTENT).into_response())
+    Ok((
+        [(SET_COOKIE, clear_cookie)],
+        axum::http::StatusCode::NO_CONTENT,
+    )
+        .into_response())
 }
 
 // ============================================================================
@@ -1102,7 +1103,10 @@ mod tests {
             .get("set-cookie")
             .expect("Set-Cookie header must be present after refresh");
         let cookie_str = set_cookie.to_str().unwrap();
-        assert!(cookie_str.contains("refresh_token="), "Cookie must contain refresh_token");
+        assert!(
+            cookie_str.contains("refresh_token="),
+            "Cookie must contain refresh_token"
+        );
         assert!(cookie_str.contains("HttpOnly"), "Cookie must be HttpOnly");
         assert!(cookie_str.contains("Path=/"), "Cookie must have Path=/");
 
@@ -1292,7 +1296,12 @@ mod tests {
             created_at: now,
             last_login_at: now,
         };
-        state.orchestrator.neo4j().upsert_user(&user_node).await.unwrap();
+        state
+            .orchestrator
+            .neo4j()
+            .upsert_user(&user_node)
+            .await
+            .unwrap();
 
         // Create a refresh token
         let raw_token = refresh::generate_token();
@@ -1327,8 +1336,14 @@ mod tests {
             .get("set-cookie")
             .expect("Logout must return Set-Cookie header");
         let cookie_str = set_cookie.to_str().unwrap();
-        assert!(cookie_str.contains("refresh_token=;"), "Cookie value must be cleared");
-        assert!(cookie_str.contains("Max-Age=0"), "Cookie must expire immediately");
+        assert!(
+            cookie_str.contains("refresh_token=;"),
+            "Cookie value must be cleared"
+        );
+        assert!(
+            cookie_str.contains("Max-Age=0"),
+            "Cookie must expire immediately"
+        );
         assert!(cookie_str.contains("HttpOnly"), "Cookie must be HttpOnly");
         assert!(cookie_str.contains("Path=/"), "Cookie must have Path=/");
 
@@ -1359,7 +1374,10 @@ mod tests {
 
         // Should still clear the cookie
         let set_cookie = resp.headers().get("set-cookie");
-        assert!(set_cookie.is_some(), "Should still send Set-Cookie to clear");
+        assert!(
+            set_cookie.is_some(),
+            "Should still send Set-Cookie to clear"
+        );
     }
 
     #[tokio::test]
@@ -1441,9 +1459,15 @@ mod tests {
             .get("set-cookie")
             .expect("Login must return Set-Cookie header");
         let cookie_str = set_cookie.to_str().unwrap();
-        assert!(cookie_str.contains("refresh_token="), "Cookie must contain refresh_token");
+        assert!(
+            cookie_str.contains("refresh_token="),
+            "Cookie must contain refresh_token"
+        );
         assert!(cookie_str.contains("HttpOnly"), "Cookie must be HttpOnly");
-        assert!(cookie_str.contains("SameSite=Lax"), "Cookie must be SameSite=Lax");
+        assert!(
+            cookie_str.contains("SameSite=Lax"),
+            "Cookie must be SameSite=Lax"
+        );
         assert!(cookie_str.contains("Path=/"), "Cookie must have Path=/");
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

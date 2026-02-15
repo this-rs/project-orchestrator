@@ -115,9 +115,7 @@ pub async fn ws_authenticate_from_cookie(
         Ok(Some(node)) => node,
         Ok(None) => {
             warn!("WS cookie auth: invalid or expired refresh token");
-            return CookieAuthResult::Invalid(
-                "Invalid or expired refresh token".to_string(),
-            );
+            return CookieAuthResult::Invalid("Invalid or expired refresh token".to_string());
         }
         Err(e) => {
             warn!("WS cookie auth: DB error validating token: {}", e);
@@ -375,7 +373,8 @@ mod tests {
         let mock = Arc::new(MockGraphStore::new());
         let headers = HeaderMap::new();
 
-        let result = ws_authenticate_from_cookie(&headers, &None, &(mock as Arc<dyn GraphStore>)).await;
+        let result =
+            ws_authenticate_from_cookie(&headers, &None, &(mock as Arc<dyn GraphStore>)).await;
 
         match result {
             CookieAuthResult::Authenticated(claims) => {
@@ -392,7 +391,8 @@ mod tests {
         let headers = HeaderMap::new();
         let config = Some(test_auth_config());
 
-        let result = ws_authenticate_from_cookie(&headers, &config, &(mock as Arc<dyn GraphStore>)).await;
+        let result =
+            ws_authenticate_from_cookie(&headers, &config, &(mock as Arc<dyn GraphStore>)).await;
 
         match result {
             CookieAuthResult::NoCookie => {} // expected
@@ -410,7 +410,8 @@ mod tests {
         );
         let config = Some(test_auth_config());
 
-        let result = ws_authenticate_from_cookie(&headers, &config, &(mock as Arc<dyn GraphStore>)).await;
+        let result =
+            ws_authenticate_from_cookie(&headers, &config, &(mock as Arc<dyn GraphStore>)).await;
 
         match result {
             CookieAuthResult::NoCookie => {} // expected
@@ -443,7 +444,8 @@ mod tests {
         let headers = headers_with_cookie("nonexistent_token_value");
         let config = Some(test_auth_config());
 
-        let result = ws_authenticate_from_cookie(&headers, &config, &(mock as Arc<dyn GraphStore>)).await;
+        let result =
+            ws_authenticate_from_cookie(&headers, &config, &(mock as Arc<dyn GraphStore>)).await;
 
         match result {
             CookieAuthResult::Invalid(reason) => {
@@ -497,12 +499,9 @@ mod tests {
 
         let headers = headers_with_cookie(&raw_token);
 
-        let result = ws_authenticate_from_cookie(
-            &headers,
-            &Some(config),
-            &(mock as Arc<dyn GraphStore>),
-        )
-        .await;
+        let result =
+            ws_authenticate_from_cookie(&headers, &Some(config), &(mock as Arc<dyn GraphStore>))
+                .await;
 
         match result {
             CookieAuthResult::Authenticated(claims) => {
