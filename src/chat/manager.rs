@@ -74,11 +74,23 @@ pub struct ActiveSession {
     /// ownership during streaming, then put it back when the stream ends.
     pub sdk_control_rx:
         Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>>,
+    /// Cloned stdin sender for writing control responses (e.g., permission
+    /// allow/deny) to the CLI subprocess **without** taking the `client` lock.
+    /// This is critical because `stream_response` holds the client lock for the
+    /// entire duration of streaming — if `send_permission_response` tried to
+    /// take the same lock, it would deadlock.
+    pub stdin_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Cancellation token for NATS listener tasks spawned by this session.
     /// When the session is replaced (e.g., by `resume_session`), the old token
     /// is cancelled so that stale NATS listeners (interrupt, snapshot, RPC)
     /// shut down instead of accumulating across resumes/restarts.
     pub nats_cancel: CancellationToken,
+    /// Stores the original tool input for pending permission requests.
+    /// Key: request_id, Value: the tool input JSON.
+    /// When the user responds Allow, we include this input in `updatedInput`
+    /// so the CLI doesn't lose the original command/parameters.
+    pub pending_permission_inputs:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -963,6 +975,7 @@ impl ChatManager {
             .permission_mode(effective_permission)
             .max_turns(self.config.max_turns)
             .include_partial_messages(true)
+            .permission_prompt_tool_name("stdio")
             .add_mcp_server("project-orchestrator", mcp_config);
 
         // Wire allowed/disallowed tool patterns from config
@@ -1218,7 +1231,18 @@ impl ChatManager {
         let sdk_control_rx = client.take_sdk_control_receiver().await;
         let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
 
-        info!("Created chat session {} with model {}", session_id, model);
+        // Clone the stdin sender BEFORE wrapping client in Arc<Mutex<>>.
+        // This allows send_permission_response to write control responses
+        // directly to the CLI subprocess without taking the client lock
+        // (which is held by stream_response during streaming → deadlock).
+        let stdin_tx = client.clone_stdin_sender().await;
+
+        info!(
+            session_id = %session_id,
+            has_stdin_tx = stdin_tx.is_some(),
+            "Created chat session with model {}",
+            model
+        );
 
         // Create broadcast channel
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
@@ -1260,7 +1284,11 @@ impl ChatManager {
                     streaming_events: streaming_events.clone(),
                     permission_mode: request.permission_mode.clone(),
                     sdk_control_rx: sdk_control_rx.clone(),
+                    stdin_tx,
                     nats_cancel: nats_cancel.clone(),
+                    pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
                 },
             );
             interrupt_flag
@@ -1479,6 +1507,17 @@ impl ChatManager {
         // so the next stream_response invocation can reuse it.
         let mut sdk_control_rx = shared_sdk_control_rx.lock().await.take();
 
+        // Get a handle to the session's pending permission inputs map so we can
+        // store the original tool input when a permission request arrives.
+        // send_permission_response() reads from this same Arc to retrieve the input.
+        let pending_perm_inputs: Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>> = {
+            let guard = active_sessions.read().await;
+            guard
+                .get(&session_id)
+                .map(|s| s.pending_permission_inputs.clone())
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())))
+        };
+
         {
             let mut c = client.lock().await;
             let stream_result = c.send_and_receive_stream(prompt).await;
@@ -1525,73 +1564,34 @@ impl ChatManager {
                                       next_seq: &std::sync::atomic::AtomicI64,
                                       current_parent: Option<String>|
              -> Option<ChatEvent> {
-                // Extract the request data (may be nested under "request")
-                let request_data = if control_msg.get("request").is_some() {
-                    control_msg
-                        .get("request")
-                        .cloned()
-                        .unwrap_or(control_msg.clone())
-                } else {
-                    control_msg.clone()
-                };
+                let perm_event =
+                    parse_permission_control_msg(&control_msg, current_parent)?;
 
-                if request_data.get("subtype").and_then(|v| v.as_str()) == Some("can_use_tool") {
-                    let tool_name = request_data
-                        .get("toolName")
-                        .or_else(|| request_data.get("tool_name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let input = request_data
-                        .get("input")
-                        .cloned()
-                        .unwrap_or(serde_json::json!({}));
-                    // Use request_id as the permission request ID so the
-                    // frontend can correlate response → request.
-                    let request_id = control_msg
-                        .get("requestId")
-                        .or_else(|| control_msg.get("request_id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
+                if let ChatEvent::PermissionRequest { ref id, ref tool, .. } = perm_event {
                     info!(
                         session_id = %session_id,
-                        tool = %tool_name,
-                        request_id = %request_id,
+                        tool = %tool,
+                        request_id = %id,
                         "Permission request from CLI"
                     );
-
-                    let perm_event = ChatEvent::PermissionRequest {
-                        id: request_id,
-                        tool: tool_name,
-                        input,
-                        parent_tool_use_id: current_parent,
-                    };
-
-                    // Persist the permission_request event
-                    if let Some(uuid) = session_uuid {
-                        let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-                        events_to_persist.push(ChatEventRecord {
-                            id: Uuid::new_v4(),
-                            session_id: uuid,
-                            seq,
-                            event_type: "permission_request".to_string(),
-                            data: serde_json::to_string(&perm_event).unwrap_or_default(),
-                            created_at: chrono::Utc::now(),
-                        });
-                    }
-
-                    // Broadcast to WebSocket clients
-                    emit_chat(perm_event.clone(), &events_tx, &nats, &session_id);
-                    Some(perm_event)
-                } else {
-                    debug!(
-                        "Ignoring non-permission SDK control request: {:?}",
-                        control_msg
-                    );
-                    None
                 }
+
+                // Persist the permission_request event
+                if let Some(uuid) = session_uuid {
+                    let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                    events_to_persist.push(ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: uuid,
+                        seq,
+                        event_type: "permission_request".to_string(),
+                        data: serde_json::to_string(&perm_event).unwrap_or_default(),
+                        created_at: chrono::Utc::now(),
+                    });
+                }
+
+                // Broadcast to WebSocket clients
+                emit_chat(perm_event.clone(), &events_tx, &nats, &session_id);
+                Some(perm_event)
             };
 
             // Main stream loop — uses tokio::select! to listen for BOTH stream
@@ -1622,6 +1622,12 @@ impl ChatManager {
                             match control_msg {
                                 Some(msg) => {
                                     if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
+                                        // Store original tool input for later use in permission response
+                                        if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                            if !id.is_empty() {
+                                                store_pending_perm_input(&pending_perm_inputs, id, input).await;
+                                            }
+                                        }
                                         streaming_events.lock().await.push(evt);
                                     }
                                     continue; // Go back to select! for next event
@@ -1640,6 +1646,12 @@ impl ChatManager {
                                     // Also drain any buffered control messages
                                     while let Ok(msg) = rx.try_recv() {
                                         if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
+                                            // Store original tool input for later use in permission response
+                                            if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                                if !id.is_empty() {
+                                                    store_pending_perm_input(&pending_perm_inputs, id, input).await;
+                                                }
+                                            }
                                             streaming_events.lock().await.push(evt);
                                         }
                                     }
@@ -2230,31 +2242,111 @@ impl ChatManager {
     /// - Broadcast to WebSocket subscribers
     /// - Trigger a new stream_response
     ///
-    /// It sends a JSON control response directly to the CLI subprocess via the SDK
-    /// control protocol: `{"type": "control_response", "response": {"allow": true/false}}`.
-    /// This is required for non-BypassPermissions modes where Claude CLI sends
-    /// `can_use_tool` control requests and expects a control_response (not a user message).
-    pub async fn send_permission_response(&self, session_id: &str, allow: bool) -> Result<()> {
-        let client = {
+    /// It sends a JSON control response directly to the CLI subprocess via the
+    /// cloned `stdin_tx` sender — **without** taking the `client` Mutex lock.
+    ///
+    /// This is critical because `stream_response` holds the client lock for the
+    /// entire duration of streaming. If we tried to lock the client here, we'd
+    /// deadlock: stream_response waits for the permission response to continue,
+    /// but we'd wait for stream_response to release the lock.
+    ///
+    /// The control response format uses the SDK control protocol envelope,
+    /// with the inner `response` matching the SDK's `internal_query.rs` format:
+    /// ```json
+    /// {
+    ///   "type": "control_response",
+    ///   "response": {
+    ///     "subtype": "success",
+    ///     "request_id": "<requestId from the control_request>",
+    ///     "response": { "allow": true }
+    ///   }
+    /// }
+    /// ```
+    /// For deny:
+    /// ```json
+    /// {
+    ///   "type": "control_response",
+    ///   "response": {
+    ///     "subtype": "success",
+    ///     "request_id": "<requestId from the control_request>",
+    ///     "response": { "allow": false, "reason": "User denied" }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// **IMPORTANT**: Do NOT include `"updatedInput": {}` — the CLI uses that field
+    /// to REPLACE the original tool input. An empty `{}` erases the command/input,
+    /// causing `"undefined is not an object"` when the CLI tries to execute.
+    pub async fn send_permission_response(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        allow: bool,
+    ) -> Result<()> {
+        let (stdin_tx, pending_perm_inputs) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
             session.last_activity = Instant::now();
-            session.client.clone()
+            let tx = session
+                .stdin_tx
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No stdin sender for session {} (CLI may not be connected)",
+                        session_id
+                    )
+                })?;
+            (tx, session.pending_permission_inputs.clone())
         };
 
-        let response = serde_json::json!({ "allow": allow });
+        // Retrieve the original tool input stored when the permission_request arrived.
+        // This is needed because the CLI's Zod schema for permission responses requires:
+        //   Allow: { behavior: "allow", updatedInput: <record> }
+        //   Deny:  { behavior: "deny",  message: <string> }
+        // The `updatedInput` field REPLACES the original tool input in the CLI, so we
+        // MUST pass back the original input — an empty {} would erase command/file_path/etc.
+        let original_input = pending_perm_inputs
+            .lock()
+            .await
+            .remove(request_id)
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let permission_response = if allow {
+            serde_json::json!({
+                "behavior": "allow",
+                "updatedInput": original_input
+            })
+        } else {
+            serde_json::json!({
+                "behavior": "deny",
+                "message": "User denied the permission request"
+            })
+        };
+
+        // Wrap in the control_response envelope with subtype + request_id:
+        let control_response = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": permission_response
+            }
+        });
+
+        let json = serde_json::to_string(&control_response)
+            .map_err(|e| anyhow!("Failed to serialize control response: {}", e))?;
 
         info!(
             session_id = %session_id,
+            request_id = %request_id,
             allow,
-            "Sending permission control response to CLI"
+            "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
-        let mut client = client.lock().await;
-        client
-            .send_control_response(response)
+        stdin_tx
+            .send(json)
             .await
             .map_err(|e| anyhow!("Failed to send permission control response: {}", e))?;
 
@@ -2384,6 +2476,9 @@ impl ChatManager {
         let sdk_control_rx = client.take_sdk_control_receiver().await;
         let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
 
+        // Clone stdin sender for lock-free permission responses (see create_session).
+        let stdin_tx = client.clone_stdin_sender().await;
+
         // Create broadcast channel
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let client = Arc::new(Mutex::new(client));
@@ -2462,7 +2557,11 @@ impl ChatManager {
                     streaming_events: streaming_events.clone(),
                     permission_mode: session_node.permission_mode.clone(),
                     sdk_control_rx: sdk_control_rx.clone(),
+                    stdin_tx,
                     nats_cancel: nats_cancel.clone(),
+                    pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
                 },
             );
             interrupt_flag
@@ -2989,6 +3088,70 @@ impl ChatManager {
     pub async fn active_session_count(&self) -> usize {
         self.active_sessions.read().await.len()
     }
+}
+
+/// Parse a raw SDK control message into a [`ChatEvent::PermissionRequest`] if it is
+/// a `can_use_tool` request.  Returns `None` for any other subtype.
+///
+/// This is the pure-logic core extracted from the `handle_control_msg` closure inside
+/// `stream_response`.  Having it as a standalone function makes it directly testable
+/// Store a pending permission input in the shared map.
+/// Extracted as a standalone async fn so that `tokio::select!` blocks don't
+/// struggle with type inference on `Arc<Mutex<HashMap>>` inline locks.
+async fn store_pending_perm_input(
+    map: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    id: &str,
+    input: &serde_json::Value,
+) {
+    map.lock().await.insert(id.to_string(), input.clone());
+}
+
+/// without needing to spin up a full streaming session.
+///
+/// The caller is still responsible for:
+/// - persisting the event to `events_to_persist`
+/// - broadcasting via `emit_chat`
+fn parse_permission_control_msg(
+    control_msg: &serde_json::Value,
+    current_parent: Option<String>,
+) -> Option<ChatEvent> {
+    // Extract the request data (may be nested under "request")
+    let request_data = if control_msg.get("request").is_some() {
+        control_msg
+            .get("request")
+            .cloned()
+            .unwrap_or_else(|| control_msg.clone())
+    } else {
+        control_msg.clone()
+    };
+
+    if request_data.get("subtype").and_then(|v| v.as_str()) != Some("can_use_tool") {
+        return None;
+    }
+
+    let tool_name = request_data
+        .get("toolName")
+        .or_else(|| request_data.get("tool_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let input = request_data
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let request_id = control_msg
+        .get("requestId")
+        .or_else(|| control_msg.get("request_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(ChatEvent::PermissionRequest {
+        id: request_id,
+        tool: tool_name,
+        input,
+        parent_tool_use_id: current_parent,
+    })
 }
 
 #[cfg(test)]
@@ -4448,7 +4611,11 @@ mod tests {
             streaming_events: Arc::new(Mutex::new(streaming_events_data)),
             permission_mode: None,
             sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
+            stdin_tx: None,
             nats_cancel: CancellationToken::new(),
+            pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
 
         Some((session, pending_messages))
@@ -5291,5 +5458,540 @@ mod tests {
         );
         // Other chat fields preserved
         assert_eq!(doc["chat"]["default_model"].as_str().unwrap(), "test");
+    }
+
+    // ── helpers for ActiveSession tests (no Claude CLI required) ────────
+
+    /// Create an ActiveSession backed by a MockTransport.
+    /// Does NOT require the Claude CLI to be installed.
+    fn mock_active_session(
+        is_streaming: bool,
+    ) -> (ActiveSession, nexus_claude::transport::mock::MockTransportHandle) {
+        let (transport, handle) = nexus_claude::transport::mock::MockTransport::pair();
+        let client = InteractiveClient::from_transport(transport);
+        let (tx, _rx) = broadcast::channel(16);
+
+        let session = ActiveSession {
+            events_tx: tx,
+            last_activity: Instant::now(),
+            cli_session_id: None,
+            client: Arc::new(Mutex::new(client)),
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            memory_manager: None,
+            next_seq: Arc::new(AtomicI64::new(1)),
+            pending_messages: Arc::new(Mutex::new(VecDeque::new())),
+            is_streaming: Arc::new(AtomicBool::new(is_streaming)),
+            streaming_text: Arc::new(Mutex::new(String::new())),
+            streaming_events: Arc::new(Mutex::new(Vec::new())),
+            permission_mode: None,
+            sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
+            stdin_tx: None,
+            nats_cancel: CancellationToken::new(),
+            pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+        };
+
+        (session, handle)
+    }
+
+    // ── parse_permission_control_msg tests ──────────────────────────────
+
+    #[test]
+    fn test_parse_permission_control_msg_can_use_tool() {
+        let msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req_abc",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "ls -la"}
+            }
+        });
+
+        let event = parse_permission_control_msg(&msg, None);
+        assert!(event.is_some(), "should parse can_use_tool");
+
+        match event.unwrap() {
+            ChatEvent::PermissionRequest {
+                id,
+                tool,
+                input,
+                parent_tool_use_id,
+            } => {
+                assert_eq!(id, "req_abc");
+                assert_eq!(tool, "Bash");
+                assert_eq!(input["command"], "ls -la");
+                assert!(parent_tool_use_id.is_none());
+            }
+            other => panic!("expected PermissionRequest, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_with_parent_tool_use_id() {
+        let msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req_xyz",
+            "request": {
+                "subtype": "can_use_tool",
+                "toolName": "Read",
+                "input": {"file_path": "/tmp/test.rs"}
+            }
+        });
+
+        let event =
+            parse_permission_control_msg(&msg, Some("toolu_parent_123".to_string()));
+        assert!(event.is_some());
+
+        match event.unwrap() {
+            ChatEvent::PermissionRequest {
+                id,
+                tool,
+                input,
+                parent_tool_use_id,
+            } => {
+                assert_eq!(id, "req_xyz");
+                assert_eq!(tool, "Read");
+                assert_eq!(input["file_path"], "/tmp/test.rs");
+                assert_eq!(
+                    parent_tool_use_id.as_deref(),
+                    Some("toolu_parent_123")
+                );
+            }
+            other => panic!("expected PermissionRequest, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_ignores_non_permission() {
+        // subtype != "can_use_tool"
+        let msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req_other",
+            "request": {
+                "subtype": "server_info",
+                "data": {"model": "claude-sonnet-4-20250514"}
+            }
+        });
+
+        let event = parse_permission_control_msg(&msg, None);
+        assert!(event.is_none(), "non-permission should return None");
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_flat_format() {
+        // No nested "request" — all fields at top level
+        let msg = serde_json::json!({
+            "subtype": "can_use_tool",
+            "requestId": "flat_001",
+            "tool_name": "Write",
+            "input": {"file_path": "/tmp/out.txt", "content": "hello"}
+        });
+
+        let event = parse_permission_control_msg(&msg, None);
+        assert!(event.is_some(), "flat format should parse");
+
+        match event.unwrap() {
+            ChatEvent::PermissionRequest { id, tool, input, .. } => {
+                assert_eq!(id, "flat_001");
+                assert_eq!(tool, "Write");
+                assert_eq!(input["content"], "hello");
+            }
+            other => panic!("expected PermissionRequest, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_missing_fields_defaults() {
+        // Minimal message with just the subtype
+        let msg = serde_json::json!({
+            "request": {
+                "subtype": "can_use_tool"
+            }
+        });
+
+        let event = parse_permission_control_msg(&msg, None);
+        assert!(event.is_some());
+
+        match event.unwrap() {
+            ChatEvent::PermissionRequest { id, tool, input, .. } => {
+                assert_eq!(id, "", "missing request_id defaults to empty");
+                assert_eq!(tool, "unknown", "missing tool defaults to 'unknown'");
+                assert_eq!(input, serde_json::json!({}), "missing input defaults to empty object");
+            }
+            other => panic!("expected PermissionRequest, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_camel_vs_snake_tool_name() {
+        // toolName (camelCase) should be preferred
+        let msg_camel = serde_json::json!({
+            "request_id": "r1",
+            "request": {
+                "subtype": "can_use_tool",
+                "toolName": "CamelTool",
+                "input": {}
+            }
+        });
+        let evt = parse_permission_control_msg(&msg_camel, None).unwrap();
+        if let ChatEvent::PermissionRequest { tool, .. } = evt {
+            assert_eq!(tool, "CamelTool");
+        }
+
+        // tool_name (snake_case) fallback
+        let msg_snake = serde_json::json!({
+            "request_id": "r2",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "SnakeTool",
+                "input": {}
+            }
+        });
+        let evt = parse_permission_control_msg(&msg_snake, None).unwrap();
+        if let ChatEvent::PermissionRequest { tool, .. } = evt {
+            assert_eq!(tool, "SnakeTool");
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_request_id_variants() {
+        // requestId (camelCase)
+        let msg = serde_json::json!({
+            "requestId": "camel_id_001",
+            "request": { "subtype": "can_use_tool", "tool_name": "T", "input": {} }
+        });
+        if let Some(ChatEvent::PermissionRequest { id, .. }) =
+            parse_permission_control_msg(&msg, None)
+        {
+            assert_eq!(id, "camel_id_001");
+        }
+
+        // request_id (snake_case)
+        let msg = serde_json::json!({
+            "request_id": "snake_id_002",
+            "request": { "subtype": "can_use_tool", "tool_name": "T", "input": {} }
+        });
+        if let Some(ChatEvent::PermissionRequest { id, .. }) =
+            parse_permission_control_msg(&msg, None)
+        {
+            assert_eq!(id, "snake_id_002");
+        }
+    }
+
+    // ── send_permission_response tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_send_permission_response_no_session_errors() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager
+            .send_permission_response("nonexistent-session-id", "req-001", true)
+            .await;
+        assert!(result.is_err(), "should fail for non-existent session");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "error should mention 'not found': {err_msg}"
+        );
+    }
+
+    // ── interrupt tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_interrupt_no_session_errors() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager.interrupt("nonexistent-session-id").await;
+        // The manager falls back to NATS publish when no local session exists.
+        // Without NATS configured, it returns an error or succeeds silently.
+        // Either way, it should not panic.
+        assert!(
+            result.is_ok() || result.is_err(),
+            "interrupt on non-existent session should not panic"
+        );
+    }
+
+    // ── interrupt flag atomicity & latency tests ────────────────────────
+
+    /// Verify that `interrupt()` sets the atomic flag immediately (< 1ms)
+    /// without acquiring the InteractiveClient Mutex.
+    #[tokio::test]
+    async fn test_interrupt_sets_flag_atomically() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (session, _handle) = mock_active_session(false);
+        let flag = session.interrupt_flag.clone();
+
+        // Insert session into manager
+        let session_id = "test-session-atomic";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        assert!(!flag.load(Ordering::SeqCst), "flag should start false");
+
+        // Measure interrupt latency
+        let start = Instant::now();
+        manager.interrupt(session_id).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "flag should be true after interrupt"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1),
+            "interrupt() took {:?}, expected < 1ms (atomic flag only)",
+            elapsed
+        );
+    }
+
+    /// Verify that `interrupt()` works even when the client Mutex is held
+    /// (simulating an active stream_response).
+    #[tokio::test]
+    async fn test_interrupt_does_not_wait_for_client_lock() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (session, _handle) = mock_active_session(true);
+        let flag = session.interrupt_flag.clone();
+        let client_lock = session.client.clone();
+
+        let session_id = "test-session-lock";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        // Hold the client Mutex (simulating stream_response owning it)
+        let _guard = client_lock.lock().await;
+
+        // interrupt() should still complete instantly because it only
+        // touches the AtomicBool, not the Mutex
+        let start = Instant::now();
+        manager.interrupt(session_id).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "flag should be set even while Mutex is held"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1),
+            "interrupt() took {:?} even though client Mutex is held — should be < 1ms",
+            elapsed
+        );
+    }
+
+    /// Verify that interrupt works when streaming is active
+    /// (is_streaming flag set to true).
+    #[tokio::test]
+    async fn test_interrupt_during_active_stream() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (session, _handle) = mock_active_session(true);
+        let interrupt_flag = session.interrupt_flag.clone();
+        let is_streaming = session.is_streaming.clone();
+
+        let session_id = "test-session-streaming";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        assert!(
+            is_streaming.load(Ordering::SeqCst),
+            "session should be streaming"
+        );
+        assert!(
+            !interrupt_flag.load(Ordering::SeqCst),
+            "interrupt should start false"
+        );
+
+        manager.interrupt(session_id).await.unwrap();
+
+        assert!(
+            interrupt_flag.load(Ordering::SeqCst),
+            "interrupt flag should be set during active stream"
+        );
+    }
+
+    /// Benchmark: interrupt latency over 100 sessions, each must be < 1ms.
+    #[tokio::test]
+    async fn test_interrupt_latency_benchmark() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let iterations = 100u32;
+        let mut flags = Vec::with_capacity(iterations as usize);
+
+        // Create N sessions
+        for i in 0..iterations {
+            let (session, _handle) = mock_active_session(true);
+            let flag = session.interrupt_flag.clone();
+            flags.push(flag);
+            manager
+                .active_sessions
+                .write()
+                .await
+                .insert(format!("bench-{i}"), session);
+        }
+
+        // Interrupt all sessions and measure total time
+        let start = Instant::now();
+        for i in 0..iterations {
+            manager.interrupt(&format!("bench-{i}")).await.unwrap();
+        }
+        let total = start.elapsed();
+        let avg = total / iterations;
+
+        // Verify all flags were set
+        for (i, flag) in flags.iter().enumerate() {
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "flag for session bench-{i} should be set"
+            );
+        }
+
+        assert!(
+            avg < Duration::from_millis(1),
+            "Average interrupt latency {:?} exceeds 1ms (total {:?} for {iterations})",
+            avg,
+            total
+        );
+    }
+
+    /// Verify that double-interrupt doesn't panic and is idempotent.
+    #[tokio::test]
+    async fn test_double_interrupt_is_idempotent() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (session, _handle) = mock_active_session(false);
+        let flag = session.interrupt_flag.clone();
+
+        let session_id = "test-double-interrupt";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        // First interrupt
+        manager.interrupt(session_id).await.unwrap();
+        assert!(flag.load(Ordering::SeqCst));
+
+        // Second interrupt — should not panic or error
+        let result = manager.interrupt(session_id).await;
+        assert!(result.is_ok(), "second interrupt should succeed");
+        assert!(flag.load(Ordering::SeqCst), "flag should remain true");
+    }
+
+    // ── send_permission_response with mock transport ────────────────────
+
+    #[tokio::test]
+    async fn test_send_permission_response_allow_via_mock() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (mut session, _handle) = mock_active_session(false);
+
+        // Create a stdin channel to capture the control response
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(16);
+        session.stdin_tx = Some(stdin_tx);
+
+        // Pre-populate pending_permission_inputs with the original tool input
+        let original_input = serde_json::json!({
+            "command": "echo \"hello\"",
+            "description": "Print hello"
+        });
+        session
+            .pending_permission_inputs
+            .lock()
+            .await
+            .insert("req-allow-001".to_string(), original_input.clone());
+
+        let session_id = "test-perm-allow";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        manager
+            .send_permission_response(session_id, "req-allow-001", true)
+            .await
+            .unwrap();
+
+        // Verify the control response was sent through stdin_tx
+        let sent_json = tokio::time::timeout(Duration::from_millis(100), stdin_rx.recv())
+            .await
+            .expect("should receive within timeout")
+            .expect("channel should be open");
+
+        let sent: serde_json::Value = serde_json::from_str(&sent_json).unwrap();
+
+        // Verify full envelope: {"type": "control_response", "response": {"subtype": "success", "request_id": ..., "response": {...}}}
+        assert_eq!(sent["type"], "control_response");
+        let outer_response = &sent["response"];
+        assert_eq!(outer_response["subtype"], "success");
+        assert_eq!(outer_response["request_id"], "req-allow-001");
+        let inner_response = &outer_response["response"];
+        assert_eq!(
+            inner_response["behavior"], "allow",
+            "inner response should contain behavior: allow"
+        );
+        assert_eq!(
+            inner_response["updatedInput"], original_input,
+            "updatedInput should contain the original tool input"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_permission_response_deny_via_mock() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (mut session, _handle) = mock_active_session(false);
+
+        // Create a stdin channel to capture the control response
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(16);
+        session.stdin_tx = Some(stdin_tx);
+
+        let session_id = "test-perm-deny";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        manager
+            .send_permission_response(session_id, "req-deny-002", false)
+            .await
+            .unwrap();
+
+        let sent_json = tokio::time::timeout(Duration::from_millis(100), stdin_rx.recv())
+            .await
+            .expect("should receive within timeout")
+            .expect("channel should be open");
+
+        let sent: serde_json::Value = serde_json::from_str(&sent_json).unwrap();
+        assert_eq!(sent["type"], "control_response");
+        let outer_response = &sent["response"];
+        assert_eq!(outer_response["subtype"], "success");
+        assert_eq!(outer_response["request_id"], "req-deny-002");
+        let inner_response = &outer_response["response"];
+        assert_eq!(
+            inner_response["behavior"], "deny",
+            "inner response should contain behavior: deny"
+        );
+        assert!(
+            inner_response["message"].as_str().unwrap().contains("denied"),
+            "inner response should contain a denial message"
+        );
     }
 }

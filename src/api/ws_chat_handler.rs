@@ -672,7 +672,7 @@ async fn handle_ws_chat(
                                         // control protocol (JSON: {"allow": true/false}) and must
                                         // NOT be persisted or broadcast as user_message events.
                                         let send_result = if is_local {
-                                            chat_manager.send_permission_response(&session_id, allow).await
+                                            chat_manager.send_permission_response(&session_id, &request_id, allow).await
                                         } else {
                                             // For remote sessions, proxy the control response via NATS RPC.
                                             // The message_type "control_response" signals the receiving
