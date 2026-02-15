@@ -1101,8 +1101,25 @@ impl ChatManager {
                 _ => vec![],
             },
             Message::System { subtype, data } => {
-                debug!("System message: {} — {:?}", subtype, data);
-                vec![]
+                match subtype.as_str() {
+                    "compact_boundary" => {
+                        // Extract compact metadata from data.compact_metadata
+                        let metadata = data.get("compact_metadata");
+                        let trigger = metadata
+                            .and_then(|m| m.get("trigger"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("auto")
+                            .to_string();
+                        let pre_tokens = metadata
+                            .and_then(|m| m.get("pre_tokens"))
+                            .and_then(|v| v.as_u64());
+                        vec![ChatEvent::CompactBoundary { trigger, pre_tokens }]
+                    }
+                    _ => {
+                        debug!("Unhandled system message: {} — {:?}", subtype, data);
+                        vec![]
+                    }
+                }
             }
             Message::User { message, .. } => {
                 // User messages with content_blocks contain tool_result blocks

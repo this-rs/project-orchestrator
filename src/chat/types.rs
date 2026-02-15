@@ -117,6 +117,14 @@ pub enum ChatEvent {
     },
     /// Permission mode was changed mid-session
     PermissionModeChanged { mode: String },
+    /// Context window was compacted (automatic or manual)
+    CompactBoundary {
+        /// Compaction trigger: "auto" or "manual"
+        trigger: String,
+        /// Number of tokens before compaction (if available)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+    },
 }
 
 impl ChatEvent {
@@ -137,6 +145,7 @@ impl ChatEvent {
             ChatEvent::Error { .. } => "error",
             ChatEvent::PermissionDecision { .. } => "permission_decision",
             ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
+            ChatEvent::CompactBoundary { .. } => "compact_boundary",
         }
     }
 }
@@ -462,6 +471,14 @@ mod tests {
                 id: "pr_2".into(),
                 allow: false,
             },
+            ChatEvent::CompactBoundary {
+                trigger: "auto".into(),
+                pre_tokens: Some(150000),
+            },
+            ChatEvent::CompactBoundary {
+                trigger: "manual".into(),
+                pre_tokens: None,
+            },
         ];
 
         for event in &events {
@@ -490,6 +507,16 @@ mod tests {
         let json = r#"{"type":"input_request","prompt":"Choose:","options":["A","B"]}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ChatEvent::InputRequest { ref options, .. } if options.is_some()));
+
+        // CompactBoundary with pre_tokens
+        let json = r#"{"type":"compact_boundary","trigger":"auto","pre_tokens":150000}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: Some(150000) } if trigger == "auto"));
+
+        // CompactBoundary without pre_tokens (backward compat)
+        let json = r#"{"type":"compact_boundary","trigger":"manual"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: None } if trigger == "manual"));
     }
 
     #[test]
