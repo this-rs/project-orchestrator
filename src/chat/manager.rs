@@ -3302,7 +3302,9 @@ mod tests {
 
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], ChatEvent::AssistantText { content, .. } if content == "Hello!"));
+        assert!(
+            matches!(&events[0], ChatEvent::AssistantText { content, .. } if content == "Hello!")
+        );
     }
 
     #[test]
@@ -4155,7 +4157,9 @@ mod tests {
         // Verify tool_use data is intact
         let tool_use: ChatEvent = serde_json::from_str(&page.events[1].data).unwrap();
         match tool_use {
-            ChatEvent::ToolUse { id, tool, input, .. } => {
+            ChatEvent::ToolUse {
+                id, tool, input, ..
+            } => {
                 assert_eq!(id, "tu_1");
                 assert_eq!(tool, "list_plans");
                 assert_eq!(input, serde_json::json!({"status": "in_progress"}));

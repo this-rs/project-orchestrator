@@ -509,8 +509,7 @@ mod tests {
         }
 
         // (4) Deserialize JSON WITH parent_tool_use_id → Some
-        let json =
-            r#"{"type":"stream_delta","text":"hello","parent_tool_use_id":"toolu_xyz789"}"#;
+        let json = r#"{"type":"stream_delta","text":"hello","parent_tool_use_id":"toolu_xyz789"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         if let ChatEvent::StreamDelta {
             text,
