@@ -53,6 +53,8 @@ pub enum WsChatClientMessage {
     },
     /// Change the permission mode of the active session
     SetPermissionMode { mode: String },
+    /// Change the model of the active session
+    SetModel { model: String },
 }
 
 /// WebSocket upgrade handler for `/ws/chat/{session_id}`
@@ -760,6 +762,36 @@ async fn handle_ws_chat(
                                                     let err = serde_json::json!({
                                                         "type": "error",
                                                         "message": format!("Failed to set permission mode: {}", e),
+                                                    });
+                                                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                                }
+                                            }
+                                        } else {
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "message": "Session not active on this instance",
+                                            });
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        }
+                                    }
+
+                                    WsChatClientMessage::SetModel { model } => {
+                                        info!(session_id = %session_id, model = %model, "WS: Received set_model");
+                                        if chat_manager.is_session_active(&session_id).await {
+                                            match chat_manager.set_session_model(&session_id, &model).await {
+                                                Ok(()) => {
+                                                    // Send confirmation back to frontend
+                                                    let confirmation = serde_json::json!({
+                                                        "type": "model_changed",
+                                                        "model": model,
+                                                    });
+                                                    let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!(session_id = %session_id, error = %e, "Failed to set model");
+                                                    let err = serde_json::json!({
+                                                        "type": "error",
+                                                        "message": format!("Failed to set model: {}", e),
                                                     });
                                                     let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                                 }
