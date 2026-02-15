@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="desktop/dist/logo-512.png" alt="Project Orchestrator" width="128" />
+  <img src="dist/logo-512.png" alt="Project Orchestrator" width="128" />
 </p>
 
 <h1 align="center">Project Orchestrator</h1>
