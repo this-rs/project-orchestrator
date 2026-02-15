@@ -129,6 +129,8 @@ pub enum ChatEvent {
     },
     /// Permission mode was changed mid-session
     PermissionModeChanged { mode: String },
+    /// Model was changed mid-session
+    ModelChanged { model: String },
     /// Context window was compacted (automatic or manual)
     CompactBoundary {
         /// Compaction trigger: "auto" or "manual"
@@ -174,6 +176,7 @@ impl ChatEvent {
             ChatEvent::Error { .. } => "error",
             ChatEvent::PermissionDecision { .. } => "permission_decision",
             ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
+            ChatEvent::ModelChanged { .. } => "model_changed",
             ChatEvent::CompactBoundary { .. } => "compact_boundary",
             ChatEvent::SystemInit { .. } => "system_init",
         }
@@ -522,6 +525,9 @@ mod tests {
                 id: "pr_2".into(),
                 allow: false,
             },
+            ChatEvent::ModelChanged {
+                model: "claude-opus-4-20250514".into(),
+            },
             ChatEvent::CompactBoundary {
                 trigger: "auto".into(),
                 pre_tokens: Some(150000),
@@ -585,6 +591,13 @@ mod tests {
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(
             matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: None } if trigger == "manual")
+        );
+
+        // ModelChanged
+        let json = r#"{"type":"model_changed","model":"claude-opus-4-20250514"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::ModelChanged { ref model } if model == "claude-opus-4-20250514")
         );
 
         // SystemInit with all fields

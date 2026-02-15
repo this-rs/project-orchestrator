@@ -67,6 +67,8 @@ pub struct ActiveSession {
     pub streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
     /// Current permission mode for this session (updated on mid-session changes)
     pub permission_mode: Option<String>,
+    /// Current model for this session (updated on mid-session model changes)
+    pub model: Option<String>,
     /// SDK control receiver for permission requests (`can_use_tool`).
     /// Taken once from `InteractiveClient::take_sdk_control_receiver()` at session
     /// creation and reused across all `stream_response` invocations. Wrapped in
@@ -1348,6 +1350,7 @@ impl ChatManager {
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
                     permission_mode: request.permission_mode.clone(),
+                    model: Some(model.clone()),
                     sdk_control_rx: sdk_control_rx.clone(),
                     stdin_tx,
                     nats_cancel: nats_cancel.clone(),
@@ -2579,6 +2582,68 @@ impl ChatManager {
         Ok(())
     }
 
+    /// Change the model of an active CLI session mid-conversation.
+    ///
+    /// Sends a `set_model` control request to the Claude CLI subprocess,
+    /// updates the in-memory `ActiveSession`, and broadcasts the change.
+    ///
+    /// **IMPORTANT**: This method sends the control request via the cloned `stdin_tx`
+    /// sender — **without** taking the `client` Mutex lock. This is critical because
+    /// `stream_response` holds the client lock for the entire duration of streaming.
+    /// If we tried to lock the client here, the WS event loop would deadlock.
+    pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<()> {
+        // Get session state and stdin_tx — do NOT extract client (avoids Mutex deadlock)
+        let (stdin_tx, old_model, events_tx) = {
+            let mut sessions = self.active_sessions.write().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            session.last_activity = Instant::now();
+            let old_model = session.model.clone();
+            session.model = Some(model.to_string());
+            let tx = session.stdin_tx.clone().ok_or_else(|| {
+                anyhow!(
+                    "No stdin sender for session {} (CLI may not be connected)",
+                    session_id
+                )
+            })?;
+            (tx, old_model, session.events_tx.clone())
+        };
+
+        // Build the control_request JSON — same format as InteractiveClient::set_model
+        let control_request = serde_json::json!({
+            "type": "control_request",
+            "request_id": Uuid::new_v4().to_string(),
+            "request": {
+                "subtype": "set_model",
+                "model": model
+            }
+        });
+
+        let json = serde_json::to_string(&control_request)
+            .map_err(|e| anyhow!("Failed to serialize set_model request: {}", e))?;
+
+        // Send via stdin_tx (lock-free — bypasses the client Mutex entirely)
+        stdin_tx
+            .send(json)
+            .await
+            .map_err(|e| anyhow!("Failed to send set_model to CLI: {}", e))?;
+
+        info!(
+            session_id = %session_id,
+            old_model = ?old_model,
+            new_model = %model,
+            "Model changed for session (via stdin_tx, lock-free)"
+        );
+
+        // Broadcast event to WebSocket clients
+        let _ = events_tx.send(ChatEvent::ModelChanged {
+            model: model.to_string(),
+        });
+
+        Ok(())
+    }
+
     /// Resume a previously inactive session by creating a new InteractiveClient.
     ///
     /// If the session has a `cli_session_id`, resumes with `--resume`.
@@ -2712,6 +2777,7 @@ impl ChatManager {
                     streaming_text: streaming_text.clone(),
                     streaming_events: streaming_events.clone(),
                     permission_mode: session_node.permission_mode.clone(),
+                    model: Some(session_node.model.clone()),
                     sdk_control_rx: sdk_control_rx.clone(),
                     stdin_tx,
                     nats_cancel: nats_cancel.clone(),
@@ -4846,6 +4912,7 @@ mod tests {
             streaming_text: Arc::new(Mutex::new(streaming_text.to_string())),
             streaming_events: Arc::new(Mutex::new(streaming_events_data)),
             permission_mode: None,
+            model: None,
             sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
             stdin_tx: None,
             nats_cancel: CancellationToken::new(),
@@ -5727,6 +5794,7 @@ mod tests {
             streaming_text: Arc::new(Mutex::new(String::new())),
             streaming_events: Arc::new(Mutex::new(Vec::new())),
             permission_mode: None,
+            model: None,
             sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
             stdin_tx: None,
             nats_cancel: CancellationToken::new(),
@@ -6242,6 +6310,108 @@ mod tests {
                 .unwrap()
                 .contains("denied"),
             "inner response should contain a denial message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_session_model_sends_control_request_via_stdin() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (mut session, _handle) = mock_active_session(false);
+
+        // Create a stdin channel to capture the control request
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(16);
+        session.stdin_tx = Some(stdin_tx);
+
+        // Subscribe to events BEFORE inserting the session
+        let mut events_rx = session.events_tx.subscribe();
+
+        let session_id = "test-model-change";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        // Change model
+        manager
+            .set_session_model(session_id, "claude-opus-4-20250514")
+            .await
+            .unwrap();
+
+        // Verify the control request was sent through stdin_tx
+        let sent_json = tokio::time::timeout(Duration::from_millis(100), stdin_rx.recv())
+            .await
+            .expect("should receive within timeout")
+            .expect("channel should be open");
+
+        let sent: serde_json::Value = serde_json::from_str(&sent_json).unwrap();
+        assert_eq!(sent["type"], "control_request");
+        assert!(
+            sent["request_id"].as_str().is_some(),
+            "should have a request_id"
+        );
+        let request = &sent["request"];
+        assert_eq!(request["subtype"], "set_model");
+        assert_eq!(request["model"], "claude-opus-4-20250514");
+
+        // Verify ModelChanged event was broadcast
+        let event = tokio::time::timeout(Duration::from_millis(100), events_rx.recv())
+            .await
+            .expect("should receive event within timeout")
+            .expect("channel should be open");
+
+        assert_eq!(event.event_type(), "model_changed");
+        if let ChatEvent::ModelChanged { model } = event {
+            assert_eq!(model, "claude-opus-4-20250514");
+        } else {
+            panic!("Expected ModelChanged event, got {:?}", event.event_type());
+        }
+
+        // Verify the in-memory session was updated
+        let sessions = manager.active_sessions.read().await;
+        let session = sessions.get(session_id).unwrap();
+        assert_eq!(session.model.as_deref(), Some("claude-opus-4-20250514"));
+    }
+
+    #[tokio::test]
+    async fn test_set_session_model_fails_without_stdin() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (session, _handle) = mock_active_session(false);
+        // stdin_tx is None by default
+
+        let session_id = "test-model-no-stdin";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        let result = manager
+            .set_session_model(session_id, "claude-opus-4-20250514")
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("No stdin sender"),
+            "Error should mention missing stdin sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_session_model_fails_for_unknown_session() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager
+            .set_session_model("nonexistent-session", "claude-opus-4-20250514")
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not found"),
+            "Error should mention session not found"
         );
     }
 }
