@@ -67,7 +67,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", branch = "main", features = ["memory"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", branch = "feat/clone-stdin-sender", features = ["memory"] }
 tokio-stream = "0.1"
 
 # Auth

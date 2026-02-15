@@ -106,6 +106,15 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
+    /// User's decision on a permission request (allow or deny).
+    /// Persisted alongside the original PermissionRequest so the decision
+    /// is visible when reloading a conversation.
+    PermissionDecision {
+        /// The permission request ID this decision answers
+        id: String,
+        /// Whether the tool was allowed
+        allow: bool,
+    },
     /// Permission mode was changed mid-session
     PermissionModeChanged { mode: String },
 }
@@ -126,6 +135,7 @@ impl ChatEvent {
             ChatEvent::StreamDelta { .. } => "stream_delta",
             ChatEvent::StreamingStatus { .. } => "streaming_status",
             ChatEvent::Error { .. } => "error",
+            ChatEvent::PermissionDecision { .. } => "permission_decision",
             ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
         }
     }
@@ -443,6 +453,14 @@ mod tests {
             ChatEvent::Error {
                 message: "CLI not found".into(),
                 parent_tool_use_id: None,
+            },
+            ChatEvent::PermissionDecision {
+                id: "pr_1".into(),
+                allow: true,
+            },
+            ChatEvent::PermissionDecision {
+                id: "pr_2".into(),
+                allow: false,
             },
         ];
 
