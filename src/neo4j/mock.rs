@@ -76,6 +76,8 @@ pub struct MockGraphStore {
     pub note_anchors: RwLock<HashMap<Uuid, Vec<NoteAnchor>>>,
     pub note_supersedes: RwLock<HashMap<Uuid, Uuid>>,
     pub users: RwLock<HashMap<Uuid, UserNode>>,
+    /// Refresh tokens keyed by token_hash
+    pub refresh_tokens: RwLock<HashMap<String, crate::neo4j::models::RefreshTokenNode>>,
     pub feature_graphs: RwLock<HashMap<Uuid, FeatureGraphNode>>,
     /// feature_graph_id -> Vec<(entity_type, entity_id, role)>
     #[allow(clippy::type_complexity)]
@@ -140,6 +142,7 @@ impl MockGraphStore {
             note_anchors: RwLock::new(HashMap::new()),
             note_supersedes: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
+            refresh_tokens: RwLock::new(HashMap::new()),
             feature_graphs: RwLock::new(HashMap::new()),
             feature_graph_entities: RwLock::new(HashMap::new()),
         }
@@ -3823,6 +3826,63 @@ impl GraphStore for MockGraphStore {
 
     async fn list_users(&self) -> Result<Vec<UserNode>> {
         Ok(self.users.read().await.values().cloned().collect())
+    }
+
+    // Refresh Tokens
+    async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let token = crate::neo4j::models::RefreshTokenNode {
+            token_hash: token_hash.to_string(),
+            user_id,
+            expires_at,
+            created_at: chrono::Utc::now(),
+            revoked: false,
+        };
+        self.refresh_tokens
+            .write()
+            .await
+            .insert(token_hash.to_string(), token);
+        Ok(())
+    }
+
+    async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
+        let tokens = self.refresh_tokens.read().await;
+        match tokens.get(token_hash) {
+            Some(token) if !token.revoked && token.expires_at > chrono::Utc::now() => {
+                Ok(Some(token.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
+        let mut tokens = self.refresh_tokens.write().await;
+        match tokens.get_mut(token_hash) {
+            Some(token) => {
+                token.revoked = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let mut tokens = self.refresh_tokens.write().await;
+        let mut count = 0u64;
+        for token in tokens.values_mut() {
+            if token.user_id == user_id && !token.revoked {
+                token.revoked = true;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     // Feature Graphs

@@ -2046,7 +2046,8 @@ mod tests {
         // Simulates the real config: auth.frontend_url is set but server.public_url is not
         let auth_config = crate::AuthConfig {
             jwt_secret: "test".to_string(),
-            jwt_expiry_secs: 3600,
+            access_token_expiry_secs: 3600,
+            refresh_token_expiry_secs: 604800,
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: Some("https://ffs.dev".to_string()),

@@ -7867,6 +7867,108 @@ impl Neo4jClient {
     }
 
     // ================================================================
+    // Refresh Tokens
+    // ================================================================
+
+    /// Store a new refresh token (hashed) linked to a user.
+    pub async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let q = query(
+            "CREATE (rt:RefreshToken {
+                token_hash: $token_hash,
+                user_id: $user_id,
+                expires_at: $expires_at,
+                created_at: $created_at,
+                revoked: false
+            })",
+        )
+        .param("token_hash", token_hash.to_string())
+        .param("user_id", user_id.to_string())
+        .param("expires_at", expires_at.to_rfc3339())
+        .param("created_at", chrono::Utc::now().to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Validate a refresh token by its hash. Returns the token if valid
+    /// (not expired, not revoked).
+    pub async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
+        let q = query(
+            "MATCH (rt:RefreshToken {token_hash: $token_hash})
+             RETURN rt",
+        )
+        .param("token_hash", token_hash.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => {
+                let node: neo4rs::Node = row.get("rt")?;
+                let token = crate::neo4j::models::RefreshTokenNode {
+                    token_hash: node.get("token_hash")?,
+                    user_id: node.get::<String>("user_id")?.parse()?,
+                    expires_at: node
+                        .get::<String>("expires_at")?
+                        .parse()
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                    created_at: node
+                        .get::<String>("created_at")?
+                        .parse()
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                    revoked: node.get("revoked").unwrap_or(false),
+                };
+
+                // Check if expired or revoked
+                if token.revoked || token.expires_at < chrono::Utc::now() {
+                    Ok(None)
+                } else {
+                    Ok(Some(token))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Revoke a single refresh token by its hash.
+    pub async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
+        let q = query(
+            "MATCH (rt:RefreshToken {token_hash: $token_hash})
+             SET rt.revoked = true
+             RETURN rt",
+        )
+        .param("token_hash", token_hash.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// Revoke all refresh tokens for a given user.
+    pub async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let q = query(
+            "MATCH (rt:RefreshToken {user_id: $user_id, revoked: false})
+             SET rt.revoked = true
+             RETURN count(rt) as count",
+        )
+        .param("user_id", user_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => {
+                let count: i64 = row.get("count")?;
+                Ok(count as u64)
+            }
+            None => Ok(0),
+        }
+    }
+
+    // ================================================================
     // Feature Graphs
     // ================================================================
 

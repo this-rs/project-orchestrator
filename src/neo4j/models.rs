@@ -899,6 +899,24 @@ pub struct UserNode {
     pub last_login_at: DateTime<Utc>,
 }
 
+/// A refresh token stored in the database (hashed).
+///
+/// The raw token is never stored — only its SHA-256 hash.
+/// Used for the dual-token auth model (short-lived JWT + long-lived refresh cookie).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshTokenNode {
+    /// SHA-256 hash of the raw token (primary lookup key)
+    pub token_hash: String,
+    /// User who owns this token
+    pub user_id: Uuid,
+    /// When this token expires
+    pub expires_at: DateTime<Utc>,
+    /// When this token was created
+    pub created_at: DateTime<Utc>,
+    /// Whether this token has been revoked (logout, rotation, etc.)
+    pub revoked: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

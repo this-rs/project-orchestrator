@@ -178,9 +178,14 @@ pub struct AuthConfig {
     // ── Common fields ──────────────────────────────────────────────────
     /// JWT signing secret (HS256, minimum 32 characters)
     pub jwt_secret: String,
-    /// JWT token lifetime in seconds (default: 28800 = 8h)
-    #[serde(default = "default_jwt_expiry")]
-    pub jwt_expiry_secs: u64,
+    /// JWT access token lifetime in seconds (default: 900 = 15min).
+    /// Short-lived: renewed via the refresh token cookie.
+    #[serde(default = "default_access_token_expiry", alias = "jwt_expiry_secs")]
+    pub access_token_expiry_secs: u64,
+    /// Refresh token lifetime in seconds (default: 604800 = 7 days).
+    /// Stored as an HttpOnly cookie; hashed in the database.
+    #[serde(default = "default_refresh_token_expiry")]
+    pub refresh_token_expiry_secs: u64,
     /// Optional domain restriction (e.g. "ffs.holdings")
     pub allowed_email_domain: Option<String>,
     /// Optional list of individually whitelisted emails (e.g. ["alice@gmail.com", "bob@ext.com"]).
@@ -259,8 +264,12 @@ pub struct OidcConfig {
     pub scopes: String,
 }
 
-fn default_jwt_expiry() -> u64 {
-    28800 // 8 hours
+fn default_access_token_expiry() -> u64 {
+    900 // 15 minutes
+}
+
+fn default_refresh_token_expiry() -> u64 {
+    604800 // 7 days
 }
 
 fn default_provider_name() -> String {
@@ -841,7 +850,7 @@ auth:
             auth.google_client_id,
             Some("123.apps.googleusercontent.com".into())
         );
-        assert_eq!(auth.jwt_expiry_secs, 3600);
+        assert_eq!(auth.access_token_expiry_secs, 3600);
         assert_eq!(auth.allowed_email_domain, Some("ffs.holdings".into()));
         assert_eq!(auth.frontend_url, Some("http://localhost:3000".into()));
         // Backward compat: effective_oidc() builds from legacy fields
@@ -902,7 +911,7 @@ neo4j:
     }
 
     #[test]
-    fn test_jwt_expiry_default() {
+    fn test_access_token_expiry_default() {
         let yaml = r#"
 auth:
   google_client_id: "id"
@@ -912,9 +921,23 @@ auth:
 "#;
         let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
-        assert_eq!(auth.jwt_expiry_secs, 28800); // 8h default
+        assert_eq!(auth.access_token_expiry_secs, 900); // 15min default
+        assert_eq!(auth.refresh_token_expiry_secs, 604800); // 7 days default
         assert!(auth.allowed_email_domain.is_none());
         assert!(auth.frontend_url.is_none());
+    }
+
+    #[test]
+    fn test_jwt_expiry_secs_alias_backward_compat() {
+        // Old config files use `jwt_expiry_secs` — the alias should still work
+        let yaml = r#"
+auth:
+  jwt_secret: "min-32-chars-secret-key-for-test!"
+  jwt_expiry_secs: 3600
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.unwrap();
+        assert_eq!(auth.access_token_expiry_secs, 3600);
     }
 
     /// Combined test for YAML file loading, env var overrides, and backward compat.
@@ -1273,7 +1296,8 @@ server:
     fn base_auth_config() -> AuthConfig {
         AuthConfig {
             jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
-            jwt_expiry_secs: 28800,
+            access_token_expiry_secs: 900,
+            refresh_token_expiry_secs: 604800,
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,

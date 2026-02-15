@@ -1379,6 +1379,32 @@ impl GraphStore for Neo4jClient {
         self.list_users().await
     }
 
+    // Refresh Tokens
+    async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        self.create_refresh_token(user_id, token_hash, expires_at)
+            .await
+    }
+
+    async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<crate::neo4j::models::RefreshTokenNode>> {
+        self.validate_refresh_token(token_hash).await
+    }
+
+    async fn revoke_refresh_token(&self, token_hash: &str) -> anyhow::Result<bool> {
+        self.revoke_refresh_token(token_hash).await
+    }
+
+    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> anyhow::Result<u64> {
+        self.revoke_all_user_tokens(user_id).await
+    }
+
     // Feature Graphs
     async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> anyhow::Result<()> {
         self.create_feature_graph(graph).await
