@@ -1058,6 +1058,31 @@ pub trait GraphStore: Send + Sync {
     async fn list_users(&self) -> Result<Vec<UserNode>>;
 
     // ================================================================
+    // Refresh Tokens
+    // ================================================================
+
+    /// Store a new refresh token (hashed) linked to a user.
+    async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
+    /// Validate a refresh token by its hash. Returns the token if valid
+    /// (not expired, not revoked).
+    async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>>;
+
+    /// Revoke a single refresh token by its hash.
+    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool>;
+
+    /// Revoke all refresh tokens for a given user (e.g. on password change).
+    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
+
+    // ================================================================
     // Feature Graphs
     // ================================================================
 

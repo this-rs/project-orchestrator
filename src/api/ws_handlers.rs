@@ -5,12 +5,15 @@
 //! WS handlers only need to subscribe to the local bus.
 
 use super::handlers::OrchestratorState;
+use super::ws_auth::CookieAuthResult;
+use crate::auth::jwt::Claims;
 use crate::events::CrudEvent;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
     },
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
@@ -29,10 +32,18 @@ pub struct WsQuery {
 }
 
 /// WebSocket upgrade handler for `/ws/events`
+///
+/// Authentication strategy (ordered by priority):
+/// 1. **Cookie auth** (browser clients) — validate `refresh_token` cookie BEFORE upgrade
+///    - Valid → upgrade + send `auth_ok` immediately
+///    - Invalid → reject with 401 (no upgrade)
+/// 2. **First-message handshake** (MCP/CLI clients) — no cookie present
+///    - Upgrade first, then wait for `{ "type": "auth", "token": "<jwt>" }`
 pub async fn ws_events(
     ws: WebSocketUpgrade,
     State(state): State<OrchestratorState>,
     Query(query): Query<WsQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let entity_filter: Option<HashSet<String>> = query.entity_types.map(|types| {
         types
@@ -43,7 +54,32 @@ pub async fn ws_events(
     });
     let project_filter = query.project_id;
 
-    ws.on_upgrade(move |socket| handle_ws(socket, state, entity_filter, project_filter))
+    // Pre-upgrade cookie auth
+    let neo4j = state.orchestrator.neo4j_arc();
+    let cookie_result =
+        super::ws_auth::ws_authenticate_from_cookie(&headers, &state.auth_config, &neo4j).await;
+
+    match cookie_result {
+        CookieAuthResult::Authenticated(claims) => {
+            // Cookie valid → upgrade with pre-authenticated claims
+            ws.on_upgrade(move |socket| {
+                handle_ws_preauthed(socket, state, entity_filter, project_filter, claims)
+            })
+            .into_response()
+        }
+        CookieAuthResult::NoCookie => {
+            // No cookie → upgrade and fall back to first-message handshake
+            ws.on_upgrade(move |socket| {
+                handle_ws_message_auth(socket, state, entity_filter, project_filter)
+            })
+            .into_response()
+        }
+        CookieAuthResult::Invalid(reason) => {
+            // Cookie present but invalid → reject before upgrade
+            debug!(reason = %reason, "WS events: cookie auth rejected");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
 }
 
 /// Check if the event passes entity_type and project_id filters.
@@ -76,27 +112,51 @@ fn passes_filters(
     true
 }
 
-/// Handle an individual WebSocket connection.
+/// Handle a WebSocket connection that was pre-authenticated via cookie.
 ///
-/// All CRUD events (local + remote via NATS bridge) arrive through the
-/// local broadcast bus — no per-connection NATS subscription needed.
-async fn handle_ws(
+/// Sends `auth_ok` immediately, then enters the event loop.
+async fn handle_ws_preauthed(
+    mut socket: WebSocket,
+    state: OrchestratorState,
+    entity_filter: Option<HashSet<String>>,
+    project_filter: Option<String>,
+    claims: Claims,
+) {
+    // Send auth_ok immediately (client doesn't need to send auth message)
+    super::ws_auth::send_auth_ok(&mut socket, &claims).await;
+    handle_ws_loop(socket, state, entity_filter, project_filter, claims).await;
+}
+
+/// Handle a WebSocket connection that needs first-message authentication (fallback).
+///
+/// Waits for `{ "type": "auth", "token": "<jwt>" }`, validates, then enters the event loop.
+async fn handle_ws_message_auth(
     mut socket: WebSocket,
     state: OrchestratorState,
     entity_filter: Option<HashSet<String>>,
     project_filter: Option<String>,
 ) {
-    // ========================================================================
-    // Phase 0: Authenticate via first message
-    // ========================================================================
     let claims = match super::ws_auth::ws_authenticate(&mut socket, &state.auth_config).await {
         Ok(claims) => claims,
         Err(reason) => {
-            debug!(reason = %reason, "WS events: auth failed");
+            debug!(reason = %reason, "WS events: message auth failed");
             return;
         }
     };
+    handle_ws_loop(socket, state, entity_filter, project_filter, claims).await;
+}
 
+/// Main event loop for an authenticated WebSocket connection.
+///
+/// All CRUD events (local + remote via NATS bridge) arrive through the
+/// local broadcast bus — no per-connection NATS subscription needed.
+async fn handle_ws_loop(
+    socket: WebSocket,
+    state: OrchestratorState,
+    entity_filter: Option<HashSet<String>>,
+    project_filter: Option<String>,
+    claims: Claims,
+) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut event_rx = state.event_bus.subscribe();
 

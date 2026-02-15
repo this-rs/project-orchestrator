@@ -5,16 +5,21 @@
 //! - `GET  /auth/google`          — Returns the Google OAuth authorization URL
 //! - `POST /auth/google/callback` — Exchanges auth code for JWT + user info
 //! - `GET  /auth/me`              — Returns the authenticated user (protected)
-//! - `POST /auth/refresh`         — Issues a new JWT from a still-valid token (protected)
+//! - `POST /auth/refresh`         — Issues a new access JWT from a valid refresh cookie
+//! - `POST /auth/logout`          — Revokes the refresh token and clears the cookie
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::auth::extractor::AuthUser;
 use crate::auth::google::GoogleOAuthClient;
 use crate::auth::jwt::encode_jwt;
 use crate::auth::oidc::OidcClient;
+use crate::auth::refresh;
 use crate::neo4j::models::UserNode;
+use crate::AuthConfig;
 use axum::{
     extract::{Query as AxumQuery, State},
+    http::header::SET_COOKIE,
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::Utc;
@@ -127,6 +132,48 @@ impl From<UserNode> for UserResponse {
 }
 
 // ============================================================================
+// Refresh token helpers
+// ============================================================================
+
+/// Generate a refresh token, store its hash in the database, and return a
+/// `Set-Cookie` header alongside the usual JSON response.
+///
+/// This is called by every login-like handler (password_login, register,
+/// google_callback, oidc_callback) to emit the HttpOnly cookie.
+async fn create_refresh_token_and_cookie(
+    state: &OrchestratorState,
+    auth_config: &AuthConfig,
+    user_id: Uuid,
+) -> Result<axum::http::HeaderValue, AppError> {
+    let raw_token = refresh::generate_token();
+    let token_hash = refresh::hash_token(&raw_token);
+    let expires_at =
+        Utc::now() + chrono::Duration::seconds(auth_config.refresh_token_expiry_secs as i64);
+
+    state
+        .orchestrator
+        .neo4j()
+        .create_refresh_token(user_id, &token_hash, expires_at)
+        .await?;
+
+    let is_secure = refresh::should_set_secure(state.public_url.as_deref());
+    Ok(refresh::build_refresh_cookie(
+        &raw_token,
+        auth_config.refresh_token_expiry_secs,
+        is_secure,
+    ))
+}
+
+/// Build an HTTP response with the access token JSON body + Set-Cookie header
+/// for the refresh token.
+fn auth_response_with_cookie(
+    json_body: AuthTokenResponse,
+    cookie: axum::http::HeaderValue,
+) -> Response {
+    ([(SET_COOKIE, cookie)], Json(json_body)).into_response()
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -182,13 +229,13 @@ pub async fn get_auth_providers(
 /// 2. Try root account first (in-memory, no DB hit)
 /// 3. If not root, look up user in Neo4j by email + provider "password"
 /// 4. Verify password with bcrypt
-/// 5. Return JWT + user info
+/// 5. Return JWT access token in body + refresh token in HttpOnly cookie
 ///
 /// Security: error messages never reveal whether the email exists or not.
 pub async fn password_login(
     State(state): State<OrchestratorState>,
     Json(req): Json<LoginRequest>,
-) -> Result<Json<AuthTokenResponse>, AppError> {
+) -> Result<Response, AppError> {
     let auth_config = state
         .auth_config
         .as_ref()
@@ -216,20 +263,27 @@ pub async fn password_login(
                     &root.email,
                     &root.name,
                     &auth_config.jwt_secret,
-                    auth_config.jwt_expiry_secs,
+                    auth_config.access_token_expiry_secs,
                 )
                 .map_err(AppError::Internal)?;
 
-                return Ok(Json(AuthTokenResponse {
-                    token,
-                    user: UserResponse {
-                        id: root_user_id,
-                        email: root.email.clone(),
-                        name: root.name.clone(),
-                        picture_url: None,
-                        is_root: true,
+                // 5. Generate refresh token + Set-Cookie
+                let cookie =
+                    create_refresh_token_and_cookie(&state, auth_config, root_user_id).await?;
+
+                return Ok(auth_response_with_cookie(
+                    AuthTokenResponse {
+                        token,
+                        user: UserResponse {
+                            id: root_user_id,
+                            email: root.email.clone(),
+                            name: root.name.clone(),
+                            picture_url: None,
+                            is_root: true,
+                        },
                     },
-                }));
+                    cookie,
+                ));
             } else {
                 return Err(invalid_credentials());
             }
@@ -261,14 +315,20 @@ pub async fn password_login(
         &user.email,
         &user.name,
         &auth_config.jwt_secret,
-        auth_config.jwt_expiry_secs,
+        auth_config.access_token_expiry_secs,
     )
     .map_err(AppError::Internal)?;
 
-    Ok(Json(AuthTokenResponse {
-        token,
-        user: UserResponse::from(user),
-    }))
+    // 5. Generate refresh token + Set-Cookie
+    let cookie = create_refresh_token_and_cookie(&state, auth_config, user.id).await?;
+
+    Ok(auth_response_with_cookie(
+        AuthTokenResponse {
+            token,
+            user: UserResponse::from(user),
+        },
+        cookie,
+    ))
 }
 
 /// POST /auth/register — Create a new password-authenticated account.
@@ -279,7 +339,7 @@ pub async fn password_login(
 pub async fn register(
     State(state): State<OrchestratorState>,
     Json(req): Json<RegisterRequest>,
-) -> Result<Json<AuthTokenResponse>, AppError> {
+) -> Result<Response, AppError> {
     let auth_config = state
         .auth_config
         .as_ref()
@@ -322,14 +382,20 @@ pub async fn register(
         &user.email,
         &user.name,
         &auth_config.jwt_secret,
-        auth_config.jwt_expiry_secs,
+        auth_config.access_token_expiry_secs,
     )
     .map_err(AppError::Internal)?;
 
-    Ok(Json(AuthTokenResponse {
-        token,
-        user: UserResponse::from(user),
-    }))
+    // 7. Generate refresh token + Set-Cookie
+    let cookie = create_refresh_token_and_cookie(&state, auth_config, user.id).await?;
+
+    Ok(auth_response_with_cookie(
+        AuthTokenResponse {
+            token,
+            user: UserResponse::from(user),
+        },
+        cookie,
+    ))
 }
 
 /// Validate registration request fields.
@@ -402,7 +468,7 @@ pub async fn google_login(
 pub async fn google_callback(
     State(state): State<OrchestratorState>,
     Json(req): Json<GoogleCallbackRequest>,
-) -> Result<Json<AuthTokenResponse>, AppError> {
+) -> Result<Response, AppError> {
     let auth_config = state
         .auth_config
         .as_ref()
@@ -450,14 +516,20 @@ pub async fn google_callback(
         &user.email,
         &user.name,
         &auth_config.jwt_secret,
-        auth_config.jwt_expiry_secs,
+        auth_config.access_token_expiry_secs,
     )
     .map_err(AppError::Internal)?;
 
-    Ok(Json(AuthTokenResponse {
-        token,
-        user: UserResponse::from(user),
-    }))
+    // 5. Generate refresh token + Set-Cookie
+    let cookie = create_refresh_token_and_cookie(&state, auth_config, user.id).await?;
+
+    Ok(auth_response_with_cookie(
+        AuthTokenResponse {
+            token,
+            user: UserResponse::from(user),
+        },
+        cookie,
+    ))
 }
 
 /// GET /auth/oidc — Returns the OIDC authorization URL.
@@ -503,7 +575,7 @@ pub async fn oidc_login(
 pub async fn oidc_callback(
     State(state): State<OrchestratorState>,
     Json(req): Json<OidcCallbackRequest>,
-) -> Result<Json<AuthTokenResponse>, AppError> {
+) -> Result<Response, AppError> {
     let auth_config = state
         .auth_config
         .as_ref()
@@ -558,14 +630,20 @@ pub async fn oidc_callback(
         &user.email,
         &user.name,
         &auth_config.jwt_secret,
-        auth_config.jwt_expiry_secs,
+        auth_config.access_token_expiry_secs,
     )
     .map_err(AppError::Internal)?;
 
-    Ok(Json(AuthTokenResponse {
-        token,
-        user: UserResponse::from(user),
-    }))
+    // 5. Generate refresh token + Set-Cookie
+    let cookie = create_refresh_token_and_cookie(&state, auth_config, user.id).await?;
+
+    Ok(auth_response_with_cookie(
+        AuthTokenResponse {
+            token,
+            user: UserResponse::from(user),
+        },
+        cookie,
+    ))
 }
 
 /// GET /auth/me — Returns the authenticated user's info.
@@ -609,31 +687,144 @@ pub async fn get_me(
     }
 }
 
-/// POST /auth/refresh — Issue a new JWT from a still-valid token.
+/// POST /auth/refresh — Issue a new access JWT from a valid refresh cookie.
 ///
-/// The caller must present a valid (non-expired) Bearer token.
-/// Returns a fresh token with a new 8h expiry window.
-/// This is independent of WebSocket connections — a WS stream can
-/// continue uninterrupted while the client refreshes the token via HTTP.
+/// Reads the `refresh_token` cookie (HttpOnly, set by login/register),
+/// validates it against the database (not expired, not revoked), then:
+/// 1. Revokes the old refresh token (rotation — single use)
+/// 2. Creates a new refresh token and emits a new Set-Cookie
+/// 3. Returns a fresh access JWT in the body
+///
+/// This does NOT require a Bearer header — the refresh cookie is sufficient.
+/// This allows refreshing even after the access token has expired.
 pub async fn refresh_token(
     State(state): State<OrchestratorState>,
-    user: AuthUser,
-) -> Result<Json<RefreshTokenResponse>, AppError> {
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
     let auth_config = state
         .auth_config
         .as_ref()
         .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
 
-    let token = encode_jwt(
-        user.user_id,
-        &user.email,
-        &user.name,
+    // 1. Extract refresh token from Cookie header
+    let cookie_header = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::Unauthorized("No refresh token cookie".to_string()))?;
+
+    let raw_token = refresh::extract_refresh_token_from_cookie(cookie_header)
+        .ok_or_else(|| AppError::Unauthorized("No refresh_token in cookie".to_string()))?;
+
+    // 2. Validate refresh token in DB (checks expiry + revoked)
+    let token_hash = refresh::hash_token(&raw_token);
+    let token_node = state
+        .orchestrator
+        .neo4j()
+        .validate_refresh_token(&token_hash)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Invalid or expired refresh token".to_string()))?;
+
+    // 3. Revoke old refresh token (rotation — each token is single-use)
+    state
+        .orchestrator
+        .neo4j()
+        .revoke_refresh_token(&token_hash)
+        .await?;
+
+    // 4. Look up user info for JWT claims
+    let user = state
+        .orchestrator
+        .neo4j()
+        .get_user_by_id(token_node.user_id)
+        .await?;
+
+    // For root accounts (not in Neo4j), fall back to auth config
+    let (user_id, email, name) = match user {
+        Some(u) => (u.id, u.email, u.name),
+        None => {
+            // Check if this is the root account
+            if let Some(ref root) = auth_config.root_account {
+                let root_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes());
+                if root_id == token_node.user_id {
+                    (root_id, root.email.clone(), root.name.clone())
+                } else {
+                    return Err(AppError::Unauthorized("User not found".to_string()));
+                }
+            } else {
+                return Err(AppError::Unauthorized("User not found".to_string()));
+            }
+        }
+    };
+
+    // 5. Generate new access JWT
+    let access_token = encode_jwt(
+        user_id,
+        &email,
+        &name,
         &auth_config.jwt_secret,
-        auth_config.jwt_expiry_secs,
+        auth_config.access_token_expiry_secs,
     )
     .map_err(AppError::Internal)?;
 
-    Ok(Json(RefreshTokenResponse { token }))
+    // 6. Generate new refresh token + Set-Cookie (rotation)
+    let cookie = create_refresh_token_and_cookie(&state, auth_config, user_id).await?;
+
+    Ok((
+        [(SET_COOKIE, cookie)],
+        Json(RefreshTokenResponse {
+            token: access_token,
+        }),
+    )
+        .into_response())
+}
+
+/// POST /auth/logout — Revoke the refresh token and clear the cookie.
+///
+/// Reads the `refresh_token` cookie, revokes the token hash in the database,
+/// and returns a `Set-Cookie` header that clears the cookie (Max-Age=0).
+///
+/// This is a public route (no Bearer required) — the user may have an expired
+/// access token at logout time. The cookie itself is the credential.
+///
+/// If no cookie is present, the endpoint returns 200 (idempotent — already logged out).
+pub async fn logout(
+    State(state): State<OrchestratorState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    // If auth is not configured, logout is a no-op
+    let _auth_config = match state.auth_config.as_ref() {
+        Some(c) => c,
+        None => {
+            return Ok(axum::http::StatusCode::NO_CONTENT.into_response());
+        }
+    };
+
+    // Extract refresh token from cookie (if present)
+    let raw_token = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(refresh::extract_refresh_token_from_cookie);
+
+    // Revoke the token in DB (if we have one)
+    if let Some(token) = raw_token {
+        let token_hash = refresh::hash_token(&token);
+        // Best-effort revocation — don't fail if token is already revoked or not found
+        let _ = state
+            .orchestrator
+            .neo4j()
+            .revoke_refresh_token(&token_hash)
+            .await;
+    }
+
+    // Clear the cookie regardless (idempotent)
+    let is_secure = refresh::should_set_secure(state.public_url.as_deref());
+    let clear_cookie = refresh::build_clear_cookie(is_secure);
+
+    Ok((
+        [(SET_COOKIE, clear_cookie)],
+        axum::http::StatusCode::NO_CONTENT,
+    )
+        .into_response())
 }
 
 // ============================================================================
@@ -663,7 +854,8 @@ mod tests {
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
             jwt_secret: TEST_SECRET.to_string(),
-            jwt_expiry_secs: 28800,
+            access_token_expiry_secs: 900,
+            refresh_token_expiry_secs: 604800,
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,
@@ -707,17 +899,18 @@ mod tests {
     async fn test_auth_app(auth_config: Option<AuthConfig>) -> Router {
         let state = make_server_state(auth_config).await;
 
-        // Public auth routes (no middleware)
+        // Public auth routes (no middleware — refresh/logout read cookie, not Bearer)
         let public = Router::new()
             .route("/auth/providers", get(get_auth_providers))
             .route("/auth/login", post(password_login))
             .route("/auth/register", post(register))
+            .route("/auth/refresh", post(refresh_token))
+            .route("/auth/logout", post(logout))
             .route("/auth/google", get(google_login));
 
-        // Protected auth routes (with middleware)
+        // Protected auth routes (require Bearer JWT)
         let protected = Router::new()
             .route("/auth/me", get(get_me))
-            .route("/auth/refresh", post(refresh_token))
             .layer(from_fn_with_state(state.clone(), require_auth));
 
         public.merge(protected).with_state(state)
@@ -733,11 +926,12 @@ mod tests {
             .route("/auth/providers", get(get_auth_providers))
             .route("/auth/login", post(password_login))
             .route("/auth/register", post(register))
+            .route("/auth/refresh", post(refresh_token))
+            .route("/auth/logout", post(logout))
             .route("/auth/google", get(google_login));
 
         let protected = Router::new()
             .route("/auth/me", get(get_me))
-            .route("/auth/refresh", post(refresh_token))
             .layer(from_fn_with_state(state.clone(), require_auth));
 
         let app = public.merge(protected).with_state(state.clone());
@@ -853,10 +1047,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_refresh_returns_new_token() {
+    async fn test_refresh_with_cookie_returns_new_token() {
         let state = make_server_state(Some(test_auth_config())).await;
 
-        // Create user
+        // Create user in mock store
         let user_id = Uuid::new_v4();
         let now = Utc::now();
         let user_node = UserNode {
@@ -877,39 +1071,336 @@ mod tests {
             .await
             .unwrap();
 
-        // Generate initial token
-        let token = encode_jwt(user_id, "bob@ffs.holdings", "Bob", TEST_SECRET, 3600).unwrap();
+        // Create a refresh token in DB (simulating what login would do)
+        let raw_token = refresh::generate_token();
+        let token_hash = refresh::hash_token(&raw_token);
+        let expires_at = Utc::now() + chrono::Duration::days(7);
+        state
+            .orchestrator
+            .neo4j()
+            .create_refresh_token(user_id, &token_hash, expires_at)
+            .await
+            .unwrap();
 
-        // Build app
-        let protected = Router::new()
+        // Build app (refresh is public — no Bearer needed)
+        let app = Router::new()
             .route("/auth/refresh", post(refresh_token))
-            .layer(from_fn_with_state(state.clone(), require_auth));
-        let app = protected.with_state(state);
+            .with_state(state);
 
         let req = HttpRequest::builder()
             .method("POST")
             .uri("/auth/refresh")
-            .header("authorization", format!("Bearer {}", token))
+            .header("cookie", format!("refresh_token={}", raw_token))
             .body(Body::empty())
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        // Verify Set-Cookie header is present (new refresh token after rotation)
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("Set-Cookie header must be present after refresh");
+        let cookie_str = set_cookie.to_str().unwrap();
+        assert!(
+            cookie_str.contains("refresh_token="),
+            "Cookie must contain refresh_token"
+        );
+        assert!(cookie_str.contains("HttpOnly"), "Cookie must be HttpOnly");
+        assert!(cookie_str.contains("Path=/"), "Cookie must have Path=/");
+
+        // Verify the body contains a new access JWT
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let new_token = json["token"].as_str().unwrap();
-
-        // Verify the new token is valid and different
-        assert!(!new_token.is_empty());
-        assert_ne!(new_token, token);
+        let new_access_token = json["token"].as_str().unwrap();
+        assert!(!new_access_token.is_empty());
 
         // Decode to verify claims
-        let claims = crate::auth::jwt::decode_jwt(new_token, TEST_SECRET).unwrap();
+        let claims = crate::auth::jwt::decode_jwt(new_access_token, TEST_SECRET).unwrap();
         assert_eq!(claims.sub, user_id.to_string());
         assert_eq!(claims.email, "bob@ffs.holdings");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_without_cookie_returns_401() {
+        let app = test_auth_app(Some(test_auth_config())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/refresh")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_with_invalid_cookie_returns_401() {
+        let app = test_auth_app(Some(test_auth_config())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/refresh")
+            .header("cookie", "refresh_token=invalid-token-value")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_revoked_token_returns_401() {
+        let state = make_server_state(Some(test_auth_config())).await;
+
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let user_node = UserNode {
+            id: user_id,
+            email: "carol@ffs.holdings".to_string(),
+            name: "Carol".to_string(),
+            picture_url: None,
+            auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+            external_id: Some("google-789".to_string()),
+            password_hash: None,
+            created_at: now,
+            last_login_at: now,
+        };
+        state
+            .orchestrator
+            .neo4j()
+            .upsert_user(&user_node)
+            .await
+            .unwrap();
+
+        // Create and immediately revoke a refresh token
+        let raw_token = refresh::generate_token();
+        let token_hash = refresh::hash_token(&raw_token);
+        let expires_at = Utc::now() + chrono::Duration::days(7);
+        state
+            .orchestrator
+            .neo4j()
+            .create_refresh_token(user_id, &token_hash, expires_at)
+            .await
+            .unwrap();
+        state
+            .orchestrator
+            .neo4j()
+            .revoke_refresh_token(&token_hash)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/auth/refresh", post(refresh_token))
+            .with_state(state);
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/refresh")
+            .header("cookie", format!("refresh_token={}", raw_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_rotation_old_token_invalidated() {
+        let state = make_server_state(Some(test_auth_config())).await;
+
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let user_node = UserNode {
+            id: user_id,
+            email: "dave@ffs.holdings".to_string(),
+            name: "Dave".to_string(),
+            picture_url: None,
+            auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+            external_id: Some("google-101".to_string()),
+            password_hash: None,
+            created_at: now,
+            last_login_at: now,
+        };
+        state
+            .orchestrator
+            .neo4j()
+            .upsert_user(&user_node)
+            .await
+            .unwrap();
+
+        // Create a refresh token
+        let raw_token = refresh::generate_token();
+        let token_hash = refresh::hash_token(&raw_token);
+        let expires_at = Utc::now() + chrono::Duration::days(7);
+        state
+            .orchestrator
+            .neo4j()
+            .create_refresh_token(user_id, &token_hash, expires_at)
+            .await
+            .unwrap();
+
+        // First refresh — should succeed
+        let app = Router::new()
+            .route("/auth/refresh", post(refresh_token))
+            .with_state(state.clone());
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/refresh")
+            .header("cookie", format!("refresh_token={}", raw_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second refresh with same token — should fail (already revoked by rotation)
+        let app2 = Router::new()
+            .route("/auth/refresh", post(refresh_token))
+            .with_state(state);
+
+        let req2 = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/refresh")
+            .header("cookie", format!("refresh_token={}", raw_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ================================================================
+    // Logout tests
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_logout_revokes_token_and_clears_cookie() {
+        let state = make_server_state(Some(test_auth_config())).await;
+
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let user_node = UserNode {
+            id: user_id,
+            email: "eve@ffs.holdings".to_string(),
+            name: "Eve".to_string(),
+            picture_url: None,
+            auth_provider: crate::neo4j::models::AuthProvider::Password,
+            external_id: None,
+            password_hash: Some("hash".to_string()),
+            created_at: now,
+            last_login_at: now,
+        };
+        state
+            .orchestrator
+            .neo4j()
+            .upsert_user(&user_node)
+            .await
+            .unwrap();
+
+        // Create a refresh token
+        let raw_token = refresh::generate_token();
+        let token_hash = refresh::hash_token(&raw_token);
+        let expires_at = Utc::now() + chrono::Duration::days(7);
+        state
+            .orchestrator
+            .neo4j()
+            .create_refresh_token(user_id, &token_hash, expires_at)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/auth/logout", post(logout))
+            .route("/auth/refresh", post(refresh_token))
+            .with_state(state.clone());
+
+        // Logout
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/logout")
+            .header("cookie", format!("refresh_token={}", raw_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Verify Set-Cookie clears the cookie
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("Logout must return Set-Cookie header");
+        let cookie_str = set_cookie.to_str().unwrap();
+        assert!(
+            cookie_str.contains("refresh_token=;"),
+            "Cookie value must be cleared"
+        );
+        assert!(
+            cookie_str.contains("Max-Age=0"),
+            "Cookie must expire immediately"
+        );
+        assert!(cookie_str.contains("HttpOnly"), "Cookie must be HttpOnly");
+        assert!(cookie_str.contains("Path=/"), "Cookie must have Path=/");
+
+        // Verify the token is now revoked — refresh should fail
+        let req2 = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/refresh")
+            .header("cookie", format!("refresh_token={}", raw_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_logout_without_cookie_is_idempotent() {
+        let app = test_auth_app(Some(test_auth_config())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/logout")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Should still clear the cookie
+        let set_cookie = resp.headers().get("set-cookie");
+        assert!(
+            set_cookie.is_some(),
+            "Should still send Set-Cookie to clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_with_invalid_token_still_clears_cookie() {
+        let app = test_auth_app(Some(test_auth_config())).await;
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/logout")
+            .header("cookie", "refresh_token=nonexistent_token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Should still clear the cookie (idempotent)
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("Should send Set-Cookie even for invalid token");
+        let cookie_str = set_cookie.to_str().unwrap();
+        assert!(cookie_str.contains("Max-Age=0"));
     }
 
     // ================================================================
@@ -920,7 +1411,8 @@ mod tests {
         let password_hash = bcrypt::hash("rootpass123", 4).unwrap(); // cost 4 for fast tests
         AuthConfig {
             jwt_secret: TEST_SECRET.to_string(),
-            jwt_expiry_secs: 28800,
+            access_token_expiry_secs: 900,
+            refresh_token_expiry_secs: 604800,
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,
@@ -961,6 +1453,23 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        // Verify Set-Cookie header is present with correct flags
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("Login must return Set-Cookie header");
+        let cookie_str = set_cookie.to_str().unwrap();
+        assert!(
+            cookie_str.contains("refresh_token="),
+            "Cookie must contain refresh_token"
+        );
+        assert!(cookie_str.contains("HttpOnly"), "Cookie must be HttpOnly");
+        assert!(
+            cookie_str.contains("SameSite=Lax"),
+            "Cookie must be SameSite=Lax"
+        );
+        assert!(cookie_str.contains("Path=/"), "Cookie must have Path=/");
+
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -969,7 +1478,7 @@ mod tests {
         assert_eq!(json["user"]["email"], "admin@ffs.holdings");
         assert_eq!(json["user"]["name"], "Admin");
 
-        // Verify the token is valid
+        // Verify the access token is valid
         let token = json["token"].as_str().unwrap();
         let claims = crate::auth::jwt::decode_jwt(token, TEST_SECRET).unwrap();
         assert_eq!(claims.email, "admin@ffs.holdings");
@@ -1353,7 +1862,8 @@ mod tests {
     async fn test_providers_explicit_oidc_config() {
         let config = AuthConfig {
             jwt_secret: TEST_SECRET.to_string(),
-            jwt_expiry_secs: 28800,
+            access_token_expiry_secs: 900,
+            refresh_token_expiry_secs: 604800,
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,

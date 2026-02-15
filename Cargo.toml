@@ -93,6 +93,7 @@ notify = { version = "8.2.0", features = ["macos_fsevent"] }
 # Embedded frontend (optional — compile dist/ into the binary)
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
+rand = "0.10.0"
 
 [features]
 default = []

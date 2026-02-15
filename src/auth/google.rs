@@ -159,7 +159,8 @@ mod tests {
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
             jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
-            jwt_expiry_secs: 28800,
+            access_token_expiry_secs: 900,
+            refresh_token_expiry_secs: 604800,
             allowed_email_domain: Some("ffs.holdings".to_string()),
             allowed_emails: None,
             frontend_url: Some("http://localhost:3000".to_string()),

@@ -9,11 +9,14 @@
 //! - On connect: replay persisted events since `last_event` query param, then `replay_complete`
 
 use super::handlers::{AppError, OrchestratorState};
+use super::ws_auth::CookieAuthResult;
+use crate::auth::jwt::Claims;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
@@ -58,11 +61,19 @@ pub enum WsChatClientMessage {
 }
 
 /// WebSocket upgrade handler for `/ws/chat/{session_id}`
+///
+/// Authentication strategy (ordered by priority):
+/// 1. **Cookie auth** (browser clients) — validate `refresh_token` cookie BEFORE upgrade
+///    - Valid → upgrade + send `auth_ok` immediately
+///    - Invalid → reject with 401 (no upgrade)
+/// 2. **First-message handshake** (MCP/CLI clients) — no cookie present
+///    - Upgrade first, then wait for `{ "type": "auth", "token": "<jwt>" }`
 pub async fn ws_chat(
     ws: WebSocketUpgrade,
     State(state): State<OrchestratorState>,
     Path(session_id): Path<String>,
     Query(query): Query<WsChatQuery>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     // Validate that chat manager is available
     let _chat_manager = state
@@ -90,27 +101,76 @@ pub async fn ws_chat(
 
     let last_event = query.last_event;
 
-    Ok(ws.on_upgrade(move |socket| handle_ws_chat(socket, state, session_id, last_event)))
+    // Pre-upgrade cookie auth
+    let neo4j = state.orchestrator.neo4j_arc();
+    let cookie_result =
+        super::ws_auth::ws_authenticate_from_cookie(&headers, &state.auth_config, &neo4j).await;
+
+    Ok(match cookie_result {
+        CookieAuthResult::Authenticated(claims) => {
+            // Cookie valid → upgrade with pre-authenticated claims
+            ws.on_upgrade(move |socket| {
+                handle_ws_chat_preauthed(socket, state, session_id, last_event, claims)
+            })
+            .into_response()
+        }
+        CookieAuthResult::NoCookie => {
+            // No cookie → upgrade and fall back to first-message handshake
+            ws.on_upgrade(move |socket| {
+                handle_ws_chat_message_auth(socket, state, session_id, last_event)
+            })
+            .into_response()
+        }
+        CookieAuthResult::Invalid(reason) => {
+            // Cookie present but invalid → reject before upgrade
+            debug!(reason = %reason, "WS chat: cookie auth rejected");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    })
 }
 
-/// Handle an individual chat WebSocket connection
-async fn handle_ws_chat(
+/// Handle a chat WebSocket connection that was pre-authenticated via cookie.
+///
+/// Sends `auth_ok` immediately, then enters the main chat loop.
+async fn handle_ws_chat_preauthed(
+    mut socket: WebSocket,
+    state: OrchestratorState,
+    session_id: String,
+    last_event: i64,
+    claims: Claims,
+) {
+    // Send auth_ok immediately (client doesn't need to send auth message)
+    super::ws_auth::send_auth_ok(&mut socket, &claims).await;
+    handle_ws_chat_loop(socket, state, session_id, last_event, claims).await;
+}
+
+/// Handle a chat WebSocket connection that needs first-message authentication (fallback).
+///
+/// Waits for `{ "type": "auth", "token": "<jwt>" }`, validates, then enters the main chat loop.
+async fn handle_ws_chat_message_auth(
     mut socket: WebSocket,
     state: OrchestratorState,
     session_id: String,
     last_event: i64,
 ) {
-    // ========================================================================
-    // Phase 0: Authenticate via first message
-    // ========================================================================
     let claims = match super::ws_auth::ws_authenticate(&mut socket, &state.auth_config).await {
         Ok(claims) => claims,
         Err(reason) => {
-            debug!(session_id = %session_id, reason = %reason, "WS chat: auth failed");
+            debug!(session_id = %session_id, reason = %reason, "WS chat: message auth failed");
             return;
         }
     };
+    handle_ws_chat_loop(socket, state, session_id, last_event, claims).await;
+}
 
+/// Main chat event loop for an authenticated WebSocket connection.
+async fn handle_ws_chat_loop(
+    socket: WebSocket,
+    state: OrchestratorState,
+    session_id: String,
+    last_event: i64,
+    claims: Claims,
+) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     info!(
