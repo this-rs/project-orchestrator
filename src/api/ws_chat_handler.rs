@@ -244,9 +244,62 @@ async fn handle_ws_chat(
     }
 
     // ========================================================================
-    // Phase 1.5: Send streaming snapshot if a stream is in progress
+    // Phase 1.5a: Subscribe to broadcast + NATS BEFORE taking snapshot
     // ========================================================================
-    // First try local snapshot (same instance owns the session)
+    // IMPORTANT: We subscribe BEFORE taking the streaming snapshot to avoid a
+    // race condition. If we took the snapshot first and subscribed later, any
+    // stream_delta tokens emitted between snapshot and subscribe would be lost
+    // (the client would see a gap in the streamed text).
+    //
+    // By subscribing first, the broadcast::Receiver starts buffering events
+    // immediately. The snapshot (Phase 1.5b) captures text accumulated before
+    // the subscribe. Events emitted after subscribe are queued in the receiver.
+    // Together they provide gap-free coverage.
+    let mut event_rx = match chat_manager.subscribe(&session_id).await {
+        Ok(rx) => Some(rx),
+        Err(_) => {
+            debug!(
+                session_id = %session_id,
+                "Session not active, no broadcast subscription yet — client can send messages to activate"
+            );
+            None
+        }
+    };
+
+    // Subscribe to NATS chat events for cross-instance delivery (if NATS configured).
+    // IMPORTANT: Only subscribe to NATS if there is NO local broadcast subscription.
+    // When this instance owns the session (event_rx is Some), the ChatManager already
+    // pushes events to the local broadcast channel — subscribing to NATS too would
+    // cause every event to be received twice (local + NATS round-trip), producing
+    // duplicated/interleaved text in the frontend.
+    // NATS is only needed for remote instances that don't have the local broadcast.
+    let mut nats_chat_sub: Option<async_nats::Subscriber> = if event_rx.is_some() {
+        debug!(
+            session_id = %session_id,
+            "Local broadcast active — skipping NATS chat subscription (same instance)"
+        );
+        None
+    } else if let Some(ref nats) = state.nats_emitter {
+        match nats.subscribe_chat_events(&session_id).await {
+            Ok(sub) => {
+                debug!(session_id = %session_id, "Subscribed to NATS chat events (remote instance)");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(session_id = %session_id, error = %e, "Failed to subscribe to NATS chat events");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ========================================================================
+    // Phase 1.5b: Send streaming snapshot if a stream is in progress
+    // ========================================================================
+    // Taken AFTER subscribe (Phase 1.5a) so no events are lost between
+    // snapshot and subscription. The receiver buffers live events while we
+    // send the snapshot to the client.
     let (mut is_currently_streaming, mut partial_text, mut streaming_events) =
         chat_manager.get_streaming_snapshot(&session_id).await;
 
@@ -267,7 +320,7 @@ async fn handle_ws_chat(
         is_currently_streaming,
         partial_text_len = partial_text.len(),
         streaming_events_count = streaming_events.len(),
-        "Phase 1.5: streaming snapshot"
+        "Phase 1.5b: streaming snapshot"
     );
 
     if is_currently_streaming {
@@ -340,8 +393,8 @@ async fn handle_ws_chat(
         }
     }
 
-    // Dedup flag: if we sent a streaming snapshot (Phase 1.5), structured events
-    // that arrive via NATS in the event loop are duplicates of what we just sent.
+    // Dedup flag: if we sent a streaming snapshot, structured events that arrive
+    // via the broadcast receiver or NATS are duplicates of what we just sent.
     // We skip them until the current stream ends (Result event clears this flag).
     // StreamDelta events are NEVER skipped — they're not in the snapshot and are
     // the real-time text tokens the client needs.
@@ -357,50 +410,6 @@ async fn handle_ws_chat(
         debug!("Client disconnected after replay");
         return;
     }
-
-    // ========================================================================
-    // Phase 2: Subscribe to broadcast for real-time events
-    // ========================================================================
-    // Try to get a broadcast receiver. If the session is not active (no CLI running),
-    // that's OK — the client can still send messages to resume it.
-    let mut event_rx = match chat_manager.subscribe(&session_id).await {
-        Ok(rx) => Some(rx),
-        Err(_) => {
-            debug!(
-                session_id = %session_id,
-                "Session not active, no broadcast subscription yet — client can send messages to activate"
-            );
-            None
-        }
-    };
-
-    // Subscribe to NATS chat events for cross-instance delivery (if NATS configured).
-    // IMPORTANT: Only subscribe to NATS if there is NO local broadcast subscription.
-    // When this instance owns the session (event_rx is Some), the ChatManager already
-    // pushes events to the local broadcast channel — subscribing to NATS too would
-    // cause every event to be received twice (local + NATS round-trip), producing
-    // duplicated/interleaved text in the frontend.
-    // NATS is only needed for remote instances that don't have the local broadcast.
-    let mut nats_chat_sub: Option<async_nats::Subscriber> = if event_rx.is_some() {
-        debug!(
-            session_id = %session_id,
-            "Local broadcast active — skipping NATS chat subscription (same instance)"
-        );
-        None
-    } else if let Some(ref nats) = state.nats_emitter {
-        match nats.subscribe_chat_events(&session_id).await {
-            Ok(sub) => {
-                debug!(session_id = %session_id, "Subscribed to NATS chat events (remote instance)");
-                Some(sub)
-            }
-            Err(e) => {
-                warn!(session_id = %session_id, error = %e, "Failed to subscribe to NATS chat events");
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     // Ping interval (30s)
     let mut ping_interval = interval(Duration::from_secs(30));
@@ -418,23 +427,17 @@ async fn handle_ws_chat(
     // Returns false if the client disconnected (caller should break).
     // Returns true if the event was sent successfully.
     //
-    // NOTE: Cross-instance dedup strategy (updated 2026-02-11):
+    // NOTE: Snapshot dedup strategy (updated 2026-02-15):
     //
-    // When a client joins a session owned by another instance, it receives events
-    // from two sources: Phase 1 replay (Neo4j) + Phase 1.5 snapshot, AND the live
-    // NATS subscription. Without dedup, structured events (tool_use, tool_result,
-    // assistant_text, etc.) appear twice — once from snapshot, once from NATS.
+    // When a client joins mid-stream, Phase 1.5b sends a snapshot of accumulated
+    // structured events. Since the broadcast/NATS subscription was created BEFORE
+    // the snapshot (Phase 1.5a), the receiver may also contain those same structured
+    // events. Without dedup, they would appear twice in the frontend.
     //
-    // Previous approach (removed): content-based fingerprint dedup. This caused
-    // legitimate repeated StreamDelta tokens ("\n", " ", "e") to be dropped.
-    //
-    // Current approach: `snapshot_dedup_active` flag. When Phase 1.5 sends a
-    // streaming snapshot, the flag is set. In the NATS branch, structured events
-    // (everything except StreamDelta/StreamingStatus) are skipped while the flag
-    // is active. The flag is cleared when a Result event arrives (stream ends).
+    // The `snapshot_dedup_active` flag filters structured events (tool_use,
+    // tool_result, assistant_text, etc.) from BOTH the local broadcast and NATS
+    // branches until a Result event arrives (stream ends).
     // StreamDelta tokens always pass through — they're never in the snapshot.
-    //
-    // Same-instance case: local broadcast XOR NATS (never both), so no dedup needed.
     macro_rules! send_chat_event {
         ($event:expr, $ws:expr) => {{
             // Serialize and send
@@ -475,6 +478,27 @@ async fn handle_ws_chat(
             } => {
                 match event {
                     Ok(chat_event) => {
+                        // --- Snapshot dedup (local broadcast) ---
+                        // After a mid-stream join, the broadcast receiver may deliver
+                        // structured events that were already sent in the Phase 1.5b
+                        // snapshot. Skip them to avoid duplicates in the frontend.
+                        // StreamDelta and StreamingStatus always pass through (not in snapshot).
+                        if snapshot_dedup_active {
+                            match &chat_event {
+                                crate::chat::types::ChatEvent::StreamDelta { .. }
+                                | crate::chat::types::ChatEvent::StreamingStatus { .. } => {}
+                                crate::chat::types::ChatEvent::Result { .. } => {
+                                    snapshot_dedup_active = false;
+                                }
+                                _ => {
+                                    debug!(
+                                        event_type = %chat_event.event_type(),
+                                        "Skipping broadcast event (already sent in snapshot)"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         if !send_chat_event!(chat_event, ws_sender) {
                             debug!("WebSocket send failed, client disconnected");
                             break;
