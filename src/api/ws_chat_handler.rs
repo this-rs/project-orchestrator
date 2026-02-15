@@ -146,7 +146,7 @@ async fn handle_ws_chat(
         .unwrap_or_default();
 
     // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
-    // NATS events don't carry seq numbers, so active dedup uses snapshot_dedup_active flag instead.
+    // NATS events don't carry seq numbers, so active dedup uses snapshot_skip_remaining counter instead.
     // Kept for future use if NATS events get seq headers.
     let mut _max_replayed_seq: i64 = last_event;
 
@@ -395,12 +395,24 @@ async fn handle_ws_chat(
         }
     }
 
-    // Dedup flag: if we sent a streaming snapshot, structured events that arrive
-    // via the broadcast receiver or NATS are duplicates of what we just sent.
-    // We skip them until the current stream ends (Result event clears this flag).
-    // StreamDelta events are NEVER skipped — they're not in the snapshot and are
-    // the real-time text tokens the client needs.
-    let mut snapshot_dedup_active = is_currently_streaming && !streaming_events.is_empty();
+    // Fingerprint-based dedup: when we sent a streaming snapshot (Phase 1.5b),
+    // events emitted in the tiny window BETWEEN subscribe (Phase 1.5a) and
+    // snapshot (Phase 1.5b) may be present in BOTH the snapshot AND the
+    // broadcast receiver. We dedup by fingerprint (type+id or type+hash).
+    //
+    // IMPORTANT: Most snapshot events were emitted BEFORE the subscribe and
+    // are NOT in the broadcast receiver at all. Only the micro-window events
+    // need dedup. Using a counter (previous approach) was wrong because it
+    // assumed ALL snapshot events would arrive via the receiver, causing
+    // genuinely new events (tool_use, tool_result, etc.) to be silently dropped.
+    let mut snapshot_fingerprints: HashSet<String> = if is_currently_streaming {
+        streaming_events
+            .iter()
+            .filter_map(|e| e.fingerprint())
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     // Send replay_complete marker
     let replay_complete = serde_json::json!({ "type": "replay_complete" });
@@ -433,13 +445,14 @@ async fn handle_ws_chat(
     //
     // When a client joins mid-stream, Phase 1.5b sends a snapshot of accumulated
     // structured events. Since the broadcast/NATS subscription was created BEFORE
-    // the snapshot (Phase 1.5a), the receiver may also contain those same structured
-    // events. Without dedup, they would appear twice in the frontend.
+    // the snapshot (Phase 1.5a), the receiver may contain events from the tiny
+    // window between subscribe and snapshot — these are also in the snapshot.
     //
-    // The `snapshot_dedup_active` flag filters structured events (tool_use,
-    // tool_result, assistant_text, etc.) from BOTH the local broadcast and NATS
-    // branches until a Result event arrives (stream ends).
-    // StreamDelta tokens always pass through — they're never in the snapshot.
+    // We dedup by fingerprint: each snapshot event's fingerprint (type+id or
+    // type+content_hash) is stored in a HashSet. When a broadcast/NATS event
+    // matches a fingerprint, it's a duplicate → skip and remove from the set.
+    // Events NOT in the set are genuinely new → forward to the client.
+    // StreamDelta/StreamingStatus have no fingerprint and always pass through.
     macro_rules! send_chat_event {
         ($event:expr, $ws:expr) => {{
             // Serialize and send
@@ -481,24 +494,24 @@ async fn handle_ws_chat(
                 match event {
                     Ok(chat_event) => {
                         // --- Snapshot dedup (local broadcast) ---
-                        // After a mid-stream join, the broadcast receiver may deliver
-                        // structured events that were already sent in the Phase 1.5b
-                        // snapshot. Skip them to avoid duplicates in the frontend.
-                        // StreamDelta and StreamingStatus always pass through (not in snapshot).
-                        if snapshot_dedup_active {
-                            match &chat_event {
-                                crate::chat::types::ChatEvent::StreamDelta { .. }
-                                | crate::chat::types::ChatEvent::StreamingStatus { .. } => {}
-                                crate::chat::types::ChatEvent::Result { .. } => {
-                                    snapshot_dedup_active = false;
-                                }
-                                _ => {
+                        // After a mid-stream join, events from the micro-window between
+                        // subscribe and snapshot may be duplicates. We dedup by fingerprint.
+                        // StreamDelta/StreamingStatus have no fingerprint and always pass.
+                        if !snapshot_fingerprints.is_empty() {
+                            if let Some(fp) = chat_event.fingerprint() {
+                                if snapshot_fingerprints.remove(&fp) {
                                     debug!(
                                         event_type = %chat_event.event_type(),
-                                        "Skipping broadcast event (already sent in snapshot)"
+                                        fingerprint = %fp,
+                                        remaining = snapshot_fingerprints.len(),
+                                        "Skipping broadcast event (duplicate of snapshot)"
                                     );
                                     continue;
                                 }
+                            }
+                            // Result event clears all remaining fingerprints (end of stream)
+                            if matches!(&chat_event, crate::chat::types::ChatEvent::Result { .. }) {
+                                snapshot_fingerprints.clear();
                             }
                         }
                         if !send_chat_event!(chat_event, ws_sender) {
@@ -540,27 +553,21 @@ async fn handle_ws_chat(
                         match serde_json::from_slice::<crate::chat::types::ChatEvent>(&msg.payload) {
                             Ok(chat_event) => {
                                 // --- Cross-instance dedup ---
-                                // 1. Snapshot dedup: if we sent a Phase 1.5 snapshot, structured
-                                //    events from the same stream arrive again via NATS — skip them.
-                                //    StreamDelta and StreamingStatus are NEVER in the snapshot, so
-                                //    they always pass through (no content-based dedup needed).
-                                if snapshot_dedup_active {
-                                    match &chat_event {
-                                        // Always forward stream tokens — these are real-time
-                                        crate::chat::types::ChatEvent::StreamDelta { .. }
-                                        | crate::chat::types::ChatEvent::StreamingStatus { .. } => {}
-                                        // Result marks end of stream — forward it and clear dedup
-                                        crate::chat::types::ChatEvent::Result { .. } => {
-                                            snapshot_dedup_active = false;
-                                        }
-                                        // All other structured events were already in the snapshot
-                                        _ => {
+                                // Dedup by fingerprint, same logic as local broadcast.
+                                if !snapshot_fingerprints.is_empty() {
+                                    if let Some(fp) = chat_event.fingerprint() {
+                                        if snapshot_fingerprints.remove(&fp) {
                                             debug!(
                                                 event_type = %chat_event.event_type(),
-                                                "Skipping NATS event (already sent in snapshot)"
+                                                fingerprint = %fp,
+                                                remaining = snapshot_fingerprints.len(),
+                                                "Skipping NATS event (duplicate of snapshot)"
                                             );
                                             continue;
                                         }
+                                    }
+                                    if matches!(&chat_event, crate::chat::types::ChatEvent::Result { .. }) {
+                                        snapshot_fingerprints.clear();
                                     }
                                 }
 
