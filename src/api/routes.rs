@@ -18,7 +18,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
+use axum::http::{header, Method};
+use tower_http::cors::CorsLayer;
 #[cfg(not(feature = "embedded-frontend"))]
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -71,34 +72,41 @@ fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
     }
 }
 
-/// Build CORS layer — restricted to `frontend_url` + Tauri origin if configured,
-/// otherwise allows any origin.
+/// Build CORS layer with credentials support for cookie-based auth.
+///
+/// `allow_credentials(true)` is required for browsers to send the `refresh_token`
+/// HttpOnly cookie on cross-origin requests (including WebSocket upgrades).
+///
+/// CORS spec requires that when `credentials: true`:
+/// - Origins MUST be explicit (not `*`)
+/// - Methods MUST be explicit (not `*`)
+/// - Headers MUST be explicit (not `*`)
 fn build_cors(state: &OrchestratorState) -> CorsLayer {
-    let cors = CorsLayer::new().allow_methods(Any).allow_headers(Any);
-
     // Build allowed origins from ServerState (localhost:{port}, tauri://localhost, public_url)
-    let mut origin_strings = state.allowed_origins();
-
-    // Also include frontend_url from auth config if set (backward compat)
-    if let Some(ref auth_config) = state.auth_config {
-        if let Some(ref frontend_url) = auth_config.frontend_url {
-            let trimmed = frontend_url.trim_end_matches('/').to_string();
-            if !origin_strings.contains(&trimmed) {
-                origin_strings.push(trimmed);
-            }
-        }
-    }
+    let origin_strings = state.allowed_origins();
 
     let origins: Vec<axum::http::HeaderValue> = origin_strings
         .iter()
         .filter_map(|s| s.parse::<axum::http::HeaderValue>().ok())
         .collect();
 
-    if origins.is_empty() {
-        cors.allow_origin(Any)
-    } else {
-        cors.allow_origin(origins)
-    }
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            header::COOKIE,
+        ])
+        .allow_credentials(true)
 }
 
 // ============================================================================
@@ -130,6 +138,8 @@ fn public_routes() -> Router<OrchestratorState> {
             "/auth/google/callback",
             post(auth_handlers::google_callback),
         )
+        // Token refresh (public — reads cookie, not Bearer. Allows refresh with expired JWT)
+        .route("/auth/refresh", post(auth_handlers::refresh_token))
         // ================================================================
         // WebSocket (public — auth via first application message)
         // ================================================================
@@ -153,10 +163,9 @@ fn public_routes() -> Router<OrchestratorState> {
 fn protected_routes() -> Router<OrchestratorState> {
     Router::new()
         // ================================================================
-        // Auth (protected — user info & token refresh)
+        // Auth (protected — user info)
         // ================================================================
         .route("/auth/me", get(auth_handlers::get_me))
-        .route("/auth/refresh", post(auth_handlers::refresh_token))
         // ================================================================
         // Projects (multi-project support)
         // ================================================================
