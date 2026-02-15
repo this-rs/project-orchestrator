@@ -2494,6 +2494,13 @@ impl ChatManager {
     ///
     /// Sends a `set_permission_mode` control request to the Claude CLI subprocess,
     /// updates the in-memory `ActiveSession`, and persists the change to Neo4j.
+    ///
+    /// **IMPORTANT**: This method sends the control request via the cloned `stdin_tx`
+    /// sender — **without** taking the `client` Mutex lock. This is critical because
+    /// `stream_response` holds the client lock for the entire duration of streaming.
+    /// If we tried to lock the client here, the WS event loop would deadlock:
+    /// it awaits the lock while stream_response holds it, so broadcast events
+    /// can no longer be forwarded to the frontend.
     pub async fn set_session_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
         // Validate mode
         const VALID_MODES: &[&str] = &["default", "acceptEdits", "bypassPermissions", "plan"];
@@ -2505,8 +2512,8 @@ impl ChatManager {
             );
         }
 
-        // Get session and update in-memory state
-        let (client, old_mode) = {
+        // Get session state and stdin_tx — do NOT extract client (avoids Mutex deadlock)
+        let (stdin_tx, old_mode, events_tx) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
@@ -2514,22 +2521,39 @@ impl ChatManager {
             session.last_activity = Instant::now();
             let old_mode = session.permission_mode.clone();
             session.permission_mode = Some(mode.to_string());
-            (session.client.clone(), old_mode)
+            let tx = session.stdin_tx.clone().ok_or_else(|| {
+                anyhow!(
+                    "No stdin sender for session {} (CLI may not be connected)",
+                    session_id
+                )
+            })?;
+            (tx, old_mode, session.events_tx.clone())
         };
 
-        // Send control request to CLI subprocess
-        let mut client = client.lock().await;
-        client
-            .set_permission_mode(mode)
+        // Build the control_request JSON — same format as InteractiveClient::set_permission_mode
+        let control_request = serde_json::json!({
+            "type": "control_request",
+            "request_id": Uuid::new_v4().to_string(),
+            "request": {
+                "subtype": "set_permission_mode",
+                "mode": mode
+            }
+        });
+
+        let json = serde_json::to_string(&control_request)
+            .map_err(|e| anyhow!("Failed to serialize set_permission_mode request: {}", e))?;
+
+        // Send via stdin_tx (lock-free — bypasses the client Mutex entirely)
+        stdin_tx
+            .send(json)
             .await
-            .map_err(|e| anyhow!("Failed to set permission mode on CLI: {}", e))?;
-        drop(client);
+            .map_err(|e| anyhow!("Failed to send set_permission_mode to CLI: {}", e))?;
 
         info!(
             session_id = %session_id,
             old_mode = ?old_mode,
             new_mode = %mode,
-            "Permission mode changed for session"
+            "Permission mode changed for session (via stdin_tx, lock-free)"
         );
 
         // Persist to Neo4j
@@ -2548,14 +2572,9 @@ impl ChatManager {
         }
 
         // Broadcast event to WebSocket clients
-        {
-            let sessions = self.active_sessions.read().await;
-            if let Some(session) = sessions.get(session_id) {
-                let _ = session.events_tx.send(ChatEvent::PermissionModeChanged {
-                    mode: mode.to_string(),
-                });
-            }
-        }
+        let _ = events_tx.send(ChatEvent::PermissionModeChanged {
+            mode: mode.to_string(),
+        });
 
         Ok(())
     }
