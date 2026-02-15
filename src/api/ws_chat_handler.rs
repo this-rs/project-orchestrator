@@ -62,12 +62,9 @@ pub enum WsChatClientMessage {
 
 /// WebSocket upgrade handler for `/ws/chat/{session_id}`
 ///
-/// Authentication strategy (ordered by priority):
-/// 1. **Cookie auth** (browser clients) — validate `refresh_token` cookie BEFORE upgrade
-///    - Valid → upgrade + send `auth_ok` immediately
-///    - Invalid → reject with 401 (no upgrade)
-/// 2. **First-message handshake** (MCP/CLI clients) — no cookie present
-///    - Upgrade first, then wait for `{ "type": "auth", "token": "<jwt>" }`
+/// Authentication: validates `refresh_token` cookie BEFORE upgrade.
+/// - Valid cookie (or no-auth mode) → upgrade + send `auth_ok` immediately
+/// - No cookie or invalid → reject with 401 (no upgrade)
 pub async fn ws_chat(
     ws: WebSocketUpgrade,
     State(state): State<OrchestratorState>,
@@ -114,16 +111,9 @@ pub async fn ws_chat(
             })
             .into_response()
         }
-        CookieAuthResult::NoCookie => {
-            // No cookie → upgrade and fall back to first-message handshake
-            ws.on_upgrade(move |socket| {
-                handle_ws_chat_message_auth(socket, state, session_id, last_event)
-            })
-            .into_response()
-        }
         CookieAuthResult::Invalid(reason) => {
-            // Cookie present but invalid → reject before upgrade
-            debug!(reason = %reason, "WS chat: cookie auth rejected");
+            // No cookie or invalid → reject before upgrade
+            debug!(reason = %reason, "WS chat: auth rejected");
             StatusCode::UNAUTHORIZED.into_response()
         }
     })
@@ -141,25 +131,6 @@ async fn handle_ws_chat_preauthed(
 ) {
     // Send auth_ok immediately (client doesn't need to send auth message)
     super::ws_auth::send_auth_ok(&mut socket, &claims).await;
-    handle_ws_chat_loop(socket, state, session_id, last_event, claims).await;
-}
-
-/// Handle a chat WebSocket connection that needs first-message authentication (fallback).
-///
-/// Waits for `{ "type": "auth", "token": "<jwt>" }`, validates, then enters the main chat loop.
-async fn handle_ws_chat_message_auth(
-    mut socket: WebSocket,
-    state: OrchestratorState,
-    session_id: String,
-    last_event: i64,
-) {
-    let claims = match super::ws_auth::ws_authenticate(&mut socket, &state.auth_config).await {
-        Ok(claims) => claims,
-        Err(reason) => {
-            debug!(session_id = %session_id, reason = %reason, "WS chat: message auth failed");
-            return;
-        }
-    };
     handle_ws_chat_loop(socket, state, session_id, last_event, claims).await;
 }
 

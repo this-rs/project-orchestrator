@@ -1,6 +1,4 @@
-//! WebSocket authentication — dual strategy.
-//!
-//! ## Strategy 1: Cookie-based auth (before upgrade)
+//! WebSocket authentication — cookie-based (pre-upgrade).
 //!
 //! For browser clients that send the `refresh_token` cookie automatically:
 //! 1. Extract the `refresh_token` cookie from the HTTP upgrade headers
@@ -8,70 +6,41 @@
 //! 3. Look up the user to build Claims
 //! 4. Accept the WebSocket upgrade → send `auth_ok` immediately
 //!
-//! This is the preferred path — authentication happens BEFORE the upgrade,
-//! so invalid credentials result in a 401 HTTP response (no WS connection).
+//! Authentication happens BEFORE the upgrade, so invalid credentials result
+//! in a 401 HTTP response (no WS connection opened).
 //!
-//! ## Strategy 2: First-message handshake (fallback, retrocompat)
-//!
-//! For non-browser clients (MCP, CLI) that can't send cookies:
-//! 1. Accept the WebSocket upgrade with no auth check
-//! 2. Wait for `{ "type": "auth", "token": "<jwt>" }` as the first message
-//! 3. Validate the JWT
-//! 4. Send `auth_ok` on success, `auth_error` + close on failure
-//!
-//! The token is validated ONCE at connection time. Even if it expires during
-//! an active stream, the connection remains open.
+//! In no-auth mode, anonymous Claims are returned immediately.
 
-use crate::auth::jwt::{decode_jwt, Claims};
+use crate::auth::jwt::Claims;
 use crate::auth::refresh;
 use crate::neo4j::GraphStore;
 use crate::AuthConfig;
 use axum::extract::ws::{Message, WebSocket};
-use futures::StreamExt;
-use serde::Deserialize;
 use std::sync::Arc;
-use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-/// Default timeout (in seconds) for the client to send the auth message
-const AUTH_TIMEOUT_SECS: u64 = 10;
-
-/// Expected shape of the auth message from the client
-#[derive(Debug, Deserialize)]
-struct WsAuthMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    token: Option<String>,
-}
-
 /// Result of pre-upgrade cookie authentication.
 ///
-/// Used by WebSocket upgrade handlers to decide the upgrade strategy:
-/// - `Authenticated(Claims)` → cookie valid, upgrade and send `auth_ok` immediately
-/// - `NoCookie` → no cookie present, upgrade and fall back to first-message handshake
-/// - `Invalid(String)` → cookie present but invalid/expired/revoked, reject with 401
+/// Used by WebSocket upgrade handlers to decide whether to accept the upgrade:
+/// - `Authenticated(Claims)` → cookie valid (or no-auth mode), upgrade and send `auth_ok`
+/// - `Invalid(String)` → no cookie or invalid cookie, reject with 401
 #[derive(Debug)]
 pub enum CookieAuthResult {
     /// Cookie was present and valid — upgrade the connection
     Authenticated(Claims),
-    /// No cookie present — upgrade and use first-message handshake (retrocompat)
-    NoCookie,
-    /// Cookie present but invalid — reject the upgrade with 401
+    /// No cookie or invalid cookie — reject the upgrade with 401
     Invalid(String),
 }
 
 /// Authenticate a WebSocket upgrade request via the `refresh_token` cookie.
 ///
 /// This is called BEFORE the WebSocket upgrade to validate cookie-based auth.
-/// The result tells the caller whether to:
-/// - Accept the upgrade with pre-authenticated Claims
-/// - Accept the upgrade and fall back to first-message handshake
-/// - Reject the upgrade with 401
+/// The result tells the caller whether to accept or reject the upgrade.
 ///
 /// # Behavior
 /// 1. If `auth_config` is `None` → **no-auth mode**: return `Authenticated` with anonymous Claims
-/// 2. If no `Cookie` header or no `refresh_token` cookie → return `NoCookie` (fallback)
+/// 2. If no `Cookie` header or no `refresh_token` cookie → return `Invalid` (reject with 401)
 /// 3. If cookie present → validate token hash in DB:
 ///    - Valid → look up user, return `Authenticated(Claims)`
 ///    - Invalid/expired/revoked → return `Invalid(reason)`
@@ -96,16 +65,16 @@ pub async fn ws_authenticate_from_cookie(
     {
         Some(h) => h,
         None => {
-            debug!("WS cookie auth: no Cookie header → fallback to message auth");
-            return CookieAuthResult::NoCookie;
+            debug!("WS cookie auth: no Cookie header → rejecting");
+            return CookieAuthResult::Invalid("No refresh_token cookie".to_string());
         }
     };
 
     let raw_token = match refresh::extract_refresh_token_from_cookie(cookie_header) {
         Some(t) => t,
         None => {
-            debug!("WS cookie auth: no refresh_token in cookie → fallback to message auth");
-            return CookieAuthResult::NoCookie;
+            debug!("WS cookie auth: no refresh_token in cookie → rejecting");
+            return CookieAuthResult::Invalid("No refresh_token cookie".to_string());
         }
     };
 
@@ -161,132 +130,9 @@ pub async fn ws_authenticate_from_cookie(
     CookieAuthResult::Authenticated(claims)
 }
 
-/// Authenticate a WebSocket connection via the first message.
-///
-/// Returns the validated `Claims` on success, or an error message string
-/// on failure. On failure, an `auth_error` message is sent to the client
-/// before returning.
-///
-/// # Behavior
-/// 1. If `auth_config` is `None` → **open access** (no-auth mode):
-///    send `auth_ok` with anonymous user and return anonymous Claims immediately.
-/// 2. If `auth_config` is `Some(...)` → **JWT required**:
-///    a. Wait up to `AUTH_TIMEOUT_SECS` for the first message
-///    b. Expect `{ "type": "auth", "token": "<jwt>" }`
-///    c. Validate the JWT and optionally check the email domain
-///    d. On success, send `{ "type": "auth_ok", "user": {...} }`
-pub async fn ws_authenticate(
-    socket: &mut WebSocket,
-    auth_config: &Option<AuthConfig>,
-) -> Result<Claims, String> {
-    // 1. No-auth mode: send auth_ok with anonymous user and return immediately
-    let config = match auth_config {
-        Some(c) => c,
-        None => {
-            let claims = Claims::anonymous();
-            let auth_ok = serde_json::json!({
-                "type": "auth_ok",
-                "user": {
-                    "id": claims.sub,
-                    "email": claims.email,
-                    "name": claims.name,
-                }
-            });
-            let _ = socket.send(Message::Text(auth_ok.to_string().into())).await;
-            debug!("WebSocket authenticated (anonymous — no-auth mode)");
-            return Ok(claims);
-        }
-    };
-
-    // 2. Wait for the first message with a timeout
-    let first_msg = match timeout(Duration::from_secs(AUTH_TIMEOUT_SECS), socket.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) => text.to_string(),
-        Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
-            debug!("WebSocket closed before auth message");
-            return Err("Connection closed before auth".to_string());
-        }
-        Ok(Some(Ok(_))) => {
-            send_auth_error(socket, "Expected text message with auth token").await;
-            return Err("Non-text message received".to_string());
-        }
-        Ok(Some(Err(e))) => {
-            warn!("WebSocket error during auth: {}", e);
-            return Err(format!("WebSocket error: {}", e));
-        }
-        Err(_) => {
-            send_auth_error(
-                socket,
-                "Authentication timeout — no auth message received within 10s",
-            )
-            .await;
-            return Err("Auth timeout".to_string());
-        }
-    };
-
-    // 3. Parse the auth message
-    let auth_msg: WsAuthMessage = match serde_json::from_str(&first_msg) {
-        Ok(msg) => msg,
-        Err(e) => {
-            send_auth_error(socket, &format!("Invalid auth message format: {}", e)).await;
-            return Err(format!("Invalid format: {}", e));
-        }
-    };
-
-    // 4. Validate message type
-    if auth_msg.msg_type != "auth" {
-        send_auth_error(
-            socket,
-            &format!(
-                "Expected message type \"auth\", got \"{}\"",
-                auth_msg.msg_type
-            ),
-        )
-        .await;
-        return Err(format!("Wrong message type: {}", auth_msg.msg_type));
-    }
-
-    // 5. Extract and validate the token
-    let token = match auth_msg.token {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            send_auth_error(socket, "Missing or empty token field").await;
-            return Err("Missing token".to_string());
-        }
-    };
-
-    let claims = match decode_jwt(&token, &config.jwt_secret) {
-        Ok(c) => c,
-        Err(e) => {
-            send_auth_error(socket, &format!("Invalid token: {}", e)).await;
-            return Err(format!("Invalid token: {}", e));
-        }
-    };
-
-    // 6. Check email restrictions (domain + individual whitelist)
-    if !config.is_email_allowed(&claims.email) {
-        send_auth_error(socket, "Email not allowed by server policy").await;
-        return Err("Email not allowed by server policy".to_string());
-    }
-
-    // 7. Send auth_ok with user info
-    let auth_ok = serde_json::json!({
-        "type": "auth_ok",
-        "user": {
-            "id": claims.sub,
-            "email": claims.email,
-            "name": claims.name,
-        }
-    });
-    let _ = socket.send(Message::Text(auth_ok.to_string().into())).await;
-
-    debug!(email = %claims.email, "WebSocket authenticated");
-    Ok(claims)
-}
-
 /// Send an `auth_ok` message with user info through the WebSocket.
 ///
-/// Called after upgrade when authentication was done pre-upgrade (cookie)
-/// or post-upgrade (first-message handshake).
+/// Called after upgrade when authentication was done pre-upgrade (cookie).
 pub async fn send_auth_ok(socket: &mut WebSocket, claims: &Claims) {
     let auth_ok = serde_json::json!({
         "type": "auth_ok",
@@ -299,16 +145,6 @@ pub async fn send_auth_ok(socket: &mut WebSocket, claims: &Claims) {
     let _ = socket.send(Message::Text(auth_ok.to_string().into())).await;
 }
 
-/// Send an auth_error message and close the WebSocket.
-async fn send_auth_error(socket: &mut WebSocket, message: &str) {
-    let error = serde_json::json!({
-        "type": "auth_error",
-        "message": message,
-    });
-    let _ = socket.send(Message::Text(error.to_string().into())).await;
-    let _ = socket.send(Message::Close(None)).await;
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -316,20 +152,9 @@ async fn send_auth_error(socket: &mut WebSocket, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::jwt::encode_jwt;
     use crate::neo4j::mock::MockGraphStore;
     use crate::test_helpers::test_auth_config;
     use axum::http::HeaderMap;
-    use uuid::Uuid;
-
-    // Helper to make a valid auth message JSON
-    fn auth_message(token: &str) -> String {
-        serde_json::json!({
-            "type": "auth",
-            "token": token
-        })
-        .to_string()
-    }
 
     /// Create a mock Neo4j with a user and a valid refresh token.
     /// Returns (mock, user_id, raw_token).
@@ -386,7 +211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cookie_auth_no_cookie_header_returns_no_cookie() {
+    async fn test_cookie_auth_no_cookie_header_returns_invalid() {
         let mock = Arc::new(MockGraphStore::new());
         let headers = HeaderMap::new();
         let config = Some(test_auth_config());
@@ -395,13 +220,19 @@ mod tests {
             ws_authenticate_from_cookie(&headers, &config, &(mock as Arc<dyn GraphStore>)).await;
 
         match result {
-            CookieAuthResult::NoCookie => {} // expected
-            other => panic!("Expected NoCookie, got {:?}", other),
+            CookieAuthResult::Invalid(reason) => {
+                assert!(
+                    reason.contains("No refresh_token cookie"),
+                    "Got: {}",
+                    reason
+                );
+            }
+            other => panic!("Expected Invalid, got {:?}", other),
         }
     }
 
     #[tokio::test]
-    async fn test_cookie_auth_no_refresh_token_in_cookie_returns_no_cookie() {
+    async fn test_cookie_auth_no_refresh_token_in_cookie_returns_invalid() {
         let mock = Arc::new(MockGraphStore::new());
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -414,8 +245,14 @@ mod tests {
             ws_authenticate_from_cookie(&headers, &config, &(mock as Arc<dyn GraphStore>)).await;
 
         match result {
-            CookieAuthResult::NoCookie => {} // expected
-            other => panic!("Expected NoCookie, got {:?}", other),
+            CookieAuthResult::Invalid(reason) => {
+                assert!(
+                    reason.contains("No refresh_token cookie"),
+                    "Got: {}",
+                    reason
+                );
+            }
+            other => panic!("Expected Invalid, got {:?}", other),
         }
     }
 
@@ -511,50 +348,5 @@ mod tests {
             }
             other => panic!("Expected Authenticated, got {:?}", other),
         }
-    }
-
-    // ========================================================================
-    // ws_authenticate (first-message handshake) tests
-    // ========================================================================
-
-    #[test]
-    fn test_ws_auth_message_deserialization() {
-        let json = r#"{"type":"auth","token":"eyJ..."}"#;
-        let msg: WsAuthMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.msg_type, "auth");
-        assert_eq!(msg.token.as_deref(), Some("eyJ..."));
-    }
-
-    #[test]
-    fn test_ws_auth_message_missing_token() {
-        let json = r#"{"type":"auth"}"#;
-        let msg: WsAuthMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.msg_type, "auth");
-        assert!(msg.token.is_none());
-    }
-
-    #[test]
-    fn test_ws_auth_message_wrong_type() {
-        let json = r#"{"type":"user_message","content":"hello"}"#;
-        let msg: WsAuthMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.msg_type, "user_message");
-    }
-
-    #[test]
-    fn test_valid_auth_message_construction() {
-        let user_id = Uuid::new_v4();
-        let config = test_auth_config();
-        let token = encode_jwt(
-            user_id,
-            "alice@ffs.holdings",
-            "Alice",
-            &config.jwt_secret,
-            3600,
-        )
-        .unwrap();
-        let msg = auth_message(&token);
-        let parsed: WsAuthMessage = serde_json::from_str(&msg).unwrap();
-        assert_eq!(parsed.msg_type, "auth");
-        assert!(parsed.token.is_some());
     }
 }
