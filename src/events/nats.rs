@@ -560,6 +560,10 @@ mod tests {
                 session_id: "sess-1".into(),
                 duration_ms: 5000,
                 cost_usd: Some(0.15),
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
             },
             ChatEvent::StreamDelta {
                 text: "tok".into(),

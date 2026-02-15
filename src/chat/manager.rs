@@ -1051,12 +1051,20 @@ impl ChatManager {
                 session_id,
                 duration_ms,
                 total_cost_usd,
+                subtype,
+                is_error,
+                num_turns,
+                result,
                 ..
             } => {
                 vec![ChatEvent::Result {
                     session_id: session_id.clone(),
                     duration_ms: *duration_ms as u64,
                     cost_usd: *total_cost_usd,
+                    subtype: subtype.clone(),
+                    is_error: *is_error,
+                    num_turns: Some(*num_turns),
+                    result_text: result.clone(),
                 }]
             }
             Message::StreamEvent { event, .. } => match event {
@@ -1101,8 +1109,65 @@ impl ChatManager {
                 _ => vec![],
             },
             Message::System { subtype, data } => {
-                debug!("System message: {} — {:?}", subtype, data);
-                vec![]
+                match subtype.as_str() {
+                    "init" => {
+                        // Extract session metadata from init system message
+                        let cli_session_id = data
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let model = data
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let tools = data
+                            .get("tools")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let mcp_servers = data
+                            .get("mcp_servers")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let permission_mode = data
+                            .get("permissionMode")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        vec![ChatEvent::SystemInit {
+                            cli_session_id,
+                            model,
+                            tools,
+                            mcp_servers,
+                            permission_mode,
+                        }]
+                    }
+                    "compact_boundary" => {
+                        // Extract compact metadata from data.compact_metadata
+                        let metadata = data.get("compact_metadata");
+                        let trigger = metadata
+                            .and_then(|m| m.get("trigger"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("auto")
+                            .to_string();
+                        let pre_tokens = metadata
+                            .and_then(|m| m.get("pre_tokens"))
+                            .and_then(|v| v.as_u64());
+                        vec![ChatEvent::CompactBoundary {
+                            trigger,
+                            pre_tokens,
+                        }]
+                    }
+                    _ => {
+                        debug!("Unhandled system message: {} — {:?}", subtype, data);
+                        vec![]
+                    }
+                }
             }
             Message::User { message, .. } => {
                 // User messages with content_blocks contain tool_result blocks
@@ -1738,6 +1803,36 @@ impl ChatManager {
                             if let Some(active) = sessions.get_mut(&session_id) {
                                 active.cli_session_id = Some(cli_sid.clone());
                                 active.last_activity = Instant::now();
+                            }
+                        }
+
+                        // Extract cli_session_id and model from System init message
+                        if let Message::System { subtype, ref data } = msg {
+                            if subtype == "init" {
+                                let cli_sid = data
+                                    .get("session_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if let Some(uuid) = session_uuid {
+                                    let _ = graph
+                                        .update_chat_session(
+                                            uuid,
+                                            Some(cli_sid.clone()),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                }
+                                // Update active session
+                                let mut sessions = active_sessions.write().await;
+                                if let Some(active) = sessions.get_mut(&session_id) {
+                                    active.cli_session_id = Some(cli_sid);
+                                    active.last_activity = Instant::now();
+                                }
                             }
                         }
 
@@ -3607,8 +3702,62 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::Result {
-            session_id, duration_ms, cost_usd
-        } if session_id == "cli-abc-123" && *duration_ms == 5000 && *cost_usd == Some(0.15)));
+            session_id, duration_ms, cost_usd, subtype, is_error, num_turns, result_text,
+        } if session_id == "cli-abc-123"
+            && *duration_ms == 5000
+            && *cost_usd == Some(0.15)
+            && subtype == "success"
+            && !is_error
+            && *num_turns == Some(3)
+            && result_text.is_none()
+        ));
+    }
+
+    #[test]
+    fn test_message_to_events_result_error_max_turns() {
+        let msg = Message::Result {
+            subtype: "error_max_turns".into(),
+            duration_ms: 8000,
+            duration_api_ms: 7500,
+            is_error: true,
+            num_turns: 15,
+            session_id: "cli-max-turns".into(),
+            total_cost_usd: Some(0.50),
+            usage: None,
+            result: None,
+            structured_output: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ChatEvent::Result {
+            subtype, is_error, num_turns, ..
+        } if subtype == "error_max_turns" && *is_error && *num_turns == Some(15)));
+    }
+
+    #[test]
+    fn test_message_to_events_result_error_during_execution() {
+        let msg = Message::Result {
+            subtype: "error_during_execution".into(),
+            duration_ms: 2000,
+            duration_api_ms: 1800,
+            is_error: true,
+            num_turns: 1,
+            session_id: "cli-exec-err".into(),
+            total_cost_usd: Some(0.02),
+            usage: None,
+            result: Some("Process exited with code 1".into()),
+            structured_output: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ChatEvent::Result {
+            subtype, is_error, result_text, ..
+        } if subtype == "error_during_execution"
+            && *is_error
+            && result_text.as_deref() == Some("Process exited with code 1")
+        ));
     }
 
     #[test]
@@ -3641,9 +3790,35 @@ mod tests {
     }
 
     #[test]
-    fn test_message_to_events_system_message() {
+    fn test_message_to_events_system_init() {
         let msg = Message::System {
             subtype: "init".into(),
+            data: serde_json::json!({
+                "session_id": "cli-sess-abc",
+                "model": "claude-sonnet-4-20250514",
+                "tools": ["Bash", "Read", "Write", "Edit"],
+                "mcp_servers": [{"name": "po", "status": "connected"}],
+                "permissionMode": "default"
+            }),
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ChatEvent::SystemInit {
+            cli_session_id, model, tools, mcp_servers, permission_mode,
+        } if cli_session_id == "cli-sess-abc"
+            && model.as_deref() == Some("claude-sonnet-4-20250514")
+            && tools.len() == 4
+            && mcp_servers.len() == 1
+            && permission_mode.as_deref() == Some("default")
+        ));
+    }
+
+    #[test]
+    fn test_message_to_events_system_unknown() {
+        // Unknown system subtypes should still be ignored
+        let msg = Message::System {
+            subtype: "unknown_future_type".into(),
             data: serde_json::json!({"version": "1.0"}),
         };
 
@@ -4867,6 +5042,10 @@ mod tests {
                 session_id: "cli-123".into(),
                 duration_ms: 5000,
                 cost_usd: Some(0.15),
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
             },
             ChatEvent::UserMessage {
                 content: "Hello".into(),

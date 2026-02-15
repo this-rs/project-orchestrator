@@ -91,6 +91,18 @@ pub enum ChatEvent {
         duration_ms: u64,
         #[serde(default)]
         cost_usd: Option<f64>,
+        /// Result subtype: "success", "error_max_turns", "error_during_execution"
+        #[serde(default)]
+        subtype: String,
+        /// Whether the result indicates an error
+        #[serde(default)]
+        is_error: bool,
+        /// Number of turns in the conversation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        num_turns: Option<i32>,
+        /// Result text or error message
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_text: Option<String>,
     },
     /// Streaming text delta (real-time token)
     StreamDelta {
@@ -117,6 +129,31 @@ pub enum ChatEvent {
     },
     /// Permission mode was changed mid-session
     PermissionModeChanged { mode: String },
+    /// Context window was compacted (automatic or manual)
+    CompactBoundary {
+        /// Compaction trigger: "auto" or "manual"
+        trigger: String,
+        /// Number of tokens before compaction (if available)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+    },
+    /// Session initialized — metadata from the CLI init system message
+    SystemInit {
+        /// CLI session ID
+        cli_session_id: String,
+        /// Model used for this session
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// List of available tool names
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+        /// Connected MCP servers
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mcp_servers: Vec<serde_json::Value>,
+        /// Permission mode for this session
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+    },
 }
 
 impl ChatEvent {
@@ -137,6 +174,8 @@ impl ChatEvent {
             ChatEvent::Error { .. } => "error",
             ChatEvent::PermissionDecision { .. } => "permission_decision",
             ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
+            ChatEvent::CompactBoundary { .. } => "compact_boundary",
+            ChatEvent::SystemInit { .. } => "system_init",
         }
     }
 }
@@ -366,7 +405,11 @@ mod tests {
             ChatEvent::Result {
                 session_id: "".into(),
                 duration_ms: 0,
-                cost_usd: None
+                cost_usd: None,
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
             }
             .event_type(),
             "result"
@@ -440,11 +483,28 @@ mod tests {
                 session_id: "cli-123".into(),
                 duration_ms: 5000,
                 cost_usd: Some(0.15),
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: Some(3),
+                result_text: None,
             },
             ChatEvent::Result {
                 session_id: "cli-456".into(),
                 duration_ms: 1000,
                 cost_usd: None,
+                subtype: "error_max_turns".into(),
+                is_error: true,
+                num_turns: Some(15),
+                result_text: None,
+            },
+            ChatEvent::Result {
+                session_id: "cli-789".into(),
+                duration_ms: 2000,
+                cost_usd: Some(0.05),
+                subtype: "error_during_execution".into(),
+                is_error: true,
+                num_turns: Some(1),
+                result_text: Some("CLI crashed unexpectedly".into()),
             },
             ChatEvent::StreamDelta {
                 text: "Hello".into(),
@@ -461,6 +521,28 @@ mod tests {
             ChatEvent::PermissionDecision {
                 id: "pr_2".into(),
                 allow: false,
+            },
+            ChatEvent::CompactBoundary {
+                trigger: "auto".into(),
+                pre_tokens: Some(150000),
+            },
+            ChatEvent::CompactBoundary {
+                trigger: "manual".into(),
+                pre_tokens: None,
+            },
+            ChatEvent::SystemInit {
+                cli_session_id: "cli-init-123".into(),
+                model: Some("claude-sonnet-4-20250514".into()),
+                tools: vec!["Bash".into(), "Read".into(), "Write".into()],
+                mcp_servers: vec![serde_json::json!({"name": "po", "status": "connected"})],
+                permission_mode: Some("default".into()),
+            },
+            ChatEvent::SystemInit {
+                cli_session_id: "cli-init-456".into(),
+                model: None,
+                tools: vec![],
+                mcp_servers: vec![],
+                permission_mode: None,
             },
         ];
 
@@ -490,6 +572,34 @@ mod tests {
         let json = r#"{"type":"input_request","prompt":"Choose:","options":["A","B"]}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ChatEvent::InputRequest { ref options, .. } if options.is_some()));
+
+        // CompactBoundary with pre_tokens
+        let json = r#"{"type":"compact_boundary","trigger":"auto","pre_tokens":150000}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: Some(150000) } if trigger == "auto")
+        );
+
+        // CompactBoundary without pre_tokens (backward compat)
+        let json = r#"{"type":"compact_boundary","trigger":"manual"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: None } if trigger == "manual")
+        );
+
+        // SystemInit with all fields
+        let json = r#"{"type":"system_init","cli_session_id":"sid-1","model":"claude-sonnet-4-20250514","tools":["Bash","Read"],"mcp_servers":[{"name":"po"}],"permission_mode":"default"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref model, .. } if cli_session_id == "sid-1" && model.as_deref() == Some("claude-sonnet-4-20250514"))
+        );
+
+        // SystemInit minimal (backward compat — only required field)
+        let json = r#"{"type":"system_init","cli_session_id":"sid-2"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref tools, ref mcp_servers, .. } if cli_session_id == "sid-2" && tools.is_empty() && mcp_servers.is_empty())
+        );
     }
 
     #[test]
