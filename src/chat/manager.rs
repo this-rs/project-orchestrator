@@ -1158,7 +1158,10 @@ impl ChatManager {
                         let pre_tokens = metadata
                             .and_then(|m| m.get("pre_tokens"))
                             .and_then(|v| v.as_u64());
-                        vec![ChatEvent::CompactBoundary { trigger, pre_tokens }]
+                        vec![ChatEvent::CompactBoundary {
+                            trigger,
+                            pre_tokens,
+                        }]
                     }
                     _ => {
                         debug!("Unhandled system message: {} — {:?}", subtype, data);
@@ -1804,11 +1807,7 @@ impl ChatManager {
                         }
 
                         // Extract cli_session_id and model from System init message
-                        if let Message::System {
-                            subtype,
-                            ref data,
-                        } = msg
-                        {
+                        if let Message::System { subtype, ref data } = msg {
                             if subtype == "init" {
                                 let cli_sid = data
                                     .get("session_id")

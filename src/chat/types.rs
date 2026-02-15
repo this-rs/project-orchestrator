@@ -576,22 +576,30 @@ mod tests {
         // CompactBoundary with pre_tokens
         let json = r#"{"type":"compact_boundary","trigger":"auto","pre_tokens":150000}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: Some(150000) } if trigger == "auto"));
+        assert!(
+            matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: Some(150000) } if trigger == "auto")
+        );
 
         // CompactBoundary without pre_tokens (backward compat)
         let json = r#"{"type":"compact_boundary","trigger":"manual"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: None } if trigger == "manual"));
+        assert!(
+            matches!(event, ChatEvent::CompactBoundary { ref trigger, pre_tokens: None } if trigger == "manual")
+        );
 
         // SystemInit with all fields
         let json = r#"{"type":"system_init","cli_session_id":"sid-1","model":"claude-sonnet-4-20250514","tools":["Bash","Read"],"mcp_servers":[{"name":"po"}],"permission_mode":"default"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref model, .. } if cli_session_id == "sid-1" && model.as_deref() == Some("claude-sonnet-4-20250514")));
+        assert!(
+            matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref model, .. } if cli_session_id == "sid-1" && model.as_deref() == Some("claude-sonnet-4-20250514"))
+        );
 
         // SystemInit minimal (backward compat — only required field)
         let json = r#"{"type":"system_init","cli_session_id":"sid-2"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref tools, ref mcp_servers, .. } if cli_session_id == "sid-2" && tools.is_empty() && mcp_servers.is_empty()));
+        assert!(
+            matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref tools, ref mcp_servers, .. } if cli_session_id == "sid-2" && tools.is_empty() && mcp_servers.is_empty())
+        );
     }
 
     #[test]
