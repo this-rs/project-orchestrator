@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // ============================================================================
@@ -336,17 +336,39 @@ pub async fn backfill_previews(
 // Permission config (runtime GET/PUT)
 // ============================================================================
 
+/// Response for GET /api/chat/config/permissions.
+/// Extends PermissionConfig with the default model from config.yaml
+/// so the frontend knows which model to pre-select for new conversations.
+#[derive(Debug, Serialize)]
+pub struct PermissionConfigResponse {
+    /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions"
+    pub mode: String,
+    /// Tool patterns to explicitly allow
+    pub allowed_tools: Vec<String>,
+    /// Tool patterns to explicitly disallow
+    pub disallowed_tools: Vec<String>,
+    /// Default model from config.yaml (used by frontend for new conversation pre-selection)
+    pub default_model: String,
+}
+
 /// GET /api/chat/config/permissions — Return current runtime permission config
 pub async fn get_chat_permissions(
     State(state): State<OrchestratorState>,
-) -> Result<Json<crate::chat::PermissionConfig>, AppError> {
+) -> Result<Json<PermissionConfigResponse>, AppError> {
     let chat_manager = state
         .chat_manager
         .as_ref()
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
 
     let config = chat_manager.get_permission_config().await;
-    Ok(Json(config))
+    let default_model = chat_manager.config.default_model.clone();
+
+    Ok(Json(PermissionConfigResponse {
+        mode: config.mode,
+        allowed_tools: config.allowed_tools,
+        disallowed_tools: config.disallowed_tools,
+        default_model,
+    }))
 }
 
 /// PUT /api/chat/config/permissions — Update runtime permission config
@@ -831,6 +853,11 @@ mod tests {
         assert_eq!(json["mode"], "default");
         assert_eq!(json["allowed_tools"].as_array().unwrap().len(), 0);
         assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
+        // default_model is now included from ChatConfig
+        assert!(
+            json["default_model"].is_string(),
+            "default_model should be present"
+        );
     }
 
     // ====================================================================
