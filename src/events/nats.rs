@@ -522,42 +522,53 @@ mod tests {
             },
             ChatEvent::AssistantText {
                 content: "Hi there!".into(),
+                parent_tool_use_id: None,
             },
             ChatEvent::Thinking {
                 content: "Let me think...".into(),
+                parent_tool_use_id: None,
             },
             ChatEvent::ToolUse {
                 id: "tu_1".into(),
                 tool: "create_plan".into(),
                 input: serde_json::json!({"title": "Plan"}),
+                parent_tool_use_id: None,
             },
             ChatEvent::ToolResult {
                 id: "tu_1".into(),
                 result: serde_json::json!({"id": "abc"}),
                 is_error: false,
+                parent_tool_use_id: None,
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu_1".into(),
                 input: serde_json::json!({"title": "Resolved"}),
+                parent_tool_use_id: None,
             },
             ChatEvent::PermissionRequest {
                 id: "pr_1".into(),
                 tool: "bash".into(),
                 input: serde_json::json!({"command": "ls"}),
+                parent_tool_use_id: None,
             },
             ChatEvent::InputRequest {
                 prompt: "Choose:".into(),
                 options: Some(vec!["A".into(), "B".into()]),
+                parent_tool_use_id: None,
             },
             ChatEvent::Result {
                 session_id: "sess-1".into(),
                 duration_ms: 5000,
                 cost_usd: Some(0.15),
             },
-            ChatEvent::StreamDelta { text: "tok".into() },
+            ChatEvent::StreamDelta {
+                text: "tok".into(),
+                parent_tool_use_id: None,
+            },
             ChatEvent::StreamingStatus { is_streaming: true },
             ChatEvent::Error {
                 message: "fail".into(),
+                parent_tool_use_id: None,
             },
         ];
 

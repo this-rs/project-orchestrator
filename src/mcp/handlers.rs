@@ -3535,7 +3535,7 @@ impl ToolHandler {
         use tokio_stream::StreamExt;
         while let Some(Ok(event)) = stream.next().await {
             match event {
-                crate::chat::ChatEvent::AssistantText { content } => {
+                crate::chat::ChatEvent::AssistantText { content, .. } => {
                     text_parts.push(content);
                 }
                 crate::chat::ChatEvent::Result {
@@ -3548,7 +3548,7 @@ impl ToolHandler {
                     cost_usd = cost;
                     break;
                 }
-                crate::chat::ChatEvent::Error { message } => {
+                crate::chat::ChatEvent::Error { message, .. } => {
                     return Err(anyhow!("Chat error: {}", message));
                 }
                 _ => {} // Skip tool_use, tool_result, thinking, etc.

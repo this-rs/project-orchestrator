@@ -31,14 +31,26 @@ pub enum ChatEvent {
     /// A user message (emitted so multi-tab clients see it)
     UserMessage { content: String },
     /// Text content from the assistant
-    AssistantText { content: String },
+    AssistantText {
+        content: String,
+        /// When set, this event originated from a sub-agent (sidechain).
+        /// The value is the tool_use ID of the parent Task that spawned the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Claude is thinking (extended thinking)
-    Thinking { content: String },
+    Thinking {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Claude is calling a tool
     ToolUse {
         id: String,
         tool: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
     },
     /// Result of a tool call
     ToolResult {
@@ -46,24 +58,32 @@ pub enum ChatEvent {
         result: serde_json::Value,
         #[serde(default)]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
     },
     /// Updated input for a tool_use (emitted when AssistantMessage provides full input
     /// after ContentBlockStart already emitted a ToolUse with empty input)
     ToolUseInputResolved {
         id: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
     },
     /// Claude is asking for permission to use a tool
     PermissionRequest {
         id: String,
         tool: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
     },
     /// Claude is waiting for user input
     InputRequest {
         prompt: String,
         #[serde(default)]
         options: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
     },
     /// Conversation turn completed
     Result {
@@ -73,11 +93,19 @@ pub enum ChatEvent {
         cost_usd: Option<f64>,
     },
     /// Streaming text delta (real-time token)
-    StreamDelta { text: String },
+    StreamDelta {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Streaming status change (broadcast to all connected clients)
     StreamingStatus { is_streaming: bool },
     /// An error occurred
-    Error { message: String },
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Permission mode was changed mid-session
     PermissionModeChanged { mode: String },
 }
@@ -269,27 +297,39 @@ mod tests {
     fn test_chat_event_serialize() {
         let event = ChatEvent::AssistantText {
             content: "Hello!".into(),
+            parent_tool_use_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"assistant_text\""));
         assert!(json.contains("Hello!"));
+        // parent_tool_use_id: None should NOT appear in JSON
+        assert!(!json.contains("parent_tool_use_id"));
     }
 
     #[test]
     fn test_chat_event_types() {
         assert_eq!(
-            ChatEvent::AssistantText { content: "".into() }.event_type(),
+            ChatEvent::AssistantText {
+                content: "".into(),
+                parent_tool_use_id: None,
+            }
+            .event_type(),
             "assistant_text"
         );
         assert_eq!(
-            ChatEvent::Thinking { content: "".into() }.event_type(),
+            ChatEvent::Thinking {
+                content: "".into(),
+                parent_tool_use_id: None,
+            }
+            .event_type(),
             "thinking"
         );
         assert_eq!(
             ChatEvent::ToolUse {
                 id: "".into(),
                 tool: "".into(),
-                input: serde_json::Value::Null
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
             }
             .event_type(),
             "tool_use"
@@ -298,13 +338,18 @@ mod tests {
             ChatEvent::PermissionRequest {
                 id: "".into(),
                 tool: "".into(),
-                input: serde_json::Value::Null
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
             }
             .event_type(),
             "permission_request"
         );
         assert_eq!(
-            ChatEvent::StreamDelta { text: "".into() }.event_type(),
+            ChatEvent::StreamDelta {
+                text: "".into(),
+                parent_tool_use_id: None,
+            }
+            .event_type(),
             "stream_delta"
         );
         assert_eq!(
@@ -341,37 +386,45 @@ mod tests {
         let events = vec![
             ChatEvent::AssistantText {
                 content: "Hello!".into(),
+                parent_tool_use_id: None,
             },
             ChatEvent::Thinking {
                 content: "Let me think...".into(),
+                parent_tool_use_id: None,
             },
             ChatEvent::ToolUse {
                 id: "tu_1".into(),
                 tool: "create_plan".into(),
                 input: serde_json::json!({"title": "Plan"}),
+                parent_tool_use_id: None,
             },
             ChatEvent::ToolResult {
                 id: "tu_1".into(),
                 result: serde_json::json!({"id": "abc"}),
                 is_error: false,
+                parent_tool_use_id: None,
             },
             ChatEvent::ToolResult {
                 id: "tu_2".into(),
                 result: serde_json::json!("Not found"),
                 is_error: true,
+                parent_tool_use_id: Some("toolu_parent_1".into()),
             },
             ChatEvent::PermissionRequest {
                 id: "pr_1".into(),
                 tool: "bash".into(),
                 input: serde_json::json!({"command": "rm -rf /"}),
+                parent_tool_use_id: None,
             },
             ChatEvent::InputRequest {
                 prompt: "Which option?".into(),
                 options: Some(vec!["A".into(), "B".into()]),
+                parent_tool_use_id: None,
             },
             ChatEvent::InputRequest {
                 prompt: "Enter value:".into(),
                 options: None,
+                parent_tool_use_id: Some("toolu_parent_2".into()),
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -385,9 +438,11 @@ mod tests {
             },
             ChatEvent::StreamDelta {
                 text: "Hello".into(),
+                parent_tool_use_id: None,
             },
             ChatEvent::Error {
                 message: "CLI not found".into(),
+                parent_tool_use_id: None,
             },
         ];
 
@@ -408,7 +463,7 @@ mod tests {
 
         let json = r#"{"type":"error","message":"fail"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ChatEvent::Error { ref message } if message == "fail"));
+        assert!(matches!(event, ChatEvent::Error { ref message, .. } if message == "fail"));
 
         let json = r#"{"type":"permission_request","id":"p1","tool":"bash","input":{"cmd":"ls"}}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
@@ -417,6 +472,119 @@ mod tests {
         let json = r#"{"type":"input_request","prompt":"Choose:","options":["A","B"]}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ChatEvent::InputRequest { ref options, .. } if options.is_some()));
+    }
+
+    #[test]
+    fn test_chat_event_parent_tool_use_id_serde() {
+        // (1) parent_tool_use_id: None → JSON should NOT contain the field
+        let event = ChatEvent::ToolUse {
+            id: "t1".into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("parent_tool_use_id"));
+
+        // (2) parent_tool_use_id: Some → JSON SHOULD contain the field
+        let event = ChatEvent::ToolUse {
+            id: "t2".into(),
+            tool: "Read".into(),
+            input: serde_json::json!({"path": "/src/main.rs"}),
+            parent_tool_use_id: Some("toolu_abc123".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"parent_tool_use_id\":\"toolu_abc123\""));
+
+        // (3) Backward compat: deserialize JSON WITHOUT parent_tool_use_id → None
+        let json = r#"{"type":"tool_use","id":"t3","tool":"Grep","input":{}}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        if let ChatEvent::ToolUse {
+            parent_tool_use_id, ..
+        } = event
+        {
+            assert!(parent_tool_use_id.is_none());
+        } else {
+            panic!("Expected ToolUse variant");
+        }
+
+        // (4) Deserialize JSON WITH parent_tool_use_id → Some
+        let json = r#"{"type":"stream_delta","text":"hello","parent_tool_use_id":"toolu_xyz789"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        if let ChatEvent::StreamDelta {
+            text,
+            parent_tool_use_id,
+        } = event
+        {
+            assert_eq!(text, "hello");
+            assert_eq!(parent_tool_use_id.as_deref(), Some("toolu_xyz789"));
+        } else {
+            panic!("Expected StreamDelta variant");
+        }
+
+        // (5) Roundtrip with parent — serialize then deserialize
+        let event = ChatEvent::ToolResult {
+            id: "tu_1".into(),
+            result: serde_json::json!({"ok": true}),
+            is_error: false,
+            parent_tool_use_id: Some("toolu_parent".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+        if let ChatEvent::ToolResult {
+            parent_tool_use_id, ..
+        } = deserialized
+        {
+            assert_eq!(parent_tool_use_id.as_deref(), Some("toolu_parent"));
+        } else {
+            panic!("Expected ToolResult variant");
+        }
+
+        // (6) All variant types that have parent_tool_use_id — roundtrip test
+        let events_with_parent: Vec<ChatEvent> = vec![
+            ChatEvent::AssistantText {
+                content: "hi".into(),
+                parent_tool_use_id: Some("p1".into()),
+            },
+            ChatEvent::Thinking {
+                content: "hmm".into(),
+                parent_tool_use_id: Some("p2".into()),
+            },
+            ChatEvent::StreamDelta {
+                text: "tok".into(),
+                parent_tool_use_id: Some("p3".into()),
+            },
+            ChatEvent::Error {
+                message: "err".into(),
+                parent_tool_use_id: Some("p4".into()),
+            },
+            ChatEvent::PermissionRequest {
+                id: "pr1".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({}),
+                parent_tool_use_id: Some("p5".into()),
+            },
+            ChatEvent::InputRequest {
+                prompt: "?".into(),
+                options: None,
+                parent_tool_use_id: Some("p6".into()),
+            },
+            ChatEvent::ToolUseInputResolved {
+                id: "tu1".into(),
+                input: serde_json::json!({}),
+                parent_tool_use_id: Some("p7".into()),
+            },
+        ];
+        for event in &events_with_parent {
+            let json = serde_json::to_string(event).unwrap();
+            assert!(
+                json.contains("parent_tool_use_id"),
+                "Missing parent_tool_use_id in JSON for {:?}",
+                event.event_type()
+            );
+            let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(event.event_type(), deserialized.event_type());
+        }
     }
 
     #[test]

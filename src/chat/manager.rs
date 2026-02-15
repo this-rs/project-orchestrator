@@ -986,6 +986,10 @@ impl ChatManager {
 
     /// Convert a Nexus SDK `Message` to a list of `ChatEvent`s
     pub fn message_to_events(msg: &Message) -> Vec<ChatEvent> {
+        // Extract parent_tool_use_id from the Message (sidechain indicator).
+        // When present, this event originated from a sub-agent spawned by a Task tool.
+        let parent = msg.parent_tool_use_id().map(|s| s.to_string());
+
         match msg {
             Message::Assistant { message, .. } => {
                 let mut events = Vec::new();
@@ -994,11 +998,13 @@ impl ChatManager {
                         ContentBlock::Text(t) => {
                             events.push(ChatEvent::AssistantText {
                                 content: t.text.clone(),
+                                parent_tool_use_id: parent.clone(),
                             });
                         }
                         ContentBlock::Thinking(t) => {
                             events.push(ChatEvent::Thinking {
                                 content: t.thinking.clone(),
+                                parent_tool_use_id: parent.clone(),
                             });
                         }
                         ContentBlock::ToolUse(t) => {
@@ -1006,6 +1012,7 @@ impl ChatManager {
                                 id: t.id.clone(),
                                 tool: t.name.clone(),
                                 input: t.input.clone(),
+                                parent_tool_use_id: parent.clone(),
                             });
                         }
                         ContentBlock::ToolResult(t) => {
@@ -1020,6 +1027,7 @@ impl ChatManager {
                                 id: t.tool_use_id.clone(),
                                 result,
                                 is_error: t.is_error.unwrap_or(false),
+                                parent_tool_use_id: parent.clone(),
                             });
                         }
                     }
@@ -1043,7 +1051,10 @@ impl ChatManager {
                     delta: StreamDelta::TextDelta { text },
                     ..
                 } => {
-                    vec![ChatEvent::StreamDelta { text: text.clone() }]
+                    vec![ChatEvent::StreamDelta {
+                        text: text.clone(),
+                        parent_tool_use_id: parent,
+                    }]
                 }
                 // Extract tool_use from ContentBlockStart — this is where tool calls
                 // first appear in the stream (before the AssistantMessage is finalized).
@@ -1068,6 +1079,7 @@ impl ChatManager {
                             id,
                             tool: name,
                             input,
+                            parent_tool_use_id: parent,
                         }]
                     } else {
                         vec![]
@@ -1097,6 +1109,7 @@ impl ChatManager {
                                 id: t.tool_use_id.clone(),
                                 result,
                                 is_error: t.is_error.unwrap_or(false),
+                                parent_tool_use_id: parent.clone(),
                             });
                         }
                     }
@@ -1477,6 +1490,7 @@ impl ChatManager {
                     emit_chat(
                         ChatEvent::Error {
                             message: format!("Error: {}", e),
+                            parent_tool_use_id: None,
                         },
                         &events_tx,
                         &nats,
@@ -1497,12 +1511,19 @@ impl ChatManager {
                 }
             };
 
+            // Track the current parent_tool_use_id from stream events.
+            // When a sub-agent is active, its stream Messages carry parent_tool_use_id.
+            // We capture this so permission requests (which arrive via a separate control
+            // channel without parent info) can be attributed to the correct agent.
+            let mut current_parent_tool_use_id: Option<String> = None;
+
             // Helper closure: process an SDK control message (permission request).
             // Returns Some(ChatEvent) if a permission_request was parsed, None otherwise.
             // The caller is responsible for adding the event to streaming_events (async).
             let handle_control_msg = |control_msg: serde_json::Value,
                                       events_to_persist: &mut Vec<ChatEventRecord>,
-                                      next_seq: &std::sync::atomic::AtomicI64|
+                                      next_seq: &std::sync::atomic::AtomicI64,
+                                      current_parent: Option<String>|
              -> Option<ChatEvent> {
                 // Extract the request data (may be nested under "request")
                 let request_data = if control_msg.get("request").is_some() {
@@ -1545,6 +1566,7 @@ impl ChatManager {
                         id: request_id,
                         tool: tool_name,
                         input,
+                        parent_tool_use_id: current_parent,
                     };
 
                     // Persist the permission_request event
@@ -1599,7 +1621,7 @@ impl ChatManager {
                         control_msg = rx.recv() => {
                             match control_msg {
                                 Some(msg) => {
-                                    if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq) {
+                                    if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                         streaming_events.lock().await.push(evt);
                                     }
                                     continue; // Go back to select! for next event
@@ -1617,7 +1639,7 @@ impl ChatManager {
                                 Some(result) => {
                                     // Also drain any buffered control messages
                                     while let Ok(msg) = rx.try_recv() {
-                                        if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq) {
+                                        if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                             streaming_events.lock().await.push(evt);
                                         }
                                     }
@@ -1637,6 +1659,14 @@ impl ChatManager {
 
                 match result {
                     Ok(ref msg) => {
+                        // Track the current parent_tool_use_id from every stream message.
+                        // This is used by handle_control_msg to attribute permission
+                        // requests to the correct sub-agent. We update on every message
+                        // (including top-level ones where parent is None) so the tracker
+                        // resets correctly when switching between agents.
+                        current_parent_tool_use_id =
+                            msg.parent_tool_use_id().map(|s| s.to_string());
+
                         // Handle StreamEvent — emit StreamDelta for text tokens directly
                         // stream_delta are NOT persisted (too many writes)
                         if let Message::StreamEvent {
@@ -1648,10 +1678,14 @@ impl ChatManager {
                             ..
                         } = msg
                         {
+                            let parent = msg.parent_tool_use_id().map(|s| s.to_string());
                             // Accumulate for mid-stream join snapshot
                             streaming_text.lock().await.push_str(text);
                             emit_chat(
-                                ChatEvent::StreamDelta { text: text.clone() },
+                                ChatEvent::StreamDelta {
+                                    text: text.clone(),
+                                    parent_tool_use_id: parent,
+                                },
                                 &events_tx,
                                 &nats,
                                 &session_id,
@@ -1716,7 +1750,10 @@ impl ChatManager {
                             //    (clients already have the tool_use), but UPDATE the persisted
                             //    record and streaming_events with the full input.
                             if let ChatEvent::ToolUse {
-                                ref id, ref input, ..
+                                ref id,
+                                ref input,
+                                ref parent_tool_use_id,
+                                ..
                             } = event
                             {
                                 if let Some(persist_idx) = emitted_tool_use_ids.get(id) {
@@ -1747,6 +1784,7 @@ impl ChatManager {
                                             ChatEvent::ToolUseInputResolved {
                                                 id: id.clone(),
                                                 input: input.clone(),
+                                                parent_tool_use_id: parent_tool_use_id.clone(),
                                             },
                                             &events_tx,
                                             &nats,
@@ -1803,9 +1841,14 @@ impl ChatManager {
                                 {
                                     let mut st = streaming_text.lock().await;
                                     if !st.is_empty() {
+                                        // Note: streaming_text is a flat buffer that doesn't track
+                                        // per-agent text. The parent_tool_use_id is set to None here.
+                                        // The frontend uses individual streaming_events (which carry
+                                        // parent_tool_use_id) for agent grouping, not partial_text.
                                         streaming_events.lock().await.push(
                                             ChatEvent::AssistantText {
                                                 content: st.clone(),
+                                                parent_tool_use_id: None,
                                             },
                                         );
                                         st.clear();
@@ -1822,6 +1865,7 @@ impl ChatManager {
                         emit_chat(
                             ChatEvent::Error {
                                 message: format!("Error: {}", e),
+                                parent_tool_use_id: None,
                             },
                             &events_tx,
                             &nats,
@@ -2591,6 +2635,7 @@ impl ChatManager {
                     } else {
                         ChatEvent::AssistantText {
                             content: msg.content.clone(),
+                            parent_tool_use_id: None,
                         }
                     };
                     ChatEventRecord {
@@ -3257,7 +3302,9 @@ mod tests {
 
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], ChatEvent::AssistantText { content } if content == "Hello!"));
+        assert!(
+            matches!(&events[0], ChatEvent::AssistantText { content, .. } if content == "Hello!")
+        );
     }
 
     #[test]
@@ -3275,7 +3322,7 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(
-            matches!(&events[0], ChatEvent::Thinking { content } if content == "Let me think...")
+            matches!(&events[0], ChatEvent::Thinking { content, .. } if content == "Let me think...")
         );
     }
 
@@ -3478,7 +3525,7 @@ mod tests {
 
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], ChatEvent::StreamDelta { text } if text == "Hello"));
+        assert!(matches!(&events[0], ChatEvent::StreamDelta { text, .. } if text == "Hello"));
     }
 
     #[test]
@@ -3632,6 +3679,7 @@ mod tests {
                 id,
                 result,
                 is_error,
+                ..
             } => {
                 assert_eq!(id, "tool-3");
                 assert!(result.is_array());
@@ -4053,6 +4101,7 @@ mod tests {
                     id: "tu_1".into(),
                     tool: "list_plans".into(),
                     input: serde_json::json!({"status": "in_progress"}),
+                    parent_tool_use_id: None,
                 })
                 .unwrap(),
                 created_at: chrono::Utc::now(),
@@ -4066,6 +4115,7 @@ mod tests {
                     id: "tu_1".into(),
                     result: serde_json::json!({"plans": []}),
                     is_error: false,
+                    parent_tool_use_id: None,
                 })
                 .unwrap(),
                 created_at: chrono::Utc::now(),
@@ -4077,6 +4127,7 @@ mod tests {
                 event_type: "assistant_text".into(),
                 data: serde_json::to_string(&ChatEvent::AssistantText {
                     content: "You have no in-progress plans.".into(),
+                    parent_tool_use_id: None,
                 })
                 .unwrap(),
                 created_at: chrono::Utc::now(),
@@ -4106,7 +4157,9 @@ mod tests {
         // Verify tool_use data is intact
         let tool_use: ChatEvent = serde_json::from_str(&page.events[1].data).unwrap();
         match tool_use {
-            ChatEvent::ToolUse { id, tool, input } => {
+            ChatEvent::ToolUse {
+                id, tool, input, ..
+            } => {
                 assert_eq!(id, "tu_1");
                 assert_eq!(tool, "list_plans");
                 assert_eq!(input, serde_json::json!({"status": "in_progress"}));
@@ -4143,6 +4196,7 @@ mod tests {
                 event_type: "assistant_text".into(),
                 data: serde_json::to_string(&ChatEvent::AssistantText {
                     content: format!("Message {}", i),
+                    parent_tool_use_id: None,
                 })
                 .unwrap(),
                 created_at: chrono::Utc::now(),
@@ -4429,11 +4483,13 @@ mod tests {
                 id: "t1".into(),
                 tool: "list_plans".into(),
                 input: serde_json::json!({}),
+                parent_tool_use_id: None,
             },
             ChatEvent::ToolResult {
                 id: "t1".into(),
                 result: serde_json::json!({"plans": []}),
                 is_error: false,
+                parent_tool_use_id: None,
             },
         ];
 
@@ -4534,6 +4590,7 @@ mod tests {
         let events_to_exclude = vec![
             ChatEvent::StreamDelta {
                 text: "Hello".into(),
+                parent_tool_use_id: None,
             },
             ChatEvent::StreamingStatus { is_streaming: true },
             ChatEvent::StreamingStatus {
@@ -4541,6 +4598,7 @@ mod tests {
             },
             ChatEvent::AssistantText {
                 content: "Hello world".into(),
+                parent_tool_use_id: None,
             },
         ];
 
@@ -4569,26 +4627,32 @@ mod tests {
                 id: "t1".into(),
                 tool: "create_plan".into(),
                 input: serde_json::json!({"title": "Plan"}),
+                parent_tool_use_id: None,
             },
             ChatEvent::ToolResult {
                 id: "t1".into(),
                 result: serde_json::json!({"id": "abc"}),
                 is_error: false,
+                parent_tool_use_id: None,
             },
             ChatEvent::Thinking {
                 content: "Let me think...".into(),
+                parent_tool_use_id: None,
             },
             ChatEvent::PermissionRequest {
                 id: "p1".into(),
                 tool: "bash".into(),
                 input: serde_json::json!({"command": "ls"}),
+                parent_tool_use_id: None,
             },
             ChatEvent::InputRequest {
                 prompt: "Choose:".into(),
                 options: Some(vec!["A".into(), "B".into()]),
+                parent_tool_use_id: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
+                parent_tool_use_id: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -4636,6 +4700,7 @@ mod tests {
             .await
             .push(ChatEvent::Thinking {
                 content: "test".into(),
+                parent_tool_use_id: None,
             });
         assert_eq!(session.streaming_events.lock().await.len(), 1);
 
