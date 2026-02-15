@@ -140,8 +140,10 @@ fn public_routes() -> Router<OrchestratorState> {
         )
         // Token refresh (public — reads cookie, not Bearer. Allows refresh with expired JWT)
         .route("/auth/refresh", post(auth_handlers::refresh_token))
+        // Logout (public — revokes refresh token cookie, works with expired JWT)
+        .route("/auth/logout", post(auth_handlers::logout))
         // ================================================================
-        // WebSocket (public — auth via first application message)
+        // WebSocket (public — auth via cookie or first application message)
         // ================================================================
         .route("/ws/events", get(ws_handlers::ws_events))
         .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
