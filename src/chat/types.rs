@@ -181,6 +181,66 @@ impl ChatEvent {
             ChatEvent::SystemInit { .. } => "system_init",
         }
     }
+
+    /// Generate a fingerprint string for dedup during mid-stream join.
+    ///
+    /// Events with unique IDs (ToolUse, ToolResult, PermissionRequest, etc.) use
+    /// the ID as fingerprint. Events without IDs (Thinking, AssistantText) use
+    /// a hash of their content. Returns `None` for StreamDelta/StreamingStatus
+    /// (these are never in the snapshot and never need dedup).
+    pub fn fingerprint(&self) -> Option<String> {
+        match self {
+            // Events with unique IDs — use type+id
+            ChatEvent::ToolUse { id, .. } => Some(format!("tool_use:{}", id)),
+            ChatEvent::ToolResult { id, .. } => Some(format!("tool_result:{}", id)),
+            ChatEvent::ToolUseInputResolved { id, .. } => {
+                Some(format!("tool_use_input_resolved:{}", id))
+            }
+            ChatEvent::PermissionRequest { id, .. } => Some(format!("permission_request:{}", id)),
+            ChatEvent::PermissionDecision { id, .. } => Some(format!("permission_decision:{}", id)),
+            ChatEvent::SystemInit { cli_session_id, .. } => {
+                Some(format!("system_init:{}", cli_session_id))
+            }
+
+            // Events without unique IDs — use type + content hash
+            ChatEvent::Thinking { content, .. } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                Some(format!("thinking:{}", hasher.finish()))
+            }
+            ChatEvent::AssistantText { content, .. } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                Some(format!("assistant_text:{}", hasher.finish()))
+            }
+            ChatEvent::UserMessage { content } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                Some(format!("user_message:{}", hasher.finish()))
+            }
+            ChatEvent::Error { message, .. } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                message.hash(&mut hasher);
+                Some(format!("error:{}", hasher.finish()))
+            }
+            ChatEvent::Result { session_id, .. } => Some(format!("result:{}", session_id)),
+            ChatEvent::InputRequest { prompt, .. } => Some(format!("input_request:{}", prompt)),
+            ChatEvent::PermissionModeChanged { mode } => {
+                Some(format!("permission_mode_changed:{}", mode))
+            }
+            ChatEvent::ModelChanged { model } => Some(format!("model_changed:{}", model)),
+            ChatEvent::CompactBoundary { trigger, .. } => {
+                Some(format!("compact_boundary:{}", trigger))
+            }
+
+            // StreamDelta and StreamingStatus are never in the snapshot
+            ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. } => None,
+        }
+    }
 }
 
 /// Paginated list of chat events (returned by get_session_messages)
