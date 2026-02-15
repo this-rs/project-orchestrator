@@ -1511,12 +1511,19 @@ impl ChatManager {
                 }
             };
 
+            // Track the current parent_tool_use_id from stream events.
+            // When a sub-agent is active, its stream Messages carry parent_tool_use_id.
+            // We capture this so permission requests (which arrive via a separate control
+            // channel without parent info) can be attributed to the correct agent.
+            let mut current_parent_tool_use_id: Option<String> = None;
+
             // Helper closure: process an SDK control message (permission request).
             // Returns Some(ChatEvent) if a permission_request was parsed, None otherwise.
             // The caller is responsible for adding the event to streaming_events (async).
             let handle_control_msg = |control_msg: serde_json::Value,
                                       events_to_persist: &mut Vec<ChatEventRecord>,
-                                      next_seq: &std::sync::atomic::AtomicI64|
+                                      next_seq: &std::sync::atomic::AtomicI64,
+                                      current_parent: Option<String>|
              -> Option<ChatEvent> {
                 // Extract the request data (may be nested under "request")
                 let request_data = if control_msg.get("request").is_some() {
@@ -1559,7 +1566,7 @@ impl ChatManager {
                         id: request_id,
                         tool: tool_name,
                         input,
-                        parent_tool_use_id: None,
+                        parent_tool_use_id: current_parent,
                     };
 
                     // Persist the permission_request event
@@ -1614,7 +1621,7 @@ impl ChatManager {
                         control_msg = rx.recv() => {
                             match control_msg {
                                 Some(msg) => {
-                                    if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq) {
+                                    if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                         streaming_events.lock().await.push(evt);
                                     }
                                     continue; // Go back to select! for next event
@@ -1632,7 +1639,7 @@ impl ChatManager {
                                 Some(result) => {
                                     // Also drain any buffered control messages
                                     while let Ok(msg) = rx.try_recv() {
-                                        if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq) {
+                                        if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                             streaming_events.lock().await.push(evt);
                                         }
                                     }
@@ -1652,6 +1659,14 @@ impl ChatManager {
 
                 match result {
                     Ok(ref msg) => {
+                        // Track the current parent_tool_use_id from every stream message.
+                        // This is used by handle_control_msg to attribute permission
+                        // requests to the correct sub-agent. We update on every message
+                        // (including top-level ones where parent is None) so the tracker
+                        // resets correctly when switching between agents.
+                        current_parent_tool_use_id =
+                            msg.parent_tool_use_id().map(|s| s.to_string());
+
                         // Handle StreamEvent — emit StreamDelta for text tokens directly
                         // stream_delta are NOT persisted (too many writes)
                         if let Message::StreamEvent {
