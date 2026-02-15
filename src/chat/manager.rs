@@ -1051,12 +1051,20 @@ impl ChatManager {
                 session_id,
                 duration_ms,
                 total_cost_usd,
+                subtype,
+                is_error,
+                num_turns,
+                result,
                 ..
             } => {
                 vec![ChatEvent::Result {
                     session_id: session_id.clone(),
                     duration_ms: *duration_ms as u64,
                     cost_usd: *total_cost_usd,
+                    subtype: subtype.clone(),
+                    is_error: *is_error,
+                    num_turns: Some(*num_turns),
+                    result_text: result.clone(),
                 }]
             }
             Message::StreamEvent { event, .. } => match event {
@@ -3624,8 +3632,62 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::Result {
-            session_id, duration_ms, cost_usd
-        } if session_id == "cli-abc-123" && *duration_ms == 5000 && *cost_usd == Some(0.15)));
+            session_id, duration_ms, cost_usd, subtype, is_error, num_turns, result_text,
+        } if session_id == "cli-abc-123"
+            && *duration_ms == 5000
+            && *cost_usd == Some(0.15)
+            && subtype == "success"
+            && !is_error
+            && *num_turns == Some(3)
+            && result_text.is_none()
+        ));
+    }
+
+    #[test]
+    fn test_message_to_events_result_error_max_turns() {
+        let msg = Message::Result {
+            subtype: "error_max_turns".into(),
+            duration_ms: 8000,
+            duration_api_ms: 7500,
+            is_error: true,
+            num_turns: 15,
+            session_id: "cli-max-turns".into(),
+            total_cost_usd: Some(0.50),
+            usage: None,
+            result: None,
+            structured_output: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ChatEvent::Result {
+            subtype, is_error, num_turns, ..
+        } if subtype == "error_max_turns" && *is_error && *num_turns == Some(15)));
+    }
+
+    #[test]
+    fn test_message_to_events_result_error_during_execution() {
+        let msg = Message::Result {
+            subtype: "error_during_execution".into(),
+            duration_ms: 2000,
+            duration_api_ms: 1800,
+            is_error: true,
+            num_turns: 1,
+            session_id: "cli-exec-err".into(),
+            total_cost_usd: Some(0.02),
+            usage: None,
+            result: Some("Process exited with code 1".into()),
+            structured_output: None,
+        };
+
+        let events = ChatManager::message_to_events(&msg);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ChatEvent::Result {
+            subtype, is_error, result_text, ..
+        } if subtype == "error_during_execution"
+            && *is_error
+            && result_text.as_deref() == Some("Process exited with code 1")
+        ));
     }
 
     #[test]
@@ -4884,6 +4946,10 @@ mod tests {
                 session_id: "cli-123".into(),
                 duration_ms: 5000,
                 cost_usd: Some(0.15),
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
             },
             ChatEvent::UserMessage {
                 content: "Hello".into(),

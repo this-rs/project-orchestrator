@@ -3542,6 +3542,7 @@ impl ToolHandler {
                     session_id: sid,
                     duration_ms: dur,
                     cost_usd: cost,
+                    ..
                 } => {
                     result_session_id = sid;
                     duration_ms = dur;

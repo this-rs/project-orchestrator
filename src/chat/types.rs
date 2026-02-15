@@ -91,6 +91,18 @@ pub enum ChatEvent {
         duration_ms: u64,
         #[serde(default)]
         cost_usd: Option<f64>,
+        /// Result subtype: "success", "error_max_turns", "error_during_execution"
+        #[serde(default)]
+        subtype: String,
+        /// Whether the result indicates an error
+        #[serde(default)]
+        is_error: bool,
+        /// Number of turns in the conversation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        num_turns: Option<i32>,
+        /// Result text or error message
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_text: Option<String>,
     },
     /// Streaming text delta (real-time token)
     StreamDelta {
@@ -375,7 +387,11 @@ mod tests {
             ChatEvent::Result {
                 session_id: "".into(),
                 duration_ms: 0,
-                cost_usd: None
+                cost_usd: None,
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
             }
             .event_type(),
             "result"
@@ -449,11 +465,28 @@ mod tests {
                 session_id: "cli-123".into(),
                 duration_ms: 5000,
                 cost_usd: Some(0.15),
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: Some(3),
+                result_text: None,
             },
             ChatEvent::Result {
                 session_id: "cli-456".into(),
                 duration_ms: 1000,
                 cost_usd: None,
+                subtype: "error_max_turns".into(),
+                is_error: true,
+                num_turns: Some(15),
+                result_text: None,
+            },
+            ChatEvent::Result {
+                session_id: "cli-789".into(),
+                duration_ms: 2000,
+                cost_usd: Some(0.05),
+                subtype: "error_during_execution".into(),
+                is_error: true,
+                num_turns: Some(1),
+                result_text: Some("CLI crashed unexpectedly".into()),
             },
             ChatEvent::StreamDelta {
                 text: "Hello".into(),
