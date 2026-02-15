@@ -146,7 +146,7 @@ async fn handle_ws_chat(
         .unwrap_or_default();
 
     // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
-    // NATS events don't carry seq numbers, so active dedup uses snapshot_dedup_active flag instead.
+    // NATS events don't carry seq numbers, so active dedup uses snapshot_skip_remaining counter instead.
     // Kept for future use if NATS events get seq headers.
     let mut _max_replayed_seq: i64 = last_event;
 
@@ -395,12 +395,14 @@ async fn handle_ws_chat(
         }
     }
 
-    // Dedup flag: if we sent a streaming snapshot, structured events that arrive
-    // via the broadcast receiver or NATS are duplicates of what we just sent.
-    // We skip them until the current stream ends (Result event clears this flag).
-    // StreamDelta events are NEVER skipped — they're not in the snapshot and are
-    // the real-time text tokens the client needs.
-    let mut snapshot_dedup_active = is_currently_streaming && !streaming_events.is_empty();
+    // Dedup counter: when we sent a streaming snapshot (Phase 1.5b), the first N
+    // structured events from the broadcast/NATS receiver are duplicates of what
+    // we just sent (where N = number of events in the snapshot). We skip exactly
+    // those N events, then forward everything after — those are genuinely new
+    // events that occurred after the snapshot was taken.
+    // StreamDelta and StreamingStatus are NEVER counted (not in the snapshot).
+    let mut snapshot_skip_remaining: usize =
+        if is_currently_streaming { streaming_events.len() } else { 0 };
 
     // Send replay_complete marker
     let replay_complete = serde_json::json!({ "type": "replay_complete" });
@@ -431,14 +433,15 @@ async fn handle_ws_chat(
     //
     // NOTE: Snapshot dedup strategy (updated 2026-02-15):
     //
-    // When a client joins mid-stream, Phase 1.5b sends a snapshot of accumulated
+    // When a client joins mid-stream, Phase 1.5b sends a snapshot of N accumulated
     // structured events. Since the broadcast/NATS subscription was created BEFORE
     // the snapshot (Phase 1.5a), the receiver may also contain those same structured
     // events. Without dedup, they would appear twice in the frontend.
     //
-    // The `snapshot_dedup_active` flag filters structured events (tool_use,
-    // tool_result, assistant_text, etc.) from BOTH the local broadcast and NATS
-    // branches until a Result event arrives (stream ends).
+    // The `snapshot_skip_remaining` counter tracks how many structured events to
+    // skip (initialized to N = snapshot event count). Each structured event from
+    // broadcast/NATS decrements the counter. Once it reaches 0, all subsequent
+    // events are genuinely new and are forwarded normally.
     // StreamDelta tokens always pass through — they're never in the snapshot.
     macro_rules! send_chat_event {
         ($event:expr, $ws:expr) => {{
@@ -481,20 +484,22 @@ async fn handle_ws_chat(
                 match event {
                     Ok(chat_event) => {
                         // --- Snapshot dedup (local broadcast) ---
-                        // After a mid-stream join, the broadcast receiver may deliver
-                        // structured events that were already sent in the Phase 1.5b
-                        // snapshot. Skip them to avoid duplicates in the frontend.
+                        // After a mid-stream join, the first N structured events from
+                        // the broadcast are duplicates of the Phase 1.5b snapshot.
+                        // We skip exactly N, then forward all subsequent events.
                         // StreamDelta and StreamingStatus always pass through (not in snapshot).
-                        if snapshot_dedup_active {
+                        if snapshot_skip_remaining > 0 {
                             match &chat_event {
                                 crate::chat::types::ChatEvent::StreamDelta { .. }
                                 | crate::chat::types::ChatEvent::StreamingStatus { .. } => {}
                                 crate::chat::types::ChatEvent::Result { .. } => {
-                                    snapshot_dedup_active = false;
+                                    snapshot_skip_remaining = 0;
                                 }
                                 _ => {
+                                    snapshot_skip_remaining -= 1;
                                     debug!(
                                         event_type = %chat_event.event_type(),
+                                        remaining = snapshot_skip_remaining,
                                         "Skipping broadcast event (already sent in snapshot)"
                                     );
                                     continue;
@@ -540,23 +545,23 @@ async fn handle_ws_chat(
                         match serde_json::from_slice::<crate::chat::types::ChatEvent>(&msg.payload) {
                             Ok(chat_event) => {
                                 // --- Cross-instance dedup ---
-                                // 1. Snapshot dedup: if we sent a Phase 1.5 snapshot, structured
-                                //    events from the same stream arrive again via NATS — skip them.
-                                //    StreamDelta and StreamingStatus are NEVER in the snapshot, so
-                                //    they always pass through (no content-based dedup needed).
-                                if snapshot_dedup_active {
+                                // Skip the first N structured events (duplicates of snapshot).
+                                // StreamDelta and StreamingStatus always pass through.
+                                if snapshot_skip_remaining > 0 {
                                     match &chat_event {
                                         // Always forward stream tokens — these are real-time
                                         crate::chat::types::ChatEvent::StreamDelta { .. }
                                         | crate::chat::types::ChatEvent::StreamingStatus { .. } => {}
-                                        // Result marks end of stream — forward it and clear dedup
+                                        // Result marks end of stream — clear counter and forward
                                         crate::chat::types::ChatEvent::Result { .. } => {
-                                            snapshot_dedup_active = false;
+                                            snapshot_skip_remaining = 0;
                                         }
-                                        // All other structured events were already in the snapshot
+                                        // Structured event duplicate — skip and decrement counter
                                         _ => {
+                                            snapshot_skip_remaining -= 1;
                                             debug!(
                                                 event_type = %chat_event.event_type(),
+                                                remaining = snapshot_skip_remaining,
                                                 "Skipping NATS event (already sent in snapshot)"
                                             );
                                             continue;
