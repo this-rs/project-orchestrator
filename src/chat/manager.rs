@@ -1510,12 +1510,16 @@ impl ChatManager {
         // Get a handle to the session's pending permission inputs map so we can
         // store the original tool input when a permission request arrives.
         // send_permission_response() reads from this same Arc to retrieve the input.
-        let pending_perm_inputs: Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>> = {
+        let pending_perm_inputs: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+        > = {
             let guard = active_sessions.read().await;
             guard
                 .get(&session_id)
                 .map(|s| s.pending_permission_inputs.clone())
-                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())))
+                .unwrap_or_else(|| {
+                    Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+                })
         };
 
         {
@@ -1564,10 +1568,12 @@ impl ChatManager {
                                       next_seq: &std::sync::atomic::AtomicI64,
                                       current_parent: Option<String>|
              -> Option<ChatEvent> {
-                let perm_event =
-                    parse_permission_control_msg(&control_msg, current_parent)?;
+                let perm_event = parse_permission_control_msg(&control_msg, current_parent)?;
 
-                if let ChatEvent::PermissionRequest { ref id, ref tool, .. } = perm_event {
+                if let ChatEvent::PermissionRequest {
+                    ref id, ref tool, ..
+                } = perm_event
+                {
                     info!(
                         session_id = %session_id,
                         tool = %tool,
@@ -2283,22 +2289,25 @@ impl ChatManager {
         request_id: &str,
         allow: bool,
     ) -> Result<()> {
-        let (stdin_tx, pending_perm_inputs) = {
+        let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
             session.last_activity = Instant::now();
-            let tx = session
-                .stdin_tx
-                .clone()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "No stdin sender for session {} (CLI may not be connected)",
-                        session_id
-                    )
-                })?;
-            (tx, session.pending_permission_inputs.clone())
+            let tx = session.stdin_tx.clone().ok_or_else(|| {
+                anyhow!(
+                    "No stdin sender for session {} (CLI may not be connected)",
+                    session_id
+                )
+            })?;
+            (
+                tx,
+                session.pending_permission_inputs.clone(),
+                session.events_tx.clone(),
+                uuid::Uuid::parse_str(session_id).ok(),
+                session.next_seq.clone(),
+            )
         };
 
         // Retrieve the original tool input stored when the permission_request arrived.
@@ -2349,6 +2358,39 @@ impl ChatManager {
             .send(json)
             .await
             .map_err(|e| anyhow!("Failed to send permission control response: {}", e))?;
+
+        // Persist and broadcast the permission decision so it survives session reload.
+        let decision_event = ChatEvent::PermissionDecision {
+            id: request_id.to_string(),
+            allow,
+        };
+
+        // Broadcast to all connected WebSocket clients
+        let _ = events_tx.send(decision_event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, decision_event.clone());
+        }
+
+        // Persist to Neo4j
+        if let Some(uuid) = session_uuid {
+            let seq = next_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let record = crate::neo4j::models::ChatEventRecord {
+                id: uuid::Uuid::new_v4(),
+                session_id: uuid,
+                seq,
+                event_type: "permission_decision".to_string(),
+                data: serde_json::to_string(&decision_event).unwrap_or_default(),
+                created_at: chrono::Utc::now(),
+            };
+            if let Err(e) = self.graph.store_chat_events(uuid, vec![record]).await {
+                warn!(
+                    session_id = %session_id,
+                    request_id = %request_id,
+                    error = %e,
+                    "Failed to persist permission_decision event"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -5466,7 +5508,10 @@ mod tests {
     /// Does NOT require the Claude CLI to be installed.
     fn mock_active_session(
         is_streaming: bool,
-    ) -> (ActiveSession, nexus_claude::transport::mock::MockTransportHandle) {
+    ) -> (
+        ActiveSession,
+        nexus_claude::transport::mock::MockTransportHandle,
+    ) {
         let (transport, handle) = nexus_claude::transport::mock::MockTransport::pair();
         let client = InteractiveClient::from_transport(transport);
         let (tx, _rx) = broadcast::channel(16);
@@ -5540,8 +5585,7 @@ mod tests {
             }
         });
 
-        let event =
-            parse_permission_control_msg(&msg, Some("toolu_parent_123".to_string()));
+        let event = parse_permission_control_msg(&msg, Some("toolu_parent_123".to_string()));
         assert!(event.is_some());
 
         match event.unwrap() {
@@ -5554,10 +5598,7 @@ mod tests {
                 assert_eq!(id, "req_xyz");
                 assert_eq!(tool, "Read");
                 assert_eq!(input["file_path"], "/tmp/test.rs");
-                assert_eq!(
-                    parent_tool_use_id.as_deref(),
-                    Some("toolu_parent_123")
-                );
+                assert_eq!(parent_tool_use_id.as_deref(), Some("toolu_parent_123"));
             }
             other => panic!("expected PermissionRequest, got: {:?}", other),
         }
@@ -5593,7 +5634,9 @@ mod tests {
         assert!(event.is_some(), "flat format should parse");
 
         match event.unwrap() {
-            ChatEvent::PermissionRequest { id, tool, input, .. } => {
+            ChatEvent::PermissionRequest {
+                id, tool, input, ..
+            } => {
                 assert_eq!(id, "flat_001");
                 assert_eq!(tool, "Write");
                 assert_eq!(input["content"], "hello");
@@ -5615,10 +5658,16 @@ mod tests {
         assert!(event.is_some());
 
         match event.unwrap() {
-            ChatEvent::PermissionRequest { id, tool, input, .. } => {
+            ChatEvent::PermissionRequest {
+                id, tool, input, ..
+            } => {
                 assert_eq!(id, "", "missing request_id defaults to empty");
                 assert_eq!(tool, "unknown", "missing tool defaults to 'unknown'");
-                assert_eq!(input, serde_json::json!({}), "missing input defaults to empty object");
+                assert_eq!(
+                    input,
+                    serde_json::json!({}),
+                    "missing input defaults to empty object"
+                );
             }
             other => panic!("expected PermissionRequest, got: {:?}", other),
         }
@@ -5990,7 +6039,10 @@ mod tests {
             "inner response should contain behavior: deny"
         );
         assert!(
-            inner_response["message"].as_str().unwrap().contains("denied"),
+            inner_response["message"]
+                .as_str()
+                .unwrap()
+                .contains("denied"),
             "inner response should contain a denial message"
         );
     }
