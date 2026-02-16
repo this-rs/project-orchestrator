@@ -982,6 +982,7 @@ impl ChatManager {
         system_prompt: &str,
         resume_id: Option<&str>,
         permission_mode_override: Option<&str>,
+        hooks: Option<std::collections::HashMap<String, Vec<nexus_claude::HookMatcher>>>,
     ) -> ClaudeCodeOptions {
         // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
         let cwd = expand_tilde(cwd);
@@ -1041,6 +1042,10 @@ impl ChatManager {
 
         if let Some(id) = resume_id {
             builder = builder.resume(id);
+        }
+
+        if let Some(hook_map) = hooks {
+            builder = builder.hooks(hook_map);
         }
 
         builder.build()
@@ -1296,6 +1301,23 @@ impl ChatManager {
             .await
             .context("Failed to persist chat session")?;
 
+        // Create broadcast channel early so CompactionNotifier can use the sender
+        let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+
+        // Build PreCompact hook → CompactionNotifier broadcasts ChatEvent::CompactionStarted
+        let compaction_hooks = {
+            let notifier = CompactionNotifier::new(events_tx.clone());
+            let mut hooks = std::collections::HashMap::new();
+            hooks.insert(
+                "PreCompact".to_string(),
+                vec![nexus_claude::HookMatcher {
+                    matcher: None,
+                    hooks: vec![std::sync::Arc::new(notifier)],
+                }],
+            );
+            hooks
+        };
+
         // Build options and create InteractiveClient
         let options = self
             .build_options(
@@ -1304,6 +1326,7 @@ impl ChatManager {
                 &system_prompt,
                 None,
                 request.permission_mode.as_deref(),
+                Some(compaction_hooks),
             )
             .await;
         let mut client = InteractiveClient::new(options)
@@ -1362,8 +1385,6 @@ impl ChatManager {
             model
         );
 
-        // Create broadcast channel
-        let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let client = Arc::new(Mutex::new(client));
 
         // Initialize next_seq (new session = start at 1)
@@ -2725,6 +2746,24 @@ impl ChatManager {
         let system_prompt = self
             .build_system_prompt(session_node.project_slug.as_deref(), message)
             .await;
+
+        // Create broadcast channel early so CompactionNotifier can use the sender
+        let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+
+        // Build PreCompact hook → CompactionNotifier broadcasts ChatEvent::CompactionStarted
+        let compaction_hooks = {
+            let notifier = CompactionNotifier::new(events_tx.clone());
+            let mut hooks = std::collections::HashMap::new();
+            hooks.insert(
+                "PreCompact".to_string(),
+                vec![nexus_claude::HookMatcher {
+                    matcher: None,
+                    hooks: vec![std::sync::Arc::new(notifier)],
+                }],
+            );
+            hooks
+        };
+
         let options = self
             .build_options(
                 &session_node.cwd,
@@ -2732,6 +2771,7 @@ impl ChatManager {
                 &system_prompt,
                 cli_session_id,
                 session_node.permission_mode.as_deref(),
+                Some(compaction_hooks),
             )
             .await;
 
@@ -2751,8 +2791,6 @@ impl ChatManager {
         // Clone stdin sender for lock-free permission responses (see create_session).
         let stdin_tx = client.clone_stdin_sender().await;
 
-        // Create broadcast channel
-        let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let client = Arc::new(Mutex::new(client));
 
         // Re-create ConversationMemoryManager for resumed session
@@ -3483,7 +3521,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None)
+            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None, None)
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
         assert!(opts.allowed_tools.is_empty());
@@ -3502,7 +3540,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None)
+            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None, None)
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
         assert_eq!(opts.allowed_tools, vec!["Bash(git *)", "Read"]);
@@ -3522,6 +3560,7 @@ mod tests {
                 "prompt",
                 None,
                 Some("bypassPermissions"),
+                None,
             )
             .await;
         assert!(matches!(
@@ -3531,7 +3570,7 @@ mod tests {
 
         // Without override, falls back to global (Default)
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None)
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
     }
@@ -3590,7 +3629,7 @@ mod tests {
 
         // Initially Default (safe-by-default)
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None)
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
 
@@ -3606,7 +3645,7 @@ mod tests {
 
         // New build_options should reflect the update
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None)
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None)
             .await;
         assert!(matches!(
             opts.permission_mode,
@@ -3669,6 +3708,7 @@ mod tests {
                 "System prompt here",
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -3690,6 +3730,7 @@ mod tests {
                 "System prompt",
                 Some("cli-session-abc"),
                 None,
+                None,
             )
             .await;
 
@@ -3703,7 +3744,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         let options = manager
-            .build_options("/tmp", "model", "prompt", None, None)
+            .build_options("/tmp", "model", "prompt", None, None, None)
             .await;
 
         let mcp = options.mcp_servers.get("project-orchestrator").unwrap();
@@ -3719,6 +3760,48 @@ mod tests {
             }
             _ => panic!("Expected Stdio MCP config"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_build_options_with_hooks() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // Build hooks map with a CompactionNotifier
+        let (tx, _rx) = broadcast::channel::<ChatEvent>(16);
+        let notifier = CompactionNotifier::new(tx);
+        let mut hooks = std::collections::HashMap::new();
+        hooks.insert(
+            "PreCompact".to_string(),
+            vec![nexus_claude::HookMatcher {
+                matcher: None,
+                hooks: vec![std::sync::Arc::new(notifier)],
+            }],
+        );
+
+        let opts = manager
+            .build_options("/tmp", "model", "prompt", None, None, Some(hooks))
+            .await;
+
+        // Hooks should be configured
+        let hook_map = opts.hooks.as_ref().expect("hooks should be Some");
+        assert!(hook_map.contains_key("PreCompact"));
+        let matchers = &hook_map["PreCompact"];
+        assert_eq!(matchers.len(), 1);
+        assert_eq!(matchers[0].hooks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_build_options_without_hooks() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let opts = manager
+            .build_options("/tmp", "model", "prompt", None, None, None)
+            .await;
+
+        // No hooks configured
+        assert!(opts.hooks.is_none());
     }
 
     // ====================================================================
