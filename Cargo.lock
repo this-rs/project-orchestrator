@@ -1756,7 +1756,6 @@ dependencies = [
 [[package]]
 name = "nexus-claude"
 version = "0.5.0"
-source = "git+https://github.com/this-rs/nexus.git?branch=feat%2Fclone-stdin-sender#83bd6e6b4c13da0457f40ccb1c05a350ad350e56"
 dependencies = [
  "async-stream",
  "async-trait",

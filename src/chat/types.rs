@@ -657,9 +657,7 @@ mod tests {
         // CompactionStarted with auto trigger
         let json = r#"{"type":"compaction_started","trigger":"auto"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert!(
-            matches!(event, ChatEvent::CompactionStarted { ref trigger } if trigger == "auto")
-        );
+        assert!(matches!(event, ChatEvent::CompactionStarted { ref trigger } if trigger == "auto"));
         assert_eq!(event.event_type(), "compaction_started");
         assert_eq!(
             event.fingerprint(),
