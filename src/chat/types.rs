@@ -77,6 +77,23 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
+    /// Claude Code called the AskUserQuestion tool — display the interactive
+    /// question widget instead of a permission approval dialog.
+    /// The `id` is the SDK control request_id (used for auto-allow response).
+    /// The `tool_call_id` is the tool_use ID (used by the frontend to send the
+    /// tool_result response back).
+    AskUserQuestion {
+        /// SDK control request ID (auto-responded with allow)
+        id: String,
+        /// tool_use call ID for sending the tool_result
+        tool_call_id: String,
+        /// The questions array from the tool input
+        questions: serde_json::Value,
+        /// Full tool input (for reference)
+        input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Claude is waiting for user input
     InputRequest {
         prompt: String,
@@ -174,6 +191,7 @@ impl ChatEvent {
             ChatEvent::ToolResult { .. } => "tool_result",
             ChatEvent::ToolUseInputResolved { .. } => "tool_use_input_resolved",
             ChatEvent::PermissionRequest { .. } => "permission_request",
+            ChatEvent::AskUserQuestion { .. } => "ask_user_question",
             ChatEvent::InputRequest { .. } => "input_request",
             ChatEvent::Result { .. } => "result",
             ChatEvent::StreamDelta { .. } => "stream_delta",
@@ -203,6 +221,7 @@ impl ChatEvent {
                 Some(format!("tool_use_input_resolved:{}", id))
             }
             ChatEvent::PermissionRequest { id, .. } => Some(format!("permission_request:{}", id)),
+            ChatEvent::AskUserQuestion { id, .. } => Some(format!("ask_user_question:{}", id)),
             ChatEvent::PermissionDecision { id, .. } => Some(format!("permission_decision:{}", id)),
             ChatEvent::SystemInit { cli_session_id, .. } => {
                 Some(format!("system_init:{}", cli_session_id))
