@@ -12,10 +12,17 @@ use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Tauri command: get the server port for the frontend to connect to
+/// Actual backend port — written once at startup from the config, read by
+/// `get_server_port` Tauri command. Defaults to `DEFAULT_DESKTOP_PORT` (6600)
+/// until the config is loaded.
+static BACKEND_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(setup::DEFAULT_DESKTOP_PORT);
+
+/// Tauri command: get the server port for the frontend to connect to.
+/// Returns the real port from config.yaml (not necessarily 6600).
 #[tauri::command]
 fn get_server_port() -> u16 {
-    setup::DEFAULT_DESKTOP_PORT
+    BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Tauri command: check backend health and return the full `/health` response.
@@ -82,6 +89,18 @@ fn restart_app(app: tauri::AppHandle) {
     app.restart();
 }
 
+/// Tauri command: receive a webview console.log/error/warn and forward it to
+/// the tracing backend so it's visible in the terminal (release builds strip
+/// the webview inspector on macOS).
+#[tauri::command]
+fn webview_log(level: String, message: String) {
+    match level.as_str() {
+        "error" => tracing::error!(target: "webview", "{}", message),
+        "warn" => tracing::warn!(target: "webview", "{}", message),
+        _ => tracing::info!(target: "webview", "{}", message),
+    }
+}
+
 fn main() {
     // Initialize tracing
     tracing_subscriber::registry()
@@ -106,6 +125,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_websocket::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(docker_manager)
         .invoke_handler(tauri::generate_handler![
@@ -114,6 +134,7 @@ fn main() {
             open_url,
             pick_directory,
             restart_app,
+            webview_log,
             // Splash screen dependency checks
             setup::check_dependencies,
             // Setup wizard commands
@@ -197,6 +218,44 @@ fn main() {
             .center()
             .visible(false)
             .decorations(false)
+            // Inject console → tracing bridge as an initialization script.
+            // This runs after __TAURI_INTERNALS__ is created but before HTML
+            // is parsed, guaranteeing the bridge is in place before any
+            // application JS (React, eventBus, wsAdapter) executes.
+            .initialization_script(r#"
+                (function() {
+                    // 1. Block Cmd/Ctrl +/-/0 zoom shortcuts
+                    document.addEventListener('keydown', function(e) {
+                        if ((e.metaKey || e.ctrlKey) && (e.key === '+' || e.key === '-' || e.key === '=' || e.key === '0')) {
+                            e.preventDefault();
+                        }
+                    }, true);
+
+                    // 2. Bridge console → Tauri tracing
+                    var ti = window.__TAURI_INTERNALS__;
+                    if (ti && ti.invoke) {
+                        var origLog = console.log;
+                        var origError = console.error;
+                        var origWarn = console.warn;
+                        function fwd(level, args) {
+                            try {
+                                var parts = [];
+                                for (var i = 0; i < args.length; i++) {
+                                    var a = args[i];
+                                    parts.push(typeof a === 'string' ? a : JSON.stringify(a));
+                                }
+                                ti.invoke('webview_log', { level: level, message: parts.join(' ') });
+                            } catch(e) {}
+                        }
+                        console.log = function() { origLog.apply(console, arguments); fwd('info', arguments); };
+                        console.error = function() { origError.apply(console, arguments); fwd('error', arguments); };
+                        console.warn = function() { origWarn.apply(console, arguments); fwd('warn', arguments); };
+                        origLog.call(console, '[webview-bridge] Console bridge installed via initialization_script');
+                    } else {
+                        console.warn('[webview-bridge] __TAURI_INTERNALS__ not available in initialization_script');
+                    }
+                })();
+            "#)
             // Intercept target="_blank" / window.open() — open in system browser
             // instead of creating a new Tauri window. This handles all <a target="_blank">
             // links in the chat UI (PR links, web search results, etc.).
@@ -234,6 +293,7 @@ fn main() {
                 };
 
                 let port = config.server_port;
+                BACKEND_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
                 let is_configured = config.setup_completed;
 
                 // Read infra_mode from the YAML config (defaults to "docker")
@@ -363,7 +423,7 @@ fn main() {
         } = &event
         {
             if !has_visible_windows {
-                tray::show_main_window(&_app);
+                tray::show_main_window(_app);
             }
         }
 
@@ -399,6 +459,19 @@ fn main() {
 }
 
 /// Close the splash screen and show the main application window.
+///
+/// The main window was initially created with `WebviewUrl::App("index.html")` to
+/// get an instant load while the backend starts. Now that the backend is confirmed
+/// healthy, we navigate the webview to `http://localhost:{port}/` so that all
+/// subsequent requests (REST, WS tickets, OIDC) are **same-origin**.
+///
+/// This is critical for auth: HttpOnly cookies set by `/auth/callback` are scoped
+/// to `localhost` — they are only sent on same-origin requests. From `tauri://`,
+/// `fetch(http://localhost:…)` is cross-origin and `SameSite=Lax` cookies are NOT
+/// sent, which breaks `/auth/refresh` (no cookie → no JWT → no WS ticket → 401).
+///
+/// The `capabilities/remote.json` grants full Tauri IPC permissions (invoke,
+/// event:listen, plugins) on `http://localhost:*` so everything keeps working.
 fn show_main_window(handle: &tauri::AppHandle) {
     // Close splash screen
     if let Some(splash) = handle.get_webview_window("splashscreen") {
@@ -409,6 +482,18 @@ fn show_main_window(handle: &tauri::AppHandle) {
 
     // Show main window
     if let Some(main_window) = handle.get_webview_window("main") {
+        // Navigate to the backend HTTP origin so all requests are same-origin.
+        // The backend serves the SPA (SERVE_FRONTEND=true), so this loads the
+        // exact same React app but from http://localhost:{port}/ instead of
+        // tauri://localhost/index.html.
+        let port = BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed);
+        let http_url = format!("http://localhost:{}/", port);
+        tracing::info!("Navigating main window to {} (same-origin for cookies)", http_url);
+        if let Ok(url) = http_url.parse() {
+            if let Err(e) = main_window.navigate(url) {
+                tracing::error!("Failed to navigate main window to {}: {}", http_url, e);
+            }
+        }
         // On macOS, apply native rounded corners + dark background BEFORE showing
         // the window to avoid any flash of white/square corners.
         // This does the same work as the JS `enableModernWindowStyle()` plugin,
@@ -486,19 +571,9 @@ fn show_main_window(handle: &tauri::AppHandle) {
             });
         }
 
-        // Inject desktop-specific JS before showing the window:
-        // Block Cmd/Ctrl +/-/0 zoom shortcuts to prevent accidental zoom.
-        // (Overscroll bounce and external link handling are managed in the
-        // frontend CSS and React components via @tauri-apps/plugin-shell.)
-        let _ = main_window.eval(r#"
-            (function() {
-                document.addEventListener('keydown', function(e) {
-                    if ((e.metaKey || e.ctrlKey) && (e.key === '+' || e.key === '-' || e.key === '=' || e.key === '0')) {
-                        e.preventDefault();
-                    }
-                }, true);
-            })();
-        "#);
+        // Console bridge + keyboard shortcuts are now injected via
+        // initialization_script() on the WebviewWindowBuilder (runs before
+        // page HTML is parsed, guaranteeing __TAURI_INTERNALS__ is available).
 
         if let Err(e) = main_window.show() {
             tracing::warn!("Failed to show main window: {}", e);

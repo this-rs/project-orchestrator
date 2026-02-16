@@ -1,8 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "Capability for the main window (app protocol)",
-  "windows": ["main", "splashscreen"],
+  "identifier": "remote-backend",
+  "description": "Permissions for the main window when served from the embedded backend (http://localhost:6600). Required because OIDC/SSO callback navigates the webview to http://localhost:{port}/auth/callback, after which the window URL is a remote HTTP origin instead of tauri://localhost. All Tauri IPC (plugin invokes, event listeners) needs explicit remote permission.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://localhost:*", "http://127.0.0.1:*"]
+  },
   "permissions": [
     "core:default",
     "shell:allow-open",

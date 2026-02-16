@@ -827,6 +827,134 @@ pub async fn logout(
         .into_response())
 }
 
+/// POST /auth/ws-ticket — Generate a short-lived, single-use WebSocket auth ticket.
+///
+/// This endpoint is a workaround for WebSocket clients that cannot send cookies
+/// during the WS upgrade request (e.g. WKWebView in Tauri desktop apps, or the
+/// `tauri-plugin-websocket` Rust-native client).
+///
+/// # Auth methods (tried in order)
+/// 1. **Cookie** — `refresh_token` HttpOnly cookie (browser same-origin path)
+/// 2. **Bearer** — `Authorization: Bearer <jwt>` header (Tauri cross-origin path,
+///    where SameSite=Lax cookies are not sent on cross-origin `fetch()` from
+///    `https://tauri.localhost` → `http://localhost:{port}`)
+///
+/// The client obtains a one-time ticket (UUID, 30s TTL) and passes it as
+/// `?ticket=xxx` when opening the WebSocket. The ticket is consumed on validation.
+///
+/// In no-auth mode, returns a ticket with anonymous Claims.
+pub async fn ws_ticket(
+    State(state): State<OrchestratorState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::auth::jwt::Claims;
+
+    let has_cookie = headers.get(axum::http::header::COOKIE).is_some();
+    let has_bearer = headers.get(axum::http::header::AUTHORIZATION).is_some();
+    tracing::info!(
+        has_cookie = has_cookie,
+        has_bearer = has_bearer,
+        "POST /auth/ws-ticket called"
+    );
+
+    // No-auth mode → ticket with anonymous claims
+    let auth_config = match state.auth_config.as_ref() {
+        Some(c) => c,
+        None => {
+            let ticket = state
+                .ws_ticket_store
+                .create_ticket(Claims::anonymous())
+                .await;
+            return Ok(Json(serde_json::json!({ "ticket": ticket })));
+        }
+    };
+
+    // --- Strategy 1: Try cookie (primary — works in same-origin browsers) ---
+    let cookie_claims = try_ws_ticket_via_cookie(&headers, auth_config, &state).await;
+    if let Some(claims) = cookie_claims {
+        let ticket = state.ws_ticket_store.create_ticket(claims).await;
+        return Ok(Json(serde_json::json!({ "ticket": ticket })));
+    }
+
+    // --- Strategy 2: Try Bearer JWT (fallback — Tauri cross-origin) ---
+    let bearer_claims = try_ws_ticket_via_bearer(&headers, auth_config);
+    if let Some(claims) = bearer_claims {
+        tracing::info!(email = %claims.email, "WS ticket issued via Bearer token");
+        let ticket = state.ws_ticket_store.create_ticket(claims).await;
+        return Ok(Json(serde_json::json!({ "ticket": ticket })));
+    }
+
+    // Neither cookie nor bearer
+    Err(AppError::Unauthorized(
+        "No refresh_token cookie or Authorization Bearer — cannot issue WS ticket".to_string(),
+    ))
+}
+
+/// Try to issue a WS ticket using the refresh_token cookie.
+/// Returns Some(Claims) on success, None if no cookie or invalid.
+async fn try_ws_ticket_via_cookie(
+    headers: &axum::http::HeaderMap,
+    auth_config: &crate::AuthConfig,
+    state: &OrchestratorState,
+) -> Option<crate::auth::jwt::Claims> {
+    let raw_token = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(refresh::extract_refresh_token_from_cookie)?;
+
+    let token_hash = refresh::hash_token(&raw_token);
+    let token_node = state
+        .orchestrator
+        .neo4j()
+        .validate_refresh_token(&token_hash)
+        .await
+        .ok()??;
+
+    let (user_id, email, name) = match state
+        .orchestrator
+        .neo4j()
+        .get_user_by_id(token_node.user_id)
+        .await
+        .ok()?
+    {
+        Some(user) => (user.id, user.email, user.name),
+        None => {
+            // Root account fallback
+            let root = auth_config.root_account.as_ref()?;
+            let root_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes());
+            if root_id == token_node.user_id {
+                (root_id, root.email.clone(), root.name.clone())
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    Some(crate::auth::jwt::Claims {
+        sub: user_id.to_string(),
+        email,
+        name,
+        iat: now,
+        exp: now + auth_config.access_token_expiry_secs as i64,
+    })
+}
+
+/// Try to issue a WS ticket using a Bearer JWT from the Authorization header.
+/// Returns Some(Claims) on success, None if no header or invalid JWT.
+fn try_ws_ticket_via_bearer(
+    headers: &axum::http::HeaderMap,
+    auth_config: &crate::AuthConfig,
+) -> Option<crate::auth::jwt::Claims> {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())?;
+
+    let token = auth_header.strip_prefix("Bearer ")?;
+
+    crate::auth::jwt::decode_jwt(token, &auth_config.jwt_secret).ok()
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -892,6 +1020,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
         })
     }
 
