@@ -423,7 +423,7 @@ fn main() {
         } = &event
         {
             if !has_visible_windows {
-                tray::show_main_window(&_app);
+                tray::show_main_window(_app);
             }
         }
 

@@ -2033,12 +2033,15 @@ mod tests {
     fn test_allowed_origins_without_public_url() {
         let state = make_origin_test_state(6600, None, None);
         let origins = state.allowed_origins();
-        assert_eq!(origins, vec![
-            "http://localhost:6600",
-            "http://127.0.0.1:6600",
-            "tauri://localhost",
-            "https://tauri.localhost",
-        ]);
+        assert_eq!(
+            origins,
+            vec![
+                "http://localhost:6600",
+                "http://127.0.0.1:6600",
+                "tauri://localhost",
+                "https://tauri.localhost",
+            ]
+        );
     }
 
     #[test]

@@ -112,12 +112,11 @@ pub async fn ws_chat(
     .await;
 
     Ok(match auth_result {
-        CookieAuthResult::Authenticated(claims) => {
-            ws.on_upgrade(move |socket| {
+        CookieAuthResult::Authenticated(claims) => ws
+            .on_upgrade(move |socket| {
                 handle_ws_chat_preauthed(socket, state, session_id, last_event, claims)
             })
-            .into_response()
-        }
+            .into_response(),
         CookieAuthResult::Invalid(reason) => {
             debug!(reason = %reason, "WS chat: auth rejected");
             StatusCode::UNAUTHORIZED.into_response()

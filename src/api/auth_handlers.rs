@@ -851,7 +851,11 @@ pub async fn ws_ticket(
 
     let has_cookie = headers.get(axum::http::header::COOKIE).is_some();
     let has_bearer = headers.get(axum::http::header::AUTHORIZATION).is_some();
-    tracing::info!(has_cookie = has_cookie, has_bearer = has_bearer, "POST /auth/ws-ticket called");
+    tracing::info!(
+        has_cookie = has_cookie,
+        has_bearer = has_bearer,
+        "POST /auth/ws-ticket called"
+    );
 
     // No-auth mode → ticket with anonymous claims
     let auth_config = match state.auth_config.as_ref() {

@@ -52,6 +52,7 @@ struct WsTicket {
 ///
 /// This works around WKWebView (macOS/iOS) not sending cookies on WebSocket
 /// upgrade requests — a known WebKit limitation since macOS Monterey.
+#[derive(Default)]
 pub struct WsTicketStore {
     tickets: RwLock<HashMap<String, WsTicket>>,
 }
@@ -81,7 +82,10 @@ impl WsTicketStore {
     pub async fn consume_ticket(&self, ticket: &str) -> Option<Claims> {
         let entry = self.tickets.write().await.remove(ticket)?;
         if entry.created_at.elapsed().as_secs() > TICKET_TTL_SECS {
-            debug!("WS ticket expired (age {}s)", entry.created_at.elapsed().as_secs());
+            debug!(
+                "WS ticket expired (age {}s)",
+                entry.created_at.elapsed().as_secs()
+            );
             return None;
         }
         Some(entry.claims)
@@ -329,7 +333,10 @@ mod tests {
         assert!(first.is_some());
 
         let second = store.consume_ticket(&ticket).await;
-        assert!(second.is_none(), "Second consume should return None (single-use)");
+        assert!(
+            second.is_none(),
+            "Second consume should return None (single-use)"
+        );
     }
 
     #[tokio::test]
@@ -351,7 +358,8 @@ mod tests {
                 "expired-ticket".to_string(),
                 WsTicket {
                     claims,
-                    created_at: Instant::now() - std::time::Duration::from_secs(TICKET_TTL_SECS + 10),
+                    created_at: Instant::now()
+                        - std::time::Duration::from_secs(TICKET_TTL_SECS + 10),
                 },
             );
         }
@@ -371,8 +379,14 @@ mod tests {
         let headers = HeaderMap::new();
         let store = empty_store();
 
-        let result =
-            ws_authenticate(&headers, &None, &(mock as Arc<dyn GraphStore>), None, &store).await;
+        let result = ws_authenticate(
+            &headers,
+            &None,
+            &(mock as Arc<dyn GraphStore>),
+            None,
+            &store,
+        )
+        .await;
 
         match result {
             CookieAuthResult::Authenticated(claims) => {
@@ -390,8 +404,14 @@ mod tests {
         let config = Some(test_auth_config());
         let store = empty_store();
 
-        let result =
-            ws_authenticate(&headers, &config, &(mock as Arc<dyn GraphStore>), None, &store).await;
+        let result = ws_authenticate(
+            &headers,
+            &config,
+            &(mock as Arc<dyn GraphStore>),
+            None,
+            &store,
+        )
+        .await;
 
         match result {
             CookieAuthResult::Invalid(reason) => {
@@ -418,8 +438,14 @@ mod tests {
 
         // Cookie header present but no refresh_token → falls through to ticket
         // No ticket either → Invalid
-        let result =
-            ws_authenticate(&headers, &config, &(mock as Arc<dyn GraphStore>), None, &store).await;
+        let result = ws_authenticate(
+            &headers,
+            &config,
+            &(mock as Arc<dyn GraphStore>),
+            None,
+            &store,
+        )
+        .await;
 
         match result {
             CookieAuthResult::Invalid(reason) => {
@@ -440,8 +466,14 @@ mod tests {
         let config = Some(test_auth_config());
         let store = empty_store();
 
-        let result =
-            ws_authenticate(&headers, &config, &(mock as Arc<dyn GraphStore>), None, &store).await;
+        let result = ws_authenticate(
+            &headers,
+            &config,
+            &(mock as Arc<dyn GraphStore>),
+            None,
+            &store,
+        )
+        .await;
 
         match result {
             CookieAuthResult::Authenticated(claims) => {
@@ -460,8 +492,14 @@ mod tests {
         let config = Some(test_auth_config());
         let store = empty_store();
 
-        let result =
-            ws_authenticate(&headers, &config, &(mock as Arc<dyn GraphStore>), None, &store).await;
+        let result = ws_authenticate(
+            &headers,
+            &config,
+            &(mock as Arc<dyn GraphStore>),
+            None,
+            &store,
+        )
+        .await;
 
         match result {
             CookieAuthResult::Invalid(reason) => {
@@ -482,8 +520,14 @@ mod tests {
         let config = Some(test_auth_config());
         let store = empty_store();
 
-        let result =
-            ws_authenticate(&headers, &config, &(mock as Arc<dyn GraphStore>), None, &store).await;
+        let result = ws_authenticate(
+            &headers,
+            &config,
+            &(mock as Arc<dyn GraphStore>),
+            None,
+            &store,
+        )
+        .await;
 
         match result {
             CookieAuthResult::Invalid(reason) => {
@@ -517,9 +561,14 @@ mod tests {
         let headers = headers_with_cookie(&raw_token);
         let store = empty_store();
 
-        let result =
-            ws_authenticate(&headers, &Some(config), &(mock as Arc<dyn GraphStore>), None, &store)
-                .await;
+        let result = ws_authenticate(
+            &headers,
+            &Some(config),
+            &(mock as Arc<dyn GraphStore>),
+            None,
+            &store,
+        )
+        .await;
 
         match result {
             CookieAuthResult::Authenticated(claims) => {
@@ -592,7 +641,11 @@ mod tests {
 
         match result {
             CookieAuthResult::Invalid(reason) => {
-                assert!(reason.contains("Invalid or expired ticket"), "Got: {}", reason);
+                assert!(
+                    reason.contains("Invalid or expired ticket"),
+                    "Got: {}",
+                    reason
+                );
             }
             other => panic!("Expected Invalid, got {:?}", other),
         }
@@ -612,7 +665,8 @@ mod tests {
                 "expired-ticket".to_string(),
                 WsTicket {
                     claims: Claims::anonymous(),
-                    created_at: Instant::now() - std::time::Duration::from_secs(TICKET_TTL_SECS + 10),
+                    created_at: Instant::now()
+                        - std::time::Duration::from_secs(TICKET_TTL_SECS + 10),
                 },
             );
         }
@@ -628,7 +682,11 @@ mod tests {
 
         match result {
             CookieAuthResult::Invalid(reason) => {
-                assert!(reason.contains("Invalid or expired ticket"), "Got: {}", reason);
+                assert!(
+                    reason.contains("Invalid or expired ticket"),
+                    "Got: {}",
+                    reason
+                );
             }
             other => panic!("Expected Invalid, got {:?}", other),
         }
