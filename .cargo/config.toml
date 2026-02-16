@@ -1,2 +1,0 @@
-[patch."https://github.com/this-rs/nexus.git"]
-nexus-claude = { path = "/Users/triviere/projects/project-orchestrator/nexus/claude-code-sdk-rs" }
