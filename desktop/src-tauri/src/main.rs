@@ -218,7 +218,7 @@ fn main() {
                     tracing::info!("No config.yaml found — generating default (unconfigured) config");
                     if let Err(e) = setup::generate_default_config() {
                         tracing::error!("Failed to generate default config: {}", e);
-                        show_main_window(&handle);
+                        show_main_window(&handle, setup::DEFAULT_DESKTOP_PORT);
                         return;
                     }
                 }
@@ -228,7 +228,7 @@ fn main() {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!("Failed to load config: {}", e);
-                        show_main_window(&handle);
+                        show_main_window(&handle, setup::DEFAULT_DESKTOP_PORT);
                         return;
                     }
                 };
@@ -346,8 +346,9 @@ fn main() {
                 }
 
                 // Transition: close splash → show main window
-                // The frontend will check /api/setup-status and redirect to /setup if needed
-                show_main_window(&handle);
+                // Navigate the webview to HTTP so cookies work for WebSocket upgrades.
+                // The frontend will check /api/setup-status and redirect to /setup if needed.
+                show_main_window(&handle, port);
             });
 
             Ok(())
@@ -399,7 +400,16 @@ fn main() {
 }
 
 /// Close the splash screen and show the main application window.
-fn show_main_window(handle: &tauri::AppHandle) {
+///
+/// Navigates the webview from `tauri://localhost` to `http://localhost:{port}`
+/// so that all requests (REST + WebSocket) are **same-origin** and the browser
+/// sends cookies automatically. This is critical for WebSocket authentication:
+/// the `new WebSocket(url)` API cannot set cookies, but a same-origin connection
+/// inherits the cookie jar from the page origin.
+///
+/// Tauri IPC (`invoke()`) continues to work because the capability file includes
+/// `remote.urls: ["http://localhost:*"]`.
+fn show_main_window(handle: &tauri::AppHandle, port: u16) {
     // Close splash screen
     if let Some(splash) = handle.get_webview_window("splashscreen") {
         if let Err(e) = splash.close() {
@@ -484,6 +494,21 @@ fn show_main_window(handle: &tauri::AppHandle) {
                     }
                 }
             });
+        }
+
+        // Navigate the webview from tauri:// to HTTP so cookies are same-origin.
+        // The backend is guaranteed to be up at this point (health check passed).
+        let http_url = format!("http://localhost:{}", port);
+        tracing::info!("Navigating main window to {}", http_url);
+        match http_url.parse::<tauri::Url>() {
+            Ok(url) => {
+                if let Err(e) = main_window.navigate(url) {
+                    tracing::error!("Failed to navigate main window to {}: {}", http_url, e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse URL {}: {}", http_url, e);
+            }
         }
 
         // Inject desktop-specific JS before showing the window:
