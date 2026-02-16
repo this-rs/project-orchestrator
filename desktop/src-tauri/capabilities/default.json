@@ -24,6 +24,7 @@
     "core:event:allow-listen",
     "core:tray:default",
     "dialog:default",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "websocket:default"
   ]
 }
