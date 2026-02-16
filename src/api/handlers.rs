@@ -59,7 +59,9 @@ impl ServerState {
     ///
     /// Always includes:
     /// - `http://localhost:{server_port}` (desktop / Tauri app)
-    /// - `tauri://localhost` (Tauri webview custom scheme)
+    /// - `tauri://localhost` (Tauri webview custom scheme — Linux/Windows)
+    /// - `https://tauri.localhost` (Tauri 2 WKWebView on macOS — WebKit transforms
+    ///   `tauri://localhost` → `https://tauri.localhost` for the Origin header)
     ///
     /// Optionally includes:
     /// - `public_url` from server config (e.g. `https://ffs.dev`)
@@ -67,7 +69,9 @@ impl ServerState {
     pub fn allowed_origins(&self) -> Vec<String> {
         let mut origins = vec![
             format!("http://localhost:{}", self.server_port),
+            format!("http://127.0.0.1:{}", self.server_port),
             "tauri://localhost".to_string(),
+            "https://tauri.localhost".to_string(),
         ];
 
         // Helper to add an origin if not already present
@@ -110,9 +114,10 @@ impl ServerState {
                 let trimmed = raw.trim_end_matches('/');
                 let allowed = self.allowed_origins();
                 if allowed.iter().any(|a| a == trimmed) {
-                    // tauri://localhost is valid for CORS but OAuth providers
-                    // only accept http/https redirect URIs → map to localhost
-                    if trimmed == "tauri://localhost" {
+                    // tauri://localhost and https://tauri.localhost are valid for
+                    // CORS but OAuth providers only accept standard http/https
+                    // redirect URIs → map both to http://localhost:{port}
+                    if trimmed == "tauri://localhost" || trimmed == "https://tauri.localhost" {
                         Ok(Some(format!("http://localhost:{}", self.server_port)))
                     } else {
                         Ok(Some(trimmed.to_string()))
@@ -2028,7 +2033,12 @@ mod tests {
     fn test_allowed_origins_without_public_url() {
         let state = make_origin_test_state(6600, None, None);
         let origins = state.allowed_origins();
-        assert_eq!(origins, vec!["http://localhost:6600", "tauri://localhost"]);
+        assert_eq!(origins, vec![
+            "http://localhost:6600",
+            "http://127.0.0.1:6600",
+            "tauri://localhost",
+            "https://tauri.localhost",
+        ]);
     }
 
     #[test]
@@ -2039,7 +2049,9 @@ mod tests {
             origins,
             vec![
                 "http://localhost:6600",
+                "http://127.0.0.1:6600",
                 "tauri://localhost",
+                "https://tauri.localhost",
                 "https://ffs.dev"
             ]
         );

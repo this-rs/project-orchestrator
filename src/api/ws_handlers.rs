@@ -20,7 +20,7 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;
 use tokio::time::{interval, Duration};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Query parameters for filtering WebSocket events
 #[derive(Debug, Deserialize, Default)]
@@ -54,6 +54,14 @@ pub async fn ws_events(
     let project_filter = query.project_id;
 
     // Pre-upgrade auth: cookie first, then ticket fallback
+    let has_cookie = headers.get(axum::http::header::COOKIE).is_some();
+    let has_ticket = query.ticket.is_some();
+    info!(
+        has_cookie = has_cookie,
+        has_ticket = has_ticket,
+        "WS /ws/events upgrade request received"
+    );
+
     let neo4j = state.orchestrator.neo4j_arc();
     let auth_result = super::ws_auth::ws_authenticate(
         &headers,
@@ -66,13 +74,14 @@ pub async fn ws_events(
 
     match auth_result {
         CookieAuthResult::Authenticated(claims) => {
+            info!(email = %claims.email, "WS /ws/events: authenticated, upgrading");
             ws.on_upgrade(move |socket| {
                 handle_ws_preauthed(socket, state, entity_filter, project_filter, claims)
             })
             .into_response()
         }
         CookieAuthResult::Invalid(reason) => {
-            debug!(reason = %reason, "WS events: auth rejected");
+            warn!(reason = %reason, "WS /ws/events: auth REJECTED (401)");
             StatusCode::UNAUTHORIZED.into_response()
         }
     }
