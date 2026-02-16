@@ -1650,16 +1650,18 @@ impl ChatManager {
         // Get a handle to the session's pending permission inputs map so we can
         // store the original tool input when a permission request arrives.
         // send_permission_response() reads from this same Arc to retrieve the input.
-        let pending_perm_inputs: Arc<
-            tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
-        > = {
+        //
+        // Also clone the stdin_tx sender for auto-allowing AskUserQuestion control
+        // requests inline (without going through send_permission_response).
+        let (pending_perm_inputs, stdin_tx_for_auto_allow) = {
             let guard = active_sessions.read().await;
-            guard
-                .get(&session_id)
-                .map(|s| s.pending_permission_inputs.clone())
-                .unwrap_or_else(|| {
-                    Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                })
+            match guard.get(&session_id) {
+                Some(s) => (s.pending_permission_inputs.clone(), s.stdin_tx.clone()),
+                None => (
+                    Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                    None,
+                ),
+            }
         };
 
         {
@@ -1700,44 +1702,52 @@ impl ChatManager {
             // channel without parent info) can be attributed to the correct agent.
             let mut current_parent_tool_use_id: Option<String> = None;
 
-            // Helper closure: process an SDK control message (permission request).
-            // Returns Some(ChatEvent) if a permission_request was parsed, None otherwise.
-            // The caller is responsible for adding the event to streaming_events (async).
+            // Helper closure: process an SDK control message (permission or AskUserQuestion).
+            // Returns Some(ChatEvent) if a can_use_tool was parsed, None otherwise.
+            // The caller is responsible for adding the event to streaming_events (async)
+            // and for auto-allowing AskUserQuestion events via stdin_tx.
             let handle_control_msg = |control_msg: serde_json::Value,
                                       events_to_persist: &mut Vec<ChatEventRecord>,
                                       next_seq: &std::sync::atomic::AtomicI64,
                                       current_parent: Option<String>|
              -> Option<ChatEvent> {
-                let perm_event = parse_permission_control_msg(&control_msg, current_parent)?;
+                let event = parse_permission_control_msg(&control_msg, current_parent)?;
 
-                if let ChatEvent::PermissionRequest {
-                    ref id, ref tool, ..
-                } = perm_event
-                {
-                    info!(
-                        session_id = %session_id,
-                        tool = %tool,
-                        request_id = %id,
-                        "Permission request from CLI"
-                    );
+                match &event {
+                    ChatEvent::PermissionRequest { id, tool, .. } => {
+                        info!(
+                            session_id = %session_id,
+                            tool = %tool,
+                            request_id = %id,
+                            "Permission request from CLI"
+                        );
+                    }
+                    ChatEvent::AskUserQuestion { id, .. } => {
+                        info!(
+                            session_id = %session_id,
+                            request_id = %id,
+                            "AskUserQuestion from CLI (will auto-allow)"
+                        );
+                    }
+                    _ => {}
                 }
 
-                // Persist the permission_request event
+                // Persist the event
                 if let Some(uuid) = session_uuid {
                     let seq = next_seq.fetch_add(1, Ordering::SeqCst);
                     events_to_persist.push(ChatEventRecord {
                         id: Uuid::new_v4(),
                         session_id: uuid,
                         seq,
-                        event_type: "permission_request".to_string(),
-                        data: serde_json::to_string(&perm_event).unwrap_or_default(),
+                        event_type: event.event_type().to_string(),
+                        data: serde_json::to_string(&event).unwrap_or_default(),
                         created_at: chrono::Utc::now(),
                     });
                 }
 
                 // Broadcast to WebSocket clients
-                emit_chat(perm_event.clone(), &events_tx, &nats, &session_id);
-                Some(perm_event)
+                emit_chat(event.clone(), &events_tx, &nats, &session_id);
+                Some(event)
             };
 
             // Main stream loop — uses tokio::select! to listen for BOTH stream
@@ -1768,8 +1778,29 @@ impl ChatManager {
                             match control_msg {
                                 Some(msg) => {
                                     if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
-                                        // Store original tool input for later use in permission response
-                                        if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                        // AskUserQuestion: auto-allow the control request so the CLI
+                                        // waits for the tool_result (user's answer) instead of blocking.
+                                        // Do NOT store in pending_perm_inputs (it's not a permission).
+                                        if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
+                                            if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                let control_response = serde_json::json!({
+                                                    "type": "control_response",
+                                                    "response": {
+                                                        "subtype": "success",
+                                                        "request_id": id,
+                                                        "response": {
+                                                            "behavior": "allow",
+                                                            "updatedInput": input
+                                                        }
+                                                    }
+                                                });
+                                                if let Ok(json) = serde_json::to_string(&control_response) {
+                                                    let _ = tx.send(json).await;
+                                                    info!(request_id = %id, "Auto-allowed AskUserQuestion control request");
+                                                }
+                                            }
+                                        } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                            // Regular permission: store original input for later response
                                             if !id.is_empty() {
                                                 store_pending_perm_input(&pending_perm_inputs, id, input).await;
                                             }
@@ -1792,8 +1823,27 @@ impl ChatManager {
                                     // Also drain any buffered control messages
                                     while let Ok(msg) = rx.try_recv() {
                                         if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
-                                            // Store original tool input for later use in permission response
-                                            if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                            // AskUserQuestion: auto-allow (same logic as above)
+                                            if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
+                                                if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                    let control_response = serde_json::json!({
+                                                        "type": "control_response",
+                                                        "response": {
+                                                            "subtype": "success",
+                                                            "request_id": id,
+                                                            "response": {
+                                                                "behavior": "allow",
+                                                                "updatedInput": input
+                                                            }
+                                                        }
+                                                    });
+                                                    if let Ok(json) = serde_json::to_string(&control_response) {
+                                                        // try_send here because we're in a sync-ish drain loop
+                                                        let _ = tx.try_send(json);
+                                                        info!(request_id = %id, "Auto-allowed AskUserQuestion control request (drain)");
+                                                    }
+                                                }
+                                            } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
                                                 if !id.is_empty() {
                                                     store_pending_perm_input(&pending_perm_inputs, id, input).await;
                                                 }
@@ -3456,6 +3506,32 @@ fn parse_permission_control_msg(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // AskUserQuestion is NOT a permission — it's a user interaction tool.
+    // Instead of emitting PermissionRequest (which shows the approval dialog),
+    // emit a dedicated AskUserQuestion event so the frontend renders the
+    // question widget directly. The caller will auto-allow this request.
+    if tool_name == "AskUserQuestion" {
+        let questions = input
+            .get("questions")
+            .cloned()
+            .unwrap_or(serde_json::json!([]));
+        // Extract the tool_call_id from the control message — this is the tool_use ID
+        // that the frontend needs to send the tool_result response back.
+        let tool_call_id = request_data
+            .get("toolUseId")
+            .or_else(|| request_data.get("tool_use_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(ChatEvent::AskUserQuestion {
+            id: request_id,
+            tool_call_id,
+            questions,
+            input,
+            parent_tool_use_id: current_parent,
+        });
+    }
 
     Some(ChatEvent::PermissionRequest {
         id: request_id,
@@ -6126,6 +6202,136 @@ mod tests {
             parse_permission_control_msg(&msg, None)
         {
             assert_eq!(id, "snake_id_002");
+        }
+    }
+
+    // ── parse_permission_control_msg: AskUserQuestion tests ─────────────
+
+    #[test]
+    fn test_parse_permission_control_msg_ask_user_question_returns_dedicated_event() {
+        let msg = serde_json::json!({
+            "type": "control_request",
+            "requestId": "req_ask_001",
+            "request": {
+                "subtype": "can_use_tool",
+                "toolName": "AskUserQuestion",
+                "toolUseId": "toolu_ask_123",
+                "input": {
+                    "questions": [{
+                        "question": "Which framework?",
+                        "header": "Framework",
+                        "options": [
+                            {"label": "React", "description": "Popular UI library"},
+                            {"label": "Vue", "description": "Progressive framework"}
+                        ],
+                        "multiSelect": false
+                    }]
+                }
+            }
+        });
+
+        let event = parse_permission_control_msg(&msg, None);
+        assert!(event.is_some(), "AskUserQuestion should parse");
+
+        match event.unwrap() {
+            ChatEvent::AskUserQuestion {
+                id,
+                tool_call_id,
+                questions,
+                input,
+                parent_tool_use_id,
+            } => {
+                assert_eq!(id, "req_ask_001");
+                assert_eq!(tool_call_id, "toolu_ask_123");
+                assert!(questions.is_array(), "questions should be an array");
+                assert_eq!(questions.as_array().unwrap().len(), 1);
+                assert_eq!(questions[0]["header"], "Framework");
+                assert!(input.get("questions").is_some());
+                assert!(parent_tool_use_id.is_none());
+            }
+            other => panic!("expected AskUserQuestion, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_ask_user_question_with_parent() {
+        let msg = serde_json::json!({
+            "requestId": "req_ask_002",
+            "request": {
+                "subtype": "can_use_tool",
+                "toolName": "AskUserQuestion",
+                "toolUseId": "toolu_ask_456",
+                "input": {
+                    "questions": [{"question": "Choose:", "header": "Q", "options": [{"label": "A"}, {"label": "B"}], "multiSelect": false}]
+                }
+            }
+        });
+
+        let event = parse_permission_control_msg(&msg, Some("toolu_parent_789".to_string()));
+        assert!(event.is_some());
+
+        match event.unwrap() {
+            ChatEvent::AskUserQuestion {
+                id,
+                parent_tool_use_id,
+                ..
+            } => {
+                assert_eq!(id, "req_ask_002");
+                assert_eq!(parent_tool_use_id.as_deref(), Some("toolu_parent_789"));
+            }
+            other => panic!("expected AskUserQuestion, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_bash_still_returns_permission_request() {
+        // Regression: Bash (and all other tools) must still return PermissionRequest
+        let msg = serde_json::json!({
+            "requestId": "req_bash_001",
+            "request": {
+                "subtype": "can_use_tool",
+                "toolName": "Bash",
+                "input": {"command": "echo hello"}
+            }
+        });
+
+        let event = parse_permission_control_msg(&msg, None);
+        assert!(event.is_some());
+
+        match event.unwrap() {
+            ChatEvent::PermissionRequest { tool, .. } => {
+                assert_eq!(tool, "Bash");
+            }
+            other => panic!("expected PermissionRequest for Bash, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_permission_control_msg_ask_user_question_missing_questions() {
+        // If input doesn't have "questions", should default to empty array
+        let msg = serde_json::json!({
+            "requestId": "req_ask_003",
+            "request": {
+                "subtype": "can_use_tool",
+                "toolName": "AskUserQuestion",
+                "input": {}
+            }
+        });
+
+        let event = parse_permission_control_msg(&msg, None);
+        assert!(event.is_some());
+
+        match event.unwrap() {
+            ChatEvent::AskUserQuestion {
+                questions,
+                tool_call_id,
+                ..
+            } => {
+                assert!(questions.is_array());
+                assert_eq!(questions.as_array().unwrap().len(), 0);
+                assert_eq!(tool_call_id, "", "missing toolUseId defaults to empty");
+            }
+            other => panic!("expected AskUserQuestion, got: {:?}", other),
         }
     }
 
