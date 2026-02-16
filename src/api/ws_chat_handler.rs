@@ -126,7 +126,7 @@ pub async fn ws_chat(
 
 /// Handle a chat WebSocket connection that was pre-authenticated via cookie.
 ///
-/// Sends `auth_ok` immediately, then enters the main chat loop.
+/// Waits for a `"ready"` message from the client before sending `auth_ok`.
 async fn handle_ws_chat_preauthed(
     mut socket: WebSocket,
     state: OrchestratorState,
@@ -134,8 +134,8 @@ async fn handle_ws_chat_preauthed(
     last_event: i64,
     claims: Claims,
 ) {
-    // Send auth_ok immediately (client doesn't need to send auth message)
-    super::ws_auth::send_auth_ok(&mut socket, &claims).await;
+    // Wait for client "ready" signal before sending auth_ok
+    super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims).await;
     handle_ws_chat_loop(socket, state, session_id, last_event, claims).await;
 }
 

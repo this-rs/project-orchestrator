@@ -119,7 +119,10 @@ fn passes_filters(
 
 /// Handle a WebSocket connection that was pre-authenticated via cookie.
 ///
-/// Sends `auth_ok` immediately, then enters the event loop.
+/// Waits for a `"ready"` message from the client before sending `auth_ok`.
+/// This prevents a race condition with the Tauri WebSocket plugin where
+/// `auth_ok` can be lost if sent before the client's message listener is
+/// registered (the plugin's `connect()` resolves before `addListener()`).
 async fn handle_ws_preauthed(
     mut socket: WebSocket,
     state: OrchestratorState,
@@ -127,8 +130,8 @@ async fn handle_ws_preauthed(
     project_filter: Option<String>,
     claims: Claims,
 ) {
-    // Send auth_ok immediately (client doesn't need to send auth message)
-    super::ws_auth::send_auth_ok(&mut socket, &claims).await;
+    // Wait for client "ready" signal before sending auth_ok
+    super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims).await;
     handle_ws_loop(socket, state, entity_filter, project_filter, claims).await;
 }
 
