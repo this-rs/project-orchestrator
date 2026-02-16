@@ -116,6 +116,57 @@ pub struct ChatManager {
     pub(crate) config_yaml_path: Option<std::path::PathBuf>,
 }
 
+// ============================================================================
+// CompactionNotifier — HookCallback that emits ChatEvent::CompactionStarted
+// ============================================================================
+
+/// Hook callback that emits a `ChatEvent::CompactionStarted` when the CLI
+/// triggers a `PreCompact` event (context window compaction is about to start).
+///
+/// This gives the frontend a real-time notification so it can display a spinner
+/// instead of leaving the user staring at silence during compaction.
+///
+/// The callback always returns `continue_: true` — it observes, never blocks.
+pub(crate) struct CompactionNotifier {
+    /// Broadcast sender for chat events (same channel as stream_response uses)
+    events_tx: broadcast::Sender<ChatEvent>,
+}
+
+impl CompactionNotifier {
+    pub fn new(events_tx: broadcast::Sender<ChatEvent>) -> Self {
+        Self { events_tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl nexus_claude::HookCallback for CompactionNotifier {
+    async fn execute(
+        &self,
+        input: &nexus_claude::HookInput,
+        _tool_use_id: Option<&str>,
+        _context: &nexus_claude::HookContext,
+    ) -> std::result::Result<nexus_claude::HookJSONOutput, nexus_claude::SdkError> {
+        if let nexus_claude::HookInput::PreCompact(pre_compact) = input {
+            let event = ChatEvent::CompactionStarted {
+                trigger: pre_compact.trigger.clone(),
+            };
+            // Best-effort broadcast — receivers may have been dropped (no subscribers)
+            let _ = self.events_tx.send(event);
+            info!(
+                trigger = %pre_compact.trigger,
+                "PreCompact hook fired — emitted CompactionStarted event"
+            );
+        }
+        // Always allow compaction to proceed
+        Ok(nexus_claude::HookJSONOutput::Sync(
+            nexus_claude::SyncHookJSONOutput {
+                continue_: Some(true),
+                ..Default::default()
+            },
+        ))
+    }
+}
+
 impl ChatManager {
     /// Create a ChatManager without memory support (for tests or when Meilisearch is unavailable)
     pub fn new_without_memory(
@@ -6413,5 +6464,94 @@ mod tests {
             result.unwrap_err().to_string().contains("not found"),
             "Error should mention session not found"
         );
+    }
+
+    // ====================================================================
+    // CompactionNotifier
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_compaction_notifier_emits_event_on_pre_compact() {
+        use nexus_claude::{HookCallback, HookContext, HookInput, PreCompactHookInput};
+
+        let (tx, mut rx) = broadcast::channel::<ChatEvent>(16);
+        let notifier = CompactionNotifier::new(tx);
+
+        let input = HookInput::PreCompact(PreCompactHookInput {
+            session_id: "test-session".into(),
+            transcript_path: "/tmp/transcript".into(),
+            cwd: "/test".into(),
+            permission_mode: None,
+            trigger: "auto".into(),
+            custom_instructions: None,
+        });
+
+        let context = HookContext { signal: None };
+        let result = notifier.execute(&input, None, &context).await;
+        assert!(result.is_ok());
+
+        // Verify event was broadcast
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            ChatEvent::CompactionStarted { ref trigger } if trigger == "auto"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_compaction_notifier_manual_trigger() {
+        use nexus_claude::{HookCallback, HookContext, HookInput, PreCompactHookInput};
+
+        let (tx, mut rx) = broadcast::channel::<ChatEvent>(16);
+        let notifier = CompactionNotifier::new(tx);
+
+        let input = HookInput::PreCompact(PreCompactHookInput {
+            session_id: "sess-2".into(),
+            transcript_path: "/tmp/t".into(),
+            cwd: "/".into(),
+            permission_mode: Some("default".into()),
+            trigger: "manual".into(),
+            custom_instructions: Some("Keep API context".into()),
+        });
+
+        let context = HookContext { signal: None };
+        let result = notifier.execute(&input, None, &context).await.unwrap();
+
+        // Must always return continue=true
+        if let nexus_claude::HookJSONOutput::Sync(sync) = result {
+            assert_eq!(sync.continue_, Some(true));
+        } else {
+            panic!("Expected Sync output");
+        }
+
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            ChatEvent::CompactionStarted { ref trigger } if trigger == "manual"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_compaction_notifier_noop_on_other_hooks() {
+        use nexus_claude::{HookCallback, HookContext, HookInput, PreToolUseHookInput};
+
+        let (tx, mut rx) = broadcast::channel::<ChatEvent>(16);
+        let notifier = CompactionNotifier::new(tx);
+
+        let input = HookInput::PreToolUse(PreToolUseHookInput {
+            session_id: "s".into(),
+            transcript_path: "/t".into(),
+            cwd: "/c".into(),
+            permission_mode: None,
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "ls"}),
+        });
+
+        let context = HookContext { signal: None };
+        let result = notifier.execute(&input, Some("tu1"), &context).await;
+        assert!(result.is_ok());
+
+        // No event should be broadcast for non-PreCompact hooks
+        assert!(rx.try_recv().is_err());
     }
 }
