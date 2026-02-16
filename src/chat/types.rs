@@ -131,6 +131,11 @@ pub enum ChatEvent {
     PermissionModeChanged { mode: String },
     /// Model was changed mid-session
     ModelChanged { model: String },
+    /// Context window compaction is starting (emitted via PreCompact hook)
+    CompactionStarted {
+        /// Compaction trigger: "auto" or "manual"
+        trigger: String,
+    },
     /// Context window was compacted (automatic or manual)
     CompactBoundary {
         /// Compaction trigger: "auto" or "manual"
@@ -177,6 +182,7 @@ impl ChatEvent {
             ChatEvent::PermissionDecision { .. } => "permission_decision",
             ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
             ChatEvent::ModelChanged { .. } => "model_changed",
+            ChatEvent::CompactionStarted { .. } => "compaction_started",
             ChatEvent::CompactBoundary { .. } => "compact_boundary",
             ChatEvent::SystemInit { .. } => "system_init",
         }
@@ -233,6 +239,9 @@ impl ChatEvent {
                 Some(format!("permission_mode_changed:{}", mode))
             }
             ChatEvent::ModelChanged { model } => Some(format!("model_changed:{}", model)),
+            ChatEvent::CompactionStarted { trigger } => {
+                Some(format!("compaction_started:{}", trigger))
+            }
             ChatEvent::CompactBoundary { trigger, .. } => {
                 Some(format!("compact_boundary:{}", trigger))
             }
@@ -588,6 +597,12 @@ mod tests {
             ChatEvent::ModelChanged {
                 model: "claude-opus-4-20250514".into(),
             },
+            ChatEvent::CompactionStarted {
+                trigger: "auto".into(),
+            },
+            ChatEvent::CompactionStarted {
+                trigger: "manual".into(),
+            },
             ChatEvent::CompactBoundary {
                 trigger: "auto".into(),
                 pre_tokens: Some(150000),
@@ -638,6 +653,36 @@ mod tests {
         let json = r#"{"type":"input_request","prompt":"Choose:","options":["A","B"]}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ChatEvent::InputRequest { ref options, .. } if options.is_some()));
+
+        // CompactionStarted with auto trigger
+        let json = r#"{"type":"compaction_started","trigger":"auto"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::CompactionStarted { ref trigger } if trigger == "auto")
+        );
+        assert_eq!(event.event_type(), "compaction_started");
+        assert_eq!(
+            event.fingerprint(),
+            Some("compaction_started:auto".to_string())
+        );
+
+        // CompactionStarted with manual trigger
+        let json = r#"{"type":"compaction_started","trigger":"manual"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(event, ChatEvent::CompactionStarted { ref trigger } if trigger == "manual")
+        );
+
+        // CompactionStarted round-trip serialization
+        let original = ChatEvent::CompactionStarted {
+            trigger: "auto".to_string(),
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: ChatEvent = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            deserialized,
+            ChatEvent::CompactionStarted { ref trigger } if trigger == "auto"
+        ));
 
         // CompactBoundary with pre_tokens
         let json = r#"{"type":"compact_boundary","trigger":"auto","pre_tokens":150000}"#;
