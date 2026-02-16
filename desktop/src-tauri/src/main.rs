@@ -12,10 +12,17 @@ use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Tauri command: get the server port for the frontend to connect to
+/// Actual backend port — written once at startup from the config, read by
+/// `get_server_port` Tauri command. Defaults to `DEFAULT_DESKTOP_PORT` (6600)
+/// until the config is loaded.
+static BACKEND_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(setup::DEFAULT_DESKTOP_PORT);
+
+/// Tauri command: get the server port for the frontend to connect to.
+/// Returns the real port from config.yaml (not necessarily 6600).
 #[tauri::command]
 fn get_server_port() -> u16 {
-    setup::DEFAULT_DESKTOP_PORT
+    BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Tauri command: check backend health and return the full `/health` response.
@@ -286,6 +293,7 @@ fn main() {
                 };
 
                 let port = config.server_port;
+                BACKEND_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
                 let is_configured = config.setup_completed;
 
                 // Read infra_mode from the YAML config (defaults to "docker")
