@@ -260,6 +260,87 @@ pub async fn send_auth_ok(socket: &mut WebSocket, claims: &Claims) {
 }
 
 // ============================================================================
+// Ready handshake — logic + WS wrapper
+// ============================================================================
+
+/// Timeout for the client to send "ready" before we fall back.
+const READY_TIMEOUT_SECS: u64 = 5;
+
+/// Result of classifying a single WebSocket message during the ready handshake.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReadyCheck {
+    /// Client sent "ready" — proceed with auth_ok
+    Ready,
+    /// Ignorable message (Ping, Pong, unrelated text) — keep waiting
+    Continue,
+    /// Client disconnected or error — abort
+    Disconnected,
+}
+
+/// Classify a WebSocket message for the ready handshake.
+///
+/// Accepts both JSON `"ready"` (quoted string) and bare `ready`.
+pub(crate) fn classify_ready_message(msg: &Result<Message, axum::Error>) -> ReadyCheck {
+    match msg {
+        Ok(Message::Text(text)) => {
+            let trimmed = text.trim().trim_matches('"');
+            if trimmed == "ready" || text.contains("\"ready\"") {
+                ReadyCheck::Ready
+            } else {
+                ReadyCheck::Continue
+            }
+        }
+        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => ReadyCheck::Continue,
+        Ok(Message::Close(_)) => ReadyCheck::Disconnected,
+        Err(_) => ReadyCheck::Disconnected,
+        _ => ReadyCheck::Continue,
+    }
+}
+
+/// Wait for the client to send a `"ready"` message, then send `auth_ok`.
+///
+/// This handshake prevents a race condition with the Tauri WebSocket plugin
+/// where `auth_ok` would be lost if sent before the client's message listener
+/// is registered (the plugin's `connect()` resolves before `addListener()`).
+///
+/// If the client doesn't send `"ready"` within [`READY_TIMEOUT_SECS`],
+/// `auth_ok` is sent anyway as a fallback for older clients.
+pub async fn wait_ready_then_auth_ok(socket: &mut WebSocket, claims: &Claims) {
+    use futures::StreamExt;
+    use tokio::time::{timeout, Duration};
+
+    let wait = timeout(Duration::from_secs(READY_TIMEOUT_SECS), async {
+        while let Some(msg) = socket.next().await {
+            match classify_ready_message(&msg) {
+                ReadyCheck::Ready => {
+                    debug!("WS: received 'ready' from client");
+                    return true;
+                }
+                ReadyCheck::Disconnected => return false,
+                ReadyCheck::Continue => continue,
+            }
+        }
+        false
+    });
+
+    match wait.await {
+        Ok(true) => {
+            // Client sent "ready" — send auth_ok
+            send_auth_ok(socket, claims).await;
+        }
+        Ok(false) => {
+            // Client disconnected before sending ready
+            debug!("WS: client disconnected before sending ready, skipping auth_ok");
+        }
+        Err(_) => {
+            // Timeout — send auth_ok anyway (fallback for older clients)
+            warn!("WS: client did not send 'ready' within 5s, sending auth_ok anyway");
+            send_auth_ok(socket, claims).await;
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -726,5 +807,75 @@ mod tests {
             }
             other => panic!("Expected Authenticated via cookie, got {:?}", other),
         }
+    }
+
+    // ========================================================================
+    // classify_ready_message tests
+    // ========================================================================
+
+    #[test]
+    fn test_ready_bare_string() {
+        let msg = Ok(Message::Text("ready".into()));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Ready);
+    }
+
+    #[test]
+    fn test_ready_json_quoted() {
+        let msg = Ok(Message::Text("\"ready\"".into()));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Ready);
+    }
+
+    #[test]
+    fn test_ready_json_object() {
+        let msg = Ok(Message::Text("{\"type\":\"ready\"}".into()));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Ready);
+    }
+
+    #[test]
+    fn test_ready_with_whitespace() {
+        let msg = Ok(Message::Text("  ready  ".into()));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Ready);
+    }
+
+    #[test]
+    fn test_unrelated_text_returns_continue() {
+        let msg = Ok(Message::Text("hello".into()));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Continue);
+    }
+
+    #[test]
+    fn test_ping_returns_continue() {
+        let msg = Ok(Message::Ping(vec![].into()));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Continue);
+    }
+
+    #[test]
+    fn test_pong_returns_continue() {
+        let msg = Ok(Message::Pong(vec![].into()));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Continue);
+    }
+
+    #[test]
+    fn test_close_returns_disconnected() {
+        let msg = Ok(Message::Close(None));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Disconnected);
+    }
+
+    #[test]
+    fn test_error_returns_disconnected() {
+        let msg: Result<Message, axum::Error> =
+            Err(axum::Error::new(std::io::Error::other("test")));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Disconnected);
+    }
+
+    #[test]
+    fn test_binary_returns_continue() {
+        let msg = Ok(Message::Binary(vec![1, 2, 3].into()));
+        assert_eq!(classify_ready_message(&msg), ReadyCheck::Continue);
+    }
+
+    #[test]
+    fn test_ready_timeout_constant() {
+        assert_eq!(READY_TIMEOUT_SECS, 5);
     }
 }
