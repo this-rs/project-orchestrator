@@ -29,13 +29,15 @@ pub struct WsQuery {
     pub entity_types: Option<String>,
     /// Filter by project ID
     pub project_id: Option<String>,
+    /// One-time ticket for auth (fallback when cookies aren't sent on WS upgrade)
+    pub ticket: Option<String>,
 }
 
 /// WebSocket upgrade handler for `/ws/events`
 ///
-/// Authentication: validates `refresh_token` cookie BEFORE upgrade.
-/// - Valid cookie (or no-auth mode) → upgrade + send `auth_ok` immediately
-/// - No cookie or invalid → reject with 401 (no upgrade)
+/// Authentication: validates `refresh_token` cookie (or ticket fallback) BEFORE upgrade.
+/// - Valid cookie/ticket (or no-auth mode) → upgrade + send `auth_ok` immediately
+/// - No credentials or invalid → reject with 401 (no upgrade)
 pub async fn ws_events(
     ws: WebSocketUpgrade,
     State(state): State<OrchestratorState>,
@@ -51,21 +53,25 @@ pub async fn ws_events(
     });
     let project_filter = query.project_id;
 
-    // Pre-upgrade cookie auth
+    // Pre-upgrade auth: cookie first, then ticket fallback
     let neo4j = state.orchestrator.neo4j_arc();
-    let cookie_result =
-        super::ws_auth::ws_authenticate_from_cookie(&headers, &state.auth_config, &neo4j).await;
+    let auth_result = super::ws_auth::ws_authenticate(
+        &headers,
+        &state.auth_config,
+        &neo4j,
+        query.ticket.as_deref(),
+        &state.ws_ticket_store,
+    )
+    .await;
 
-    match cookie_result {
+    match auth_result {
         CookieAuthResult::Authenticated(claims) => {
-            // Cookie valid → upgrade with pre-authenticated claims
             ws.on_upgrade(move |socket| {
                 handle_ws_preauthed(socket, state, entity_filter, project_filter, claims)
             })
             .into_response()
         }
         CookieAuthResult::Invalid(reason) => {
-            // No cookie or invalid → reject before upgrade
             debug!(reason = %reason, "WS events: auth rejected");
             StatusCode::UNAUTHORIZED.into_response()
         }

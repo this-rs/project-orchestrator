@@ -827,6 +827,93 @@ pub async fn logout(
         .into_response())
 }
 
+/// POST /auth/ws-ticket — Generate a short-lived, single-use WebSocket auth ticket.
+///
+/// This endpoint is a workaround for WKWebView (macOS/iOS Tauri desktop apps)
+/// where the browser's WebSocket API does NOT send HttpOnly cookies during the
+/// HTTP upgrade request. The client:
+/// 1. Calls this endpoint via `fetch()` (which sends cookies correctly)
+/// 2. Receives a one-time ticket (UUID, 30s TTL)
+/// 3. Passes it as `?ticket=xxx` when opening the WebSocket
+///
+/// The ticket is validated during `ws_authenticate()` as a fallback when no cookie
+/// is present. It is consumed (single-use) on validation.
+///
+/// In no-auth mode, returns a ticket with anonymous Claims.
+pub async fn ws_ticket(
+    State(state): State<OrchestratorState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::auth::jwt::Claims;
+
+    // No-auth mode → ticket with anonymous claims
+    let auth_config = match state.auth_config.as_ref() {
+        Some(c) => c,
+        None => {
+            let ticket = state
+                .ws_ticket_store
+                .create_ticket(Claims::anonymous())
+                .await;
+            return Ok(Json(serde_json::json!({ "ticket": ticket })));
+        }
+    };
+
+    // Extract refresh token from cookie
+    let raw_token = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(refresh::extract_refresh_token_from_cookie)
+        .ok_or_else(|| {
+            AppError::Unauthorized("No refresh_token cookie — cannot issue WS ticket".to_string())
+        })?;
+
+    // Validate the refresh token in DB
+    let token_hash = refresh::hash_token(&raw_token);
+    let token_node = state
+        .orchestrator
+        .neo4j()
+        .validate_refresh_token(&token_hash)
+        .await?
+        .ok_or_else(|| {
+            AppError::Unauthorized("Invalid or expired refresh token".to_string())
+        })?;
+
+    // Look up user (with root account fallback)
+    let (user_id, email, name) = match state
+        .orchestrator
+        .neo4j()
+        .get_user_by_id(token_node.user_id)
+        .await?
+    {
+        Some(user) => (user.id, user.email, user.name),
+        None => {
+            if let Some(ref root) = auth_config.root_account {
+                let root_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes());
+                if root_id == token_node.user_id {
+                    (root_id, root.email.clone(), root.name.clone())
+                } else {
+                    return Err(AppError::Unauthorized("User not found".to_string()));
+                }
+            } else {
+                return Err(AppError::Unauthorized("User not found".to_string()));
+            }
+        }
+    };
+
+    // Build Claims
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        sub: user_id.to_string(),
+        email,
+        name,
+        iat: now,
+        exp: now + auth_config.access_token_expiry_secs as i64,
+    };
+
+    let ticket = state.ws_ticket_store.create_ticket(claims).await;
+    Ok(Json(serde_json::json!({ "ticket": ticket })))
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -892,6 +979,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
         })
     }
 

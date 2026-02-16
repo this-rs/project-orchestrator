@@ -700,6 +700,21 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         Some(cm)
     };
 
+    // Create WS ticket store (in-memory, for WKWebView cookie workaround)
+    let ws_ticket_store = Arc::new(api::ws_auth::WsTicketStore::new());
+
+    // Spawn periodic cleanup of expired WS tickets (every 60s)
+    {
+        let store = ws_ticket_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                store.cleanup_expired().await;
+            }
+        });
+    }
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
@@ -713,6 +728,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         setup_completed: config.setup_completed,
         server_port: config.server_port,
         public_url: config.public_url.clone(),
+        ws_ticket_store,
     });
 
     // Create router

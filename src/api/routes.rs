@@ -142,8 +142,11 @@ fn public_routes() -> Router<OrchestratorState> {
         .route("/auth/refresh", post(auth_handlers::refresh_token))
         // Logout (public — revokes refresh token cookie, works with expired JWT)
         .route("/auth/logout", post(auth_handlers::logout))
+        // WS ticket (public — reads cookie to issue a short-lived WS auth ticket.
+        // Workaround for WKWebView not sending cookies on WebSocket upgrades.)
+        .route("/auth/ws-ticket", post(auth_handlers::ws_ticket))
         // ================================================================
-        // WebSocket (public — auth via cookie or first application message)
+        // WebSocket (public — auth via cookie or ticket fallback)
         // ================================================================
         .route("/ws/events", get(ws_handlers::ws_events))
         .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
@@ -659,6 +662,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
         });
         create_router(state)
     }
@@ -682,6 +686,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
         });
         create_router(state)
     }

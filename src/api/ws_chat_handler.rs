@@ -31,6 +31,8 @@ pub struct WsChatQuery {
     /// Last event sequence number seen by the client (for replay)
     #[serde(default)]
     pub last_event: i64,
+    /// One-time ticket for auth (fallback when cookies aren't sent on WS upgrade)
+    pub ticket: Option<String>,
 }
 
 /// Messages sent from the client over the WebSocket
@@ -98,21 +100,25 @@ pub async fn ws_chat(
 
     let last_event = query.last_event;
 
-    // Pre-upgrade cookie auth
+    // Pre-upgrade auth: cookie first, then ticket fallback
     let neo4j = state.orchestrator.neo4j_arc();
-    let cookie_result =
-        super::ws_auth::ws_authenticate_from_cookie(&headers, &state.auth_config, &neo4j).await;
+    let auth_result = super::ws_auth::ws_authenticate(
+        &headers,
+        &state.auth_config,
+        &neo4j,
+        query.ticket.as_deref(),
+        &state.ws_ticket_store,
+    )
+    .await;
 
-    Ok(match cookie_result {
+    Ok(match auth_result {
         CookieAuthResult::Authenticated(claims) => {
-            // Cookie valid → upgrade with pre-authenticated claims
             ws.on_upgrade(move |socket| {
                 handle_ws_chat_preauthed(socket, state, session_id, last_event, claims)
             })
             .into_response()
         }
         CookieAuthResult::Invalid(reason) => {
-            // No cookie or invalid → reject before upgrade
             debug!(reason = %reason, "WS chat: auth rejected");
             StatusCode::UNAUTHORIZED.into_response()
         }

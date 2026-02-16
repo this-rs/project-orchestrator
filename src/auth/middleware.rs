@@ -128,6 +128,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
         })
     }
 

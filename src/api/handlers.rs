@@ -46,6 +46,9 @@ pub struct ServerState {
     /// Public URL for reverse-proxy setups (e.g. https://ffs.dev).
     /// Used for CORS and OAuth origin whitelist when both desktop + web access is needed.
     pub public_url: Option<String>,
+    /// In-memory store for ephemeral WebSocket auth tickets.
+    /// Used as a fallback when cookies are not sent on WS upgrades (WKWebView).
+    pub ws_ticket_store: Arc<super::ws_auth::WsTicketStore>,
 }
 
 /// Shared orchestrator state
@@ -2017,6 +2020,7 @@ mod tests {
             setup_completed: true,
             server_port,
             public_url: public_url.map(|s| s.to_string()),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
         }
     }
 
