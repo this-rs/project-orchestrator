@@ -459,6 +459,19 @@ fn main() {
 }
 
 /// Close the splash screen and show the main application window.
+///
+/// The main window was initially created with `WebviewUrl::App("index.html")` to
+/// get an instant load while the backend starts. Now that the backend is confirmed
+/// healthy, we navigate the webview to `http://localhost:{port}/` so that all
+/// subsequent requests (REST, WS tickets, OIDC) are **same-origin**.
+///
+/// This is critical for auth: HttpOnly cookies set by `/auth/callback` are scoped
+/// to `localhost` — they are only sent on same-origin requests. From `tauri://`,
+/// `fetch(http://localhost:…)` is cross-origin and `SameSite=Lax` cookies are NOT
+/// sent, which breaks `/auth/refresh` (no cookie → no JWT → no WS ticket → 401).
+///
+/// The `capabilities/remote.json` grants full Tauri IPC permissions (invoke,
+/// event:listen, plugins) on `http://localhost:*` so everything keeps working.
 fn show_main_window(handle: &tauri::AppHandle) {
     // Close splash screen
     if let Some(splash) = handle.get_webview_window("splashscreen") {
@@ -469,6 +482,18 @@ fn show_main_window(handle: &tauri::AppHandle) {
 
     // Show main window
     if let Some(main_window) = handle.get_webview_window("main") {
+        // Navigate to the backend HTTP origin so all requests are same-origin.
+        // The backend serves the SPA (SERVE_FRONTEND=true), so this loads the
+        // exact same React app but from http://localhost:{port}/ instead of
+        // tauri://localhost/index.html.
+        let port = BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed);
+        let http_url = format!("http://localhost:{}/", port);
+        tracing::info!("Navigating main window to {} (same-origin for cookies)", http_url);
+        if let Ok(url) = http_url.parse() {
+            if let Err(e) = main_window.navigate(url) {
+                tracing::error!("Failed to navigate main window to {}: {}", http_url, e);
+            }
+        }
         // On macOS, apply native rounded corners + dark background BEFORE showing
         // the window to avoid any flash of white/square corners.
         // This does the same work as the JS `enableModernWindowStyle()` plugin,
