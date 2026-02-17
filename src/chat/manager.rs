@@ -6982,7 +6982,9 @@ mod tests {
         assert!(output.is_ok(), "callback should succeed");
 
         // 7. Verify CompactionStarted was broadcast on the events channel
-        let event = events_rx.try_recv().expect("Should have received CompactionStarted event");
+        let event = events_rx
+            .try_recv()
+            .expect("Should have received CompactionStarted event");
         assert!(
             matches!(event, ChatEvent::CompactionStarted { ref trigger } if trigger == "auto"),
             "Event should be CompactionStarted with trigger=auto, got: {:?}",
@@ -6992,7 +6994,11 @@ mod tests {
         // 8. Verify output is Sync with continue: true
         match output.unwrap() {
             nexus_claude::HookJSONOutput::Sync(sync) => {
-                assert_eq!(sync.continue_, Some(true), "Hook should return continue=true");
+                assert_eq!(
+                    sync.continue_,
+                    Some(true),
+                    "Hook should return continue=true"
+                );
             }
             other => panic!("Expected Sync output, got: {:?}", other),
         }
@@ -7058,7 +7064,10 @@ mod tests {
         let response: serde_json::Value =
             serde_json::from_str(&response_json_str).expect("Should be valid JSON");
 
-        assert_eq!(response["type"], "control_response", "type must be control_response");
+        assert_eq!(
+            response["type"], "control_response",
+            "type must be control_response"
+        );
 
         let resp = &response["response"];
         assert_eq!(resp["subtype"], "success", "subtype must be success");
@@ -7069,6 +7078,9 @@ mod tests {
 
         // The inner response should contain the hook output (continue: true)
         let inner = &resp["response"];
-        assert_eq!(inner["continue"], true, "Hook output should have continue=true");
+        assert_eq!(
+            inner["continue"], true,
+            "Hook output should have continue=true"
+        );
     }
 }
