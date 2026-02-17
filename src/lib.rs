@@ -414,6 +414,15 @@ pub struct Config {
     /// Chat permission config from YAML (if present).
     /// Priority: YAML > env vars > defaults.
     pub chat_permissions: Option<chat::config::PermissionConfig>,
+    /// Chat default model from YAML (if present).
+    /// Priority: YAML > env var (CHAT_DEFAULT_MODEL) > hardcoded default.
+    pub chat_default_model: Option<String>,
+    /// Chat max sessions from YAML (if present).
+    pub chat_max_sessions: Option<usize>,
+    /// Chat max turns from YAML (if present).
+    pub chat_max_turns: Option<i32>,
+    /// Chat session timeout from YAML (if present).
+    pub chat_session_timeout_secs: Option<u64>,
     /// Resolved path to the config.yaml file that was loaded (if any).
     /// Used for persisting runtime changes back to disk.
     pub config_yaml_path: Option<std::path::PathBuf>,
@@ -458,6 +467,10 @@ impl Config {
             frontend_path: std::env::var("FRONTEND_PATH").unwrap_or(yaml.server.frontend_path),
             public_url: std::env::var("PUBLIC_URL").ok().or(yaml.server.public_url),
             chat_permissions: yaml.chat.permissions,
+            chat_default_model: yaml.chat.default_model,
+            chat_max_sessions: yaml.chat.max_sessions,
+            chat_max_turns: yaml.chat.max_turns,
+            chat_session_timeout_secs: yaml.chat.session_timeout_secs,
             config_yaml_path: resolved_path,
         })
     }
@@ -679,6 +692,20 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // but YAML config takes precedence when present.
         if let Some(yaml_permissions) = &config.chat_permissions {
             chat_config.permission = yaml_permissions.clone();
+        }
+        // Override chat settings from YAML if present.
+        // Priority: YAML > env var > hardcoded default.
+        if let Some(ref model) = config.chat_default_model {
+            chat_config.default_model = model.clone();
+        }
+        if let Some(max_sessions) = config.chat_max_sessions {
+            chat_config.max_sessions = max_sessions;
+        }
+        if let Some(max_turns) = config.chat_max_turns {
+            chat_config.max_turns = max_turns;
+        }
+        if let Some(timeout_secs) = config.chat_session_timeout_secs {
+            chat_config.session_timeout = std::time::Duration::from_secs(timeout_secs);
         }
         let mut cm = chat::ChatManager::new(
             orchestrator.neo4j_arc(),

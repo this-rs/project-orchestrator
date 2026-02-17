@@ -86,6 +86,27 @@ fn default_true() -> bool {
     true
 }
 
+/// Normalize a model ID to the official Anthropic API format (`claude-{family}-{version}`).
+///
+/// Handles legacy IDs from old config.yaml files (e.g. `sonnet-4-5` → `claude-sonnet-4-6`)
+/// and ensures the `claude-` prefix is always present.
+fn normalize_model_id(raw: &str) -> String {
+    // Legacy model upgrades: old non-prefixed IDs → current prefixed IDs
+    match raw {
+        "sonnet-4-5" => return "claude-sonnet-4-6".into(),
+        "opus-4-5" => return "claude-opus-4-6".into(),
+        "opus-4-6" => return "claude-opus-4-6".into(),
+        "haiku-4-5" => return "claude-haiku-4-5".into(),
+        _ => {}
+    }
+    // If already prefixed, return as-is
+    if raw.starts_with("claude-") {
+        return raw.to_string();
+    }
+    // Unknown non-prefixed ID — add prefix
+    format!("claude-{raw}")
+}
+
 /// YAML-serializable config structure (matches backend config.yaml format).
 #[derive(Debug, Serialize)]
 struct YamlOutput {
@@ -844,7 +865,9 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         allowed_emails,
         nats_url,
         nats_enabled,
-        chat_model: yaml.chat.default_model.unwrap_or_else(|| "sonnet-4-5".into()),
+        chat_model: normalize_model_id(
+            &yaml.chat.default_model.unwrap_or_else(|| "claude-sonnet-4-6".into()),
+        ),
         chat_max_sessions: yaml.chat.max_sessions.unwrap_or(3) as u32,
         chat_max_turns: yaml.chat.max_turns.unwrap_or(50) as u32,
         chat_permission_mode: yaml.chat.permissions

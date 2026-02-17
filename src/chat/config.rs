@@ -120,7 +120,7 @@ impl ChatConfig {
         Self {
             mcp_server_path,
             default_model: std::env::var("CHAT_DEFAULT_MODEL")
-                .unwrap_or_else(|_| "claude-opus-4-6".into()),
+                .unwrap_or_else(|_| "claude-sonnet-4-6".into()),
             max_sessions: std::env::var("CHAT_MAX_SESSIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -230,7 +230,7 @@ mod tests {
     fn test_default_config() {
         let config = ChatConfig {
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
-            default_model: "claude-opus-4-6".into(),
+            default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),
             neo4j_uri: "bolt://localhost:7687".into(),
@@ -244,7 +244,7 @@ mod tests {
             permission: PermissionConfig::default(),
         };
 
-        assert_eq!(config.default_model, "claude-opus-4-6");
+        assert_eq!(config.default_model, "claude-sonnet-4-6");
         assert_eq!(config.max_sessions, 10);
         assert_eq!(config.session_timeout.as_secs(), 1800);
     }
@@ -263,7 +263,7 @@ mod tests {
         std::env::remove_var("CHAT_DISALLOWED_TOOLS");
 
         let config = ChatConfig::from_env();
-        assert_eq!(config.default_model, "claude-opus-4-6");
+        assert_eq!(config.default_model, "claude-sonnet-4-6");
         assert_eq!(config.max_sessions, 10);
         assert_eq!(config.session_timeout.as_secs(), 1800);
         // Permission defaults — MCP tools are pre-approved out of the box

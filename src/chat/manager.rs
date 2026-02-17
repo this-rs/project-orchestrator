@@ -3622,7 +3622,7 @@ mod tests {
     fn test_config() -> ChatConfig {
         ChatConfig {
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
-            default_model: "claude-opus-4-6".into(),
+            default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),
             neo4j_uri: "bolt://localhost:7687".into(),
@@ -3653,7 +3653,7 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        assert_eq!(manager.resolve_model(None), "claude-opus-4-6");
+        assert_eq!(manager.resolve_model(None), "claude-sonnet-4-6");
     }
 
     #[tokio::test]
