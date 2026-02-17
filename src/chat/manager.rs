@@ -3593,6 +3593,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_options_uses_config_permission_default() {
         // Default config uses "default" permission mode (safe-by-default)
+        // and pre-approves MCP tools out of the box
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
@@ -3600,7 +3601,7 @@ mod tests {
             .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None, None)
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
-        assert!(opts.allowed_tools.is_empty());
+        assert_eq!(opts.allowed_tools, vec!["mcp__project-orchestrator__*"]);
         assert!(opts.disallowed_tools.is_empty());
     }
 
@@ -3658,7 +3659,8 @@ mod tests {
 
         let config = manager.get_permission_config().await;
         assert_eq!(config.mode, "default");
-        assert!(config.allowed_tools.is_empty());
+        // MCP tools are pre-approved by default
+        assert_eq!(config.allowed_tools, vec!["mcp__project-orchestrator__*"]);
         assert!(config.disallowed_tools.is_empty());
     }
 

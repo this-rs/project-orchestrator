@@ -655,6 +655,8 @@ pub struct ClaudeSetupResult {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
+    /// Whether MCP tool permissions were pre-approved in settings.json.
+    pub allowed_tools_configured: bool,
 }
 
 /// Configure Claude Code to use the Project Orchestrator MCP server.
@@ -663,38 +665,47 @@ pub struct ClaudeSetupResult {
 /// 1. If already configured → returns immediately
 /// 2. Tries `claude mcp add` if CLI is available
 /// 3. Falls back to editing `~/.claude/mcp.json` directly
+///
+/// Also configures `~/.claude/settings.json` to pre-approve all MCP tools.
 #[tauri::command]
 pub fn setup_claude_code(server_url: Option<String>, port: Option<u16>) -> ClaudeSetupResult {
     match project_orchestrator::setup_claude::setup_claude_code(server_url.as_deref(), port) {
         Ok(result) => match result {
-            project_orchestrator::setup_claude::SetupResult::ConfiguredViaCli => ClaudeSetupResult {
+            project_orchestrator::setup_claude::SetupResult::ConfiguredViaCli {
+                allowed_tools_configured,
+            } => ClaudeSetupResult {
                 success: true,
                 method: "cli".into(),
                 message: "Claude Code configured via CLI (claude mcp add)".into(),
                 file_path: None,
+                allowed_tools_configured,
             },
-            project_orchestrator::setup_claude::SetupResult::ConfiguredViaFile { path } => {
-                ClaudeSetupResult {
-                    success: true,
-                    method: "file".into(),
-                    message: format!("Claude Code configured by editing {}", path.display()),
-                    file_path: Some(path.display().to_string()),
-                }
-            }
-            project_orchestrator::setup_claude::SetupResult::AlreadyConfigured => {
-                ClaudeSetupResult {
-                    success: true,
-                    method: "already_configured".into(),
-                    message: "Project Orchestrator is already configured in Claude Code".into(),
-                    file_path: None,
-                }
-            }
+            project_orchestrator::setup_claude::SetupResult::ConfiguredViaFile {
+                path,
+                allowed_tools_configured,
+            } => ClaudeSetupResult {
+                success: true,
+                method: "file".into(),
+                message: format!("Claude Code configured by editing {}", path.display()),
+                file_path: Some(path.display().to_string()),
+                allowed_tools_configured,
+            },
+            project_orchestrator::setup_claude::SetupResult::AlreadyConfigured {
+                allowed_tools_configured,
+            } => ClaudeSetupResult {
+                success: true,
+                method: "already_configured".into(),
+                message: "Project Orchestrator is already configured in Claude Code".into(),
+                file_path: None,
+                allowed_tools_configured,
+            },
         },
         Err(e) => ClaudeSetupResult {
             success: false,
             method: "error".into(),
             message: format!("Failed to configure: {}", e),
             file_path: None,
+            allowed_tools_configured: false,
         },
     }
 }

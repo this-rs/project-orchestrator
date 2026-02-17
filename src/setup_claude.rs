@@ -3,10 +3,14 @@
 //! Detects Claude Code CLI and configures the Project Orchestrator
 //! MCP server, either via `claude mcp add` or by directly editing
 //! `~/.claude/mcp.json`.
+//!
+//! Also configures `~/.claude/settings.json` to pre-approve all MCP tools
+//! from the Project Orchestrator server (`mcp__project-orchestrator__*`),
+//! so the user doesn't get a permission prompt for every tool call.
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ============================================================================
 // Types
@@ -16,11 +20,14 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub enum SetupResult {
     /// Successfully configured via `claude mcp add`
-    ConfiguredViaCli,
+    ConfiguredViaCli { allowed_tools_configured: bool },
     /// Successfully configured by writing to mcp.json directly
-    ConfiguredViaFile { path: PathBuf },
+    ConfiguredViaFile {
+        path: PathBuf,
+        allowed_tools_configured: bool,
+    },
     /// Already configured — no changes needed
-    AlreadyConfigured,
+    AlreadyConfigured { allowed_tools_configured: bool },
 }
 
 // ============================================================================
@@ -28,6 +35,11 @@ pub enum SetupResult {
 // ============================================================================
 
 const MCP_SERVER_NAME: &str = "project-orchestrator";
+
+/// Permission pattern that allows all MCP tools from the Project Orchestrator server.
+/// Format: `mcp__<server-name>__*` (Claude Code double-underscore convention).
+/// See: https://code.claude.com/docs/en/permissions#mcp
+const MCP_ALLOWED_TOOL_PATTERN: &str = "mcp__project-orchestrator__*";
 
 /// Build the default SSE URL using the given port.
 ///
@@ -53,17 +65,35 @@ pub fn setup_claude_code(server_url: Option<&str>, port: Option<u16>) -> Result<
     let default_url = default_sse_url(port.unwrap_or(8080));
     let url = server_url.unwrap_or(&default_url);
 
+    // Always try to configure allowed tools (idempotent — safe to call multiple times)
+    let allowed_tools_ok = match configure_allowed_tools() {
+        Ok(()) => {
+            tracing::info!("MCP allowed tools configured in settings.json");
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Failed to configure allowed tools in settings.json: {}", e);
+            false
+        }
+    };
+
     // Check if already configured
     if is_already_configured()? {
         tracing::info!("Project Orchestrator MCP server is already configured in Claude Code");
-        return Ok(SetupResult::AlreadyConfigured);
+        return Ok(SetupResult::AlreadyConfigured {
+            allowed_tools_configured: allowed_tools_ok,
+        });
     }
 
     // Try CLI first
     if let Some(claude_path) = detect_claude_cli() {
         tracing::info!("Claude Code CLI found at: {}", claude_path);
         match configure_via_cli(&claude_path, url) {
-            Ok(()) => return Ok(SetupResult::ConfiguredViaCli),
+            Ok(()) => {
+                return Ok(SetupResult::ConfiguredViaCli {
+                    allowed_tools_configured: allowed_tools_ok,
+                })
+            }
             Err(e) => {
                 tracing::warn!(
                     "Failed to configure via CLI ({}), falling back to mcp.json",
@@ -77,7 +107,10 @@ pub fn setup_claude_code(server_url: Option<&str>, port: Option<u16>) -> Result<
 
     // Fallback: edit mcp.json directly
     let path = configure_via_file(url)?;
-    Ok(SetupResult::ConfiguredViaFile { path })
+    Ok(SetupResult::ConfiguredViaFile {
+        path,
+        allowed_tools_configured: allowed_tools_ok,
+    })
 }
 
 /// Detect if Claude Code CLI is installed.
@@ -250,12 +283,111 @@ fn configure_via_file(url: &str) -> Result<PathBuf> {
 }
 
 // ============================================================================
+// Allowed tools configuration (settings.json)
+// ============================================================================
+
+/// Get the path to Claude Code's settings file.
+fn settings_json_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Cannot determine home directory")?;
+    Ok(home.join(".claude").join("settings.json"))
+}
+
+/// Configure allowed tools in `~/.claude/settings.json`.
+///
+/// Adds the `mcp__project-orchestrator__*` pattern to `permissions.allow`
+/// so all MCP tools from the Project Orchestrator server are pre-approved.
+///
+/// - Merges with existing settings (never overwrites)
+/// - Creates a backup (.bak) if the file already exists
+/// - Idempotent: safe to call multiple times
+pub fn configure_allowed_tools() -> Result<()> {
+    let path = settings_json_path()?;
+    configure_allowed_tools_at(&path)
+}
+
+/// Internal implementation that accepts a path (for testability).
+fn configure_allowed_tools_at(path: &Path) -> Result<()> {
+    // Read existing settings or create empty object
+    let mut json: Value = if path.exists() {
+        let content = std::fs::read_to_string(path).context("Failed to read settings.json")?;
+
+        // Create backup before modifying
+        let backup_path = path.with_extension("json.bak");
+        std::fs::copy(path, &backup_path).context("Failed to create backup of settings.json")?;
+        tracing::info!("Backup created at: {}", backup_path.display());
+
+        serde_json::from_str(&content).unwrap_or(Value::Object(Default::default()))
+    } else {
+        Value::Object(Default::default())
+    };
+
+    // Ensure top-level is an object
+    let obj = json
+        .as_object_mut()
+        .context("settings.json is not a JSON object")?;
+
+    // Ensure permissions object exists
+    if !obj.contains_key("permissions") {
+        obj.insert("permissions".to_string(), Value::Object(Default::default()));
+    }
+
+    let permissions = obj
+        .get_mut("permissions")
+        .and_then(|p| p.as_object_mut())
+        .context("permissions is not an object")?;
+
+    // Ensure allow array exists
+    if !permissions.contains_key("allow") {
+        permissions.insert("allow".to_string(), Value::Array(Vec::new()));
+    }
+
+    let allow = permissions
+        .get_mut("allow")
+        .and_then(|a| a.as_array_mut())
+        .context("permissions.allow is not an array")?;
+
+    // Check if the pattern is already present (idempotent)
+    let already_present = allow
+        .iter()
+        .any(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN));
+
+    if already_present {
+        tracing::info!(
+            "Pattern '{}' already in permissions.allow — skipping",
+            MCP_ALLOWED_TOOL_PATTERN
+        );
+        return Ok(());
+    }
+
+    // Add the pattern
+    allow.push(Value::String(MCP_ALLOWED_TOOL_PATTERN.to_string()));
+
+    // Create parent directory if needed
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create .claude directory")?;
+    }
+
+    // Write the updated settings
+    let formatted =
+        serde_json::to_string_pretty(&json).context("Failed to serialize settings JSON")?;
+    std::fs::write(path, formatted).context("Failed to write settings.json")?;
+
+    tracing::info!(
+        "Added '{}' to permissions.allow in: {}",
+        MCP_ALLOWED_TOOL_PATTERN,
+        path.display()
+    );
+    Ok(())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_detect_claude_cli() {
@@ -267,5 +399,151 @@ mod tests {
     fn test_mcp_json_path() {
         let path = mcp_json_path().unwrap();
         assert!(path.ends_with(".claude/mcp.json") || path.ends_with(".claude\\mcp.json"));
+    }
+
+    // ========================================================================
+    // configure_allowed_tools_at() tests
+    // ========================================================================
+
+    #[test]
+    fn test_configure_allowed_tools_new_file() {
+        // File doesn't exist → should create settings.json with correct structure
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        assert!(!path.exists());
+        configure_allowed_tools_at(&path).unwrap();
+        assert!(path.exists());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+
+        // Verify structure: { "permissions": { "allow": ["mcp__project-orchestrator__*"] } }
+        let allow = json["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 1);
+        assert_eq!(allow[0].as_str().unwrap(), MCP_ALLOWED_TOOL_PATTERN);
+    }
+
+    #[test]
+    fn test_configure_allowed_tools_merge() {
+        // Existing file with other permissions → should add MCP pattern without removing existing ones
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        let existing = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(git *)", "Read"]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        configure_allowed_tools_at(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+
+        let allow = json["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 3);
+        assert!(allow.iter().any(|v| v.as_str() == Some("Bash(git *)")));
+        assert!(allow.iter().any(|v| v.as_str() == Some("Read")));
+        assert!(allow
+            .iter()
+            .any(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN)));
+    }
+
+    #[test]
+    fn test_configure_allowed_tools_idempotent() {
+        // Called twice → pattern should appear only once
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        configure_allowed_tools_at(&path).unwrap();
+        configure_allowed_tools_at(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+
+        let allow = json["permissions"]["allow"].as_array().unwrap();
+        let count = allow
+            .iter()
+            .filter(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN))
+            .count();
+        assert_eq!(
+            count, 1,
+            "Pattern should appear exactly once after two calls"
+        );
+    }
+
+    #[test]
+    fn test_configure_allowed_tools_preserves_other_keys() {
+        // File with other top-level keys → they must be preserved
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        let existing = serde_json::json!({
+            "env": {
+                "ANTHROPIC_API_KEY": "sk-ant-xxx"
+            },
+            "enabledPlugins": ["code-review"],
+            "permissions": {
+                "deny": ["Bash(rm *)"]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        configure_allowed_tools_at(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let json: Value = serde_json::from_str(&content).unwrap();
+
+        // Other keys preserved
+        assert_eq!(
+            json["env"]["ANTHROPIC_API_KEY"].as_str().unwrap(),
+            "sk-ant-xxx"
+        );
+        assert_eq!(json["enabledPlugins"][0].as_str().unwrap(), "code-review");
+
+        // Deny array preserved
+        let deny = json["permissions"]["deny"].as_array().unwrap();
+        assert_eq!(deny.len(), 1);
+        assert_eq!(deny[0].as_str().unwrap(), "Bash(rm *)");
+
+        // Allow array created with our pattern
+        let allow = json["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 1);
+        assert_eq!(allow[0].as_str().unwrap(), MCP_ALLOWED_TOOL_PATTERN);
+    }
+
+    #[test]
+    fn test_configure_allowed_tools_backup() {
+        // Existing file → a .bak file should be created with original content
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        let original_content = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(git *)"]
+            }
+        });
+        let original_str = serde_json::to_string_pretty(&original_content).unwrap();
+        std::fs::write(&path, &original_str).unwrap();
+
+        configure_allowed_tools_at(&path).unwrap();
+
+        // Verify backup was created
+        let backup_path = path.with_extension("json.bak");
+        assert!(backup_path.exists(), "Backup file should exist");
+
+        // Verify backup contains the original content
+        let backup_content = std::fs::read_to_string(&backup_path).unwrap();
+        assert_eq!(backup_content, original_str);
+
+        // Verify the main file has been modified (has MCP pattern)
+        let modified_content = std::fs::read_to_string(&path).unwrap();
+        let json: Value = serde_json::from_str(&modified_content).unwrap();
+        let allow = json["permissions"]["allow"].as_array().unwrap();
+        assert!(allow
+            .iter()
+            .any(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN)));
     }
 }
