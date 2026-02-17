@@ -27,6 +27,10 @@ fn test_config() -> Config {
         frontend_path: "./dist".to_string(),
         public_url: None,
         chat_permissions: None,
+        chat_default_model: None,
+        chat_max_sessions: None,
+        chat_max_turns: None,
+        chat_session_timeout_secs: None,
         config_yaml_path: None,
     }
 }
