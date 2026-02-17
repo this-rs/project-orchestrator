@@ -1190,6 +1190,8 @@ use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteTy
 pub struct ProjectContext {
     pub project: Option<ProjectNode>,
     pub workspace: Option<WorkspaceNode>,
+    /// Other projects in the same workspace (excludes the current project)
+    pub sibling_projects: Vec<ProjectNode>,
     pub active_plans: Vec<PlanNode>,
     pub plan_constraints: Vec<ConstraintNode>,
     pub guidelines: Vec<Note>,
@@ -1227,11 +1229,21 @@ pub async fn fetch_project_context(
     ctx.last_synced = project.last_synced;
     ctx.project = Some(project);
 
-    // 2. Workspace
+    // 2. Workspace + sibling projects
     ctx.workspace = graph
         .get_project_workspace(project_id)
         .await
         .unwrap_or(None);
+
+    // 2b. Sibling projects (other projects in the same workspace)
+    if let Some(ref ws) = ctx.workspace {
+        let mut siblings = graph
+            .list_workspace_projects(ws.id)
+            .await
+            .unwrap_or_default();
+        siblings.retain(|p| p.id != project_id);
+        ctx.sibling_projects = siblings;
+    }
 
     // 3. Active plans for this project
     let (plans, _) = graph
@@ -1372,6 +1384,24 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
                 "slug": w.slug,
                 "description": w.description,
             }),
+        );
+    }
+
+    if !ctx.sibling_projects.is_empty() {
+        let siblings: Vec<_> = ctx
+            .sibling_projects
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.name,
+                    "slug": p.slug,
+                    "description": p.description,
+                })
+            })
+            .collect();
+        map.insert(
+            "sibling_projects".into(),
+            serde_json::Value::Array(siblings),
         );
     }
 
@@ -1557,6 +1587,18 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
         md.push_str(&format!("## Workspace : {} ({})\n", w.name, w.slug));
         if let Some(ref desc) = w.description {
             md.push_str(&format!("{}\n", desc));
+        }
+        md.push('\n');
+    }
+
+    if !ctx.sibling_projects.is_empty() {
+        md.push_str("## Projets du workspace\n");
+        for p in &ctx.sibling_projects {
+            if let Some(ref desc) = p.description {
+                md.push_str(&format!("- **{}** ({}) — {}\n", p.name, p.slug, desc));
+            } else {
+                md.push_str(&format!("- **{}** ({})\n", p.name, p.slug));
+            }
         }
         md.push('\n');
     }
@@ -2072,6 +2114,159 @@ mod tests {
         // Global guidelines include only global ones
         assert_eq!(ctx.global_guidelines.len(), 1);
         assert_eq!(ctx.global_guidelines[0].content, "Global team convention");
+    }
+
+    // ================================================================
+    // sibling_projects tests
+    // ================================================================
+
+    #[test]
+    fn test_context_to_json_with_sibling_projects() {
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "Current".into(),
+                slug: "current".into(),
+                root_path: "/tmp/current".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: None,
+            }),
+            sibling_projects: vec![
+                ProjectNode {
+                    id: uuid::Uuid::new_v4(),
+                    name: "SiblingA".into(),
+                    slug: "sibling-a".into(),
+                    root_path: "/tmp/a".into(),
+                    description: Some("First sibling".into()),
+                    created_at: Utc::now(),
+                    last_synced: None,
+                },
+                ProjectNode {
+                    id: uuid::Uuid::new_v4(),
+                    name: "SiblingB".into(),
+                    slug: "sibling-b".into(),
+                    root_path: "/tmp/b".into(),
+                    description: None,
+                    created_at: Utc::now(),
+                    last_synced: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let json = context_to_json(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let siblings = parsed["sibling_projects"].as_array().unwrap();
+        assert_eq!(siblings.len(), 2);
+        assert_eq!(siblings[0]["name"], "SiblingA");
+        assert_eq!(siblings[0]["slug"], "sibling-a");
+        assert_eq!(siblings[0]["description"], "First sibling");
+        assert_eq!(siblings[1]["name"], "SiblingB");
+        assert_eq!(siblings[1]["slug"], "sibling-b");
+        assert!(siblings[1]["description"].is_null());
+    }
+
+    #[test]
+    fn test_context_to_markdown_with_sibling_projects() {
+        let ctx = ProjectContext {
+            project: Some(ProjectNode {
+                id: uuid::Uuid::new_v4(),
+                name: "Current".into(),
+                slug: "current".into(),
+                root_path: "/tmp/current".into(),
+                description: None,
+                created_at: Utc::now(),
+                last_synced: Some(Utc::now()),
+            }),
+            workspace: Some(WorkspaceNode {
+                id: uuid::Uuid::new_v4(),
+                name: "MyWorkspace".into(),
+                slug: "my-ws".into(),
+                description: None,
+                created_at: Utc::now(),
+                updated_at: None,
+                metadata: serde_json::json!({}),
+            }),
+            sibling_projects: vec![
+                ProjectNode {
+                    id: uuid::Uuid::new_v4(),
+                    name: "Backend".into(),
+                    slug: "backend".into(),
+                    root_path: "/tmp/backend".into(),
+                    description: Some("The API server".into()),
+                    created_at: Utc::now(),
+                    last_synced: None,
+                },
+                ProjectNode {
+                    id: uuid::Uuid::new_v4(),
+                    name: "Frontend".into(),
+                    slug: "frontend".into(),
+                    root_path: "/tmp/frontend".into(),
+                    description: None,
+                    created_at: Utc::now(),
+                    last_synced: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let md = context_to_markdown(&ctx, None);
+        assert!(md.contains("## Projets du workspace"));
+        assert!(md.contains("**Backend** (backend) — The API server"));
+        assert!(md.contains("**Frontend** (frontend)"));
+        // No description → no " — " suffix
+        assert!(!md.contains("**Frontend** (frontend) —"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_project_context_with_sibling_projects() {
+        use crate::test_helpers::{mock_app_state, test_project_named, test_workspace};
+
+        let state = mock_app_state();
+        let ws = test_workspace();
+        state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let project_a = test_project_named("ProjectA");
+        state.neo4j.create_project(&project_a).await.unwrap();
+        state
+            .neo4j
+            .add_project_to_workspace(ws.id, project_a.id)
+            .await
+            .unwrap();
+
+        let project_b = test_project_named("ProjectB");
+        state.neo4j.create_project(&project_b).await.unwrap();
+        state
+            .neo4j
+            .add_project_to_workspace(ws.id, project_b.id)
+            .await
+            .unwrap();
+
+        let ctx = fetch_project_context(&state.neo4j, &project_a.slug)
+            .await
+            .unwrap();
+
+        assert!(ctx.project.is_some());
+        assert_eq!(ctx.project.as_ref().unwrap().name, "ProjectA");
+        assert!(ctx.workspace.is_some());
+        assert_eq!(ctx.sibling_projects.len(), 1);
+        assert_eq!(ctx.sibling_projects[0].name, "ProjectB");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_project_context_no_siblings_without_workspace() {
+        use crate::test_helpers::{mock_app_state, test_project};
+
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        let ctx = fetch_project_context(&state.neo4j, &project.slug)
+            .await
+            .unwrap();
+
+        assert!(ctx.project.is_some());
+        assert!(ctx.workspace.is_none());
+        assert!(ctx.sibling_projects.is_empty());
     }
 
     #[test]
