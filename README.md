@@ -8,12 +8,27 @@
   <strong>Coordinate AI coding agents with a shared knowledge graph.</strong>
 </p>
 
-Project Orchestrator gives your AI agents a shared brain. Instead of each agent starting from scratch, they share code understanding, plans, decisions, and progress through a central knowledge base.
+<p align="center">
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_aarch64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="40"></a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_x64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" height="40"></a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_amd64.AppImage"><img src="https://img.shields.io/badge/Download_for_Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" height="40"></a>
+</p>
 
-[![CI](https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/this-rs/project-orchestrator/branch/main/graph/badge.svg)](https://codecov.io/gh/this-rs/project-orchestrator)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
+<p align="center">
+  <a href="#desktop-app">All download options (Intel Mac, .msi, .deb, .rpm...)</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml"><img src="https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/this-rs/project-orchestrator"><img src="https://codecov.io/gh/this-rs/project-orchestrator/branch/main/graph/badge.svg" alt="codecov"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.75+-orange.svg" alt="Rust"></a>
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest"><img src="https://img.shields.io/github/v/release/this-rs/project-orchestrator?label=release" alt="Latest Release"></a>
+</p>
+
+Project Orchestrator gives your AI agents a shared brain. Instead of each agent starting from scratch, they share code understanding, plans, decisions, and progress through a central knowledge base.
 
 ---
 
@@ -24,19 +39,99 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 - **Plan & Task Management** — Structured workflows with dependencies, steps, and progress tracking
 - **Multi-Language Parsing** — Tree-sitter support for Rust, TypeScript, Python, Go, and 8 more languages
 - **Multi-Project Workspaces** — Group related projects with shared context, contracts, and milestones
-- **MCP Integration** — 145 tools available for Claude Code, OpenAI Agents, and Cursor
+- **MCP Integration** — 130 tools available for Claude Code, OpenAI Agents, and Cursor
 - **Auto-Sync** — File watcher keeps the knowledge base updated as you code
 - **Authentication** — Google OAuth2, OIDC, and Password login with deny-by-default security
 - **Chat WebSocket** — Real-time conversational AI via Claude integration
 - **Event System** — Live CRUD notifications via WebSocket
 - **NATS Integration** — Inter-process event sync for multi-instance deployments
-- **YAML Configuration** — Hierarchical config with env var overrides
 
 ---
 
-## Quick Start
+## Installation
 
-### 1. Start the backend services
+### Desktop App
+
+Download the desktop app for your platform:
+
+| Platform | Download | Type |
+|----------|----------|------|
+| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_aarch64.dmg) | M1/M2/M3/M4 |
+| **macOS** (Intel) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_x64.dmg) | Intel Mac |
+| **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_x64-setup.exe) | Installer |
+| **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_x64_en-US.msi) | MSI |
+| **Linux** (64-bit) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_amd64.AppImage) | Universal |
+| **Linux** (Debian/Ubuntu) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.1-1_amd64.deb) | apt/dpkg |
+| **Linux** (Fedora/RHEL) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.1-1.x86_64.rpm) | dnf/rpm |
+
+> All releases are available on the [Releases page](https://github.com/this-rs/project-orchestrator/releases/latest).
+
+---
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew install this-rs/tap/project-orchestrator
+```
+
+This installs `orchestrator`, `orch` (CLI shorthand), and `mcp_server`.
+
+---
+
+### Shell Script (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.sh | sh
+```
+
+Options:
+
+```bash
+# Install a specific version
+curl -fsSL https://…/install.sh | sh -s -- --version 0.0.1
+
+# Install without the embedded frontend (lighter)
+curl -fsSL https://…/install.sh | sh -s -- --no-frontend
+
+# Custom install directory
+curl -fsSL https://…/install.sh | sh -s -- --install-dir /usr/local/bin
+```
+
+---
+
+### PowerShell (Windows)
+
+```powershell
+irm https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.ps1 | iex
+```
+
+---
+
+### npm / npx
+
+```bash
+# Run directly without installing
+npx @anthropic/project-orchestrator
+
+# Or install globally
+npm install -g @anthropic/project-orchestrator
+```
+
+> *Coming soon — npm package not yet published.*
+
+---
+
+### Docker
+
+```bash
+# Full (with embedded frontend)
+docker pull ghcr.io/this-rs/project-orchestrator:latest
+
+# API-only (lighter, no frontend)
+docker pull ghcr.io/this-rs/project-orchestrator:latest-api
+```
+
+Or use Docker Compose with all services (Neo4j, Meilisearch, NATS):
 
 ```bash
 git clone https://github.com/this-rs/project-orchestrator.git
@@ -44,10 +139,60 @@ cd project-orchestrator
 docker compose up -d
 ```
 
-**Or install the pre-built binary:**
+---
+
+### Debian / Ubuntu (apt)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.sh | sh
+# Download and install the .deb package
+curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.1-1_amd64.deb
+sudo dpkg -i project-orchestrator_0.0.1-1_amd64.deb
+
+# Start the service
+sudo systemctl enable --now project-orchestrator
+```
+
+---
+
+### Fedora / RHEL (rpm)
+
+```bash
+# Download and install the .rpm package
+curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.1-1.x86_64.rpm
+sudo rpm -i project-orchestrator-0.0.1-1.x86_64.rpm
+```
+
+---
+
+### Build from Source
+
+```bash
+git clone https://github.com/this-rs/project-orchestrator.git
+cd project-orchestrator
+cargo build --release
+
+# Binaries in target/release/:
+#   orchestrator  — main server
+#   orch          — CLI shorthand
+#   mcp_server    — MCP server for AI tools
+```
+
+---
+
+## Quick Start
+
+### 1. Start the backend services
+
+The server requires **Neo4j** and **Meilisearch**. The easiest way is Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+Then start the orchestrator:
+
+```bash
+orchestrator serve
 ```
 
 ### 2. Configure your AI tool
@@ -58,7 +203,7 @@ Add to your MCP configuration (e.g., `~/.claude/mcp.json`):
 {
   "mcpServers": {
     "project-orchestrator": {
-      "command": "/path/to/mcp_server",
+      "command": "mcp_server",
       "env": {
         "NEO4J_URI": "bolt://localhost:7687",
         "NEO4J_USER": "neo4j",
@@ -82,7 +227,7 @@ Add to your MCP configuration (e.g., `~/.claude/mcp.json`):
 # - sync_project: Parse and index your code
 # - create_plan: Start a development plan
 # - create_workspace: Group related projects
-# - And 141 more tools...
+# - And 126 more tools...
 ```
 
 That's it! Your AI agents now have shared context.
@@ -138,7 +283,7 @@ That's it! Your AI agents now have shared context.
 | [Installation](docs/setup/installation.md) | Full setup instructions and configuration |
 | [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
 | [API Reference](docs/api/reference.md) | Complete REST API documentation |
-| [MCP Tools](docs/api/mcp-tools.md) | All 145 MCP tools with examples |
+| [MCP Tools](docs/api/mcp-tools.md) | All 130 MCP tools with examples |
 | [Workspaces](docs/guides/workspaces.md) | Multi-project coordination |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
 | [Authentication](docs/guides/authentication.md) | JWT + OAuth/OIDC + Password auth setup |
@@ -199,7 +344,7 @@ chat:
            ▼                  ▼                   ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  PROJECT ORCHESTRATOR                        │
-│                    (145 MCP Tools)                           │
+│                    (130 MCP Tools)                           │
 │                                                             │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
 │  │   Auth   │  │   Chat   │  │  Events  │  │   Config   │  │
