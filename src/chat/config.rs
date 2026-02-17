@@ -110,6 +110,10 @@ pub struct ChatConfig {
     pub prompt_builder_model: String,
     /// Permission configuration (mode + allowed/disallowed tool patterns)
     pub permission: PermissionConfig,
+    /// Whether to use an oneshot LLM call to refine project context in the system prompt.
+    /// When `false`, falls back to static markdown rendering (useful in tests to avoid
+    /// spawning a real Claude CLI subprocess).
+    pub enable_oneshot_refinement: bool,
 }
 
 impl ChatConfig {
@@ -168,6 +172,9 @@ impl ChatConfig {
                     })
                     .unwrap_or_default(),
             },
+            enable_oneshot_refinement: std::env::var("CHAT_ENABLE_ONESHOT_REFINEMENT")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
         }
     }
 
@@ -242,6 +249,7 @@ mod tests {
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
+            enable_oneshot_refinement: true,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -363,6 +371,7 @@ mod tests {
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
+            enable_oneshot_refinement: true,
         };
 
         let json = config.mcp_server_config();
@@ -388,6 +397,7 @@ mod tests {
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
+            enable_oneshot_refinement: true,
         };
 
         let json = config.mcp_server_config();
