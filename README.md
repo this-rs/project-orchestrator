@@ -9,9 +9,15 @@
 </p>
 
 <p align="center">
-  <a href="#desktop-app"><img src="https://img.shields.io/badge/macOS-Download-000?logo=apple&logoColor=white" alt="macOS"></a>
-  <a href="#desktop-app"><img src="https://img.shields.io/badge/Windows-Download-0078D4?logo=windows&logoColor=white" alt="Windows"></a>
-  <a href="#desktop-app"><img src="https://img.shields.io/badge/Linux-Download-FCC624?logo=linux&logoColor=black" alt="Linux"></a>
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_aarch64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="40"></a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_x64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" height="40"></a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.1_amd64.AppImage"><img src="https://img.shields.io/badge/Download_for_Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" height="40"></a>
+</p>
+
+<p align="center">
+  <a href="#desktop-app">All download options (Intel Mac, .msi, .deb, .rpm...)</a>
 </p>
 
 <p align="center">
