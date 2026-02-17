@@ -1031,6 +1031,7 @@ impl ChatManager {
             .max_turns(self.config.max_turns)
             .include_partial_messages(true)
             .permission_prompt_tool_name("stdio")
+            .cli_channel_buffer_size(8192)
             .add_mcp_server("project-orchestrator", mcp_config);
 
         // Wire allowed/disallowed tool patterns from config
