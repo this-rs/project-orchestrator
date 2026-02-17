@@ -21,6 +21,7 @@ use crate::neo4j::GraphStore;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use nexus_claude::{
+    build_hook_response_json, dispatch_hook_from_registry, is_hook_callback,
     memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
@@ -1337,6 +1338,17 @@ impl ChatManager {
             .await
             .map_err(|e| anyhow!("Failed to connect InteractiveClient: {}", e))?;
 
+        // Initialize hooks with the CLI (sends PreCompact, etc. registrations).
+        // Must be called AFTER connect() and BEFORE take_sdk_control_receiver().
+        // Graceful: warn on failure but don't abort the session.
+        if let Err(e) = client.initialize_hooks().await {
+            warn!(
+                session_id = %session_id,
+                "Failed to initialize hooks with CLI (non-fatal): {}",
+                e
+            );
+        }
+
         // Create ConversationMemoryManager for message recording
         let memory_manager = if let Some(ref mem_config) = self.memory_config {
             let mm = ConversationMemoryManager::new(mem_config.clone());
@@ -1664,6 +1676,14 @@ impl ChatManager {
             }
         };
 
+        // Extract hook callbacks registry BEFORE taking the long-lived client lock.
+        // This Arc<RwLock<>> allows dispatching hook_callbacks inside the select! loop
+        // without needing to re-lock the client (which is held by the stream).
+        let hook_callbacks_registry = {
+            let c = client.lock().await;
+            c.hook_callbacks()
+        };
+
         {
             let mut c = client.lock().await;
             let stream_result = c.send_and_receive_stream(prompt).await;
@@ -1777,6 +1797,24 @@ impl ChatManager {
                         control_msg = rx.recv() => {
                             match control_msg {
                                 Some(msg) => {
+                                    // Hook callbacks: dispatch via lock-free registry, send response via stdin_tx
+                                    if is_hook_callback(&msg) {
+                                        let request_id = msg.get("request_id")
+                                            .or_else(|| msg.get("request").and_then(|r| r.get("request_id")))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if let Some(result) = dispatch_hook_from_registry(&msg, &hook_callbacks_registry).await {
+                                            info!(session_id = %session_id, request_id = %request_id, "Hook callback dispatched");
+                                            if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                let response_json = build_hook_response_json(&request_id, &result);
+                                                let _ = tx.send(response_json).await;
+                                                debug!(request_id = %request_id, "Hook response sent to CLI");
+                                            }
+                                        }
+                                        continue;
+                                    }
+
                                     if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                         // AskUserQuestion: auto-allow the control request so the CLI
                                         // waits for the tool_result (user's answer) instead of blocking.
@@ -1822,6 +1860,23 @@ impl ChatManager {
                                 Some(result) => {
                                     // Also drain any buffered control messages
                                     while let Ok(msg) = rx.try_recv() {
+                                        // Hook callbacks: dispatch inline (same as select! branch)
+                                        if is_hook_callback(&msg) {
+                                            let request_id = msg.get("request_id")
+                                                .or_else(|| msg.get("request").and_then(|r| r.get("request_id")))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            if let Some(result) = dispatch_hook_from_registry(&msg, &hook_callbacks_registry).await {
+                                                info!(session_id = %session_id, request_id = %request_id, "Hook callback dispatched (drain)");
+                                                if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                    let response_json = build_hook_response_json(&request_id, &result);
+                                                    let _ = tx.try_send(response_json);
+                                                }
+                                            }
+                                            continue;
+                                        }
+
                                         if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                             // AskUserQuestion: auto-allow (same logic as above)
                                             if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
@@ -2833,6 +2888,17 @@ impl ChatManager {
             .connect()
             .await
             .map_err(|e| anyhow!("Failed to connect resumed InteractiveClient: {}", e))?;
+
+        // Initialize hooks with the CLI (sends PreCompact, etc. registrations).
+        // Must be called AFTER connect() and BEFORE take_sdk_control_receiver().
+        // Graceful: warn on failure but don't abort the session.
+        if let Err(e) = client.initialize_hooks().await {
+            warn!(
+                session_id = %session_id,
+                "Failed to initialize hooks on resume (non-fatal): {}",
+                e
+            );
+        }
 
         // Take the SDK control receiver ONCE at session resume.
         let sdk_control_rx = client.take_sdk_control_receiver().await;
@@ -6844,5 +6910,165 @@ mod tests {
 
         // No event should be broadcast for non-PreCompact hooks
         assert!(rx.try_recv().is_err());
+    }
+
+    // ====================================================================
+    // Hook dispatch e2e (CompactionNotifier + dispatch_hook_from_registry)
+    // ====================================================================
+
+    /// E2E test: simulates the full hook_callback flow as it happens in stream_response.
+    ///
+    /// 1. Create a CompactionNotifier with a broadcast channel
+    /// 2. Register it via InteractiveClient::initialize_hooks()
+    /// 3. Clone the hook_callbacks registry (like stream_response does)
+    /// 4. Build a hook_callback JSON message (like the CLI would send)
+    /// 5. Dispatch via dispatch_hook_from_registry (lock-free)
+    /// 6. Verify CompactionStarted was broadcast
+    /// 7. Verify the hook output is continue: true
+    #[tokio::test]
+    async fn test_compaction_hook_e2e_dispatch_broadcasts_event() {
+        use nexus_claude::transport::mock::MockTransport;
+        use nexus_claude::{dispatch_hook_from_registry, HookMatcher, InteractiveClient};
+
+        // 1. Create CompactionNotifier backed by a broadcast channel
+        let (events_tx, mut events_rx) = broadcast::channel::<ChatEvent>(16);
+        let notifier = CompactionNotifier::new(events_tx);
+
+        // 2. Build hooks map and initialize
+        let mut hooks = std::collections::HashMap::new();
+        hooks.insert(
+            "PreCompact".to_string(),
+            vec![HookMatcher {
+                matcher: None,
+                hooks: vec![std::sync::Arc::new(notifier)],
+            }],
+        );
+
+        let (transport, _handle) = MockTransport::pair();
+        let client = InteractiveClient::from_transport_with_hooks(transport, hooks);
+        client.initialize_hooks().await.unwrap();
+
+        // 3. Clone registry (this is what stream_response does before the select! loop)
+        let registry = client.hook_callbacks();
+
+        // 4. Get the callback_id that was generated
+        let callback_id = {
+            let cbs = registry.read().await;
+            assert_eq!(cbs.len(), 1, "Should have exactly one registered callback");
+            cbs.keys().next().unwrap().clone()
+        };
+
+        // 5. Build a hook_callback control message (simulating what the CLI sends)
+        let control_msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req-e2e-001",
+            "request": {
+                "subtype": "hook_callback",
+                "callback_id": callback_id,
+                "input": {
+                    "hook_event_name": "PreCompact",
+                    "session_id": "test-session-e2e",
+                    "transcript_path": "/tmp/transcript.json",
+                    "cwd": "/home/user/project",
+                    "trigger": "auto"
+                }
+            }
+        });
+
+        // 6. Dispatch (lock-free, just like stream_response does)
+        let result = dispatch_hook_from_registry(&control_msg, &registry).await;
+        assert!(result.is_some(), "dispatch should find the callback");
+        let output = result.unwrap();
+        assert!(output.is_ok(), "callback should succeed");
+
+        // 7. Verify CompactionStarted was broadcast on the events channel
+        let event = events_rx.try_recv().expect("Should have received CompactionStarted event");
+        assert!(
+            matches!(event, ChatEvent::CompactionStarted { ref trigger } if trigger == "auto"),
+            "Event should be CompactionStarted with trigger=auto, got: {:?}",
+            event
+        );
+
+        // 8. Verify output is Sync with continue: true
+        match output.unwrap() {
+            nexus_claude::HookJSONOutput::Sync(sync) => {
+                assert_eq!(sync.continue_, Some(true), "Hook should return continue=true");
+            }
+            other => panic!("Expected Sync output, got: {:?}", other),
+        }
+    }
+
+    /// Test that build_hook_response_json produces valid JSON that would be sent to CLI.
+    /// Verifies the format matches what the CLI expects as a control_response.
+    #[tokio::test]
+    async fn test_hook_response_sent_to_cli_format() {
+        use nexus_claude::transport::mock::MockTransport;
+        use nexus_claude::{
+            build_hook_response_json, dispatch_hook_from_registry, HookMatcher, InteractiveClient,
+        };
+
+        // Setup: CompactionNotifier + initialize + dispatch
+        let (events_tx, _events_rx) = broadcast::channel::<ChatEvent>(16);
+        let notifier = CompactionNotifier::new(events_tx);
+
+        let mut hooks = std::collections::HashMap::new();
+        hooks.insert(
+            "PreCompact".to_string(),
+            vec![HookMatcher {
+                matcher: None,
+                hooks: vec![std::sync::Arc::new(notifier)],
+            }],
+        );
+
+        let (transport, _handle) = MockTransport::pair();
+        let client = InteractiveClient::from_transport_with_hooks(transport, hooks);
+        client.initialize_hooks().await.unwrap();
+
+        let registry = client.hook_callbacks();
+        let callback_id = {
+            let cbs = registry.read().await;
+            cbs.keys().next().unwrap().clone()
+        };
+
+        let request_id = "req-response-test-001";
+        let control_msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "hook_callback",
+                "callback_id": callback_id,
+                "input": {
+                    "hook_event_name": "PreCompact",
+                    "session_id": "sess-resp",
+                    "transcript_path": "/tmp/t.json",
+                    "cwd": "/home",
+                    "trigger": "manual"
+                }
+            }
+        });
+
+        let result = dispatch_hook_from_registry(&control_msg, &registry)
+            .await
+            .expect("Should dispatch");
+
+        // Build the response JSON (this is what stream_response sends via stdin_tx)
+        let response_json_str = build_hook_response_json(request_id, &result);
+
+        // Parse and verify structure
+        let response: serde_json::Value =
+            serde_json::from_str(&response_json_str).expect("Should be valid JSON");
+
+        assert_eq!(response["type"], "control_response", "type must be control_response");
+
+        let resp = &response["response"];
+        assert_eq!(resp["subtype"], "success", "subtype must be success");
+        assert_eq!(
+            resp["request_id"], request_id,
+            "request_id must match the original"
+        );
+
+        // The inner response should contain the hook output (continue: true)
+        let inner = &resp["response"];
+        assert_eq!(inner["continue"], true, "Hook output should have continue=true");
     }
 }
