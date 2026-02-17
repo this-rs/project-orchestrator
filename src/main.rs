@@ -114,7 +114,9 @@ fn run_setup_claude(url: Option<&str>, port: u16) {
     let default_url = format!("http://localhost:{}/mcp/sse", port);
 
     match setup_claude::setup_claude_code(url, Some(port)) {
-        Ok(setup_claude::SetupResult::ConfiguredViaCli { allowed_tools_configured }) => {
+        Ok(setup_claude::SetupResult::ConfiguredViaCli {
+            allowed_tools_configured,
+        }) => {
             println!("  Claude Code configured via CLI.");
             if allowed_tools_configured {
                 println!("  MCP tools pre-approved in settings.json.");
@@ -123,7 +125,10 @@ fn run_setup_claude(url: Option<&str>, port: u16) {
             println!("  The MCP server has been added. You can verify with:");
             println!("    claude mcp list");
         }
-        Ok(setup_claude::SetupResult::ConfiguredViaFile { path, allowed_tools_configured }) => {
+        Ok(setup_claude::SetupResult::ConfiguredViaFile {
+            path,
+            allowed_tools_configured,
+        }) => {
             println!("  Claude Code configured via {}.", path.display());
             if allowed_tools_configured {
                 println!("  MCP tools pre-approved in settings.json.");
@@ -132,7 +137,9 @@ fn run_setup_claude(url: Option<&str>, port: u16) {
             println!("  The MCP server entry has been added to your mcp.json.");
             println!("  Restart Claude Code to pick up the changes.");
         }
-        Ok(setup_claude::SetupResult::AlreadyConfigured { allowed_tools_configured }) => {
+        Ok(setup_claude::SetupResult::AlreadyConfigured {
+            allowed_tools_configured,
+        }) => {
             println!("  Project Orchestrator is already configured in Claude Code.");
             if allowed_tools_configured {
                 println!("  MCP tools pre-approved in settings.json.");

@@ -854,7 +854,10 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["mode"], "default");
-        assert_eq!(json["allowed_tools"].as_array().unwrap().len(), 0);
+        // MCP tools are pre-approved by default
+        let allowed = json["allowed_tools"].as_array().unwrap();
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0], "mcp__project-orchestrator__*");
         assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
         // default_model is now included from ChatConfig
         assert!(
@@ -953,7 +956,7 @@ mod tests {
     async fn test_update_chat_permissions_partial_json() {
         let app = test_app_with_chat().await;
 
-        // Only set mode, allowed_tools/disallowed_tools default to empty
+        // Only set mode — allowed_tools defaults to MCP tools, disallowed_tools defaults to empty
         let resp = app
             .oneshot(auth_put(
                 "/api/chat/config/permissions",
@@ -968,7 +971,10 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["mode"], "acceptEdits");
-        assert_eq!(json["allowed_tools"].as_array().unwrap().len(), 0);
+        // MCP tools pre-approved by default when allowed_tools is not specified
+        let allowed = json["allowed_tools"].as_array().unwrap();
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0], "mcp__project-orchestrator__*");
         assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
     }
 }

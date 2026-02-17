@@ -12,8 +12,10 @@ pub struct PermissionConfig {
     /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions"
     #[serde(default = "PermissionConfig::default_mode")]
     pub mode: String,
-    /// Tool patterns to explicitly allow (e.g. "Bash(git *)", "mcp__project-orchestrator__*")
-    #[serde(default)]
+    /// Tool patterns to explicitly allow (e.g. "Bash(git *)", "mcp__project-orchestrator__*").
+    /// Defaults to [`DEFAULT_ALLOWED_TOOLS`] when absent from config, ensuring MCP tools
+    /// are usable out of the box.
+    #[serde(default = "PermissionConfig::default_allowed_tools")]
     pub allowed_tools: Vec<String>,
     /// Tool patterns to explicitly disallow (e.g. "Bash(rm -rf *)", "Bash(sudo *)")
     #[serde(default)]
@@ -52,13 +54,31 @@ impl PermissionConfig {
     pub fn is_valid_mode(mode: &str) -> bool {
         Self::valid_modes().contains(&mode)
     }
+
+    /// Default allowed tool patterns (MCP tools pre-approved out of the box).
+    pub fn default_allowed_tools() -> Vec<String> {
+        DEFAULT_ALLOWED_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
 }
+
+/// Default allowed tool patterns applied when no explicit configuration is provided.
+///
+/// These ensure that MCP tools from the Project Orchestrator server are usable
+/// out of the box, without requiring the user to manually add them via the
+/// chat settings page or config.yaml.
+pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &["mcp__project-orchestrator__*"];
 
 impl Default for PermissionConfig {
     fn default() -> Self {
         Self {
             mode: Self::default_mode(),
-            allowed_tools: Vec::new(),
+            allowed_tools: DEFAULT_ALLOWED_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             disallowed_tools: Vec::new(),
         }
     }
@@ -137,7 +157,7 @@ impl ChatConfig {
                             .filter(|t| !t.is_empty())
                             .collect()
                     })
-                    .unwrap_or_default(),
+                    .unwrap_or_else(PermissionConfig::default_allowed_tools),
                 disallowed_tools: std::env::var("CHAT_DISALLOWED_TOOLS")
                     .ok()
                     .map(|s| {
@@ -246,9 +266,12 @@ mod tests {
         assert_eq!(config.default_model, "claude-opus-4-6");
         assert_eq!(config.max_sessions, 10);
         assert_eq!(config.session_timeout.as_secs(), 1800);
-        // Permission defaults
+        // Permission defaults — MCP tools are pre-approved out of the box
         assert_eq!(config.permission.mode, "default");
-        assert!(config.permission.allowed_tools.is_empty());
+        assert_eq!(
+            config.permission.allowed_tools,
+            vec!["mcp__project-orchestrator__*"]
+        );
         assert!(config.permission.disallowed_tools.is_empty());
 
         // Phase 2: custom values
@@ -378,7 +401,8 @@ mod tests {
     fn test_permission_config_defaults() {
         let config = PermissionConfig::default();
         assert_eq!(config.mode, "default");
-        assert!(config.allowed_tools.is_empty());
+        // MCP tools are pre-approved by default
+        assert_eq!(config.allowed_tools, vec!["mcp__project-orchestrator__*"]);
         assert!(config.disallowed_tools.is_empty());
     }
 
@@ -460,14 +484,20 @@ mod tests {
 
     #[test]
     fn test_permission_config_serde_defaults() {
-        // Empty JSON should use defaults
+        // Empty JSON should use defaults — MCP tools pre-approved
         let config: PermissionConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(config.mode, "default");
-        assert!(config.allowed_tools.is_empty());
+        assert_eq!(config.allowed_tools, vec!["mcp__project-orchestrator__*"]);
         assert!(config.disallowed_tools.is_empty());
 
         // Partial JSON should fill defaults
         let config: PermissionConfig = serde_json::from_str(r#"{"mode":"default"}"#).unwrap();
+        assert_eq!(config.mode, "default");
+        assert_eq!(config.allowed_tools, vec!["mcp__project-orchestrator__*"]);
+
+        // Explicit empty array should be respected (user intent to disable)
+        let config: PermissionConfig =
+            serde_json::from_str(r#"{"mode":"default","allowed_tools":[]}"#).unwrap();
         assert_eq!(config.mode, "default");
         assert!(config.allowed_tools.is_empty());
     }

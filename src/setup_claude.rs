@@ -20,18 +20,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub enum SetupResult {
     /// Successfully configured via `claude mcp add`
-    ConfiguredViaCli {
-        allowed_tools_configured: bool,
-    },
+    ConfiguredViaCli { allowed_tools_configured: bool },
     /// Successfully configured by writing to mcp.json directly
     ConfiguredViaFile {
         path: PathBuf,
         allowed_tools_configured: bool,
     },
     /// Already configured — no changes needed
-    AlreadyConfigured {
-        allowed_tools_configured: bool,
-    },
+    AlreadyConfigured { allowed_tools_configured: bool },
 }
 
 // ============================================================================
@@ -313,13 +309,11 @@ pub fn configure_allowed_tools() -> Result<()> {
 fn configure_allowed_tools_at(path: &Path) -> Result<()> {
     // Read existing settings or create empty object
     let mut json: Value = if path.exists() {
-        let content =
-            std::fs::read_to_string(path).context("Failed to read settings.json")?;
+        let content = std::fs::read_to_string(path).context("Failed to read settings.json")?;
 
         // Create backup before modifying
         let backup_path = path.with_extension("json.bak");
-        std::fs::copy(path, &backup_path)
-            .context("Failed to create backup of settings.json")?;
+        std::fs::copy(path, &backup_path).context("Failed to create backup of settings.json")?;
         tracing::info!("Backup created at: {}", backup_path.display());
 
         serde_json::from_str(&content).unwrap_or(Value::Object(Default::default()))
@@ -334,10 +328,7 @@ fn configure_allowed_tools_at(path: &Path) -> Result<()> {
 
     // Ensure permissions object exists
     if !obj.contains_key("permissions") {
-        obj.insert(
-            "permissions".to_string(),
-            Value::Object(Default::default()),
-        );
+        obj.insert("permissions".to_string(), Value::Object(Default::default()));
     }
 
     let permissions = obj
@@ -455,7 +446,9 @@ mod tests {
         assert_eq!(allow.len(), 3);
         assert!(allow.iter().any(|v| v.as_str() == Some("Bash(git *)")));
         assert!(allow.iter().any(|v| v.as_str() == Some("Read")));
-        assert!(allow.iter().any(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN)));
+        assert!(allow
+            .iter()
+            .any(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN)));
     }
 
     #[test]
@@ -475,7 +468,10 @@ mod tests {
             .iter()
             .filter(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN))
             .count();
-        assert_eq!(count, 1, "Pattern should appear exactly once after two calls");
+        assert_eq!(
+            count, 1,
+            "Pattern should appear exactly once after two calls"
+        );
     }
 
     #[test]
@@ -501,7 +497,10 @@ mod tests {
         let json: Value = serde_json::from_str(&content).unwrap();
 
         // Other keys preserved
-        assert_eq!(json["env"]["ANTHROPIC_API_KEY"].as_str().unwrap(), "sk-ant-xxx");
+        assert_eq!(
+            json["env"]["ANTHROPIC_API_KEY"].as_str().unwrap(),
+            "sk-ant-xxx"
+        );
         assert_eq!(json["enabledPlugins"][0].as_str().unwrap(), "code-review");
 
         // Deny array preserved
@@ -543,6 +542,8 @@ mod tests {
         let modified_content = std::fs::read_to_string(&path).unwrap();
         let json: Value = serde_json::from_str(&modified_content).unwrap();
         let allow = json["permissions"]["allow"].as_array().unwrap();
-        assert!(allow.iter().any(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN)));
+        assert!(allow
+            .iter()
+            .any(|v| v.as_str() == Some(MCP_ALLOWED_TOOL_PATTERN)));
     }
 }
