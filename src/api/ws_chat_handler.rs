@@ -74,6 +74,8 @@ pub async fn ws_chat(
     Query(query): Query<WsChatQuery>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
+    let pre_upgrade_start = tokio::time::Instant::now();
+
     // Validate that chat manager is available
     let _chat_manager = state
         .chat_manager
@@ -98,6 +100,12 @@ pub async fn ws_chat(
         )));
     }
 
+    debug!(
+        session_id = %session_id,
+        elapsed_ms = pre_upgrade_start.elapsed().as_millis() as u64,
+        "⏱ Pre-upgrade: session validation done"
+    );
+
     let last_event = query.last_event;
 
     // Pre-upgrade auth: cookie first, then ticket fallback
@@ -110,6 +118,12 @@ pub async fn ws_chat(
         &state.ws_ticket_store,
     )
     .await;
+
+    debug!(
+        session_id = %session_id,
+        elapsed_ms = pre_upgrade_start.elapsed().as_millis() as u64,
+        "⏱ Pre-upgrade: auth completed, upgrading WS"
+    );
 
     Ok(match auth_result {
         CookieAuthResult::Authenticated(claims) => ws
@@ -134,8 +148,14 @@ async fn handle_ws_chat_preauthed(
     last_event: i64,
     claims: Claims,
 ) {
+    let t0 = tokio::time::Instant::now();
     // Wait for client "ready" signal before sending auth_ok
     super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims).await;
+    debug!(
+        session_id = %session_id,
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "⏱ ready handshake completed"
+    );
     handle_ws_chat_loop(socket, state, session_id, last_event, claims).await;
 }
 
@@ -148,6 +168,8 @@ async fn handle_ws_chat_loop(
     claims: Claims,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    let loop_start = tokio::time::Instant::now();
 
     info!(
         session_id = %session_id,
@@ -176,110 +198,131 @@ async fn handle_ws_chat_loop(
     // ========================================================================
     // Phase 1: Replay persisted events since last_event
     // ========================================================================
-    let events = chat_manager
-        .get_events_since(&session_id, last_event)
-        .await
-        .unwrap_or_default();
+    // OPTIMIZATION: Skip the Neo4j query entirely when last_event is very large
+    // (e.g. Number.MAX_SAFE_INTEGER from the frontend). This means the client
+    // doesn't want any historical replay — it will load history via REST and
+    // only needs the live streaming snapshot (Phase 1.5). Skipping saves one
+    // Neo4j round-trip (~50-200ms) that would always return 0 events anyway.
+    const SKIP_REPLAY_THRESHOLD: i64 = 1_000_000_000_000;
 
-    // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
-    // NATS events don't carry seq numbers, so active dedup uses snapshot_skip_remaining counter instead.
-    // Kept for future use if NATS events get seq headers.
-    let mut _max_replayed_seq: i64 = last_event;
-
-    if !events.is_empty() {
-        // New format: replay ChatEventRecord from Neo4j
-        debug!(
-            session_id = %session_id,
-            count = events.len(),
-            "Replaying persisted ChatEventRecord"
-        );
-        for event in events {
-            // Track highest seq for diagnostics / future dedup watermark
-            if event.seq > _max_replayed_seq {
-                _max_replayed_seq = event.seq;
-            }
-
-            // Normalize to flat format matching Phase 1.5 / live events.
-            // ChatEventRecord.data is a serde-serialized ChatEvent which already
-            // contains the "type" tag. We parse it, inject seq + replaying, and
-            // send it flat — so the frontend always receives the same JSON shape
-            // regardless of whether the event comes from replay, snapshot, or live.
-            let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
-                Ok(serde_json::Value::Object(mut obj)) => {
-                    obj.insert("seq".to_string(), serde_json::json!(event.seq));
-                    obj.insert("replaying".to_string(), serde_json::json!(true));
-                    serde_json::Value::Object(obj)
-                }
-                _ => {
-                    // Fallback for malformed records: wrap in data field
-                    serde_json::json!({
-                        "seq": event.seq,
-                        "type": event.event_type,
-                        "data": serde_json::Value::String(event.data.clone()),
-                        "replaying": true,
-                    })
-                }
-            };
-            if ws_sender
-                .send(Message::Text(msg.to_string().into()))
-                .await
-                .is_err()
-            {
-                debug!("Client disconnected during replay");
-                return;
-            }
-        }
-    } else if last_event == 0 {
-        // Fallback: Load from Nexus SDK for pre-migration sessions
-        debug!(
-            session_id = %session_id,
-            "No ChatEventRecord found, falling back to Nexus message history"
-        );
-        match chat_manager
-            .get_session_messages(&session_id, None, None)
+    if last_event < SKIP_REPLAY_THRESHOLD {
+        let events = chat_manager
+            .get_events_since(&session_id, last_event)
             .await
-        {
-            Ok(loaded) => {
-                debug!(
-                    session_id = %session_id,
-                    count = loaded.events.len(),
-                    "Replaying message history (fallback)"
-                );
-                for event in &loaded.events {
-                    let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
-                        Ok(serde_json::Value::Object(mut obj)) => {
-                            obj.insert("seq".to_string(), serde_json::json!(event.seq));
-                            obj.insert("replaying".to_string(), serde_json::json!(true));
-                            serde_json::Value::Object(obj)
+            .unwrap_or_default();
+
+        // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
+        // NATS events don't carry seq numbers, so active dedup uses snapshot_skip_remaining counter instead.
+        // Kept for future use if NATS events get seq headers.
+        let mut _max_replayed_seq: i64 = last_event;
+
+        if !events.is_empty() {
+            // New format: replay ChatEventRecord from Neo4j
+            debug!(
+                session_id = %session_id,
+                count = events.len(),
+                "Replaying persisted ChatEventRecord"
+            );
+            for event in events {
+                // Track highest seq for diagnostics / future dedup watermark
+                if event.seq > _max_replayed_seq {
+                    _max_replayed_seq = event.seq;
+                }
+
+                // Normalize to flat format matching Phase 1.5 / live events.
+                // ChatEventRecord.data is a serde-serialized ChatEvent which already
+                // contains the "type" tag. We parse it, inject seq + replaying, and
+                // send it flat — so the frontend always receives the same JSON shape
+                // regardless of whether the event comes from replay, snapshot, or live.
+                let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
+                    Ok(serde_json::Value::Object(mut obj)) => {
+                        obj.insert("seq".to_string(), serde_json::json!(event.seq));
+                        obj.insert("replaying".to_string(), serde_json::json!(true));
+                        serde_json::Value::Object(obj)
+                    }
+                    _ => {
+                        // Fallback for malformed records: wrap in data field
+                        serde_json::json!({
+                            "seq": event.seq,
+                            "type": event.event_type,
+                            "data": serde_json::Value::String(event.data.clone()),
+                            "replaying": true,
+                        })
+                    }
+                };
+                if ws_sender
+                    .send(Message::Text(msg.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    debug!("Client disconnected during replay");
+                    return;
+                }
+            }
+        } else if last_event == 0 {
+            // Fallback: Load from Nexus SDK for pre-migration sessions
+            debug!(
+                session_id = %session_id,
+                "No ChatEventRecord found, falling back to Nexus message history"
+            );
+            match chat_manager
+                .get_session_messages(&session_id, None, None)
+                .await
+            {
+                Ok(loaded) => {
+                    debug!(
+                        session_id = %session_id,
+                        count = loaded.events.len(),
+                        "Replaying message history (fallback)"
+                    );
+                    for event in &loaded.events {
+                        let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
+                            Ok(serde_json::Value::Object(mut obj)) => {
+                                obj.insert("seq".to_string(), serde_json::json!(event.seq));
+                                obj.insert("replaying".to_string(), serde_json::json!(true));
+                                serde_json::Value::Object(obj)
+                            }
+                            _ => {
+                                serde_json::json!({
+                                    "seq": event.seq,
+                                    "type": event.event_type,
+                                    "data": serde_json::Value::String(event.data.clone()),
+                                    "replaying": true,
+                                })
+                            }
+                        };
+                        if ws_sender
+                            .send(Message::Text(msg.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            debug!("Client disconnected during fallback replay");
+                            return;
                         }
-                        _ => {
-                            serde_json::json!({
-                                "seq": event.seq,
-                                "type": event.event_type,
-                                "data": serde_json::Value::String(event.data.clone()),
-                                "replaying": true,
-                            })
-                        }
-                    };
-                    if ws_sender
-                        .send(Message::Text(msg.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        debug!("Client disconnected during fallback replay");
-                        return;
                     }
                 }
-            }
-            Err(e) => {
-                warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "Failed to load message history for replay"
-                );
+                Err(e) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "Failed to load message history for replay"
+                    );
+                }
             }
         }
+    } else {
+        debug!(
+            session_id = %session_id,
+            last_event,
+            "Skipping Phase 1 replay (last_event >= threshold, client loads history via REST)"
+        );
     }
+
+    debug!(
+        session_id = %session_id,
+        elapsed_ms = loop_start.elapsed().as_millis() as u64,
+        "⏱ Phase 1 completed"
+    );
 
     // ========================================================================
     // Phase 1.5a: Subscribe to broadcast + NATS BEFORE taking snapshot
@@ -358,7 +401,8 @@ async fn handle_ws_chat_loop(
         is_currently_streaming,
         partial_text_len = partial_text.len(),
         streaming_events_count = streaming_events.len(),
-        "Phase 1.5b: streaming snapshot"
+        elapsed_ms = loop_start.elapsed().as_millis() as u64,
+        "⏱ Phase 1.5b: streaming snapshot"
     );
 
     if is_currently_streaming {
@@ -451,6 +495,11 @@ async fn handle_ws_chat_loop(
     };
 
     // Send replay_complete marker
+    debug!(
+        session_id = %session_id,
+        elapsed_ms = loop_start.elapsed().as_millis() as u64,
+        "⏱ Snapshot sent, sending replay_complete"
+    );
     let replay_complete = serde_json::json!({ "type": "replay_complete" });
     if ws_sender
         .send(Message::Text(replay_complete.to_string().into()))
