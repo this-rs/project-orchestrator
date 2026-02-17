@@ -884,20 +884,26 @@ impl ChatManager {
         };
 
         // Try oneshot Opus refinement (with tool catalog for tool-aware prompting)
-        let context_json = context_to_json(&ctx);
-        let tools_catalog_json = super::prompt::tools_catalog_to_json(super::prompt::TOOL_GROUPS);
-        let dynamic_section = match self
-            .refine_context_with_oneshot(user_message, &context_json, &tools_catalog_json)
-            .await
-        {
-            Ok(refined) => refined,
-            Err(e) => {
-                warn!(
-                    "Oneshot context refinement failed: {} — using markdown fallback",
-                    e
-                );
-                context_to_markdown(&ctx, Some(user_message))
+        let dynamic_section = if self.config.enable_oneshot_refinement {
+            let context_json = context_to_json(&ctx);
+            let tools_catalog_json =
+                super::prompt::tools_catalog_to_json(super::prompt::TOOL_GROUPS);
+            match self
+                .refine_context_with_oneshot(user_message, &context_json, &tools_catalog_json)
+                .await
+            {
+                Ok(refined) => refined,
+                Err(e) => {
+                    warn!(
+                        "Oneshot context refinement failed: {} — using markdown fallback",
+                        e
+                    );
+                    context_to_markdown(&ctx, Some(user_message))
+                }
             }
+        } else {
+            info!("Oneshot refinement disabled — using markdown fallback");
+            context_to_markdown(&ctx, Some(user_message))
         };
 
         assemble_prompt(BASE_SYSTEM_PROMPT, &dynamic_section)
@@ -3635,6 +3641,7 @@ mod tests {
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: crate::chat::config::PermissionConfig::default(),
+            enable_oneshot_refinement: false,
         }
     }
 
