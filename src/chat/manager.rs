@@ -88,6 +88,11 @@ pub struct ActiveSession {
     /// is cancelled so that stale NATS listeners (interrupt, snapshot, RPC)
     /// shut down instead of accumulating across resumes/restarts.
     pub nats_cancel: CancellationToken,
+    /// Cancellation token for the stream_response loop. Cancelled by `interrupt()`
+    /// and by the NATS interrupt listener to immediately unblock the `tokio::select!`
+    /// in `stream_response`, even when the CLI is silent (e.g., executing `sleep 60`).
+    /// A NEW token is created at each stream start (CancellationToken is not resettable).
+    pub interrupt_token: CancellationToken,
     /// Stores the original tool input for pending permission requests.
     /// Key: request_id, Value: the tool input JSON.
     /// When the user responds Allow, we include this input in `updatedInput`
@@ -439,10 +444,17 @@ impl ChatManager {
                         }
 
                         info!(
-                            "NATS interrupt received for session {}, setting interrupt flag",
+                            "NATS interrupt received for session {}, setting interrupt flag and cancelling token",
                             session_id
                         );
                         interrupt_flag.store(true, Ordering::SeqCst);
+                        // Cancel the current interrupt_token to unblock stream_response's select!
+                        {
+                            let sessions = active_sessions.read().await;
+                            if let Some(session) = sessions.get(&session_id) {
+                                session.interrupt_token.cancel();
+                            }
+                        }
                     }
                 }
             }
@@ -651,6 +663,8 @@ impl ChatManager {
                         Some(session) => {
                             session.last_activity = Instant::now();
                             session.interrupt_flag.store(false, Ordering::SeqCst);
+                            // Reset interrupt_token (CancellationToken is not resettable — create a new one)
+                            session.interrupt_token = CancellationToken::new();
                             Some((
                                 session.client.clone(),
                                 session.events_tx.clone(),
@@ -662,6 +676,7 @@ impl ChatManager {
                                 session.streaming_text.clone(),
                                 session.streaming_events.clone(),
                                 session.sdk_control_rx.clone(),
+                                session.interrupt_token.clone(),
                             ))
                         }
                         None => None,
@@ -697,6 +712,7 @@ impl ChatManager {
                         streaming_text,
                         streaming_events,
                         sdk_control_rx,
+                        interrupt_token,
                     )) => {
                         let message = &request.message;
 
@@ -807,6 +823,7 @@ impl ChatManager {
                                     event_emitter_clone,
                                     nats_clone,
                                     sdk_control_rx,
+                                    interrupt_token,
                                 )
                                 .await;
                             });
@@ -1415,6 +1432,7 @@ impl ChatManager {
 
         // Register active session — cancel old NATS listeners if session key already exists
         let nats_cancel = CancellationToken::new();
+        let interrupt_token = CancellationToken::new();
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -1445,6 +1463,7 @@ impl ChatManager {
                     sdk_control_rx: sdk_control_rx.clone(),
                     stdin_tx,
                     nats_cancel: nats_cancel.clone(),
+                    interrupt_token: interrupt_token.clone(),
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
@@ -1573,6 +1592,7 @@ impl ChatManager {
                 event_emitter,
                 nats,
                 sdk_control_rx,
+                interrupt_token,
             )
             .await;
         });
@@ -1605,6 +1625,7 @@ impl ChatManager {
         shared_sdk_control_rx: Arc<
             tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
         >,
+        interrupt_token: CancellationToken,
     ) {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
@@ -1656,6 +1677,11 @@ impl ChatManager {
         // Maps tool_use ID → index in events_to_persist, so we can update
         // the persisted record when AssistantMessage provides the full input.
         let mut emitted_tool_use_ids: std::collections::HashMap<String, Option<usize>> =
+            std::collections::HashMap::new();
+        // Track pending tool calls (ToolUse without a corresponding ToolResult).
+        // Maps tool_use ID → parent_tool_use_id. On interrupt, ToolCancelled is
+        // emitted for each remaining entry so the frontend stops showing "running...".
+        let mut pending_tool_calls: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
         let session_uuid = Uuid::parse_str(&session_id).ok();
 
@@ -1788,18 +1814,20 @@ impl ChatManager {
             // Now we select! between the two sources so control messages are
             // processed even when the stream is idle (waiting for permission).
             loop {
-                // Check interrupt flag at each iteration
-                if interrupt_flag.load(Ordering::SeqCst) {
-                    info!(
-                        "Interrupt flag detected during stream for session {}",
-                        session_id
-                    );
-                    break;
-                }
-
                 let result = if let Some(ref mut rx) = sdk_control_rx {
                     tokio::select! {
-                        biased;  // Prioritize control messages over stream events
+                        biased;  // Prioritize interrupt > control messages > stream events
+
+                        // Interrupt token: immediately unblocks the select! when cancelled,
+                        // even if stream.next() is blocked waiting for CLI output (e.g., sleep 60).
+                        // This is the core fix for the interrupt-during-long-tool bug.
+                        _ = interrupt_token.cancelled() => {
+                            info!(
+                                "Interrupt token cancelled during stream for session {}",
+                                session_id
+                            );
+                            break;
+                        }
 
                         control_msg = rx.recv() => {
                             match control_msg {
@@ -1920,10 +1948,24 @@ impl ChatManager {
                         }
                     }
                 } else {
-                    // No control channel — just read from stream
-                    match stream.next().await {
-                        Some(result) => result,
-                        None => break,
+                    // No control channel — use select! with interrupt token + stream
+                    tokio::select! {
+                        biased;
+
+                        _ = interrupt_token.cancelled() => {
+                            info!(
+                                "Interrupt token cancelled during stream for session {} (no control channel)",
+                                session_id
+                            );
+                            break;
+                        }
+
+                        stream_item = stream.next() => {
+                            match stream_item {
+                                Some(result) => result,
+                                None => break,
+                            }
+                        }
                     }
                 };
 
@@ -2096,6 +2138,13 @@ impl ChatManager {
                                 }
                                 // First occurrence — record it
                                 emitted_tool_use_ids.insert(id.clone(), None);
+                                // Track as pending (no ToolResult yet)
+                                pending_tool_calls.insert(id.clone(), parent_tool_use_id.clone());
+                            }
+
+                            // When a ToolResult arrives, the tool is no longer pending
+                            if let ChatEvent::ToolResult { ref id, .. } = event {
+                                pending_tool_calls.remove(id);
                             }
 
                             // Persist structured events (skip transient: stream_delta, streaming_status)
@@ -2221,7 +2270,8 @@ impl ChatManager {
             }
         }
 
-        // If interrupted, send the interrupt signal to the CLI
+        // If interrupted, send the interrupt signal to the CLI and emit ToolCancelled
+        // for any tools that were still running (ToolUse without ToolResult).
         if interrupt_flag.load(Ordering::SeqCst) {
             debug!("Sending interrupt signal to CLI for session {}", session_id);
             let mut c = client.lock().await;
@@ -2230,6 +2280,46 @@ impl ChatManager {
                     "Failed to send interrupt signal to CLI for session {}: {}",
                     session_id, e
                 );
+            }
+
+            // Emit ToolCancelled for each pending tool (ToolUse without ToolResult)
+            if !pending_tool_calls.is_empty() {
+                info!(
+                    "Emitting ToolCancelled for {} pending tool(s) in session {}",
+                    pending_tool_calls.len(),
+                    session_id
+                );
+                let mut cancel_events = Vec::new();
+                for (tool_id, parent) in &pending_tool_calls {
+                    let event = ChatEvent::ToolCancelled {
+                        id: tool_id.clone(),
+                        parent_tool_use_id: parent.clone(),
+                    };
+                    cancel_events.push(event.clone());
+                    emit_chat(event, &events_tx, &nats, &session_id);
+                }
+
+                // Persist ToolCancelled events in Neo4j
+                if let Some(uuid) = session_uuid {
+                    let mut cancel_records = Vec::new();
+                    for event in &cancel_events {
+                        let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                        cancel_records.push(ChatEventRecord {
+                            id: Uuid::new_v4(),
+                            session_id: uuid,
+                            seq,
+                            event_type: event.event_type().to_string(),
+                            data: serde_json::to_string(event).unwrap_or_default(),
+                            created_at: chrono::Utc::now(),
+                        });
+                    }
+                    if let Err(e) = graph.store_chat_events(uuid, cancel_records).await {
+                        warn!(
+                            "Failed to persist ToolCancelled events for session {}: {}",
+                            session_id, e
+                        );
+                    }
+                }
             }
         }
 
@@ -2311,6 +2401,8 @@ impl ChatManager {
 
             // Recursive call to process the queued message
             // Use Box::pin to handle recursive async
+            // Create a fresh interrupt_token for the new stream (the old one may be cancelled)
+            let fresh_interrupt_token = CancellationToken::new();
             Box::pin(Self::stream_response(
                 client,
                 events_tx,
@@ -2329,6 +2421,7 @@ impl ChatManager {
                 event_emitter,
                 nats,
                 shared_sdk_control_rx,
+                fresh_interrupt_token,
             ))
             .await;
         }
@@ -2406,6 +2499,7 @@ impl ChatManager {
             streaming_text,
             streaming_events,
             sdk_control_rx,
+            interrupt_token,
         ) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
@@ -2414,6 +2508,8 @@ impl ChatManager {
 
             // Reset interrupt flag for new message
             session.interrupt_flag.store(false, Ordering::SeqCst);
+            // Reset interrupt_token (CancellationToken is not resettable — create a new one)
+            session.interrupt_token = CancellationToken::new();
             session.last_activity = Instant::now();
 
             (
@@ -2427,6 +2523,7 @@ impl ChatManager {
                 session.streaming_text.clone(),
                 session.streaming_events.clone(),
                 session.sdk_control_rx.clone(),
+                session.interrupt_token.clone(),
             )
         };
 
@@ -2516,6 +2613,7 @@ impl ChatManager {
                 event_emitter,
                 nats,
                 sdk_control_rx,
+                interrupt_token,
             )
             .await;
         });
@@ -2958,6 +3056,7 @@ impl ChatManager {
 
         // Register as active — cancel old NATS listeners if session was previously active
         let nats_cancel = CancellationToken::new();
+        let interrupt_token = CancellationToken::new();
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous resume/create of this session.
@@ -2993,6 +3092,7 @@ impl ChatManager {
                     sdk_control_rx: sdk_control_rx.clone(),
                     stdin_tx,
                     nats_cancel: nats_cancel.clone(),
+                    interrupt_token: interrupt_token.clone(),
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
@@ -3070,6 +3170,7 @@ impl ChatManager {
                 event_emitter,
                 nats,
                 sdk_control_rx,
+                interrupt_token,
             )
             .await;
         });
@@ -3437,17 +3538,27 @@ impl ChatManager {
     /// client lock. The stream loop then sends the actual interrupt signal to the CLI.
     /// This is instantaneous — no waiting for the Mutex.
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
-        let interrupt_flag = {
+        let (interrupt_flag, interrupt_token) = {
             let sessions = self.active_sessions.read().await;
-            sessions.get(session_id).map(|s| s.interrupt_flag.clone())
+            match sessions.get(session_id) {
+                Some(s) => (
+                    Some(s.interrupt_flag.clone()),
+                    Some(s.interrupt_token.clone()),
+                ),
+                None => (None, None),
+            }
         };
 
         if let Some(flag) = interrupt_flag {
-            // Session is local — set the flag so the stream loop breaks
+            // Session is local — set the flag AND cancel the token so the stream loop breaks
+            // immediately, even if blocked on stream.next() (e.g., CLI executing sleep 60)
             flag.store(true, Ordering::SeqCst);
+            if let Some(token) = interrupt_token {
+                token.cancel();
+            }
             info!(
                 session_id = %session_id,
-                "Interrupt flag set locally"
+                "Interrupt flag set and token cancelled locally"
             );
         } else {
             debug!(
@@ -5202,6 +5313,7 @@ mod tests {
             sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
             stdin_tx: None,
             nats_cancel: CancellationToken::new(),
+            interrupt_token: CancellationToken::new(),
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -6084,6 +6196,7 @@ mod tests {
             sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
             stdin_tx: None,
             nats_cancel: CancellationToken::new(),
+            interrupt_token: CancellationToken::new(),
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
