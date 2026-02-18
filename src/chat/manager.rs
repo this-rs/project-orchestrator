@@ -776,11 +776,13 @@ impl ChatManager {
                                 "NATS RPC: Auto-continue toggled"
                             );
 
-                            // Broadcast state change event
-                            let _ = events_tx.send(ChatEvent::AutoContinueStateChanged {
+                            // Broadcast state change event (local + NATS for other instances)
+                            let event = ChatEvent::AutoContinueStateChanged {
                                 session_id: session_id.clone(),
                                 enabled,
-                            });
+                            };
+                            let _ = events_tx.send(event.clone());
+                            nats.publish_chat_event(&session_id, event);
 
                             crate::events::ChatRpcResponse {
                                 success: true,
@@ -3054,19 +3056,25 @@ impl ChatManager {
     ///
     /// Unlike `set_session_permission_mode`, this does NOT send a control request to the
     /// CLI subprocess — auto-continue is purely a backend-side concern.
+    ///
+    /// Works whether the session is active (CLI spawned) or idle (just viewing).
+    /// - Active: updates in-memory AtomicBool + broadcasts locally + NATS
+    /// - Idle: persists to Neo4j + broadcasts via NATS only (no local broadcast channel)
     pub async fn set_auto_continue(&self, session_id: &str, enabled: bool) -> Result<()> {
-        let events_tx = {
+        // Try to update in-memory state if session is active
+        let maybe_events_tx = {
             let sessions = self.active_sessions.read().await;
-            let session = sessions
-                .get(session_id)
-                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
-            session
-                .auto_continue
-                .store(enabled, std::sync::atomic::Ordering::Relaxed);
-            session.events_tx.clone()
+            if let Some(session) = sessions.get(session_id) {
+                session
+                    .auto_continue
+                    .store(enabled, std::sync::atomic::Ordering::Relaxed);
+                Some(session.events_tx.clone())
+            } else {
+                None
+            }
         };
 
-        // Persist to Neo4j
+        // Persist to Neo4j (always — whether active or idle)
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             if let Err(e) = self.graph.set_session_auto_continue(uuid, enabled).await {
                 warn!(
@@ -3077,17 +3085,29 @@ impl ChatManager {
             }
         }
 
+        let is_local = maybe_events_tx.is_some();
         info!(
             session_id = %session_id,
             enabled = %enabled,
+            is_local = %is_local,
             "Auto-continue toggled for session"
         );
 
         // Broadcast event to WebSocket clients
-        let _ = events_tx.send(ChatEvent::AutoContinueStateChanged {
+        let event = ChatEvent::AutoContinueStateChanged {
             session_id: session_id.to_string(),
             enabled,
-        });
+        };
+
+        // Local broadcast (only if session is active on this instance)
+        if let Some(events_tx) = maybe_events_tx {
+            let _ = events_tx.send(event.clone());
+        }
+
+        // NATS broadcast (always — for cross-instance AND idle-session propagation)
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, event);
+        }
 
         Ok(())
     }

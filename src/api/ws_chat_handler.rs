@@ -914,42 +914,23 @@ async fn handle_ws_chat_loop(
 
                                     WsChatClientMessage::SetAutoContinue { enabled } => {
                                         info!(session_id = %session_id, enabled = %enabled, "WS: Received set_auto_continue");
-                                        if chat_manager.is_session_active(&session_id).await {
-                                            // Session is local — toggle directly
-                                            match chat_manager.set_auto_continue(&session_id, enabled).await {
-                                                Ok(()) => {
-                                                    let confirmation = serde_json::json!({
-                                                        "type": "auto_continue_state_changed",
-                                                        "enabled": enabled,
-                                                    });
-                                                    let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
-                                                }
-                                                Err(e) => {
-                                                    warn!(session_id = %session_id, error = %e, "Failed to set auto_continue");
-                                                    let err = serde_json::json!({
-                                                        "type": "error",
-                                                        "message": format!("Failed to set auto_continue: {}", e),
-                                                    });
-                                                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                                }
-                                            }
-                                        } else {
-                                            // Session not local — proxy via NATS RPC to owning instance
-                                            let payload = serde_json::json!({ "enabled": enabled }).to_string();
-                                            if chat_manager
-                                                .try_remote_send(&session_id, &payload, "set_auto_continue")
-                                                .await
-                                                .unwrap_or(false)
-                                            {
+                                        // set_auto_continue works whether the session is active or idle:
+                                        // - Active: updates in-memory + Neo4j + local broadcast + NATS
+                                        // - Idle: updates Neo4j + NATS only
+                                        // No need for try_remote_send — NATS pub/sub handles cross-instance.
+                                        match chat_manager.set_auto_continue(&session_id, enabled).await {
+                                            Ok(()) => {
                                                 let confirmation = serde_json::json!({
                                                     "type": "auto_continue_state_changed",
                                                     "enabled": enabled,
                                                 });
                                                 let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
-                                            } else {
+                                            }
+                                            Err(e) => {
+                                                warn!(session_id = %session_id, error = %e, "Failed to set auto_continue");
                                                 let err = serde_json::json!({
                                                     "type": "error",
-                                                    "message": "Session not found or not active on any instance",
+                                                    "message": format!("Failed to set auto_continue: {}", e),
                                                 });
                                                 let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                             }
