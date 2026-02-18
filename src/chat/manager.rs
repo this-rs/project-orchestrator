@@ -1670,6 +1670,9 @@ impl ChatManager {
         streaming_text.lock().await.clear();
         streaming_events.lock().await.clear();
 
+        // Track whether this stream ended with error_max_turns (for auto-continue)
+        let mut hit_error_max_turns = false;
+
         // Record user message in memory manager
         if let Some(ref mm) = memory_manager {
             let mut mm = mm.lock().await;
@@ -2217,6 +2220,13 @@ impl ChatManager {
                                 streaming_events.lock().await.push(event.clone());
                             }
 
+                            // Detect error_max_turns for auto-continue
+                            if let ChatEvent::Result { ref subtype, .. } = event {
+                                if subtype == "error_max_turns" {
+                                    hit_error_max_turns = true;
+                                }
+                            }
+
                             emit_chat(event, &events_tx, &nats, &session_id);
                         }
                     }
@@ -2356,6 +2366,61 @@ impl ChatManager {
         streaming_text.lock().await.clear();
         streaming_events.lock().await.clear();
         debug!("Stream completed for session {}", session_id);
+
+        // Auto-continue: if error_max_turns was hit and auto_continue is enabled,
+        // emit an AutoContinue event, wait 500ms (interruptible), then enqueue "Continue"
+        // into pending_messages for the drain below.
+        if hit_error_max_turns
+            && auto_continue.load(Ordering::Relaxed)
+            && !interrupt_flag.load(Ordering::SeqCst)
+        {
+            let delay_ms = 500u64;
+            info!(
+                "Auto-continue triggered for session {} (delay={}ms)",
+                session_id, delay_ms
+            );
+
+            // Emit AutoContinue event so frontends can show "Auto-continuing..."
+            let ac_event = ChatEvent::AutoContinue {
+                session_id: session_id.clone(),
+                delay_ms,
+            };
+            emit_chat(ac_event.clone(), &events_tx, &nats, &session_id);
+
+            // Persist the AutoContinue event
+            if let Some(uuid) = session_uuid {
+                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                let record = ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq,
+                    event_type: ac_event.event_type().to_string(),
+                    data: serde_json::to_string(&ac_event).unwrap_or_default(),
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = graph.store_chat_events(uuid, vec![record]).await;
+            }
+
+            // Interruptible delay — if the user interrupts during the wait, skip the enqueue
+            let sleep_cancelled = tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => false,
+                _ = interrupt_token.cancelled() => true,
+            };
+
+            if !sleep_cancelled && !interrupt_flag.load(Ordering::SeqCst) {
+                // Enqueue "Continue" — the drain below will pick it up and recurse
+                pending_messages
+                    .lock()
+                    .await
+                    .push_back("Continue".to_string());
+                debug!("Auto-continue: enqueued 'Continue' for session {}", session_id);
+            } else {
+                info!(
+                    "Auto-continue cancelled by interrupt for session {}",
+                    session_id
+                );
+            }
+        }
 
         // Check pending_messages queue — if there are queued messages, process the next one
         let next_message = {
