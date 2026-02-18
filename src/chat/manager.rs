@@ -760,8 +760,7 @@ impl ChatManager {
 
                             // Persist to Neo4j
                             if let Ok(uuid) = Uuid::parse_str(&session_id) {
-                                if let Err(e) =
-                                    graph.set_session_auto_continue(uuid, enabled).await
+                                if let Err(e) = graph.set_session_auto_continue(uuid, enabled).await
                                 {
                                     warn!(
                                         session_id = %session_id,
@@ -2451,7 +2450,10 @@ impl ChatManager {
                     .lock()
                     .await
                     .push_back("Continue".to_string());
-                debug!("Auto-continue: enqueued 'Continue' for session {}", session_id);
+                debug!(
+                    "Auto-continue: enqueued 'Continue' for session {}",
+                    session_id
+                );
             } else {
                 info!(
                     "Auto-continue cancelled by interrupt for session {}",
@@ -3097,7 +3099,9 @@ impl ChatManager {
         // Try local active session first
         let sessions = self.active_sessions.read().await;
         if let Some(session) = sessions.get(session_id) {
-            return Ok(session.auto_continue.load(std::sync::atomic::Ordering::Relaxed));
+            return Ok(session
+                .auto_continue
+                .load(std::sync::atomic::Ordering::Relaxed));
         }
         drop(sessions);
 
@@ -3241,7 +3245,10 @@ impl ChatManager {
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
         let auto_continue = Arc::new(AtomicBool::new(
-            self.graph.get_session_auto_continue(uuid).await.unwrap_or(self.config.auto_continue),
+            self.graph
+                .get_session_auto_continue(uuid)
+                .await
+                .unwrap_or(self.config.auto_continue),
         ));
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;

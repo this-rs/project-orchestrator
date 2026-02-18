@@ -520,7 +520,9 @@ async fn handle_ws_chat_loop(
             "enabled": ac_enabled,
             "seq": 0,
         });
-        let _ = ws_sender.send(Message::Text(ac_msg.to_string().into())).await;
+        let _ = ws_sender
+            .send(Message::Text(ac_msg.to_string().into()))
+            .await;
     }
 
     // Ping interval (30s)

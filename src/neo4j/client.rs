@@ -7337,7 +7337,10 @@ impl Neo4jClient {
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
             // Neo4j may return null if property not set
-            Ok(row.get::<Option<bool>>("auto_continue").unwrap_or(None).unwrap_or(false))
+            Ok(row
+                .get::<Option<bool>>("auto_continue")
+                .unwrap_or(None)
+                .unwrap_or(false))
         } else {
             Ok(false)
         }
