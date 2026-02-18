@@ -512,6 +512,17 @@ async fn handle_ws_chat_loop(
         return;
     }
 
+    // Send current auto_continue state so the frontend can initialize its toggle
+    if let Ok(ac_enabled) = chat_manager.get_auto_continue_state(&session_id).await {
+        let ac_msg = serde_json::json!({
+            "type": "auto_continue_state_changed",
+            "session_id": session_id,
+            "enabled": ac_enabled,
+            "seq": 0,
+        });
+        let _ = ws_sender.send(Message::Text(ac_msg.to_string().into())).await;
+    }
+
     // Ping interval (30s)
     let mut ping_interval = interval(Duration::from_secs(30));
     ping_interval.tick().await; // skip first immediate tick

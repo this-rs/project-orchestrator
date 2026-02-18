@@ -3090,6 +3090,25 @@ impl ChatManager {
         Ok(())
     }
 
+    /// Get the current auto-continue state for a session.
+    ///
+    /// Reads from the in-memory ActiveSession if local, otherwise falls back to Neo4j.
+    pub async fn get_auto_continue_state(&self, session_id: &str) -> Result<bool> {
+        // Try local active session first
+        let sessions = self.active_sessions.read().await;
+        if let Some(session) = sessions.get(session_id) {
+            return Ok(session.auto_continue.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        drop(sessions);
+
+        // Fallback to Neo4j
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            return self.graph.get_session_auto_continue(uuid).await;
+        }
+
+        Ok(self.config.auto_continue)
+    }
+
     /// Resume a previously inactive session by creating a new InteractiveClient.
     ///
     /// If the session has a `cli_session_id`, resumes with `--resume`.
