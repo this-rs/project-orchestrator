@@ -40,6 +40,12 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Inject version from git tag
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          npm pkg set version="${VERSION}"
+          echo "Injected frontend version: $(node -p "require('./package.json').version")"
+
       - name: Install dependencies
         run: npm ci
 
@@ -1003,6 +1009,7 @@ jobs:
           build-args: |
             FRONTEND_SRC=./frontend
             INCLUDE_FRONTEND=${{ matrix.include_frontend }}
+            APP_VERSION=${{ env.RELEASE_TAG }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=release-docker

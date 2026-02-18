@@ -13,6 +13,8 @@ WORKDIR /app/frontend
 
 # Accept frontend source path as build arg (default: ./frontend)
 ARG FRONTEND_SRC=./frontend
+# Version to inject into the frontend (from git tag). Falls back to package.json default.
+ARG APP_VERSION=""
 
 # Copy everything from the frontend source.
 # Use a wildcard so COPY doesn't fail if only dist/ is present.
@@ -22,6 +24,11 @@ COPY ${FRONTEND_SRC}/ ./
 # If only dist/ was copied (CI scenario), skip the build entirely.
 RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
         echo "Frontend source detected — installing dependencies and building..."; \
+        if [ -n "$APP_VERSION" ]; then \
+            CLEAN_VERSION="${APP_VERSION#v}"; \
+            npm pkg set version="${CLEAN_VERSION}"; \
+            echo "Injected frontend version: ${CLEAN_VERSION}"; \
+        fi; \
         npm ci --ignore-scripts && npm run build; \
     elif [ -d "dist" ]; then \
         echo "Pre-built frontend dist/ detected — skipping build"; \
