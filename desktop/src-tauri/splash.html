@@ -152,6 +152,7 @@
 
     .check-action {
       font-size: 11px;
+      font-family: inherit;
       color: #6366f1;
       text-decoration: none;
       cursor: pointer;
@@ -162,6 +163,8 @@
       transition: background 0.2s;
       flex-shrink: 0;
       white-space: nowrap;
+      -webkit-app-region: no-drag;
+      app-region: no-drag;
     }
     .check-action:hover {
       background: rgba(99, 102, 241, 0.2);
@@ -215,6 +218,8 @@
       border-radius: 6px;
       cursor: pointer;
       transition: background 0.2s;
+      -webkit-app-region: no-drag;
+      app-region: no-drag;
     }
     .btn-continue:hover { background: #4f46e5; }
     .btn-continue.visible { display: inline-block; }
@@ -296,6 +301,19 @@
   </div>
 
   <script>
+    // ========================================================================
+    // macOS Tauri 2 click fix — block touch events that interfere with mouse
+    // clicks in webviews with decorations: false.
+    // See: https://github.com/tauri-apps/tauri/discussions/11957
+    // ========================================================================
+    if (/Mac|Macintosh/i.test(navigator.userAgent)) {
+      const originalAddEventListener = EventTarget.prototype.addEventListener;
+      EventTarget.prototype.addEventListener = function(type, listener, options) {
+        if (type.match(/^touch/)) return;
+        return originalAddEventListener.call(this, type, listener, options);
+      };
+    }
+
     // ========================================================================
     // SVG icons
     // ========================================================================
@@ -416,7 +434,7 @@
           setCheck('check-claude', 'success');
         } else {
           setCheck('check-claude', 'warning', 'Chat features require Claude Code CLI',
-            `<span class="check-action" onclick="openUrl('https://docs.anthropic.com/en/docs/claude-code/overview')">Install</span>`);
+            `<button class="check-action" onclick="openUrl('https://docs.anthropic.com/en/docs/claude-code/overview')">Install</button>`);
         }
 
         // -- NATS visibility --
@@ -484,7 +502,7 @@
       } else if (dockerStatus === 'installed') {
         // Docker Desktop is installed but daemon is not running
         setCheck('check-docker', 'warning', 'Docker Desktop is not running',
-          `<span class="check-action" onclick="invoke('open_docker_desktop').catch(()=>{})">Open</span>`);
+          `<button class="check-action" onclick="invoke('open_docker_desktop').catch(()=>{})">Open</button>`);
         setCheck('check-neo4j', '', 'Waiting for Docker...');
         setCheck('check-meilisearch', '', 'Waiting for Docker...');
         if (deps.natsEnabled) {
@@ -499,7 +517,7 @@
         // Docker not installed
         const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
         setCheck('check-docker', 'error', 'Docker is required to run services',
-          `<span class="check-action" onclick="openUrl('${url}')">Install</span>`);
+          `<button class="check-action" onclick="openUrl('${url}')">Install</button>`);
         setCheck('check-neo4j', 'error', 'Requires Docker');
         setCheck('check-meilisearch', 'error', 'Requires Docker');
         if (deps.natsEnabled) {
