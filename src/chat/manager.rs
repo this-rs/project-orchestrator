@@ -3006,6 +3006,52 @@ impl ChatManager {
         Ok(())
     }
 
+    /// Toggle auto-continue for an active session.
+    ///
+    /// Updates the in-memory `ActiveSession.auto_continue` AtomicBool,
+    /// persists the change to Neo4j, and broadcasts a `ChatEvent::AutoContinueStateChanged`
+    /// so that all connected frontends can sync their toggle UI.
+    ///
+    /// Unlike `set_session_permission_mode`, this does NOT send a control request to the
+    /// CLI subprocess — auto-continue is purely a backend-side concern.
+    pub async fn set_auto_continue(&self, session_id: &str, enabled: bool) -> Result<()> {
+        let events_tx = {
+            let sessions = self.active_sessions.read().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            session
+                .auto_continue
+                .store(enabled, std::sync::atomic::Ordering::Relaxed);
+            session.events_tx.clone()
+        };
+
+        // Persist to Neo4j
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            if let Err(e) = self.graph.set_session_auto_continue(uuid, enabled).await {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist auto_continue change to Neo4j (non-fatal)"
+                );
+            }
+        }
+
+        info!(
+            session_id = %session_id,
+            enabled = %enabled,
+            "Auto-continue toggled for session"
+        );
+
+        // Broadcast event to WebSocket clients
+        let _ = events_tx.send(ChatEvent::AutoContinueStateChanged {
+            session_id: session_id.to_string(),
+            enabled,
+        });
+
+        Ok(())
+    }
+
     /// Resume a previously inactive session by creating a new InteractiveClient.
     ///
     /// If the session has a `cli_session_id`, resumes with `--resume`.

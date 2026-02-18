@@ -60,6 +60,8 @@ pub enum WsChatClientMessage {
     SetPermissionMode { mode: String },
     /// Change the model of the active session
     SetModel { model: String },
+    /// Toggle auto-continue for the active session
+    SetAutoContinue { enabled: bool },
 }
 
 /// WebSocket upgrade handler for `/ws/chat/{session_id}`
@@ -884,6 +886,36 @@ async fn handle_ws_chat_loop(
                                                     let err = serde_json::json!({
                                                         "type": "error",
                                                         "message": format!("Failed to set model: {}", e),
+                                                    });
+                                                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                                }
+                                            }
+                                        } else {
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "message": "Session not active on this instance",
+                                            });
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        }
+                                    }
+
+                                    WsChatClientMessage::SetAutoContinue { enabled } => {
+                                        info!(session_id = %session_id, enabled = %enabled, "WS: Received set_auto_continue");
+                                        if chat_manager.is_session_active(&session_id).await {
+                                            match chat_manager.set_auto_continue(&session_id, enabled).await {
+                                                Ok(()) => {
+                                                    // Send confirmation back to frontend
+                                                    let confirmation = serde_json::json!({
+                                                        "type": "auto_continue_state_changed",
+                                                        "enabled": enabled,
+                                                    });
+                                                    let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!(session_id = %session_id, error = %e, "Failed to set auto_continue");
+                                                    let err = serde_json::json!({
+                                                        "type": "error",
+                                                        "message": format!("Failed to set auto_continue: {}", e),
                                                     });
                                                     let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                                 }
