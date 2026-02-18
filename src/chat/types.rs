@@ -69,6 +69,15 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
+    /// Tool execution was cancelled by user interrupt.
+    /// Emitted for each pending ToolUse that did not receive a ToolResult
+    /// when the stream is interrupted (e.g., user clicks Stop during sleep 60).
+    ToolCancelled {
+        /// The tool_use ID that was cancelled
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Claude is asking for permission to use a tool
     PermissionRequest {
         id: String,
@@ -190,6 +199,7 @@ impl ChatEvent {
             ChatEvent::ToolUse { .. } => "tool_use",
             ChatEvent::ToolResult { .. } => "tool_result",
             ChatEvent::ToolUseInputResolved { .. } => "tool_use_input_resolved",
+            ChatEvent::ToolCancelled { .. } => "tool_cancelled",
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::AskUserQuestion { .. } => "ask_user_question",
             ChatEvent::InputRequest { .. } => "input_request",
@@ -220,6 +230,7 @@ impl ChatEvent {
             ChatEvent::ToolUseInputResolved { id, .. } => {
                 Some(format!("tool_use_input_resolved:{}", id))
             }
+            ChatEvent::ToolCancelled { id, .. } => Some(format!("tool_cancelled:{}", id)),
             ChatEvent::PermissionRequest { id, .. } => Some(format!("permission_request:{}", id)),
             ChatEvent::AskUserQuestion { id, .. } => Some(format!("ask_user_question:{}", id)),
             ChatEvent::PermissionDecision { id, .. } => Some(format!("permission_decision:{}", id)),
@@ -475,6 +486,14 @@ mod tests {
             "tool_use"
         );
         assert_eq!(
+            ChatEvent::ToolCancelled {
+                id: "".into(),
+                parent_tool_use_id: None,
+            }
+            .event_type(),
+            "tool_cancelled"
+        );
+        assert_eq!(
             ChatEvent::PermissionRequest {
                 id: "".into(),
                 tool: "".into(),
@@ -553,6 +572,14 @@ mod tests {
                 result: serde_json::json!("Not found"),
                 is_error: true,
                 parent_tool_use_id: Some("toolu_parent_1".into()),
+            },
+            ChatEvent::ToolCancelled {
+                id: "tu_3".into(),
+                parent_tool_use_id: None,
+            },
+            ChatEvent::ToolCancelled {
+                id: "tu_4".into(),
+                parent_tool_use_id: Some("toolu_parent_3".into()),
             },
             ChatEvent::PermissionRequest {
                 id: "pr_1".into(),

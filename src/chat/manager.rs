@@ -1678,6 +1678,11 @@ impl ChatManager {
         // the persisted record when AssistantMessage provides the full input.
         let mut emitted_tool_use_ids: std::collections::HashMap<String, Option<usize>> =
             std::collections::HashMap::new();
+        // Track pending tool calls (ToolUse without a corresponding ToolResult).
+        // Maps tool_use ID → parent_tool_use_id. On interrupt, ToolCancelled is
+        // emitted for each remaining entry so the frontend stops showing "running...".
+        let mut pending_tool_calls: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
         let session_uuid = Uuid::parse_str(&session_id).ok();
 
         // Temporarily take the SDK control receiver from the shared slot.
@@ -2133,6 +2138,13 @@ impl ChatManager {
                                 }
                                 // First occurrence — record it
                                 emitted_tool_use_ids.insert(id.clone(), None);
+                                // Track as pending (no ToolResult yet)
+                                pending_tool_calls.insert(id.clone(), parent_tool_use_id.clone());
+                            }
+
+                            // When a ToolResult arrives, the tool is no longer pending
+                            if let ChatEvent::ToolResult { ref id, .. } = event {
+                                pending_tool_calls.remove(id);
                             }
 
                             // Persist structured events (skip transient: stream_delta, streaming_status)
@@ -2258,7 +2270,8 @@ impl ChatManager {
             }
         }
 
-        // If interrupted, send the interrupt signal to the CLI
+        // If interrupted, send the interrupt signal to the CLI and emit ToolCancelled
+        // for any tools that were still running (ToolUse without ToolResult).
         if interrupt_flag.load(Ordering::SeqCst) {
             debug!("Sending interrupt signal to CLI for session {}", session_id);
             let mut c = client.lock().await;
@@ -2267,6 +2280,46 @@ impl ChatManager {
                     "Failed to send interrupt signal to CLI for session {}: {}",
                     session_id, e
                 );
+            }
+
+            // Emit ToolCancelled for each pending tool (ToolUse without ToolResult)
+            if !pending_tool_calls.is_empty() {
+                info!(
+                    "Emitting ToolCancelled for {} pending tool(s) in session {}",
+                    pending_tool_calls.len(),
+                    session_id
+                );
+                let mut cancel_events = Vec::new();
+                for (tool_id, parent) in &pending_tool_calls {
+                    let event = ChatEvent::ToolCancelled {
+                        id: tool_id.clone(),
+                        parent_tool_use_id: parent.clone(),
+                    };
+                    cancel_events.push(event.clone());
+                    emit_chat(event, &events_tx, &nats, &session_id);
+                }
+
+                // Persist ToolCancelled events in Neo4j
+                if let Some(uuid) = session_uuid {
+                    let mut cancel_records = Vec::new();
+                    for event in &cancel_events {
+                        let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                        cancel_records.push(ChatEventRecord {
+                            id: Uuid::new_v4(),
+                            session_id: uuid,
+                            seq,
+                            event_type: event.event_type().to_string(),
+                            data: serde_json::to_string(event).unwrap_or_default(),
+                            created_at: chrono::Utc::now(),
+                        });
+                    }
+                    if let Err(e) = graph.store_chat_events(uuid, cancel_records).await {
+                        warn!(
+                            "Failed to persist ToolCancelled events for session {}: {}",
+                            session_id, e
+                        );
+                    }
+                }
             }
         }
 
