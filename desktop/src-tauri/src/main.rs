@@ -224,6 +224,17 @@ fn main() {
             // application JS (React, eventBus, wsAdapter) executes.
             .initialization_script(r#"
                 (function() {
+                    // 0. macOS Tauri 2 click fix — block touch events that interfere
+                    //    with mouse clicks in webviews with decorations: false.
+                    //    See: https://github.com/tauri-apps/tauri/discussions/11957
+                    if (/Mac|Macintosh/i.test(navigator.userAgent)) {
+                        var origAEL = EventTarget.prototype.addEventListener;
+                        EventTarget.prototype.addEventListener = function(type, listener, options) {
+                            if (/^touch/.test(type)) return;
+                            return origAEL.call(this, type, listener, options);
+                        };
+                    }
+
                     // 1. Block Cmd/Ctrl +/-/0 zoom shortcuts
                     document.addEventListener('keydown', function(e) {
                         if ((e.metaKey || e.ctrlKey) && (e.key === '+' || e.key === '-' || e.key === '=' || e.key === '0')) {
