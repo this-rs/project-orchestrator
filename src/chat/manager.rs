@@ -140,11 +140,23 @@ pub struct ChatManager {
 pub(crate) struct CompactionNotifier {
     /// Broadcast sender for chat events (same channel as stream_response uses)
     events_tx: broadcast::Sender<ChatEvent>,
+    /// NATS emitter for cross-instance propagation (None in tests or when NATS is disabled)
+    nats: Option<Arc<crate::events::NatsEmitter>>,
+    /// Session ID for NATS subject routing
+    session_id: String,
 }
 
 impl CompactionNotifier {
-    pub fn new(events_tx: broadcast::Sender<ChatEvent>) -> Self {
-        Self { events_tx }
+    pub fn new(
+        events_tx: broadcast::Sender<ChatEvent>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        session_id: String,
+    ) -> Self {
+        Self {
+            events_tx,
+            nats,
+            session_id,
+        }
     }
 }
 
@@ -160,10 +172,15 @@ impl nexus_claude::HookCallback for CompactionNotifier {
             let event = ChatEvent::CompactionStarted {
                 trigger: pre_compact.trigger.clone(),
             };
-            // Best-effort broadcast — receivers may have been dropped (no subscribers)
-            let _ = self.events_tx.send(event);
+            // Best-effort local broadcast — receivers may have been dropped (no subscribers)
+            let _ = self.events_tx.send(event.clone());
+            // Cross-instance propagation via NATS (fire-and-forget, tokio::spawn inside)
+            if let Some(ref nats) = self.nats {
+                nats.publish_chat_event(&self.session_id, event);
+            }
             info!(
                 trigger = %pre_compact.trigger,
+                session_id = %self.session_id,
                 "PreCompact hook fired — emitted CompactionStarted event"
             );
         }
@@ -1377,7 +1394,11 @@ impl ChatManager {
 
         // Build PreCompact hook → CompactionNotifier broadcasts ChatEvent::CompactionStarted
         let compaction_hooks = {
-            let notifier = CompactionNotifier::new(events_tx.clone());
+            let notifier = CompactionNotifier::new(
+                events_tx.clone(),
+                self.nats.clone(),
+                session_id.to_string(),
+            );
             let mut hooks = std::collections::HashMap::new();
             hooks.insert(
                 "PreCompact".to_string(),
@@ -3169,7 +3190,11 @@ impl ChatManager {
 
         // Build PreCompact hook → CompactionNotifier broadcasts ChatEvent::CompactionStarted
         let compaction_hooks = {
-            let notifier = CompactionNotifier::new(events_tx.clone());
+            let notifier = CompactionNotifier::new(
+                events_tx.clone(),
+                self.nats.clone(),
+                session_id.to_string(),
+            );
             let mut hooks = std::collections::HashMap::new();
             hooks.insert(
                 "PreCompact".to_string(),
@@ -4248,7 +4273,7 @@ mod tests {
 
         // Build hooks map with a CompactionNotifier
         let (tx, _rx) = broadcast::channel::<ChatEvent>(16);
-        let notifier = CompactionNotifier::new(tx);
+        let notifier = CompactionNotifier::new(tx, None, "test-session".to_string());
         let mut hooks = std::collections::HashMap::new();
         hooks.insert(
             "PreCompact".to_string(),
@@ -7171,7 +7196,7 @@ mod tests {
         use nexus_claude::{HookCallback, HookContext, HookInput, PreCompactHookInput};
 
         let (tx, mut rx) = broadcast::channel::<ChatEvent>(16);
-        let notifier = CompactionNotifier::new(tx);
+        let notifier = CompactionNotifier::new(tx, None, "test-session".to_string());
 
         let input = HookInput::PreCompact(PreCompactHookInput {
             session_id: "test-session".into(),
@@ -7199,7 +7224,7 @@ mod tests {
         use nexus_claude::{HookCallback, HookContext, HookInput, PreCompactHookInput};
 
         let (tx, mut rx) = broadcast::channel::<ChatEvent>(16);
-        let notifier = CompactionNotifier::new(tx);
+        let notifier = CompactionNotifier::new(tx, None, "sess-2".to_string());
 
         let input = HookInput::PreCompact(PreCompactHookInput {
             session_id: "sess-2".into(),
@@ -7232,7 +7257,7 @@ mod tests {
         use nexus_claude::{HookCallback, HookContext, HookInput, PreToolUseHookInput};
 
         let (tx, mut rx) = broadcast::channel::<ChatEvent>(16);
-        let notifier = CompactionNotifier::new(tx);
+        let notifier = CompactionNotifier::new(tx, None, "test-session".to_string());
 
         let input = HookInput::PreToolUse(PreToolUseHookInput {
             session_id: "s".into(),
@@ -7271,7 +7296,7 @@ mod tests {
 
         // 1. Create CompactionNotifier backed by a broadcast channel
         let (events_tx, mut events_rx) = broadcast::channel::<ChatEvent>(16);
-        let notifier = CompactionNotifier::new(events_tx);
+        let notifier = CompactionNotifier::new(events_tx, None, "test-session-e2e".to_string());
 
         // 2. Build hooks map and initialize
         let mut hooks = std::collections::HashMap::new();
@@ -7354,7 +7379,7 @@ mod tests {
 
         // Setup: CompactionNotifier + initialize + dispatch
         let (events_tx, _events_rx) = broadcast::channel::<ChatEvent>(16);
-        let notifier = CompactionNotifier::new(events_tx);
+        let notifier = CompactionNotifier::new(events_tx, None, "sess-resp".to_string());
 
         let mut hooks = std::collections::HashMap::new();
         hooks.insert(
