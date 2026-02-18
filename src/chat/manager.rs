@@ -749,6 +749,44 @@ impl ChatManager {
                                     error: Some(format!("Failed to send control response: {}", e)),
                                 },
                             }
+                        } else if request.message_type == "set_auto_continue" {
+                            // Toggle auto-continue for this session (no CLI interaction needed)
+                            let enabled: bool = serde_json::from_str::<serde_json::Value>(message)
+                                .ok()
+                                .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
+                                .unwrap_or(false);
+
+                            auto_continue.store(enabled, Ordering::Relaxed);
+
+                            // Persist to Neo4j
+                            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                                if let Err(e) =
+                                    graph.set_session_auto_continue(uuid, enabled).await
+                                {
+                                    warn!(
+                                        session_id = %session_id,
+                                        error = %e,
+                                        "Failed to persist auto_continue via NATS RPC (non-fatal)"
+                                    );
+                                }
+                            }
+
+                            info!(
+                                session_id = %session_id,
+                                enabled = %enabled,
+                                "NATS RPC: Auto-continue toggled"
+                            );
+
+                            // Broadcast state change event
+                            let _ = events_tx.send(ChatEvent::AutoContinueStateChanged {
+                                session_id: session_id.clone(),
+                                enabled,
+                            });
+
+                            crate::events::ChatRpcResponse {
+                                success: true,
+                                error: None,
+                            }
                         } else if is_streaming.load(Ordering::SeqCst) {
                             // If streaming → queue the message (will be drained by stream_response)
                             info!(
