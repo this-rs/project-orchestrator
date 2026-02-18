@@ -114,6 +114,10 @@ pub struct ChatConfig {
     /// When `false`, falls back to static markdown rendering (useful in tests to avoid
     /// spawning a real Claude CLI subprocess).
     pub enable_oneshot_refinement: bool,
+    /// Whether auto-continue is enabled by default for new sessions.
+    /// When `true`, the backend automatically sends "Continue" after error_max_turns.
+    /// Can be toggled per-session via WebSocket.
+    pub auto_continue: bool,
 }
 
 impl ChatConfig {
@@ -175,6 +179,9 @@ impl ChatConfig {
             enable_oneshot_refinement: std::env::var("CHAT_ENABLE_ONESHOT_REFINEMENT")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
+            auto_continue: std::env::var("CHAT_AUTO_CONTINUE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         }
     }
 
@@ -250,6 +257,7 @@ mod tests {
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
             enable_oneshot_refinement: true,
+            auto_continue: false,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -372,6 +380,7 @@ mod tests {
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
             enable_oneshot_refinement: true,
+            auto_continue: false,
         };
 
         let json = config.mcp_server_config();
@@ -398,6 +407,7 @@ mod tests {
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
             enable_oneshot_refinement: true,
+            auto_continue: false,
         };
 
         let json = config.mcp_server_config();

@@ -99,6 +99,10 @@ pub struct ActiveSession {
     /// so the CLI doesn't lose the original command/parameters.
     pub pending_permission_inputs:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    /// Whether auto-continue is enabled for this session.
+    /// When `true`, the backend automatically sends "Continue" after error_max_turns.
+    /// Toggled via WebSocket `set_auto_continue` message.
+    pub auto_continue: Arc<AtomicBool>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -677,6 +681,7 @@ impl ChatManager {
                                 session.streaming_events.clone(),
                                 session.sdk_control_rx.clone(),
                                 session.interrupt_token.clone(),
+                                session.auto_continue.clone(),
                             ))
                         }
                         None => None,
@@ -713,6 +718,7 @@ impl ChatManager {
                         streaming_events,
                         sdk_control_rx,
                         interrupt_token,
+                        auto_continue,
                     )) => {
                         let message = &request.message;
 
@@ -824,6 +830,7 @@ impl ChatManager {
                                     nats_clone,
                                     sdk_control_rx,
                                     interrupt_token,
+                                    auto_continue,
                                 )
                                 .await;
                             });
@@ -1433,6 +1440,7 @@ impl ChatManager {
         // Register active session — cancel old NATS listeners if session key already exists
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
+        let auto_continue = Arc::new(AtomicBool::new(self.config.auto_continue));
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -1467,6 +1475,7 @@ impl ChatManager {
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
+                    auto_continue: auto_continue.clone(),
                 },
             );
             interrupt_flag
@@ -1593,6 +1602,7 @@ impl ChatManager {
                 nats,
                 sdk_control_rx,
                 interrupt_token,
+                auto_continue,
             )
             .await;
         });
@@ -1626,6 +1636,7 @@ impl ChatManager {
             tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
         >,
         interrupt_token: CancellationToken,
+        auto_continue: Arc<AtomicBool>,
     ) {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
@@ -2422,6 +2433,7 @@ impl ChatManager {
                 nats,
                 shared_sdk_control_rx,
                 fresh_interrupt_token,
+                auto_continue,
             ))
             .await;
         }
@@ -2500,6 +2512,7 @@ impl ChatManager {
             streaming_events,
             sdk_control_rx,
             interrupt_token,
+            auto_continue,
         ) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
@@ -2524,6 +2537,7 @@ impl ChatManager {
                 session.streaming_events.clone(),
                 session.sdk_control_rx.clone(),
                 session.interrupt_token.clone(),
+                session.auto_continue.clone(),
             )
         };
 
@@ -2614,6 +2628,7 @@ impl ChatManager {
                 nats,
                 sdk_control_rx,
                 interrupt_token,
+                auto_continue,
             )
             .await;
         });
@@ -3057,6 +3072,9 @@ impl ChatManager {
         // Register as active — cancel old NATS listeners if session was previously active
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
+        let auto_continue = Arc::new(AtomicBool::new(
+            self.graph.get_session_auto_continue(uuid).await.unwrap_or(self.config.auto_continue),
+        ));
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous resume/create of this session.
@@ -3096,6 +3114,7 @@ impl ChatManager {
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
+                    auto_continue: auto_continue.clone(),
                 },
             );
             interrupt_flag
@@ -3171,6 +3190,7 @@ impl ChatManager {
                 nats,
                 sdk_control_rx,
                 interrupt_token,
+                auto_continue,
             )
             .await;
         });
@@ -3753,6 +3773,7 @@ mod tests {
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: crate::chat::config::PermissionConfig::default(),
             enable_oneshot_refinement: false,
+            auto_continue: false,
         }
     }
 
@@ -5317,6 +5338,7 @@ mod tests {
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            auto_continue: Arc::new(AtomicBool::new(false)),
         };
 
         Some((session, pending_messages))
@@ -6200,6 +6222,7 @@ mod tests {
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            auto_continue: Arc::new(AtomicBool::new(false)),
         };
 
         (session, handle)

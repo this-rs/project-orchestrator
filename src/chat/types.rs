@@ -187,6 +187,19 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
     },
+    /// Backend auto-continue: emitted when the backend detects error_max_turns
+    /// and auto_continue is enabled. Signals that a "Continue" will be sent
+    /// automatically after the delay.
+    AutoContinue {
+        session_id: String,
+        /// Delay in milliseconds before the auto-continue message is sent
+        delay_ms: u64,
+    },
+    /// Auto-continue state changed for a session (broadcast to sync all frontends)
+    AutoContinueStateChanged {
+        session_id: String,
+        enabled: bool,
+    },
 }
 
 impl ChatEvent {
@@ -213,6 +226,8 @@ impl ChatEvent {
             ChatEvent::CompactionStarted { .. } => "compaction_started",
             ChatEvent::CompactBoundary { .. } => "compact_boundary",
             ChatEvent::SystemInit { .. } => "system_init",
+            ChatEvent::AutoContinue { .. } => "auto_continue",
+            ChatEvent::AutoContinueStateChanged { .. } => "auto_continue_state_changed",
         }
     }
 
@@ -275,6 +290,17 @@ impl ChatEvent {
             ChatEvent::CompactBoundary { trigger, .. } => {
                 Some(format!("compact_boundary:{}", trigger))
             }
+
+            ChatEvent::AutoContinue { session_id, .. } => {
+                Some(format!("auto_continue:{}", session_id))
+            }
+            ChatEvent::AutoContinueStateChanged {
+                session_id,
+                enabled,
+            } => Some(format!(
+                "auto_continue_state_changed:{}:{}",
+                session_id, enabled
+            )),
 
             // StreamDelta and StreamingStatus are never in the snapshot
             ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. } => None,

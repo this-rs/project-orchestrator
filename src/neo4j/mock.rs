@@ -43,6 +43,8 @@ pub struct MockGraphStore {
     pub notes: RwLock<HashMap<Uuid, Note>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
     pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
+    /// Per-session auto_continue flag (stored separately from ChatSessionNode)
+    pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -112,6 +114,7 @@ impl MockGraphStore {
             notes: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
             chat_events: RwLock::new(HashMap::new()),
+            session_auto_continue: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -3623,6 +3626,17 @@ impl GraphStore for MockGraphStore {
             session.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {
+        let mut auto_continue = self.session_auto_continue.write().await;
+        auto_continue.insert(id, enabled);
+        Ok(())
+    }
+
+    async fn get_session_auto_continue(&self, id: Uuid) -> Result<bool> {
+        let auto_continue = self.session_auto_continue.read().await;
+        Ok(auto_continue.get(&id).copied().unwrap_or(false))
     }
 
     async fn backfill_chat_session_previews(&self) -> Result<usize> {
