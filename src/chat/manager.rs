@@ -7296,8 +7296,7 @@ mod tests {
 
         // 1. Create CompactionNotifier backed by a broadcast channel
         let (events_tx, mut events_rx) = broadcast::channel::<ChatEvent>(16);
-        let notifier =
-            CompactionNotifier::new(events_tx, None, "test-session-e2e".to_string());
+        let notifier = CompactionNotifier::new(events_tx, None, "test-session-e2e".to_string());
 
         // 2. Build hooks map and initialize
         let mut hooks = std::collections::HashMap::new();
