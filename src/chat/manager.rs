@@ -3488,7 +3488,10 @@ impl ChatManager {
         let (interrupt_flag, interrupt_token) = {
             let sessions = self.active_sessions.read().await;
             match sessions.get(session_id) {
-                Some(s) => (Some(s.interrupt_flag.clone()), Some(s.interrupt_token.clone())),
+                Some(s) => (
+                    Some(s.interrupt_flag.clone()),
+                    Some(s.interrupt_token.clone()),
+                ),
                 None => (None, None),
             }
         };
