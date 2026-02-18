@@ -4655,6 +4655,49 @@ mod tests {
     }
 
     // ====================================================================
+    // Auto-continue tests
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_mock_auto_continue_set_and_get() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        // Default should be false for unknown session
+        let result = store.get_session_auto_continue(session_id).await.unwrap();
+        assert!(!result);
+
+        // Set to true
+        store
+            .set_session_auto_continue(session_id, true)
+            .await
+            .unwrap();
+        let result = store.get_session_auto_continue(session_id).await.unwrap();
+        assert!(result);
+
+        // Toggle back to false
+        store
+            .set_session_auto_continue(session_id, false)
+            .await
+            .unwrap();
+        let result = store.get_session_auto_continue(session_id).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_mock_auto_continue_multiple_sessions() {
+        let store = MockGraphStore::new();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+
+        store.set_session_auto_continue(s1, true).await.unwrap();
+        store.set_session_auto_continue(s2, false).await.unwrap();
+
+        assert!(store.get_session_auto_continue(s1).await.unwrap());
+        assert!(!store.get_session_auto_continue(s2).await.unwrap());
+    }
+
+    // ====================================================================
     // User / Auth tests
     // ====================================================================
 
