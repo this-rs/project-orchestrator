@@ -60,6 +60,8 @@ pub enum WsChatClientMessage {
     SetPermissionMode { mode: String },
     /// Change the model of the active session
     SetModel { model: String },
+    /// Toggle auto-continue for the active session
+    SetAutoContinue { enabled: bool },
 }
 
 /// WebSocket upgrade handler for `/ws/chat/{session_id}`
@@ -510,6 +512,19 @@ async fn handle_ws_chat_loop(
         return;
     }
 
+    // Send current auto_continue state so the frontend can initialize its toggle
+    if let Ok(ac_enabled) = chat_manager.get_auto_continue_state(&session_id).await {
+        let ac_msg = serde_json::json!({
+            "type": "auto_continue_state_changed",
+            "session_id": session_id,
+            "enabled": ac_enabled,
+            "seq": 0,
+        });
+        let _ = ws_sender
+            .send(Message::Text(ac_msg.to_string().into()))
+            .await;
+    }
+
     // Ping interval (30s)
     let mut ping_interval = interval(Duration::from_secs(30));
     ping_interval.tick().await; // skip first immediate tick
@@ -894,6 +909,50 @@ async fn handle_ws_chat_loop(
                                                 "message": "Session not active on this instance",
                                             });
                                             let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        }
+                                    }
+
+                                    WsChatClientMessage::SetAutoContinue { enabled } => {
+                                        info!(session_id = %session_id, enabled = %enabled, "WS: Received set_auto_continue");
+                                        if chat_manager.is_session_active(&session_id).await {
+                                            // Session is local — toggle directly
+                                            match chat_manager.set_auto_continue(&session_id, enabled).await {
+                                                Ok(()) => {
+                                                    let confirmation = serde_json::json!({
+                                                        "type": "auto_continue_state_changed",
+                                                        "enabled": enabled,
+                                                    });
+                                                    let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!(session_id = %session_id, error = %e, "Failed to set auto_continue");
+                                                    let err = serde_json::json!({
+                                                        "type": "error",
+                                                        "message": format!("Failed to set auto_continue: {}", e),
+                                                    });
+                                                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                                }
+                                            }
+                                        } else {
+                                            // Session not local — proxy via NATS RPC to owning instance
+                                            let payload = serde_json::json!({ "enabled": enabled }).to_string();
+                                            if chat_manager
+                                                .try_remote_send(&session_id, &payload, "set_auto_continue")
+                                                .await
+                                                .unwrap_or(false)
+                                            {
+                                                let confirmation = serde_json::json!({
+                                                    "type": "auto_continue_state_changed",
+                                                    "enabled": enabled,
+                                                });
+                                                let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
+                                            } else {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "Session not found or not active on any instance",
+                                                });
+                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                            }
                                         }
                                     }
                                 }

@@ -99,6 +99,10 @@ pub struct ActiveSession {
     /// so the CLI doesn't lose the original command/parameters.
     pub pending_permission_inputs:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    /// Whether auto-continue is enabled for this session.
+    /// When `true`, the backend automatically sends "Continue" after error_max_turns.
+    /// Toggled via WebSocket `set_auto_continue` message.
+    pub auto_continue: Arc<AtomicBool>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -677,6 +681,7 @@ impl ChatManager {
                                 session.streaming_events.clone(),
                                 session.sdk_control_rx.clone(),
                                 session.interrupt_token.clone(),
+                                session.auto_continue.clone(),
                             ))
                         }
                         None => None,
@@ -713,6 +718,7 @@ impl ChatManager {
                         streaming_events,
                         sdk_control_rx,
                         interrupt_token,
+                        auto_continue,
                     )) => {
                         let message = &request.message;
 
@@ -742,6 +748,43 @@ impl ChatManager {
                                     success: false,
                                     error: Some(format!("Failed to send control response: {}", e)),
                                 },
+                            }
+                        } else if request.message_type == "set_auto_continue" {
+                            // Toggle auto-continue for this session (no CLI interaction needed)
+                            let enabled: bool = serde_json::from_str::<serde_json::Value>(message)
+                                .ok()
+                                .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
+                                .unwrap_or(false);
+
+                            auto_continue.store(enabled, Ordering::Relaxed);
+
+                            // Persist to Neo4j
+                            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                                if let Err(e) = graph.set_session_auto_continue(uuid, enabled).await
+                                {
+                                    warn!(
+                                        session_id = %session_id,
+                                        error = %e,
+                                        "Failed to persist auto_continue via NATS RPC (non-fatal)"
+                                    );
+                                }
+                            }
+
+                            info!(
+                                session_id = %session_id,
+                                enabled = %enabled,
+                                "NATS RPC: Auto-continue toggled"
+                            );
+
+                            // Broadcast state change event
+                            let _ = events_tx.send(ChatEvent::AutoContinueStateChanged {
+                                session_id: session_id.clone(),
+                                enabled,
+                            });
+
+                            crate::events::ChatRpcResponse {
+                                success: true,
+                                error: None,
                             }
                         } else if is_streaming.load(Ordering::SeqCst) {
                             // If streaming → queue the message (will be drained by stream_response)
@@ -824,6 +867,7 @@ impl ChatManager {
                                     nats_clone,
                                     sdk_control_rx,
                                     interrupt_token,
+                                    auto_continue,
                                 )
                                 .await;
                             });
@@ -1433,6 +1477,7 @@ impl ChatManager {
         // Register active session — cancel old NATS listeners if session key already exists
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
+        let auto_continue = Arc::new(AtomicBool::new(self.config.auto_continue));
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -1467,6 +1512,7 @@ impl ChatManager {
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
+                    auto_continue: auto_continue.clone(),
                 },
             );
             interrupt_flag
@@ -1593,6 +1639,7 @@ impl ChatManager {
                 nats,
                 sdk_control_rx,
                 interrupt_token,
+                auto_continue,
             )
             .await;
         });
@@ -1626,6 +1673,7 @@ impl ChatManager {
             tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
         >,
         interrupt_token: CancellationToken,
+        auto_continue: Arc<AtomicBool>,
     ) {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
@@ -1658,6 +1706,9 @@ impl ChatManager {
         // Clear streaming buffers for the new stream
         streaming_text.lock().await.clear();
         streaming_events.lock().await.clear();
+
+        // Track whether this stream ended with error_max_turns (for auto-continue)
+        let mut hit_error_max_turns = false;
 
         // Record user message in memory manager
         if let Some(ref mm) = memory_manager {
@@ -2206,6 +2257,13 @@ impl ChatManager {
                                 streaming_events.lock().await.push(event.clone());
                             }
 
+                            // Detect error_max_turns for auto-continue
+                            if let ChatEvent::Result { ref subtype, .. } = event {
+                                if subtype == "error_max_turns" {
+                                    hit_error_max_turns = true;
+                                }
+                            }
+
                             emit_chat(event, &events_tx, &nats, &session_id);
                         }
                     }
@@ -2346,6 +2404,64 @@ impl ChatManager {
         streaming_events.lock().await.clear();
         debug!("Stream completed for session {}", session_id);
 
+        // Auto-continue: if error_max_turns was hit and auto_continue is enabled,
+        // emit an AutoContinue event, wait 500ms (interruptible), then enqueue "Continue"
+        // into pending_messages for the drain below.
+        if hit_error_max_turns
+            && auto_continue.load(Ordering::Relaxed)
+            && !interrupt_flag.load(Ordering::SeqCst)
+        {
+            let delay_ms = 500u64;
+            info!(
+                "Auto-continue triggered for session {} (delay={}ms)",
+                session_id, delay_ms
+            );
+
+            // Emit AutoContinue event so frontends can show "Auto-continuing..."
+            let ac_event = ChatEvent::AutoContinue {
+                session_id: session_id.clone(),
+                delay_ms,
+            };
+            emit_chat(ac_event.clone(), &events_tx, &nats, &session_id);
+
+            // Persist the AutoContinue event
+            if let Some(uuid) = session_uuid {
+                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                let record = ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq,
+                    event_type: ac_event.event_type().to_string(),
+                    data: serde_json::to_string(&ac_event).unwrap_or_default(),
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = graph.store_chat_events(uuid, vec![record]).await;
+            }
+
+            // Interruptible delay — if the user interrupts during the wait, skip the enqueue
+            let sleep_cancelled = tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => false,
+                _ = interrupt_token.cancelled() => true,
+            };
+
+            if !sleep_cancelled && !interrupt_flag.load(Ordering::SeqCst) {
+                // Enqueue "Continue" — the drain below will pick it up and recurse
+                pending_messages
+                    .lock()
+                    .await
+                    .push_back("Continue".to_string());
+                debug!(
+                    "Auto-continue: enqueued 'Continue' for session {}",
+                    session_id
+                );
+            } else {
+                info!(
+                    "Auto-continue cancelled by interrupt for session {}",
+                    session_id
+                );
+            }
+        }
+
         // Check pending_messages queue — if there are queued messages, process the next one
         let next_message = {
             let mut queue = pending_messages.lock().await;
@@ -2422,6 +2538,7 @@ impl ChatManager {
                 nats,
                 shared_sdk_control_rx,
                 fresh_interrupt_token,
+                auto_continue,
             ))
             .await;
         }
@@ -2500,6 +2617,7 @@ impl ChatManager {
             streaming_events,
             sdk_control_rx,
             interrupt_token,
+            auto_continue,
         ) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
@@ -2524,6 +2642,7 @@ impl ChatManager {
                 session.streaming_events.clone(),
                 session.sdk_control_rx.clone(),
                 session.interrupt_token.clone(),
+                session.auto_continue.clone(),
             )
         };
 
@@ -2614,6 +2733,7 @@ impl ChatManager {
                 nats,
                 sdk_control_rx,
                 interrupt_token,
+                auto_continue,
             )
             .await;
         });
@@ -2926,6 +3046,73 @@ impl ChatManager {
         Ok(())
     }
 
+    /// Toggle auto-continue for an active session.
+    ///
+    /// Updates the in-memory `ActiveSession.auto_continue` AtomicBool,
+    /// persists the change to Neo4j, and broadcasts a `ChatEvent::AutoContinueStateChanged`
+    /// so that all connected frontends can sync their toggle UI.
+    ///
+    /// Unlike `set_session_permission_mode`, this does NOT send a control request to the
+    /// CLI subprocess — auto-continue is purely a backend-side concern.
+    pub async fn set_auto_continue(&self, session_id: &str, enabled: bool) -> Result<()> {
+        let events_tx = {
+            let sessions = self.active_sessions.read().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            session
+                .auto_continue
+                .store(enabled, std::sync::atomic::Ordering::Relaxed);
+            session.events_tx.clone()
+        };
+
+        // Persist to Neo4j
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            if let Err(e) = self.graph.set_session_auto_continue(uuid, enabled).await {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist auto_continue change to Neo4j (non-fatal)"
+                );
+            }
+        }
+
+        info!(
+            session_id = %session_id,
+            enabled = %enabled,
+            "Auto-continue toggled for session"
+        );
+
+        // Broadcast event to WebSocket clients
+        let _ = events_tx.send(ChatEvent::AutoContinueStateChanged {
+            session_id: session_id.to_string(),
+            enabled,
+        });
+
+        Ok(())
+    }
+
+    /// Get the current auto-continue state for a session.
+    ///
+    /// Reads from the in-memory ActiveSession if local, otherwise falls back to Neo4j.
+    pub async fn get_auto_continue_state(&self, session_id: &str) -> Result<bool> {
+        // Try local active session first
+        let sessions = self.active_sessions.read().await;
+        if let Some(session) = sessions.get(session_id) {
+            return Ok(session
+                .auto_continue
+                .load(std::sync::atomic::Ordering::Relaxed));
+        }
+        drop(sessions);
+
+        // Fallback to Neo4j
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            return self.graph.get_session_auto_continue(uuid).await;
+        }
+
+        Ok(self.config.auto_continue)
+    }
+
     /// Resume a previously inactive session by creating a new InteractiveClient.
     ///
     /// If the session has a `cli_session_id`, resumes with `--resume`.
@@ -3057,6 +3244,12 @@ impl ChatManager {
         // Register as active — cancel old NATS listeners if session was previously active
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
+        let auto_continue = Arc::new(AtomicBool::new(
+            self.graph
+                .get_session_auto_continue(uuid)
+                .await
+                .unwrap_or(self.config.auto_continue),
+        ));
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous resume/create of this session.
@@ -3096,6 +3289,7 @@ impl ChatManager {
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
+                    auto_continue: auto_continue.clone(),
                 },
             );
             interrupt_flag
@@ -3171,6 +3365,7 @@ impl ChatManager {
                 nats,
                 sdk_control_rx,
                 interrupt_token,
+                auto_continue,
             )
             .await;
         });
@@ -3753,6 +3948,7 @@ mod tests {
             prompt_builder_model: "claude-opus-4-6".into(),
             permission: crate::chat::config::PermissionConfig::default(),
             enable_oneshot_refinement: false,
+            auto_continue: false,
         }
     }
 
@@ -5317,6 +5513,7 @@ mod tests {
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            auto_continue: Arc::new(AtomicBool::new(false)),
         };
 
         Some((session, pending_messages))
@@ -6200,6 +6397,7 @@ mod tests {
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            auto_continue: Arc::new(AtomicBool::new(false)),
         };
 
         (session, handle)

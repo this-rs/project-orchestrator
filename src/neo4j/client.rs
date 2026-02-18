@@ -7319,6 +7319,33 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Set the auto_continue flag on a chat session node.
+    pub async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) SET s.auto_continue = $enabled, s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("enabled", enabled);
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get the auto_continue flag from a chat session node.
+    /// Returns `false` if the session doesn't exist or the property is not set.
+    pub async fn get_session_auto_continue(&self, id: Uuid) -> Result<bool> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) RETURN s.auto_continue AS auto_continue";
+        let q = query(cypher).param("id", id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            // Neo4j may return null if property not set
+            Ok(row
+                .get::<Option<bool>>("auto_continue")
+                .unwrap_or(None)
+                .unwrap_or(false))
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Backfill title and preview for sessions that don't have them yet.
     /// Uses the first user_message event stored in Neo4j.
     /// Returns the number of sessions updated.

@@ -187,6 +187,16 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
     },
+    /// Backend auto-continue: emitted when the backend detects error_max_turns
+    /// and auto_continue is enabled. Signals that a "Continue" will be sent
+    /// automatically after the delay.
+    AutoContinue {
+        session_id: String,
+        /// Delay in milliseconds before the auto-continue message is sent
+        delay_ms: u64,
+    },
+    /// Auto-continue state changed for a session (broadcast to sync all frontends)
+    AutoContinueStateChanged { session_id: String, enabled: bool },
 }
 
 impl ChatEvent {
@@ -213,6 +223,8 @@ impl ChatEvent {
             ChatEvent::CompactionStarted { .. } => "compaction_started",
             ChatEvent::CompactBoundary { .. } => "compact_boundary",
             ChatEvent::SystemInit { .. } => "system_init",
+            ChatEvent::AutoContinue { .. } => "auto_continue",
+            ChatEvent::AutoContinueStateChanged { .. } => "auto_continue_state_changed",
         }
     }
 
@@ -275,6 +287,17 @@ impl ChatEvent {
             ChatEvent::CompactBoundary { trigger, .. } => {
                 Some(format!("compact_boundary:{}", trigger))
             }
+
+            ChatEvent::AutoContinue { session_id, .. } => {
+                Some(format!("auto_continue:{}", session_id))
+            }
+            ChatEvent::AutoContinueStateChanged {
+                session_id,
+                enabled,
+            } => Some(format!(
+                "auto_continue_state_changed:{}:{}",
+                session_id, enabled
+            )),
 
             // StreamDelta and StreamingStatus are never in the snapshot
             ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. } => None,
@@ -671,6 +694,18 @@ mod tests {
                 mcp_servers: vec![],
                 permission_mode: None,
             },
+            ChatEvent::AutoContinue {
+                session_id: "sess-auto-1".into(),
+                delay_ms: 500,
+            },
+            ChatEvent::AutoContinueStateChanged {
+                session_id: "sess-auto-2".into(),
+                enabled: true,
+            },
+            ChatEvent::AutoContinueStateChanged {
+                session_id: "sess-auto-3".into(),
+                enabled: false,
+            },
         ];
 
         for event in &events {
@@ -679,6 +714,46 @@ mod tests {
             // Verify the type tag roundtrips correctly
             assert_eq!(event.event_type(), deserialized.event_type());
         }
+    }
+
+    #[test]
+    fn test_auto_continue_event_types_and_fingerprints() {
+        let ac = ChatEvent::AutoContinue {
+            session_id: "sess-1".into(),
+            delay_ms: 500,
+        };
+        assert_eq!(ac.event_type(), "auto_continue");
+        assert_eq!(ac.fingerprint(), Some("auto_continue:sess-1".to_string()));
+
+        let acs_on = ChatEvent::AutoContinueStateChanged {
+            session_id: "sess-2".into(),
+            enabled: true,
+        };
+        assert_eq!(acs_on.event_type(), "auto_continue_state_changed");
+        assert_eq!(
+            acs_on.fingerprint(),
+            Some("auto_continue_state_changed:sess-2:true".to_string())
+        );
+
+        let acs_off = ChatEvent::AutoContinueStateChanged {
+            session_id: "sess-2".into(),
+            enabled: false,
+        };
+        assert_eq!(
+            acs_off.fingerprint(),
+            Some("auto_continue_state_changed:sess-2:false".to_string())
+        );
+    }
+
+    #[test]
+    fn test_auto_continue_event_deserialize_from_json() {
+        let json = r#"{"type":"auto_continue","session_id":"s1","delay_ms":500}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_type(), "auto_continue");
+
+        let json2 = r#"{"type":"auto_continue_state_changed","session_id":"s1","enabled":true}"#;
+        let event2: ChatEvent = serde_json::from_str(json2).unwrap();
+        assert_eq!(event2.event_type(), "auto_continue_state_changed");
     }
 
     #[test]

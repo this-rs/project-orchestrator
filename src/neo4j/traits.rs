@@ -977,6 +977,12 @@ pub trait GraphStore: Send + Sync {
     /// Update the permission_mode field on a chat session node
     async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()>;
 
+    /// Set the auto_continue flag on a chat session node
+    async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()>;
+
+    /// Get the auto_continue flag from a chat session node (false if not set)
+    async fn get_session_auto_continue(&self, id: Uuid) -> Result<bool>;
+
     /// Backfill title and preview for sessions that don't have them yet
     async fn backfill_chat_session_previews(&self) -> Result<usize>;
 
