@@ -19,6 +19,29 @@ use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
 
+// ============================================================================
+// Feature Graph LLM Generation
+// ============================================================================
+
+/// A proposal from the LLM for a feature graph to create.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FeatureGraphProposal {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub entry_function: String,
+    #[serde(default = "FeatureGraphProposal::default_depth")]
+    pub depth: u32,
+    #[serde(default)]
+    pub include_relations: Option<Vec<String>>,
+}
+
+impl FeatureGraphProposal {
+    fn default_depth() -> u32 {
+        2
+    }
+}
+
 /// Main orchestrator for coordinating AI agents
 pub struct Orchestrator {
     state: AppState,
@@ -224,7 +247,58 @@ impl Orchestrator {
             // --- Auto-generate if no feature graphs exist at all ---
             if graphs.is_empty() {
                 tracing::info!(
-                    "No feature graphs found for project {} — auto-generating from top entry functions",
+                    "No feature graphs found for project {} — attempting LLM-based proposal",
+                    project_id
+                );
+
+                // Try LLM-based proposal first
+                let proposals =
+                    Orchestrator::propose_feature_graphs_with_llm(neo4j.as_ref(), project_id).await;
+
+                if !proposals.is_empty() {
+                    tracing::info!(
+                        "LLM proposed {} feature graph(s) for project {} — creating them",
+                        proposals.len(),
+                        project_id
+                    );
+
+                    for proposal in &proposals {
+                        let include_rels = proposal.include_relations.as_deref();
+                        match neo4j
+                            .auto_build_feature_graph(
+                                &proposal.name,
+                                proposal.description.as_deref(),
+                                project_id,
+                                &proposal.entry_function,
+                                proposal.depth,
+                                include_rels,
+                            )
+                            .await
+                        {
+                            Ok(detail) => {
+                                tracing::info!(
+                                    "Created LLM-proposed feature graph '{}' ({}) with {} entities",
+                                    detail.graph.name,
+                                    detail.graph.id,
+                                    detail.entities.len()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to create LLM-proposed feature graph '{}' (entry: '{}'): {}",
+                                    proposal.name,
+                                    proposal.entry_function,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Fallback: LLM returned empty — use naive top-functions approach
+                tracing::info!(
+                    "LLM proposal returned empty for project {} — falling back to top entry functions",
                     project_id
                 );
 
@@ -249,7 +323,7 @@ impl Orchestrator {
                 }
 
                 tracing::info!(
-                    "Auto-generating {} feature graph(s) for project {}",
+                    "Fallback: auto-generating {} feature graph(s) for project {}",
                     top_functions.len(),
                     project_id
                 );
@@ -314,6 +388,248 @@ impl Orchestrator {
                 }
             }
         });
+    }
+
+    /// Gather codebase context for LLM-based feature graph proposal.
+    ///
+    /// Collects top functions, module structure, and existing feature graphs
+    /// to build a JSON context that the LLM can analyze.
+    async fn gather_codebase_context(
+        neo4j: &dyn crate::neo4j::GraphStore,
+        project_id: Uuid,
+    ) -> Result<String> {
+        // Top 30 functions by connectivity
+        let top_functions = neo4j.get_top_entry_functions(project_id, 30).await?;
+
+        // Module structure: most connected files
+        let connected_files = neo4j
+            .get_most_connected_files_for_project(project_id, 20)
+            .await
+            .unwrap_or_default();
+
+        // Language stats
+        let lang_stats = neo4j
+            .get_language_stats_for_project(project_id)
+            .await
+            .unwrap_or_default();
+
+        // Existing feature graphs (to avoid duplicates)
+        let existing_fgs = neo4j
+            .list_feature_graphs(Some(project_id))
+            .await
+            .unwrap_or_default();
+
+        let existing_fg_json: Vec<serde_json::Value> = existing_fgs
+            .iter()
+            .map(|fg| {
+                serde_json::json!({
+                    "name": fg.name,
+                    "entry_function": fg.entry_function,
+                    "entity_count": fg.entity_count,
+                })
+            })
+            .collect();
+
+        let files_json: Vec<serde_json::Value> = connected_files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "path": f.path,
+                    "imports": f.imports,
+                    "dependents": f.dependents,
+                })
+            })
+            .collect();
+
+        let langs_json: Vec<serde_json::Value> = lang_stats
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "language": l.language,
+                    "file_count": l.file_count,
+                })
+            })
+            .collect();
+
+        let context = serde_json::json!({
+            "top_functions": top_functions,
+            "connected_files": files_json,
+            "language_stats": langs_json,
+            "existing_feature_graphs": existing_fg_json,
+        });
+
+        Ok(context.to_string())
+    }
+
+    /// Build the prompt that asks the LLM to propose feature graphs.
+    fn build_feature_graph_prompt(codebase_context: &str) -> String {
+        format!(
+            r#"You are analyzing a codebase to identify meaningful feature graphs.
+
+A **feature graph** maps a coherent feature or subsystem by starting from an entry-point function and traversing its call graph (callers + callees), related types (structs/enums via impl blocks), traits, and imports.
+
+## Your task
+
+Analyze the codebase context below and propose **5 to 15 feature graphs** that cover the main features/subsystems of this project. Each proposal needs:
+- **name**: A short, human-readable name (e.g. "Code Sync Pipeline", "Authentication Flow", "MCP Tool Dispatch")
+- **description**: One sentence explaining what this feature covers
+- **entry_function**: The function name to start BFS traversal from (must be one of the top_functions listed)
+- **depth**: BFS depth 1-5 (use 2-3 for focused features, 4-5 for broad subsystems)
+- **include_relations**: Optional array of relation types to traverse. Options: "calls", "implements_trait", "implements_for", "imports". Omit or set to null for all relations.
+
+## Guidelines
+- Choose entry points that represent the **core logic** of each feature, not utility functions
+- Prefer functions that are **high in the call hierarchy** (many callees) over leaf functions
+- Give names that a developer would use to describe the feature (not just the function name)
+- Avoid duplicating existing feature graphs (listed below)
+- Group related functions into the same feature graph via the right entry point
+- Cover as much of the codebase as possible without excessive overlap
+
+## Codebase context
+
+{codebase_context}
+
+## Response format
+
+Respond with ONLY a JSON array, no markdown fences, no explanation:
+[
+  {{
+    "name": "Feature Name",
+    "description": "What this feature does",
+    "entry_function": "function_name",
+    "depth": 2,
+    "include_relations": null
+  }}
+]"#,
+            codebase_context = codebase_context
+        )
+    }
+
+    /// Use a oneshot LLM call to propose feature graphs for a project.
+    ///
+    /// Follows the same pattern as `ChatManager::refine_context_with_oneshot`:
+    /// InteractiveClient + max_turns(1) + BypassPermissions.
+    ///
+    /// Returns an empty Vec on any failure (best-effort).
+    async fn propose_feature_graphs_with_llm(
+        neo4j: &dyn crate::neo4j::GraphStore,
+        project_id: Uuid,
+    ) -> Vec<FeatureGraphProposal> {
+        // 1. Gather context
+        let context = match Self::gather_codebase_context(neo4j, project_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to gather codebase context for LLM feature graph proposal: {}",
+                    e
+                );
+                return Vec::new();
+            }
+        };
+
+        // 2. Build prompt
+        let prompt = Self::build_feature_graph_prompt(&context);
+
+        // 3. Oneshot LLM call
+        let model = std::env::var("FEATURE_GRAPH_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+
+        if model.is_empty() {
+            tracing::info!("FEATURE_GRAPH_MODEL is empty, skipping LLM feature graph proposal");
+            return Vec::new();
+        }
+
+        tracing::info!(
+            "Proposing feature graphs via LLM (model: {}) for project {}",
+            model,
+            project_id
+        );
+
+        use nexus_claude::{ClaudeCodeOptions, InteractiveClient, PermissionMode};
+
+        #[allow(deprecated)]
+        let options = ClaudeCodeOptions::builder()
+            .model(&model)
+            .system_prompt("You are a code architecture analyst. Respond only with valid JSON.")
+            .permission_mode(PermissionMode::BypassPermissions)
+            .max_turns(1)
+            .build();
+
+        let mut client = match InteractiveClient::new(options) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to create LLM client for feature graph proposal: {}",
+                    e
+                );
+                return Vec::new();
+            }
+        };
+
+        if let Err(e) = client.connect().await {
+            tracing::warn!(
+                "Failed to connect LLM client for feature graph proposal: {}",
+                e
+            );
+            return Vec::new();
+        }
+
+        let messages = match client.send_and_receive(prompt).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("LLM feature graph proposal call failed: {}", e);
+                let _ = client.disconnect().await;
+                return Vec::new();
+            }
+        };
+
+        let _ = client.disconnect().await;
+
+        // 4. Extract text from response
+        use nexus_claude::{ContentBlock, Message};
+        let mut response_text = String::new();
+        for msg in &messages {
+            if let Message::Assistant { message, .. } = msg {
+                for block in &message.content {
+                    if let ContentBlock::Text(text) = block {
+                        response_text.push_str(&text.text);
+                    }
+                }
+            }
+        }
+
+        if response_text.is_empty() {
+            tracing::warn!("LLM returned empty response for feature graph proposal");
+            return Vec::new();
+        }
+
+        // 5. Parse JSON — try to extract array from response
+        //    The LLM might wrap it in markdown fences, so strip those
+        let json_str = response_text
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        match serde_json::from_str::<Vec<FeatureGraphProposal>>(json_str) {
+            Ok(proposals) => {
+                tracing::info!(
+                    "LLM proposed {} feature graph(s) for project {}",
+                    proposals.len(),
+                    project_id
+                );
+                proposals
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse LLM feature graph proposals: {}. Response: {}",
+                    e,
+                    &response_text[..response_text.len().min(500)]
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Get the search store
@@ -2551,5 +2867,317 @@ mod tests {
                 && e.entity_id == plan.id.to_string()),
             "PlanManager should emit via the shared EventEmitter"
         );
+    }
+
+    // ========================================================================
+    // Feature Graph Proposal Parsing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_feature_graph_proposals_valid_json() {
+        let json = r#"[
+            {
+                "name": "Code Sync Pipeline",
+                "description": "Handles file sync and tree-sitter parsing",
+                "entry_function": "sync_directory",
+                "depth": 3,
+                "include_relations": ["calls", "imports"]
+            },
+            {
+                "name": "MCP Tool Dispatch",
+                "description": "Routes MCP tool calls to handlers",
+                "entry_function": "handle_tools_call",
+                "depth": 2
+            }
+        ]"#;
+
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json).unwrap();
+        assert_eq!(proposals.len(), 2);
+
+        assert_eq!(proposals[0].name, "Code Sync Pipeline");
+        assert_eq!(
+            proposals[0].description.as_deref(),
+            Some("Handles file sync and tree-sitter parsing")
+        );
+        assert_eq!(proposals[0].entry_function, "sync_directory");
+        assert_eq!(proposals[0].depth, 3);
+        assert_eq!(
+            proposals[0].include_relations.as_ref().unwrap(),
+            &vec!["calls".to_string(), "imports".to_string()]
+        );
+
+        assert_eq!(proposals[1].name, "MCP Tool Dispatch");
+        assert_eq!(proposals[1].depth, 2);
+        assert!(proposals[1].include_relations.is_none());
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposals_defaults() {
+        // Minimal JSON — depth defaults to 2, include_relations defaults to None
+        let json = r#"[{
+            "name": "Auth Flow",
+            "entry_function": "authenticate"
+        }]"#;
+
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].depth, 2);
+        assert!(proposals[0].description.is_none());
+        assert!(proposals[0].include_relations.is_none());
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposals_invalid_json() {
+        let json = "this is not json at all";
+        let result = serde_json::from_str::<Vec<FeatureGraphProposal>>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposals_missing_required_field() {
+        // Missing entry_function — should fail
+        let json = r#"[{"name": "No Entry"}]"#;
+        let result = serde_json::from_str::<Vec<FeatureGraphProposal>>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposals_strips_markdown_fences() {
+        let response = "```json\n[{\"name\": \"Test\", \"entry_function\": \"foo\"}]\n```";
+        let json_str = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json_str).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].name, "Test");
+        assert_eq!(proposals[0].entry_function, "foo");
+    }
+
+    // ========================================================================
+    // gather_codebase_context Tests
+    // ========================================================================
+
+    use crate::neo4j::models::{FileNode, FunctionNode, Visibility};
+    use chrono::Utc;
+
+    fn test_file(path: &str, project_id: Uuid) -> FileNode {
+        FileNode {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            last_parsed: Utc::now(),
+            project_id: Some(project_id),
+        }
+    }
+
+    fn test_function(name: &str, file_path: &str) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gather_codebase_context_returns_valid_json() {
+        let state = mock_app_state();
+        let neo4j = state.neo4j.as_ref();
+        let project = test_project();
+        neo4j.create_project(&project).await.unwrap();
+
+        neo4j
+            .upsert_file(&test_file("src/main.rs", project.id))
+            .await
+            .unwrap();
+        neo4j
+            .upsert_function(&test_function("main", "src/main.rs"))
+            .await
+            .unwrap();
+
+        let context = Orchestrator::gather_codebase_context(neo4j, project.id)
+            .await
+            .unwrap();
+
+        // Should be valid JSON with all expected keys
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert!(parsed.get("top_functions").unwrap().is_array());
+        assert!(parsed.get("connected_files").unwrap().is_array());
+        assert!(parsed.get("language_stats").unwrap().is_array());
+        assert!(parsed.get("existing_feature_graphs").unwrap().is_array());
+    }
+
+    #[tokio::test]
+    async fn test_gather_codebase_context_empty_project() {
+        let state = mock_app_state();
+        let neo4j = state.neo4j.as_ref();
+        let project = test_project();
+        neo4j.create_project(&project).await.unwrap();
+
+        let context = Orchestrator::gather_codebase_context(neo4j, project.id)
+            .await
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(parsed["top_functions"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["connected_files"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            parsed["existing_feature_graphs"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gather_codebase_context_includes_existing_feature_graphs() {
+        let state = mock_app_state();
+        let neo4j = state.neo4j.as_ref();
+        let project = test_project();
+        neo4j.create_project(&project).await.unwrap();
+
+        neo4j
+            .upsert_file(&test_file("src/lib.rs", project.id))
+            .await
+            .unwrap();
+        neo4j
+            .upsert_function(&test_function("entry_fn", "src/lib.rs"))
+            .await
+            .unwrap();
+
+        // Create a feature graph
+        neo4j
+            .auto_build_feature_graph("Test FG", Some("desc"), project.id, "entry_fn", 2, None)
+            .await
+            .unwrap();
+
+        let context = Orchestrator::gather_codebase_context(neo4j, project.id)
+            .await
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+        let fgs = parsed["existing_feature_graphs"].as_array().unwrap();
+        assert_eq!(fgs.len(), 1);
+        assert_eq!(fgs[0]["name"], "Test FG");
+    }
+
+    #[tokio::test]
+    async fn test_gather_codebase_context_includes_language_stats() {
+        let state = mock_app_state();
+        let neo4j = state.neo4j.as_ref();
+        let project = test_project();
+        neo4j.create_project(&project).await.unwrap();
+
+        neo4j
+            .upsert_file(&test_file("src/main.rs", project.id))
+            .await
+            .unwrap();
+        neo4j
+            .upsert_file(&test_file("src/lib.rs", project.id))
+            .await
+            .unwrap();
+
+        let context = Orchestrator::gather_codebase_context(neo4j, project.id)
+            .await
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+        let langs = parsed["language_stats"].as_array().unwrap();
+        assert!(
+            !langs.is_empty(),
+            "Should have language stats for rust files"
+        );
+        assert_eq!(langs[0]["language"], "rust");
+    }
+
+    // ========================================================================
+    // build_feature_graph_prompt Tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_feature_graph_prompt_contains_context() {
+        let context = r#"{"top_functions":["foo","bar"]}"#;
+        let prompt = Orchestrator::build_feature_graph_prompt(context);
+
+        assert!(prompt.contains("feature graph"));
+        assert!(prompt.contains(context));
+        assert!(prompt.contains("entry_function"));
+        assert!(prompt.contains("JSON array"));
+        assert!(prompt.contains("5 to 15"));
+    }
+
+    #[test]
+    fn test_build_feature_graph_prompt_has_response_format() {
+        let prompt = Orchestrator::build_feature_graph_prompt("{}");
+
+        // Should contain the JSON example structure
+        assert!(prompt.contains("\"name\": \"Feature Name\""));
+        assert!(prompt.contains("\"depth\": 2"));
+        assert!(prompt.contains("include_relations"));
+    }
+
+    // ========================================================================
+    // FeatureGraphProposal edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_parse_feature_graph_proposal_depth_zero() {
+        let json = r#"[{"name": "Test", "entry_function": "foo", "depth": 0}]"#;
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json).unwrap();
+        assert_eq!(proposals[0].depth, 0);
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposal_depth_max() {
+        let json = r#"[{"name": "Test", "entry_function": "foo", "depth": 5}]"#;
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json).unwrap();
+        assert_eq!(proposals[0].depth, 5);
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposal_empty_include_relations() {
+        let json = r#"[{"name": "Test", "entry_function": "foo", "include_relations": []}]"#;
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json).unwrap();
+        assert_eq!(proposals[0].include_relations.as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposal_empty_array() {
+        let json = "[]";
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json).unwrap();
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposal_unicode_names() {
+        let json = r#"[{"name": "Gestion des données 📊", "entry_function": "process_données", "description": "Traitement des entrées utilisateur"}]"#;
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json).unwrap();
+        assert_eq!(proposals[0].name, "Gestion des données 📊");
+        assert!(proposals[0].description.is_some());
+    }
+
+    #[test]
+    fn test_parse_feature_graph_proposals_strips_plain_markdown_fences() {
+        // Just ``` without json tag
+        let response = "```\n[{\"name\": \"Test\", \"entry_function\": \"bar\"}]\n```";
+        let json_str = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json_str).unwrap();
+        assert_eq!(proposals[0].entry_function, "bar");
     }
 }
