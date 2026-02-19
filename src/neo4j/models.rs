@@ -51,6 +51,9 @@ pub struct ChatSessionNode {
     pub cli_session_id: Option<String>,
     /// Associated project slug
     pub project_slug: Option<String>,
+    /// Associated workspace slug (if session spans a workspace)
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
     /// Working directory
     pub cwd: String,
     /// Session title (auto-generated or user-provided)
@@ -76,6 +79,9 @@ pub struct ChatSessionNode {
     /// Permission mode override for this session (None = use global config)
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Additional directories exposed to Claude CLI (serialized as JSON array string in Neo4j)
+    #[serde(default)]
+    pub add_dirs: Option<Vec<String>>,
 }
 
 // ============================================================================

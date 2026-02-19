@@ -280,6 +280,7 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         id: Uuid::new_v4(),
         cli_session_id: None,
         project_slug: project_slug.map(|s| s.to_string()),
+        workspace_slug: None,
         cwd: "/tmp/test".to_string(),
         title: None,
         model: "claude-opus-4-6".to_string(),
@@ -290,6 +291,7 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         conversation_id: None,
         preview: None,
         permission_mode: None,
+        add_dirs: None,
     }
 }
 

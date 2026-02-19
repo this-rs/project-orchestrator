@@ -3510,6 +3510,16 @@ impl ToolHandler {
             .get("permission_mode")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let workspace_slug = args
+            .get("workspace_slug")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let add_dirs: Option<Vec<String>> =
+            args.get("add_dirs").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
 
         let request = crate::chat::ChatRequest {
             message: message.to_string(),
@@ -3518,6 +3528,8 @@ impl ToolHandler {
             project_slug,
             model,
             permission_mode,
+            add_dirs,
+            workspace_slug,
         };
 
         // Create session and wait for it to complete (non-streaming for MCP)

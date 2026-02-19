@@ -22,6 +22,13 @@ pub struct ChatRequest {
     /// Values: "default", "acceptEdits", "plan", "bypassPermissions"
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Additional directories to expose to Claude Code CLI (--add-dir)
+    #[serde(default)]
+    pub add_dirs: Option<Vec<String>>,
+    /// Workspace slug — if set, the backend resolves all project root_paths
+    /// as add_dirs automatically (mutually exclusive with explicit add_dirs)
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)
@@ -347,6 +354,9 @@ pub struct ChatSession {
     /// Associated project slug
     #[serde(default)]
     pub project_slug: Option<String>,
+    /// Associated workspace slug (if session spans a workspace)
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
     /// Working directory
     pub cwd: String,
     /// Session title (auto-generated or user-provided)
@@ -373,6 +383,9 @@ pub struct ChatSession {
     /// Permission mode override for this session (None = global config)
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Additional directories exposed to Claude CLI (--add-dir)
+    #[serde(default)]
+    pub add_dirs: Option<Vec<String>>,
 }
 
 /// Response when creating a session
@@ -417,6 +430,9 @@ pub struct MessageSearchResult {
     /// Associated project slug
     #[serde(default)]
     pub project_slug: Option<String>,
+    /// Associated workspace slug (if session was started on a workspace)
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
     /// Nexus conversation ID
     pub conversation_id: String,
     /// Matching messages in this session
@@ -1014,6 +1030,7 @@ mod tests {
             id: "test-id".into(),
             cli_session_id: Some("cli-123".into()),
             project_slug: Some("my-project".into()),
+            workspace_slug: None,
             cwd: "/tmp".into(),
             title: Some("Test session".into()),
             model: "claude-opus-4-6".into(),
@@ -1024,6 +1041,7 @@ mod tests {
             conversation_id: Some("conv-abc-123".into()),
             preview: Some("Hello, can you help me?".into()),
             permission_mode: None,
+            add_dirs: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -1124,6 +1142,7 @@ mod tests {
             session_title: Some("My session".into()),
             session_preview: Some("First message preview".into()),
             project_slug: Some("my-project".into()),
+            workspace_slug: None,
             conversation_id: "conv-xyz".into(),
             hits: vec![MessageSearchHit {
                 message_id: "msg-1".into(),
@@ -1156,6 +1175,7 @@ mod tests {
             session_title: None,
             session_preview: None,
             project_slug: None,
+            workspace_slug: None,
             conversation_id: "conv-1".into(),
             hits: vec![],
             best_score: 0.0,

@@ -167,6 +167,7 @@ pub async fn list_sessions(
             id: s.id.to_string(),
             cli_session_id: s.cli_session_id,
             project_slug: s.project_slug,
+            workspace_slug: s.workspace_slug,
             cwd: s.cwd,
             title: s.title,
             model: s.model,
@@ -177,6 +178,7 @@ pub async fn list_sessions(
             conversation_id: s.conversation_id,
             preview: s.preview,
             permission_mode: s.permission_mode,
+            add_dirs: s.add_dirs,
         })
         .collect();
 
@@ -205,6 +207,7 @@ pub async fn get_session(
         id: node.id.to_string(),
         cli_session_id: node.cli_session_id,
         project_slug: node.project_slug,
+        workspace_slug: node.workspace_slug,
         cwd: node.cwd,
         title: node.title,
         model: node.model,
@@ -215,6 +218,7 @@ pub async fn get_session(
         conversation_id: node.conversation_id,
         preview: node.preview,
         permission_mode: node.permission_mode,
+        add_dirs: node.add_dirs,
     }))
 }
 
