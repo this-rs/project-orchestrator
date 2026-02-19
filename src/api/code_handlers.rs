@@ -109,13 +109,7 @@ pub async fn search_code(
     let hits = state
         .orchestrator
         .meili()
-        .search_code_with_scores(
-            &params.query,
-            limit,
-            params.language.as_deref(),
-            None,
-            None,
-        )
+        .search_code_with_scores(&params.query, limit, params.language.as_deref(), None, None)
         .await?;
 
     Ok(Json(hits))

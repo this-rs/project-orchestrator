@@ -223,6 +223,13 @@ impl GraphStore for Neo4jClient {
         self.get_workspace_milestone_tasks(milestone_id).await
     }
 
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        self.get_workspace_milestone_steps(milestone_id).await
+    }
+
     // ========================================================================
     // Resource operations
     // ========================================================================

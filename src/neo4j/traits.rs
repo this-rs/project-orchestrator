@@ -175,6 +175,12 @@ pub trait GraphStore: Send + Sync {
     /// Get tasks linked to a workspace milestone (with plan info)
     async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>>;
 
+    /// Get all steps for all tasks linked to a workspace milestone (batch)
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
+
     // ========================================================================
     // Resource operations
     // ========================================================================

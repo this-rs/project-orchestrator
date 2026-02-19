@@ -727,13 +727,50 @@ impl GraphStore for MockGraphStore {
                         }
                     })
                     .unwrap_or_default();
+                let plan_status = plans.get(&plan_id).map(|p| {
+                    serde_json::to_value(&p.status)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
                 Some(TaskWithPlan {
                     task,
                     plan_id,
                     plan_title,
+                    plan_status,
                 })
             })
             .collect())
+    }
+
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        let task_ids = self
+            .ws_milestone_tasks
+            .read()
+            .await
+            .get(&milestone_id)
+            .cloned()
+            .unwrap_or_default();
+        let steps = self.steps.read().await;
+        let task_steps = self.task_steps.read().await;
+
+        let mut map: std::collections::HashMap<Uuid, Vec<StepNode>> =
+            std::collections::HashMap::new();
+        for tid in &task_ids {
+            if let Some(step_ids) = task_steps.get(tid) {
+                let mut task_step_list: Vec<StepNode> = step_ids
+                    .iter()
+                    .filter_map(|sid| steps.get(sid).cloned())
+                    .collect();
+                task_step_list.sort_by_key(|s| s.order);
+                map.insert(*tid, task_step_list);
+            }
+        }
+        Ok(map)
     }
 
     // ========================================================================
@@ -3196,10 +3233,16 @@ impl GraphStore for MockGraphStore {
             .filter_map(|t| {
                 let pid = task_plan_map.get(&t.id)?;
                 let plan = plans.get(pid)?;
+                let plan_status = serde_json::to_value(&plan.status)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
                 Some(TaskWithPlan {
                     task: t.clone(),
                     plan_id: *pid,
                     plan_title: plan.title.clone(),
+                    plan_status: Some(plan_status),
                 })
             })
             .collect();

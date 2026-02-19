@@ -782,7 +782,10 @@ async fn test_workspace_milestone_task_association() {
         .unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].task.id, task.id);
-    assert!(tasks[0].plan_id != uuid::Uuid::nil(), "plan_id should be set");
+    assert!(
+        tasks[0].plan_id != uuid::Uuid::nil(),
+        "plan_id should be set"
+    );
 
     // Get milestone progress
     let (total, completed, in_progress, pending) = state

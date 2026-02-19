@@ -1157,12 +1157,16 @@ impl Neo4jClient {
     }
 
     /// Get tasks linked to a workspace milestone (with plan info)
-    pub async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>> {
+    pub async fn get_workspace_milestone_tasks(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Vec<TaskWithPlan>> {
         let q = query(
             r#"
             MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)
             OPTIONAL MATCH (p:Plan)-[:HAS_TASK]->(t)
-            RETURN t, p.id AS plan_id, COALESCE(p.title, '') AS plan_title
+            RETURN t, p.id AS plan_id, COALESCE(p.title, '') AS plan_title,
+                   COALESCE(p.status, '') AS plan_status
             ORDER BY t.priority DESC, t.created_at
             "#,
         )
@@ -1174,13 +1178,74 @@ impl Neo4jClient {
             let node: neo4rs::Node = row.get("t")?;
             let plan_id_str: String = row.get("plan_id").unwrap_or_default();
             let plan_title: String = row.get("plan_title").unwrap_or_default();
+            let plan_status: String = row.get("plan_status").unwrap_or_default();
             tasks.push(TaskWithPlan {
                 task: self.node_to_task(&node)?,
                 plan_id: plan_id_str.parse().unwrap_or_default(),
                 plan_title,
+                plan_status: if plan_status.is_empty() {
+                    None
+                } else {
+                    Some(pascal_to_snake_case(&plan_status))
+                },
             });
         }
         Ok(tasks)
+    }
+
+    /// Get all steps for all tasks linked to a workspace milestone (batch query)
+    pub async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        let q = query(
+            r#"
+            MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)-[:HAS_STEP]->(s:Step)
+            RETURN t.id AS task_id, s
+            ORDER BY t.id, s.order
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut steps_map: std::collections::HashMap<Uuid, Vec<StepNode>> =
+            std::collections::HashMap::new();
+
+        while let Some(row) = result.next().await? {
+            let task_id_str: String = row.get("task_id")?;
+            let task_id: Uuid = task_id_str.parse()?;
+            let node: neo4rs::Node = row.get("s")?;
+            let step = StepNode {
+                id: node.get::<String>("id")?.parse()?,
+                order: node.get::<i64>("order")? as u32,
+                description: node.get("description")?,
+                status: serde_json::from_str(&format!(
+                    "\"{}\"",
+                    pascal_to_snake_case(&node.get::<String>("status")?)
+                ))
+                .unwrap_or(StepStatus::Pending),
+                verification: node
+                    .get::<String>("verification")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                created_at: node
+                    .get::<String>("created_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+                updated_at: node
+                    .get::<String>("updated_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                completed_at: node
+                    .get::<String>("completed_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+            };
+            steps_map.entry(task_id).or_default().push(step);
+        }
+
+        Ok(steps_map)
     }
 
     /// Helper to convert Neo4j node to WorkspaceMilestoneNode
@@ -6077,7 +6142,8 @@ impl Neo4jClient {
             r#"
             {}
             {}
-            RETURN t, p.id AS plan_id, p.title AS plan_title
+            RETURN t, p.id AS plan_id, p.title AS plan_title,
+                   COALESCE(p.status, '') AS plan_status
             ORDER BY {} {}
             SKIP {}
             LIMIT {}
@@ -6091,10 +6157,16 @@ impl Neo4jClient {
             let node: neo4rs::Node = row.get("t")?;
             let plan_id_str: String = row.get("plan_id")?;
             let plan_title: String = row.get("plan_title")?;
+            let plan_status: String = row.get("plan_status").unwrap_or_default();
             tasks.push(TaskWithPlan {
                 task: self.node_to_task(&node)?,
                 plan_id: plan_id_str.parse()?,
                 plan_title,
+                plan_status: if plan_status.is_empty() {
+                    None
+                } else {
+                    Some(pascal_to_snake_case(&plan_status))
+                },
             });
         }
 
