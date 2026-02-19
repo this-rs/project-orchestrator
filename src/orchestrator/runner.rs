@@ -237,6 +237,53 @@ impl Orchestrator {
         self.state.neo4j.clone()
     }
 
+    /// Compute graph analytics for a project (synchronous, best-effort).
+    ///
+    /// Runs the full analytics pipeline (PageRank, Betweenness, Louvain, etc.)
+    /// and persists scores back to Neo4j. Logs timing on success, warns on failure.
+    /// Errors are caught and logged — analytics failures never break the sync pipeline.
+    pub async fn analyze_project_safe(&self, project_id: Uuid) {
+        let start = std::time::Instant::now();
+        match self.analytics.analyze_project(project_id).await {
+            Ok(result) => {
+                let elapsed = start.elapsed();
+                tracing::info!(
+                    "Analytics computed for project {} in {:?} (files: {} nodes/{} edges, functions: {} nodes/{} edges)",
+                    project_id,
+                    elapsed,
+                    result.file_analytics.node_count,
+                    result.file_analytics.edge_count,
+                    result.function_analytics.node_count,
+                    result.function_analytics.edge_count,
+                );
+                // Emit event so frontend/other instances know analytics were refreshed
+                self.emit(
+                    CrudEvent::new(
+                        EventEntityType::Project,
+                        CrudAction::Updated,
+                        project_id.to_string(),
+                    )
+                    .with_payload(serde_json::json!({
+                        "type": "analytics_computed",
+                        "file_nodes": result.file_analytics.node_count,
+                        "file_edges": result.file_analytics.edge_count,
+                        "file_communities": result.file_analytics.communities.len(),
+                        "function_nodes": result.function_analytics.node_count,
+                        "function_edges": result.function_analytics.edge_count,
+                        "computation_ms": elapsed.as_millis() as u64,
+                    })),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Analytics computation failed for project {}: {}",
+                    project_id,
+                    e
+                );
+            }
+        }
+    }
+
     /// Spawn a background task that refreshes all auto-built feature graphs
     /// for a project, or auto-generates them if none exist.
     /// Best-effort: logs info on success, warn on failure.
@@ -3201,5 +3248,94 @@ mod tests {
 
         let proposals: Vec<FeatureGraphProposal> = serde_json::from_str(json_str).unwrap();
         assert_eq!(proposals[0].entry_function, "bar");
+    }
+
+    // ── analytics integration ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_analyze_project_safe_computes_and_emits() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::GraphStore;
+
+        // Build custom state with a shared MockGraphStore reference
+        let mock_store = Arc::new(MockGraphStore::new());
+        let state = crate::test_helpers::mock_app_state_with_graph(mock_store.clone());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let hybrid = Arc::new(HybridEmitter::new(bus));
+        let mut rx = hybrid.subscribe();
+        let orch = Orchestrator::with_event_bus(state, hybrid).await.unwrap();
+
+        let project = test_project();
+        orch.create_project(&project).await.unwrap();
+        let _create_ev = rx.recv().await.unwrap(); // drain create event
+
+        // Seed files via the shared MockGraphStore
+        let files = ["src/main.rs", "src/lib.rs", "src/api.rs"];
+        for path in &files {
+            let file = crate::neo4j::models::FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "abc".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            GraphStore::upsert_file(&*mock_store, &file).await.unwrap();
+        }
+        // Register files as project files and add imports
+        {
+            let mut pf = mock_store.project_files.write().await;
+            pf.entry(project.id)
+                .or_default()
+                .extend(files.iter().map(|s| s.to_string()));
+        }
+        {
+            let mut imports = mock_store.import_relationships.write().await;
+            imports
+                .entry("src/main.rs".to_string())
+                .or_default()
+                .push("src/lib.rs".to_string());
+            imports
+                .entry("src/main.rs".to_string())
+                .or_default()
+                .push("src/api.rs".to_string());
+            imports
+                .entry("src/api.rs".to_string())
+                .or_default()
+                .push("src/lib.rs".to_string());
+        }
+
+        // Run analytics (synchronous, best-effort)
+        orch.analyze_project_safe(project.id).await;
+
+        // Verify analytics scores were persisted to MockGraphStore
+        {
+            let fa = mock_store.file_analytics.read().await;
+            assert_eq!(fa.len(), 3, "Should have analytics for 3 files");
+            let main_rs = &fa["src/main.rs"];
+            assert!(main_rs.pagerank > 0.0, "PageRank should be positive");
+            assert!(
+                !main_rs.community_label.is_empty(),
+                "Community label should be set"
+            );
+        }
+
+        // Verify CrudEvent was emitted with analytics_computed payload
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.entity_type, EventEntityType::Project);
+        assert_eq!(ev.action, CrudAction::Updated);
+        assert_eq!(ev.entity_id, project.id.to_string());
+        assert!(!ev.payload.is_null(), "Payload should be set");
+        assert_eq!(ev.payload["type"], "analytics_computed");
+        assert_eq!(ev.payload["file_nodes"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_analyze_project_safe_empty_project_no_error() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let project = test_project();
+        orch.create_project(&project).await.unwrap();
+
+        // Should not panic or error on empty project
+        orch.analyze_project_safe(project.id).await;
     }
 }

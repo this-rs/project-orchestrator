@@ -382,6 +382,9 @@ impl ToolHandler {
 
         self.neo4j().update_project_synced(project.id).await?;
 
+        // Compute graph analytics (PageRank, communities, etc.) — best-effort, synchronous
+        self.orchestrator.analyze_project_safe(project.id).await;
+
         // Refresh auto-built feature graphs in background (best-effort)
         self.orchestrator.spawn_refresh_feature_graphs(project.id);
 
@@ -2000,9 +2003,11 @@ impl ToolHandler {
             .sync_directory_for_project(path, project_id, project_slug.as_deref())
             .await?;
 
-        // Update last_synced and refresh feature graphs when project context is available
+        // Update last_synced, compute analytics, and refresh feature graphs when project context is available
         if let Some(pid) = project_id {
             self.neo4j().update_project_synced(pid).await?;
+            // Compute graph analytics (PageRank, communities, etc.) — best-effort, synchronous
+            self.orchestrator.analyze_project_safe(pid).await;
             // Refresh auto-built feature graphs in background (best-effort)
             self.orchestrator.spawn_refresh_feature_graphs(pid);
         }
