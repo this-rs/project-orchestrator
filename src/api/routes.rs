@@ -447,6 +447,13 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(code_handlers::add_entity_to_feature_graph),
         )
         // ================================================================
+        // Structural Analytics
+        // ================================================================
+        .route(
+            "/api/code/communities",
+            get(code_handlers::get_code_communities),
+        )
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(

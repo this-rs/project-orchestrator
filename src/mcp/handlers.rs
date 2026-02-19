@@ -236,6 +236,9 @@ impl ToolHandler {
             "auto_build_feature_graph" => self.auto_build_feature_graph(args).await,
             "delete_feature_graph" => self.delete_feature_graph(args).await,
 
+            // Structural Analytics
+            "get_code_communities" => self.get_code_communities(args).await,
+
             // Implementation Planner
             "plan_implementation" => self.plan_implementation(args).await,
 
@@ -3863,6 +3866,65 @@ impl ToolHandler {
     }
 
     // ========================================================================
+    // Structural Analytics
+    // ========================================================================
+
+    async fn get_code_communities(&self, args: Value) -> Result<Value> {
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("project_slug is required"))?;
+        let min_size = args
+            .get("min_size")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(2) as usize;
+
+        // Resolve project slug → project ID
+        let project = self
+            .neo4j()
+            .get_project_by_slug(project_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project '{}' not found", project_slug))?;
+
+        let communities = self.neo4j().get_project_communities(project.id).await?;
+
+        if communities.is_empty() {
+            return Ok(json!({
+                "message": "No structural analytics available. Run sync_project first, then wait for analytics computation.",
+                "communities": [],
+                "total_files": 0
+            }));
+        }
+
+        // Filter by min_size and sort by size descending
+        let mut filtered: Vec<_> = communities
+            .into_iter()
+            .filter(|c| c.file_count >= min_size)
+            .collect();
+        filtered.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+
+        let total_files: usize = filtered.iter().map(|c| c.file_count).sum();
+
+        let communities_json: Vec<Value> = filtered
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.community_id,
+                    "label": c.community_label,
+                    "size": c.file_count,
+                    "key_files": c.key_files,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "communities": communities_json,
+            "total_files": total_files,
+            "community_count": communities_json.len(),
+        }))
+    }
+
+    // ========================================================================
     // Implementation Planner
     // ========================================================================
 
@@ -6314,5 +6376,188 @@ mod tests {
         // Original fields still present
         assert!(result.get("target").is_some());
         assert!(result.get("caller_count").is_some());
+    }
+
+    // ========================================================================
+    // Structural Analytics — get_code_communities
+    // ========================================================================
+
+    async fn create_handler_with_communities() -> ToolHandler {
+        use crate::graph::models::FileAnalyticsUpdate;
+
+        let graph = MockGraphStore::new();
+        let project = test_project_named("analytics-proj");
+        graph.create_project(&project).await.unwrap();
+
+        // Seed files with project association
+        let file_paths = vec![
+            "src/api/handlers.rs",
+            "src/api/routes.rs",
+            "src/api/models.rs",
+            "src/neo4j/client.rs",
+            "src/neo4j/models.rs",
+            "src/utils.rs",
+        ];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = crate::neo4j::models::FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Set community analytics — 2 communities + 1 orphan
+        graph
+            .batch_update_file_analytics(&[
+                FileAnalyticsUpdate {
+                    path: "src/api/handlers.rs".to_string(),
+                    pagerank: 0.8,
+                    betweenness: 0.1,
+                    community_id: 0,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.5,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/api/routes.rs".to_string(),
+                    pagerank: 0.6,
+                    betweenness: 0.05,
+                    community_id: 0,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.4,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/api/models.rs".to_string(),
+                    pagerank: 0.4,
+                    betweenness: 0.02,
+                    community_id: 0,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.3,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/neo4j/client.rs".to_string(),
+                    pagerank: 0.9,
+                    betweenness: 0.3,
+                    community_id: 1,
+                    community_label: "neo4j".to_string(),
+                    clustering_coefficient: 0.6,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/neo4j/models.rs".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    community_label: "neo4j".to_string(),
+                    clustering_coefficient: 0.5,
+                    component_id: 0,
+                },
+                // utils.rs has no analytics → orphan (no community)
+            ])
+            .await
+            .unwrap();
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    #[tokio::test]
+    async fn test_get_code_communities_with_data() {
+        let handler = create_handler_with_communities().await;
+
+        let result = handler
+            .handle(
+                "get_code_communities",
+                Some(json!({"project_slug": "analytics-proj"})),
+            )
+            .await
+            .unwrap();
+
+        let communities = result.get("communities").unwrap().as_array().unwrap();
+        assert!(
+            !communities.is_empty(),
+            "should return communities, got: {:?}",
+            result
+        );
+
+        // Check community count
+        let count = result.get("community_count").unwrap().as_u64().unwrap();
+        assert_eq!(count, 2, "should have 2 communities");
+
+        // Check sorted by size descending
+        let sizes: Vec<u64> = communities
+            .iter()
+            .map(|c| c.get("size").unwrap().as_u64().unwrap())
+            .collect();
+        assert!(sizes[0] >= sizes[1], "should be sorted by size desc");
+
+        // Check total_files
+        let total = result.get("total_files").unwrap().as_u64().unwrap();
+        assert_eq!(total, 5, "should count 5 files with communities");
+    }
+
+    #[tokio::test]
+    async fn test_get_code_communities_no_data() {
+        let handler = create_handler().await;
+
+        // Create a project with no analytics
+        let result = handler
+            .handle(
+                "create_project",
+                Some(json!({"name": "Empty Project", "root_path": "/tmp/empty"})),
+            )
+            .await
+            .unwrap();
+        let slug = result.get("slug").unwrap().as_str().unwrap();
+
+        let result = handler
+            .handle(
+                "get_code_communities",
+                Some(json!({"project_slug": slug})),
+            )
+            .await
+            .unwrap();
+
+        // Should have fallback message
+        assert!(result.get("message").is_some());
+        let communities = result.get("communities").unwrap().as_array().unwrap();
+        assert!(communities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_code_communities_min_size_filter() {
+        let handler = create_handler_with_communities().await;
+
+        // With min_size=3, only api community (3 files) should pass
+        let result = handler
+            .handle(
+                "get_code_communities",
+                Some(json!({"project_slug": "analytics-proj", "min_size": 3})),
+            )
+            .await
+            .unwrap();
+
+        let communities = result.get("communities").unwrap().as_array().unwrap();
+        assert_eq!(
+            communities.len(),
+            1,
+            "min_size=3 should filter out neo4j community (2 files)"
+        );
+        let label = communities[0].get("label").unwrap().as_str().unwrap();
+        assert_eq!(label, "api");
     }
 }

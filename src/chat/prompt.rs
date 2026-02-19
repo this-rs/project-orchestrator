@@ -530,6 +530,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "get_impl_blocks",
                 description: "Blocs impl d'un type",
             },
+            ToolRef {
+                name: "get_code_communities",
+                description: "Communautés de code (clusters Louvain)",
+            },
         ],
     },
     // ── Knowledge / Notes (17 tools) ─────────────────────────────────
@@ -2327,11 +2331,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_149_tools() {
+    fn test_tool_groups_cover_all_150_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 149,
-            "TOOL_GROUPS must cover exactly 149 unique tools (got {}). \
+            count, 150,
+            "TOOL_GROUPS must cover exactly 150 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

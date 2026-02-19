@@ -1209,6 +1209,70 @@ pub async fn auto_build_feature_graph(
 }
 
 // ============================================================================
+// Structural Analytics
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct CommunitiesQuery {
+    pub project_slug: String,
+    pub min_size: Option<usize>,
+}
+
+/// GET /api/code/communities
+pub async fn get_code_communities(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<CommunitiesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", params.project_slug)))?;
+
+    let min_size = params.min_size.unwrap_or(2);
+    let communities = state
+        .orchestrator
+        .neo4j()
+        .get_project_communities(project.id)
+        .await?;
+
+    if communities.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "message": "No structural analytics available. Run sync_project first.",
+            "communities": [],
+            "total_files": 0
+        })));
+    }
+
+    let mut filtered: Vec<_> = communities
+        .into_iter()
+        .filter(|c| c.file_count >= min_size)
+        .collect();
+    filtered.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+
+    let total_files: usize = filtered.iter().map(|c| c.file_count).sum();
+
+    let communities_json: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.community_id,
+                "label": c.community_label,
+                "size": c.file_count,
+                "key_files": c.key_files,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "communities": communities_json,
+        "total_files": total_files,
+        "community_count": communities_json.len(),
+    })))
+}
+
+// ============================================================================
 // Implementation Planner
 // ============================================================================
 

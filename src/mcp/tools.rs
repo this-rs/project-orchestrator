@@ -2104,6 +2104,21 @@ fn chat_tools() -> Vec<ToolDefinition> {
             },
         },
         // ================================================================
+        // Structural Analytics (3)
+        // ================================================================
+        ToolDefinition {
+            name: "get_code_communities".to_string(),
+            description: "Identify code communities (clusters of tightly coupled files) in a project using structural analysis (Louvain clustering)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Project slug"},
+                    "min_size": {"type": "integer", "description": "Minimum community size to return (default: 2)"}
+                })),
+                required: Some(vec!["project_slug".to_string()]),
+            },
+        },
+        // ================================================================
         // Implementation Planner (1)
         // ================================================================
         ToolDefinition {
@@ -2134,7 +2149,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 149, "Expected 149 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 150, "Expected 150 tools, got {}", tools.len());
     }
 
     #[test]
