@@ -11,6 +11,7 @@ pub mod api;
 pub mod auth;
 pub mod chat;
 pub mod events;
+pub mod graph;
 pub mod mcp;
 pub mod meilisearch;
 pub mod neo4j;
