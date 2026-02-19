@@ -24,6 +24,8 @@ pub struct CodeSearchQuery {
     pub limit: Option<usize>,
     /// Filter by language (rust, typescript, python, go)
     pub language: Option<String>,
+    /// Filter by project slug
+    pub project_slug: Option<String>,
 }
 
 /// Search code semantically across the codebase
@@ -44,7 +46,7 @@ pub async fn search_code(
             &params.query,
             params.limit.unwrap_or(10),
             params.language.as_deref(),
-            None,
+            params.project_slug.as_deref(),
             None,
         )
         .await?;
@@ -490,11 +492,40 @@ pub struct ModuleInfo {
     pub public_api: Vec<String>,
 }
 
+#[derive(Deserialize)]
+pub struct ArchitectureQuery {
+    pub project_slug: Option<String>,
+}
+
 /// Get high-level architecture overview
 pub async fn get_architecture(
     State(state): State<OrchestratorState>,
+    Query(params): Query<ArchitectureQuery>,
 ) -> Result<Json<ArchitectureOverview>, AppError> {
-    let lang_stats = state.orchestrator.neo4j().get_language_stats().await?;
+    // Resolve optional project_slug → project_id
+    let project_id = if let Some(ref slug) = params.project_slug {
+        Some(
+            state
+                .orchestrator
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?
+                .id,
+        )
+    } else {
+        None
+    };
+
+    let lang_stats = if let Some(pid) = project_id {
+        state
+            .orchestrator
+            .neo4j()
+            .get_language_stats_for_project(pid)
+            .await?
+    } else {
+        state.orchestrator.neo4j().get_language_stats().await?
+    };
 
     let languages: Vec<LanguageStats> = lang_stats
         .into_iter()
@@ -506,11 +537,19 @@ pub async fn get_architecture(
         })
         .collect();
 
-    let key_files = state
-        .orchestrator
-        .neo4j()
-        .get_most_connected_files_detailed(10)
-        .await?;
+    let key_files = if let Some(pid) = project_id {
+        state
+            .orchestrator
+            .neo4j()
+            .get_most_connected_files_for_project(pid, 10)
+            .await?
+    } else {
+        state
+            .orchestrator
+            .neo4j()
+            .get_most_connected_files_detailed(10)
+            .await?
+    };
 
     let total_files: usize = languages.iter().map(|l| l.file_count).sum();
 
