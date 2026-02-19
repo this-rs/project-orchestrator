@@ -61,8 +61,8 @@ Download the desktop app for your platform:
 | **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.3_x64-setup.exe) | Installer |
 | **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.3_x64_en-US.msi) | MSI |
 | **Linux** (64-bit) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.3_amd64.AppImage) | Universal |
-| **Linux** (Debian/Ubuntu) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.3-1_amd64.deb) | apt/dpkg |
-| **Linux** (Fedora/RHEL) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.3-1.x86_64.rpm) | dnf/rpm |
+| **Linux** (Debian/Ubuntu) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.1.0-1_amd64.deb) | apt/dpkg |
+| **Linux** (Fedora/RHEL) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.1.0-1.x86_64.rpm) | dnf/rpm |
 
 > All releases are available on the [Releases page](https://github.com/this-rs/project-orchestrator/releases/latest).
 
@@ -145,8 +145,8 @@ docker compose up -d
 
 ```bash
 # Download and install the .deb package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.3-1_amd64.deb
-sudo dpkg -i project-orchestrator_0.0.3-1_amd64.deb
+curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.1.0-1_amd64.deb
+sudo dpkg -i project-orchestrator_0.1.0-1_amd64.deb
 
 # Start the service
 sudo systemctl enable --now project-orchestrator
@@ -158,8 +158,8 @@ sudo systemctl enable --now project-orchestrator
 
 ```bash
 # Download and install the .rpm package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.3-1.x86_64.rpm
-sudo rpm -i project-orchestrator-0.0.3-1.x86_64.rpm
+curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.1.0-1.x86_64.rpm
+sudo rpm -i project-orchestrator-0.1.0-1.x86_64.rpm
 ```
 
 ---
