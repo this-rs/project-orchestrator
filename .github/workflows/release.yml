@@ -29,10 +29,13 @@ jobs:
     name: Build Frontend
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout frontend
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.FRONTEND_REPO }}
+      - name: Clone frontend (latest main)
+        run: |
+          git clone --depth=1 https://github.com/${{ env.FRONTEND_REPO }}.git .
+          echo "=== Frontend checkout verification ==="
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "Date:   $(git log -1 --format='%ci')"
+          echo "Msg:    $(git log -1 --format='%s')"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -51,6 +54,15 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Verify build output
+        run: |
+          echo "=== Build output verification ==="
+          echo "index.html hash: $(sha256sum dist/index.html | cut -c1-16)"
+          echo "Asset files:"
+          ls -la dist/assets/ | head -20
+          echo "Version in bundle:"
+          grep -o '"0\.[0-9]\.[0-9]"' dist/assets/*.js | head -5 || true
 
       - name: Upload frontend dist
         uses: actions/upload-artifact@v4
@@ -280,6 +292,13 @@ jobs:
         id: version
         run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Inject version from git tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          echo "Injected version ${VERSION}:"
+          grep '^version' Cargo.toml | head -1
+
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
@@ -357,6 +376,13 @@ jobs:
       - name: Get version from tag
         id: version
         run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject version from git tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          echo "Injected version ${VERSION}:"
+          grep '^version' Cargo.toml | head -1
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
