@@ -3709,6 +3709,7 @@ impl GraphStore for MockGraphStore {
                     propagation_path: vec![format!("workspace:{}", workspace.slug)],
                     distance: 1,
                     note: n,
+                    path_pagerank: None,
                 })
                 .collect())
         } else {

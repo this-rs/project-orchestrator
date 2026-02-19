@@ -7048,13 +7048,17 @@ impl Neo4jClient {
             _ => ("id", entity_id.to_string()),
         };
 
-        // Query for notes propagated through the graph
+        // Query for notes propagated through the graph.
+        // The scoring formula integrates PageRank of intermediate nodes:
+        //   avg_path_pagerank = mean of COALESCE(node.pagerank, 0.05) over path nodes
+        //   score = (1/(distance+1)) * importance * (1 + avg_path_pagerank * 5)
+        // This amplifies scores for notes propagated via structurally important hubs.
         let cypher = format!(
             r#"
             MATCH (target:{} {{{}: $entity_id}})
             MATCH path = (n:Note)-[:ATTACHED_TO]->(source)-[:CONTAINS|IMPORTS|CALLS*0..{}]->(target)
             WHERE n.status = 'active'
-            WITH n, source, length(path) - 1 AS distance,
+            WITH n, source, path, length(path) - 1 AS distance,
                  [node IN nodes(path) | coalesce(node.name, node.path, node.id)] AS path_names
             WITH n, source, distance, path_names,
                  CASE n.importance
@@ -7062,12 +7066,16 @@ impl Neo4jClient {
                      WHEN 'high' THEN 0.8
                      WHEN 'medium' THEN 0.5
                      ELSE 0.3
-                 END AS importance_weight
-            WITH n, source, distance, path_names,
-                 (1.0 / (distance + 1)) * importance_weight AS score
+                 END AS importance_weight,
+                 CASE WHEN size(nodes(path)) > 0
+                      THEN reduce(s = 0.0, node IN nodes(path) | s + coalesce(node.pagerank, 0.05)) / size(nodes(path))
+                      ELSE 0.05
+                 END AS avg_path_pagerank
+            WITH n, source, distance, path_names, avg_path_pagerank,
+                 (1.0 / (distance + 1)) * importance_weight * (1.0 + avg_path_pagerank * 5.0) AS score
             WHERE score >= $min_score
             RETURN DISTINCT n, score, coalesce(source.name, source.path, source.id) AS source_entity,
-                   path_names, distance
+                   path_names, distance, avg_path_pagerank
             ORDER BY score DESC
             LIMIT 20
             "#,
@@ -7088,6 +7096,7 @@ impl Neo4jClient {
             let source_entity: String = row.get("source_entity")?;
             let path_names: Vec<String> = row.get("path_names").unwrap_or_default();
             let distance: i64 = row.get("distance")?;
+            let avg_path_pagerank: Option<f64> = row.get::<f64>("avg_path_pagerank").ok();
 
             propagated_notes.push(PropagatedNote {
                 note,
@@ -7095,6 +7104,7 @@ impl Neo4jClient {
                 source_entity,
                 propagation_path: path_names,
                 distance: distance as u32,
+                path_pagerank: avg_path_pagerank,
             });
         }
 
@@ -7133,6 +7143,7 @@ impl Neo4jClient {
                 source_entity: format!("workspace:{}", workspace_name),
                 propagation_path: vec![format!("workspace:{}", workspace_name)],
                 distance: 1, // One hop: project -> workspace
+                path_pagerank: None,
             });
         }
 
