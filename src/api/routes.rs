@@ -66,7 +66,20 @@ fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
         // on SPA routes — `not_found_service` would force 404 on every fallback.
         let index_path = format!("{}/index.html", state.frontend_path);
         let serve_dir = ServeDir::new(&state.frontend_path).fallback(ServeFile::new(index_path));
-        router.fallback_service(serve_dir)
+
+        // Prevent stale caching: WKWebView (Tauri desktop) aggressively caches
+        // HTTP responses using heuristic expiration when no Cache-Control is set.
+        // Without this, index.html can be served from a previous app version even
+        // after reinstalling — the WebKit cache lives in ~/Library/WebKit/ and
+        // ~/Library/Caches/<bundle-id>/, NOT inside the .app bundle.
+        let service = tower::ServiceBuilder::new()
+            .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+            ))
+            .service(serve_dir);
+
+        router.fallback_service(service)
     } else {
         router
     }
@@ -865,6 +878,57 @@ mod tests {
         assert!(
             text.contains("SPA"),
             "/auth/callback GET should return SPA index.html"
+        );
+    }
+
+    // ====================================================================
+    // Cache-Control: index.html (and SPA fallback) must have no-cache
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_index_html_has_no_cache_headers() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            cache_control.as_deref(),
+            Some("no-cache, no-store, must-revalidate"),
+            "index.html must have no-cache to prevent stale WKWebView caching"
+        );
+    }
+
+    // ====================================================================
+    // Cache-Control: static assets also get no-cache (ServeDir wrapper)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_static_asset_has_cache_control() {
+        let dist = create_fake_dist();
+        let app = test_app_with_frontend(dist.path()).await;
+
+        let resp = app
+            .oneshot(Request::get("/assets/app.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert!(
+            cache_control.is_some(),
+            "Static assets must have Cache-Control header"
         );
     }
 }

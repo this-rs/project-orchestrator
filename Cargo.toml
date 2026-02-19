@@ -14,7 +14,7 @@ tokio-util = "0.7"
 # Web framework for webhook listener
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs", "set-header"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

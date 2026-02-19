@@ -497,8 +497,14 @@ fn show_main_window(handle: &tauri::AppHandle) {
         // The backend serves the SPA (SERVE_FRONTEND=true), so this loads the
         // exact same React app but from http://localhost:{port}/ instead of
         // tauri://localhost/index.html.
+        //
+        // Cache-buster: append ?v=<version> so WKWebView treats each app version
+        // as a distinct URL. Without this, the WebKit cache (stored in
+        // ~/Library/WebKit/, NOT inside the .app bundle) can serve stale
+        // index.html from a previous version even after reinstalling the app.
         let port = BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed);
-        let http_url = format!("http://localhost:{}/", port);
+        let version = env!("CARGO_PKG_VERSION");
+        let http_url = format!("http://localhost:{}/?v={}", port, version);
         tracing::info!("Navigating main window to {} (same-origin for cookies)", http_url);
         if let Ok(url) = http_url.parse() {
             if let Err(e) = main_window.navigate(url) {
