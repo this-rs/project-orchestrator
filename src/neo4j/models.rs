@@ -765,6 +765,31 @@ pub struct CommunityRow {
     pub key_files: Vec<String>,
 }
 
+/// A "god function" — a function with too many callers/callees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GodFunction {
+    pub name: String,
+    pub file: String,
+    pub in_degree: usize,
+    pub out_degree: usize,
+}
+
+/// Structural health report for a project's codebase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeHealthReport {
+    pub god_functions: Vec<GodFunction>,
+    pub orphan_files: Vec<String>,
+    pub coupling_metrics: Option<CouplingMetrics>,
+}
+
+/// Coupling metrics from clustering coefficients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouplingMetrics {
+    pub avg_clustering_coefficient: f64,
+    pub max_clustering_coefficient: f64,
+    pub most_coupled_file: Option<String>,
+}
+
 /// A feature graph — a named subgraph capturing all code entities related to a feature.
 /// Reusable across sessions to avoid re-exploring the same feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]

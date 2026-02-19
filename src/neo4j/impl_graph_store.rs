@@ -612,6 +612,22 @@ impl GraphStore for Neo4jClient {
         self.get_affected_communities(file_paths).await
     }
 
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> anyhow::Result<crate::neo4j::models::CodeHealthReport> {
+        self.get_code_health_report(project_id, god_function_threshold)
+            .await
+    }
+
+    async fn get_circular_dependencies(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<Vec<String>>> {
+        self.get_circular_dependencies(project_id).await
+    }
+
     async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {
         self.get_file_symbol_names(path).await
     }

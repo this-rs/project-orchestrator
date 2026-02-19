@@ -3561,6 +3561,139 @@ impl Neo4jClient {
         Ok(labels)
     }
 
+    /// Get a structural health report for a project: god functions, orphan files, coupling metrics.
+    pub async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> Result<CodeHealthReport> {
+        use crate::neo4j::models::{CodeHealthReport, CouplingMetrics, GodFunction};
+
+        // God functions: functions with high in-degree (many callers)
+        let god_q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)-[:CONTAINS]->(func:Function)
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(func)
+            OPTIONAL MATCH (func)-[:CALLS]->(callee:Function)
+            WITH func, f, count(DISTINCT caller) AS in_deg, count(DISTINCT callee) AS out_deg
+            WHERE in_deg >= $threshold
+            RETURN func.name AS name, f.path AS file, in_deg, out_deg
+            ORDER BY in_deg DESC
+            LIMIT 10
+            "#,
+        )
+        .param("pid", project_id.to_string())
+        .param("threshold", god_function_threshold as i64);
+
+        let god_rows = self.execute_with_params(god_q).await?;
+        let god_functions: Vec<GodFunction> = god_rows
+            .iter()
+            .filter_map(|row| {
+                let name = row.get::<String>("name").ok()?;
+                let file = row.get::<String>("file").ok()?;
+                let in_degree = row.get::<i64>("in_deg").unwrap_or(0) as usize;
+                let out_degree = row.get::<i64>("out_deg").unwrap_or(0) as usize;
+                Some(GodFunction {
+                    name,
+                    file,
+                    in_degree,
+                    out_degree,
+                })
+            })
+            .collect();
+
+        // Orphan files: files with no IMPORTS relationships (neither importing nor imported)
+        let orphan_q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE NOT EXISTS { (f)-[:IMPORTS]->() }
+              AND NOT EXISTS { ()-[:IMPORTS]->(f) }
+              AND NOT EXISTS { (f)-[:CONTAINS]->(:Function) }
+            RETURN f.path AS path
+            ORDER BY path
+            LIMIT 20
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let orphan_rows = self.execute_with_params(orphan_q).await?;
+        let orphan_files: Vec<String> = orphan_rows
+            .iter()
+            .filter_map(|row| row.get::<String>("path").ok())
+            .collect();
+
+        // Coupling metrics from clustering_coefficient
+        let coupling_q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE f.clustering_coefficient IS NOT NULL
+            WITH avg(f.clustering_coefficient) AS avg_cc,
+                 max(f.clustering_coefficient) AS max_cc,
+                 collect({path: f.path, cc: f.clustering_coefficient}) AS files
+            WITH avg_cc, max_cc, files,
+                 [x IN files WHERE x.cc = max_cc | x.path][0] AS most_coupled
+            RETURN avg_cc, max_cc, most_coupled
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let coupling_rows = self.execute_with_params(coupling_q).await?;
+        let coupling_metrics = coupling_rows.first().and_then(|row| {
+            let avg = row.get::<f64>("avg_cc").ok()?;
+            let max = row.get::<f64>("max_cc").ok()?;
+            let most_coupled = row.get::<String>("most_coupled").ok();
+            Some(CouplingMetrics {
+                avg_clustering_coefficient: avg,
+                max_clustering_coefficient: max,
+                most_coupled_file: most_coupled,
+            })
+        });
+
+        Ok(CodeHealthReport {
+            god_functions,
+            orphan_files,
+            coupling_metrics,
+        })
+    }
+
+    /// Detect circular dependencies between files (import cycles).
+    pub async fn get_circular_dependencies(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<Vec<String>>> {
+        let q = query(
+            r#"
+            MATCH path = (f:File)-[:IMPORTS*2..5]->(f)
+            WHERE EXISTS { MATCH (p:Project {id: $pid})-[:CONTAINS]->(f) }
+            WITH nodes(path) AS cycle_nodes
+            WITH [n IN cycle_nodes | n.path] AS cycle
+            WITH cycle, cycle[0] AS canonical
+            RETURN DISTINCT cycle
+            ORDER BY size(cycle)
+            LIMIT 10
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        let mut cycles: Vec<Vec<String>> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for row in &rows {
+            if let Ok(cycle) = row.get::<Vec<String>>("cycle") {
+                // Deduplicate: normalize by sorting the cycle to a canonical form
+                let mut canonical = cycle.clone();
+                canonical.sort();
+                let key = canonical.join("|");
+                if seen.insert(key) {
+                    cycles.push(cycle);
+                }
+            }
+        }
+
+        Ok(cycles)
+    }
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     pub async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
         let q = query(

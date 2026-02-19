@@ -238,6 +238,7 @@ impl ToolHandler {
 
             // Structural Analytics
             "get_code_communities" => self.get_code_communities(args).await,
+            "get_code_health" => self.get_code_health(args).await,
 
             // Implementation Planner
             "plan_implementation" => self.plan_implementation(args).await,
@@ -3924,6 +3925,66 @@ impl ToolHandler {
         }))
     }
 
+    async fn get_code_health(&self, args: Value) -> Result<Value> {
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("project_slug is required"))?;
+        let god_function_threshold = args
+            .get("god_function_threshold")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as usize;
+
+        // Resolve project slug → project ID
+        let project = self
+            .neo4j()
+            .get_project_by_slug(project_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project '{}' not found", project_slug))?;
+
+        let report = self
+            .neo4j()
+            .get_code_health_report(project.id, god_function_threshold)
+            .await?;
+
+        let circular_deps = self
+            .neo4j()
+            .get_circular_dependencies(project.id)
+            .await?;
+
+        let god_functions_json: Vec<Value> = report
+            .god_functions
+            .iter()
+            .map(|g| {
+                json!({
+                    "name": g.name,
+                    "file": g.file,
+                    "in_degree": g.in_degree,
+                    "out_degree": g.out_degree,
+                })
+            })
+            .collect();
+
+        let coupling_json = report.coupling_metrics.as_ref().map(|c| {
+            json!({
+                "avg_clustering_coefficient": c.avg_clustering_coefficient,
+                "max_clustering_coefficient": c.max_clustering_coefficient,
+                "most_coupled_file": c.most_coupled_file,
+            })
+        });
+
+        Ok(json!({
+            "god_functions": god_functions_json,
+            "god_function_count": god_functions_json.len(),
+            "god_function_threshold": god_function_threshold,
+            "orphan_files": report.orphan_files,
+            "orphan_file_count": report.orphan_files.len(),
+            "coupling_metrics": coupling_json,
+            "circular_dependencies": circular_deps,
+            "circular_dependency_count": circular_deps.len(),
+        }))
+    }
+
     // ========================================================================
     // Implementation Planner
     // ========================================================================
@@ -6559,5 +6620,340 @@ mod tests {
         );
         let label = communities[0].get("label").unwrap().as_str().unwrap();
         assert_eq!(label, "api");
+    }
+
+    // ========================================================================
+    // Structural Analytics — get_code_health
+    // ========================================================================
+
+    async fn create_handler_with_health_data() -> ToolHandler {
+        use crate::graph::models::FileAnalyticsUpdate;
+
+        let graph = MockGraphStore::new();
+        let project = test_project_named("health-proj");
+        graph.create_project(&project).await.unwrap();
+
+        // Files
+        let file_paths = vec![
+            "src/main.rs",
+            "src/lib.rs",
+            "src/orphan.rs",
+            "src/utils.rs",
+        ];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Functions — create a "god function" (many callers)
+        let god_fn = FunctionNode {
+            name: "god_function".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 5,
+            line_start: 1,
+            line_end: 50,
+            docstring: None,
+        };
+        graph.upsert_function(&god_fn).await.unwrap();
+
+        let helper_fn = FunctionNode {
+            name: "helper".to_string(),
+            file_path: "src/utils.rs".to_string(),
+            visibility: Visibility::Private,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        };
+        graph.upsert_function(&helper_fn).await.unwrap();
+
+        let main_fn = FunctionNode {
+            name: "main".to_string(),
+            file_path: "src/main.rs".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            line_start: 1,
+            line_end: 5,
+            docstring: None,
+        };
+        graph.upsert_function(&main_fn).await.unwrap();
+
+        // Call relationships: main -> god_function, helper -> god_function (2 callers)
+        graph
+            .call_relationships
+            .write()
+            .await
+            .entry("main".to_string())
+            .or_default()
+            .push("god_function".to_string());
+        graph
+            .call_relationships
+            .write()
+            .await
+            .entry("helper".to_string())
+            .or_default()
+            .push("god_function".to_string());
+        // god_function calls helper (1 callee)
+        graph
+            .call_relationships
+            .write()
+            .await
+            .entry("god_function".to_string())
+            .or_default()
+            .push("helper".to_string());
+
+        // Import relationships: main.rs -> lib.rs, lib.rs -> utils.rs
+        // orphan.rs has no imports and nothing imports it
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("src/main.rs".to_string())
+            .or_default()
+            .push("src/lib.rs".to_string());
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("src/lib.rs".to_string())
+            .or_default()
+            .push("src/utils.rs".to_string());
+
+        // File analytics (for coupling metrics)
+        graph
+            .batch_update_file_analytics(&[
+                FileAnalyticsUpdate {
+                    path: "src/main.rs".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.3,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/lib.rs".to_string(),
+                    pagerank: 0.9,
+                    betweenness: 0.5,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.7,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/utils.rs".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.05,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_god_functions() {
+        let handler = create_handler_with_health_data().await;
+
+        // threshold=2 → god_function has in_degree=2, should be flagged
+        let result = handler
+            .handle(
+                "get_code_health",
+                Some(json!({"project_slug": "health-proj", "god_function_threshold": 2})),
+            )
+            .await
+            .unwrap();
+
+        let god_fns = result.get("god_functions").unwrap().as_array().unwrap();
+        assert_eq!(god_fns.len(), 1, "should flag god_function");
+        assert_eq!(
+            god_fns[0].get("name").unwrap().as_str().unwrap(),
+            "god_function"
+        );
+        assert_eq!(god_fns[0].get("in_degree").unwrap().as_u64().unwrap(), 2);
+        assert_eq!(god_fns[0].get("out_degree").unwrap().as_u64().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_orphan_files() {
+        let handler = create_handler_with_health_data().await;
+
+        let result = handler
+            .handle(
+                "get_code_health",
+                Some(json!({"project_slug": "health-proj"})),
+            )
+            .await
+            .unwrap();
+
+        let orphans = result.get("orphan_files").unwrap().as_array().unwrap();
+        let orphan_strs: Vec<&str> = orphans.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            orphan_strs.contains(&"src/orphan.rs"),
+            "orphan.rs should be flagged (no imports, no dependents, no functions)"
+        );
+        // main.rs, lib.rs, utils.rs should NOT be orphans
+        assert!(!orphan_strs.contains(&"src/main.rs"));
+        assert!(!orphan_strs.contains(&"src/lib.rs"));
+        assert!(!orphan_strs.contains(&"src/utils.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_coupling_metrics() {
+        let handler = create_handler_with_health_data().await;
+
+        let result = handler
+            .handle(
+                "get_code_health",
+                Some(json!({"project_slug": "health-proj"})),
+            )
+            .await
+            .unwrap();
+
+        let coupling = result.get("coupling_metrics").unwrap();
+        assert!(!coupling.is_null(), "should have coupling metrics");
+
+        let avg = coupling
+            .get("avg_clustering_coefficient")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        // (0.3 + 0.7 + 0.2) / 3 = 0.4
+        assert!((avg - 0.4).abs() < 0.01, "avg should be ~0.4, got {}", avg);
+
+        let max = coupling
+            .get("max_clustering_coefficient")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(
+            (max - 0.7).abs() < 0.01,
+            "max should be 0.7, got {}",
+            max
+        );
+
+        assert_eq!(
+            coupling
+                .get("most_coupled_file")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "src/lib.rs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_circular_dependencies() {
+        let graph = MockGraphStore::new();
+        let project = test_project_named("cycle-proj");
+        graph.create_project(&project).await.unwrap();
+
+        let file_paths = vec!["a.rs", "b.rs", "c.rs"];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Circular: a -> b -> c -> a
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("a.rs".to_string())
+            .or_default()
+            .push("b.rs".to_string());
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("b.rs".to_string())
+            .or_default()
+            .push("c.rs".to_string());
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("c.rs".to_string())
+            .or_default()
+            .push("a.rs".to_string());
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        let handler = ToolHandler::new(orchestrator);
+
+        let result = handler
+            .handle(
+                "get_code_health",
+                Some(json!({"project_slug": "cycle-proj"})),
+            )
+            .await
+            .unwrap();
+
+        let cycles = result
+            .get("circular_dependencies")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(
+            !cycles.is_empty(),
+            "should detect circular dependency a->b->c->a"
+        );
+        let count = result
+            .get("circular_dependency_count")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!(count >= 1, "should have at least 1 cycle");
     }
 }

@@ -1272,6 +1272,70 @@ pub async fn get_code_communities(
     })))
 }
 
+#[derive(Deserialize)]
+pub struct CodeHealthQuery {
+    pub project_slug: String,
+    pub god_function_threshold: Option<usize>,
+}
+
+/// GET /api/code/health
+pub async fn get_code_health(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<CodeHealthQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", params.project_slug)))?;
+
+    let threshold = params.god_function_threshold.unwrap_or(10);
+    let report = state
+        .orchestrator
+        .neo4j()
+        .get_code_health_report(project.id, threshold)
+        .await?;
+
+    let circular_deps = state
+        .orchestrator
+        .neo4j()
+        .get_circular_dependencies(project.id)
+        .await?;
+
+    let god_functions_json: Vec<serde_json::Value> = report
+        .god_functions
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "name": g.name,
+                "file": g.file,
+                "in_degree": g.in_degree,
+                "out_degree": g.out_degree,
+            })
+        })
+        .collect();
+
+    let coupling_json = report.coupling_metrics.as_ref().map(|c| {
+        serde_json::json!({
+            "avg_clustering_coefficient": c.avg_clustering_coefficient,
+            "max_clustering_coefficient": c.max_clustering_coefficient,
+            "most_coupled_file": c.most_coupled_file,
+        })
+    });
+
+    Ok(Json(serde_json::json!({
+        "god_functions": god_functions_json,
+        "god_function_count": god_functions_json.len(),
+        "god_function_threshold": threshold,
+        "orphan_files": report.orphan_files,
+        "orphan_file_count": report.orphan_files.len(),
+        "coupling_metrics": coupling_json,
+        "circular_dependencies": circular_deps,
+        "circular_dependency_count": circular_deps.len(),
+    })))
+}
+
 // ============================================================================
 // Implementation Planner
 // ============================================================================

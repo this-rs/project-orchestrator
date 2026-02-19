@@ -2118,6 +2118,18 @@ fn chat_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["project_slug".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "get_code_health".to_string(),
+            description: "Get a structural health report for a project: god functions (too many callers), orphan files (disconnected), coupling metrics (clustering coefficients), and circular dependency detection.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Project slug"},
+                    "god_function_threshold": {"type": "integer", "description": "Minimum in-degree to flag as god function (default: 10)"}
+                })),
+                required: Some(vec!["project_slug".to_string()]),
+            },
+        },
         // ================================================================
         // Implementation Planner (1)
         // ================================================================
@@ -2149,7 +2161,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 150, "Expected 150 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 151, "Expected 151 tools, got {}", tools.len());
     }
 
     #[test]

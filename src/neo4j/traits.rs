@@ -476,6 +476,19 @@ pub trait GraphStore: Send + Sync {
         file_paths: &[String],
     ) -> Result<Vec<String>>;
 
+    /// Get a structural health report: god functions, orphan files, coupling metrics.
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> Result<crate::neo4j::models::CodeHealthReport>;
+
+    /// Detect circular dependencies between files (import cycles).
+    async fn get_circular_dependencies(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<Vec<String>>>;
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
 

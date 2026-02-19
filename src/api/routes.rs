@@ -453,6 +453,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/communities",
             get(code_handlers::get_code_communities),
         )
+        .route(
+            "/api/code/health",
+            get(code_handlers::get_code_health),
+        )
         // ================================================================
         // Implementation Planner
         // ================================================================
