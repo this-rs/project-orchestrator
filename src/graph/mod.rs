@@ -26,9 +26,11 @@
 //! - [`extraction`] — Neo4j → petgraph conversion via GraphStore trait
 //! - [`writer`] — Batch-write results back to Neo4j via GraphStore trait
 //! - [`engine`] — `AnalyticsEngine` trait and `GraphAnalyticsEngine` orchestrator
+//! - [`debouncer`] — `AnalyticsDebouncer` for coalescing rapid-fire triggers
 //! - [`mock`] — `MockAnalyticsEngine` for testing (cfg(test) only)
 
 pub mod algorithms;
+pub mod debouncer;
 pub mod engine;
 pub mod extraction;
 pub mod models;
@@ -38,6 +40,7 @@ pub mod writer;
 pub mod mock;
 
 // Re-export primary types for convenience
+pub use debouncer::AnalyticsDebouncer;
 pub use engine::{AnalyticsEngine, GraphAnalyticsEngine, ProjectAnalytics};
 pub use models::{
     AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeHealthReport, CodeNode, CodeNodeType,

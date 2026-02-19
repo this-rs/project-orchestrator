@@ -137,6 +137,10 @@ impl FileWatcher {
                                     tracing::warn!("Failed to sync {}: {}", path.display(), e);
                                 } else {
                                     tracing::info!("Auto-synced: {}", path.display());
+                                    // Trigger debounced analytics (coalesces rapid file changes)
+                                    if let Some(pid) = project_id {
+                                        orchestrator.analytics_debouncer().trigger(pid);
+                                    }
                                 }
                             }
                         }

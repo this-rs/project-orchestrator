@@ -1504,6 +1504,8 @@ impl ToolHandler {
                 if let Err(e) = orchestrator.neo4j().update_project_synced(project_id).await {
                     tracing::warn!("Failed to update last_synced: {}", e);
                 }
+                // Trigger debounced analytics recomputation (fire-and-forget)
+                orchestrator.analytics_debouncer().trigger(project_id);
             });
         }
 

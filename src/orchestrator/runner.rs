@@ -3,7 +3,7 @@
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
-use crate::graph::{AnalyticsConfig, AnalyticsEngine, GraphAnalyticsEngine};
+use crate::graph::{AnalyticsConfig, AnalyticsDebouncer, AnalyticsEngine, GraphAnalyticsEngine};
 use crate::neo4j::models::*;
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
@@ -53,6 +53,7 @@ pub struct Orchestrator {
     note_lifecycle: Arc<NoteLifecycleManager>,
     planner: Arc<super::ImplementationPlanner>,
     analytics: Arc<dyn AnalyticsEngine>,
+    analytics_debouncer: AnalyticsDebouncer,
     event_bus: Option<Arc<HybridEmitter>>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
 }
@@ -83,6 +84,7 @@ impl Orchestrator {
             state.neo4j.clone(),
             AnalyticsConfig::default(),
         ));
+        let analytics_debouncer = AnalyticsDebouncer::new(analytics.clone(), 2000);
 
         Ok(Self {
             state,
@@ -93,6 +95,7 @@ impl Orchestrator {
             note_lifecycle,
             planner,
             analytics,
+            analytics_debouncer,
             event_bus: None,
             event_emitter: None,
         })
@@ -136,6 +139,7 @@ impl Orchestrator {
             state.neo4j.clone(),
             AnalyticsConfig::default(),
         ));
+        let analytics_debouncer = AnalyticsDebouncer::new(analytics.clone(), 2000);
 
         Ok(Self {
             state,
@@ -146,6 +150,7 @@ impl Orchestrator {
             note_lifecycle,
             planner,
             analytics,
+            analytics_debouncer,
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
         })
@@ -190,6 +195,7 @@ impl Orchestrator {
             state.neo4j.clone(),
             AnalyticsConfig::default(),
         ));
+        let analytics_debouncer = AnalyticsDebouncer::new(analytics.clone(), 2000);
 
         Ok(Self {
             state,
@@ -200,6 +206,7 @@ impl Orchestrator {
             note_lifecycle,
             planner,
             analytics,
+            analytics_debouncer,
             event_bus: None,
             event_emitter: Some(emitter),
         })
@@ -724,6 +731,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// Get the graph analytics engine
     pub fn analytics(&self) -> &Arc<dyn AnalyticsEngine> {
         &self.analytics
+    }
+
+    /// Get the analytics debouncer (for incremental sync triggers)
+    pub fn analytics_debouncer(&self) -> &AnalyticsDebouncer {
+        &self.analytics_debouncer
     }
 
     // ========================================================================
