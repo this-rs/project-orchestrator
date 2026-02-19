@@ -224,6 +224,26 @@ Exemple de décomposition correcte :
 - `get_file_dependencies(file_path)` → imports et dépendants
 - `get_context_notes(entity_type, entity_id)` → notes pertinentes (guidelines, gotchas...)
 
+### Analyse structurelle (GDS)
+
+Quand les données GDS (Graph Data Science) sont disponibles sur le projet :
+
+1. **Comprendre la structure modulaire** → `get_code_communities(project_slug)`
+   - Clusters Louvain de fichiers/fonctions fortement couplés
+   - Chaque communauté a ses fichiers clés et métriques de cohésion
+   - **Utilise ceci** : avant un refactoring, pour comprendre les frontières modulaires
+
+2. **Évaluer la santé du codebase** → `get_code_health(project_slug)`
+   - God functions (trop de connexions), fichiers orphelins (0 connexions), couplage moyen, dépendances circulaires
+   - **Utilise ceci** : en début de projet, revue de code, ou priorisation de dette technique
+
+3. **Évaluer l'importance d'un nœud** → `get_node_importance(project_slug, node_path, node_type)`
+   - PageRank, betweenness centrality, bridge detection, risk level
+   - Retourne un summary interprétatif (critical/high/medium/low)
+   - **Utilise ceci** : avant de modifier un fichier/fonction, pour évaluer le risque de régression
+
+**Note** : ces outils nécessitent que les métriques GDS aient été calculées. Si les résultats sont vides, le codebase n'a pas encore été analysé par GDS.
+
 ### Stratégie de recherche — MCP-first (OBLIGATOIRE)
 
 **Règle absolue** : TOUJOURS utiliser les outils MCP d'exploration de code EN PREMIER.
@@ -531,17 +551,44 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "get_impl_blocks",
                 description: "Blocs impl d'un type",
             },
+        ],
+    },
+    // ── Structural Analytics (3 tools) ────────────────────────────────
+    ToolGroup {
+        name: "structural_analytics",
+        description: "Analyse structurelle GDS : communautés, santé du code, importance des nœuds",
+        keywords: &[
+            "communauté",
+            "community",
+            "louvain",
+            "cluster",
+            "santé",
+            "health",
+            "god function",
+            "orphelin",
+            "couplage",
+            "circulaire",
+            "importance",
+            "pagerank",
+            "betweenness",
+            "centralité",
+            "bridge",
+            "risque",
+            "analytique",
+            "GDS",
+        ],
+        tools: &[
             ToolRef {
                 name: "get_code_communities",
-                description: "Communautés de code (clusters Louvain)",
+                description: "Communautés de code (clusters Louvain) avec fichiers clés et métriques de cohésion",
             },
             ToolRef {
                 name: "get_code_health",
-                description: "Rapport santé : god functions, orphelins, couplage, dépendances circulaires",
+                description: "Rapport santé du codebase : god functions, fichiers orphelins, couplage, dépendances circulaires",
             },
             ToolRef {
                 name: "get_node_importance",
-                description: "Importance structurelle d'un fichier/fonction : PageRank, betweenness, risk level, summary",
+                description: "Importance structurelle d'un fichier/fonction : PageRank, betweenness, bridge detection, risk level, summary interprétatif",
             },
         ],
     },
@@ -2511,7 +2558,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 14, "Expected 14 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 15, "Expected 15 tool groups");
     }
 
     #[test]
