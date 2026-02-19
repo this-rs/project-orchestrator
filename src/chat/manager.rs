@@ -4414,6 +4414,122 @@ mod tests {
     }
 
     // ====================================================================
+    // resolve_add_dirs & build_options with add_dirs
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_resolve_add_dirs_explicit() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let dirs = vec!["/path/a".to_string(), "/path/b".to_string()];
+        let result = manager
+            .resolve_add_dirs("/tmp", Some(&dirs), None, None)
+            .await;
+
+        assert_eq!(result, vec!["/path/a", "/path/b"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_add_dirs_empty() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager.resolve_add_dirs("/tmp", None, None, None).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_add_dirs_workspace() {
+        let state = mock_app_state();
+
+        // Create a workspace and projects
+        let ws = crate::test_helpers::test_workspace();
+        state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let mut p1 = crate::test_helpers::test_project();
+        p1.root_path = "/home/user/proj-a".to_string();
+        state.neo4j.create_project(&p1).await.unwrap();
+        state
+            .neo4j
+            .add_project_to_workspace(ws.id, p1.id)
+            .await
+            .unwrap();
+
+        let mut p2 = crate::test_helpers::test_project();
+        p2.root_path = "/home/user/proj-b".to_string();
+        state.neo4j.create_project(&p2).await.unwrap();
+        state
+            .neo4j
+            .add_project_to_workspace(ws.id, p2.id)
+            .await
+            .unwrap();
+
+        let mut p3 = crate::test_helpers::test_project();
+        p3.root_path = "/home/user/proj-cwd".to_string();
+        state.neo4j.create_project(&p3).await.unwrap();
+        state
+            .neo4j
+            .add_project_to_workspace(ws.id, p3.id)
+            .await
+            .unwrap();
+
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // cwd matches p3, so only p1 and p2 should be returned
+        let result = manager
+            .resolve_add_dirs("/home/user/proj-cwd", None, Some(&ws.slug), None)
+            .await;
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"/home/user/proj-a".to_string()));
+        assert!(result.contains(&"/home/user/proj-b".to_string()));
+        assert!(!result.contains(&"/home/user/proj-cwd".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_add_dirs_workspace_not_found() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager
+            .resolve_add_dirs("/tmp", None, Some("nonexistent-ws"), None)
+            .await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_options_with_add_dirs() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let dirs = ["/extra/dir1".to_string(), "/extra/dir2".to_string()];
+        let opts = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &dirs)
+            .await;
+
+        assert_eq!(opts.add_dirs.len(), 2);
+        assert!(opts
+            .add_dirs
+            .contains(&std::path::PathBuf::from("/extra/dir1")));
+        assert!(opts
+            .add_dirs
+            .contains(&std::path::PathBuf::from("/extra/dir2")));
+    }
+
+    #[tokio::test]
+    async fn test_build_options_without_add_dirs() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let opts = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &[])
+            .await;
+
+        assert!(opts.add_dirs.is_empty());
+    }
+
+    // ====================================================================
     // message_to_events
     // ====================================================================
 
