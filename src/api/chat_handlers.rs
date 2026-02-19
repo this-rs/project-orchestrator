@@ -138,6 +138,8 @@ pub async fn list_messages(
 pub struct SessionsListQuery {
     #[serde(default)]
     pub project_slug: Option<String>,
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
     #[serde(flatten)]
     pub pagination: PaginationParams,
 }
@@ -154,6 +156,7 @@ pub async fn list_sessions(
         .neo4j()
         .list_chat_sessions(
             query.project_slug.as_deref(),
+            query.workspace_slug.as_deref(),
             query.pagination.validated_limit(),
             query.pagination.offset,
         )

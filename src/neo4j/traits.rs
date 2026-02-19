@@ -794,6 +794,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_plans_filtered(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -811,6 +812,8 @@ pub trait GraphStore: Send + Sync {
     async fn list_all_tasks_filtered(
         &self,
         plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -882,6 +885,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_notes(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)>;
 
@@ -957,6 +961,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_chat_sessions(
         &self,
         project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatSessionNode>, usize)>;

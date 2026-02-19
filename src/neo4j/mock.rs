@@ -3033,6 +3033,7 @@ impl GraphStore for MockGraphStore {
     async fn list_plans_filtered(
         &self,
         project_id: Option<Uuid>,
+        _workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -3096,6 +3097,8 @@ impl GraphStore for MockGraphStore {
     async fn list_all_tasks_filtered(
         &self,
         plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        _workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -3109,6 +3112,7 @@ impl GraphStore for MockGraphStore {
         let pt = self.plan_tasks.read().await;
         let tasks = self.tasks.read().await;
         let plans = self.plans.read().await;
+        let pp = self.project_plans.read().await;
 
         // Build task_id -> plan_id mapping
         let mut task_plan_map: HashMap<Uuid, Uuid> = HashMap::new();
@@ -3123,6 +3127,16 @@ impl GraphStore for MockGraphStore {
             .filter(|t| {
                 if let Some(pid) = plan_id {
                     if task_plan_map.get(&t.id) != Some(&pid) {
+                        return false;
+                    }
+                }
+                if let Some(pid) = project_id {
+                    // Filter tasks whose plan belongs to this project
+                    if let Some(plan_id) = task_plan_map.get(&t.id) {
+                        if !pp.get(&pid).map_or(false, |plans| plans.contains(plan_id)) {
+                            return false;
+                        }
+                    } else {
                         return false;
                     }
                 }
@@ -3313,6 +3327,7 @@ impl GraphStore for MockGraphStore {
     async fn list_notes(
         &self,
         project_id: Option<Uuid>,
+        _workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
         let notes = self.notes.read().await;
@@ -3559,6 +3574,7 @@ impl GraphStore for MockGraphStore {
     async fn list_chat_sessions(
         &self,
         project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatSessionNode>, usize)> {
@@ -3568,6 +3584,8 @@ impl GraphStore for MockGraphStore {
             .filter(|s| {
                 if let Some(slug) = project_slug {
                     s.project_slug.as_deref() == Some(slug)
+                } else if let Some(ws) = workspace_slug {
+                    s.workspace_slug.as_deref() == Some(ws)
                 } else {
                     true
                 }

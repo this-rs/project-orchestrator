@@ -5927,6 +5927,7 @@ impl Neo4jClient {
     pub async fn list_plans_filtered(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -5955,6 +5956,11 @@ impl Neo4jClient {
             format!(
                 "MATCH (proj:Project {{id: '{}'}})-[:HAS_PLAN]->(p:Plan)",
                 pid
+            )
+        } else if let Some(ws) = workspace_slug {
+            format!(
+                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)",
+                ws
             )
         } else {
             "MATCH (p:Plan)".to_string()
@@ -5998,6 +6004,8 @@ impl Neo4jClient {
     pub async fn list_all_tasks_filtered(
         &self,
         plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -6018,6 +6026,16 @@ impl Neo4jClient {
         // Build plan filter if specified
         let plan_match = if let Some(pid) = plan_id {
             format!("MATCH (p:Plan {{id: '{}'}})-[:HAS_TASK]->(t:Task)", pid)
+        } else if let Some(pid) = project_id {
+            format!(
+                "MATCH (proj:Project {{id: '{}'}})-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)",
+                pid
+            )
+        } else if let Some(ws) = workspace_slug {
+            format!(
+                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)",
+                ws
+            )
         } else {
             "MATCH (p:Plan)-[:HAS_TASK]->(t:Task)".to_string()
         };
@@ -6442,6 +6460,7 @@ impl Neo4jClient {
     pub async fn list_notes(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
         let mut where_conditions = Vec::new();
@@ -6450,6 +6469,11 @@ impl Neo4jClient {
             where_conditions.push("(n.project_id IS NULL OR n.project_id = '')".to_string());
         } else if let Some(ref pid) = project_id {
             where_conditions.push(format!("n.project_id = '{}'", pid));
+        } else if let Some(ws) = workspace_slug {
+            where_conditions.push(format!(
+                "n.project_id IN [(w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]",
+                ws
+            ));
         }
 
         if let Some(ref statuses) = filters.status {
@@ -7223,6 +7247,7 @@ impl Neo4jClient {
     pub async fn list_chat_sessions(
         &self,
         project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatSessionNode>, usize)> {
@@ -7240,6 +7265,21 @@ impl Neo4jClient {
                 .param("limit", limit as i64),
                 query("MATCH (s:ChatSession {project_slug: $slug}) RETURN count(s) AS total")
                     .param("slug", slug.to_string()),
+            )
+        } else if let Some(ws) = workspace_slug {
+            (
+                query(
+                    r#"
+                    MATCH (s:ChatSession {workspace_slug: $ws})
+                    RETURN s ORDER BY s.updated_at DESC
+                    SKIP $offset LIMIT $limit
+                    "#,
+                )
+                .param("ws", ws.to_string())
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+                query("MATCH (s:ChatSession {workspace_slug: $ws}) RETURN count(s) AS total")
+                    .param("ws", ws.to_string()),
             )
         } else {
             (

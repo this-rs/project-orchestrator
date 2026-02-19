@@ -1278,7 +1278,7 @@ pub async fn fetch_project_context(
         ..Default::default()
     };
     let (guidelines, _) = graph
-        .list_notes(Some(project_id), &guideline_filters)
+        .list_notes(Some(project_id), None, &guideline_filters)
         .await
         .unwrap_or_default();
     ctx.guidelines = guidelines;
@@ -1290,7 +1290,7 @@ pub async fn fetch_project_context(
         ..Default::default()
     };
     let (gotchas, _) = graph
-        .list_notes(Some(project_id), &gotcha_filters)
+        .list_notes(Some(project_id), None, &gotcha_filters)
         .await
         .unwrap_or_default();
     ctx.gotchas = gotchas;
@@ -1304,7 +1304,7 @@ pub async fn fetch_project_context(
         ..Default::default()
     };
     let (global_guidelines, _) = graph
-        .list_notes(None, &global_guideline_filters)
+        .list_notes(None, None, &global_guideline_filters)
         .await
         .unwrap_or_default();
     ctx.global_guidelines = global_guidelines;
@@ -1317,7 +1317,7 @@ pub async fn fetch_project_context(
         ..Default::default()
     };
     let (global_gotchas, _) = graph
-        .list_notes(None, &global_gotcha_filters)
+        .list_notes(None, None, &global_gotcha_filters)
         .await
         .unwrap_or_default();
     ctx.global_gotchas = global_gotchas;

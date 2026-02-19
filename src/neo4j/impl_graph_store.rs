@@ -1029,6 +1029,7 @@ impl GraphStore for Neo4jClient {
     async fn list_plans_filtered(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -1040,6 +1041,7 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<(Vec<PlanNode>, usize)> {
         self.list_plans_filtered(
             project_id,
+            workspace_slug,
             statuses,
             priority_min,
             priority_max,
@@ -1056,6 +1058,8 @@ impl GraphStore for Neo4jClient {
     async fn list_all_tasks_filtered(
         &self,
         plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -1068,6 +1072,8 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<(Vec<TaskWithPlan>, usize)> {
         self.list_all_tasks_filtered(
             plan_id,
+            project_id,
+            workspace_slug,
             statuses,
             priority_min,
             priority_max,
@@ -1151,9 +1157,10 @@ impl GraphStore for Neo4jClient {
     async fn list_notes(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> anyhow::Result<(Vec<Note>, usize)> {
-        self.list_notes(project_id, filters).await
+        self.list_notes(project_id, workspace_slug, filters).await
     }
 
     async fn link_note_to_entity(
@@ -1248,10 +1255,11 @@ impl GraphStore for Neo4jClient {
     async fn list_chat_sessions(
         &self,
         project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<(Vec<ChatSessionNode>, usize)> {
-        self.list_chat_sessions(project_slug, limit, offset).await
+        self.list_chat_sessions(project_slug, workspace_slug, limit, offset).await
     }
 
     #[allow(clippy::too_many_arguments)]

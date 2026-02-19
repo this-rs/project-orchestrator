@@ -34,6 +34,8 @@ pub struct NotesListQuery {
     pub max_staleness: Option<f64>,
     pub tags: Option<String>,
     pub global_only: Option<bool>,
+    /// Filter by workspace slug (notes of projects in this workspace)
+    pub workspace_slug: Option<String>,
 }
 
 impl NotesListQuery {
@@ -146,7 +148,7 @@ pub async fn list_notes(
     let (notes, total) = state
         .orchestrator
         .note_manager()
-        .list_notes(query.project_id, &filters)
+        .list_notes(query.project_id, query.workspace_slug.as_deref(), &filters)
         .await?;
 
     Ok(Json(PaginatedResponse::new(
