@@ -2130,6 +2130,19 @@ fn chat_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["project_slug".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "get_node_importance".to_string(),
+            description: "Get structural importance metrics for a specific file or function: PageRank, betweenness centrality, community membership, degree counts, plus an interpreted importance/risk assessment with human-readable summary.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "node_path": {"type": "string", "description": "File path or function name"},
+                    "node_type": {"type": "string", "enum": ["file", "function"], "description": "Node type (default: file)"},
+                    "project_slug": {"type": "string", "description": "Project slug (required for disambiguation)"}
+                })),
+                required: Some(vec!["node_path".to_string(), "project_slug".to_string()]),
+            },
+        },
         // ================================================================
         // Implementation Planner (1)
         // ================================================================
@@ -2161,7 +2174,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 151, "Expected 151 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 152, "Expected 152 tools, got {}", tools.len());
     }
 
     #[test]

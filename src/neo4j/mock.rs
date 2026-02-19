@@ -2065,6 +2065,182 @@ impl GraphStore for MockGraphStore {
         Ok(cycles)
     }
 
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+
+        match node_type {
+            "function" => {
+                let functions = self.functions.read().await;
+                // Functions are keyed by "file_path::name", so find by name
+                let func = functions
+                    .values()
+                    .find(|f| f.name == node_path && project_paths.contains(&f.file_path));
+                if func.is_none() {
+                    return Ok(None);
+                }
+
+                let fa = self.function_analytics.read().await;
+                let cr = self.call_relationships.read().await;
+
+                let in_degree = cr
+                    .iter()
+                    .filter(|(_, callees)| callees.contains(&node_path.to_string()))
+                    .count() as i64;
+                let out_degree = cr
+                    .get(node_path)
+                    .map(|c| c.len())
+                    .unwrap_or(0) as i64;
+
+                if let Some(analytics) = fa.get(node_path) {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "function".to_string(),
+                        pagerank: Some(analytics.pagerank),
+                        betweenness: Some(analytics.betweenness),
+                        clustering_coefficient: Some(analytics.clustering_coefficient),
+                        community_id: Some(analytics.community_id as i64),
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                    }))
+                } else {
+                    // Node exists but no GDS metrics
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "function".to_string(),
+                        pagerank: None,
+                        betweenness: None,
+                        clustering_coefficient: None,
+                        community_id: None,
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                    }))
+                }
+            }
+            _ => {
+                // File
+                if !project_paths.contains(&node_path.to_string()) {
+                    return Ok(None);
+                }
+
+                let fa = self.file_analytics.read().await;
+                let ir = self.import_relationships.read().await;
+
+                let in_degree = ir
+                    .iter()
+                    .filter(|(_, targets)| targets.contains(&node_path.to_string()))
+                    .count() as i64;
+                let out_degree = ir
+                    .get(node_path)
+                    .map(|t| t.len())
+                    .unwrap_or(0) as i64;
+
+                if let Some(analytics) = fa.get(node_path) {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "file".to_string(),
+                        pagerank: Some(analytics.pagerank),
+                        betweenness: Some(analytics.betweenness),
+                        clustering_coefficient: Some(analytics.clustering_coefficient),
+                        community_id: Some(analytics.community_id as i64),
+                        community_label: Some(analytics.community_label.clone()),
+                        in_degree,
+                        out_degree,
+                    }))
+                } else {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "file".to_string(),
+                        pagerank: None,
+                        betweenness: None,
+                        clustering_coefficient: None,
+                        community_id: None,
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                    }))
+                }
+            }
+        }
+    }
+
+    async fn get_project_percentiles(
+        &self,
+        project_id: Uuid,
+    ) -> Result<ProjectPercentiles> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+
+        let fa = self.file_analytics.read().await;
+        let fna = self.function_analytics.read().await;
+
+        let mut pageranks: Vec<f64> = Vec::new();
+        let mut betweennesses: Vec<f64> = Vec::new();
+
+        // Collect from file analytics
+        for path in &project_paths {
+            if let Some(a) = fa.get(path) {
+                pageranks.push(a.pagerank);
+                betweennesses.push(a.betweenness);
+            }
+        }
+
+        // Collect from function analytics (functions belonging to project files)
+        let functions = self.functions.read().await;
+        for func in functions.values() {
+            if project_paths.contains(&func.file_path) {
+                if let Some(a) = fna.get(&func.name) {
+                    pageranks.push(a.pagerank);
+                    betweennesses.push(a.betweenness);
+                }
+            }
+        }
+
+        if pageranks.is_empty() {
+            return Ok(ProjectPercentiles {
+                pagerank_p50: 0.0,
+                pagerank_p80: 0.0,
+                pagerank_p95: 0.0,
+                betweenness_p50: 0.0,
+                betweenness_p80: 0.0,
+                betweenness_p95: 0.0,
+                betweenness_mean: 0.0,
+                betweenness_stddev: 0.0,
+            });
+        }
+
+        pageranks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        betweennesses.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let cnt = pageranks.len();
+        let percentile = |sorted: &[f64], p: f64| -> f64 {
+            let idx = ((cnt as f64 * p) as usize).min(cnt - 1);
+            sorted[idx]
+        };
+
+        let bw_mean: f64 = betweennesses.iter().sum::<f64>() / cnt as f64;
+        let bw_var: f64 =
+            betweennesses.iter().map(|x| (x - bw_mean).powi(2)).sum::<f64>() / cnt as f64;
+
+        Ok(ProjectPercentiles {
+            pagerank_p50: percentile(&pageranks, 0.5),
+            pagerank_p80: percentile(&pageranks, 0.8),
+            pagerank_p95: percentile(&pageranks, 0.95),
+            betweenness_p50: percentile(&betweennesses, 0.5),
+            betweenness_p80: percentile(&betweennesses, 0.8),
+            betweenness_p95: percentile(&betweennesses, 0.95),
+            betweenness_mean: bw_mean,
+            betweenness_stddev: bw_var.sqrt(),
+        })
+    }
+
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
         let functions = self.functions.read().await;
         let structs = self.structs_map.read().await;

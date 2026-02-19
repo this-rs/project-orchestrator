@@ -538,6 +538,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "get_code_health",
                 description: "Rapport santé : god functions, orphelins, couplage, dépendances circulaires",
             },
+            ToolRef {
+                name: "get_node_importance",
+                description: "Importance structurelle d'un fichier/fonction : PageRank, betweenness, risk level, summary",
+            },
         ],
     },
     // ── Knowledge / Notes (17 tools) ─────────────────────────────────
@@ -2335,11 +2339,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_151_tools() {
+    fn test_tool_groups_cover_all_152_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 151,
-            "TOOL_GROUPS must cover exactly 151 unique tools (got {}). \
+            count, 152,
+            "TOOL_GROUPS must cover exactly 152 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

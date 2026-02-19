@@ -489,6 +489,20 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<Vec<String>>>;
 
+    /// Get GDS metrics for a specific node (file or function) in a project.
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>>;
+
+    /// Get statistical percentiles for GDS metrics across all nodes in a project.
+    async fn get_project_percentiles(
+        &self,
+        project_id: Uuid,
+    ) -> Result<ProjectPercentiles>;
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
 

@@ -239,6 +239,7 @@ impl ToolHandler {
             // Structural Analytics
             "get_code_communities" => self.get_code_communities(args).await,
             "get_code_health" => self.get_code_health(args).await,
+            "get_node_importance" => self.get_node_importance(args).await,
 
             // Implementation Planner
             "plan_implementation" => self.plan_implementation(args).await,
@@ -3985,6 +3986,166 @@ impl ToolHandler {
         }))
     }
 
+    async fn get_node_importance(&self, args: Value) -> Result<Value> {
+        let node_path = args
+            .get("node_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("node_path is required"))?;
+        let node_type = args
+            .get("node_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("project_slug is required"))?;
+
+        let project = self
+            .neo4j()
+            .get_project_by_slug(project_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project '{}' not found", project_slug))?;
+
+        let metrics = self
+            .neo4j()
+            .get_node_gds_metrics(node_path, node_type, project.id)
+            .await?;
+
+        let metrics = match metrics {
+            Some(m) => m,
+            None => {
+                return Err(anyhow!(
+                    "Node not found: '{}' (type: {}). Check the path or run sync_project.",
+                    node_path,
+                    node_type
+                ))
+            }
+        };
+
+        // Check if GDS analytics are available
+        if metrics.pagerank.is_none() {
+            return Ok(json!({
+                "node": node_path,
+                "node_type": node_type,
+                "message": "No structural analytics available for this node. Run sync_project first, then wait for analytics computation.",
+                "metrics": {
+                    "in_degree": metrics.in_degree,
+                    "out_degree": metrics.out_degree,
+                }
+            }));
+        }
+
+        let percentiles = self
+            .neo4j()
+            .get_project_percentiles(project.id)
+            .await?;
+
+        let interpretation = Self::interpret_node_metrics(&metrics, &percentiles);
+
+        Ok(json!({
+            "node": metrics.node_path,
+            "node_type": metrics.node_type,
+            "metrics": {
+                "pagerank": metrics.pagerank,
+                "betweenness": metrics.betweenness,
+                "clustering_coefficient": metrics.clustering_coefficient,
+                "community_id": metrics.community_id,
+                "community_label": metrics.community_label,
+                "in_degree": metrics.in_degree,
+                "out_degree": metrics.out_degree,
+            },
+            "interpretation": {
+                "importance": interpretation.importance,
+                "is_bridge": interpretation.is_bridge,
+                "risk_level": interpretation.risk_level,
+                "summary": interpretation.summary,
+            }
+        }))
+    }
+
+    /// Compute human-readable interpretation from raw GDS metrics.
+    fn interpret_node_metrics(
+        metrics: &crate::neo4j::models::NodeGdsMetrics,
+        percentiles: &crate::neo4j::models::ProjectPercentiles,
+    ) -> crate::neo4j::models::NodeInterpretation {
+        let pr = metrics.pagerank.unwrap_or(0.0);
+        let bw = metrics.betweenness.unwrap_or(0.0);
+
+        // Importance: based on PageRank percentile
+        let importance = if pr >= percentiles.pagerank_p95 {
+            "critical"
+        } else if pr >= percentiles.pagerank_p80 {
+            "high"
+        } else if pr >= percentiles.pagerank_p50 {
+            "medium"
+        } else {
+            "low"
+        };
+
+        // Bridge detection: betweenness > mean + 2*stddev
+        let is_bridge = bw > percentiles.betweenness_mean + 2.0 * percentiles.betweenness_stddev;
+
+        // Risk level: composite score
+        let risk_level = if importance == "critical" && is_bridge {
+            "critical"
+        } else if importance == "critical" || (importance == "high" && is_bridge) {
+            "high"
+        } else if importance == "high" || (importance == "medium" && is_bridge) {
+            "medium"
+        } else {
+            "low"
+        };
+
+        // Build summary
+        let node_label = if metrics.node_type == "function" {
+            "function"
+        } else {
+            "file"
+        };
+
+        let mut parts: Vec<String> = Vec::new();
+
+        match importance {
+            "critical" => parts.push(format!(
+                "This {} is a critical hub (top 5% PageRank)",
+                node_label
+            )),
+            "high" => parts.push(format!(
+                "This {} is highly connected (top 20% PageRank)",
+                node_label
+            )),
+            "medium" => parts.push(format!(
+                "This {} has moderate structural importance",
+                node_label
+            )),
+            _ => parts.push(format!(
+                "This {} has low structural importance",
+                node_label
+            )),
+        }
+
+        if is_bridge {
+            parts.push("and acts as a bridge between communities (high betweenness)".to_string());
+        }
+
+        match risk_level {
+            "critical" | "high" => {
+                parts.push("Changes here have high blast radius.".to_string())
+            }
+            "medium" => parts.push("Changes here may affect multiple dependents.".to_string()),
+            _ => parts.push("Changes here have limited impact.".to_string()),
+        }
+
+        let summary = parts.join(". ").replace(". and ", " and ");
+
+        crate::neo4j::models::NodeInterpretation {
+            importance: importance.to_string(),
+            is_bridge,
+            risk_level: risk_level.to_string(),
+            summary,
+        }
+    }
+
     // ========================================================================
     // Implementation Planner
     // ========================================================================
@@ -6955,5 +7116,334 @@ mod tests {
             .as_u64()
             .unwrap();
         assert!(count >= 1, "should have at least 1 cycle");
+    }
+
+    // ========================================================================
+    // Structural Analytics — get_node_importance
+    // ========================================================================
+
+    async fn create_handler_with_importance_data() -> ToolHandler {
+        use crate::graph::models::{FileAnalyticsUpdate, FunctionAnalyticsUpdate};
+
+        let graph = MockGraphStore::new();
+        let project = test_project_named("importance-proj");
+        graph.create_project(&project).await.unwrap();
+
+        // 9 files to establish a reliable distribution for percentile calculations
+        let file_paths: Vec<&str> = vec![
+            "src/hub.rs",
+            "src/leaf.rs",
+            "src/bridge.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/c.rs",
+            "src/d.rs",
+            "src/e.rs",
+            "src/f.rs",
+        ];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Function in hub.rs
+        let hub_fn = FunctionNode {
+            name: "hub_function".to_string(),
+            file_path: "src/hub.rs".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 10,
+            line_start: 1,
+            line_end: 100,
+            docstring: None,
+        };
+        graph.upsert_function(&hub_fn).await.unwrap();
+
+        // File analytics — 10 data points (9 files + 1 function)
+        // Distribution designed so:
+        //   hub.rs (pagerank=0.95) → critical (top 5%)
+        //   bridge.rs (betweenness=2.0) → bridge (>> mean+2σ)
+        //   leaf.rs (pagerank=0.01) → low
+        //   a-f.rs → low pagerank, low betweenness (bulk of distribution)
+        graph
+            .batch_update_file_analytics(&[
+                FileAnalyticsUpdate {
+                    path: "src/hub.rs".to_string(),
+                    pagerank: 0.95,
+                    betweenness: 0.1,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.8,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/leaf.rs".to_string(),
+                    pagerank: 0.01,
+                    betweenness: 0.02,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.1,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/bridge.rs".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 2.0,
+                    community_id: 1,
+                    community_label: "infra".to_string(),
+                    clustering_coefficient: 0.3,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/a.rs".to_string(),
+                    pagerank: 0.05,
+                    betweenness: 0.03,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/b.rs".to_string(),
+                    pagerank: 0.08,
+                    betweenness: 0.04,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/c.rs".to_string(),
+                    pagerank: 0.12,
+                    betweenness: 0.05,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/d.rs".to_string(),
+                    pagerank: 0.15,
+                    betweenness: 0.06,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/e.rs".to_string(),
+                    pagerank: 0.20,
+                    betweenness: 0.07,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/f.rs".to_string(),
+                    pagerank: 0.25,
+                    betweenness: 0.08,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        // Function analytics — hub_function has high pagerank
+        graph
+            .batch_update_function_analytics(&[FunctionAnalyticsUpdate {
+                name: "hub_function".to_string(),
+                pagerank: 0.90,
+                betweenness: 0.09,
+                community_id: 0,
+                clustering_coefficient: 0.7,
+                component_id: 0,
+            }])
+            .await
+            .unwrap();
+
+        // Import relationships for degree counting
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("src/leaf.rs".to_string())
+            .or_default()
+            .push("src/hub.rs".to_string());
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("src/bridge.rs".to_string())
+            .or_default()
+            .push("src/hub.rs".to_string());
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_critical_file() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "src/hub.rs",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.get("node").unwrap().as_str().unwrap(), "src/hub.rs");
+        assert_eq!(result.get("node_type").unwrap().as_str().unwrap(), "file");
+
+        let interp = result.get("interpretation").unwrap();
+        let importance = interp.get("importance").unwrap().as_str().unwrap();
+        assert_eq!(importance, "critical", "hub.rs (top pagerank) should be critical");
+
+        let risk = interp.get("risk_level").unwrap().as_str().unwrap();
+        assert!(
+            risk == "critical" || risk == "high",
+            "risk should be critical or high, got {}",
+            risk
+        );
+
+        let summary = interp.get("summary").unwrap().as_str().unwrap();
+        assert!(
+            summary.contains("critical hub"),
+            "summary should mention critical hub, got: {}",
+            summary
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_low_file() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "src/leaf.rs",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await
+            .unwrap();
+
+        let interp = result.get("interpretation").unwrap();
+        let importance = interp.get("importance").unwrap().as_str().unwrap();
+        assert_eq!(importance, "low", "leaf.rs should be low importance");
+
+        let risk = interp.get("risk_level").unwrap().as_str().unwrap();
+        assert_eq!(risk, "low");
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_bridge_file() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "src/bridge.rs",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await
+            .unwrap();
+
+        let interp = result.get("interpretation").unwrap();
+        let is_bridge = interp.get("is_bridge").unwrap().as_bool().unwrap();
+        assert!(is_bridge, "bridge.rs should be detected as a bridge (betweenness=0.9)");
+
+        let summary = interp.get("summary").unwrap().as_str().unwrap();
+        assert!(
+            summary.contains("bridge"),
+            "summary should mention bridge, got: {}",
+            summary
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_function() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "hub_function",
+                    "node_type": "function",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.get("node_type").unwrap().as_str().unwrap(),
+            "function"
+        );
+
+        let metrics = result.get("metrics").unwrap();
+        assert!(metrics.get("pagerank").unwrap().as_f64().unwrap() > 0.0);
+
+        let interp = result.get("interpretation").unwrap();
+        let importance = interp.get("importance").unwrap().as_str().unwrap();
+        assert!(
+            importance == "critical" || importance == "high",
+            "hub_function (pagerank=0.90, at p80) should be critical or high, got {}",
+            importance
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_not_found() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "nonexistent.rs",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await;
+
+        assert!(result.is_err(), "should error for non-existent node");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Node not found"),
+            "error should say Node not found, got: {}",
+            err_msg
+        );
     }
 }

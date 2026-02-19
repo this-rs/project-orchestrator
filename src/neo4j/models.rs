@@ -790,6 +790,42 @@ pub struct CouplingMetrics {
     pub most_coupled_file: Option<String>,
 }
 
+/// GDS metrics for a single node (file or function).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeGdsMetrics {
+    pub node_path: String,
+    pub node_type: String, // "file" or "function"
+    pub pagerank: Option<f64>,
+    pub betweenness: Option<f64>,
+    pub clustering_coefficient: Option<f64>,
+    pub community_id: Option<i64>,
+    pub community_label: Option<String>,
+    pub in_degree: i64,
+    pub out_degree: i64,
+}
+
+/// Statistical percentiles for a project's GDS metrics distribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectPercentiles {
+    pub pagerank_p50: f64,
+    pub pagerank_p80: f64,
+    pub pagerank_p95: f64,
+    pub betweenness_p50: f64,
+    pub betweenness_p80: f64,
+    pub betweenness_p95: f64,
+    pub betweenness_mean: f64,
+    pub betweenness_stddev: f64,
+}
+
+/// Interpretation of a node's structural importance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInterpretation {
+    pub importance: String,  // "critical", "high", "medium", "low"
+    pub is_bridge: bool,
+    pub risk_level: String,  // "critical", "high", "medium", "low"
+    pub summary: String,
+}
+
 /// A feature graph — a named subgraph capturing all code entities related to a feature.
 /// Reusable across sessions to avoid re-exploring the same feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]

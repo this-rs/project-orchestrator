@@ -628,6 +628,23 @@ impl GraphStore for Neo4jClient {
         self.get_circular_dependencies(project_id).await
     }
 
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<NodeGdsMetrics>> {
+        self.get_node_gds_metrics(node_path, node_type, project_id)
+            .await
+    }
+
+    async fn get_project_percentiles(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<ProjectPercentiles> {
+        self.get_project_percentiles(project_id).await
+    }
+
     async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {
         self.get_file_symbol_names(path).await
     }

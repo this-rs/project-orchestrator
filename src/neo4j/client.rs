@@ -3694,6 +3694,117 @@ impl Neo4jClient {
         Ok(cycles)
     }
 
+    /// Get GDS metrics for a specific node (file or function) in a project.
+    pub async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>> {
+        let (label, id_prop) = match node_type {
+            "function" => ("Function", "name"),
+            _ => ("File", "path"),
+        };
+
+        let cypher = format!(
+            r#"
+            MATCH (p:Project {{id: $pid}})-[:CONTAINS]->(n:{label} {{{id_prop}: $node_path}})
+            OPTIONAL MATCH (caller)-[]->(n)
+            WITH n, count(DISTINCT caller) AS in_deg
+            OPTIONAL MATCH (n)-[]->(callee)
+            WITH n, in_deg, count(DISTINCT callee) AS out_deg
+            RETURN
+                n.{id_prop} AS node_path,
+                n.pagerank AS pagerank,
+                n.betweenness AS betweenness,
+                n.clustering_coefficient AS clustering_coefficient,
+                n.community_id AS community_id,
+                n.community_label AS community_label,
+                in_deg, out_deg
+            "#,
+        );
+
+        let q = query(&cypher)
+            .param("pid", project_id.to_string())
+            .param("node_path", node_path);
+
+        let rows = self.execute_with_params(q).await?;
+        if let Some(row) = rows.first() {
+            let path: String = row.get("node_path").unwrap_or_default();
+            if path.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(NodeGdsMetrics {
+                node_path: path,
+                node_type: node_type.to_string(),
+                pagerank: row.get::<f64>("pagerank").ok(),
+                betweenness: row.get::<f64>("betweenness").ok(),
+                clustering_coefficient: row.get::<f64>("clustering_coefficient").ok(),
+                community_id: row.get::<i64>("community_id").ok(),
+                community_label: row.get::<String>("community_label").ok(),
+                in_degree: row.get::<i64>("in_deg").unwrap_or(0),
+                out_degree: row.get::<i64>("out_deg").unwrap_or(0),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get statistical percentiles for GDS metrics across all files+functions in a project.
+    pub async fn get_project_percentiles(
+        &self,
+        project_id: Uuid,
+    ) -> Result<ProjectPercentiles> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(n)
+            WHERE (n:File OR n:Function) AND n.pagerank IS NOT NULL
+            WITH collect(n.pagerank) AS prs, collect(n.betweenness) AS bws
+            WITH prs, bws,
+                 apoc.coll.sort(prs) AS sorted_pr,
+                 apoc.coll.sort(bws) AS sorted_bw
+            WITH sorted_pr, sorted_bw, size(sorted_pr) AS cnt,
+                 reduce(s = 0.0, x IN bws | s + x) / size(bws) AS bw_mean
+            WITH sorted_pr, sorted_bw, cnt, bw_mean,
+                 sorted_pr[toInteger(cnt * 0.5)] AS pr_p50,
+                 sorted_pr[toInteger(cnt * 0.8)] AS pr_p80,
+                 sorted_pr[toInteger(cnt * 0.95)] AS pr_p95,
+                 sorted_bw[toInteger(cnt * 0.5)] AS bw_p50,
+                 sorted_bw[toInteger(cnt * 0.8)] AS bw_p80,
+                 sorted_bw[toInteger(cnt * 0.95)] AS bw_p95
+            WITH *, reduce(s = 0.0, x IN sorted_bw | s + (x - bw_mean) * (x - bw_mean)) / cnt AS bw_var
+            RETURN pr_p50, pr_p80, pr_p95, bw_p50, bw_p80, bw_p95, bw_mean, sqrt(bw_var) AS bw_stddev
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        if let Some(row) = rows.first() {
+            Ok(ProjectPercentiles {
+                pagerank_p50: row.get::<f64>("pr_p50").unwrap_or(0.0),
+                pagerank_p80: row.get::<f64>("pr_p80").unwrap_or(0.0),
+                pagerank_p95: row.get::<f64>("pr_p95").unwrap_or(0.0),
+                betweenness_p50: row.get::<f64>("bw_p50").unwrap_or(0.0),
+                betweenness_p80: row.get::<f64>("bw_p80").unwrap_or(0.0),
+                betweenness_p95: row.get::<f64>("bw_p95").unwrap_or(0.0),
+                betweenness_mean: row.get::<f64>("bw_mean").unwrap_or(0.0),
+                betweenness_stddev: row.get::<f64>("bw_stddev").unwrap_or(0.0),
+            })
+        } else {
+            // No data — return zeroes
+            Ok(ProjectPercentiles {
+                pagerank_p50: 0.0,
+                pagerank_p80: 0.0,
+                pagerank_p95: 0.0,
+                betweenness_p50: 0.0,
+                betweenness_p80: 0.0,
+                betweenness_p95: 0.0,
+                betweenness_mean: 0.0,
+                betweenness_stddev: 0.0,
+            })
+        }
+    }
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     pub async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
         let q = query(
