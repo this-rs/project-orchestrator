@@ -32,5 +32,6 @@ pub mod writer;
 // Re-export primary types for convenience
 pub use models::{
     AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeHealthReport, CodeNode, CodeNodeType,
-    CommunityInfo, ComponentInfo, GraphAnalytics, NodeMetrics,
+    CommunityInfo, ComponentInfo, FileAnalyticsUpdate, FunctionAnalyticsUpdate, GraphAnalytics,
+    NodeMetrics,
 };

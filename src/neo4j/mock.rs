@@ -86,6 +86,10 @@ pub struct MockGraphStore {
     /// feature_graph_id -> Vec<(entity_type, entity_id, role)>
     #[allow(clippy::type_complexity)]
     pub feature_graph_entities: RwLock<HashMap<Uuid, Vec<(String, String, Option<String>)>>>,
+    /// Analytics scores stored for File nodes (keyed by path)
+    pub file_analytics: RwLock<HashMap<String, crate::graph::models::FileAnalyticsUpdate>>,
+    /// Analytics scores stored for Function nodes (keyed by name)
+    pub function_analytics: RwLock<HashMap<String, crate::graph::models::FunctionAnalyticsUpdate>>,
 }
 
 #[allow(dead_code)]
@@ -152,6 +156,8 @@ impl MockGraphStore {
             refresh_tokens: RwLock::new(HashMap::new()),
             feature_graphs: RwLock::new(HashMap::new()),
             feature_graph_entities: RwLock::new(HashMap::new()),
+            file_analytics: RwLock::new(HashMap::new()),
+            function_analytics: RwLock::new(HashMap::new()),
         }
     }
 
@@ -4675,6 +4681,28 @@ impl GraphStore for MockGraphStore {
         }
 
         Ok(edges)
+    }
+
+    async fn batch_update_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FileAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        let mut fa = self.file_analytics.write().await;
+        for update in updates {
+            fa.insert(update.path.clone(), update.clone());
+        }
+        Ok(())
+    }
+
+    async fn batch_update_function_analytics(
+        &self,
+        updates: &[crate::graph::models::FunctionAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        let mut fa = self.function_analytics.write().await;
+        for update in updates {
+            fa.insert(update.name.clone(), update.clone());
+        }
+        Ok(())
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {

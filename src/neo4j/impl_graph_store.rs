@@ -1551,6 +1551,20 @@ impl GraphStore for Neo4jClient {
         self.get_project_call_edges(project_id).await
     }
 
+    async fn batch_update_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FileAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        self.batch_update_file_analytics(updates).await
+    }
+
+    async fn batch_update_function_analytics(
+        &self,
+        updates: &[crate::graph::models::FunctionAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        self.batch_update_function_analytics(updates).await
+    }
+
     async fn health_check(&self) -> anyhow::Result<bool> {
         match self.execute("RETURN 1 AS ping").await {
             Ok(_) => Ok(true),

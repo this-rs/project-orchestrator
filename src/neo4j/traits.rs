@@ -4,6 +4,7 @@
 //! This trait mirrors all public async methods of `Neo4jClient`,
 //! enabling testing with mock implementations and future backend swaps.
 
+use crate::graph::models::{FileAnalyticsUpdate, FunctionAnalyticsUpdate};
 use crate::neo4j::models::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -1190,6 +1191,17 @@ pub trait GraphStore: Send + Sync {
     /// Scoped to the same project (no cross-project calls).
     /// Single bulk query — used by the graph analytics engine for extraction.
     async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Batch-update analytics scores on File nodes.
+    /// Uses UNWIND for single-query efficiency.
+    async fn batch_update_file_analytics(&self, updates: &[FileAnalyticsUpdate]) -> Result<()>;
+
+    /// Batch-update analytics scores on Function nodes.
+    /// Uses UNWIND for single-query efficiency.
+    async fn batch_update_function_analytics(
+        &self,
+        updates: &[FunctionAnalyticsUpdate],
+    ) -> Result<()>;
 
     // ========================================================================
     // Health check

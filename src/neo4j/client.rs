@@ -8994,6 +8994,93 @@ impl Neo4jClient {
         Ok(edges)
     }
 
+    /// Batch-update analytics scores on File nodes via UNWIND.
+    pub async fn batch_update_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FileAnalyticsUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        // Build UNWIND list directly in Cypher (internal computed data, no injection risk)
+        let entries: Vec<String> = updates
+            .iter()
+            .map(|u| {
+                format!(
+                    "{{path: '{}', pagerank: {}, betweenness: {}, community_id: {}, community_label: '{}', clustering_coefficient: {}, component_id: {}}}",
+                    u.path.replace('\'', "\\'"),
+                    u.pagerank,
+                    u.betweenness,
+                    u.community_id,
+                    u.community_label.replace('\'', "\\'"),
+                    u.clustering_coefficient,
+                    u.component_id
+                )
+            })
+            .collect();
+
+        let cypher = format!(
+            r#"
+            UNWIND [{}] AS u
+            MATCH (f:File {{path: u.path}})
+            SET f.pagerank = u.pagerank,
+                f.betweenness = u.betweenness,
+                f.community_id = u.community_id,
+                f.community_label = u.community_label,
+                f.clustering_coefficient = u.clustering_coefficient,
+                f.component_id = u.component_id,
+                f.analytics_updated_at = datetime()
+            "#,
+            entries.join(", ")
+        );
+
+        self.execute(&cypher).await?;
+        Ok(())
+    }
+
+    /// Batch-update analytics scores on Function nodes via UNWIND.
+    pub async fn batch_update_function_analytics(
+        &self,
+        updates: &[crate::graph::models::FunctionAnalyticsUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let entries: Vec<String> = updates
+            .iter()
+            .map(|u| {
+                format!(
+                    "{{name: '{}', pagerank: {}, betweenness: {}, community_id: {}, clustering_coefficient: {}, component_id: {}}}",
+                    u.name.replace('\'', "\\'"),
+                    u.pagerank,
+                    u.betweenness,
+                    u.community_id,
+                    u.clustering_coefficient,
+                    u.component_id
+                )
+            })
+            .collect();
+
+        let cypher = format!(
+            r#"
+            UNWIND [{}] AS u
+            MATCH (f:Function {{name: u.name}})
+            SET f.pagerank = u.pagerank,
+                f.betweenness = u.betweenness,
+                f.community_id = u.community_id,
+                f.clustering_coefficient = u.clustering_coefficient,
+                f.component_id = u.component_id,
+                f.analytics_updated_at = datetime()
+            "#,
+            entries.join(", ")
+        );
+
+        self.execute(&cypher).await?;
+        Ok(())
+    }
+
     fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {
         Ok(FeatureGraphNode {
             id: node.get::<String>("id")?.parse()?,

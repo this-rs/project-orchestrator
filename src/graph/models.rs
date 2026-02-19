@@ -308,6 +308,52 @@ pub struct GraphAnalytics {
 }
 
 // ============================================================================
+// Writer types — Analytics updates for Neo4j persistence
+// ============================================================================
+
+/// Batch update payload for File nodes' analytics properties.
+///
+/// Used by the `AnalyticsWriter` to persist computed scores back to Neo4j
+/// in a single UNWIND query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAnalyticsUpdate {
+    /// File path (matches the `path` property on File nodes)
+    pub path: String,
+    /// PageRank score
+    pub pagerank: f64,
+    /// Betweenness centrality score
+    pub betweenness: f64,
+    /// Louvain community ID
+    pub community_id: u32,
+    /// Human-readable community label
+    pub community_label: String,
+    /// Local clustering coefficient
+    pub clustering_coefficient: f64,
+    /// Weakly connected component ID
+    pub component_id: u32,
+}
+
+/// Batch update payload for Function nodes' analytics properties.
+///
+/// Used by the `AnalyticsWriter` to persist computed scores back to Neo4j
+/// in a single UNWIND query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionAnalyticsUpdate {
+    /// Function name (matches the `name` property on Function nodes)
+    pub name: String,
+    /// PageRank score
+    pub pagerank: f64,
+    /// Betweenness centrality score
+    pub betweenness: f64,
+    /// Louvain community ID
+    pub community_id: u32,
+    /// Local clustering coefficient
+    pub clustering_coefficient: f64,
+    /// Weakly connected component ID
+    pub component_id: u32,
+}
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
