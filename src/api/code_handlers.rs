@@ -1401,6 +1401,172 @@ mod tests {
         assert_eq!(q.language, None);
     }
 
+    #[test]
+    fn test_code_search_query_with_workspace_slug() {
+        let json = r#"{"query":"test","workspace_slug":"my-ws"}"#;
+        let q: CodeSearchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.query, "test");
+        assert_eq!(q.workspace_slug.as_deref(), Some("my-ws"));
+        assert!(q.project_slug.is_none());
+    }
+
+    #[test]
+    fn test_architecture_query_with_workspace_slug() {
+        let json = r#"{"workspace_slug":"my-ws"}"#;
+        let q: ArchitectureQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.workspace_slug.as_deref(), Some("my-ws"));
+        assert!(q.project_slug.is_none());
+    }
+
+    /// Build a test router with a workspace containing a project with seeded code
+    async fn test_app_with_workspace() -> axum::Router {
+        use crate::neo4j::models::{ProjectNode, WorkspaceNode};
+
+        let app_state = mock_app_state();
+
+        // Create workspace
+        let ws_id = uuid::Uuid::new_v4();
+        let workspace = WorkspaceNode {
+            id: ws_id,
+            name: "Test Workspace".to_string(),
+            slug: "test-ws".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata: serde_json::Value::Null,
+        };
+        app_state.neo4j.create_workspace(&workspace).await.unwrap();
+
+        // Create project and link to workspace
+        let proj_id = uuid::Uuid::new_v4();
+        let project = ProjectNode {
+            id: proj_id,
+            name: "Test Project".to_string(),
+            slug: "test-project".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+        };
+        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .neo4j
+            .add_project_to_workspace(ws_id, proj_id)
+            .await
+            .unwrap();
+
+        // Seed code document
+        let doc = CodeDocument {
+            id: "src/main.rs".to_string(),
+            path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            symbols: vec!["main".to_string()],
+            docstrings: "Entry point".to_string(),
+            signatures: vec!["fn main()".to_string()],
+            imports: vec![],
+            project_id: proj_id.to_string(),
+            project_slug: "test-project".to_string(),
+        };
+        app_state.meili.index_code(&doc).await.unwrap();
+
+        // Seed file for architecture
+        let file = FileNode {
+            path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(proj_id),
+        };
+        app_state.neo4j.upsert_file(&file).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        create_router(state)
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_workspace_slug_filter() {
+        let app = test_app_with_workspace().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/search?query=main&workspace_slug=test-ws",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let results = json.as_array().unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0]["document"]["path"], "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn test_search_code_workspace_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/search?query=main&workspace_slug=nonexistent",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_architecture_with_workspace_slug() {
+        let app = test_app_with_workspace().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/architecture?workspace_slug=test-ws"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_files"], 1);
+        let languages = json["languages"].as_array().unwrap();
+        assert_eq!(languages.len(), 1);
+        assert_eq!(languages[0]["language"], "rust");
+    }
+
+    #[tokio::test]
+    async fn test_architecture_workspace_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/architecture?workspace_slug=nonexistent",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     // ====================================================================
     // GET /api/code/impact — analyze_impact with caller_count
     // ====================================================================
