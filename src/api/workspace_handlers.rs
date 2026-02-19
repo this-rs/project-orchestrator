@@ -469,7 +469,7 @@ pub struct AddProjectRequest {
 pub async fn list_workspace_projects(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
-) -> Result<Json<Vec<ProjectSummary>>, AppError> {
+) -> Result<Json<Vec<ProjectNode>>, AppError> {
     let workspace = state
         .orchestrator
         .neo4j()
@@ -483,16 +483,7 @@ pub async fn list_workspace_projects(
         .list_workspace_projects(workspace.id)
         .await?;
 
-    Ok(Json(
-        projects
-            .into_iter()
-            .map(|p| ProjectSummary {
-                id: p.id.to_string(),
-                name: p.name,
-                slug: p.slug,
-            })
-            .collect(),
-    ))
+    Ok(Json(projects))
 }
 
 /// Add project to workspace
