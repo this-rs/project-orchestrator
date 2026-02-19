@@ -699,7 +699,7 @@ impl GraphStore for MockGraphStore {
         Ok((total, completed, in_progress, pending))
     }
 
-    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>> {
+    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>> {
         let task_ids = self
             .ws_milestone_tasks
             .read()
@@ -708,9 +708,31 @@ impl GraphStore for MockGraphStore {
             .cloned()
             .unwrap_or_default();
         let tasks = self.tasks.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let plans = self.plans.read().await;
+
         Ok(task_ids
             .iter()
-            .filter_map(|id| tasks.get(id).cloned())
+            .filter_map(|id| {
+                let task = tasks.get(id)?.clone();
+                // Find which plan owns this task
+                let (plan_id, plan_title) = plan_tasks
+                    .iter()
+                    .find_map(|(pid, tids)| {
+                        if tids.contains(id) {
+                            let title = plans.get(pid).map(|p| p.title.clone()).unwrap_or_default();
+                            Some((*pid, title))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                Some(TaskWithPlan {
+                    task,
+                    plan_id,
+                    plan_title,
+                })
+            })
             .collect())
     }
 

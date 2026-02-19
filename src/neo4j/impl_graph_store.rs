@@ -219,7 +219,7 @@ impl GraphStore for Neo4jClient {
     async fn get_workspace_milestone_tasks(
         &self,
         milestone_id: Uuid,
-    ) -> anyhow::Result<Vec<TaskNode>> {
+    ) -> anyhow::Result<Vec<TaskWithPlan>> {
         self.get_workspace_milestone_tasks(milestone_id).await
     }
 

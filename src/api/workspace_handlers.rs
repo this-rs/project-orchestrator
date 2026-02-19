@@ -737,11 +737,11 @@ pub async fn add_task_to_workspace_milestone(
     Ok(StatusCode::CREATED)
 }
 
-/// List tasks linked to a workspace milestone
+/// List tasks linked to a workspace milestone (with plan info)
 pub async fn list_workspace_milestone_tasks(
     State(state): State<OrchestratorState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<TaskNode>>, AppError> {
+) -> Result<Json<Vec<TaskWithPlan>>, AppError> {
     let id: Uuid = id
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
@@ -1478,12 +1478,15 @@ mod tests {
             .unwrap();
         let tasks: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
-        // Verify task structure includes expected fields
+        // Verify task structure includes expected fields (now returns TaskWithPlan)
         for task in &tasks {
             assert!(task["id"].is_string());
             assert!(task["description"].is_string());
             assert!(task["status"].is_string());
             assert!(task.get("created_at").is_some());
+            // TaskWithPlan adds plan_id and plan_title
+            assert!(task["plan_id"].is_string());
+            assert!(task["plan_title"].is_string());
         }
     }
 
