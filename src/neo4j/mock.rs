@@ -699,7 +699,7 @@ impl GraphStore for MockGraphStore {
         Ok((total, completed, in_progress, pending))
     }
 
-    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>> {
+    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>> {
         let task_ids = self
             .ws_milestone_tasks
             .read()
@@ -708,10 +708,69 @@ impl GraphStore for MockGraphStore {
             .cloned()
             .unwrap_or_default();
         let tasks = self.tasks.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let plans = self.plans.read().await;
+
         Ok(task_ids
             .iter()
-            .filter_map(|id| tasks.get(id).cloned())
+            .filter_map(|id| {
+                let task = tasks.get(id)?.clone();
+                // Find which plan owns this task
+                let (plan_id, plan_title) = plan_tasks
+                    .iter()
+                    .find_map(|(pid, tids)| {
+                        if tids.contains(id) {
+                            let title = plans.get(pid).map(|p| p.title.clone()).unwrap_or_default();
+                            Some((*pid, title))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let plan_status = plans.get(&plan_id).map(|p| {
+                    serde_json::to_value(&p.status)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
+                Some(TaskWithPlan {
+                    task,
+                    plan_id,
+                    plan_title,
+                    plan_status,
+                })
+            })
             .collect())
+    }
+
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        let task_ids = self
+            .ws_milestone_tasks
+            .read()
+            .await
+            .get(&milestone_id)
+            .cloned()
+            .unwrap_or_default();
+        let steps = self.steps.read().await;
+        let task_steps = self.task_steps.read().await;
+
+        let mut map: std::collections::HashMap<Uuid, Vec<StepNode>> =
+            std::collections::HashMap::new();
+        for tid in &task_ids {
+            if let Some(step_ids) = task_steps.get(tid) {
+                let mut task_step_list: Vec<StepNode> = step_ids
+                    .iter()
+                    .filter_map(|sid| steps.get(sid).cloned())
+                    .collect();
+                task_step_list.sort_by_key(|s| s.order);
+                map.insert(*tid, task_step_list);
+            }
+        }
+        Ok(map)
     }
 
     // ========================================================================
@@ -3033,6 +3092,7 @@ impl GraphStore for MockGraphStore {
     async fn list_plans_filtered(
         &self,
         project_id: Option<Uuid>,
+        _workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -3096,6 +3156,8 @@ impl GraphStore for MockGraphStore {
     async fn list_all_tasks_filtered(
         &self,
         plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        _workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -3109,6 +3171,7 @@ impl GraphStore for MockGraphStore {
         let pt = self.plan_tasks.read().await;
         let tasks = self.tasks.read().await;
         let plans = self.plans.read().await;
+        let pp = self.project_plans.read().await;
 
         // Build task_id -> plan_id mapping
         let mut task_plan_map: HashMap<Uuid, Uuid> = HashMap::new();
@@ -3123,6 +3186,16 @@ impl GraphStore for MockGraphStore {
             .filter(|t| {
                 if let Some(pid) = plan_id {
                     if task_plan_map.get(&t.id) != Some(&pid) {
+                        return false;
+                    }
+                }
+                if let Some(pid) = project_id {
+                    // Filter tasks whose plan belongs to this project
+                    if let Some(plan_id) = task_plan_map.get(&t.id) {
+                        if !pp.get(&pid).is_some_and(|plans| plans.contains(plan_id)) {
+                            return false;
+                        }
+                    } else {
                         return false;
                     }
                 }
@@ -3160,10 +3233,16 @@ impl GraphStore for MockGraphStore {
             .filter_map(|t| {
                 let pid = task_plan_map.get(&t.id)?;
                 let plan = plans.get(pid)?;
+                let plan_status = serde_json::to_value(&plan.status)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
                 Some(TaskWithPlan {
                     task: t.clone(),
                     plan_id: *pid,
                     plan_title: plan.title.clone(),
+                    plan_status: Some(plan_status),
                 })
             })
             .collect();
@@ -3313,6 +3392,7 @@ impl GraphStore for MockGraphStore {
     async fn list_notes(
         &self,
         project_id: Option<Uuid>,
+        _workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
         let notes = self.notes.read().await;
@@ -3559,6 +3639,7 @@ impl GraphStore for MockGraphStore {
     async fn list_chat_sessions(
         &self,
         project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatSessionNode>, usize)> {
@@ -3568,6 +3649,8 @@ impl GraphStore for MockGraphStore {
             .filter(|s| {
                 if let Some(slug) = project_slug {
                     s.project_slug.as_deref() == Some(slug)
+                } else if let Some(ws) = workspace_slug {
+                    s.workspace_slug.as_deref() == Some(ws)
                 } else {
                     true
                 }

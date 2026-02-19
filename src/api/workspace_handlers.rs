@@ -136,6 +136,48 @@ pub struct MilestoneProgressResponse {
     pub percentage: f64,
 }
 
+/// Full milestone detail: milestone → plans → tasks → steps + progress
+#[derive(Serialize)]
+pub struct MilestoneDetailResponse {
+    #[serde(flatten)]
+    pub milestone: WorkspaceMilestoneResponse,
+    pub plans: Vec<MilestonePlanSummary>,
+    pub progress: MilestoneProgressResponse,
+}
+
+/// A plan summary within a milestone detail
+#[derive(Serialize)]
+pub struct MilestonePlanSummary {
+    pub id: String,
+    pub title: String,
+    pub status: Option<String>,
+    pub tasks: Vec<MilestoneTaskSummary>,
+}
+
+/// A task summary within a milestone plan
+#[derive(Serialize)]
+pub struct MilestoneTaskSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub description: String,
+    pub status: String,
+    pub priority: Option<i32>,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub steps: Vec<MilestoneStepSummary>,
+}
+
+/// A step summary within a milestone task
+#[derive(Serialize)]
+pub struct MilestoneStepSummary {
+    pub id: String,
+    pub order: u32,
+    pub description: String,
+    pub status: String,
+    pub verification: Option<String>,
+}
+
 // ============================================================================
 // Request/Response types - Resource
 // ============================================================================
@@ -469,7 +511,7 @@ pub struct AddProjectRequest {
 pub async fn list_workspace_projects(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
-) -> Result<Json<Vec<ProjectSummary>>, AppError> {
+) -> Result<Json<Vec<ProjectNode>>, AppError> {
     let workspace = state
         .orchestrator
         .neo4j()
@@ -483,16 +525,7 @@ pub async fn list_workspace_projects(
         .list_workspace_projects(workspace.id)
         .await?;
 
-    Ok(Json(
-        projects
-            .into_iter()
-            .map(|p| ProjectSummary {
-                id: p.id.to_string(),
-                name: p.name,
-                slug: p.slug,
-            })
-            .collect(),
-    ))
+    Ok(Json(projects))
 }
 
 /// Add project to workspace
@@ -640,23 +673,111 @@ pub async fn create_workspace_milestone(
     ))
 }
 
-/// Get workspace milestone
+/// Get workspace milestone with full detail: plans → tasks → steps + progress
 pub async fn get_workspace_milestone(
     State(state): State<OrchestratorState>,
     Path(id): Path<String>,
-) -> Result<Json<WorkspaceMilestoneResponse>, AppError> {
+) -> Result<Json<MilestoneDetailResponse>, AppError> {
     let id: Uuid = id
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
 
-    let milestone = state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+
+    // 1. Get milestone node
+    let milestone = neo4j
         .get_workspace_milestone(id)
         .await?
         .ok_or_else(|| AppError::NotFound("Milestone not found".to_string()))?;
 
-    Ok(Json(WorkspaceMilestoneResponse::from(milestone)))
+    // 2. Get tasks with plan info (plan_id, plan_title, plan_status)
+    let tasks_with_plan = neo4j.get_workspace_milestone_tasks(id).await?;
+
+    // 3. Get progress stats
+    let (total, completed, in_progress, pending) =
+        neo4j.get_workspace_milestone_progress(id).await?;
+
+    let percentage = if total > 0 {
+        (completed as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // 4. Get all steps in one batch query
+    let mut steps_map = neo4j.get_workspace_milestone_steps(id).await?;
+
+    // 5. Group tasks by plan and build hierarchical response
+    let mut plan_order: Vec<Uuid> = Vec::new();
+    let mut plan_map: std::collections::HashMap<
+        Uuid,
+        (String, Option<String>, Vec<MilestoneTaskSummary>),
+    > = std::collections::HashMap::new();
+
+    for twp in tasks_with_plan {
+        let steps = steps_map
+            .remove(&twp.task.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| MilestoneStepSummary {
+                id: s.id.to_string(),
+                order: s.order,
+                description: s.description,
+                status: serde_json::to_value(&s.status)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                verification: s.verification,
+            })
+            .collect();
+
+        let task_summary = MilestoneTaskSummary {
+            id: twp.task.id.to_string(),
+            title: twp.task.title,
+            description: twp.task.description,
+            status: serde_json::to_value(&twp.task.status)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string(),
+            priority: twp.task.priority,
+            tags: twp.task.tags,
+            created_at: twp.task.created_at.to_rfc3339(),
+            completed_at: twp.task.completed_at.map(|dt| dt.to_rfc3339()),
+            steps,
+        };
+
+        let entry = plan_map.entry(twp.plan_id).or_insert_with(|| {
+            plan_order.push(twp.plan_id);
+            (twp.plan_title.clone(), twp.plan_status.clone(), vec![])
+        });
+        entry.2.push(task_summary);
+    }
+
+    let plans: Vec<MilestonePlanSummary> = plan_order
+        .into_iter()
+        .filter_map(|pid| {
+            let (title, status, tasks) = plan_map.remove(&pid)?;
+            Some(MilestonePlanSummary {
+                id: pid.to_string(),
+                title,
+                status,
+                tasks,
+            })
+        })
+        .collect();
+
+    Ok(Json(MilestoneDetailResponse {
+        milestone: WorkspaceMilestoneResponse::from(milestone),
+        plans,
+        progress: MilestoneProgressResponse {
+            total,
+            completed,
+            in_progress,
+            pending,
+            percentage,
+        },
+    }))
 }
 
 /// Update workspace milestone
@@ -746,11 +867,11 @@ pub async fn add_task_to_workspace_milestone(
     Ok(StatusCode::CREATED)
 }
 
-/// List tasks linked to a workspace milestone
+/// List tasks linked to a workspace milestone (with plan info)
 pub async fn list_workspace_milestone_tasks(
     State(state): State<OrchestratorState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<TaskNode>>, AppError> {
+) -> Result<Json<Vec<TaskWithPlan>>, AppError> {
     let id: Uuid = id
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
@@ -1487,12 +1608,15 @@ mod tests {
             .unwrap();
         let tasks: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
-        // Verify task structure includes expected fields
+        // Verify task structure includes expected fields (now returns TaskWithPlan)
         for task in &tasks {
             assert!(task["id"].is_string());
             assert!(task["description"].is_string());
             assert!(task["status"].is_string());
             assert!(task.get("created_at").is_some());
+            // TaskWithPlan adds plan_id and plan_title
+            assert!(task["plan_id"].is_string());
+            assert!(task["plan_title"].is_string());
         }
     }
 

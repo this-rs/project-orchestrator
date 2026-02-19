@@ -1156,12 +1156,17 @@ impl Neo4jClient {
         }
     }
 
-    /// Get tasks linked to a workspace milestone
-    pub async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>> {
+    /// Get tasks linked to a workspace milestone (with plan info)
+    pub async fn get_workspace_milestone_tasks(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Vec<TaskWithPlan>> {
         let q = query(
             r#"
             MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)
-            RETURN t
+            OPTIONAL MATCH (p:Plan)-[:HAS_TASK]->(t)
+            RETURN t, p.id AS plan_id, COALESCE(p.title, '') AS plan_title,
+                   COALESCE(p.status, '') AS plan_status
             ORDER BY t.priority DESC, t.created_at
             "#,
         )
@@ -1171,9 +1176,76 @@ impl Neo4jClient {
         let mut tasks = Vec::new();
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("t")?;
-            tasks.push(self.node_to_task(&node)?);
+            let plan_id_str: String = row.get("plan_id").unwrap_or_default();
+            let plan_title: String = row.get("plan_title").unwrap_or_default();
+            let plan_status: String = row.get("plan_status").unwrap_or_default();
+            tasks.push(TaskWithPlan {
+                task: self.node_to_task(&node)?,
+                plan_id: plan_id_str.parse().unwrap_or_default(),
+                plan_title,
+                plan_status: if plan_status.is_empty() {
+                    None
+                } else {
+                    Some(pascal_to_snake_case(&plan_status))
+                },
+            });
         }
         Ok(tasks)
+    }
+
+    /// Get all steps for all tasks linked to a workspace milestone (batch query)
+    pub async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        let q = query(
+            r#"
+            MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)-[:HAS_STEP]->(s:Step)
+            RETURN t.id AS task_id, s
+            ORDER BY t.id, s.order
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut steps_map: std::collections::HashMap<Uuid, Vec<StepNode>> =
+            std::collections::HashMap::new();
+
+        while let Some(row) = result.next().await? {
+            let task_id_str: String = row.get("task_id")?;
+            let task_id: Uuid = task_id_str.parse()?;
+            let node: neo4rs::Node = row.get("s")?;
+            let step = StepNode {
+                id: node.get::<String>("id")?.parse()?,
+                order: node.get::<i64>("order")? as u32,
+                description: node.get("description")?,
+                status: serde_json::from_str(&format!(
+                    "\"{}\"",
+                    pascal_to_snake_case(&node.get::<String>("status")?)
+                ))
+                .unwrap_or(StepStatus::Pending),
+                verification: node
+                    .get::<String>("verification")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                created_at: node
+                    .get::<String>("created_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+                updated_at: node
+                    .get::<String>("updated_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                completed_at: node
+                    .get::<String>("completed_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+            };
+            steps_map.entry(task_id).or_default().push(step);
+        }
+
+        Ok(steps_map)
     }
 
     /// Helper to convert Neo4j node to WorkspaceMilestoneNode
@@ -5927,6 +5999,7 @@ impl Neo4jClient {
     pub async fn list_plans_filtered(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -5955,6 +6028,11 @@ impl Neo4jClient {
             format!(
                 "MATCH (proj:Project {{id: '{}'}})-[:HAS_PLAN]->(p:Plan)",
                 pid
+            )
+        } else if let Some(ws) = workspace_slug {
+            format!(
+                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)",
+                ws
             )
         } else {
             "MATCH (p:Plan)".to_string()
@@ -5998,6 +6076,8 @@ impl Neo4jClient {
     pub async fn list_all_tasks_filtered(
         &self,
         plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -6018,6 +6098,16 @@ impl Neo4jClient {
         // Build plan filter if specified
         let plan_match = if let Some(pid) = plan_id {
             format!("MATCH (p:Plan {{id: '{}'}})-[:HAS_TASK]->(t:Task)", pid)
+        } else if let Some(pid) = project_id {
+            format!(
+                "MATCH (proj:Project {{id: '{}'}})-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)",
+                pid
+            )
+        } else if let Some(ws) = workspace_slug {
+            format!(
+                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)",
+                ws
+            )
         } else {
             "MATCH (p:Plan)-[:HAS_TASK]->(t:Task)".to_string()
         };
@@ -6052,7 +6142,8 @@ impl Neo4jClient {
             r#"
             {}
             {}
-            RETURN t, p.id AS plan_id, p.title AS plan_title
+            RETURN t, p.id AS plan_id, p.title AS plan_title,
+                   COALESCE(p.status, '') AS plan_status
             ORDER BY {} {}
             SKIP {}
             LIMIT {}
@@ -6066,10 +6157,16 @@ impl Neo4jClient {
             let node: neo4rs::Node = row.get("t")?;
             let plan_id_str: String = row.get("plan_id")?;
             let plan_title: String = row.get("plan_title")?;
+            let plan_status: String = row.get("plan_status").unwrap_or_default();
             tasks.push(TaskWithPlan {
                 task: self.node_to_task(&node)?,
                 plan_id: plan_id_str.parse()?,
                 plan_title,
+                plan_status: if plan_status.is_empty() {
+                    None
+                } else {
+                    Some(pascal_to_snake_case(&plan_status))
+                },
             });
         }
 
@@ -6442,6 +6539,7 @@ impl Neo4jClient {
     pub async fn list_notes(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
         let mut where_conditions = Vec::new();
@@ -6450,6 +6548,11 @@ impl Neo4jClient {
             where_conditions.push("(n.project_id IS NULL OR n.project_id = '')".to_string());
         } else if let Some(ref pid) = project_id {
             where_conditions.push(format!("n.project_id = '{}'", pid));
+        } else if let Some(ws) = workspace_slug {
+            where_conditions.push(format!(
+                "n.project_id IN [(w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]",
+                ws
+            ));
         }
 
         if let Some(ref statuses) = filters.status {
@@ -7223,6 +7326,7 @@ impl Neo4jClient {
     pub async fn list_chat_sessions(
         &self,
         project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatSessionNode>, usize)> {
@@ -7240,6 +7344,21 @@ impl Neo4jClient {
                 .param("limit", limit as i64),
                 query("MATCH (s:ChatSession {project_slug: $slug}) RETURN count(s) AS total")
                     .param("slug", slug.to_string()),
+            )
+        } else if let Some(ws) = workspace_slug {
+            (
+                query(
+                    r#"
+                    MATCH (s:ChatSession {workspace_slug: $ws})
+                    RETURN s ORDER BY s.updated_at DESC
+                    SKIP $offset LIMIT $limit
+                    "#,
+                )
+                .param("ws", ws.to_string())
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+                query("MATCH (s:ChatSession {workspace_slug: $ws}) RETURN count(s) AS total")
+                    .param("ws", ws.to_string()),
             )
         } else {
             (

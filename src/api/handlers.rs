@@ -289,6 +289,8 @@ pub struct PlansListQuery {
     pub search_filter: SearchFilter,
     /// Filter by project UUID
     pub project_id: Option<String>,
+    /// Filter by workspace slug (plans of projects in this workspace)
+    pub workspace_slug: Option<String>,
 }
 
 /// List all plans with optional pagination and filters
@@ -313,6 +315,7 @@ pub async fn list_plans(
         .neo4j()
         .list_plans_filtered(
             project_id,
+            query.workspace_slug.as_deref(),
             query.status_filter.to_vec(),
             query.priority_filter.priority_min,
             query.priority_filter.priority_max,
@@ -506,6 +509,10 @@ pub struct TasksListQuery {
     pub plan_id: Option<Uuid>,
     /// Filter by assigned agent/user
     pub assigned_to: Option<String>,
+    /// Filter by project UUID (tasks belonging to plans of this project)
+    pub project_id: Option<Uuid>,
+    /// Filter by workspace slug (tasks belonging to plans of projects in this workspace)
+    pub workspace_slug: Option<String>,
 }
 
 /// List all tasks across all plans with optional filters
@@ -520,6 +527,8 @@ pub async fn list_all_tasks(
         .neo4j()
         .list_all_tasks_filtered(
             query.plan_id,
+            query.project_id,
+            query.workspace_slug.as_deref(),
             query.status_filter.to_vec(),
             query.priority_filter.priority_min,
             query.priority_filter.priority_max,

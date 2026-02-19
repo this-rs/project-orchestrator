@@ -172,8 +172,14 @@ pub trait GraphStore: Send + Sync {
         milestone_id: Uuid,
     ) -> Result<(u32, u32, u32, u32)>;
 
-    /// Get tasks linked to a workspace milestone
-    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>>;
+    /// Get tasks linked to a workspace milestone (with plan info)
+    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>>;
+
+    /// Get all steps for all tasks linked to a workspace milestone (batch)
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
 
     // ========================================================================
     // Resource operations
@@ -794,6 +800,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_plans_filtered(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -811,6 +818,8 @@ pub trait GraphStore: Send + Sync {
     async fn list_all_tasks_filtered(
         &self,
         plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         statuses: Option<Vec<String>>,
         priority_min: Option<i32>,
         priority_max: Option<i32>,
@@ -882,6 +891,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_notes(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)>;
 
@@ -957,6 +967,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_chat_sessions(
         &self,
         project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatSessionNode>, usize)>;

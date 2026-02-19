@@ -163,9 +163,12 @@ impl NoteManager {
     pub async fn list_notes(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
-        self.neo4j.list_notes(project_id, filters).await
+        self.neo4j
+            .list_notes(project_id, workspace_slug, filters)
+            .await
     }
 
     /// List notes for a specific project
@@ -174,7 +177,7 @@ impl NoteManager {
         project_id: Uuid,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
-        self.neo4j.list_notes(Some(project_id), filters).await
+        self.neo4j.list_notes(Some(project_id), None, filters).await
     }
 
     // ========================================================================
@@ -717,7 +720,7 @@ mod tests {
             limit: Some(2),
             ..Default::default()
         };
-        let (notes, total) = mgr.list_notes(None, &filters).await.unwrap();
+        let (notes, total) = mgr.list_notes(None, None, &filters).await.unwrap();
 
         assert_eq!(total, 3);
         assert_eq!(notes.len(), 2); // limited to 2
@@ -1003,7 +1006,7 @@ mod tests {
 
         // List all notes — should return both
         let all_filters = NoteFilters::default();
-        let (all_notes, all_total) = mgr.list_notes(None, &all_filters).await.unwrap();
+        let (all_notes, all_total) = mgr.list_notes(None, None, &all_filters).await.unwrap();
         assert_eq!(all_total, 2);
         assert_eq!(all_notes.len(), 2);
 
@@ -1012,7 +1015,8 @@ mod tests {
             global_only: Some(true),
             ..Default::default()
         };
-        let (global_notes, global_total) = mgr.list_notes(None, &global_filters).await.unwrap();
+        let (global_notes, global_total) =
+            mgr.list_notes(None, None, &global_filters).await.unwrap();
         assert_eq!(global_total, 1);
         assert_eq!(global_notes.len(), 1);
         assert!(global_notes[0].project_id.is_none());
@@ -1020,7 +1024,7 @@ mod tests {
 
         // List project-specific — should return only the project one
         let (project_notes, project_total) = mgr
-            .list_notes(Some(project.id), &all_filters)
+            .list_notes(Some(project.id), None, &all_filters)
             .await
             .unwrap();
         assert_eq!(project_total, 1);

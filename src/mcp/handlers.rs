@@ -477,6 +477,7 @@ impl ToolHandler {
             .neo4j()
             .list_plans_filtered(
                 project_id,
+                None,
                 status,
                 priority_min,
                 priority_max,
@@ -740,6 +741,8 @@ impl ToolHandler {
             .neo4j()
             .list_all_tasks_filtered(
                 plan_id,
+                None,
+                None,
                 status,
                 priority_min,
                 priority_max,
@@ -2074,7 +2077,7 @@ impl ToolHandler {
         let (notes, total) = self
             .orchestrator
             .note_manager()
-            .list_notes(project_id, &filters)
+            .list_notes(project_id, None, &filters)
             .await?;
 
         Ok(json!({
@@ -3444,7 +3447,7 @@ impl ToolHandler {
 
         let (sessions, total) = self
             .neo4j()
-            .list_chat_sessions(project_slug, limit, offset)
+            .list_chat_sessions(project_slug, None, limit, offset)
             .await?;
 
         Ok(json!({

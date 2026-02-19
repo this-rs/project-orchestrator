@@ -24,12 +24,19 @@ pub struct CodeSearchQuery {
     pub limit: Option<usize>,
     /// Filter by language (rust, typescript, python, go)
     pub language: Option<String>,
+    /// Filter by project slug (takes precedence over workspace_slug)
+    pub project_slug: Option<String>,
+    /// Filter by workspace slug (searches all projects in the workspace)
+    pub workspace_slug: Option<String>,
 }
 
 /// Search code semantically across the codebase
 ///
 /// Returns `SearchHit<CodeDocument>` directly so the frontend gets
 /// the `{ document, score }` shape it expects.
+///
+/// When `workspace_slug` is provided (and `project_slug` is not), searches all
+/// projects in the workspace, merges results by score, and truncates to `limit`.
 pub async fn search_code(
     State(state): State<OrchestratorState>,
     Query(params): Query<CodeSearchQuery>,
@@ -37,16 +44,72 @@ pub async fn search_code(
     Json<Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>>,
     AppError,
 > {
+    let limit = params.limit.unwrap_or(10);
+
+    // If project_slug is given, use it directly (backward compat)
+    if params.project_slug.is_some() {
+        let hits = state
+            .orchestrator
+            .meili()
+            .search_code_with_scores(
+                &params.query,
+                limit,
+                params.language.as_deref(),
+                params.project_slug.as_deref(),
+                None,
+            )
+            .await?;
+        return Ok(Json(hits));
+    }
+
+    // If workspace_slug is given, resolve to project slugs and merge results
+    if let Some(ref ws_slug) = params.workspace_slug {
+        let workspace = state
+            .orchestrator
+            .neo4j()
+            .get_workspace_by_slug(ws_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Workspace not found: {}", ws_slug)))?;
+
+        let projects = state
+            .orchestrator
+            .neo4j()
+            .list_workspace_projects(workspace.id)
+            .await?;
+
+        let mut all_hits = Vec::new();
+        for project in &projects {
+            let hits = state
+                .orchestrator
+                .meili()
+                .search_code_with_scores(
+                    &params.query,
+                    limit,
+                    params.language.as_deref(),
+                    Some(&project.slug),
+                    None,
+                )
+                .await
+                .unwrap_or_default();
+            all_hits.extend(hits);
+        }
+
+        // Sort by score descending and truncate to limit
+        all_hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_hits.truncate(limit);
+
+        return Ok(Json(all_hits));
+    }
+
+    // No filter — global search
     let hits = state
         .orchestrator
         .meili()
-        .search_code_with_scores(
-            &params.query,
-            params.limit.unwrap_or(10),
-            params.language.as_deref(),
-            None,
-            None,
-        )
+        .search_code_with_scores(&params.query, limit, params.language.as_deref(), None, None)
         .await?;
 
     Ok(Json(hits))
@@ -490,11 +553,80 @@ pub struct ModuleInfo {
     pub public_api: Vec<String>,
 }
 
+#[derive(Deserialize)]
+pub struct ArchitectureQuery {
+    /// Filter by project slug (takes precedence over workspace_slug)
+    pub project_slug: Option<String>,
+    /// Filter by workspace slug (aggregates architecture of all workspace projects)
+    pub workspace_slug: Option<String>,
+}
+
 /// Get high-level architecture overview
+///
+/// When `workspace_slug` is provided (and `project_slug` is not), aggregates
+/// language stats and key files across all projects in the workspace.
 pub async fn get_architecture(
     State(state): State<OrchestratorState>,
+    Query(params): Query<ArchitectureQuery>,
 ) -> Result<Json<ArchitectureOverview>, AppError> {
-    let lang_stats = state.orchestrator.neo4j().get_language_stats().await?;
+    // Resolve project_ids: single project, workspace projects, or global
+    let project_ids: Option<Vec<uuid::Uuid>> = if let Some(ref slug) = params.project_slug {
+        // Single project filter (backward compat)
+        let project = state
+            .orchestrator
+            .neo4j()
+            .get_project_by_slug(slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+        Some(vec![project.id])
+    } else if let Some(ref ws_slug) = params.workspace_slug {
+        // Workspace filter: resolve to all project IDs
+        let workspace = state
+            .orchestrator
+            .neo4j()
+            .get_workspace_by_slug(ws_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Workspace not found: {}", ws_slug)))?;
+        let projects = state
+            .orchestrator
+            .neo4j()
+            .list_workspace_projects(workspace.id)
+            .await?;
+        Some(projects.into_iter().map(|p| p.id).collect())
+    } else {
+        None
+    };
+
+    // Aggregate language stats
+    let lang_stats = match &project_ids {
+        Some(ids) => {
+            let mut all_stats = Vec::new();
+            for pid in ids {
+                let stats = state
+                    .orchestrator
+                    .neo4j()
+                    .get_language_stats_for_project(*pid)
+                    .await?;
+                all_stats.extend(stats);
+            }
+            // Merge stats by language
+            let mut merged: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for s in all_stats {
+                *merged.entry(s.language).or_default() += s.file_count;
+            }
+            merged
+                .into_iter()
+                .map(
+                    |(language, file_count)| crate::neo4j::models::LanguageStatsNode {
+                        language,
+                        file_count,
+                    },
+                )
+                .collect::<Vec<_>>()
+        }
+        None => state.orchestrator.neo4j().get_language_stats().await?,
+    };
 
     let languages: Vec<LanguageStats> = lang_stats
         .into_iter()
@@ -506,11 +638,31 @@ pub async fn get_architecture(
         })
         .collect();
 
-    let key_files = state
-        .orchestrator
-        .neo4j()
-        .get_most_connected_files_detailed(10)
-        .await?;
+    // Aggregate key files
+    let key_files = match &project_ids {
+        Some(ids) => {
+            let mut all_files = Vec::new();
+            for pid in ids {
+                let files = state
+                    .orchestrator
+                    .neo4j()
+                    .get_most_connected_files_for_project(*pid, 10)
+                    .await?;
+                all_files.extend(files);
+            }
+            // Sort by dependents descending and take top 10
+            all_files.sort_by(|a, b| b.dependents.cmp(&a.dependents));
+            all_files.truncate(10);
+            all_files
+        }
+        None => {
+            state
+                .orchestrator
+                .neo4j()
+                .get_most_connected_files_detailed(10)
+                .await?
+        }
+    };
 
     let total_files: usize = languages.iter().map(|l| l.file_count).sum();
 
@@ -1247,6 +1399,172 @@ mod tests {
         assert_eq!(q.query, "test");
         assert_eq!(q.limit, None);
         assert_eq!(q.language, None);
+    }
+
+    #[test]
+    fn test_code_search_query_with_workspace_slug() {
+        let json = r#"{"query":"test","workspace_slug":"my-ws"}"#;
+        let q: CodeSearchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.query, "test");
+        assert_eq!(q.workspace_slug.as_deref(), Some("my-ws"));
+        assert!(q.project_slug.is_none());
+    }
+
+    #[test]
+    fn test_architecture_query_with_workspace_slug() {
+        let json = r#"{"workspace_slug":"my-ws"}"#;
+        let q: ArchitectureQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.workspace_slug.as_deref(), Some("my-ws"));
+        assert!(q.project_slug.is_none());
+    }
+
+    /// Build a test router with a workspace containing a project with seeded code
+    async fn test_app_with_workspace() -> axum::Router {
+        use crate::neo4j::models::{ProjectNode, WorkspaceNode};
+
+        let app_state = mock_app_state();
+
+        // Create workspace
+        let ws_id = uuid::Uuid::new_v4();
+        let workspace = WorkspaceNode {
+            id: ws_id,
+            name: "Test Workspace".to_string(),
+            slug: "test-ws".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata: serde_json::Value::Null,
+        };
+        app_state.neo4j.create_workspace(&workspace).await.unwrap();
+
+        // Create project and link to workspace
+        let proj_id = uuid::Uuid::new_v4();
+        let project = ProjectNode {
+            id: proj_id,
+            name: "Test Project".to_string(),
+            slug: "test-project".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+        };
+        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .neo4j
+            .add_project_to_workspace(ws_id, proj_id)
+            .await
+            .unwrap();
+
+        // Seed code document
+        let doc = CodeDocument {
+            id: "src/main.rs".to_string(),
+            path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            symbols: vec!["main".to_string()],
+            docstrings: "Entry point".to_string(),
+            signatures: vec!["fn main()".to_string()],
+            imports: vec![],
+            project_id: proj_id.to_string(),
+            project_slug: "test-project".to_string(),
+        };
+        app_state.meili.index_code(&doc).await.unwrap();
+
+        // Seed file for architecture
+        let file = FileNode {
+            path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(proj_id),
+        };
+        app_state.neo4j.upsert_file(&file).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        create_router(state)
+    }
+
+    #[tokio::test]
+    async fn test_search_code_with_workspace_slug_filter() {
+        let app = test_app_with_workspace().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/search?query=main&workspace_slug=test-ws",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let results = json.as_array().unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0]["document"]["path"], "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn test_search_code_workspace_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/search?query=main&workspace_slug=nonexistent",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_architecture_with_workspace_slug() {
+        let app = test_app_with_workspace().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/architecture?workspace_slug=test-ws"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_files"], 1);
+        let languages = json["languages"].as_array().unwrap();
+        assert_eq!(languages.len(), 1);
+        assert_eq!(languages[0]["language"], "rust");
+    }
+
+    #[tokio::test]
+    async fn test_architecture_workspace_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/architecture?workspace_slug=nonexistent",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ====================================================================

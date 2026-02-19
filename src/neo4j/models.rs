@@ -321,6 +321,9 @@ pub struct TaskWithPlan {
     pub plan_id: Uuid,
     /// Title of the parent plan
     pub plan_title: String,
+    /// Status of the parent plan (e.g. "draft", "in_progress", "completed")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_status: Option<String>,
 }
 
 /// A step within a task
