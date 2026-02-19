@@ -61,15 +61,26 @@ pub async fn serve_embedded(uri: Uri) -> impl IntoResponse {
     }
 }
 
-/// Build an HTTP response with the correct Content-Type for the given file path.
+/// Build an HTTP response with the correct Content-Type and Cache-Control for the given file path.
+///
+/// - `assets/*` (Vite content-hashed files): cached forever (immutable).
+/// - Everything else (`index.html`, SPA fallback): never cached — ensures version
+///   updates are picked up immediately by WKWebView/browsers.
 fn serve_file(path: &str, data: &[u8]) -> Response {
     let mime = mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string();
 
+    let cache_control = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache, no-store, must-revalidate"
+    };
+
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, cache_control)
         .body(Body::from(data.to_vec()))
         .unwrap()
 }
