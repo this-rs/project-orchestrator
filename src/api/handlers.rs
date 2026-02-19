@@ -1493,6 +1493,37 @@ pub async fn add_task_to_milestone(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Request body for linking a plan to a milestone
+#[derive(Deserialize)]
+pub struct LinkPlanToMilestoneRequest {
+    pub plan_id: Uuid,
+}
+
+/// Link a plan to a project milestone
+pub async fn link_plan_to_milestone(
+    State(state): State<OrchestratorState>,
+    Path(milestone_id): Path<Uuid>,
+    Json(req): Json<LinkPlanToMilestoneRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .link_plan_to_milestone(req.plan_id, milestone_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Unlink a plan from a project milestone
+pub async fn unlink_plan_from_milestone(
+    State(state): State<OrchestratorState>,
+    Path((milestone_id, plan_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .unlink_plan_from_milestone(plan_id, milestone_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Milestone details response
 #[derive(Serialize)]
 pub struct MilestoneDetailsResponse {

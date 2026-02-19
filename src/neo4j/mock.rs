@@ -63,9 +63,11 @@ pub struct MockGraphStore {
     pub release_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub release_commits: RwLock<HashMap<Uuid, Vec<String>>>,
     pub milestone_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+    pub milestone_plans: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub workspace_projects: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub workspace_ws_milestones: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub ws_milestone_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+    pub ws_milestone_plans: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub workspace_resources: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub workspace_components: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     #[allow(clippy::type_complexity)]
@@ -131,9 +133,11 @@ impl MockGraphStore {
             release_tasks: RwLock::new(HashMap::new()),
             release_commits: RwLock::new(HashMap::new()),
             milestone_tasks: RwLock::new(HashMap::new()),
+            milestone_plans: RwLock::new(HashMap::new()),
             workspace_projects: RwLock::new(HashMap::new()),
             workspace_ws_milestones: RwLock::new(HashMap::new()),
             ws_milestone_tasks: RwLock::new(HashMap::new()),
+            ws_milestone_plans: RwLock::new(HashMap::new()),
             workspace_resources: RwLock::new(HashMap::new()),
             workspace_components: RwLock::new(HashMap::new()),
             component_dependencies: RwLock::new(HashMap::new()),
@@ -665,6 +669,30 @@ impl GraphStore for MockGraphStore {
     ) -> Result<()> {
         if let Some(tasks) = self.ws_milestone_tasks.write().await.get_mut(&milestone_id) {
             tasks.retain(|t| *t != task_id);
+        }
+        Ok(())
+    }
+
+    async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        let mut map = self.ws_milestone_plans.write().await;
+        let plans = map.entry(milestone_id).or_default();
+        if !plans.contains(&plan_id) {
+            plans.push(plan_id);
+        }
+        Ok(())
+    }
+
+    async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        if let Some(plans) = self.ws_milestone_plans.write().await.get_mut(&milestone_id) {
+            plans.retain(|p| *p != plan_id);
         }
         Ok(())
     }
@@ -2965,6 +2993,22 @@ impl GraphStore for MockGraphStore {
             .entry(milestone_id)
             .or_default()
             .push(task_id);
+        Ok(())
+    }
+
+    async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
+        let mut map = self.milestone_plans.write().await;
+        let plans = map.entry(milestone_id).or_default();
+        if !plans.contains(&plan_id) {
+            plans.push(plan_id);
+        }
+        Ok(())
+    }
+
+    async fn unlink_plan_from_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
+        if let Some(plans) = self.milestone_plans.write().await.get_mut(&milestone_id) {
+            plans.retain(|p| *p != plan_id);
+        }
         Ok(())
     }
 

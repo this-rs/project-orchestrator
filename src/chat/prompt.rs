@@ -821,9 +821,17 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "add_task_to_milestone",
                 description: "Lier tâche → milestone",
             },
+            ToolRef {
+                name: "link_plan_to_milestone",
+                description: "Lier plan → milestone (relation directe TARGETS_MILESTONE)",
+            },
+            ToolRef {
+                name: "unlink_plan_from_milestone",
+                description: "Délier plan d'un milestone",
+            },
         ],
     },
-    // ── Workspace (33 tools) ─────────────────────────────────────────
+    // ── Workspace (35 tools) ─────────────────────────────────────────
     ToolGroup {
         name: "workspace",
         description: "Multi-projets, topologie, ressources partagées",
@@ -902,6 +910,14 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             ToolRef {
                 name: "add_task_to_workspace_milestone",
                 description: "Lier tâche → ws milestone",
+            },
+            ToolRef {
+                name: "link_plan_to_workspace_milestone",
+                description: "Lier plan → ws milestone (TARGETS_MILESTONE)",
+            },
+            ToolRef {
+                name: "unlink_plan_from_workspace_milestone",
+                description: "Délier plan d'un ws milestone",
             },
             ToolRef {
                 name: "get_workspace_milestone_progress",
@@ -2311,11 +2327,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_145_tools() {
+    fn test_tool_groups_cover_all_149_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 145,
-            "TOOL_GROUPS must cover exactly 145 unique tools (got {}). \
+            count, 149,
+            "TOOL_GROUPS must cover exactly 149 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

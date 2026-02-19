@@ -16,7 +16,7 @@ use crate::auth::middleware::require_auth;
 use axum::http::{header, Method};
 use axum::{
     middleware::from_fn_with_state,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use tower_http::cors::CorsLayer;
@@ -344,6 +344,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::add_task_to_milestone),
         )
         .route(
+            "/api/milestones/{milestone_id}/plans",
+            post(handlers::link_plan_to_milestone),
+        )
+        .route(
+            "/api/milestones/{milestone_id}/plans/{plan_id}",
+            delete(handlers::unlink_plan_from_milestone),
+        )
+        .route(
             "/api/milestones/{milestone_id}/progress",
             get(handlers::get_milestone_progress),
         )
@@ -553,6 +561,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/workspace-milestones/{id}/tasks",
             get(workspace_handlers::list_workspace_milestone_tasks)
                 .post(workspace_handlers::add_task_to_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}/plans",
+            post(workspace_handlers::link_plan_to_workspace_milestone),
+        )
+        .route(
+            "/api/workspace-milestones/{id}/plans/{plan_id}",
+            delete(workspace_handlers::unlink_plan_from_workspace_milestone),
         )
         .route(
             "/api/workspace-milestones/{id}/progress",

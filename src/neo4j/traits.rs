@@ -166,6 +166,20 @@ pub trait GraphStore: Send + Sync {
         task_id: Uuid,
     ) -> Result<()>;
 
+    /// Link a plan to a workspace milestone
+    async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()>;
+
+    /// Unlink a plan from a workspace milestone
+    async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()>;
+
     /// Get workspace milestone progress
     async fn get_workspace_milestone_progress(
         &self,
@@ -757,6 +771,12 @@ pub trait GraphStore: Send + Sync {
 
     /// Add a task to a milestone
     async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()>;
+
+    /// Link a plan to a project milestone
+    async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
+
+    /// Unlink a plan from a project milestone
+    async fn unlink_plan_from_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
 
     /// Get milestone details with tasks
     async fn get_milestone_details(

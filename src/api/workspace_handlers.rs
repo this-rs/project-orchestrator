@@ -867,6 +867,56 @@ pub async fn add_task_to_workspace_milestone(
     Ok(StatusCode::CREATED)
 }
 
+/// Request body for linking a plan to a workspace milestone
+#[derive(Deserialize)]
+pub struct AddPlanRequest {
+    pub plan_id: String,
+}
+
+/// Link a plan to a workspace milestone
+pub async fn link_plan_to_workspace_milestone(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+    Json(req): Json<AddPlanRequest>,
+) -> Result<StatusCode, AppError> {
+    let milestone_id: Uuid = id
+        .parse()
+        .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
+
+    let plan_id: Uuid = req
+        .plan_id
+        .parse()
+        .map_err(|_| AppError::BadRequest("Invalid plan ID".to_string()))?;
+
+    state
+        .orchestrator
+        .link_plan_to_workspace_milestone(plan_id, milestone_id)
+        .await?;
+
+    Ok(StatusCode::CREATED)
+}
+
+/// Unlink a plan from a workspace milestone
+pub async fn unlink_plan_from_workspace_milestone(
+    State(state): State<OrchestratorState>,
+    Path((id, plan_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let milestone_id: Uuid = id
+        .parse()
+        .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
+
+    let plan_id: Uuid = plan_id
+        .parse()
+        .map_err(|_| AppError::BadRequest("Invalid plan ID".to_string()))?;
+
+    state
+        .orchestrator
+        .unlink_plan_from_workspace_milestone(plan_id, milestone_id)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// List tasks linked to a workspace milestone (with plan info)
 pub async fn list_workspace_milestone_tasks(
     State(state): State<OrchestratorState>,

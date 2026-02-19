@@ -209,6 +209,24 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_plan_to_workspace_milestone(plan_id, milestone_id)
+            .await
+    }
+
+    async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.unlink_plan_from_workspace_milestone(plan_id, milestone_id)
+            .await
+    }
+
     async fn get_workspace_milestone_progress(
         &self,
         milestone_id: Uuid,
@@ -984,6 +1002,22 @@ impl GraphStore for Neo4jClient {
 
     async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> anyhow::Result<()> {
         self.add_task_to_milestone(milestone_id, task_id).await
+    }
+
+    async fn link_plan_to_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_plan_to_milestone(plan_id, milestone_id).await
+    }
+
+    async fn unlink_plan_from_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.unlink_plan_from_milestone(plan_id, milestone_id).await
     }
 
     async fn get_milestone_details(

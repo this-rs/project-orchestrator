@@ -116,6 +116,8 @@ impl ToolHandler {
             "delete_milestone" => self.delete_milestone(args).await,
             "get_milestone_progress" => self.get_milestone_progress(args).await,
             "add_task_to_milestone" => self.add_task_to_milestone(args).await,
+            "link_plan_to_milestone" => self.link_plan_to_milestone(args).await,
+            "unlink_plan_from_milestone" => self.unlink_plan_from_milestone(args).await,
 
             // Commits
             "create_commit" => self.create_commit(args).await,
@@ -194,6 +196,10 @@ impl ToolHandler {
             "update_workspace_milestone" => self.update_workspace_milestone(args).await,
             "delete_workspace_milestone" => self.delete_workspace_milestone(args).await,
             "add_task_to_workspace_milestone" => self.add_task_to_workspace_milestone(args).await,
+            "link_plan_to_workspace_milestone" => self.link_plan_to_workspace_milestone(args).await,
+            "unlink_plan_from_workspace_milestone" => {
+                self.unlink_plan_from_workspace_milestone(args).await
+            }
             "get_workspace_milestone_progress" => self.get_workspace_milestone_progress(args).await,
 
             // Resources
@@ -1408,6 +1414,26 @@ impl ToolHandler {
             .add_task_to_milestone(milestone_id, task_id)
             .await?;
         Ok(json!({"added": true}))
+    }
+
+    async fn link_plan_to_milestone(&self, args: Value) -> Result<Value> {
+        let plan_id = parse_uuid(&args, "plan_id")?;
+        let milestone_id = parse_uuid(&args, "milestone_id")?;
+
+        self.orchestrator
+            .link_plan_to_milestone(plan_id, milestone_id)
+            .await?;
+        Ok(json!({"linked": true}))
+    }
+
+    async fn unlink_plan_from_milestone(&self, args: Value) -> Result<Value> {
+        let plan_id = parse_uuid(&args, "plan_id")?;
+        let milestone_id = parse_uuid(&args, "milestone_id")?;
+
+        self.orchestrator
+            .unlink_plan_from_milestone(plan_id, milestone_id)
+            .await?;
+        Ok(json!({"unlinked": true}))
     }
 
     // ========================================================================
@@ -2924,6 +2950,28 @@ impl ToolHandler {
             .await?;
 
         Ok(json!({"added": true}))
+    }
+
+    async fn link_plan_to_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let plan_id = parse_uuid(&args, "plan_id")?;
+        let id = parse_uuid(&args, "id")?;
+
+        self.orchestrator
+            .link_plan_to_workspace_milestone(plan_id, id)
+            .await?;
+
+        Ok(json!({"linked": true}))
+    }
+
+    async fn unlink_plan_from_workspace_milestone(&self, args: Value) -> Result<Value> {
+        let plan_id = parse_uuid(&args, "plan_id")?;
+        let id = parse_uuid(&args, "id")?;
+
+        self.orchestrator
+            .unlink_plan_from_workspace_milestone(plan_id, id)
+            .await?;
+
+        Ok(json!({"unlinked": true}))
     }
 
     async fn get_workspace_milestone_progress(&self, args: Value) -> Result<Value> {
