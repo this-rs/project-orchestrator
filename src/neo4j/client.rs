@@ -3493,6 +3493,74 @@ impl Neo4jClient {
         Ok(communities)
     }
 
+    /// Get GDS analytics properties for a node (File by path, or Function by name).
+    pub async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>> {
+        let cypher = if node_type == "function" {
+            r#"
+            MATCH (n:Function {name: $id})
+            RETURN n.pagerank AS pagerank, n.betweenness AS betweenness,
+                   n.community_id AS community_id, n.community_label AS community_label
+            LIMIT 1
+            "#
+        } else {
+            r#"
+            MATCH (n:File {path: $id})
+            RETURN n.pagerank AS pagerank, n.betweenness AS betweenness,
+                   n.community_id AS community_id, n.community_label AS community_label
+            LIMIT 1
+            "#
+        };
+
+        let q = query(cypher).param("id", identifier);
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            Ok(Some(NodeAnalyticsRow {
+                pagerank: row.get::<f64>("pagerank").ok(),
+                betweenness: row.get::<f64>("betweenness").ok(),
+                community_id: row.get::<i64>("community_id").ok(),
+                community_label: row.get::<String>("community_label").ok(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get distinct community labels for a list of file paths.
+    pub async fn get_affected_communities(
+        &self,
+        file_paths: &[String],
+    ) -> Result<Vec<String>> {
+        if file_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let q = query(
+            r#"
+            MATCH (f:File)
+            WHERE f.path IN $paths AND f.community_label IS NOT NULL
+            RETURN DISTINCT f.community_label AS label
+            ORDER BY label
+            "#,
+        )
+        .param("paths", file_paths.to_vec());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut labels = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(label) = row.get::<String>("label") {
+                labels.push(label);
+            }
+        }
+
+        Ok(labels)
+    }
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     pub async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
         let q = query(

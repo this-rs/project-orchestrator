@@ -597,6 +597,21 @@ impl GraphStore for Neo4jClient {
         self.get_project_communities(project_id).await
     }
 
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> anyhow::Result<Option<NodeAnalyticsRow>> {
+        self.get_node_analytics(identifier, node_type).await
+    }
+
+    async fn get_affected_communities(
+        &self,
+        file_paths: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        self.get_affected_communities(file_paths).await
+    }
+
     async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {
         self.get_file_symbol_names(path).await
     }

@@ -741,6 +741,16 @@ pub struct ConnectedFileNode {
     pub community_id: Option<i64>,
 }
 
+/// GDS analytics properties for a single node (File or Function).
+/// Returned by `get_node_analytics()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeAnalyticsRow {
+    pub pagerank: Option<f64>,
+    pub betweenness: Option<f64>,
+    pub community_id: Option<i64>,
+    pub community_label: Option<String>,
+}
+
 /// A community row returned by `get_project_communities()`.
 /// Represents a Louvain community detected by graph analytics.
 #[derive(Debug, Clone, Serialize, Deserialize)]

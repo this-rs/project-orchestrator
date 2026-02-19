@@ -461,6 +461,21 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<CommunityRow>>;
 
+    /// Get GDS analytics properties for a node (File by path, or Function by name).
+    /// Returns None if the node doesn't exist or has no analytics properties.
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>>;
+
+    /// Get distinct community labels for a list of file paths.
+    /// Returns only non-null community_label values.
+    async fn get_affected_communities(
+        &self,
+        file_paths: &[String],
+    ) -> Result<Vec<String>>;
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
 

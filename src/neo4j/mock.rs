@@ -1865,6 +1865,50 @@ impl GraphStore for MockGraphStore {
         Ok(result)
     }
 
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>> {
+        if node_type == "function" {
+            let fa = self.function_analytics.read().await;
+            if let Some(analytics) = fa.get(identifier) {
+                return Ok(Some(NodeAnalyticsRow {
+                    pagerank: Some(analytics.pagerank),
+                    betweenness: Some(analytics.betweenness),
+                    community_id: Some(analytics.community_id as i64),
+                    community_label: None, // FunctionAnalyticsUpdate has no label
+                }));
+            }
+            Ok(None)
+        } else {
+            let fa = self.file_analytics.read().await;
+            if let Some(analytics) = fa.get(identifier) {
+                return Ok(Some(NodeAnalyticsRow {
+                    pagerank: Some(analytics.pagerank),
+                    betweenness: Some(analytics.betweenness),
+                    community_id: Some(analytics.community_id as i64),
+                    community_label: Some(analytics.community_label.clone()),
+                }));
+            }
+            Ok(None)
+        }
+    }
+
+    async fn get_affected_communities(
+        &self,
+        file_paths: &[String],
+    ) -> Result<Vec<String>> {
+        let fa = self.file_analytics.read().await;
+        let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for path in file_paths {
+            if let Some(analytics) = fa.get(path) {
+                labels.insert(analytics.community_label.clone());
+            }
+        }
+        Ok(labels.into_iter().collect())
+    }
+
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
         let functions = self.functions.read().await;
         let structs = self.structs_map.read().await;
