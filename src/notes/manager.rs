@@ -166,7 +166,9 @@ impl NoteManager {
         workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
-        self.neo4j.list_notes(project_id, workspace_slug, filters).await
+        self.neo4j
+            .list_notes(project_id, workspace_slug, filters)
+            .await
     }
 
     /// List notes for a specific project
@@ -1013,7 +1015,8 @@ mod tests {
             global_only: Some(true),
             ..Default::default()
         };
-        let (global_notes, global_total) = mgr.list_notes(None, None, &global_filters).await.unwrap();
+        let (global_notes, global_total) =
+            mgr.list_notes(None, None, &global_filters).await.unwrap();
         assert_eq!(global_total, 1);
         assert_eq!(global_notes.len(), 1);
         assert!(global_notes[0].project_id.is_none());
