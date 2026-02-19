@@ -1156,12 +1156,13 @@ impl Neo4jClient {
         }
     }
 
-    /// Get tasks linked to a workspace milestone
-    pub async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>> {
+    /// Get tasks linked to a workspace milestone (with plan info)
+    pub async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>> {
         let q = query(
             r#"
             MATCH (wm:WorkspaceMilestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)
-            RETURN t
+            OPTIONAL MATCH (p:Plan)-[:HAS_TASK]->(t)
+            RETURN t, p.id AS plan_id, COALESCE(p.title, '') AS plan_title
             ORDER BY t.priority DESC, t.created_at
             "#,
         )
@@ -1171,7 +1172,13 @@ impl Neo4jClient {
         let mut tasks = Vec::new();
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("t")?;
-            tasks.push(self.node_to_task(&node)?);
+            let plan_id_str: String = row.get("plan_id").unwrap_or_default();
+            let plan_title: String = row.get("plan_title").unwrap_or_default();
+            tasks.push(TaskWithPlan {
+                task: self.node_to_task(&node)?,
+                plan_id: plan_id_str.parse().unwrap_or_default(),
+                plan_title,
+            });
         }
         Ok(tasks)
     }
