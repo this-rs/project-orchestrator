@@ -1537,6 +1537,20 @@ impl GraphStore for Neo4jClient {
         self.get_top_entry_functions(project_id, limit).await
     }
 
+    async fn get_project_import_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_project_import_edges(project_id).await
+    }
+
+    async fn get_project_call_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_project_call_edges(project_id).await
+    }
+
     async fn health_check(&self) -> anyhow::Result<bool> {
         match self.execute("RETURN 1 AS ping").await {
             Ok(_) => Ok(true),

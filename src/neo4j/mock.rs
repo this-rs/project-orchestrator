@@ -4607,6 +4607,76 @@ impl GraphStore for MockGraphStore {
         Ok(sorted.into_iter().map(|(name, _)| name).collect())
     }
 
+    async fn get_project_import_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let ir = self.import_relationships.read().await;
+        let mut edges = Vec::new();
+
+        for (source, targets) in ir.iter() {
+            if project_paths.contains(source) {
+                for target in targets {
+                    if project_paths.contains(target) {
+                        edges.push((source.clone(), target.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn get_project_call_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+        let mut edges = Vec::new();
+
+        for (caller_id, callees) in cr.iter() {
+            // Check caller belongs to project and get its name
+            let caller_fn = match functions.get(caller_id) {
+                Some(f) if project_paths.contains(&f.file_path) => f,
+                _ => continue,
+            };
+            let caller_name = caller_fn.name.clone();
+            for callee_name in callees {
+                // Check callee belongs to project
+                let callee_in_project = functions
+                    .values()
+                    .any(|f| f.name == *callee_name && project_paths.contains(&f.file_path));
+                if callee_in_project {
+                    // Return simple names (matching the real Cypher: f1.name, f2.name)
+                    edges.push((caller_name.clone(), callee_name.clone()));
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
     async fn health_check(&self) -> anyhow::Result<bool> {
         Ok(true)
     }

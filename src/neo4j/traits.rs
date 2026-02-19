@@ -1179,6 +1179,19 @@ pub trait GraphStore: Send + Sync {
     async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>>;
 
     // ========================================================================
+    // Bulk graph extraction (for graph analytics)
+    // ========================================================================
+
+    /// Get all IMPORTS edges between files in a project as (source_path, target_path) pairs.
+    /// Single bulk query — used by the graph analytics engine for extraction.
+    async fn get_project_import_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Get all CALLS edges between functions in a project as (caller_id, callee_id) pairs.
+    /// Scoped to the same project (no cross-project calls).
+    /// Single bulk query — used by the graph analytics engine for extraction.
+    async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    // ========================================================================
     // Health check
     // ========================================================================
 

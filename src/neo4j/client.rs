@@ -8933,6 +8933,67 @@ impl Neo4jClient {
         Ok(functions)
     }
 
+    // ========================================================================
+    // Bulk graph extraction (for graph analytics)
+    // ========================================================================
+
+    /// Get all IMPORTS edges between files in a project as (source_path, target_path) pairs.
+    pub async fn get_project_import_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)-[:IMPORTS]->(f2:File)<-[:CONTAINS]-(p)
+            RETURN f1.path AS source, f2.path AS target
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(source), Ok(target)) = (
+                row.get::<String>("source"),
+                row.get::<String>("target"),
+            ) {
+                edges.push((source, target));
+            }
+        }
+
+        Ok(edges)
+    }
+
+    /// Get all CALLS edges between functions in a project as (caller_id, callee_id) pairs.
+    /// Scoped to the same project (no cross-project calls).
+    pub async fn get_project_call_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(:File)-[:CONTAINS]->(f1:Function)-[:CALLS]->(f2:Function)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+            RETURN f1.name AS source, f2.name AS target
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(source), Ok(target)) = (
+                row.get::<String>("source"),
+                row.get::<String>("target"),
+            ) {
+                edges.push((source, target));
+            }
+        }
+
+        Ok(edges)
+    }
+
     fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {
         Ok(FeatureGraphNode {
             id: node.get::<String>("id")?.parse()?,
