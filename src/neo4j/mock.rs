@@ -3192,7 +3192,7 @@ impl GraphStore for MockGraphStore {
                 if let Some(pid) = project_id {
                     // Filter tasks whose plan belongs to this project
                     if let Some(plan_id) = task_plan_map.get(&t.id) {
-                        if !pp.get(&pid).map_or(false, |plans| plans.contains(plan_id)) {
+                        if !pp.get(&pid).is_some_and(|plans| plans.contains(plan_id)) {
                             return false;
                         }
                     } else {
