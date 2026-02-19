@@ -456,10 +456,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Vec<ConnectedFileNode>>;
 
     /// Get distinct communities for a project (from graph analytics Louvain clustering)
-    async fn get_project_communities(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<CommunityRow>>;
+    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>>;
 
     /// Get GDS analytics properties for a node (File by path, or Function by name).
     /// Returns None if the node doesn't exist or has no analytics properties.
@@ -471,10 +468,7 @@ pub trait GraphStore: Send + Sync {
 
     /// Get distinct community labels for a list of file paths.
     /// Returns only non-null community_label values.
-    async fn get_affected_communities(
-        &self,
-        file_paths: &[String],
-    ) -> Result<Vec<String>>;
+    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>>;
 
     /// Get a structural health report: god functions, orphan files, coupling metrics.
     async fn get_code_health_report(
@@ -484,10 +478,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<crate::neo4j::models::CodeHealthReport>;
 
     /// Detect circular dependencies between files (import cycles).
-    async fn get_circular_dependencies(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<Vec<String>>>;
+    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>>;
 
     /// Get GDS metrics for a specific node (file or function) in a project.
     async fn get_node_gds_metrics(
@@ -498,10 +489,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Option<NodeGdsMetrics>>;
 
     /// Get statistical percentiles for GDS metrics across all nodes in a project.
-    async fn get_project_percentiles(
-        &self,
-        project_id: Uuid,
-    ) -> Result<ProjectPercentiles>;
+    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles>;
 
     /// Get top N files by betweenness centrality (bridge files).
     async fn get_top_bridges_by_betweenness(
@@ -1214,6 +1202,7 @@ pub trait GraphStore: Send + Sync {
     /// Automatically build a feature graph from a function entry point.
     /// Uses the call graph (callers + callees) to discover related functions and files,
     /// creates a FeatureGraph, and populates it with the discovered entities.
+    #[allow(clippy::too_many_arguments)]
     async fn auto_build_feature_graph(
         &self,
         name: &str,

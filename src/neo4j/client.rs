@@ -3451,10 +3451,7 @@ impl Neo4jClient {
 
     /// Get distinct communities for a project (from graph analytics Louvain clustering).
     /// Returns communities sorted by file_count descending.
-    pub async fn get_project_communities(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<CommunityRow>> {
+    pub async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>> {
         let q = query(
             r#"
             MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
@@ -3478,9 +3475,7 @@ impl Neo4jClient {
                 .get::<String>("label")
                 .unwrap_or_else(|_| format!("Community {}", community_id));
             let file_count = row.get::<i64>("file_count").unwrap_or(0) as usize;
-            let key_files: Vec<String> = row
-                .get::<Vec<String>>("key_files")
-                .unwrap_or_default();
+            let key_files: Vec<String> = row.get::<Vec<String>>("key_files").unwrap_or_default();
 
             communities.push(CommunityRow {
                 community_id,
@@ -3531,10 +3526,7 @@ impl Neo4jClient {
     }
 
     /// Get distinct community labels for a list of file paths.
-    pub async fn get_affected_communities(
-        &self,
-        file_paths: &[String],
-    ) -> Result<Vec<String>> {
+    pub async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>> {
         if file_paths.is_empty() {
             return Ok(vec![]);
         }
@@ -3657,10 +3649,7 @@ impl Neo4jClient {
     }
 
     /// Detect circular dependencies between files (import cycles).
-    pub async fn get_circular_dependencies(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<Vec<String>>> {
+    pub async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>> {
         let q = query(
             r#"
             MATCH path = (f:File)-[:IMPORTS*2..5]->(f)
@@ -3751,10 +3740,7 @@ impl Neo4jClient {
     }
 
     /// Get statistical percentiles for GDS metrics across all files+functions in a project.
-    pub async fn get_project_percentiles(
-        &self,
-        project_id: Uuid,
-    ) -> Result<ProjectPercentiles> {
+    pub async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles> {
         let q = query(
             r#"
             MATCH (p:Project {id: $pid})-[:CONTAINS]->(n)
@@ -8869,6 +8855,7 @@ impl Neo4jClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn auto_build_feature_graph(
         &self,
         name: &str,
@@ -9428,10 +9415,9 @@ impl Neo4jClient {
         let mut edges = Vec::new();
 
         while let Some(row) = result.next().await? {
-            if let (Ok(source), Ok(target)) = (
-                row.get::<String>("source"),
-                row.get::<String>("target"),
-            ) {
+            if let (Ok(source), Ok(target)) =
+                (row.get::<String>("source"), row.get::<String>("target"))
+            {
                 edges.push((source, target));
             }
         }
@@ -9441,10 +9427,7 @@ impl Neo4jClient {
 
     /// Get all CALLS edges between functions in a project as (caller_id, callee_id) pairs.
     /// Scoped to the same project (no cross-project calls).
-    pub async fn get_project_call_edges(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(String, String)>> {
+    pub async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>> {
         let q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(:File)-[:CONTAINS]->(f1:Function)-[:CALLS]->(f2:Function)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
@@ -9457,10 +9440,9 @@ impl Neo4jClient {
         let mut edges = Vec::new();
 
         while let Some(row) = result.next().await? {
-            if let (Ok(source), Ok(target)) = (
-                row.get::<String>("source"),
-                row.get::<String>("target"),
-            ) {
+            if let (Ok(source), Ok(target)) =
+                (row.get::<String>("source"), row.get::<String>("target"))
+            {
                 edges.push((source, target));
             }
         }

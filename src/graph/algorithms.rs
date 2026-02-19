@@ -120,8 +120,7 @@ pub fn betweenness_centrality(graph: &CodeGraph) -> HashMap<String, f64> {
     }
 
     let scores = rustworkx_core::centrality::betweenness_centrality(
-        g,
-        false, // include_endpoints
+        g, false, // include_endpoints
         true,  // normalized
         200,   // parallel_threshold (sequential for small graphs)
     );
@@ -223,7 +222,10 @@ pub fn louvain_communities(
             let m2 = 2.0 * total_weight;
 
             // Try removing node from current community
-            let sigma_tot_current = comm_total_strength.get(&current_comm).copied().unwrap_or(0.0);
+            let sigma_tot_current = comm_total_strength
+                .get(&current_comm)
+                .copied()
+                .unwrap_or(0.0);
             let remove_cost =
                 w_in_current / m2 - resolution * ki * (sigma_tot_current - ki) / (m2 * m2);
 
@@ -235,10 +237,11 @@ pub fn louvain_communities(
                 if target_comm == current_comm {
                     continue;
                 }
-                let sigma_tot_target =
-                    comm_total_strength.get(&target_comm).copied().unwrap_or(0.0);
-                let insert_cost = w_to_target / m2
-                    - resolution * ki * sigma_tot_target / (m2 * m2);
+                let sigma_tot_target = comm_total_strength
+                    .get(&target_comm)
+                    .copied()
+                    .unwrap_or(0.0);
+                let insert_cost = w_to_target / m2 - resolution * ki * sigma_tot_target / (m2 * m2);
                 let gain = insert_cost - remove_cost;
 
                 if gain > best_gain {
@@ -350,11 +353,7 @@ fn generate_community_label(members: &[String]) -> String {
     if common_depth > 0 {
         let prefix = first_parts[..common_depth].join("/");
         // Return the last meaningful directory component
-        prefix
-            .rsplit('/')
-            .next()
-            .unwrap_or(&prefix)
-            .to_string()
+        prefix.rsplit('/').next().unwrap_or(&prefix).to_string()
     } else {
         format!("group_{}", members.len())
     }
@@ -454,9 +453,7 @@ pub fn clustering_coefficient(graph: &CodeGraph) -> HashMap<String, f64> {
 /// Identify weakly connected components (treating edges as undirected).
 ///
 /// Returns `(node_to_component, component_infos)`.
-pub fn connected_components(
-    graph: &CodeGraph,
-) -> (HashMap<String, u32>, Vec<ComponentInfo>) {
+pub fn connected_components(graph: &CodeGraph) -> (HashMap<String, u32>, Vec<ComponentInfo>) {
     let g = &graph.graph;
     let n = g.node_count();
     if n == 0 {
@@ -585,10 +582,7 @@ pub fn compute_health(
     } else {
         0.0
     };
-    let max_coupling = clustering_vals
-        .iter()
-        .copied()
-        .fold(0.0f64, f64::max);
+    let max_coupling = clustering_vals.iter().copied().fold(0.0f64, f64::max);
 
     CodeHealthReport {
         god_functions,
@@ -622,8 +616,7 @@ pub fn compute_all(graph: &CodeGraph, config: &AnalyticsConfig) -> GraphAnalytic
     let bc = betweenness_centrality(graph);
 
     // 3. Louvain communities
-    let (comm_map, communities, modularity) =
-        louvain_communities(graph, config.louvain_resolution);
+    let (comm_map, communities, modularity) = louvain_communities(graph, config.louvain_resolution);
 
     // 4. Clustering coefficient
     let cc = clustering_coefficient(graph);
@@ -856,9 +849,30 @@ mod tests {
                 project_id: None,
             });
         }
-        g.add_edge("A", "B", CodeEdge { edge_type: CodeEdgeType::Calls, weight: 1.0 });
-        g.add_edge("B", "C", CodeEdge { edge_type: CodeEdgeType::Calls, weight: 1.0 });
-        g.add_edge("C", "A", CodeEdge { edge_type: CodeEdgeType::Calls, weight: 1.0 });
+        g.add_edge(
+            "A",
+            "B",
+            CodeEdge {
+                edge_type: CodeEdgeType::Calls,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "B",
+            "C",
+            CodeEdge {
+                edge_type: CodeEdgeType::Calls,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "C",
+            "A",
+            CodeEdge {
+                edge_type: CodeEdgeType::Calls,
+                weight: 1.0,
+            },
+        );
         g
     }
 
@@ -875,8 +889,22 @@ mod tests {
                 project_id: None,
             });
         }
-        g.add_edge("c1_a", "c1_b", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("c1_b", "c1_c", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge(
+            "c1_a",
+            "c1_b",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "c1_b",
+            "c1_c",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
 
         // Component 2: 2 nodes
         for name in &["c2_x", "c2_y"] {
@@ -888,7 +916,14 @@ mod tests {
                 project_id: None,
             });
         }
-        g.add_edge("c2_x", "c2_y", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge(
+            "c2_x",
+            "c2_y",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
 
         g
     }
@@ -1052,7 +1087,10 @@ mod tests {
         }
 
         // The two communities should be different
-        assert_ne!(a_comm, b_comm, "The two cliques should be in different communities");
+        assert_ne!(
+            a_comm, b_comm,
+            "The two cliques should be in different communities"
+        );
     }
 
     #[test]
@@ -1142,7 +1180,7 @@ mod tests {
         assert!(analytics.modularity >= 0.0);
 
         // Every node should have metrics
-        for (_, m) in &analytics.metrics {
+        for m in analytics.metrics.values() {
             assert!(m.pagerank >= 0.0);
             assert!(m.betweenness >= 0.0);
             assert!(m.clustering_coefficient >= 0.0);
@@ -1199,7 +1237,11 @@ mod tests {
             }
         }
 
-        assert!(edge_count >= 1900, "Expected ~2000 edges, got {}", edge_count);
+        assert!(
+            edge_count >= 1900,
+            "Expected ~2000 edges, got {}",
+            edge_count
+        );
 
         let config = AnalyticsConfig::default();
         let start = std::time::Instant::now();
@@ -1220,7 +1262,9 @@ mod tests {
 
         eprintln!(
             "Benchmark: {} nodes, {} edges → {}ms",
-            analytics.node_count, analytics.edge_count, elapsed.as_millis()
+            analytics.node_count,
+            analytics.edge_count,
+            elapsed.as_millis()
         );
     }
 
@@ -1283,7 +1327,10 @@ mod tests {
         g.add_edge(
             "src/a.rs",
             "src/b.rs",
-            CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 },
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
         );
         // Orphan file
         g.add_node(CodeNode {
@@ -1298,7 +1345,10 @@ mod tests {
         let analytics = compute_all(&g, &config);
 
         assert!(
-            analytics.health.orphan_files.contains(&"src/orphan.rs".to_string()),
+            analytics
+                .health
+                .orphan_files
+                .contains(&"src/orphan.rs".to_string()),
             "src/orphan.rs should be detected as orphan, got: {:?}",
             analytics.health.orphan_files
         );

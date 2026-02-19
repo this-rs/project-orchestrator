@@ -526,52 +526,47 @@ pub async fn analyze_impact(
         .unwrap_or_default();
 
     // Compute risk level using composite formula when GDS data is available
-    let (risk_level, betweenness_score, risk_formula) =
-        if let Some(ref analytics) = node_analytics {
-            if let Some(betweenness) = analytics.betweenness {
-                // Composite risk formula:
-                // betweenness_score = clamp(betweenness * 3.0, 0, 1)
-                // community_spread = affected_communities / total (use 5 as reasonable estimate)
-                // degree_score = clamp(caller_count / 20.0, 0, 1)
-                // risk = betweenness_score * 0.5 + community_spread * 0.3 + degree_score * 0.2
-                let bs = (betweenness * 3.0).clamp(0.0, 1.0);
-                let total_communities = 5.0_f64; // reasonable default
-                let cs = (affected_communities.len() as f64 / total_communities).clamp(0.0, 1.0);
-                let ds = (caller_count as f64 / 20.0).clamp(0.0, 1.0);
-                let risk_score = bs * 0.5 + cs * 0.3 + ds * 0.2;
+    let (risk_level, betweenness_score, risk_formula) = if let Some(ref analytics) = node_analytics
+    {
+        if let Some(betweenness) = analytics.betweenness {
+            // Composite risk formula:
+            // betweenness_score = clamp(betweenness * 3.0, 0, 1)
+            // community_spread = affected_communities / total (use 5 as reasonable estimate)
+            // degree_score = clamp(caller_count / 20.0, 0, 1)
+            // risk = betweenness_score * 0.5 + community_spread * 0.3 + degree_score * 0.2
+            let bs = (betweenness * 3.0).clamp(0.0, 1.0);
+            let total_communities = 5.0_f64; // reasonable default
+            let cs = (affected_communities.len() as f64 / total_communities).clamp(0.0, 1.0);
+            let ds = (caller_count as f64 / 20.0).clamp(0.0, 1.0);
+            let risk_score = bs * 0.5 + cs * 0.3 + ds * 0.2;
 
-                let level = if risk_score > 0.7 {
-                    "high"
-                } else if risk_score > 0.3 {
-                    "medium"
-                } else {
-                    "low"
-                };
-
-                let formula = format!(
-                    "betweenness={:.2} ({}), {}/{} communities affected, {} callers → score={:.2}",
-                    betweenness,
-                    if betweenness > 0.23 { "high bridge" } else if betweenness > 0.1 { "moderate bridge" } else { "low bridge" },
-                    affected_communities.len(),
-                    total_communities as usize,
-                    caller_count,
-                    risk_score,
-                );
-
-                (level.to_string(), Some(betweenness), Some(formula))
+            let level = if risk_score > 0.7 {
+                "high"
+            } else if risk_score > 0.3 {
+                "medium"
             } else {
-                // Analytics exist but no betweenness → fallback
-                let level = if transitively_affected.len() > 10 || caller_count > 10 {
-                    "high"
-                } else if transitively_affected.len() > 3 || caller_count > 3 {
-                    "medium"
+                "low"
+            };
+
+            let formula = format!(
+                "betweenness={:.2} ({}), {}/{} communities affected, {} callers → score={:.2}",
+                betweenness,
+                if betweenness > 0.23 {
+                    "high bridge"
+                } else if betweenness > 0.1 {
+                    "moderate bridge"
                 } else {
-                    "low"
-                };
-                (level.to_string(), None, None)
-            }
+                    "low bridge"
+                },
+                affected_communities.len(),
+                total_communities as usize,
+                caller_count,
+                risk_score,
+            );
+
+            (level.to_string(), Some(betweenness), Some(formula))
         } else {
-            // No GDS analytics at all → fallback to legacy threshold logic
+            // Analytics exist but no betweenness → fallback
             let level = if transitively_affected.len() > 10 || caller_count > 10 {
                 "high"
             } else if transitively_affected.len() > 3 || caller_count > 3 {
@@ -580,7 +575,18 @@ pub async fn analyze_impact(
                 "low"
             };
             (level.to_string(), None, None)
+        }
+    } else {
+        // No GDS analytics at all → fallback to legacy threshold logic
+        let level = if transitively_affected.len() > 10 || caller_count > 10 {
+            "high"
+        } else if transitively_affected.len() > 3 || caller_count > 3 {
+            "medium"
+        } else {
+            "low"
         };
+        (level.to_string(), None, None)
+    };
 
     let suggestion = format!(
         "Run tests in: {}. Consider reviewing: {}",
@@ -1228,7 +1234,9 @@ pub async fn get_code_communities(
         .neo4j()
         .get_project_by_slug(&params.project_slug)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", params.project_slug)))?;
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
 
     let min_size = params.min_size.unwrap_or(2);
     let communities = state
@@ -1288,7 +1296,9 @@ pub async fn get_code_health(
         .neo4j()
         .get_project_by_slug(&params.project_slug)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", params.project_slug)))?;
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
 
     let threshold = params.god_function_threshold.unwrap_or(10);
     let report = state
@@ -2160,7 +2170,11 @@ mod tests {
 
         // Verify communities are present
         let communities = json["communities"].as_array().unwrap();
-        assert_eq!(communities.len(), 2, "Should have 2 communities: Core and Utilities");
+        assert_eq!(
+            communities.len(),
+            2,
+            "Should have 2 communities: Core and Utilities"
+        );
 
         let core = communities
             .iter()
@@ -2195,7 +2209,7 @@ mod tests {
         // communities should be absent (skip_serializing_if = Vec::is_empty)
         assert!(
             json.get("communities").is_none()
-                || json["communities"].as_array().map_or(true, |c| c.is_empty()),
+                || json["communities"].as_array().is_none_or(|c| c.is_empty()),
             "No communities should be returned when GDS not computed"
         );
     }
@@ -2227,7 +2241,13 @@ mod tests {
 
         // file_a: high degree (3 dependents) but LOW pagerank
         // file_b: low degree (1 dependent) but HIGH pagerank
-        for path in &["src/file_a.rs", "src/file_b.rs", "src/dep1.rs", "src/dep2.rs", "src/dep3.rs"] {
+        for path in &[
+            "src/file_a.rs",
+            "src/file_b.rs",
+            "src/dep1.rs",
+            "src/dep2.rs",
+            "src/dep3.rs",
+        ] {
             let file = FileNode {
                 path: path.to_string(),
                 language: "rust".to_string(),
@@ -2239,18 +2259,30 @@ mod tests {
         }
 
         // file_a has 3 dependents (high degree)
-        graph.create_import_relationship("src/dep1.rs", "src/file_a.rs", "file_a").await.unwrap();
-        graph.create_import_relationship("src/dep2.rs", "src/file_a.rs", "file_a").await.unwrap();
-        graph.create_import_relationship("src/dep3.rs", "src/file_a.rs", "file_a").await.unwrap();
+        graph
+            .create_import_relationship("src/dep1.rs", "src/file_a.rs", "file_a")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/dep2.rs", "src/file_a.rs", "file_a")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/dep3.rs", "src/file_a.rs", "file_a")
+            .await
+            .unwrap();
 
         // file_b has 1 dependent (low degree)
-        graph.create_import_relationship("src/dep1.rs", "src/file_b.rs", "file_b").await.unwrap();
+        graph
+            .create_import_relationship("src/dep1.rs", "src/file_b.rs", "file_b")
+            .await
+            .unwrap();
 
         // But file_b has HIGHER pagerank than file_a
         let analytics = vec![
             FileAnalyticsUpdate {
                 path: "src/file_a.rs".to_string(),
-                pagerank: 0.05,  // LOW pagerank despite high degree
+                pagerank: 0.05, // LOW pagerank despite high degree
                 betweenness: 0.1,
                 community_id: 0,
                 community_label: "Main".to_string(),
@@ -2259,7 +2291,7 @@ mod tests {
             },
             FileAnalyticsUpdate {
                 path: "src/file_b.rs".to_string(),
-                pagerank: 0.15,  // HIGH pagerank despite low degree
+                pagerank: 0.15, // HIGH pagerank despite low degree
                 betweenness: 0.3,
                 community_id: 0,
                 community_label: "Main".to_string(),
@@ -2345,12 +2377,12 @@ mod tests {
 
         // Barbell graph: cluster A ←→ bridge ←→ cluster B
         let all_files = [
-            "src/bridge.rs",   // bridge between clusters
-            "src/a1.rs",       // cluster A
-            "src/a2.rs",       // cluster A
-            "src/b1.rs",       // cluster B
-            "src/b2.rs",       // cluster B
-            "src/leaf.rs",     // isolated leaf
+            "src/bridge.rs", // bridge between clusters
+            "src/a1.rs",     // cluster A
+            "src/a2.rs",     // cluster A
+            "src/b1.rs",     // cluster B
+            "src/b2.rs",     // cluster B
+            "src/leaf.rs",   // isolated leaf
         ];
         for path in &all_files {
             let file = FileNode {
@@ -2361,17 +2393,34 @@ mod tests {
                 project_id: Some(project_id),
             };
             graph.upsert_file(&file).await.unwrap();
-            graph.project_files.write().await
-                .entry(project_id).or_default().push(path.to_string());
+            graph
+                .project_files
+                .write()
+                .await
+                .entry(project_id)
+                .or_default()
+                .push(path.to_string());
         }
 
         // Import relationships: bridge connects both clusters
         // a1 → bridge, a2 → bridge (cluster A depends on bridge)
         // bridge → b1, bridge → b2 (bridge depends on cluster B)
-        graph.create_import_relationship("src/a1.rs", "src/bridge.rs", "bridge").await.unwrap();
-        graph.create_import_relationship("src/a2.rs", "src/bridge.rs", "bridge").await.unwrap();
-        graph.create_import_relationship("src/bridge.rs", "src/b1.rs", "b1").await.unwrap();
-        graph.create_import_relationship("src/bridge.rs", "src/b2.rs", "b2").await.unwrap();
+        graph
+            .create_import_relationship("src/a1.rs", "src/bridge.rs", "bridge")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/a2.rs", "src/bridge.rs", "bridge")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/bridge.rs", "src/b1.rs", "b1")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/bridge.rs", "src/b2.rs", "b2")
+            .await
+            .unwrap();
 
         // leaf has no connections
         // (leaf.rs has no import relationships)
@@ -2563,7 +2612,9 @@ mod tests {
         // affected_communities should be empty (no analytics)
         assert!(
             json.get("affected_communities").is_none()
-                || json["affected_communities"].as_array().map_or(true, |c| c.is_empty()),
+                || json["affected_communities"]
+                    .as_array()
+                    .is_none_or(|c| c.is_empty()),
             "affected_communities should be empty without GDS data"
         );
         // Legacy risk level still works
