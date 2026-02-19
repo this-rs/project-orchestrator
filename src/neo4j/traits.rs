@@ -455,6 +455,12 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ConnectedFileNode>>;
 
+    /// Get distinct communities for a project (from graph analytics Louvain clustering)
+    async fn get_project_communities(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<CommunityRow>>;
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
 

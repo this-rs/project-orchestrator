@@ -536,6 +536,22 @@ pub struct ArchitectureOverview {
     pub modules: Vec<ModuleInfo>,
     pub key_files: Vec<ConnectedFileNode>,
     pub orphan_files: Vec<String>,
+    /// Detected code communities from graph analytics (empty if analytics not yet computed)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub communities: Vec<CommunityOverview>,
+}
+
+/// Summary of a detected code community (Louvain clustering)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityOverview {
+    /// Numeric community identifier
+    pub id: i64,
+    /// Human-readable community label
+    pub label: String,
+    /// Number of files in this community
+    pub file_count: usize,
+    /// Top files in this community (by pagerank)
+    pub key_files: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -650,8 +666,14 @@ pub async fn get_architecture(
                     .await?;
                 all_files.extend(files);
             }
-            // Sort by dependents descending and take top 10
-            all_files.sort_by(|a, b| b.dependents.cmp(&a.dependents));
+            // Sort by pagerank (descending) with fallback to dependents
+            all_files.sort_by(|a, b| {
+                let pr_a = a.pagerank.unwrap_or(0.0);
+                let pr_b = b.pagerank.unwrap_or(0.0);
+                pr_b.partial_cmp(&pr_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.dependents.cmp(&a.dependents))
+            });
             all_files.truncate(10);
             all_files
         }
@@ -664,6 +686,31 @@ pub async fn get_architecture(
         }
     };
 
+    // Aggregate community overviews from graph analytics
+    let communities: Vec<CommunityOverview> = match &project_ids {
+        Some(ids) => {
+            let mut all_rows = Vec::new();
+            for pid in ids {
+                let comms = state
+                    .orchestrator
+                    .neo4j()
+                    .get_project_communities(*pid)
+                    .await?;
+                all_rows.extend(comms);
+            }
+            all_rows
+                .into_iter()
+                .map(|r| CommunityOverview {
+                    id: r.community_id,
+                    label: r.community_label,
+                    file_count: r.file_count,
+                    key_files: r.key_files,
+                })
+                .collect()
+        }
+        None => vec![],
+    };
+
     let total_files: usize = languages.iter().map(|l| l.file_count).sum();
 
     Ok(Json(ArchitectureOverview {
@@ -672,6 +719,7 @@ pub async fn get_architecture(
         modules: vec![],
         key_files,
         orphan_files: vec![],
+        communities,
     }))
 }
 
@@ -1743,5 +1791,315 @@ mod tests {
                 path
             );
         }
+    }
+
+    // ====================================================================
+    // GET /api/code/architecture — GDS enrichment tests (Task 3.1)
+    // ====================================================================
+
+    /// Build a test router with files that have GDS analytics scores
+    async fn test_app_with_analytics() -> (axum::Router, uuid::Uuid) {
+        use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+        let project_id = uuid::Uuid::new_v4();
+
+        // Create project
+        let project = ProjectNode {
+            id: project_id,
+            name: "analytics-proj".to_string(),
+            slug: "analytics-proj".to_string(),
+            description: None,
+            root_path: "/tmp/analytics".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: Some(chrono::Utc::now()),
+        };
+        graph.create_project(&project).await.unwrap();
+
+        // Seed files with project_id
+        let file_paths = [
+            "src/main.rs",
+            "src/handler.rs",
+            "src/utils.rs",
+            "src/config.rs",
+        ];
+        for path in &file_paths {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project_id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Seed import relationships
+        // main.rs imports handler.rs and config.rs
+        graph
+            .create_import_relationship("src/main.rs", "src/handler.rs", "handler")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/main.rs", "src/config.rs", "config")
+            .await
+            .unwrap();
+        // handler.rs imports utils.rs
+        graph
+            .create_import_relationship("src/handler.rs", "src/utils.rs", "utils")
+            .await
+            .unwrap();
+
+        // Seed GDS analytics: main.rs has HIGH pagerank, utils.rs has LOW pagerank
+        let analytics = vec![
+            FileAnalyticsUpdate {
+                path: "src/main.rs".to_string(),
+                pagerank: 0.15,
+                betweenness: 0.30,
+                community_id: 0,
+                community_label: "Core".to_string(),
+                clustering_coefficient: 0.5,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/handler.rs".to_string(),
+                pagerank: 0.10,
+                betweenness: 0.20,
+                community_id: 0,
+                community_label: "Core".to_string(),
+                clustering_coefficient: 0.3,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/utils.rs".to_string(),
+                pagerank: 0.05,
+                betweenness: 0.05,
+                community_id: 1,
+                community_label: "Utilities".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/config.rs".to_string(),
+                pagerank: 0.03,
+                betweenness: 0.01,
+                community_id: 1,
+                community_label: "Utilities".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+        ];
+        graph.batch_update_file_analytics(&analytics).await.unwrap();
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        (create_router(state), project_id)
+    }
+
+    #[tokio::test]
+    async fn test_architecture_with_gds_scores() {
+        // Test 1: Files with GDS analytics return pagerank, community fields
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/architecture?project_slug=analytics-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let key_files = json["key_files"].as_array().unwrap();
+        assert!(!key_files.is_empty());
+
+        // The first file should be src/main.rs (highest pagerank = 0.15)
+        assert_eq!(key_files[0]["path"], "src/main.rs");
+        assert!(key_files[0]["pagerank"].as_f64().unwrap() > 0.14);
+        assert!(key_files[0]["betweenness"].as_f64().unwrap() > 0.0);
+        assert_eq!(key_files[0]["community_label"], "Core");
+
+        // Verify communities are present
+        let communities = json["communities"].as_array().unwrap();
+        assert_eq!(communities.len(), 2, "Should have 2 communities: Core and Utilities");
+
+        let core = communities
+            .iter()
+            .find(|c| c["label"] == "Core")
+            .expect("Core community should exist");
+        assert_eq!(core["file_count"], 2);
+
+        let utils = communities
+            .iter()
+            .find(|c| c["label"] == "Utilities")
+            .expect("Utilities community should exist");
+        assert_eq!(utils["file_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_architecture_without_gds_scores_fallback() {
+        // Test 2: Files WITHOUT GDS analytics → same response as before (fallback to degree)
+        let app = test_app_with_code().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/architecture"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // key_files should still work (may be empty if no import relationships seeded)
+        assert!(json["key_files"].is_array());
+        // communities should be absent (skip_serializing_if = Vec::is_empty)
+        assert!(
+            json.get("communities").is_none()
+                || json["communities"].as_array().map_or(true, |c| c.is_empty()),
+            "No communities should be returned when GDS not computed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_architecture_pagerank_ordering_overrides_degree() {
+        // Test 3: File with high pagerank but lower degree should rank higher
+        // than file with low pagerank but higher degree
+        use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+        let project_id = uuid::Uuid::new_v4();
+
+        let project = ProjectNode {
+            id: project_id,
+            name: "ordering-proj".to_string(),
+            slug: "ordering-proj".to_string(),
+            description: None,
+            root_path: "/tmp/ordering".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: Some(chrono::Utc::now()),
+        };
+        graph.create_project(&project).await.unwrap();
+
+        // file_a: high degree (3 dependents) but LOW pagerank
+        // file_b: low degree (1 dependent) but HIGH pagerank
+        for path in &["src/file_a.rs", "src/file_b.rs", "src/dep1.rs", "src/dep2.rs", "src/dep3.rs"] {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project_id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // file_a has 3 dependents (high degree)
+        graph.create_import_relationship("src/dep1.rs", "src/file_a.rs", "file_a").await.unwrap();
+        graph.create_import_relationship("src/dep2.rs", "src/file_a.rs", "file_a").await.unwrap();
+        graph.create_import_relationship("src/dep3.rs", "src/file_a.rs", "file_a").await.unwrap();
+
+        // file_b has 1 dependent (low degree)
+        graph.create_import_relationship("src/dep1.rs", "src/file_b.rs", "file_b").await.unwrap();
+
+        // But file_b has HIGHER pagerank than file_a
+        let analytics = vec![
+            FileAnalyticsUpdate {
+                path: "src/file_a.rs".to_string(),
+                pagerank: 0.05,  // LOW pagerank despite high degree
+                betweenness: 0.1,
+                community_id: 0,
+                community_label: "Main".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/file_b.rs".to_string(),
+                pagerank: 0.15,  // HIGH pagerank despite low degree
+                betweenness: 0.3,
+                community_id: 0,
+                community_label: "Main".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+        ];
+        graph.batch_update_file_analytics(&analytics).await.unwrap();
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/architecture?project_slug=ordering-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let key_files = json["key_files"].as_array().unwrap();
+        // file_b (pagerank 0.15) should be BEFORE file_a (pagerank 0.05)
+        // even though file_a has more dependents
+        let first_path = key_files[0]["path"].as_str().unwrap();
+        assert_eq!(
+            first_path, "src/file_b.rs",
+            "File with higher pagerank should rank first, regardless of degree"
+        );
     }
 }

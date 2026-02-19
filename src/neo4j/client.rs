@@ -3377,8 +3377,10 @@ impl Neo4jClient {
             OPTIONAL MATCH (f)-[:IMPORTS]->(imported:File)
             OPTIONAL MATCH (dependent:File)-[:IMPORTS]->(f)
             WITH f, count(DISTINCT imported) AS imports, count(DISTINCT dependent) AS dependents
-            RETURN f.path AS path, imports, dependents, imports + dependents AS connections
-            ORDER BY connections DESC
+            RETURN f.path AS path, imports, dependents, imports + dependents AS connections,
+                   f.pagerank AS pagerank, f.betweenness AS betweenness,
+                   f.community_label AS community_label, f.community_id AS community_id
+            ORDER BY COALESCE(f.pagerank, 0) DESC, connections DESC
             LIMIT $limit
             "#,
         )
@@ -3393,6 +3395,10 @@ impl Neo4jClient {
                     path,
                     imports: row.get("imports").unwrap_or(0),
                     dependents: row.get("dependents").unwrap_or(0),
+                    pagerank: row.get::<f64>("pagerank").ok(),
+                    betweenness: row.get::<f64>("betweenness").ok(),
+                    community_label: row.get::<String>("community_label").ok(),
+                    community_id: row.get::<i64>("community_id").ok(),
                 });
             }
         }
@@ -3413,8 +3419,10 @@ impl Neo4jClient {
             OPTIONAL MATCH (f)-[:IMPORTS]->(imported:File)
             OPTIONAL MATCH (dependent:File)-[:IMPORTS]->(f)
             WITH f, count(DISTINCT imported) AS imports, count(DISTINCT dependent) AS dependents
-            RETURN f.path AS path, imports, dependents, imports + dependents AS connections
-            ORDER BY connections DESC
+            RETURN f.path AS path, imports, dependents, imports + dependents AS connections,
+                   f.pagerank AS pagerank, f.betweenness AS betweenness,
+                   f.community_label AS community_label, f.community_id AS community_id
+            ORDER BY COALESCE(f.pagerank, 0) DESC, connections DESC
             LIMIT $limit
             "#,
         )
@@ -3430,11 +3438,59 @@ impl Neo4jClient {
                     path,
                     imports: row.get("imports").unwrap_or(0),
                     dependents: row.get("dependents").unwrap_or(0),
+                    pagerank: row.get::<f64>("pagerank").ok(),
+                    betweenness: row.get::<f64>("betweenness").ok(),
+                    community_label: row.get::<String>("community_label").ok(),
+                    community_id: row.get::<i64>("community_id").ok(),
                 });
             }
         }
 
         Ok(files)
+    }
+
+    /// Get distinct communities for a project (from graph analytics Louvain clustering).
+    /// Returns communities sorted by file_count descending.
+    pub async fn get_project_communities(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<CommunityRow>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE f.community_id IS NOT NULL
+            WITH f.community_id AS cid, f.community_label AS label,
+                 count(f) AS file_count,
+                 collect(f.path) AS all_paths
+            ORDER BY file_count DESC
+            RETURN cid, label, file_count,
+                   [p IN all_paths | p][..3] AS key_files
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut communities = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let community_id = row.get::<i64>("cid").unwrap_or(0);
+            let community_label = row
+                .get::<String>("label")
+                .unwrap_or_else(|_| format!("Community {}", community_id));
+            let file_count = row.get::<i64>("file_count").unwrap_or(0) as usize;
+            let key_files: Vec<String> = row
+                .get::<Vec<String>>("key_files")
+                .unwrap_or_default();
+
+            communities.push(CommunityRow {
+                community_id,
+                community_label,
+                file_count,
+                key_files,
+            });
+        }
+
+        Ok(communities)
     }
 
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)

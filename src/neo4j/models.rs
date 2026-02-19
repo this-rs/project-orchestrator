@@ -721,12 +721,38 @@ pub struct FileSymbolNamesNode {
     pub enums: Vec<String>,
 }
 
-/// A file with connection counts (imports + dependents)
+/// A file with connection counts (imports + dependents) and optional GDS analytics scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectedFileNode {
     pub path: String,
     pub imports: i64,
     pub dependents: i64,
+    /// PageRank score from graph analytics (higher = more structurally important)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pagerank: Option<f64>,
+    /// Betweenness centrality score (higher = more bridge-like)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub betweenness: Option<f64>,
+    /// Human-readable community label (e.g., "MCP Tool Pipeline")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_label: Option<String>,
+    /// Numeric community identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_id: Option<i64>,
+}
+
+/// A community row returned by `get_project_communities()`.
+/// Represents a Louvain community detected by graph analytics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityRow {
+    /// Numeric community identifier
+    pub community_id: i64,
+    /// Human-readable community label
+    pub community_label: String,
+    /// Number of files in this community
+    pub file_count: usize,
+    /// Top files in this community (by pagerank, up to 3)
+    pub key_files: Vec<String>,
 }
 
 /// A feature graph — a named subgraph capturing all code entities related to a feature.

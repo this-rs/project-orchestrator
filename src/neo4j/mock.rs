@@ -1714,6 +1714,7 @@ impl GraphStore for MockGraphStore {
         limit: usize,
     ) -> Result<Vec<ConnectedFileNode>> {
         let ir = self.import_relationships.read().await;
+        let fa = self.file_analytics.read().await;
         let mut import_counts: HashMap<String, i64> = HashMap::new();
         let mut dependent_counts: HashMap<String, i64> = HashMap::new();
 
@@ -1732,14 +1733,28 @@ impl GraphStore for MockGraphStore {
 
         let mut result: Vec<ConnectedFileNode> = all_files
             .into_iter()
-            .map(|path| ConnectedFileNode {
-                imports: *import_counts.get(&path).unwrap_or(&0),
-                dependents: *dependent_counts.get(&path).unwrap_or(&0),
-                path,
+            .map(|path| {
+                let analytics = fa.get(&path);
+                ConnectedFileNode {
+                    imports: *import_counts.get(&path).unwrap_or(&0),
+                    dependents: *dependent_counts.get(&path).unwrap_or(&0),
+                    pagerank: analytics.map(|a| a.pagerank),
+                    betweenness: analytics.map(|a| a.betweenness),
+                    community_label: analytics.map(|a| a.community_label.clone()),
+                    community_id: analytics.map(|a| a.community_id as i64),
+                    path,
+                }
             })
             .collect();
 
-        result.sort_by(|a, b| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)));
+        // Sort by pagerank (descending) with fallback to degree
+        result.sort_by(|a, b| {
+            let pr_a = a.pagerank.unwrap_or(0.0);
+            let pr_b = b.pagerank.unwrap_or(0.0);
+            pr_b.partial_cmp(&pr_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)))
+        });
         result.truncate(limit);
         Ok(result)
     }
@@ -1757,6 +1772,7 @@ impl GraphStore for MockGraphStore {
             .collect();
 
         let ir = self.import_relationships.read().await;
+        let fa = self.file_analytics.read().await;
         let mut import_counts: HashMap<String, i64> = HashMap::new();
         let mut dependent_counts: HashMap<String, i64> = HashMap::new();
 
@@ -1780,15 +1796,72 @@ impl GraphStore for MockGraphStore {
 
         let mut result: Vec<ConnectedFileNode> = all_files
             .into_iter()
-            .map(|path| ConnectedFileNode {
-                imports: *import_counts.get(&path).unwrap_or(&0),
-                dependents: *dependent_counts.get(&path).unwrap_or(&0),
-                path,
+            .map(|path| {
+                let analytics = fa.get(&path);
+                ConnectedFileNode {
+                    imports: *import_counts.get(&path).unwrap_or(&0),
+                    dependents: *dependent_counts.get(&path).unwrap_or(&0),
+                    pagerank: analytics.map(|a| a.pagerank),
+                    betweenness: analytics.map(|a| a.betweenness),
+                    community_label: analytics.map(|a| a.community_label.clone()),
+                    community_id: analytics.map(|a| a.community_id as i64),
+                    path,
+                }
             })
             .collect();
 
-        result.sort_by(|a, b| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)));
+        // Sort by pagerank (descending) with fallback to degree
+        result.sort_by(|a, b| {
+            let pr_a = a.pagerank.unwrap_or(0.0);
+            let pr_b = b.pagerank.unwrap_or(0.0);
+            pr_b.partial_cmp(&pr_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)))
+        });
         result.truncate(limit);
+        Ok(result)
+    }
+
+    async fn get_project_communities(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<CommunityRow>> {
+        let files = self.files.read().await;
+        let fa = self.file_analytics.read().await;
+
+        // Collect files belonging to this project that have analytics
+        let project_paths: Vec<String> = files
+            .values()
+            .filter(|f| f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+
+        // Group by community_id
+        let mut communities: HashMap<u32, (String, Vec<String>)> = HashMap::new();
+        for path in &project_paths {
+            if let Some(analytics) = fa.get(path) {
+                let entry = communities
+                    .entry(analytics.community_id)
+                    .or_insert_with(|| (analytics.community_label.clone(), Vec::new()));
+                entry.1.push(path.clone());
+            }
+        }
+
+        // Build result sorted by file_count descending
+        let mut result: Vec<CommunityRow> = communities
+            .into_iter()
+            .map(|(cid, (label, paths))| {
+                let key_files: Vec<String> = paths.iter().take(3).cloned().collect();
+                CommunityRow {
+                    community_id: cid as i64,
+                    community_label: label,
+                    file_count: paths.len(),
+                    key_files,
+                }
+            })
+            .collect();
+
+        result.sort_by(|a, b| b.file_count.cmp(&a.file_count));
         Ok(result)
     }
 
