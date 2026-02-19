@@ -24,14 +24,19 @@ pub struct CodeSearchQuery {
     pub limit: Option<usize>,
     /// Filter by language (rust, typescript, python, go)
     pub language: Option<String>,
-    /// Filter by project slug
+    /// Filter by project slug (takes precedence over workspace_slug)
     pub project_slug: Option<String>,
+    /// Filter by workspace slug (searches all projects in the workspace)
+    pub workspace_slug: Option<String>,
 }
 
 /// Search code semantically across the codebase
 ///
 /// Returns `SearchHit<CodeDocument>` directly so the frontend gets
 /// the `{ document, score }` shape it expects.
+///
+/// When `workspace_slug` is provided (and `project_slug` is not), searches all
+/// projects in the workspace, merges results by score, and truncates to `limit`.
 pub async fn search_code(
     State(state): State<OrchestratorState>,
     Query(params): Query<CodeSearchQuery>,
@@ -39,14 +44,76 @@ pub async fn search_code(
     Json<Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>>,
     AppError,
 > {
+    let limit = params.limit.unwrap_or(10);
+
+    // If project_slug is given, use it directly (backward compat)
+    if params.project_slug.is_some() {
+        let hits = state
+            .orchestrator
+            .meili()
+            .search_code_with_scores(
+                &params.query,
+                limit,
+                params.language.as_deref(),
+                params.project_slug.as_deref(),
+                None,
+            )
+            .await?;
+        return Ok(Json(hits));
+    }
+
+    // If workspace_slug is given, resolve to project slugs and merge results
+    if let Some(ref ws_slug) = params.workspace_slug {
+        let workspace = state
+            .orchestrator
+            .neo4j()
+            .get_workspace_by_slug(ws_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Workspace not found: {}", ws_slug)))?;
+
+        let projects = state
+            .orchestrator
+            .neo4j()
+            .list_workspace_projects(workspace.id)
+            .await?;
+
+        let mut all_hits = Vec::new();
+        for project in &projects {
+            let hits = state
+                .orchestrator
+                .meili()
+                .search_code_with_scores(
+                    &params.query,
+                    limit,
+                    params.language.as_deref(),
+                    Some(&project.slug),
+                    None,
+                )
+                .await
+                .unwrap_or_default();
+            all_hits.extend(hits);
+        }
+
+        // Sort by score descending and truncate to limit
+        all_hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_hits.truncate(limit);
+
+        return Ok(Json(all_hits));
+    }
+
+    // No filter — global search
     let hits = state
         .orchestrator
         .meili()
         .search_code_with_scores(
             &params.query,
-            params.limit.unwrap_or(10),
+            limit,
             params.language.as_deref(),
-            params.project_slug.as_deref(),
+            None,
             None,
         )
         .await?;
@@ -494,37 +561,77 @@ pub struct ModuleInfo {
 
 #[derive(Deserialize)]
 pub struct ArchitectureQuery {
+    /// Filter by project slug (takes precedence over workspace_slug)
     pub project_slug: Option<String>,
+    /// Filter by workspace slug (aggregates architecture of all workspace projects)
+    pub workspace_slug: Option<String>,
 }
 
 /// Get high-level architecture overview
+///
+/// When `workspace_slug` is provided (and `project_slug` is not), aggregates
+/// language stats and key files across all projects in the workspace.
 pub async fn get_architecture(
     State(state): State<OrchestratorState>,
     Query(params): Query<ArchitectureQuery>,
 ) -> Result<Json<ArchitectureOverview>, AppError> {
-    // Resolve optional project_slug → project_id
-    let project_id = if let Some(ref slug) = params.project_slug {
-        Some(
-            state
-                .orchestrator
-                .neo4j()
-                .get_project_by_slug(slug)
-                .await?
-                .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?
-                .id,
-        )
+    // Resolve project_ids: single project, workspace projects, or global
+    let project_ids: Option<Vec<uuid::Uuid>> = if let Some(ref slug) = params.project_slug {
+        // Single project filter (backward compat)
+        let project = state
+            .orchestrator
+            .neo4j()
+            .get_project_by_slug(slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+        Some(vec![project.id])
+    } else if let Some(ref ws_slug) = params.workspace_slug {
+        // Workspace filter: resolve to all project IDs
+        let workspace = state
+            .orchestrator
+            .neo4j()
+            .get_workspace_by_slug(ws_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Workspace not found: {}", ws_slug)))?;
+        let projects = state
+            .orchestrator
+            .neo4j()
+            .list_workspace_projects(workspace.id)
+            .await?;
+        Some(projects.into_iter().map(|p| p.id).collect())
     } else {
         None
     };
 
-    let lang_stats = if let Some(pid) = project_id {
-        state
-            .orchestrator
-            .neo4j()
-            .get_language_stats_for_project(pid)
-            .await?
-    } else {
-        state.orchestrator.neo4j().get_language_stats().await?
+    // Aggregate language stats
+    let lang_stats = match &project_ids {
+        Some(ids) => {
+            let mut all_stats = Vec::new();
+            for pid in ids {
+                let stats = state
+                    .orchestrator
+                    .neo4j()
+                    .get_language_stats_for_project(*pid)
+                    .await?;
+                all_stats.extend(stats);
+            }
+            // Merge stats by language
+            let mut merged: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for s in all_stats {
+                *merged.entry(s.language).or_default() += s.file_count;
+            }
+            merged
+                .into_iter()
+                .map(
+                    |(language, file_count)| crate::neo4j::models::LanguageStatsNode {
+                        language,
+                        file_count,
+                    },
+                )
+                .collect::<Vec<_>>()
+        }
+        None => state.orchestrator.neo4j().get_language_stats().await?,
     };
 
     let languages: Vec<LanguageStats> = lang_stats
@@ -537,18 +644,30 @@ pub async fn get_architecture(
         })
         .collect();
 
-    let key_files = if let Some(pid) = project_id {
-        state
-            .orchestrator
-            .neo4j()
-            .get_most_connected_files_for_project(pid, 10)
-            .await?
-    } else {
-        state
-            .orchestrator
-            .neo4j()
-            .get_most_connected_files_detailed(10)
-            .await?
+    // Aggregate key files
+    let key_files = match &project_ids {
+        Some(ids) => {
+            let mut all_files = Vec::new();
+            for pid in ids {
+                let files = state
+                    .orchestrator
+                    .neo4j()
+                    .get_most_connected_files_for_project(*pid, 10)
+                    .await?;
+                all_files.extend(files);
+            }
+            // Sort by dependents descending and take top 10
+            all_files.sort_by(|a, b| b.dependents.cmp(&a.dependents));
+            all_files.truncate(10);
+            all_files
+        }
+        None => {
+            state
+                .orchestrator
+                .neo4j()
+                .get_most_connected_files_detailed(10)
+                .await?
+        }
     };
 
     let total_files: usize = languages.iter().map(|l| l.file_count).sum();
