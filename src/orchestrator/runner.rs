@@ -3,6 +3,7 @@
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
+use crate::graph::{AnalyticsConfig, AnalyticsEngine, GraphAnalyticsEngine};
 use crate::neo4j::models::*;
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
@@ -51,6 +52,7 @@ pub struct Orchestrator {
     note_manager: Arc<NoteManager>,
     note_lifecycle: Arc<NoteLifecycleManager>,
     planner: Arc<super::ImplementationPlanner>,
+    analytics: Arc<dyn AnalyticsEngine>,
     event_bus: Option<Arc<HybridEmitter>>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
 }
@@ -77,6 +79,10 @@ impl Orchestrator {
             plan_manager.clone(),
             note_manager.clone(),
         ));
+        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
+            state.neo4j.clone(),
+            AnalyticsConfig::default(),
+        ));
 
         Ok(Self {
             state,
@@ -86,6 +92,7 @@ impl Orchestrator {
             note_manager,
             note_lifecycle,
             planner,
+            analytics,
             event_bus: None,
             event_emitter: None,
         })
@@ -125,6 +132,10 @@ impl Orchestrator {
             plan_manager.clone(),
             note_manager.clone(),
         ));
+        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
+            state.neo4j.clone(),
+            AnalyticsConfig::default(),
+        ));
 
         Ok(Self {
             state,
@@ -134,6 +145,7 @@ impl Orchestrator {
             note_manager,
             note_lifecycle,
             planner,
+            analytics,
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
         })
@@ -174,6 +186,10 @@ impl Orchestrator {
             plan_manager.clone(),
             note_manager.clone(),
         ));
+        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
+            state.neo4j.clone(),
+            AnalyticsConfig::default(),
+        ));
 
         Ok(Self {
             state,
@@ -183,6 +199,7 @@ impl Orchestrator {
             note_manager,
             note_lifecycle,
             planner,
+            analytics,
             event_bus: None,
             event_emitter: Some(emitter),
         })
@@ -655,6 +672,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// Get the implementation planner
     pub fn planner(&self) -> &Arc<super::ImplementationPlanner> {
         &self.planner
+    }
+
+    /// Get the graph analytics engine
+    pub fn analytics(&self) -> &Arc<dyn AnalyticsEngine> {
+        &self.analytics
     }
 
     // ========================================================================
