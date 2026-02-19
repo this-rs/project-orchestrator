@@ -1122,6 +1122,45 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Link a plan to a workspace milestone
+    pub async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $plan_id})
+            MATCH (wm:WorkspaceMilestone {id: $milestone_id})
+            MERGE (p)-[:TARGETS_MILESTONE]->(wm)
+            "#,
+        )
+        .param("plan_id", plan_id.to_string())
+        .param("milestone_id", milestone_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Unlink a plan from a workspace milestone
+    pub async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $plan_id})-[r:TARGETS_MILESTONE]->(wm:WorkspaceMilestone {id: $milestone_id})
+            DELETE r
+            "#,
+        )
+        .param("plan_id", plan_id.to_string())
+        .param("milestone_id", milestone_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Get workspace milestone progress
     pub async fn get_workspace_milestone_progress(
         &self,
@@ -5787,6 +5826,41 @@ impl Neo4jClient {
         )
         .param("milestone_id", milestone_id.to_string())
         .param("task_id", task_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Link a plan to a project milestone
+    pub async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $plan_id})
+            MATCH (m:Milestone {id: $milestone_id})
+            MERGE (p)-[:TARGETS_MILESTONE]->(m)
+            "#,
+        )
+        .param("plan_id", plan_id.to_string())
+        .param("milestone_id", milestone_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Unlink a plan from a project milestone
+    pub async fn unlink_plan_from_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Plan {id: $plan_id})-[r:TARGETS_MILESTONE]->(m:Milestone {id: $milestone_id})
+            DELETE r
+            "#,
+        )
+        .param("plan_id", plan_id.to_string())
+        .param("milestone_id", milestone_id.to_string());
 
         self.graph.run(q).await?;
         Ok(())

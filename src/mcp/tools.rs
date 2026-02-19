@@ -793,6 +793,31 @@ fn milestone_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["milestone_id".to_string(), "task_id".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "link_plan_to_milestone".to_string(),
+            description: "Link a plan to a project milestone (TARGETS_MILESTONE relationship)"
+                .to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "milestone_id": {"type": "string", "description": "Milestone UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "milestone_id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "unlink_plan_from_milestone".to_string(),
+            description: "Unlink a plan from a project milestone".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "milestone_id": {"type": "string", "description": "Milestone UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "milestone_id".to_string()]),
+            },
+        },
     ]
 }
 
@@ -1661,6 +1686,30 @@ fn workspace_tools() -> Vec<ToolDefinition> {
             },
         },
         ToolDefinition {
+            name: "link_plan_to_workspace_milestone".to_string(),
+            description: "Link a plan to a workspace milestone (TARGETS_MILESTONE relationship)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "id": {"type": "string", "description": "Workspace milestone UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "id".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "unlink_plan_from_workspace_milestone".to_string(),
+            description: "Unlink a plan from a workspace milestone".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "plan_id": {"type": "string", "description": "Plan UUID"},
+                    "id": {"type": "string", "description": "Workspace milestone UUID"}
+                })),
+                required: Some(vec!["plan_id".to_string(), "id".to_string()]),
+            },
+        },
+        ToolDefinition {
             name: "get_workspace_milestone_progress".to_string(),
             description: "Get completion progress for a workspace milestone".to_string(),
             input_schema: InputSchema {
@@ -2084,7 +2133,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 145, "Expected 145 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 149, "Expected 149 tools, got {}", tools.len());
     }
 
     #[test]
@@ -2112,8 +2161,8 @@ mod tests {
         let tools = workspace_tools();
         assert_eq!(
             tools.len(),
-            32,
-            "Expected 32 workspace tools, got {}",
+            34,
+            "Expected 34 workspace tools, got {}",
             tools.len()
         );
     }
@@ -2134,13 +2183,15 @@ mod tests {
         assert!(names.contains(&"add_project_to_workspace"));
         assert!(names.contains(&"remove_project_from_workspace"));
 
-        // Workspace milestones (7)
+        // Workspace milestones (9)
         assert!(names.contains(&"list_workspace_milestones"));
         assert!(names.contains(&"create_workspace_milestone"));
         assert!(names.contains(&"get_workspace_milestone"));
         assert!(names.contains(&"update_workspace_milestone"));
         assert!(names.contains(&"delete_workspace_milestone"));
         assert!(names.contains(&"add_task_to_workspace_milestone"));
+        assert!(names.contains(&"link_plan_to_workspace_milestone"));
+        assert!(names.contains(&"unlink_plan_from_workspace_milestone"));
         assert!(names.contains(&"get_workspace_milestone_progress"));
 
         // Resources (5)

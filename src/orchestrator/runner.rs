@@ -1440,6 +1440,42 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Link a plan to a project milestone and emit event
+    pub async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
+        self.neo4j()
+            .link_plan_to_milestone(plan_id, milestone_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Milestone,
+                CrudAction::Linked,
+                milestone_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"plan_id": plan_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Unlink a plan from a project milestone and emit event
+    pub async fn unlink_plan_from_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .unlink_plan_from_milestone(plan_id, milestone_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Milestone,
+                CrudAction::Unlinked,
+                milestone_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"plan_id": plan_id.to_string()})),
+        );
+        Ok(())
+    }
+
     // --- Workspaces ---
 
     /// Create a workspace and emit event
@@ -1592,6 +1628,46 @@ impl Orchestrator {
                 milestone_id.to_string(),
             )
             .with_payload(serde_json::json!({"task_id": task_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Link a plan to a workspace milestone and emit event
+    pub async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .link_plan_to_workspace_milestone(plan_id, milestone_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::WorkspaceMilestone,
+                CrudAction::Linked,
+                milestone_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"plan_id": plan_id.to_string()})),
+        );
+        Ok(())
+    }
+
+    /// Unlink a plan from a workspace milestone and emit event
+    pub async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        self.neo4j()
+            .unlink_plan_from_workspace_milestone(plan_id, milestone_id)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::WorkspaceMilestone,
+                CrudAction::Unlinked,
+                milestone_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"plan_id": plan_id.to_string()})),
         );
         Ok(())
     }
@@ -2099,6 +2175,28 @@ mod tests {
         assert_eq!(ev.action, CrudAction::Linked);
     }
 
+    #[tokio::test]
+    async fn test_link_plan_to_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_plan_to_milestone(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+        assert_eq!(ev.entity_type, EventEntityType::Milestone);
+    }
+
+    #[tokio::test]
+    async fn test_unlink_plan_from_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.unlink_plan_from_milestone(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+        assert_eq!(ev.entity_type, EventEntityType::Milestone);
+    }
+
     // ── Workspaces ───────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2201,6 +2299,28 @@ mod tests {
             .unwrap();
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.action, CrudAction::Linked);
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.link_plan_to_workspace_milestone(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Linked);
+        assert_eq!(ev.entity_type, EventEntityType::WorkspaceMilestone);
+    }
+
+    #[tokio::test]
+    async fn test_unlink_plan_from_workspace_milestone_emits_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        orch.unlink_plan_from_workspace_milestone(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Unlinked);
+        assert_eq!(ev.entity_type, EventEntityType::WorkspaceMilestone);
     }
 
     // ── Resources ────────────────────────────────────────────────────
