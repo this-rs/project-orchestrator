@@ -3818,6 +3818,8 @@ impl ToolHandler {
                     .collect()
             });
 
+        let filter_community = args.get("filter_community").and_then(|v| v.as_bool());
+
         let detail = self
             .neo4j()
             .auto_build_feature_graph(
@@ -3827,6 +3829,7 @@ impl ToolHandler {
                 entry_function,
                 depth,
                 include_relations.as_deref(),
+                filter_community,
             )
             .await?;
 

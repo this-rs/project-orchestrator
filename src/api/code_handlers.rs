@@ -1046,6 +1046,7 @@ pub struct AutoBuildBody {
     pub entry_function: String,
     pub depth: Option<u32>,
     pub include_relations: Option<Vec<String>>,
+    pub filter_community: Option<bool>,
 }
 
 /// POST /api/feature-graphs
@@ -1182,6 +1183,7 @@ pub async fn auto_build_feature_graph(
             &body.entry_function,
             depth,
             body.include_relations.as_deref(),
+            body.filter_community,
         )
         .await?;
     let entities: Vec<serde_json::Value> = detail

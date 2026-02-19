@@ -1535,6 +1535,7 @@ impl GraphStore for Neo4jClient {
         entry_function: &str,
         depth: u32,
         include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
     ) -> anyhow::Result<FeatureGraphDetail> {
         self.auto_build_feature_graph(
             name,
@@ -1543,6 +1544,7 @@ impl GraphStore for Neo4jClient {
             entry_function,
             depth,
             include_relations,
+            filter_community,
         )
         .await
     }

@@ -2082,7 +2082,8 @@ fn chat_tools() -> Vec<ToolDefinition> {
                     "project_id": {"type": "string", "description": "Project UUID"},
                     "entry_function": {"type": "string", "description": "Function name to start traversal from"},
                     "depth": {"type": "integer", "description": "Traversal depth (1-5, default 2)"},
-                    "include_relations": {"type": "array", "items": {"type": "string"}, "description": "Relation types to traverse (default: all). Options: calls, implements_trait, implements_for, imports"}
+                    "include_relations": {"type": "array", "items": {"type": "string"}, "description": "Relation types to traverse (default: all). Options: calls, implements_trait, implements_for, imports"},
+                    "filter_community": {"type": "boolean", "description": "Filter out transitive functions from different communities (default: true). Set to false to include all traversed functions."}
                 })),
                 required: Some(vec![
                     "name".to_string(),

@@ -1188,6 +1188,7 @@ pub trait GraphStore: Send + Sync {
         entry_function: &str,
         depth: u32,
         include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
     ) -> Result<FeatureGraphDetail>;
 
     /// Refresh an auto-built feature graph by re-running the BFS with the

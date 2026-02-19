@@ -4274,6 +4274,7 @@ impl GraphStore for MockGraphStore {
         entry_function: &str,
         depth: u32,
         include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
     ) -> Result<FeatureGraphDetail> {
         let should_include = |rel: &str| -> bool {
             match &include_relations {
@@ -4281,6 +4282,7 @@ impl GraphStore for MockGraphStore {
                 Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
             }
         };
+        let filter_community = filter_community.unwrap_or(true);
         let depth = depth.clamp(1, 5);
 
         // Collect callees from the mock call_relationships
@@ -4288,14 +4290,21 @@ impl GraphStore for MockGraphStore {
         let mut all_functions = std::collections::HashSet::new();
         all_functions.insert(entry_function.to_string());
 
+        // Track direct (depth=1) connections for community filtering
+        let mut direct_connections: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         // Simple BFS traversal for callees
         let mut queue: Vec<String> = vec![entry_function.to_string()];
-        for _ in 0..depth {
+        for current_depth in 0..depth {
             let mut next_queue = Vec::new();
             for func in &queue {
                 // Check direct name match
                 if let Some(callees) = cr.get(func) {
                     for callee in callees {
+                        if current_depth == 0 {
+                            direct_connections.insert(callee.clone());
+                        }
                         if all_functions.insert(callee.clone()) {
                             next_queue.push(callee.clone());
                         }
@@ -4305,6 +4314,9 @@ impl GraphStore for MockGraphStore {
                 for (caller_id, callees) in cr.iter() {
                     if caller_id.ends_with(&format!("::{}", func)) {
                         for callee in callees {
+                            if current_depth == 0 {
+                                direct_connections.insert(callee.clone());
+                            }
                             if all_functions.insert(callee.clone()) {
                                 next_queue.push(callee.clone());
                             }
@@ -4315,13 +4327,33 @@ impl GraphStore for MockGraphStore {
             queue = next_queue;
         }
 
-        // Collect callers
+        // Collect callers (all are direct connections)
         for (caller, callees) in cr.iter() {
             if callees.contains(&entry_function.to_string()) {
                 all_functions.insert(caller.clone());
+                direct_connections.insert(caller.clone());
             }
         }
         drop(cr);
+
+        // Community-based filtering
+        if filter_community {
+            let fa = self.function_analytics.read().await;
+            let entry_community = fa.get(entry_function).map(|a| a.community_id as i64);
+
+            if let Some(entry_cid) = entry_community {
+                all_functions.retain(|fname| {
+                    fname == entry_function
+                        || direct_connections.contains(fname)
+                        || fa
+                            .get(fname)
+                            .map(|a| a.community_id as i64)
+                            .map(|c| c == entry_cid)
+                            .unwrap_or(true) // no analytics → keep
+                });
+            }
+            drop(fa);
+        }
 
         if all_functions.len() <= 1 {
             // Only entry function found — check it even exists in functions
@@ -5949,7 +5981,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-fg", None, pid, "handle_request", 2, None)
+            .auto_build_feature_graph("test-fg", None, pid, "handle_request", 2, None, None)
             .await
             .unwrap();
 
@@ -6022,7 +6054,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-imports", None, pid, "process", 2, None)
+            .auto_build_feature_graph("test-imports", None, pid, "process", 2, None, None)
             .await
             .unwrap();
 
@@ -6078,7 +6110,7 @@ mod tests {
 
         // Build feature graph for project A
         let detail = store
-            .auto_build_feature_graph("test-no-cross", None, pid_a, "shared_func", 2, None)
+            .auto_build_feature_graph("test-no-cross", None, pid_a, "shared_func", 2, None, None)
             .await
             .unwrap();
 
@@ -6144,7 +6176,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2, None)
+            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2, None, None)
             .await
             .unwrap();
 
@@ -6307,6 +6339,298 @@ mod tests {
     }
 
     // ========================================================================
+    // Feature Graph — community filtering tests (Task 3.5)
+    // ========================================================================
+
+    /// Helper: set up a chain entry → F2 → F3 with communities, for community filtering tests.
+    /// Returns (store, project_id).
+    async fn setup_community_chain() -> (MockGraphStore, Uuid) {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed project files
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(vec![
+                "src/entry.rs".to_string(),
+                "src/direct.rs".to_string(),
+                "src/transitive.rs".to_string(),
+            ]);
+
+        // Create functions
+        store
+            .upsert_function(&make_function("entry_fn", "src/entry.rs", 1))
+            .await
+            .unwrap();
+        store
+            .upsert_function(&make_function("direct_fn", "src/direct.rs", 1))
+            .await
+            .unwrap();
+        store
+            .upsert_function(&make_function("transitive_fn", "src/transitive.rs", 1))
+            .await
+            .unwrap();
+
+        // Chain: entry_fn → direct_fn → transitive_fn
+        store
+            .create_call_relationship("entry_fn", "direct_fn", Some(pid))
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("direct_fn", "transitive_fn", Some(pid))
+            .await
+            .unwrap();
+
+        (store, pid)
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_excludes_transitive_different_community() {
+        // Entry in community 1, calls direct_fn (community 2, direct),
+        // direct_fn calls transitive_fn (community 3, transitive)
+        // → direct_fn kept (direct dependency), transitive_fn excluded
+        let (store, pid) = setup_community_chain().await;
+
+        // Set community IDs via function analytics
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    name: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 2,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 3,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-community",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(
+            func_names.contains(&"entry_fn"),
+            "entry should always be kept"
+        );
+        assert!(
+            func_names.contains(&"direct_fn"),
+            "direct callee should be kept even if different community"
+        );
+        assert!(
+            !func_names.contains(&"transitive_fn"),
+            "transitive function from different community should be excluded, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_no_community_data_keeps_all() {
+        // Entry without community_id → all functions kept (no filtering)
+        let (store, pid) = setup_community_chain().await;
+
+        // No function analytics set → no community data
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-no-community",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(true), // filter enabled but no community data
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "without community data, all functions should be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_disabled_keeps_all() {
+        // filter_community=false → all functions kept even with community data
+        let (store, pid) = setup_community_chain().await;
+
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    name: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 2,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 3,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-no-filter",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(false), // filtering disabled
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "with filter disabled, all functions should be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_same_community_keeps_all() {
+        // All nodes in same community → all kept
+        let (store, pid) = setup_community_chain().await;
+
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    name: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-same-community",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "same community functions should all be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    // ========================================================================
     // Feature Graph — refresh tests
     // ========================================================================
 
@@ -6339,7 +6663,7 @@ mod tests {
 
         // Auto-build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-refresh", None, pid, "process", 2, None)
+            .auto_build_feature_graph("test-refresh", None, pid, "process", 2, None, None)
             .await
             .unwrap();
         let fg_id = detail.graph.id;

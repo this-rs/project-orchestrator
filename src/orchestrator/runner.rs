@@ -343,6 +343,7 @@ impl Orchestrator {
                                 &proposal.entry_function,
                                 proposal.depth,
                                 include_rels,
+                                None,
                             )
                             .await
                         {
@@ -401,7 +402,7 @@ impl Orchestrator {
 
                 for func_name in &top_functions {
                     match neo4j
-                        .auto_build_feature_graph(func_name, None, project_id, func_name, 2, None)
+                        .auto_build_feature_graph(func_name, None, project_id, func_name, 2, None, None)
                         .await
                     {
                         Ok(detail) => {
@@ -3138,7 +3139,7 @@ mod tests {
 
         // Create a feature graph
         neo4j
-            .auto_build_feature_graph("Test FG", Some("desc"), project.id, "entry_fn", 2, None)
+            .auto_build_feature_graph("Test FG", Some("desc"), project.id, "entry_fn", 2, None, None)
             .await
             .unwrap();
 

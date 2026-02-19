@@ -8602,6 +8602,7 @@ impl Neo4jClient {
         entry_function: &str,
         depth: u32,
         include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
     ) -> Result<FeatureGraphDetail> {
         // Helper: check if a relation type should be included
         let should_include = |rel: &str| -> bool {
@@ -8611,8 +8612,10 @@ impl Neo4jClient {
             }
         };
 
+        let filter_community = filter_community.unwrap_or(true);
+
         // Step 1: Collect all related functions and their files via call graph
-        // We collect the entry function + callers + callees
+        // We collect the entry function + callers + callees, plus community_id for filtering
         let depth = depth.clamp(1, 5);
 
         let q = query(&format!(
@@ -8630,7 +8633,8 @@ impl Neo4jClient {
             UNWIND all_funcs AS f
             WITH DISTINCT f
             WHERE f IS NOT NULL
-            RETURN f.name AS func_name, f.file_path AS file_path
+            RETURN f.name AS func_name, f.file_path AS file_path,
+                   f.community_id AS community_id
             "#,
             depth = depth
         ))
@@ -8639,19 +8643,20 @@ impl Neo4jClient {
 
         let rows = self.execute_with_params(q).await?;
 
-        // Collect unique functions and files
-        let mut functions: Vec<(String, Option<String>)> = Vec::new();
+        // Collect unique functions with community info
+        let mut functions: Vec<(String, Option<String>, Option<i64>)> = Vec::new();
         let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for row in &rows {
             if let Ok(func_name) = row.get::<String>("func_name") {
                 let file_path: Option<String> = row.get::<String>("file_path").ok();
+                let community_id: Option<i64> = row.get::<i64>("community_id").ok();
                 if let Some(ref fp) = file_path {
                     if !fp.is_empty() {
                         files.insert(fp.clone());
                     }
                 }
-                functions.push((func_name, file_path));
+                functions.push((func_name, file_path, community_id));
             }
         }
 
@@ -8660,6 +8665,65 @@ impl Neo4jClient {
                 "No function found matching '{}'",
                 entry_function
             ));
+        }
+
+        // Step 1a: Community-based filtering (post-traversal)
+        // Keep same community OR direct (depth=1) connection OR no community data
+        if filter_community {
+            let entry_community = functions
+                .iter()
+                .find(|(name, _, _)| name == entry_function)
+                .and_then(|(_, _, cid)| *cid);
+
+            if let Some(entry_cid) = entry_community {
+                // Get direct (depth=1) callees and callers for the entry function
+                let direct_q = query(
+                    r#"
+                    MATCH (entry:Function {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                    OPTIONAL MATCH (entry)-[:CALLS]->(dc:Function)
+                    WHERE EXISTS { MATCH (dc)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                    OPTIONAL MATCH (caller:Function)-[:CALLS]->(entry)
+                    WHERE EXISTS { MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                    WITH collect(DISTINCT dc.name) AS direct_callees,
+                         collect(DISTINCT caller.name) AS direct_callers
+                    RETURN direct_callees + direct_callers AS direct_names
+                    "#,
+                )
+                .param("name", entry_function)
+                .param("project_id", project_id.to_string());
+
+                let direct_rows = self.execute_with_params(direct_q).await?;
+                let mut direct_set: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                if let Some(row) = direct_rows.first() {
+                    if let Ok(names) = row.get::<Vec<String>>("direct_names") {
+                        for n in names {
+                            if !n.is_empty() {
+                                direct_set.insert(n);
+                            }
+                        }
+                    }
+                }
+
+                // Filter: keep entry + same community + direct connections + unknown community
+                functions.retain(|(fname, _, cid)| {
+                    fname == entry_function
+                        || direct_set.contains(fname)
+                        || cid.is_none()
+                        || *cid == Some(entry_cid)
+                });
+
+                // Rebuild files set from remaining functions
+                files.clear();
+                for (_, fp, _) in &functions {
+                    if let Some(ref fp) = fp {
+                        if !fp.is_empty() {
+                            files.insert(fp.clone());
+                        }
+                    }
+                }
+            }
+            // If entry has no community_id → no filtering (backward compat)
         }
 
         // Step 1b: Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR for structs/enums in collected files
@@ -8745,7 +8809,7 @@ impl Neo4jClient {
         let mut entities = Vec::new();
 
         // Add functions with role: entry_point for the entry function, core_logic for others
-        for (func_name, _file_path) in &functions {
+        for (func_name, _file_path, _) in &functions {
             let role = if func_name == entry_function {
                 "entry_point"
             } else {
