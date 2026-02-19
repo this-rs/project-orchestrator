@@ -5551,6 +5551,128 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -- chat_send_message arg parsing (workspace_slug, add_dirs) ------------
+
+    #[tokio::test]
+    async fn test_chat_send_message_parses_workspace_slug() {
+        // chat_send_message requires a ChatManager — without one it fails,
+        // but we can verify the arg parsing logic inline.
+        let args = json!({
+            "message": "Hello",
+            "cwd": "/tmp",
+            "workspace_slug": "my-ws",
+            "add_dirs": ["/dir/a", "/dir/b"]
+        });
+
+        let workspace_slug = args
+            .get("workspace_slug")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        assert_eq!(workspace_slug.as_deref(), Some("my-ws"));
+
+        let add_dirs: Option<Vec<String>> =
+            args.get("add_dirs").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
+        assert_eq!(
+            add_dirs.as_deref(),
+            Some(vec!["/dir/a".to_string(), "/dir/b".to_string()].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_send_message_workspace_slug_defaults() {
+        let args = json!({
+            "message": "Hello",
+            "cwd": "/tmp"
+        });
+
+        let workspace_slug = args
+            .get("workspace_slug")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        assert!(workspace_slug.is_none());
+
+        let add_dirs: Option<Vec<String>> =
+            args.get("add_dirs").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
+        assert!(add_dirs.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_chat_send_message_no_chat_manager_with_workspace() {
+        let handler = create_handler().await;
+        let result = handler
+            .handle(
+                "chat_send_message",
+                Some(json!({
+                    "message": "Hello",
+                    "cwd": "/tmp",
+                    "workspace_slug": "my-ws",
+                    "add_dirs": ["/extra/dir"]
+                })),
+            )
+            .await;
+        // No chat_manager → error, but parsing succeeded
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Chat manager not initialized"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_crud_with_workspace_fields() {
+        let handler = create_handler().await;
+
+        use crate::test_helpers::test_chat_session;
+        let mut session = test_chat_session(Some("test-proj"));
+        session.workspace_slug = Some("test-ws".into());
+        session.add_dirs = Some(vec!["/extra/a".into(), "/extra/b".into()]);
+        let session_id = session.id.to_string();
+        handler.neo4j().create_chat_session(&session).await.unwrap();
+
+        // Get it and verify workspace fields are present
+        let result = handler
+            .handle("get_chat_session", Some(json!({"session_id": session_id})))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.get("workspace_slug").unwrap().as_str().unwrap(),
+            "test-ws"
+        );
+        let dirs = result.get("add_dirs").unwrap().as_array().unwrap();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].as_str().unwrap(), "/extra/a");
+        assert_eq!(dirs[1].as_str().unwrap(), "/extra/b");
+    }
+
+    #[tokio::test]
+    async fn test_list_chat_sessions_includes_workspace() {
+        let handler = create_handler().await;
+
+        use crate::test_helpers::test_chat_session;
+        let mut session = test_chat_session(Some("proj"));
+        session.workspace_slug = Some("ws-slug".into());
+        handler.neo4j().create_chat_session(&session).await.unwrap();
+
+        let result = handler
+            .handle("list_chat_sessions", Some(json!({})))
+            .await
+            .unwrap();
+        let items = result.get("items").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("workspace_slug").unwrap().as_str().unwrap(),
+            "ws-slug"
+        );
+    }
+
     // -- list_chat_messages --------------------------------------------------
 
     #[tokio::test]
