@@ -780,6 +780,9 @@ pub trait GraphStore: Send + Sync {
     /// Add a commit to a release
     async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
 
+    /// Remove a commit from a release
+    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
+
     /// Get release details with tasks and commits
     async fn get_release_details(
         &self,

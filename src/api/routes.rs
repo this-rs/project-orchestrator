@@ -345,6 +345,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/releases/{release_id}/commits",
             post(handlers::add_commit_to_release),
         )
+        .route(
+            "/api/releases/{release_id}/commits/{commit_sha}",
+            delete(handlers::remove_commit_from_release),
+        )
         // Milestones
         .route(
             "/api/milestones/{milestone_id}",
@@ -453,10 +457,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/communities",
             get(code_handlers::get_code_communities),
         )
-        .route(
-            "/api/code/health",
-            get(code_handlers::get_code_health),
-        )
+        .route("/api/code/health", get(code_handlers::get_code_health))
         // ================================================================
         // Implementation Planner
         // ================================================================

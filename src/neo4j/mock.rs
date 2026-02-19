@@ -1822,10 +1822,7 @@ impl GraphStore for MockGraphStore {
         Ok(result)
     }
 
-    async fn get_project_communities(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<CommunityRow>> {
+    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>> {
         let files = self.files.read().await;
         let fa = self.file_analytics.read().await;
 
@@ -1895,10 +1892,7 @@ impl GraphStore for MockGraphStore {
         }
     }
 
-    async fn get_affected_communities(
-        &self,
-        file_paths: &[String],
-    ) -> Result<Vec<String>> {
+    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>> {
         let fa = self.file_analytics.read().await;
         let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for path in file_paths {
@@ -1937,10 +1931,7 @@ impl GraphStore for MockGraphStore {
                 .filter(|(_, callees)| callees.contains(&func.name))
                 .count();
             // out_degree: how many functions this one calls
-            let out_degree = cr
-                .get(&func.name)
-                .map(|callees| callees.len())
-                .unwrap_or(0);
+            let out_degree = cr.get(&func.name).map(|callees| callees.len()).unwrap_or(0);
             if in_degree >= god_function_threshold {
                 god_functions.push(GodFunction {
                     name: func.name.clone(),
@@ -2004,10 +1995,7 @@ impl GraphStore for MockGraphStore {
         })
     }
 
-    async fn get_circular_dependencies(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<Vec<String>>> {
+    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>> {
         let pf = self.project_files.read().await;
         let project_paths: Vec<String> = pf.get(&project_id).cloned().unwrap_or_default();
         let project_paths_set: std::collections::HashSet<&str> =
@@ -2044,7 +2032,8 @@ impl GraphStore for MockGraphStore {
                                 .min_by(|a, b| a.1.cmp(b.1))
                                 .map(|(i, _)| i)
                                 .unwrap_or(0);
-                            let mut canonical: Vec<String> = cycle[min_idx..cycle.len() - 1].to_vec();
+                            let mut canonical: Vec<String> =
+                                cycle[min_idx..cycle.len() - 1].to_vec();
                             canonical.extend(cycle[..min_idx].to_vec());
                             canonical.push(canonical[0].clone());
                             if !cycles.iter().any(|c| c == &canonical) {
@@ -2092,10 +2081,7 @@ impl GraphStore for MockGraphStore {
                     .iter()
                     .filter(|(_, callees)| callees.contains(&node_path.to_string()))
                     .count() as i64;
-                let out_degree = cr
-                    .get(node_path)
-                    .map(|c| c.len())
-                    .unwrap_or(0) as i64;
+                let out_degree = cr.get(node_path).map(|c| c.len()).unwrap_or(0) as i64;
 
                 if let Some(analytics) = fa.get(node_path) {
                     Ok(Some(NodeGdsMetrics {
@@ -2137,10 +2123,7 @@ impl GraphStore for MockGraphStore {
                     .iter()
                     .filter(|(_, targets)| targets.contains(&node_path.to_string()))
                     .count() as i64;
-                let out_degree = ir
-                    .get(node_path)
-                    .map(|t| t.len())
-                    .unwrap_or(0) as i64;
+                let out_degree = ir.get(node_path).map(|t| t.len()).unwrap_or(0) as i64;
 
                 if let Some(analytics) = fa.get(node_path) {
                     Ok(Some(NodeGdsMetrics {
@@ -2171,10 +2154,7 @@ impl GraphStore for MockGraphStore {
         }
     }
 
-    async fn get_project_percentiles(
-        &self,
-        project_id: Uuid,
-    ) -> Result<ProjectPercentiles> {
+    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles> {
         let pf = self.project_files.read().await;
         let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
 
@@ -2226,8 +2206,11 @@ impl GraphStore for MockGraphStore {
         };
 
         let bw_mean: f64 = betweennesses.iter().sum::<f64>() / cnt as f64;
-        let bw_var: f64 =
-            betweennesses.iter().map(|x| (x - bw_mean).powi(2)).sum::<f64>() / cnt as f64;
+        let bw_var: f64 = betweennesses
+            .iter()
+            .map(|x| (x - bw_mean).powi(2))
+            .sum::<f64>()
+            / cnt as f64;
 
         Ok(ProjectPercentiles {
             pagerank_p50: percentile(&pageranks, 0.5),
@@ -3357,6 +3340,16 @@ impl GraphStore for MockGraphStore {
             .entry(release_id)
             .or_default()
             .push(commit_hash.to_string());
+        Ok(())
+    }
+
+    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
+        self.release_commits
+            .write()
+            .await
+            .entry(release_id)
+            .or_default()
+            .retain(|h| h != commit_hash);
         Ok(())
     }
 
@@ -6787,15 +6780,7 @@ mod tests {
             .unwrap();
 
         let detail = store
-            .auto_build_feature_graph(
-                "test-community",
-                None,
-                pid,
-                "entry_fn",
-                2,
-                None,
-                Some(true),
-            )
+            .auto_build_feature_graph("test-community", None, pid, "entry_fn", 2, None, Some(true))
             .await
             .unwrap();
 

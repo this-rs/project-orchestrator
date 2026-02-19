@@ -402,7 +402,9 @@ impl Orchestrator {
 
                 for func_name in &top_functions {
                     match neo4j
-                        .auto_build_feature_graph(func_name, None, project_id, func_name, 2, None, None)
+                        .auto_build_feature_graph(
+                            func_name, None, project_id, func_name, 2, None, None,
+                        )
                         .await
                     {
                         Ok(detail) => {
@@ -1766,6 +1768,26 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             CrudEvent::new(
                 EventEntityType::Release,
                 CrudAction::Linked,
+                release_id.to_string(),
+            )
+            .with_payload(serde_json::json!({"commit_hash": commit_hash})),
+        );
+        Ok(())
+    }
+
+    /// Remove a commit from a release and emit event
+    pub async fn remove_commit_from_release(
+        &self,
+        release_id: Uuid,
+        commit_hash: &str,
+    ) -> Result<()> {
+        self.neo4j()
+            .remove_commit_from_release(release_id, commit_hash)
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Release,
+                CrudAction::Unlinked,
                 release_id.to_string(),
             )
             .with_payload(serde_json::json!({"commit_hash": commit_hash})),
@@ -3139,7 +3161,15 @@ mod tests {
 
         // Create a feature graph
         neo4j
-            .auto_build_feature_graph("Test FG", Some("desc"), project.id, "entry_fn", 2, None, None)
+            .auto_build_feature_graph(
+                "Test FG",
+                Some("desc"),
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                None,
+            )
             .await
             .unwrap();
 

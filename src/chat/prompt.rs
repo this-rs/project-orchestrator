@@ -854,6 +854,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 description: "Lier commit → release",
             },
             ToolRef {
+                name: "remove_commit_from_release",
+                description: "Délier commit d'une release",
+            },
+            ToolRef {
                 name: "create_milestone",
                 description: "Créer un milestone",
             },
@@ -1479,10 +1483,7 @@ async fn build_gds_topology_section(
     if !bridges.is_empty() {
         let mut bridge_lines = vec!["### Bridge Files (high blast radius)".to_string()];
         for b in &bridges {
-            let label = b
-                .community_label
-                .as_deref()
-                .unwrap_or("unknown");
+            let label = b.community_label.as_deref().unwrap_or("unknown");
             bridge_lines.push(format!(
                 "- {} — betweenness {:.2}, community: {}",
                 b.path, b.betweenness, label
@@ -1493,10 +1494,7 @@ async fn build_gds_topology_section(
     }
 
     // 3. Structural Alerts (god functions + circular deps)
-    let health = graph
-        .get_code_health_report(project_id, 10)
-        .await
-        .ok();
+    let health = graph.get_code_health_report(project_id, 10).await.ok();
 
     let circular = graph
         .get_circular_dependencies(project_id)
@@ -2504,11 +2502,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_152_tools() {
+    fn test_tool_groups_cover_all_153_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 152,
-            "TOOL_GROUPS must cover exactly 152 unique tools (got {}). \
+            count, 153,
+            "TOOL_GROUPS must cover exactly 153 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -2841,9 +2839,9 @@ mod tests {
     #[tokio::test]
     async fn test_topology_section_with_full_data() {
         use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::test_helpers::{mock_app_state_with, test_project_named};
-        use crate::meilisearch::mock::MockSearchStore;
 
         let graph = MockGraphStore::new();
         let project = test_project_named("topo-proj");
@@ -2930,15 +2928,15 @@ mod tests {
         let topo = ctx.structural_topology.unwrap();
 
         // Check communities section
-        assert!(topo.contains("Code Communities"), "should have communities header");
+        assert!(
+            topo.contains("Code Communities"),
+            "should have communities header"
+        );
         assert!(topo.contains("api"), "should mention api community");
         assert!(topo.contains("neo4j"), "should mention neo4j community");
 
         // Check bridges section
-        assert!(
-            topo.contains("Bridge Files"),
-            "should have bridges header"
-        );
+        assert!(topo.contains("Bridge Files"), "should have bridges header");
         assert!(
             topo.contains("neo4j/client.rs"),
             "neo4j/client.rs should be a bridge (highest betweenness)"
@@ -2980,9 +2978,9 @@ mod tests {
     #[tokio::test]
     async fn test_topology_section_in_json() {
         use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::test_helpers::{mock_app_state_with, test_project_named};
-        use crate::meilisearch::mock::MockSearchStore;
 
         let graph = MockGraphStore::new();
         let project = test_project_named("json-topo");

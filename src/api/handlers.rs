@@ -1337,6 +1337,18 @@ pub async fn add_commit_to_release(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Remove a commit from a release
+pub async fn remove_commit_from_release(
+    State(state): State<OrchestratorState>,
+    Path((release_id, commit_sha)): Path<(Uuid, String)>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .remove_commit_from_release(release_id, &commit_sha)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Release details response
 #[derive(Serialize)]
 pub struct ReleaseDetailsResponse {

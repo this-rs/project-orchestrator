@@ -107,6 +107,7 @@ impl ToolHandler {
             "delete_release" => self.delete_release(args).await,
             "add_task_to_release" => self.add_task_to_release(args).await,
             "add_commit_to_release" => self.add_commit_to_release(args).await,
+            "remove_commit_from_release" => self.remove_commit_from_release(args).await,
 
             // Milestones
             "list_milestones" => self.list_milestones(args).await,
@@ -1280,6 +1281,19 @@ impl ToolHandler {
             .add_commit_to_release(release_id, commit_sha)
             .await?;
         Ok(json!({"added": true}))
+    }
+
+    async fn remove_commit_from_release(&self, args: Value) -> Result<Value> {
+        let release_id = parse_uuid(&args, "release_id")?;
+        let commit_sha = args
+            .get("commit_sha")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("commit_sha is required"))?;
+
+        self.orchestrator
+            .remove_commit_from_release(release_id, commit_sha)
+            .await?;
+        Ok(json!({"removed": true}))
     }
 
     // ========================================================================
@@ -3876,10 +3890,7 @@ impl ToolHandler {
             .get("project_slug")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("project_slug is required"))?;
-        let min_size = args
-            .get("min_size")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(2) as usize;
+        let min_size = args.get("min_size").and_then(|v| v.as_i64()).unwrap_or(2) as usize;
 
         // Resolve project slug → project ID
         let project = self
@@ -3948,10 +3959,7 @@ impl ToolHandler {
             .get_code_health_report(project.id, god_function_threshold)
             .await?;
 
-        let circular_deps = self
-            .neo4j()
-            .get_circular_dependencies(project.id)
-            .await?;
+        let circular_deps = self.neo4j().get_circular_dependencies(project.id).await?;
 
         let god_functions_json: Vec<Value> = report
             .god_functions
@@ -4035,10 +4043,7 @@ impl ToolHandler {
             }));
         }
 
-        let percentiles = self
-            .neo4j()
-            .get_project_percentiles(project.id)
-            .await?;
+        let percentiles = self.neo4j().get_project_percentiles(project.id).await?;
 
         let interpretation = Self::interpret_node_metrics(&metrics, &percentiles);
 
@@ -4118,10 +4123,7 @@ impl ToolHandler {
                 "This {} has moderate structural importance",
                 node_label
             )),
-            _ => parts.push(format!(
-                "This {} has low structural importance",
-                node_label
-            )),
+            _ => parts.push(format!("This {} has low structural importance", node_label)),
         }
 
         if is_bridge {
@@ -4129,9 +4131,7 @@ impl ToolHandler {
         }
 
         match risk_level {
-            "critical" | "high" => {
-                parts.push("Changes here have high blast radius.".to_string())
-            }
+            "critical" | "high" => parts.push("Changes here have high blast radius.".to_string()),
             "medium" => parts.push("Changes here may affect multiple dependents.".to_string()),
             _ => parts.push("Changes here have limited impact.".to_string()),
         }
@@ -6747,10 +6747,7 @@ mod tests {
         let slug = result.get("slug").unwrap().as_str().unwrap();
 
         let result = handler
-            .handle(
-                "get_code_communities",
-                Some(json!({"project_slug": slug})),
-            )
+            .handle("get_code_communities", Some(json!({"project_slug": slug})))
             .await
             .unwrap();
 
@@ -6795,12 +6792,7 @@ mod tests {
         graph.create_project(&project).await.unwrap();
 
         // Files
-        let file_paths = vec![
-            "src/main.rs",
-            "src/lib.rs",
-            "src/orphan.rs",
-            "src/utils.rs",
-        ];
+        let file_paths = vec!["src/main.rs", "src/lib.rs", "src/orphan.rs", "src/utils.rs"];
         graph
             .project_files
             .write()
@@ -7024,18 +7016,10 @@ mod tests {
             .unwrap()
             .as_f64()
             .unwrap();
-        assert!(
-            (max - 0.7).abs() < 0.01,
-            "max should be 0.7, got {}",
-            max
-        );
+        assert!((max - 0.7).abs() < 0.01, "max should be 0.7, got {}", max);
 
         assert_eq!(
-            coupling
-                .get("most_coupled_file")
-                .unwrap()
-                .as_str()
-                .unwrap(),
+            coupling.get("most_coupled_file").unwrap().as_str().unwrap(),
             "src/lib.rs"
         );
     }
@@ -7324,7 +7308,10 @@ mod tests {
 
         let interp = result.get("interpretation").unwrap();
         let importance = interp.get("importance").unwrap().as_str().unwrap();
-        assert_eq!(importance, "critical", "hub.rs (top pagerank) should be critical");
+        assert_eq!(
+            importance, "critical",
+            "hub.rs (top pagerank) should be critical"
+        );
 
         let risk = interp.get("risk_level").unwrap().as_str().unwrap();
         assert!(
@@ -7381,7 +7368,10 @@ mod tests {
 
         let interp = result.get("interpretation").unwrap();
         let is_bridge = interp.get("is_bridge").unwrap().as_bool().unwrap();
-        assert!(is_bridge, "bridge.rs should be detected as a bridge (betweenness=0.9)");
+        assert!(
+            is_bridge,
+            "bridge.rs should be detected as a bridge (betweenness=0.9)"
+        );
 
         let summary = interp.get("summary").unwrap().as_str().unwrap();
         assert!(

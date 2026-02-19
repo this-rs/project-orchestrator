@@ -590,10 +590,7 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
-    async fn get_project_communities(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<CommunityRow>> {
+    async fn get_project_communities(&self, project_id: Uuid) -> anyhow::Result<Vec<CommunityRow>> {
         self.get_project_communities(project_id).await
     }
 
@@ -605,10 +602,7 @@ impl GraphStore for Neo4jClient {
         self.get_node_analytics(identifier, node_type).await
     }
 
-    async fn get_affected_communities(
-        &self,
-        file_paths: &[String],
-    ) -> anyhow::Result<Vec<String>> {
+    async fn get_affected_communities(&self, file_paths: &[String]) -> anyhow::Result<Vec<String>> {
         self.get_affected_communities(file_paths).await
     }
 
@@ -650,8 +644,7 @@ impl GraphStore for Neo4jClient {
         project_id: Uuid,
         limit: usize,
     ) -> anyhow::Result<Vec<BridgeFile>> {
-        self.get_top_bridges_by_betweenness(project_id, limit)
-            .await
+        self.get_top_bridges_by_betweenness(project_id, limit).await
     }
 
     async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {
@@ -1019,6 +1012,15 @@ impl GraphStore for Neo4jClient {
         commit_hash: &str,
     ) -> anyhow::Result<()> {
         self.add_commit_to_release(release_id, commit_hash).await
+    }
+
+    async fn remove_commit_from_release(
+        &self,
+        release_id: Uuid,
+        commit_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.remove_commit_from_release(release_id, commit_hash)
+            .await
     }
 
     async fn get_release_details(

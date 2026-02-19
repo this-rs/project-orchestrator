@@ -3690,14 +3690,20 @@ impl Neo4jClient {
         node_type: &str,
         project_id: Uuid,
     ) -> Result<Option<NodeGdsMetrics>> {
-        let (label, id_prop) = match node_type {
-            "function" => ("Function", "name"),
-            _ => ("File", "path"),
+        let (id_prop, match_pattern) = match node_type {
+            "function" => (
+                "name",
+                "MATCH (p:Project {id: $pid})-[:CONTAINS]->(:File)-[:CONTAINS]->(n:Function {name: $node_path})",
+            ),
+            _ => (
+                "path",
+                "MATCH (p:Project {id: $pid})-[:CONTAINS]->(n:File {path: $node_path})",
+            ),
         };
 
         let cypher = format!(
             r#"
-            MATCH (p:Project {{id: $pid}})-[:CONTAINS]->(n:{label} {{{id_prop}: $node_path}})
+            {match_pattern}
             OPTIONAL MATCH (caller)-[]->(n)
             WITH n, count(DISTINCT caller) AS in_deg
             OPTIONAL MATCH (n)-[]->(callee)
@@ -3745,7 +3751,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project {id: $pid})-[:CONTAINS]->(n)
             WHERE (n:File OR n:Function) AND n.pagerank IS NOT NULL
-            WITH collect(n.pagerank) AS prs, collect(n.betweenness) AS bws
+            WITH collect(toFloat(n.pagerank)) AS prs, collect(toFloat(COALESCE(n.betweenness, 0.0))) AS bws
             WITH prs, bws,
                  apoc.coll.sort(prs) AS sorted_pr,
                  apoc.coll.sort(bws) AS sorted_bw
@@ -5940,6 +5946,25 @@ impl Neo4jClient {
             MATCH (r:Release {id: $release_id})
             MATCH (c:Commit {hash: $hash})
             MERGE (r)-[:INCLUDES_COMMIT]->(c)
+            "#,
+        )
+        .param("release_id", release_id.to_string())
+        .param("hash", commit_hash);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Remove a commit from a release
+    pub async fn remove_commit_from_release(
+        &self,
+        release_id: Uuid,
+        commit_hash: &str,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (r:Release {id: $release_id})-[rel:INCLUDES_COMMIT]->(c:Commit {hash: $hash})
+            DELETE rel
             "#,
         )
         .param("release_id", release_id.to_string())

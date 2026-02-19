@@ -820,9 +820,9 @@ pub struct ProjectPercentiles {
 /// Interpretation of a node's structural importance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInterpretation {
-    pub importance: String,  // "critical", "high", "medium", "low"
+    pub importance: String, // "critical", "high", "medium", "low"
     pub is_bridge: bool,
-    pub risk_level: String,  // "critical", "high", "medium", "low"
+    pub risk_level: String, // "critical", "high", "medium", "low"
     pub summary: String,
 }
 

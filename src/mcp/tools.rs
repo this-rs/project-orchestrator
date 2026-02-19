@@ -695,6 +695,18 @@ fn release_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["release_id".to_string(), "commit_sha".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "remove_commit_from_release".to_string(),
+            description: "Remove a commit from a release".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "release_id": {"type": "string", "description": "Release UUID"},
+                    "commit_sha": {"type": "string", "description": "Commit SHA"}
+                })),
+                required: Some(vec!["release_id".to_string(), "commit_sha".to_string()]),
+            },
+        },
     ]
 }
 
@@ -2174,7 +2186,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 152, "Expected 152 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 153, "Expected 153 tools, got {}", tools.len());
     }
 
     #[test]
