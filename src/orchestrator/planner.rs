@@ -675,10 +675,7 @@ impl ImplementationPlanner {
     /// one file per group (preserving old parallel behavior).
     /// Two community groups are only kept separate (parallel) if there's no
     /// direct edge between them in the DAG (truly independent).
-    fn group_by_community(
-        level: &[String],
-        dag: &ModificationDag,
-    ) -> Vec<Vec<String>> {
+    fn group_by_community(level: &[String], dag: &ModificationDag) -> Vec<Vec<String>> {
         // Check if any file has community_id; if none do, fall back to one-per-group
         let has_any_community = level
             .iter()
@@ -822,11 +819,7 @@ impl ImplementationPlanner {
                                 // Try to get community label from first node
                                 let cid = dag.nodes.get(&group[0]).and_then(|n| n.community_id);
                                 match cid {
-                                    Some(id) => format!(
-                                        "Community {} ({} files)",
-                                        id,
-                                        group.len()
-                                    ),
+                                    Some(id) => format!("Community {} ({} files)", id, group.len()),
                                     None => format!("{} independent files", group.len()),
                                 }
                             };
@@ -1684,15 +1677,17 @@ mod tests {
             nodes,
             edges: vec![],
         };
-        let level: Vec<String> = vec![
-            "a1.rs", "a2.rs", "a3.rs", "b1.rs", "b2.rs", "b3.rs",
-        ]
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
+        let level: Vec<String> = vec!["a1.rs", "a2.rs", "a3.rs", "b1.rs", "b2.rs", "b3.rs"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let groups = ImplementationPlanner::group_by_community(&level, &dag);
-        assert_eq!(groups.len(), 2, "Should have 2 independent community groups");
+        assert_eq!(
+            groups.len(),
+            2,
+            "Should have 2 independent community groups"
+        );
         // Each group should have 3 files
         assert_eq!(groups[0].len(), 3);
         assert_eq!(groups[1].len(), 3);
@@ -1701,11 +1696,17 @@ mod tests {
         let levels = vec![level];
         let phases = ImplementationPlanner::compute_phases(&levels, &dag);
         assert_eq!(phases.len(), 1);
-        assert!(phases[0].parallel, "Independent communities should produce parallel phase");
+        assert!(
+            phases[0].parallel,
+            "Independent communities should produce parallel phase"
+        );
         assert_eq!(phases[0].branches.len(), 2);
         // Branch reason should mention community ID
         assert!(
-            phases[0].branches.iter().any(|b| b.reason.contains("Community")),
+            phases[0]
+                .branches
+                .iter()
+                .any(|b| b.reason.contains("Community")),
             "Branch reason should reference community"
         );
     }
@@ -1738,7 +1739,11 @@ mod tests {
             .collect();
 
         let groups = ImplementationPlanner::group_by_community(&level, &dag);
-        assert_eq!(groups.len(), 1, "Same community files should be in one group");
+        assert_eq!(
+            groups.len(),
+            1,
+            "Same community files should be in one group"
+        );
         assert_eq!(groups[0].len(), 4);
 
         // Compute phases — single group → not parallel
@@ -1852,11 +1857,7 @@ mod tests {
         let groups = ImplementationPlanner::group_by_community(&level, &dag);
         // Community 10 (alpha) and community 20 (beta, gamma) should merge
         // because alpha→beta edge connects them
-        assert_eq!(
-            groups.len(),
-            1,
-            "Cross-community edge should merge groups"
-        );
+        assert_eq!(groups.len(), 1, "Cross-community edge should merge groups");
         assert_eq!(groups[0].len(), 3);
 
         // Compute phases — single group → not parallel

@@ -1055,7 +1055,8 @@ mod tests {
         assert!(
             hub_score > leaf_score,
             "Hub path ({:.3}) should score higher than leaf path ({:.3})",
-            hub_score, leaf_score
+            hub_score,
+            leaf_score
         );
 
         // Both are higher than old formula (multiplier always >= 1.0)

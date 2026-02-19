@@ -93,10 +93,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_returns_empty_by_default() {
         let mock = MockAnalyticsEngine::new();
-        let analytics = mock
-            .analyze_file_graph(Uuid::new_v4())
-            .await
-            .unwrap();
+        let analytics = mock.analyze_file_graph(Uuid::new_v4()).await.unwrap();
         assert_eq!(analytics.node_count, 0);
         assert!(analytics.metrics.is_empty());
     }

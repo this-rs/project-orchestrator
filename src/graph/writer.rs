@@ -262,11 +262,7 @@ mod tests {
 
         // Verify function analytics were persisted
         let func_a = store.function_analytics.read().await;
-        assert_eq!(
-            func_a.len(),
-            4,
-            "Should have 4 function analytics entries"
-        );
+        assert_eq!(func_a.len(), 4, "Should have 4 function analytics entries");
 
         let main_fn = &func_a["main"];
         assert!(main_fn.pagerank > 0.0);

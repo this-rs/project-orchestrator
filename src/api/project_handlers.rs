@@ -285,10 +285,7 @@ pub async fn sync_project(
         .await?;
 
     // Compute graph analytics (PageRank, communities, etc.) — best-effort, synchronous
-    state
-        .orchestrator
-        .analyze_project_safe(project.id)
-        .await;
+    state.orchestrator.analyze_project_safe(project.id).await;
 
     // Refresh auto-built feature graphs in background (best-effort)
     state.orchestrator.spawn_refresh_feature_graphs(project.id);

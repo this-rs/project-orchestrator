@@ -461,7 +461,10 @@ mod tests {
         assert_eq!(CodeEdgeType::Imports.to_string(), "IMPORTS");
         assert_eq!(CodeEdgeType::Calls.to_string(), "CALLS");
         assert_eq!(CodeEdgeType::Defines.to_string(), "DEFINES");
-        assert_eq!(CodeEdgeType::ImplementsTrait.to_string(), "IMPLEMENTS_TRAIT");
+        assert_eq!(
+            CodeEdgeType::ImplementsTrait.to_string(),
+            "IMPLEMENTS_TRAIT"
+        );
         assert_eq!(CodeEdgeType::ImplementsFor.to_string(), "IMPLEMENTS_FOR");
     }
 
@@ -569,7 +572,9 @@ mod tests {
         assert_eq!(g.edge_count(), 1);
 
         // Non-existent source → None
-        assert!(g.add_edge("missing.rs", "b.rs", CodeEdge::default()).is_none());
+        assert!(g
+            .add_edge("missing.rs", "b.rs", CodeEdge::default())
+            .is_none());
     }
 
     #[test]

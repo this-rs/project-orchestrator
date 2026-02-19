@@ -411,7 +411,10 @@ mod tests {
 
         // Should detect orphan
         assert!(
-            analytics.health.orphan_files.contains(&"src/lonely.rs".to_string()),
+            analytics
+                .health
+                .orphan_files
+                .contains(&"src/lonely.rs".to_string()),
             "Single isolated file should be detected as orphan"
         );
     }

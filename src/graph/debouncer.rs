@@ -92,11 +92,7 @@ impl AnalyticsDebouncer {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Debounced analytics failed for project {}: {}",
-                        last_pid,
-                        e
-                    );
+                    tracing::warn!("Debounced analytics failed for project {}: {}", last_pid, e);
                 }
             }
         }
@@ -138,17 +134,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AnalyticsEngine for CountingAnalyticsEngine {
-        async fn analyze_file_graph(
-            &self,
-            project_id: Uuid,
-        ) -> anyhow::Result<GraphAnalytics> {
+        async fn analyze_file_graph(&self, project_id: Uuid) -> anyhow::Result<GraphAnalytics> {
             self.inner.analyze_file_graph(project_id).await
         }
 
-        async fn analyze_function_graph(
-            &self,
-            project_id: Uuid,
-        ) -> anyhow::Result<GraphAnalytics> {
+        async fn analyze_function_graph(&self, project_id: Uuid) -> anyhow::Result<GraphAnalytics> {
             self.inner.analyze_function_graph(project_id).await
         }
 

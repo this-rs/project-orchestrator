@@ -335,7 +335,7 @@ mod tests {
         let files = ["src/a.rs", "src/b.rs"];
         let imports = [
             ("src/a.rs", "src/b.rs"),       // valid: both nodes exist
-            ("src/a.rs", "src/missing.rs"),  // target not in project files
+            ("src/a.rs", "src/missing.rs"), // target not in project files
         ];
 
         seed_files_and_imports(&store, project.id, &files, &imports).await;
