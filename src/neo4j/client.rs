@@ -3805,6 +3805,37 @@ impl Neo4jClient {
         }
     }
 
+    /// Get top N files by betweenness centrality (bridge files).
+    pub async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE f.betweenness IS NOT NULL
+            RETURN f.path AS path, f.betweenness AS betweenness,
+                   f.community_label AS community_label
+            ORDER BY f.betweenness DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("pid", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let rows = self.execute_with_params(q).await?;
+        let mut bridges = Vec::new();
+        for row in &rows {
+            bridges.push(BridgeFile {
+                path: row.get::<String>("path").unwrap_or_default(),
+                betweenness: row.get::<f64>("betweenness").unwrap_or(0.0),
+                community_label: row.get::<String>("community_label").ok(),
+            });
+        }
+        Ok(bridges)
+    }
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     pub async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
         let q = query(

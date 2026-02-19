@@ -503,6 +503,13 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<ProjectPercentiles>;
 
+    /// Get top N files by betweenness centrality (bridge files).
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>>;
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
 

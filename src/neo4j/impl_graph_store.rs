@@ -645,6 +645,15 @@ impl GraphStore for Neo4jClient {
         self.get_project_percentiles(project_id).await
     }
 
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<BridgeFile>> {
+        self.get_top_bridges_by_betweenness(project_id, limit)
+            .await
+    }
+
     async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {
         self.get_file_symbol_names(path).await
     }

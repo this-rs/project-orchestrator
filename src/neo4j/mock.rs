@@ -2241,6 +2241,31 @@ impl GraphStore for MockGraphStore {
         })
     }
 
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+        let fa = self.file_analytics.read().await;
+
+        let mut bridges: Vec<BridgeFile> = project_paths
+            .iter()
+            .filter_map(|path| {
+                fa.get(path).map(|a| BridgeFile {
+                    path: path.clone(),
+                    betweenness: a.betweenness,
+                    community_label: Some(a.community_label.clone()),
+                })
+            })
+            .collect();
+
+        bridges.sort_by(|a, b| b.betweenness.partial_cmp(&a.betweenness).unwrap());
+        bridges.truncate(limit);
+        Ok(bridges)
+    }
+
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
         let functions = self.functions.read().await;
         let structs = self.structs_map.read().await;

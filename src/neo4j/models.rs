@@ -826,6 +826,14 @@ pub struct NodeInterpretation {
     pub summary: String,
 }
 
+/// A file with high betweenness centrality (bridge between communities).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeFile {
+    pub path: String,
+    pub betweenness: f64,
+    pub community_label: Option<String>,
+}
+
 /// A feature graph — a named subgraph capturing all code entities related to a feature.
 /// Reusable across sessions to avoid re-exploring the same feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
