@@ -1959,7 +1959,9 @@ fn chat_tools() -> Vec<ToolDefinition> {
                     "cwd": {"type": "string", "description": "Working directory for Claude Code CLI"},
                     "session_id": {"type": "string", "description": "Session ID to resume (optional — creates new session if omitted)"},
                     "project_slug": {"type": "string", "description": "Project slug to associate with the session"},
-                    "model": {"type": "string", "description": "Model override (default: from config)"}
+                    "model": {"type": "string", "description": "Model override (default: from config)"},
+                    "workspace_slug": {"type": "string", "description": "Workspace slug — resolves all project root_paths as --add-dir automatically"},
+                    "add_dirs": {"type": "array", "items": {"type": "string"}, "description": "Additional directories to expose to Claude CLI (--add-dir)"}
                 })),
                 required: Some(vec!["message".to_string(), "cwd".to_string()]),
             },

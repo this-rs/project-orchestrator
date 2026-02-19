@@ -1057,11 +1057,71 @@ impl ChatManager {
     // ClaudeCodeOptions builder
     // ========================================================================
 
+    /// Resolve additional directories for the Claude CLI `--add-dir` flag.
+    ///
+    /// Priority:
+    /// 1. Explicit `add_dirs` from the request → use as-is (with tilde expansion)
+    /// 2. `workspace_slug` → resolve all project root_paths, exclude cwd to avoid duplicates
+    /// 3. Neither → empty vec (no additional dirs)
+    pub async fn resolve_add_dirs(
+        &self,
+        cwd: &str,
+        add_dirs: Option<&[String]>,
+        workspace_slug: Option<&str>,
+        _project_slug: Option<&str>,
+    ) -> Vec<String> {
+        // Case 1: explicit add_dirs
+        if let Some(dirs) = add_dirs {
+            if !dirs.is_empty() {
+                return dirs.iter().map(|d| expand_tilde(d)).collect();
+            }
+        }
+
+        // Case 2: workspace_slug → resolve projects
+        if let Some(ws_slug) = workspace_slug {
+            match self.graph.get_workspace_by_slug(ws_slug).await {
+                Ok(Some(ws)) => match self.graph.list_workspace_projects(ws.id).await {
+                    Ok(projects) => {
+                        let expanded_cwd = expand_tilde(cwd);
+                        return projects
+                            .into_iter()
+                            .map(|p| expand_tilde(&p.root_path))
+                            .filter(|path| *path != expanded_cwd)
+                            .collect();
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace_slug = ws_slug,
+                            "Failed to list workspace projects for add_dirs: {}",
+                            e
+                        );
+                    }
+                },
+                Ok(None) => {
+                    tracing::warn!(
+                        workspace_slug = ws_slug,
+                        "Workspace not found for add_dirs resolution"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workspace_slug = ws_slug,
+                        "Failed to get workspace for add_dirs: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Case 3: no add_dirs
+        Vec::new()
+    }
+
     /// Build `ClaudeCodeOptions` for a new or resumed session.
     ///
     /// `permission_mode_override`: if Some, overrides the global config permission mode
     /// for this specific session (e.g. user chose a different mode for this session).
-    #[allow(deprecated)]
+    #[allow(deprecated, clippy::too_many_arguments)]
     pub async fn build_options(
         &self,
         cwd: &str,
@@ -1070,6 +1130,7 @@ impl ChatManager {
         resume_id: Option<&str>,
         permission_mode_override: Option<&str>,
         hooks: Option<std::collections::HashMap<String, Vec<nexus_claude::HookMatcher>>>,
+        add_dirs: &[String],
     ) -> ClaudeCodeOptions {
         // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
         let cwd = expand_tilde(cwd);
@@ -1134,6 +1195,11 @@ impl ChatManager {
 
         if let Some(hook_map) = hooks {
             builder = builder.hooks(hook_map);
+        }
+
+        // Add additional directories (--add-dir flags)
+        for dir in add_dirs {
+            builder = builder.add_dir(expand_tilde(dir));
         }
 
         builder.build()
@@ -1369,10 +1435,21 @@ impl ChatManager {
             .await;
 
         // Persist session in Neo4j
+        // Resolve add_dirs from explicit request, workspace, or empty
+        let resolved_add_dirs = self
+            .resolve_add_dirs(
+                &request.cwd,
+                request.add_dirs.as_deref(),
+                request.workspace_slug.as_deref(),
+                request.project_slug.as_deref(),
+            )
+            .await;
+
         let session_node = ChatSessionNode {
             id: session_id,
             cli_session_id: None,
             project_slug: request.project_slug.clone(),
+            workspace_slug: request.workspace_slug.clone(),
             cwd: request.cwd.clone(),
             title: None,
             model: model.clone(),
@@ -1383,6 +1460,11 @@ impl ChatManager {
             conversation_id: None,
             preview: None,
             permission_mode: request.permission_mode.clone(),
+            add_dirs: if resolved_add_dirs.is_empty() {
+                None
+            } else {
+                Some(resolved_add_dirs.clone())
+            },
         };
         self.graph
             .create_chat_session(&session_node)
@@ -1419,6 +1501,7 @@ impl ChatManager {
                 None,
                 request.permission_mode.as_deref(),
                 Some(compaction_hooks),
+                &resolved_add_dirs,
             )
             .await;
         let mut client = InteractiveClient::new(options)
@@ -3206,6 +3289,7 @@ impl ChatManager {
             hooks
         };
 
+        let resume_add_dirs = session_node.add_dirs.clone().unwrap_or_default();
         let options = self
             .build_options(
                 &session_node.cwd,
@@ -3214,6 +3298,7 @@ impl ChatManager {
                 cli_session_id,
                 session_node.permission_mode.as_deref(),
                 Some(compaction_hooks),
+                &resume_add_dirs,
             )
             .await;
 
@@ -3701,6 +3786,7 @@ impl ChatManager {
                 session_title: session_info.and_then(|s| s.title.clone()),
                 session_preview: session_info.and_then(|s| s.preview.clone()),
                 project_slug: session_info.and_then(|s| s.project_slug.clone()),
+                workspace_slug: session_info.and_then(|s| s.workspace_slug.clone()),
                 conversation_id: conv_id,
                 hits,
                 best_score,
@@ -4024,7 +4110,15 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None, None)
+            .build_options(
+                "/tmp",
+                "claude-opus-4-6",
+                "test prompt",
+                None,
+                None,
+                None,
+                &[],
+            )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
         assert_eq!(opts.allowed_tools, vec!["mcp__project-orchestrator__*"]);
@@ -4043,7 +4137,15 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "test prompt", None, None, None)
+            .build_options(
+                "/tmp",
+                "claude-opus-4-6",
+                "test prompt",
+                None,
+                None,
+                None,
+                &[],
+            )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
         assert_eq!(opts.allowed_tools, vec!["Bash(git *)", "Read"]);
@@ -4064,6 +4166,7 @@ mod tests {
                 None,
                 Some("bypassPermissions"),
                 None,
+                &[],
             )
             .await;
         assert!(matches!(
@@ -4073,7 +4176,7 @@ mod tests {
 
         // Without override, falls back to global (Default)
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None)
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[])
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
     }
@@ -4133,7 +4236,7 @@ mod tests {
 
         // Initially Default (safe-by-default)
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None)
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[])
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
 
@@ -4149,7 +4252,7 @@ mod tests {
 
         // New build_options should reflect the update
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None)
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[])
             .await;
         assert!(matches!(
             opts.permission_mode,
@@ -4213,6 +4316,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
             )
             .await;
 
@@ -4235,6 +4339,7 @@ mod tests {
                 Some("cli-session-abc"),
                 None,
                 None,
+                &[],
             )
             .await;
 
@@ -4248,7 +4353,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         let options = manager
-            .build_options("/tmp", "model", "prompt", None, None, None)
+            .build_options("/tmp", "model", "prompt", None, None, None, &[])
             .await;
 
         let mcp = options.mcp_servers.get("project-orchestrator").unwrap();
@@ -4284,7 +4389,7 @@ mod tests {
         );
 
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, Some(hooks))
+            .build_options("/tmp", "model", "prompt", None, None, Some(hooks), &[])
             .await;
 
         // Hooks should be configured
@@ -4301,11 +4406,127 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, None)
+            .build_options("/tmp", "model", "prompt", None, None, None, &[])
             .await;
 
         // No hooks configured
         assert!(opts.hooks.is_none());
+    }
+
+    // ====================================================================
+    // resolve_add_dirs & build_options with add_dirs
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_resolve_add_dirs_explicit() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let dirs = vec!["/path/a".to_string(), "/path/b".to_string()];
+        let result = manager
+            .resolve_add_dirs("/tmp", Some(&dirs), None, None)
+            .await;
+
+        assert_eq!(result, vec!["/path/a", "/path/b"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_add_dirs_empty() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager.resolve_add_dirs("/tmp", None, None, None).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_add_dirs_workspace() {
+        let state = mock_app_state();
+
+        // Create a workspace and projects
+        let ws = crate::test_helpers::test_workspace();
+        state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let mut p1 = crate::test_helpers::test_project();
+        p1.root_path = "/home/user/proj-a".to_string();
+        state.neo4j.create_project(&p1).await.unwrap();
+        state
+            .neo4j
+            .add_project_to_workspace(ws.id, p1.id)
+            .await
+            .unwrap();
+
+        let mut p2 = crate::test_helpers::test_project();
+        p2.root_path = "/home/user/proj-b".to_string();
+        state.neo4j.create_project(&p2).await.unwrap();
+        state
+            .neo4j
+            .add_project_to_workspace(ws.id, p2.id)
+            .await
+            .unwrap();
+
+        let mut p3 = crate::test_helpers::test_project();
+        p3.root_path = "/home/user/proj-cwd".to_string();
+        state.neo4j.create_project(&p3).await.unwrap();
+        state
+            .neo4j
+            .add_project_to_workspace(ws.id, p3.id)
+            .await
+            .unwrap();
+
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // cwd matches p3, so only p1 and p2 should be returned
+        let result = manager
+            .resolve_add_dirs("/home/user/proj-cwd", None, Some(&ws.slug), None)
+            .await;
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"/home/user/proj-a".to_string()));
+        assert!(result.contains(&"/home/user/proj-b".to_string()));
+        assert!(!result.contains(&"/home/user/proj-cwd".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_add_dirs_workspace_not_found() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let result = manager
+            .resolve_add_dirs("/tmp", None, Some("nonexistent-ws"), None)
+            .await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_options_with_add_dirs() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let dirs = ["/extra/dir1".to_string(), "/extra/dir2".to_string()];
+        let opts = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &dirs)
+            .await;
+
+        assert_eq!(opts.add_dirs.len(), 2);
+        assert!(opts
+            .add_dirs
+            .contains(&std::path::PathBuf::from("/extra/dir1")));
+        assert!(opts
+            .add_dirs
+            .contains(&std::path::PathBuf::from("/extra/dir2")));
+    }
+
+    #[tokio::test]
+    async fn test_build_options_without_add_dirs() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let opts = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &[])
+            .await;
+
+        assert!(opts.add_dirs.is_empty());
     }
 
     // ====================================================================
@@ -5100,6 +5321,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             cli_session_id: Some("cli-123".into()),
             project_slug: Some("test-proj".into()),
+            workspace_slug: None,
             cwd: "/home/user/code".into(),
             title: Some("My session".into()),
             model: "claude-opus-4-6".into(),
@@ -5110,6 +5332,7 @@ mod tests {
             conversation_id: Some("conv-abc-123".into()),
             preview: Some("Hello, can you help me with this?".into()),
             permission_mode: None,
+            add_dirs: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -5456,6 +5679,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             cli_session_id: None,
             project_slug: None,
+            workspace_slug: None,
             cwd: "/tmp".into(),
             title: None,
             model: "model".into(),
@@ -5466,6 +5690,7 @@ mod tests {
             conversation_id: Some("conv-serde-test".into()),
             preview: None,
             permission_mode: None,
+            add_dirs: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -5484,6 +5709,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             cli_session_id: None,
             project_slug: None,
+            workspace_slug: None,
             cwd: "/tmp".into(),
             title: None,
             model: "model".into(),
@@ -5494,6 +5720,7 @@ mod tests {
             conversation_id: None,
             preview: None,
             permission_mode: None,
+            add_dirs: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();

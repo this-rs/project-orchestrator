@@ -167,6 +167,7 @@ pub async fn list_sessions(
             id: s.id.to_string(),
             cli_session_id: s.cli_session_id,
             project_slug: s.project_slug,
+            workspace_slug: s.workspace_slug,
             cwd: s.cwd,
             title: s.title,
             model: s.model,
@@ -177,6 +178,7 @@ pub async fn list_sessions(
             conversation_id: s.conversation_id,
             preview: s.preview,
             permission_mode: s.permission_mode,
+            add_dirs: s.add_dirs,
         })
         .collect();
 
@@ -205,6 +207,7 @@ pub async fn get_session(
         id: node.id.to_string(),
         cli_session_id: node.cli_session_id,
         project_slug: node.project_slug,
+        workspace_slug: node.workspace_slug,
         cwd: node.cwd,
         title: node.title,
         model: node.model,
@@ -215,6 +218,7 @@ pub async fn get_session(
         conversation_id: node.conversation_id,
         preview: node.preview,
         permission_mode: node.permission_mode,
+        add_dirs: node.add_dirs,
     }))
 }
 
@@ -782,6 +786,91 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["items"][0]["conversation_id"], "conv-xyz");
+    }
+
+    // ====================================================================
+    // workspace_slug & add_dirs in session responses
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_session_includes_workspace_slug() {
+        let mut session = test_chat_session(Some("my-proj"));
+        session.workspace_slug = Some("my-workspace".into());
+        let session_id = session.id;
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/chat/sessions/{}", session_id)))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["workspace_slug"], "my-workspace");
+    }
+
+    #[tokio::test]
+    async fn test_get_session_includes_add_dirs() {
+        let mut session = test_chat_session(Some("my-proj"));
+        session.add_dirs = Some(vec!["/extra/a".into(), "/extra/b".into()]);
+        let session_id = session.id;
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/chat/sessions/{}", session_id)))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let dirs = json["add_dirs"].as_array().unwrap();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0], "/extra/a");
+        assert_eq!(dirs[1], "/extra/b");
+    }
+
+    #[tokio::test]
+    async fn test_get_session_workspace_null_by_default() {
+        let session = test_chat_session(None);
+        let session_id = session.id;
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/chat/sessions/{}", session_id)))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["workspace_slug"].is_null());
+        assert!(json["add_dirs"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_includes_workspace_and_add_dirs() {
+        let mut s1 = test_chat_session(Some("proj-a"));
+        s1.workspace_slug = Some("ws-1".into());
+        s1.add_dirs = Some(vec!["/dir/x".into()]);
+        let app = test_app_with_sessions(&[s1]).await;
+
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["items"][0]["workspace_slug"], "ws-1");
+        assert_eq!(json["items"][0]["add_dirs"][0], "/dir/x");
     }
 
     // ====================================================================

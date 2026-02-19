@@ -7121,6 +7121,7 @@ impl Neo4jClient {
                     id: $id,
                     cli_session_id: $cli_session_id,
                     project_slug: $project_slug,
+                    workspace_slug: $workspace_slug,
                     cwd: $cwd,
                     title: $title,
                     model: $model,
@@ -7130,7 +7131,8 @@ impl Neo4jClient {
                     total_cost_usd: $total_cost_usd,
                     conversation_id: $conversation_id,
                     preview: $preview,
-                    permission_mode: $permission_mode
+                    permission_mode: $permission_mode,
+                    add_dirs: $add_dirs
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -7146,6 +7148,7 @@ impl Neo4jClient {
                     id: $id,
                     cli_session_id: $cli_session_id,
                     project_slug: $project_slug,
+                    workspace_slug: $workspace_slug,
                     cwd: $cwd,
                     title: $title,
                     model: $model,
@@ -7155,7 +7158,8 @@ impl Neo4jClient {
                     total_cost_usd: $total_cost_usd,
                     conversation_id: $conversation_id,
                     preview: $preview,
-                    permission_mode: $permission_mode
+                    permission_mode: $permission_mode,
+                    add_dirs: $add_dirs
                 })
                 "#,
             )
@@ -7172,6 +7176,10 @@ impl Neo4jClient {
                         "project_slug",
                         session.project_slug.clone().unwrap_or_default(),
                     )
+                    .param(
+                        "workspace_slug",
+                        session.workspace_slug.clone().unwrap_or_default(),
+                    )
                     .param("cwd", session.cwd.clone())
                     .param("title", session.title.clone().unwrap_or_default())
                     .param("model", session.model.clone())
@@ -7187,6 +7195,11 @@ impl Neo4jClient {
                     .param(
                         "permission_mode",
                         session.permission_mode.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "add_dirs",
+                        serde_json::to_string(&session.add_dirs.clone().unwrap_or_default())
+                            .unwrap_or_else(|_| "[]".to_string()),
                     ),
             )
             .await?;
@@ -7430,10 +7443,21 @@ impl Neo4jClient {
     fn parse_chat_session_node(node: &neo4rs::Node) -> Result<ChatSessionNode> {
         let cli_session_id: String = node.get("cli_session_id").unwrap_or_default();
         let project_slug: String = node.get("project_slug").unwrap_or_default();
+        let workspace_slug: String = node.get("workspace_slug").unwrap_or_default();
         let title: String = node.get("title").unwrap_or_default();
         let conversation_id: String = node.get("conversation_id").unwrap_or_default();
         let preview: String = node.get("preview").unwrap_or_default();
         let permission_mode: String = node.get("permission_mode").unwrap_or_default();
+        let add_dirs_json: String = node.get("add_dirs").unwrap_or_default();
+
+        // Deserialize add_dirs from JSON string (backward compat: empty string → None)
+        let add_dirs: Option<Vec<String>> = if add_dirs_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&add_dirs_json)
+                .ok()
+                .and_then(|v: Vec<String>| if v.is_empty() { None } else { Some(v) })
+        };
 
         Ok(ChatSessionNode {
             id: node.get::<String>("id")?.parse()?,
@@ -7446,6 +7470,11 @@ impl Neo4jClient {
                 None
             } else {
                 Some(project_slug)
+            },
+            workspace_slug: if workspace_slug.is_empty() {
+                None
+            } else {
+                Some(workspace_slug)
             },
             cwd: node.get("cwd")?,
             title: if title.is_empty() { None } else { Some(title) },
@@ -7482,6 +7511,7 @@ impl Neo4jClient {
             } else {
                 Some(permission_mode)
             },
+            add_dirs,
         })
     }
 

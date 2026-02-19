@@ -51,6 +51,9 @@ pub struct ChatSessionNode {
     pub cli_session_id: Option<String>,
     /// Associated project slug
     pub project_slug: Option<String>,
+    /// Associated workspace slug (if session spans a workspace)
+    #[serde(default)]
+    pub workspace_slug: Option<String>,
     /// Working directory
     pub cwd: String,
     /// Session title (auto-generated or user-provided)
@@ -76,6 +79,9 @@ pub struct ChatSessionNode {
     /// Permission mode override for this session (None = use global config)
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Additional directories exposed to Claude CLI (serialized as JSON array string in Neo4j)
+    #[serde(default)]
+    pub add_dirs: Option<Vec<String>>,
 }
 
 // ============================================================================
@@ -1152,5 +1158,75 @@ mod tests {
         let json = r#"{"from_id":"00000000-0000-0000-0000-000000000001","to_id":"00000000-0000-0000-0000-000000000002","protocol":"grpc"}"#;
         let dep: ComponentDependency = serde_json::from_str(json).unwrap();
         assert!(dep.required);
+    }
+
+    #[test]
+    fn test_chat_session_node_with_workspace_and_add_dirs() {
+        let session = ChatSessionNode {
+            id: Uuid::new_v4(),
+            cli_session_id: None,
+            project_slug: Some("proj".to_string()),
+            workspace_slug: Some("my-ws".to_string()),
+            cwd: "/tmp".to_string(),
+            title: None,
+            model: "model".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            message_count: 0,
+            total_cost_usd: Some(0.0),
+            conversation_id: None,
+            preview: None,
+            permission_mode: None,
+            add_dirs: Some(vec!["/dir/a".to_string(), "/dir/b".to_string()]),
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        let de: ChatSessionNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.workspace_slug.as_deref(), Some("my-ws"));
+        assert_eq!(de.add_dirs.as_ref().unwrap().len(), 2);
+        assert_eq!(de.add_dirs.as_ref().unwrap()[0], "/dir/a");
+    }
+
+    #[test]
+    fn test_chat_session_node_workspace_fields_default() {
+        let session = ChatSessionNode {
+            id: Uuid::new_v4(),
+            cli_session_id: None,
+            project_slug: None,
+            workspace_slug: None,
+            cwd: "/tmp".to_string(),
+            title: None,
+            model: "model".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            message_count: 0,
+            total_cost_usd: Some(0.0),
+            conversation_id: None,
+            preview: None,
+            permission_mode: None,
+            add_dirs: None,
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        let de: ChatSessionNode = serde_json::from_str(&json).unwrap();
+        assert!(de.workspace_slug.is_none());
+        assert!(de.add_dirs.is_none());
+    }
+
+    #[test]
+    fn test_chat_session_node_deserialize_missing_workspace_fields() {
+        // Backward compatibility: JSON without workspace_slug/add_dirs should deserialize fine
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "cwd": "/tmp",
+            "model": "claude-opus-4-6",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "message_count": 0,
+            "total_cost_usd": 0.0
+        }"#;
+        let session: ChatSessionNode = serde_json::from_str(json).unwrap();
+        assert!(session.workspace_slug.is_none());
+        assert!(session.add_dirs.is_none());
     }
 }
