@@ -224,6 +224,26 @@ Exemple de décomposition correcte :
 - `get_file_dependencies(file_path)` → imports et dépendants
 - `get_context_notes(entity_type, entity_id)` → notes pertinentes (guidelines, gotchas...)
 
+### Analyse structurelle (GDS)
+
+Quand les données GDS (Graph Data Science) sont disponibles sur le projet :
+
+1. **Comprendre la structure modulaire** → `get_code_communities(project_slug)`
+   - Clusters Louvain de fichiers/fonctions fortement couplés
+   - Chaque communauté a ses fichiers clés et métriques de cohésion
+   - **Utilise ceci** : avant un refactoring, pour comprendre les frontières modulaires
+
+2. **Évaluer la santé du codebase** → `get_code_health(project_slug)`
+   - God functions (trop de connexions), fichiers orphelins (0 connexions), couplage moyen, dépendances circulaires
+   - **Utilise ceci** : en début de projet, revue de code, ou priorisation de dette technique
+
+3. **Évaluer l'importance d'un nœud** → `get_node_importance(project_slug, node_path, node_type)`
+   - PageRank, betweenness centrality, bridge detection, risk level
+   - Retourne un summary interprétatif (critical/high/medium/low)
+   - **Utilise ceci** : avant de modifier un fichier/fonction, pour évaluer le risque de régression
+
+**Note** : ces outils nécessitent que les métriques GDS aient été calculées. Si les résultats sont vides, le codebase n'a pas encore été analysé par GDS.
+
 ### Stratégie de recherche — MCP-first (OBLIGATOIRE)
 
 **Règle absolue** : TOUJOURS utiliser les outils MCP d'exploration de code EN PREMIER.
@@ -299,6 +319,7 @@ link_note_to_entity(note_id, "function", "build_system_prompt")
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
+use uuid::Uuid;
 
 // ============================================================================
 // Tool catalog — static grouping of MCP tools for meta-prompting
@@ -529,6 +550,45 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             ToolRef {
                 name: "get_impl_blocks",
                 description: "Blocs impl d'un type",
+            },
+        ],
+    },
+    // ── Structural Analytics (3 tools) ────────────────────────────────
+    ToolGroup {
+        name: "structural_analytics",
+        description: "Analyse structurelle GDS : communautés, santé du code, importance des nœuds",
+        keywords: &[
+            "communauté",
+            "community",
+            "louvain",
+            "cluster",
+            "santé",
+            "health",
+            "god function",
+            "orphelin",
+            "couplage",
+            "circulaire",
+            "importance",
+            "pagerank",
+            "betweenness",
+            "centralité",
+            "bridge",
+            "risque",
+            "analytique",
+            "GDS",
+        ],
+        tools: &[
+            ToolRef {
+                name: "get_code_communities",
+                description: "Communautés de code (clusters Louvain) avec fichiers clés et métriques de cohésion",
+            },
+            ToolRef {
+                name: "get_code_health",
+                description: "Rapport santé du codebase : god functions, fichiers orphelins, couplage, dépendances circulaires",
+            },
+            ToolRef {
+                name: "get_node_importance",
+                description: "Importance structurelle d'un fichier/fonction : PageRank, betweenness, bridge detection, risk level, summary interprétatif",
             },
         ],
     },
@@ -792,6 +852,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             ToolRef {
                 name: "add_commit_to_release",
                 description: "Lier commit → release",
+            },
+            ToolRef {
+                name: "remove_commit_from_release",
+                description: "Délier commit d'une release",
             },
             ToolRef {
                 name: "create_milestone",
@@ -1221,6 +1285,8 @@ pub struct ProjectContext {
     pub key_files: Vec<ConnectedFileNode>,
     pub feature_graphs: Vec<FeatureGraphNode>,
     pub last_synced: Option<DateTime<Utc>>,
+    /// Pre-built GDS topology section (communities, bridges, health alerts)
+    pub structural_topology: Option<String>,
 }
 
 // ============================================================================
@@ -1368,7 +1434,103 @@ pub async fn fetch_project_context(
         .await
         .unwrap_or_default();
 
+    // 12. Structural topology (GDS communities, bridges, health alerts)
+    ctx.structural_topology = build_gds_topology_section(graph, project_id).await;
+
     Ok(ctx)
+}
+
+/// Build a Markdown section with GDS topology data for the system prompt.
+/// Returns None if no GDS data is available (graceful degradation).
+async fn build_gds_topology_section(
+    graph: &Arc<dyn GraphStore>,
+    project_id: Uuid,
+) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
+
+    // 1. Code Communities
+    let communities = graph
+        .get_project_communities(project_id)
+        .await
+        .unwrap_or_default();
+
+    if communities.is_empty() {
+        return None; // No GDS data at all
+    }
+
+    let mut comm_lines = vec!["### Code Communities (structural clusters)".to_string()];
+    let mut sorted_communities = communities;
+    sorted_communities.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+    for c in sorted_communities.iter().take(5) {
+        let key_files_str = if c.key_files.len() > 3 {
+            format!("{}, ...", c.key_files[..3].join(", "))
+        } else {
+            c.key_files.join(", ")
+        };
+        comm_lines.push(format!(
+            "- **{}** ({} files): {}",
+            c.community_label, c.file_count, key_files_str
+        ));
+    }
+    sections.push(comm_lines.join("\n"));
+
+    // 2. Bridge Files
+    let bridges = graph
+        .get_top_bridges_by_betweenness(project_id, 3)
+        .await
+        .unwrap_or_default();
+
+    if !bridges.is_empty() {
+        let mut bridge_lines = vec!["### Bridge Files (high blast radius)".to_string()];
+        for b in &bridges {
+            let label = b.community_label.as_deref().unwrap_or("unknown");
+            bridge_lines.push(format!(
+                "- {} — betweenness {:.2}, community: {}",
+                b.path, b.betweenness, label
+            ));
+        }
+        bridge_lines.push("Changes to bridge files affect multiple communities.".to_string());
+        sections.push(bridge_lines.join("\n"));
+    }
+
+    // 3. Structural Alerts (god functions + circular deps)
+    let health = graph.get_code_health_report(project_id, 10).await.ok();
+
+    let circular = graph
+        .get_circular_dependencies(project_id)
+        .await
+        .unwrap_or_default();
+
+    let has_god_functions = health
+        .as_ref()
+        .map(|h| !h.god_functions.is_empty())
+        .unwrap_or(false);
+    let has_cycles = !circular.is_empty();
+
+    if has_god_functions || has_cycles {
+        let mut alert_lines = vec!["### Structural Alerts".to_string()];
+
+        if let Some(ref h) = health {
+            for gf in h.god_functions.iter().take(5) {
+                alert_lines.push(format!(
+                    "- God function: {} ({} callers, {} callees) in {}",
+                    gf.name, gf.in_degree, gf.out_degree, gf.file
+                ));
+            }
+        }
+
+        for cycle in circular.iter().take(3) {
+            alert_lines.push(format!("- Circular dep: {}", cycle.join(" -> ")));
+        }
+
+        sections.push(alert_lines.join("\n"));
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
 }
 
 // ============================================================================
@@ -1573,6 +1735,13 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
         map.insert("feature_graphs".into(), serde_json::Value::Array(fgs));
     }
 
+    if let Some(ref topo) = ctx.structural_topology {
+        map.insert(
+            "structural_topology".into(),
+            serde_json::Value::String(topo.clone()),
+        );
+    }
+
     if let Some(ref ts) = ctx.last_synced {
         map.insert(
             "last_synced".into(),
@@ -1718,6 +1887,12 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
             ));
         }
         md.push('\n');
+    }
+
+    if let Some(ref topo) = ctx.structural_topology {
+        md.push_str("## Topologie structurelle\n");
+        md.push_str(topo);
+        md.push_str("\n\n");
     }
 
     if !ctx.feature_graphs.is_empty() {
@@ -2327,11 +2502,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_149_tools() {
+    fn test_tool_groups_cover_all_153_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 149,
-            "TOOL_GROUPS must cover exactly 149 unique tools (got {}). \
+            count, 153,
+            "TOOL_GROUPS must cover exactly 153 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -2381,7 +2556,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 14, "Expected 14 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 15, "Expected 15 tool groups");
     }
 
     #[test]
@@ -2654,6 +2829,206 @@ mod tests {
         assert!(
             section.contains("…"),
             "Long descriptions should be truncated with …"
+        );
+    }
+
+    // ================================================================
+    // GDS topology section tests
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_topology_section_with_full_data() {
+        use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::test_helpers::{mock_app_state_with, test_project_named};
+
+        let graph = MockGraphStore::new();
+        let project = test_project_named("topo-proj");
+        graph.create_project(&project).await.unwrap();
+
+        let file_paths = vec![
+            "src/api/handlers.rs",
+            "src/api/routes.rs",
+            "src/neo4j/client.rs",
+            "src/neo4j/models.rs",
+        ];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = crate::neo4j::models::FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Analytics → 2 communities + bridge
+        graph
+            .batch_update_file_analytics(&[
+                FileAnalyticsUpdate {
+                    path: "src/api/handlers.rs".to_string(),
+                    pagerank: 0.8,
+                    betweenness: 0.5,
+                    community_id: 0,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.4,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/api/routes.rs".to_string(),
+                    pagerank: 0.4,
+                    betweenness: 0.1,
+                    community_id: 0,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.3,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/neo4j/client.rs".to_string(),
+                    pagerank: 0.9,
+                    betweenness: 0.8,
+                    community_id: 1,
+                    community_label: "neo4j".to_string(),
+                    clustering_coefficient: 0.6,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/neo4j/models.rs".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.05,
+                    community_id: 1,
+                    community_label: "neo4j".to_string(),
+                    clustering_coefficient: 0.5,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+
+        let ctx = fetch_project_context(&state.neo4j, "topo-proj")
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.structural_topology.is_some(),
+            "should have structural topology"
+        );
+        let topo = ctx.structural_topology.unwrap();
+
+        // Check communities section
+        assert!(
+            topo.contains("Code Communities"),
+            "should have communities header"
+        );
+        assert!(topo.contains("api"), "should mention api community");
+        assert!(topo.contains("neo4j"), "should mention neo4j community");
+
+        // Check bridges section
+        assert!(topo.contains("Bridge Files"), "should have bridges header");
+        assert!(
+            topo.contains("neo4j/client.rs"),
+            "neo4j/client.rs should be a bridge (highest betweenness)"
+        );
+
+        // Size check: < 2000 chars
+        assert!(
+            topo.len() < 2000,
+            "topology section should be compact, got {} chars",
+            topo.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topology_section_no_gds_data() {
+        use crate::test_helpers::{mock_app_state, test_project_named};
+
+        let state = mock_app_state();
+        let project = test_project_named("no-gds-proj");
+        state.neo4j.create_project(&project).await.unwrap();
+
+        let ctx = fetch_project_context(&state.neo4j, "no-gds-proj")
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.structural_topology.is_none(),
+            "should be None when no GDS data"
+        );
+
+        // Verify markdown output has no topology
+        let md = context_to_markdown(&ctx, None);
+        assert!(
+            !md.contains("Topologie structurelle"),
+            "markdown should not contain topology section"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topology_section_in_json() {
+        use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::test_helpers::{mock_app_state_with, test_project_named};
+
+        let graph = MockGraphStore::new();
+        let project = test_project_named("json-topo");
+        graph.create_project(&project).await.unwrap();
+
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .push("src/main.rs".to_string());
+
+        let file = crate::neo4j::models::FileNode {
+            path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "test".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project.id),
+        };
+        graph.upsert_file(&file).await.unwrap();
+
+        graph
+            .batch_update_file_analytics(&[FileAnalyticsUpdate {
+                path: "src/main.rs".to_string(),
+                pagerank: 0.5,
+                betweenness: 0.2,
+                community_id: 0,
+                community_label: "main".to_string(),
+                clustering_coefficient: 0.3,
+                component_id: 0,
+            }])
+            .await
+            .unwrap();
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let ctx = fetch_project_context(&state.neo4j, "json-topo")
+            .await
+            .unwrap();
+
+        let json_str = context_to_json(&ctx);
+        assert!(
+            json_str.contains("structural_topology"),
+            "JSON should contain structural_topology key"
+        );
+        assert!(
+            json_str.contains("Code Communities"),
+            "JSON should contain communities data"
         );
     }
 }

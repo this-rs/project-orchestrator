@@ -3377,8 +3377,10 @@ impl Neo4jClient {
             OPTIONAL MATCH (f)-[:IMPORTS]->(imported:File)
             OPTIONAL MATCH (dependent:File)-[:IMPORTS]->(f)
             WITH f, count(DISTINCT imported) AS imports, count(DISTINCT dependent) AS dependents
-            RETURN f.path AS path, imports, dependents, imports + dependents AS connections
-            ORDER BY connections DESC
+            RETURN f.path AS path, imports, dependents, imports + dependents AS connections,
+                   f.pagerank AS pagerank, f.betweenness AS betweenness,
+                   f.community_label AS community_label, f.community_id AS community_id
+            ORDER BY COALESCE(f.pagerank, 0) DESC, connections DESC
             LIMIT $limit
             "#,
         )
@@ -3393,6 +3395,10 @@ impl Neo4jClient {
                     path,
                     imports: row.get("imports").unwrap_or(0),
                     dependents: row.get("dependents").unwrap_or(0),
+                    pagerank: row.get::<f64>("pagerank").ok(),
+                    betweenness: row.get::<f64>("betweenness").ok(),
+                    community_label: row.get::<String>("community_label").ok(),
+                    community_id: row.get::<i64>("community_id").ok(),
                 });
             }
         }
@@ -3413,8 +3419,10 @@ impl Neo4jClient {
             OPTIONAL MATCH (f)-[:IMPORTS]->(imported:File)
             OPTIONAL MATCH (dependent:File)-[:IMPORTS]->(f)
             WITH f, count(DISTINCT imported) AS imports, count(DISTINCT dependent) AS dependents
-            RETURN f.path AS path, imports, dependents, imports + dependents AS connections
-            ORDER BY connections DESC
+            RETURN f.path AS path, imports, dependents, imports + dependents AS connections,
+                   f.pagerank AS pagerank, f.betweenness AS betweenness,
+                   f.community_label AS community_label, f.community_id AS community_id
+            ORDER BY COALESCE(f.pagerank, 0) DESC, connections DESC
             LIMIT $limit
             "#,
         )
@@ -3430,11 +3438,394 @@ impl Neo4jClient {
                     path,
                     imports: row.get("imports").unwrap_or(0),
                     dependents: row.get("dependents").unwrap_or(0),
+                    pagerank: row.get::<f64>("pagerank").ok(),
+                    betweenness: row.get::<f64>("betweenness").ok(),
+                    community_label: row.get::<String>("community_label").ok(),
+                    community_id: row.get::<i64>("community_id").ok(),
                 });
             }
         }
 
         Ok(files)
+    }
+
+    /// Get distinct communities for a project (from graph analytics Louvain clustering).
+    /// Returns communities sorted by file_count descending.
+    pub async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE f.community_id IS NOT NULL
+            WITH f.community_id AS cid, f.community_label AS label,
+                 count(f) AS file_count,
+                 collect(f.path) AS all_paths
+            ORDER BY file_count DESC
+            RETURN cid, label, file_count,
+                   [p IN all_paths | p][..3] AS key_files
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut communities = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let community_id = row.get::<i64>("cid").unwrap_or(0);
+            let community_label = row
+                .get::<String>("label")
+                .unwrap_or_else(|_| format!("Community {}", community_id));
+            let file_count = row.get::<i64>("file_count").unwrap_or(0) as usize;
+            let key_files: Vec<String> = row.get::<Vec<String>>("key_files").unwrap_or_default();
+
+            communities.push(CommunityRow {
+                community_id,
+                community_label,
+                file_count,
+                key_files,
+            });
+        }
+
+        Ok(communities)
+    }
+
+    /// Get GDS analytics properties for a node (File by path, or Function by name).
+    pub async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>> {
+        let cypher = if node_type == "function" {
+            r#"
+            MATCH (n:Function {name: $id})
+            RETURN n.pagerank AS pagerank, n.betweenness AS betweenness,
+                   n.community_id AS community_id, n.community_label AS community_label
+            LIMIT 1
+            "#
+        } else {
+            r#"
+            MATCH (n:File {path: $id})
+            RETURN n.pagerank AS pagerank, n.betweenness AS betweenness,
+                   n.community_id AS community_id, n.community_label AS community_label
+            LIMIT 1
+            "#
+        };
+
+        let q = query(cypher).param("id", identifier);
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            Ok(Some(NodeAnalyticsRow {
+                pagerank: row.get::<f64>("pagerank").ok(),
+                betweenness: row.get::<f64>("betweenness").ok(),
+                community_id: row.get::<i64>("community_id").ok(),
+                community_label: row.get::<String>("community_label").ok(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get distinct community labels for a list of file paths.
+    pub async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>> {
+        if file_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let q = query(
+            r#"
+            MATCH (f:File)
+            WHERE f.path IN $paths AND f.community_label IS NOT NULL
+            RETURN DISTINCT f.community_label AS label
+            ORDER BY label
+            "#,
+        )
+        .param("paths", file_paths.to_vec());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut labels = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(label) = row.get::<String>("label") {
+                labels.push(label);
+            }
+        }
+
+        Ok(labels)
+    }
+
+    /// Get a structural health report for a project: god functions, orphan files, coupling metrics.
+    pub async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> Result<CodeHealthReport> {
+        use crate::neo4j::models::{CodeHealthReport, CouplingMetrics, GodFunction};
+
+        // God functions: functions with high in-degree (many callers)
+        let god_q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)-[:CONTAINS]->(func:Function)
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(func)
+            OPTIONAL MATCH (func)-[:CALLS]->(callee:Function)
+            WITH func, f, count(DISTINCT caller) AS in_deg, count(DISTINCT callee) AS out_deg
+            WHERE in_deg >= $threshold
+            RETURN func.name AS name, f.path AS file, in_deg, out_deg
+            ORDER BY in_deg DESC
+            LIMIT 10
+            "#,
+        )
+        .param("pid", project_id.to_string())
+        .param("threshold", god_function_threshold as i64);
+
+        let god_rows = self.execute_with_params(god_q).await?;
+        let god_functions: Vec<GodFunction> = god_rows
+            .iter()
+            .filter_map(|row| {
+                let name = row.get::<String>("name").ok()?;
+                let file = row.get::<String>("file").ok()?;
+                let in_degree = row.get::<i64>("in_deg").unwrap_or(0) as usize;
+                let out_degree = row.get::<i64>("out_deg").unwrap_or(0) as usize;
+                Some(GodFunction {
+                    name,
+                    file,
+                    in_degree,
+                    out_degree,
+                })
+            })
+            .collect();
+
+        // Orphan files: files with no IMPORTS relationships (neither importing nor imported)
+        let orphan_q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE NOT EXISTS { (f)-[:IMPORTS]->() }
+              AND NOT EXISTS { ()-[:IMPORTS]->(f) }
+              AND NOT EXISTS { (f)-[:CONTAINS]->(:Function) }
+            RETURN f.path AS path
+            ORDER BY path
+            LIMIT 20
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let orphan_rows = self.execute_with_params(orphan_q).await?;
+        let orphan_files: Vec<String> = orphan_rows
+            .iter()
+            .filter_map(|row| row.get::<String>("path").ok())
+            .collect();
+
+        // Coupling metrics from clustering_coefficient
+        let coupling_q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE f.clustering_coefficient IS NOT NULL
+            WITH avg(f.clustering_coefficient) AS avg_cc,
+                 max(f.clustering_coefficient) AS max_cc,
+                 collect({path: f.path, cc: f.clustering_coefficient}) AS files
+            WITH avg_cc, max_cc, files,
+                 [x IN files WHERE x.cc = max_cc | x.path][0] AS most_coupled
+            RETURN avg_cc, max_cc, most_coupled
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let coupling_rows = self.execute_with_params(coupling_q).await?;
+        let coupling_metrics = coupling_rows.first().and_then(|row| {
+            let avg = row.get::<f64>("avg_cc").ok()?;
+            let max = row.get::<f64>("max_cc").ok()?;
+            let most_coupled = row.get::<String>("most_coupled").ok();
+            Some(CouplingMetrics {
+                avg_clustering_coefficient: avg,
+                max_clustering_coefficient: max,
+                most_coupled_file: most_coupled,
+            })
+        });
+
+        Ok(CodeHealthReport {
+            god_functions,
+            orphan_files,
+            coupling_metrics,
+        })
+    }
+
+    /// Detect circular dependencies between files (import cycles).
+    pub async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>> {
+        let q = query(
+            r#"
+            MATCH path = (f:File)-[:IMPORTS*2..5]->(f)
+            WHERE EXISTS { MATCH (p:Project {id: $pid})-[:CONTAINS]->(f) }
+            WITH nodes(path) AS cycle_nodes
+            WITH [n IN cycle_nodes | n.path] AS cycle
+            WITH cycle, cycle[0] AS canonical
+            RETURN DISTINCT cycle
+            ORDER BY size(cycle)
+            LIMIT 10
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        let mut cycles: Vec<Vec<String>> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for row in &rows {
+            if let Ok(cycle) = row.get::<Vec<String>>("cycle") {
+                // Deduplicate: normalize by sorting the cycle to a canonical form
+                let mut canonical = cycle.clone();
+                canonical.sort();
+                let key = canonical.join("|");
+                if seen.insert(key) {
+                    cycles.push(cycle);
+                }
+            }
+        }
+
+        Ok(cycles)
+    }
+
+    /// Get GDS metrics for a specific node (file or function) in a project.
+    pub async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>> {
+        let (id_prop, match_pattern) = match node_type {
+            "function" => (
+                "name",
+                "MATCH (p:Project {id: $pid})-[:CONTAINS]->(:File)-[:CONTAINS]->(n:Function {name: $node_path})",
+            ),
+            _ => (
+                "path",
+                "MATCH (p:Project {id: $pid})-[:CONTAINS]->(n:File {path: $node_path})",
+            ),
+        };
+
+        let cypher = format!(
+            r#"
+            {match_pattern}
+            OPTIONAL MATCH (caller)-[]->(n)
+            WITH n, count(DISTINCT caller) AS in_deg
+            OPTIONAL MATCH (n)-[]->(callee)
+            WITH n, in_deg, count(DISTINCT callee) AS out_deg
+            RETURN
+                n.{id_prop} AS node_path,
+                n.pagerank AS pagerank,
+                n.betweenness AS betweenness,
+                n.clustering_coefficient AS clustering_coefficient,
+                n.community_id AS community_id,
+                n.community_label AS community_label,
+                in_deg, out_deg
+            "#,
+        );
+
+        let q = query(&cypher)
+            .param("pid", project_id.to_string())
+            .param("node_path", node_path);
+
+        let rows = self.execute_with_params(q).await?;
+        if let Some(row) = rows.first() {
+            let path: String = row.get("node_path").unwrap_or_default();
+            if path.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(NodeGdsMetrics {
+                node_path: path,
+                node_type: node_type.to_string(),
+                pagerank: row.get::<f64>("pagerank").ok(),
+                betweenness: row.get::<f64>("betweenness").ok(),
+                clustering_coefficient: row.get::<f64>("clustering_coefficient").ok(),
+                community_id: row.get::<i64>("community_id").ok(),
+                community_label: row.get::<String>("community_label").ok(),
+                in_degree: row.get::<i64>("in_deg").unwrap_or(0),
+                out_degree: row.get::<i64>("out_deg").unwrap_or(0),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get statistical percentiles for GDS metrics across all files+functions in a project.
+    pub async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(n)
+            WHERE (n:File OR n:Function) AND n.pagerank IS NOT NULL
+            WITH collect(toFloat(n.pagerank)) AS prs, collect(toFloat(COALESCE(n.betweenness, 0.0))) AS bws
+            WITH prs, bws,
+                 apoc.coll.sort(prs) AS sorted_pr,
+                 apoc.coll.sort(bws) AS sorted_bw
+            WITH sorted_pr, sorted_bw, size(sorted_pr) AS cnt,
+                 reduce(s = 0.0, x IN bws | s + x) / size(bws) AS bw_mean
+            WITH sorted_pr, sorted_bw, cnt, bw_mean,
+                 sorted_pr[toInteger(cnt * 0.5)] AS pr_p50,
+                 sorted_pr[toInteger(cnt * 0.8)] AS pr_p80,
+                 sorted_pr[toInteger(cnt * 0.95)] AS pr_p95,
+                 sorted_bw[toInteger(cnt * 0.5)] AS bw_p50,
+                 sorted_bw[toInteger(cnt * 0.8)] AS bw_p80,
+                 sorted_bw[toInteger(cnt * 0.95)] AS bw_p95
+            WITH *, reduce(s = 0.0, x IN sorted_bw | s + (x - bw_mean) * (x - bw_mean)) / cnt AS bw_var
+            RETURN pr_p50, pr_p80, pr_p95, bw_p50, bw_p80, bw_p95, bw_mean, sqrt(bw_var) AS bw_stddev
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        if let Some(row) = rows.first() {
+            Ok(ProjectPercentiles {
+                pagerank_p50: row.get::<f64>("pr_p50").unwrap_or(0.0),
+                pagerank_p80: row.get::<f64>("pr_p80").unwrap_or(0.0),
+                pagerank_p95: row.get::<f64>("pr_p95").unwrap_or(0.0),
+                betweenness_p50: row.get::<f64>("bw_p50").unwrap_or(0.0),
+                betweenness_p80: row.get::<f64>("bw_p80").unwrap_or(0.0),
+                betweenness_p95: row.get::<f64>("bw_p95").unwrap_or(0.0),
+                betweenness_mean: row.get::<f64>("bw_mean").unwrap_or(0.0),
+                betweenness_stddev: row.get::<f64>("bw_stddev").unwrap_or(0.0),
+            })
+        } else {
+            // No data — return zeroes
+            Ok(ProjectPercentiles {
+                pagerank_p50: 0.0,
+                pagerank_p80: 0.0,
+                pagerank_p95: 0.0,
+                betweenness_p50: 0.0,
+                betweenness_p80: 0.0,
+                betweenness_p95: 0.0,
+                betweenness_mean: 0.0,
+                betweenness_stddev: 0.0,
+            })
+        }
+    }
+
+    /// Get top N files by betweenness centrality (bridge files).
+    pub async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE f.betweenness IS NOT NULL
+            RETURN f.path AS path, f.betweenness AS betweenness,
+                   f.community_label AS community_label
+            ORDER BY f.betweenness DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("pid", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let rows = self.execute_with_params(q).await?;
+        let mut bridges = Vec::new();
+        for row in &rows {
+            bridges.push(BridgeFile {
+                path: row.get::<String>("path").unwrap_or_default(),
+                betweenness: row.get::<f64>("betweenness").unwrap_or(0.0),
+                community_label: row.get::<String>("community_label").ok(),
+            });
+        }
+        Ok(bridges)
     }
 
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
@@ -5564,6 +5955,25 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Remove a commit from a release
+    pub async fn remove_commit_from_release(
+        &self,
+        release_id: Uuid,
+        commit_hash: &str,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (r:Release {id: $release_id})-[rel:INCLUDES_COMMIT]->(c:Commit {hash: $hash})
+            DELETE rel
+            "#,
+        )
+        .param("release_id", release_id.to_string())
+        .param("hash", commit_hash);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Get release details with tasks and commits
     pub async fn get_release_details(
         &self,
@@ -6924,13 +7334,17 @@ impl Neo4jClient {
             _ => ("id", entity_id.to_string()),
         };
 
-        // Query for notes propagated through the graph
+        // Query for notes propagated through the graph.
+        // The scoring formula integrates PageRank of intermediate nodes:
+        //   avg_path_pagerank = mean of COALESCE(node.pagerank, 0.05) over path nodes
+        //   score = (1/(distance+1)) * importance * (1 + avg_path_pagerank * 5)
+        // This amplifies scores for notes propagated via structurally important hubs.
         let cypher = format!(
             r#"
             MATCH (target:{} {{{}: $entity_id}})
             MATCH path = (n:Note)-[:ATTACHED_TO]->(source)-[:CONTAINS|IMPORTS|CALLS*0..{}]->(target)
             WHERE n.status = 'active'
-            WITH n, source, length(path) - 1 AS distance,
+            WITH n, source, path, length(path) - 1 AS distance,
                  [node IN nodes(path) | coalesce(node.name, node.path, node.id)] AS path_names
             WITH n, source, distance, path_names,
                  CASE n.importance
@@ -6938,12 +7352,16 @@ impl Neo4jClient {
                      WHEN 'high' THEN 0.8
                      WHEN 'medium' THEN 0.5
                      ELSE 0.3
-                 END AS importance_weight
-            WITH n, source, distance, path_names,
-                 (1.0 / (distance + 1)) * importance_weight AS score
+                 END AS importance_weight,
+                 CASE WHEN size(nodes(path)) > 0
+                      THEN reduce(s = 0.0, node IN nodes(path) | s + coalesce(node.pagerank, 0.05)) / size(nodes(path))
+                      ELSE 0.05
+                 END AS avg_path_pagerank
+            WITH n, source, distance, path_names, avg_path_pagerank,
+                 (1.0 / (distance + 1)) * importance_weight * (1.0 + avg_path_pagerank * 5.0) AS score
             WHERE score >= $min_score
             RETURN DISTINCT n, score, coalesce(source.name, source.path, source.id) AS source_entity,
-                   path_names, distance
+                   path_names, distance, avg_path_pagerank
             ORDER BY score DESC
             LIMIT 20
             "#,
@@ -6964,6 +7382,7 @@ impl Neo4jClient {
             let source_entity: String = row.get("source_entity")?;
             let path_names: Vec<String> = row.get("path_names").unwrap_or_default();
             let distance: i64 = row.get("distance")?;
+            let avg_path_pagerank: Option<f64> = row.get::<f64>("avg_path_pagerank").ok();
 
             propagated_notes.push(PropagatedNote {
                 note,
@@ -6971,6 +7390,7 @@ impl Neo4jClient {
                 source_entity,
                 propagation_path: path_names,
                 distance: distance as u32,
+                path_pagerank: avg_path_pagerank,
             });
         }
 
@@ -7009,6 +7429,7 @@ impl Neo4jClient {
                 source_entity: format!("workspace:{}", workspace_name),
                 propagation_path: vec![format!("workspace:{}", workspace_name)],
                 distance: 1, // One hop: project -> workspace
+                path_pagerank: None,
             });
         }
 
@@ -8459,6 +8880,7 @@ impl Neo4jClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn auto_build_feature_graph(
         &self,
         name: &str,
@@ -8467,6 +8889,7 @@ impl Neo4jClient {
         entry_function: &str,
         depth: u32,
         include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
     ) -> Result<FeatureGraphDetail> {
         // Helper: check if a relation type should be included
         let should_include = |rel: &str| -> bool {
@@ -8476,8 +8899,10 @@ impl Neo4jClient {
             }
         };
 
+        let filter_community = filter_community.unwrap_or(true);
+
         // Step 1: Collect all related functions and their files via call graph
-        // We collect the entry function + callers + callees
+        // We collect the entry function + callers + callees, plus community_id for filtering
         let depth = depth.clamp(1, 5);
 
         let q = query(&format!(
@@ -8495,7 +8920,8 @@ impl Neo4jClient {
             UNWIND all_funcs AS f
             WITH DISTINCT f
             WHERE f IS NOT NULL
-            RETURN f.name AS func_name, f.file_path AS file_path
+            RETURN f.name AS func_name, f.file_path AS file_path,
+                   f.community_id AS community_id
             "#,
             depth = depth
         ))
@@ -8504,19 +8930,20 @@ impl Neo4jClient {
 
         let rows = self.execute_with_params(q).await?;
 
-        // Collect unique functions and files
-        let mut functions: Vec<(String, Option<String>)> = Vec::new();
+        // Collect unique functions with community info
+        let mut functions: Vec<(String, Option<String>, Option<i64>)> = Vec::new();
         let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for row in &rows {
             if let Ok(func_name) = row.get::<String>("func_name") {
                 let file_path: Option<String> = row.get::<String>("file_path").ok();
+                let community_id: Option<i64> = row.get::<i64>("community_id").ok();
                 if let Some(ref fp) = file_path {
                     if !fp.is_empty() {
                         files.insert(fp.clone());
                     }
                 }
-                functions.push((func_name, file_path));
+                functions.push((func_name, file_path, community_id));
             }
         }
 
@@ -8525,6 +8952,65 @@ impl Neo4jClient {
                 "No function found matching '{}'",
                 entry_function
             ));
+        }
+
+        // Step 1a: Community-based filtering (post-traversal)
+        // Keep same community OR direct (depth=1) connection OR no community data
+        if filter_community {
+            let entry_community = functions
+                .iter()
+                .find(|(name, _, _)| name == entry_function)
+                .and_then(|(_, _, cid)| *cid);
+
+            if let Some(entry_cid) = entry_community {
+                // Get direct (depth=1) callees and callers for the entry function
+                let direct_q = query(
+                    r#"
+                    MATCH (entry:Function {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                    OPTIONAL MATCH (entry)-[:CALLS]->(dc:Function)
+                    WHERE EXISTS { MATCH (dc)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                    OPTIONAL MATCH (caller:Function)-[:CALLS]->(entry)
+                    WHERE EXISTS { MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                    WITH collect(DISTINCT dc.name) AS direct_callees,
+                         collect(DISTINCT caller.name) AS direct_callers
+                    RETURN direct_callees + direct_callers AS direct_names
+                    "#,
+                )
+                .param("name", entry_function)
+                .param("project_id", project_id.to_string());
+
+                let direct_rows = self.execute_with_params(direct_q).await?;
+                let mut direct_set: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                if let Some(row) = direct_rows.first() {
+                    if let Ok(names) = row.get::<Vec<String>>("direct_names") {
+                        for n in names {
+                            if !n.is_empty() {
+                                direct_set.insert(n);
+                            }
+                        }
+                    }
+                }
+
+                // Filter: keep entry + same community + direct connections + unknown community
+                functions.retain(|(fname, _, cid)| {
+                    fname == entry_function
+                        || direct_set.contains(fname)
+                        || cid.is_none()
+                        || *cid == Some(entry_cid)
+                });
+
+                // Rebuild files set from remaining functions
+                files.clear();
+                for (_, fp, _) in &functions {
+                    if let Some(ref fp) = fp {
+                        if !fp.is_empty() {
+                            files.insert(fp.clone());
+                        }
+                    }
+                }
+            }
+            // If entry has no community_id → no filtering (backward compat)
         }
 
         // Step 1b: Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR for structs/enums in collected files
@@ -8610,7 +9096,7 @@ impl Neo4jClient {
         let mut entities = Vec::new();
 
         // Add functions with role: entry_point for the entry function, core_logic for others
-        for (func_name, _file_path) in &functions {
+        for (func_name, _file_path, _) in &functions {
             let role = if func_name == entry_function {
                 "entry_point"
             } else {
@@ -8931,6 +9417,149 @@ impl Neo4jClient {
         }
 
         Ok(functions)
+    }
+
+    // ========================================================================
+    // Bulk graph extraction (for graph analytics)
+    // ========================================================================
+
+    /// Get all IMPORTS edges between files in a project as (source_path, target_path) pairs.
+    pub async fn get_project_import_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)-[:IMPORTS]->(f2:File)<-[:CONTAINS]-(p)
+            RETURN f1.path AS source, f2.path AS target
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(source), Ok(target)) =
+                (row.get::<String>("source"), row.get::<String>("target"))
+            {
+                edges.push((source, target));
+            }
+        }
+
+        Ok(edges)
+    }
+
+    /// Get all CALLS edges between functions in a project as (caller_id, callee_id) pairs.
+    /// Scoped to the same project (no cross-project calls).
+    pub async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(:File)-[:CONTAINS]->(f1:Function)-[:CALLS]->(f2:Function)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+            RETURN f1.name AS source, f2.name AS target
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(source), Ok(target)) =
+                (row.get::<String>("source"), row.get::<String>("target"))
+            {
+                edges.push((source, target));
+            }
+        }
+
+        Ok(edges)
+    }
+
+    /// Batch-update analytics scores on File nodes via UNWIND.
+    pub async fn batch_update_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FileAnalyticsUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        // Build UNWIND list directly in Cypher (internal computed data, no injection risk)
+        let entries: Vec<String> = updates
+            .iter()
+            .map(|u| {
+                format!(
+                    "{{path: '{}', pagerank: {}, betweenness: {}, community_id: {}, community_label: '{}', clustering_coefficient: {}, component_id: {}}}",
+                    u.path.replace('\'', "\\'"),
+                    u.pagerank,
+                    u.betweenness,
+                    u.community_id,
+                    u.community_label.replace('\'', "\\'"),
+                    u.clustering_coefficient,
+                    u.component_id
+                )
+            })
+            .collect();
+
+        let cypher = format!(
+            r#"
+            UNWIND [{}] AS u
+            MATCH (f:File {{path: u.path}})
+            SET f.pagerank = u.pagerank,
+                f.betweenness = u.betweenness,
+                f.community_id = u.community_id,
+                f.community_label = u.community_label,
+                f.clustering_coefficient = u.clustering_coefficient,
+                f.component_id = u.component_id,
+                f.analytics_updated_at = datetime()
+            "#,
+            entries.join(", ")
+        );
+
+        self.execute(&cypher).await?;
+        Ok(())
+    }
+
+    /// Batch-update analytics scores on Function nodes via UNWIND.
+    pub async fn batch_update_function_analytics(
+        &self,
+        updates: &[crate::graph::models::FunctionAnalyticsUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let entries: Vec<String> = updates
+            .iter()
+            .map(|u| {
+                format!(
+                    "{{name: '{}', pagerank: {}, betweenness: {}, community_id: {}, clustering_coefficient: {}, component_id: {}}}",
+                    u.name.replace('\'', "\\'"),
+                    u.pagerank,
+                    u.betweenness,
+                    u.community_id,
+                    u.clustering_coefficient,
+                    u.component_id
+                )
+            })
+            .collect();
+
+        let cypher = format!(
+            r#"
+            UNWIND [{}] AS u
+            MATCH (f:Function {{name: u.name}})
+            SET f.pagerank = u.pagerank,
+                f.betweenness = u.betweenness,
+                f.community_id = u.community_id,
+                f.clustering_coefficient = u.clustering_coefficient,
+                f.component_id = u.component_id,
+                f.analytics_updated_at = datetime()
+            "#,
+            entries.join(", ")
+        );
+
+        self.execute(&cypher).await?;
+        Ok(())
     }
 
     fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {

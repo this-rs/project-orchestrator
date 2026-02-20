@@ -695,6 +695,18 @@ fn release_tools() -> Vec<ToolDefinition> {
                 required: Some(vec!["release_id".to_string(), "commit_sha".to_string()]),
             },
         },
+        ToolDefinition {
+            name: "remove_commit_from_release".to_string(),
+            description: "Remove a commit from a release".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "release_id": {"type": "string", "description": "Release UUID"},
+                    "commit_sha": {"type": "string", "description": "Commit SHA"}
+                })),
+                required: Some(vec!["release_id".to_string(), "commit_sha".to_string()]),
+            },
+        },
     ]
 }
 
@@ -2082,7 +2094,8 @@ fn chat_tools() -> Vec<ToolDefinition> {
                     "project_id": {"type": "string", "description": "Project UUID"},
                     "entry_function": {"type": "string", "description": "Function name to start traversal from"},
                     "depth": {"type": "integer", "description": "Traversal depth (1-5, default 2)"},
-                    "include_relations": {"type": "array", "items": {"type": "string"}, "description": "Relation types to traverse (default: all). Options: calls, implements_trait, implements_for, imports"}
+                    "include_relations": {"type": "array", "items": {"type": "string"}, "description": "Relation types to traverse (default: all). Options: calls, implements_trait, implements_for, imports"},
+                    "filter_community": {"type": "boolean", "description": "Filter out transitive functions from different communities (default: true). Set to false to include all traversed functions."}
                 })),
                 required: Some(vec![
                     "name".to_string(),
@@ -2100,6 +2113,46 @@ fn chat_tools() -> Vec<ToolDefinition> {
                     "id": {"type": "string", "description": "Feature graph UUID"}
                 })),
                 required: Some(vec!["id".to_string()]),
+            },
+        },
+        // ================================================================
+        // Structural Analytics (3)
+        // ================================================================
+        ToolDefinition {
+            name: "get_code_communities".to_string(),
+            description: "Identify code communities (clusters of tightly coupled files) in a project using structural analysis (Louvain clustering)".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Project slug"},
+                    "min_size": {"type": "integer", "description": "Minimum community size to return (default: 2)"}
+                })),
+                required: Some(vec!["project_slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_code_health".to_string(),
+            description: "Get a structural health report for a project: god functions (too many callers), orphan files (disconnected), coupling metrics (clustering coefficients), and circular dependency detection.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "project_slug": {"type": "string", "description": "Project slug"},
+                    "god_function_threshold": {"type": "integer", "description": "Minimum in-degree to flag as god function (default: 10)"}
+                })),
+                required: Some(vec!["project_slug".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "get_node_importance".to_string(),
+            description: "Get structural importance metrics for a specific file or function: PageRank, betweenness centrality, community membership, degree counts, plus an interpreted importance/risk assessment with human-readable summary.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "node_path": {"type": "string", "description": "File path or function name"},
+                    "node_type": {"type": "string", "enum": ["file", "function"], "description": "Node type (default: file)"},
+                    "project_slug": {"type": "string", "description": "Project slug (required for disambiguation)"}
+                })),
+                required: Some(vec!["node_path".to_string(), "project_slug".to_string()]),
             },
         },
         // ================================================================
@@ -2133,7 +2186,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 149, "Expected 149 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 153, "Expected 153 tools, got {}", tools.len());
     }
 
     #[test]

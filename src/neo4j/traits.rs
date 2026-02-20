@@ -4,6 +4,7 @@
 //! This trait mirrors all public async methods of `Neo4jClient`,
 //! enabling testing with mock implementations and future backend swaps.
 
+use crate::graph::models::{FileAnalyticsUpdate, FunctionAnalyticsUpdate};
 use crate::neo4j::models::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -454,6 +455,49 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ConnectedFileNode>>;
 
+    /// Get distinct communities for a project (from graph analytics Louvain clustering)
+    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>>;
+
+    /// Get GDS analytics properties for a node (File by path, or Function by name).
+    /// Returns None if the node doesn't exist or has no analytics properties.
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>>;
+
+    /// Get distinct community labels for a list of file paths.
+    /// Returns only non-null community_label values.
+    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>>;
+
+    /// Get a structural health report: god functions, orphan files, coupling metrics.
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> Result<crate::neo4j::models::CodeHealthReport>;
+
+    /// Detect circular dependencies between files (import cycles).
+    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>>;
+
+    /// Get GDS metrics for a specific node (file or function) in a project.
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>>;
+
+    /// Get statistical percentiles for GDS metrics across all nodes in a project.
+    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles>;
+
+    /// Get top N files by betweenness centrality (bridge files).
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>>;
+
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
 
@@ -735,6 +779,9 @@ pub trait GraphStore: Send + Sync {
 
     /// Add a commit to a release
     async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
+
+    /// Remove a commit from a release
+    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
 
     /// Get release details with tasks and commits
     async fn get_release_details(
@@ -1158,6 +1205,7 @@ pub trait GraphStore: Send + Sync {
     /// Automatically build a feature graph from a function entry point.
     /// Uses the call graph (callers + callees) to discover related functions and files,
     /// creates a FeatureGraph, and populates it with the discovered entities.
+    #[allow(clippy::too_many_arguments)]
     async fn auto_build_feature_graph(
         &self,
         name: &str,
@@ -1166,6 +1214,7 @@ pub trait GraphStore: Send + Sync {
         entry_function: &str,
         depth: u32,
         include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
     ) -> Result<FeatureGraphDetail>;
 
     /// Refresh an auto-built feature graph by re-running the BFS with the
@@ -1177,6 +1226,30 @@ pub trait GraphStore: Send + Sync {
     /// Get the top N most connected functions for a project, ranked by
     /// (callers + callees). Used for auto-generating feature graphs after sync.
     async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>>;
+
+    // ========================================================================
+    // Bulk graph extraction (for graph analytics)
+    // ========================================================================
+
+    /// Get all IMPORTS edges between files in a project as (source_path, target_path) pairs.
+    /// Single bulk query — used by the graph analytics engine for extraction.
+    async fn get_project_import_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Get all CALLS edges between functions in a project as (caller_id, callee_id) pairs.
+    /// Scoped to the same project (no cross-project calls).
+    /// Single bulk query — used by the graph analytics engine for extraction.
+    async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Batch-update analytics scores on File nodes.
+    /// Uses UNWIND for single-query efficiency.
+    async fn batch_update_file_analytics(&self, updates: &[FileAnalyticsUpdate]) -> Result<()>;
+
+    /// Batch-update analytics scores on Function nodes.
+    /// Uses UNWIND for single-query efficiency.
+    async fn batch_update_function_analytics(
+        &self,
+        updates: &[FunctionAnalyticsUpdate],
+    ) -> Result<()>;
 
     // ========================================================================
     // Health check

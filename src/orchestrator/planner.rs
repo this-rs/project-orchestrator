@@ -193,6 +193,9 @@ pub struct DagNode {
     pub test_files: Vec<String>,
     /// Number of dependent files
     pub dependents_count: usize,
+    /// Community ID from graph analytics (Louvain clustering).
+    /// Used to group files into parallel branches in compute_phases().
+    pub community_id: Option<u32>,
 }
 
 /// The modification DAG (Directed Acyclic Graph)
@@ -485,6 +488,16 @@ impl ImplementationPlanner {
                 }
             }
 
+            // Fetch community_id from graph analytics (best-effort)
+            let community_id = self
+                .neo4j
+                .get_node_analytics(&zone.file_path, "file")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|a| a.community_id)
+                .map(|c| c as u32);
+
             nodes.insert(
                 zone.file_path.clone(),
                 DagNode {
@@ -493,6 +506,7 @@ impl ImplementationPlanner {
                     risk,
                     test_files,
                     dependents_count,
+                    community_id,
                 },
             );
         }
@@ -654,7 +668,78 @@ impl ImplementationPlanner {
         }
     }
 
+    /// Group files in a topo-sort level by community_id.
+    ///
+    /// Files in the same community are grouped into a single branch.
+    /// If NO files have community_id (analytics not computed), falls back to
+    /// one file per group (preserving old parallel behavior).
+    /// Two community groups are only kept separate (parallel) if there's no
+    /// direct edge between them in the DAG (truly independent).
+    fn group_by_community(level: &[String], dag: &ModificationDag) -> Vec<Vec<String>> {
+        // Check if any file has community_id; if none do, fall back to one-per-group
+        let has_any_community = level
+            .iter()
+            .any(|f| dag.nodes.get(f).and_then(|n| n.community_id).is_some());
+
+        if !has_any_community {
+            // No community data → each file is its own group (old behavior)
+            let mut groups: Vec<Vec<String>> = level.iter().map(|f| vec![f.clone()]).collect();
+            groups.sort_by(|a, b| a[0].cmp(&b[0]));
+            return groups;
+        }
+
+        // Build edge set for quick lookup
+        let edge_set: HashSet<(&str, &str)> = dag
+            .edges
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+
+        // Group files by community_id
+        let mut community_groups: HashMap<Option<u32>, Vec<String>> = HashMap::new();
+        for file in level {
+            let cid = dag.nodes.get(file).and_then(|n| n.community_id);
+            community_groups.entry(cid).or_default().push(file.clone());
+        }
+
+        let mut groups: Vec<Vec<String>> = community_groups.into_values().collect();
+
+        // Merge groups that have cross-community edges (not truly independent)
+        // Use a union-find approach: if any edge connects files from two groups, merge them
+        let mut merged = true;
+        while merged {
+            merged = false;
+            'outer: for i in 0..groups.len() {
+                for j in (i + 1)..groups.len() {
+                    let has_cross_edge = groups[i].iter().any(|a| {
+                        groups[j].iter().any(|b| {
+                            edge_set.contains(&(a.as_str(), b.as_str()))
+                                || edge_set.contains(&(b.as_str(), a.as_str()))
+                        })
+                    });
+                    if has_cross_edge {
+                        let to_merge = groups.remove(j);
+                        groups[i].extend(to_merge);
+                        merged = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        // Sort groups deterministically (by first file path)
+        for group in &mut groups {
+            group.sort();
+        }
+        groups.sort_by(|a, b| a[0].cmp(&b[0]));
+
+        groups
+    }
+
     /// Compute phases from topological sort levels + DAG nodes.
+    /// Uses community-aware grouping: files from independent communities
+    /// become separate parallel branches, while same-community or
+    /// cross-dependent files are grouped together.
     fn compute_phases(levels: &[Vec<String>], dag: &ModificationDag) -> Vec<Phase> {
         let mut phases = Vec::new();
 
@@ -684,29 +769,74 @@ impl ImplementationPlanner {
                     branches: vec![],
                 });
             } else {
-                // Multiple nodes — parallel phase
-                let branches: Vec<Branch> = level
-                    .iter()
-                    .map(|file| {
-                        let node = dag.nodes.get(file);
-                        Branch {
-                            files: vec![file.clone()],
-                            reason: format!(
-                                "Modify {} ({})",
-                                file.rsplit('/').next().unwrap_or(file),
-                                node.map(|n| format!("{} dependents", n.dependents_count))
-                                    .unwrap_or_default()
-                            ),
-                        }
-                    })
-                    .collect();
-                phases.push(Phase {
-                    phase_number: i + 1,
-                    description,
-                    parallel: true,
-                    modifications: vec![],
-                    branches,
-                });
+                // Multiple nodes — use community-aware grouping
+                let groups = Self::group_by_community(level, dag);
+
+                if groups.len() == 1 {
+                    // All in one group — sequential phase (same community or cross-linked)
+                    let modifications: Vec<Modification> = groups[0]
+                        .iter()
+                        .map(|file| {
+                            let node = dag.nodes.get(file);
+                            Modification {
+                                file: file.clone(),
+                                reason: format!(
+                                    "Modify {} ({})",
+                                    file.rsplit('/').next().unwrap_or(file),
+                                    node.map(|n| format!("{} dependents", n.dependents_count))
+                                        .unwrap_or_default()
+                                ),
+                                symbols_affected: node
+                                    .map(|n| n.symbols.clone())
+                                    .unwrap_or_default(),
+                                risk: node.map(|n| n.risk.clone()).unwrap_or_default(),
+                                dependents_count: node.map(|n| n.dependents_count).unwrap_or(0),
+                            }
+                        })
+                        .collect();
+                    phases.push(Phase {
+                        phase_number: i + 1,
+                        description,
+                        parallel: false,
+                        modifications,
+                        branches: vec![],
+                    });
+                } else {
+                    // Multiple independent groups — parallel branches
+                    let branches: Vec<Branch> = groups
+                        .iter()
+                        .map(|group| {
+                            let reason = if group.len() == 1 {
+                                let file = &group[0];
+                                let node = dag.nodes.get(file);
+                                format!(
+                                    "Modify {} ({})",
+                                    file.rsplit('/').next().unwrap_or(file),
+                                    node.map(|n| format!("{} dependents", n.dependents_count))
+                                        .unwrap_or_default()
+                                )
+                            } else {
+                                // Try to get community label from first node
+                                let cid = dag.nodes.get(&group[0]).and_then(|n| n.community_id);
+                                match cid {
+                                    Some(id) => format!("Community {} ({} files)", id, group.len()),
+                                    None => format!("{} independent files", group.len()),
+                                }
+                            };
+                            Branch {
+                                files: group.clone(),
+                                reason,
+                            }
+                        })
+                        .collect();
+                    phases.push(Phase {
+                        phase_number: i + 1,
+                        description,
+                        parallel: true,
+                        modifications: vec![],
+                        branches,
+                    });
+                }
             }
         }
 
@@ -1315,6 +1445,7 @@ mod tests {
                 risk: RiskLevel::Low,
                 test_files: vec![],
                 dependents_count: 0,
+                community_id: None,
             },
         );
         nodes.insert(
@@ -1325,6 +1456,7 @@ mod tests {
                 risk: RiskLevel::Low,
                 test_files: vec![],
                 dependents_count: 0,
+                community_id: None,
             },
         );
 
@@ -1377,6 +1509,7 @@ mod tests {
                     risk: RiskLevel::Low,
                     test_files: vec![],
                     dependents_count: 0,
+                    community_id: None,
                 },
             );
         }
@@ -1406,6 +1539,7 @@ mod tests {
                     risk: RiskLevel::Low,
                     test_files: vec![],
                     dependents_count: 0,
+                    community_id: None,
                 },
             );
         }
@@ -1436,6 +1570,7 @@ mod tests {
                 risk: RiskLevel::Low,
                 test_files: vec![],
                 dependents_count: 1,
+                community_id: None,
             },
         );
         nodes.insert(
@@ -1446,6 +1581,7 @@ mod tests {
                 risk: RiskLevel::Medium,
                 test_files: vec![],
                 dependents_count: 0,
+                community_id: None,
             },
         );
         let dag = ModificationDag {
@@ -1476,6 +1612,7 @@ mod tests {
                     risk: RiskLevel::Low,
                     test_files: vec![],
                     dependents_count: 0,
+                    community_id: None,
                 },
             );
         }
@@ -1496,6 +1633,242 @@ mod tests {
         assert!(!phases[0].parallel);
         assert!(phases[1].parallel);
         assert_eq!(phases[1].branches.len(), 2);
+    }
+
+    // ========================================================================
+    // Task 3.4 — Community-aware phase tests
+    // ========================================================================
+
+    #[test]
+    fn test_community_grouping_two_independent_communities() {
+        // 6 files in 2 independent communities → 2 parallel branches
+        let mut nodes = HashMap::new();
+        // Community 1: a1.rs, a2.rs, a3.rs
+        for name in &["a1.rs", "a2.rs", "a3.rs"] {
+            nodes.insert(
+                name.to_string(),
+                DagNode {
+                    file_path: name.to_string(),
+                    symbols: vec![],
+                    risk: RiskLevel::Low,
+                    test_files: vec![],
+                    dependents_count: 0,
+                    community_id: Some(1),
+                },
+            );
+        }
+        // Community 2: b1.rs, b2.rs, b3.rs
+        for name in &["b1.rs", "b2.rs", "b3.rs"] {
+            nodes.insert(
+                name.to_string(),
+                DagNode {
+                    file_path: name.to_string(),
+                    symbols: vec![],
+                    risk: RiskLevel::Low,
+                    test_files: vec![],
+                    dependents_count: 0,
+                    community_id: Some(2),
+                },
+            );
+        }
+
+        // No edges between communities — all in same topo level
+        let dag = ModificationDag {
+            nodes,
+            edges: vec![],
+        };
+        let level: Vec<String> = vec!["a1.rs", "a2.rs", "a3.rs", "b1.rs", "b2.rs", "b3.rs"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let groups = ImplementationPlanner::group_by_community(&level, &dag);
+        assert_eq!(
+            groups.len(),
+            2,
+            "Should have 2 independent community groups"
+        );
+        // Each group should have 3 files
+        assert_eq!(groups[0].len(), 3);
+        assert_eq!(groups[1].len(), 3);
+
+        // Compute phases — should produce parallel branches
+        let levels = vec![level];
+        let phases = ImplementationPlanner::compute_phases(&levels, &dag);
+        assert_eq!(phases.len(), 1);
+        assert!(
+            phases[0].parallel,
+            "Independent communities should produce parallel phase"
+        );
+        assert_eq!(phases[0].branches.len(), 2);
+        // Branch reason should mention community ID
+        assert!(
+            phases[0]
+                .branches
+                .iter()
+                .any(|b| b.reason.contains("Community")),
+            "Branch reason should reference community"
+        );
+    }
+
+    #[test]
+    fn test_community_grouping_same_community_sequential() {
+        // 4 files all in same community → single group → sequential (not parallel)
+        let mut nodes = HashMap::new();
+        for name in &["x1.rs", "x2.rs", "x3.rs", "x4.rs"] {
+            nodes.insert(
+                name.to_string(),
+                DagNode {
+                    file_path: name.to_string(),
+                    symbols: vec![],
+                    risk: RiskLevel::Low,
+                    test_files: vec![],
+                    dependents_count: 0,
+                    community_id: Some(5),
+                },
+            );
+        }
+
+        let dag = ModificationDag {
+            nodes,
+            edges: vec![],
+        };
+        let level: Vec<String> = vec!["x1.rs", "x2.rs", "x3.rs", "x4.rs"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let groups = ImplementationPlanner::group_by_community(&level, &dag);
+        assert_eq!(
+            groups.len(),
+            1,
+            "Same community files should be in one group"
+        );
+        assert_eq!(groups[0].len(), 4);
+
+        // Compute phases — single group → not parallel
+        let levels = vec![level];
+        let phases = ImplementationPlanner::compute_phases(&levels, &dag);
+        assert_eq!(phases.len(), 1);
+        assert!(
+            !phases[0].parallel,
+            "Same community should produce sequential phase"
+        );
+        assert_eq!(phases[0].modifications.len(), 4);
+    }
+
+    #[test]
+    fn test_community_grouping_no_community_data_fallback() {
+        // No files have community_id → old behavior: each file is its own group
+        let mut nodes = HashMap::new();
+        for name in &["p.rs", "q.rs", "r.rs"] {
+            nodes.insert(
+                name.to_string(),
+                DagNode {
+                    file_path: name.to_string(),
+                    symbols: vec![],
+                    risk: RiskLevel::Low,
+                    test_files: vec![],
+                    dependents_count: 0,
+                    community_id: None,
+                },
+            );
+        }
+
+        let dag = ModificationDag {
+            nodes,
+            edges: vec![],
+        };
+        let level: Vec<String> = vec!["p.rs", "q.rs", "r.rs"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let groups = ImplementationPlanner::group_by_community(&level, &dag);
+        // Without community data, each file is its own group (old parallel behavior)
+        assert_eq!(
+            groups.len(),
+            3,
+            "No community data → one file per group (old behavior)"
+        );
+        for group in &groups {
+            assert_eq!(group.len(), 1);
+        }
+
+        // Compute phases — 3 groups → parallel with 3 branches
+        let levels = vec![level];
+        let phases = ImplementationPlanner::compute_phases(&levels, &dag);
+        assert_eq!(phases.len(), 1);
+        assert!(
+            phases[0].parallel,
+            "No community data → parallel branches (old behavior)"
+        );
+        assert_eq!(phases[0].branches.len(), 3);
+    }
+
+    #[test]
+    fn test_community_grouping_cross_community_edge_merges() {
+        // 2 communities with a cross-community edge → should merge into 1 group
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "alpha.rs".to_string(),
+            DagNode {
+                file_path: "alpha.rs".to_string(),
+                symbols: vec![],
+                risk: RiskLevel::Low,
+                test_files: vec![],
+                dependents_count: 1,
+                community_id: Some(10),
+            },
+        );
+        nodes.insert(
+            "beta.rs".to_string(),
+            DagNode {
+                file_path: "beta.rs".to_string(),
+                symbols: vec![],
+                risk: RiskLevel::Low,
+                test_files: vec![],
+                dependents_count: 0,
+                community_id: Some(20),
+            },
+        );
+        nodes.insert(
+            "gamma.rs".to_string(),
+            DagNode {
+                file_path: "gamma.rs".to_string(),
+                symbols: vec![],
+                risk: RiskLevel::Low,
+                test_files: vec![],
+                dependents_count: 0,
+                community_id: Some(20),
+            },
+        );
+
+        // Cross-community edge: alpha (community 10) → beta (community 20)
+        let dag = ModificationDag {
+            nodes,
+            edges: vec![("alpha.rs".to_string(), "beta.rs".to_string())],
+        };
+        let level: Vec<String> = vec!["alpha.rs", "beta.rs", "gamma.rs"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let groups = ImplementationPlanner::group_by_community(&level, &dag);
+        // Community 10 (alpha) and community 20 (beta, gamma) should merge
+        // because alpha→beta edge connects them
+        assert_eq!(groups.len(), 1, "Cross-community edge should merge groups");
+        assert_eq!(groups[0].len(), 3);
+
+        // Compute phases — single group → not parallel
+        let levels = vec![level];
+        let phases = ImplementationPlanner::compute_phases(&levels, &dag);
+        assert_eq!(phases.len(), 1);
+        assert!(
+            !phases[0].parallel,
+            "Merged communities should be sequential"
+        );
+        assert_eq!(phases[0].modifications.len(), 3);
     }
 
     // ========================================================================

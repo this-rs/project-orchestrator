@@ -438,6 +438,15 @@ pub struct ImpactAnalysis {
     pub caller_count: i64,
     pub risk_level: String, // "low", "medium", "high"
     pub suggestion: String,
+    /// Community labels affected by this change (from graph analytics)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub affected_communities: Vec<String>,
+    /// Betweenness centrality of the target node (bridge score)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub betweenness_score: Option<f64>,
+    /// Human-readable explanation of the risk score computation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_formula: Option<String>,
 }
 
 /// Analyze impact of changing a file or function
@@ -495,12 +504,88 @@ pub async fn analyze_impact(
         .cloned()
         .collect();
 
-    let risk_level = if transitively_affected.len() > 10 || caller_count > 10 {
-        "high"
-    } else if transitively_affected.len() > 3 || caller_count > 3 {
-        "medium"
+    // Fetch GDS analytics for the target node (best-effort: None if not computed)
+    let node_analytics = state
+        .orchestrator
+        .neo4j()
+        .get_node_analytics(&query.target, target_type)
+        .await
+        .unwrap_or(None);
+
+    // Collect all affected file paths for community analysis
+    let all_affected: Vec<String> = directly_affected
+        .iter()
+        .chain(transitively_affected.iter())
+        .cloned()
+        .collect();
+    let affected_communities = state
+        .orchestrator
+        .neo4j()
+        .get_affected_communities(&all_affected)
+        .await
+        .unwrap_or_default();
+
+    // Compute risk level using composite formula when GDS data is available
+    let (risk_level, betweenness_score, risk_formula) = if let Some(ref analytics) = node_analytics
+    {
+        if let Some(betweenness) = analytics.betweenness {
+            // Composite risk formula:
+            // betweenness_score = clamp(betweenness * 3.0, 0, 1)
+            // community_spread = affected_communities / total (use 5 as reasonable estimate)
+            // degree_score = clamp(caller_count / 20.0, 0, 1)
+            // risk = betweenness_score * 0.5 + community_spread * 0.3 + degree_score * 0.2
+            let bs = (betweenness * 3.0).clamp(0.0, 1.0);
+            let total_communities = 5.0_f64; // reasonable default
+            let cs = (affected_communities.len() as f64 / total_communities).clamp(0.0, 1.0);
+            let ds = (caller_count as f64 / 20.0).clamp(0.0, 1.0);
+            let risk_score = bs * 0.5 + cs * 0.3 + ds * 0.2;
+
+            let level = if risk_score > 0.7 {
+                "high"
+            } else if risk_score > 0.3 {
+                "medium"
+            } else {
+                "low"
+            };
+
+            let formula = format!(
+                "betweenness={:.2} ({}), {}/{} communities affected, {} callers → score={:.2}",
+                betweenness,
+                if betweenness > 0.23 {
+                    "high bridge"
+                } else if betweenness > 0.1 {
+                    "moderate bridge"
+                } else {
+                    "low bridge"
+                },
+                affected_communities.len(),
+                total_communities as usize,
+                caller_count,
+                risk_score,
+            );
+
+            (level.to_string(), Some(betweenness), Some(formula))
+        } else {
+            // Analytics exist but no betweenness → fallback
+            let level = if transitively_affected.len() > 10 || caller_count > 10 {
+                "high"
+            } else if transitively_affected.len() > 3 || caller_count > 3 {
+                "medium"
+            } else {
+                "low"
+            };
+            (level.to_string(), None, None)
+        }
     } else {
-        "low"
+        // No GDS analytics at all → fallback to legacy threshold logic
+        let level = if transitively_affected.len() > 10 || caller_count > 10 {
+            "high"
+        } else if transitively_affected.len() > 3 || caller_count > 3 {
+            "medium"
+        } else {
+            "low"
+        };
+        (level.to_string(), None, None)
     };
 
     let suggestion = format!(
@@ -520,8 +605,11 @@ pub async fn analyze_impact(
         transitively_affected,
         test_files_affected: test_files,
         caller_count,
-        risk_level: risk_level.to_string(),
+        risk_level,
         suggestion,
+        affected_communities,
+        betweenness_score,
+        risk_formula,
     }))
 }
 
@@ -536,6 +624,22 @@ pub struct ArchitectureOverview {
     pub modules: Vec<ModuleInfo>,
     pub key_files: Vec<ConnectedFileNode>,
     pub orphan_files: Vec<String>,
+    /// Detected code communities from graph analytics (empty if analytics not yet computed)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub communities: Vec<CommunityOverview>,
+}
+
+/// Summary of a detected code community (Louvain clustering)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityOverview {
+    /// Numeric community identifier
+    pub id: i64,
+    /// Human-readable community label
+    pub label: String,
+    /// Number of files in this community
+    pub file_count: usize,
+    /// Top files in this community (by pagerank)
+    pub key_files: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -650,8 +754,14 @@ pub async fn get_architecture(
                     .await?;
                 all_files.extend(files);
             }
-            // Sort by dependents descending and take top 10
-            all_files.sort_by(|a, b| b.dependents.cmp(&a.dependents));
+            // Sort by pagerank (descending) with fallback to dependents
+            all_files.sort_by(|a, b| {
+                let pr_a = a.pagerank.unwrap_or(0.0);
+                let pr_b = b.pagerank.unwrap_or(0.0);
+                pr_b.partial_cmp(&pr_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.dependents.cmp(&a.dependents))
+            });
             all_files.truncate(10);
             all_files
         }
@@ -664,6 +774,31 @@ pub async fn get_architecture(
         }
     };
 
+    // Aggregate community overviews from graph analytics
+    let communities: Vec<CommunityOverview> = match &project_ids {
+        Some(ids) => {
+            let mut all_rows = Vec::new();
+            for pid in ids {
+                let comms = state
+                    .orchestrator
+                    .neo4j()
+                    .get_project_communities(*pid)
+                    .await?;
+                all_rows.extend(comms);
+            }
+            all_rows
+                .into_iter()
+                .map(|r| CommunityOverview {
+                    id: r.community_id,
+                    label: r.community_label,
+                    file_count: r.file_count,
+                    key_files: r.key_files,
+                })
+                .collect()
+        }
+        None => vec![],
+    };
+
     let total_files: usize = languages.iter().map(|l| l.file_count).sum();
 
     Ok(Json(ArchitectureOverview {
@@ -672,6 +807,7 @@ pub async fn get_architecture(
         modules: vec![],
         key_files,
         orphan_files: vec![],
+        communities,
     }))
 }
 
@@ -916,6 +1052,7 @@ pub struct AutoBuildBody {
     pub entry_function: String,
     pub depth: Option<u32>,
     pub include_relations: Option<Vec<String>>,
+    pub filter_community: Option<bool>,
 }
 
 /// POST /api/feature-graphs
@@ -1052,6 +1189,7 @@ pub async fn auto_build_feature_graph(
             &body.entry_function,
             depth,
             body.include_relations.as_deref(),
+            body.filter_community,
         )
         .await?;
     let entities: Vec<serde_json::Value> = detail
@@ -1073,6 +1211,138 @@ pub async fn auto_build_feature_graph(
         "project_id": detail.graph.project_id.to_string(),
         "entities": entities,
         "entity_count": entities.len(),
+    })))
+}
+
+// ============================================================================
+// Structural Analytics
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct CommunitiesQuery {
+    pub project_slug: String,
+    pub min_size: Option<usize>,
+}
+
+/// GET /api/code/communities
+pub async fn get_code_communities(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<CommunitiesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let min_size = params.min_size.unwrap_or(2);
+    let communities = state
+        .orchestrator
+        .neo4j()
+        .get_project_communities(project.id)
+        .await?;
+
+    if communities.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "message": "No structural analytics available. Run sync_project first.",
+            "communities": [],
+            "total_files": 0
+        })));
+    }
+
+    let mut filtered: Vec<_> = communities
+        .into_iter()
+        .filter(|c| c.file_count >= min_size)
+        .collect();
+    filtered.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+
+    let total_files: usize = filtered.iter().map(|c| c.file_count).sum();
+
+    let communities_json: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.community_id,
+                "label": c.community_label,
+                "size": c.file_count,
+                "key_files": c.key_files,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "communities": communities_json,
+        "total_files": total_files,
+        "community_count": communities_json.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct CodeHealthQuery {
+    pub project_slug: String,
+    pub god_function_threshold: Option<usize>,
+}
+
+/// GET /api/code/health
+pub async fn get_code_health(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<CodeHealthQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let threshold = params.god_function_threshold.unwrap_or(10);
+    let report = state
+        .orchestrator
+        .neo4j()
+        .get_code_health_report(project.id, threshold)
+        .await?;
+
+    let circular_deps = state
+        .orchestrator
+        .neo4j()
+        .get_circular_dependencies(project.id)
+        .await?;
+
+    let god_functions_json: Vec<serde_json::Value> = report
+        .god_functions
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "name": g.name,
+                "file": g.file,
+                "in_degree": g.in_degree,
+                "out_degree": g.out_degree,
+            })
+        })
+        .collect();
+
+    let coupling_json = report.coupling_metrics.as_ref().map(|c| {
+        serde_json::json!({
+            "avg_clustering_coefficient": c.avg_clustering_coefficient,
+            "max_clustering_coefficient": c.max_clustering_coefficient,
+            "most_coupled_file": c.most_coupled_file,
+        })
+    });
+
+    Ok(Json(serde_json::json!({
+        "god_functions": god_functions_json,
+        "god_function_count": god_functions_json.len(),
+        "god_function_threshold": threshold,
+        "orphan_files": report.orphan_files,
+        "orphan_file_count": report.orphan_files.len(),
+        "coupling_metrics": coupling_json,
+        "circular_dependencies": circular_deps,
+        "circular_dependency_count": circular_deps.len(),
     })))
 }
 
@@ -1743,5 +2013,611 @@ mod tests {
                 path
             );
         }
+    }
+
+    // ====================================================================
+    // GET /api/code/architecture — GDS enrichment tests (Task 3.1)
+    // ====================================================================
+
+    /// Build a test router with files that have GDS analytics scores
+    async fn test_app_with_analytics() -> (axum::Router, uuid::Uuid) {
+        use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+        let project_id = uuid::Uuid::new_v4();
+
+        // Create project
+        let project = ProjectNode {
+            id: project_id,
+            name: "analytics-proj".to_string(),
+            slug: "analytics-proj".to_string(),
+            description: None,
+            root_path: "/tmp/analytics".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: Some(chrono::Utc::now()),
+        };
+        graph.create_project(&project).await.unwrap();
+
+        // Seed files with project_id
+        let file_paths = [
+            "src/main.rs",
+            "src/handler.rs",
+            "src/utils.rs",
+            "src/config.rs",
+        ];
+        for path in &file_paths {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project_id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Seed import relationships
+        // main.rs imports handler.rs and config.rs
+        graph
+            .create_import_relationship("src/main.rs", "src/handler.rs", "handler")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/main.rs", "src/config.rs", "config")
+            .await
+            .unwrap();
+        // handler.rs imports utils.rs
+        graph
+            .create_import_relationship("src/handler.rs", "src/utils.rs", "utils")
+            .await
+            .unwrap();
+
+        // Seed GDS analytics: main.rs has HIGH pagerank, utils.rs has LOW pagerank
+        let analytics = vec![
+            FileAnalyticsUpdate {
+                path: "src/main.rs".to_string(),
+                pagerank: 0.15,
+                betweenness: 0.30,
+                community_id: 0,
+                community_label: "Core".to_string(),
+                clustering_coefficient: 0.5,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/handler.rs".to_string(),
+                pagerank: 0.10,
+                betweenness: 0.20,
+                community_id: 0,
+                community_label: "Core".to_string(),
+                clustering_coefficient: 0.3,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/utils.rs".to_string(),
+                pagerank: 0.05,
+                betweenness: 0.05,
+                community_id: 1,
+                community_label: "Utilities".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/config.rs".to_string(),
+                pagerank: 0.03,
+                betweenness: 0.01,
+                community_id: 1,
+                community_label: "Utilities".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+        ];
+        graph.batch_update_file_analytics(&analytics).await.unwrap();
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        (create_router(state), project_id)
+    }
+
+    #[tokio::test]
+    async fn test_architecture_with_gds_scores() {
+        // Test 1: Files with GDS analytics return pagerank, community fields
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/architecture?project_slug=analytics-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let key_files = json["key_files"].as_array().unwrap();
+        assert!(!key_files.is_empty());
+
+        // The first file should be src/main.rs (highest pagerank = 0.15)
+        assert_eq!(key_files[0]["path"], "src/main.rs");
+        assert!(key_files[0]["pagerank"].as_f64().unwrap() > 0.14);
+        assert!(key_files[0]["betweenness"].as_f64().unwrap() > 0.0);
+        assert_eq!(key_files[0]["community_label"], "Core");
+
+        // Verify communities are present
+        let communities = json["communities"].as_array().unwrap();
+        assert_eq!(
+            communities.len(),
+            2,
+            "Should have 2 communities: Core and Utilities"
+        );
+
+        let core = communities
+            .iter()
+            .find(|c| c["label"] == "Core")
+            .expect("Core community should exist");
+        assert_eq!(core["file_count"], 2);
+
+        let utils = communities
+            .iter()
+            .find(|c| c["label"] == "Utilities")
+            .expect("Utilities community should exist");
+        assert_eq!(utils["file_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_architecture_without_gds_scores_fallback() {
+        // Test 2: Files WITHOUT GDS analytics → same response as before (fallback to degree)
+        let app = test_app_with_code().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/architecture"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // key_files should still work (may be empty if no import relationships seeded)
+        assert!(json["key_files"].is_array());
+        // communities should be absent (skip_serializing_if = Vec::is_empty)
+        assert!(
+            json.get("communities").is_none()
+                || json["communities"].as_array().is_none_or(|c| c.is_empty()),
+            "No communities should be returned when GDS not computed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_architecture_pagerank_ordering_overrides_degree() {
+        // Test 3: File with high pagerank but lower degree should rank higher
+        // than file with low pagerank but higher degree
+        use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+        let project_id = uuid::Uuid::new_v4();
+
+        let project = ProjectNode {
+            id: project_id,
+            name: "ordering-proj".to_string(),
+            slug: "ordering-proj".to_string(),
+            description: None,
+            root_path: "/tmp/ordering".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: Some(chrono::Utc::now()),
+        };
+        graph.create_project(&project).await.unwrap();
+
+        // file_a: high degree (3 dependents) but LOW pagerank
+        // file_b: low degree (1 dependent) but HIGH pagerank
+        for path in &[
+            "src/file_a.rs",
+            "src/file_b.rs",
+            "src/dep1.rs",
+            "src/dep2.rs",
+            "src/dep3.rs",
+        ] {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project_id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // file_a has 3 dependents (high degree)
+        graph
+            .create_import_relationship("src/dep1.rs", "src/file_a.rs", "file_a")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/dep2.rs", "src/file_a.rs", "file_a")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/dep3.rs", "src/file_a.rs", "file_a")
+            .await
+            .unwrap();
+
+        // file_b has 1 dependent (low degree)
+        graph
+            .create_import_relationship("src/dep1.rs", "src/file_b.rs", "file_b")
+            .await
+            .unwrap();
+
+        // But file_b has HIGHER pagerank than file_a
+        let analytics = vec![
+            FileAnalyticsUpdate {
+                path: "src/file_a.rs".to_string(),
+                pagerank: 0.05, // LOW pagerank despite high degree
+                betweenness: 0.1,
+                community_id: 0,
+                community_label: "Main".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/file_b.rs".to_string(),
+                pagerank: 0.15, // HIGH pagerank despite low degree
+                betweenness: 0.3,
+                community_id: 0,
+                community_label: "Main".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+        ];
+        graph.batch_update_file_analytics(&analytics).await.unwrap();
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/architecture?project_slug=ordering-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let key_files = json["key_files"].as_array().unwrap();
+        // file_b (pagerank 0.15) should be BEFORE file_a (pagerank 0.05)
+        // even though file_a has more dependents
+        let first_path = key_files[0]["path"].as_str().unwrap();
+        assert_eq!(
+            first_path, "src/file_b.rs",
+            "File with higher pagerank should rank first, regardless of degree"
+        );
+    }
+
+    // ====================================================================
+    // GET /api/code/impact — GDS enrichment tests (Task 3.2)
+    // ====================================================================
+
+    /// Build a test router with import relationships and GDS analytics
+    /// for testing the enriched impact analysis.
+    async fn test_app_with_impact_analytics() -> axum::Router {
+        use crate::graph::models::FileAnalyticsUpdate;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+        let project_id = uuid::Uuid::new_v4();
+
+        let project = ProjectNode {
+            id: project_id,
+            name: "impact-proj".to_string(),
+            slug: "impact-proj".to_string(),
+            description: None,
+            root_path: "/tmp/impact".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: Some(chrono::Utc::now()),
+        };
+        graph.create_project(&project).await.unwrap();
+
+        // Barbell graph: cluster A ←→ bridge ←→ cluster B
+        let all_files = [
+            "src/bridge.rs", // bridge between clusters
+            "src/a1.rs",     // cluster A
+            "src/a2.rs",     // cluster A
+            "src/b1.rs",     // cluster B
+            "src/b2.rs",     // cluster B
+            "src/leaf.rs",   // isolated leaf
+        ];
+        for path in &all_files {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project_id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+            graph
+                .project_files
+                .write()
+                .await
+                .entry(project_id)
+                .or_default()
+                .push(path.to_string());
+        }
+
+        // Import relationships: bridge connects both clusters
+        // a1 → bridge, a2 → bridge (cluster A depends on bridge)
+        // bridge → b1, bridge → b2 (bridge depends on cluster B)
+        graph
+            .create_import_relationship("src/a1.rs", "src/bridge.rs", "bridge")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/a2.rs", "src/bridge.rs", "bridge")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/bridge.rs", "src/b1.rs", "b1")
+            .await
+            .unwrap();
+        graph
+            .create_import_relationship("src/bridge.rs", "src/b2.rs", "b2")
+            .await
+            .unwrap();
+
+        // leaf has no connections
+        // (leaf.rs has no import relationships)
+
+        // GDS analytics:
+        // bridge.rs = high betweenness (0.4), community 0 ("Core")
+        // a1, a2 = low betweenness, community 1 ("Cluster A")
+        // b1, b2 = low betweenness, community 2 ("Cluster B")
+        // leaf.rs = very low betweenness, community 3 ("Isolated")
+        let analytics = vec![
+            FileAnalyticsUpdate {
+                path: "src/bridge.rs".to_string(),
+                pagerank: 0.20,
+                betweenness: 0.40,
+                community_id: 0,
+                community_label: "Core".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/a1.rs".to_string(),
+                pagerank: 0.08,
+                betweenness: 0.02,
+                community_id: 1,
+                community_label: "Cluster A".to_string(),
+                clustering_coefficient: 0.5,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/a2.rs".to_string(),
+                pagerank: 0.07,
+                betweenness: 0.01,
+                community_id: 1,
+                community_label: "Cluster A".to_string(),
+                clustering_coefficient: 0.5,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/b1.rs".to_string(),
+                pagerank: 0.06,
+                betweenness: 0.03,
+                community_id: 2,
+                community_label: "Cluster B".to_string(),
+                clustering_coefficient: 0.5,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/b2.rs".to_string(),
+                pagerank: 0.05,
+                betweenness: 0.02,
+                community_id: 2,
+                community_label: "Cluster B".to_string(),
+                clustering_coefficient: 0.5,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: "src/leaf.rs".to_string(),
+                pagerank: 0.01,
+                betweenness: 0.01,
+                community_id: 3,
+                community_label: "Isolated".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+        ];
+        graph.batch_update_file_analytics(&analytics).await.unwrap();
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestrator::FileWatcher::new(orchestrator.clone()),
+        ));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        create_router(state)
+    }
+
+    #[tokio::test]
+    async fn test_impact_bridge_file_high_risk() {
+        // Test 1: Bridge file with high betweenness → risk should be elevated
+        let app = test_app_with_impact_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/bridge.rs&project_slug=impact-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Bridge has betweenness 0.4 → risk_formula should be present
+        assert!(json["betweenness_score"].as_f64().unwrap() > 0.3);
+        assert!(json["risk_formula"].is_string());
+        let formula = json["risk_formula"].as_str().unwrap();
+        assert!(formula.contains("high bridge"), "Formula: {}", formula);
+
+        // Affected communities: dependents of bridge are a1, a2 (Cluster A)
+        // find_dependent_files returns files that depend ON the target
+        let communities = json["affected_communities"].as_array().unwrap();
+        assert!(
+            !communities.is_empty(),
+            "Bridge should have affected communities from its dependents"
+        );
+        assert!(
+            communities.iter().any(|c| c == "Cluster A"),
+            "Cluster A files depend on bridge, got: {:?}",
+            communities
+        );
+
+        // Key check: risk should be elevated due to high betweenness (0.4)
+        // even though only 1 community is directly affected
+        // betweenness_score * 0.5 = 0.40 * 3.0 clamped to 1.0 * 0.5 = 0.5
+        // That alone pushes risk_score > 0.3 → at least "medium"
+        let risk = json["risk_level"].as_str().unwrap();
+        assert!(
+            risk == "medium" || risk == "high",
+            "Bridge with betweenness 0.4 should be at least medium risk, got: {}",
+            risk
+        );
+    }
+
+    #[tokio::test]
+    async fn test_impact_leaf_file_low_risk() {
+        // Test 2: Leaf file with low betweenness, 1 community → low risk
+        let app = test_app_with_impact_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/leaf.rs&project_slug=impact-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["risk_level"], "low");
+        assert!(json["betweenness_score"].as_f64().unwrap() < 0.05);
+        let formula = json["risk_formula"].as_str().unwrap();
+        assert!(formula.contains("low bridge"), "Formula: {}", formula);
+    }
+
+    #[tokio::test]
+    async fn test_impact_no_gds_data_fallback() {
+        // Test 3: File without GDS analytics → fallback to legacy threshold logic
+        let app = test_app_with_imports().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=test-proj",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // No GDS data → betweenness_score and risk_formula should be absent
+        assert!(
+            json.get("betweenness_score").is_none() || json["betweenness_score"].is_null(),
+            "betweenness_score should be absent without GDS data"
+        );
+        assert!(
+            json.get("risk_formula").is_none() || json["risk_formula"].is_null(),
+            "risk_formula should be absent without GDS data"
+        );
+        // affected_communities should be empty (no analytics)
+        assert!(
+            json.get("affected_communities").is_none()
+                || json["affected_communities"]
+                    .as_array()
+                    .is_none_or(|c| c.is_empty()),
+            "affected_communities should be empty without GDS data"
+        );
+        // Legacy risk level still works
+        assert!(["low", "medium", "high"].contains(&json["risk_level"].as_str().unwrap()));
     }
 }

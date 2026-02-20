@@ -107,6 +107,7 @@ impl ToolHandler {
             "delete_release" => self.delete_release(args).await,
             "add_task_to_release" => self.add_task_to_release(args).await,
             "add_commit_to_release" => self.add_commit_to_release(args).await,
+            "remove_commit_from_release" => self.remove_commit_from_release(args).await,
 
             // Milestones
             "list_milestones" => self.list_milestones(args).await,
@@ -235,6 +236,11 @@ impl ToolHandler {
             "add_to_feature_graph" => self.add_to_feature_graph(args).await,
             "auto_build_feature_graph" => self.auto_build_feature_graph(args).await,
             "delete_feature_graph" => self.delete_feature_graph(args).await,
+
+            // Structural Analytics
+            "get_code_communities" => self.get_code_communities(args).await,
+            "get_code_health" => self.get_code_health(args).await,
+            "get_node_importance" => self.get_node_importance(args).await,
 
             // Implementation Planner
             "plan_implementation" => self.plan_implementation(args).await,
@@ -381,6 +387,9 @@ impl ToolHandler {
             .await?;
 
         self.neo4j().update_project_synced(project.id).await?;
+
+        // Compute graph analytics (PageRank, communities, etc.) — best-effort, synchronous
+        self.orchestrator.analyze_project_safe(project.id).await;
 
         // Refresh auto-built feature graphs in background (best-effort)
         self.orchestrator.spawn_refresh_feature_graphs(project.id);
@@ -1274,6 +1283,19 @@ impl ToolHandler {
         Ok(json!({"added": true}))
     }
 
+    async fn remove_commit_from_release(&self, args: Value) -> Result<Value> {
+        let release_id = parse_uuid(&args, "release_id")?;
+        let commit_sha = args
+            .get("commit_sha")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("commit_sha is required"))?;
+
+        self.orchestrator
+            .remove_commit_from_release(release_id, commit_sha)
+            .await?;
+        Ok(json!({"removed": true}))
+    }
+
     // ========================================================================
     // Milestone Handlers
     // ========================================================================
@@ -1501,6 +1523,8 @@ impl ToolHandler {
                 if let Err(e) = orchestrator.neo4j().update_project_synced(project_id).await {
                     tracing::warn!("Failed to update last_synced: {}", e);
                 }
+                // Trigger debounced analytics recomputation (fire-and-forget)
+                orchestrator.analytics_debouncer().trigger(project_id);
             });
         }
 
@@ -2000,9 +2024,11 @@ impl ToolHandler {
             .sync_directory_for_project(path, project_id, project_slug.as_deref())
             .await?;
 
-        // Update last_synced and refresh feature graphs when project context is available
+        // Update last_synced, compute analytics, and refresh feature graphs when project context is available
         if let Some(pid) = project_id {
             self.neo4j().update_project_synced(pid).await?;
+            // Compute graph analytics (PageRank, communities, etc.) — best-effort, synchronous
+            self.orchestrator.analyze_project_safe(pid).await;
             // Refresh auto-built feature graphs in background (best-effort)
             self.orchestrator.spawn_refresh_feature_graphs(pid);
         }
@@ -3811,6 +3837,8 @@ impl ToolHandler {
                     .collect()
             });
 
+        let filter_community = args.get("filter_community").and_then(|v| v.as_bool());
+
         let detail = self
             .neo4j()
             .auto_build_feature_graph(
@@ -3820,6 +3848,7 @@ impl ToolHandler {
                 entry_function,
                 depth,
                 include_relations.as_deref(),
+                filter_community,
             )
             .await?;
 
@@ -3850,6 +3879,271 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let deleted = self.neo4j().delete_feature_graph(id).await?;
         Ok(json!({ "deleted": deleted }))
+    }
+
+    // ========================================================================
+    // Structural Analytics
+    // ========================================================================
+
+    async fn get_code_communities(&self, args: Value) -> Result<Value> {
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("project_slug is required"))?;
+        let min_size = args.get("min_size").and_then(|v| v.as_i64()).unwrap_or(2) as usize;
+
+        // Resolve project slug → project ID
+        let project = self
+            .neo4j()
+            .get_project_by_slug(project_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project '{}' not found", project_slug))?;
+
+        let communities = self.neo4j().get_project_communities(project.id).await?;
+
+        if communities.is_empty() {
+            return Ok(json!({
+                "message": "No structural analytics available. Run sync_project first, then wait for analytics computation.",
+                "communities": [],
+                "total_files": 0
+            }));
+        }
+
+        // Filter by min_size and sort by size descending
+        let mut filtered: Vec<_> = communities
+            .into_iter()
+            .filter(|c| c.file_count >= min_size)
+            .collect();
+        filtered.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+
+        let total_files: usize = filtered.iter().map(|c| c.file_count).sum();
+
+        let communities_json: Vec<Value> = filtered
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.community_id,
+                    "label": c.community_label,
+                    "size": c.file_count,
+                    "key_files": c.key_files,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "communities": communities_json,
+            "total_files": total_files,
+            "community_count": communities_json.len(),
+        }))
+    }
+
+    async fn get_code_health(&self, args: Value) -> Result<Value> {
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("project_slug is required"))?;
+        let god_function_threshold = args
+            .get("god_function_threshold")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as usize;
+
+        // Resolve project slug → project ID
+        let project = self
+            .neo4j()
+            .get_project_by_slug(project_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project '{}' not found", project_slug))?;
+
+        let report = self
+            .neo4j()
+            .get_code_health_report(project.id, god_function_threshold)
+            .await?;
+
+        let circular_deps = self.neo4j().get_circular_dependencies(project.id).await?;
+
+        let god_functions_json: Vec<Value> = report
+            .god_functions
+            .iter()
+            .map(|g| {
+                json!({
+                    "name": g.name,
+                    "file": g.file,
+                    "in_degree": g.in_degree,
+                    "out_degree": g.out_degree,
+                })
+            })
+            .collect();
+
+        let coupling_json = report.coupling_metrics.as_ref().map(|c| {
+            json!({
+                "avg_clustering_coefficient": c.avg_clustering_coefficient,
+                "max_clustering_coefficient": c.max_clustering_coefficient,
+                "most_coupled_file": c.most_coupled_file,
+            })
+        });
+
+        Ok(json!({
+            "god_functions": god_functions_json,
+            "god_function_count": god_functions_json.len(),
+            "god_function_threshold": god_function_threshold,
+            "orphan_files": report.orphan_files,
+            "orphan_file_count": report.orphan_files.len(),
+            "coupling_metrics": coupling_json,
+            "circular_dependencies": circular_deps,
+            "circular_dependency_count": circular_deps.len(),
+        }))
+    }
+
+    async fn get_node_importance(&self, args: Value) -> Result<Value> {
+        let node_path = args
+            .get("node_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("node_path is required"))?;
+        let node_type = args
+            .get("node_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+        let project_slug = args
+            .get("project_slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("project_slug is required"))?;
+
+        let project = self
+            .neo4j()
+            .get_project_by_slug(project_slug)
+            .await?
+            .ok_or_else(|| anyhow!("Project '{}' not found", project_slug))?;
+
+        let metrics = self
+            .neo4j()
+            .get_node_gds_metrics(node_path, node_type, project.id)
+            .await?;
+
+        let metrics = match metrics {
+            Some(m) => m,
+            None => {
+                return Err(anyhow!(
+                    "Node not found: '{}' (type: {}). Check the path or run sync_project.",
+                    node_path,
+                    node_type
+                ))
+            }
+        };
+
+        // Check if GDS analytics are available
+        if metrics.pagerank.is_none() {
+            return Ok(json!({
+                "node": node_path,
+                "node_type": node_type,
+                "message": "No structural analytics available for this node. Run sync_project first, then wait for analytics computation.",
+                "metrics": {
+                    "in_degree": metrics.in_degree,
+                    "out_degree": metrics.out_degree,
+                }
+            }));
+        }
+
+        let percentiles = self.neo4j().get_project_percentiles(project.id).await?;
+
+        let interpretation = Self::interpret_node_metrics(&metrics, &percentiles);
+
+        Ok(json!({
+            "node": metrics.node_path,
+            "node_type": metrics.node_type,
+            "metrics": {
+                "pagerank": metrics.pagerank,
+                "betweenness": metrics.betweenness,
+                "clustering_coefficient": metrics.clustering_coefficient,
+                "community_id": metrics.community_id,
+                "community_label": metrics.community_label,
+                "in_degree": metrics.in_degree,
+                "out_degree": metrics.out_degree,
+            },
+            "interpretation": {
+                "importance": interpretation.importance,
+                "is_bridge": interpretation.is_bridge,
+                "risk_level": interpretation.risk_level,
+                "summary": interpretation.summary,
+            }
+        }))
+    }
+
+    /// Compute human-readable interpretation from raw GDS metrics.
+    fn interpret_node_metrics(
+        metrics: &crate::neo4j::models::NodeGdsMetrics,
+        percentiles: &crate::neo4j::models::ProjectPercentiles,
+    ) -> crate::neo4j::models::NodeInterpretation {
+        let pr = metrics.pagerank.unwrap_or(0.0);
+        let bw = metrics.betweenness.unwrap_or(0.0);
+
+        // Importance: based on PageRank percentile
+        let importance = if pr >= percentiles.pagerank_p95 {
+            "critical"
+        } else if pr >= percentiles.pagerank_p80 {
+            "high"
+        } else if pr >= percentiles.pagerank_p50 {
+            "medium"
+        } else {
+            "low"
+        };
+
+        // Bridge detection: betweenness > mean + 2*stddev
+        let is_bridge = bw > percentiles.betweenness_mean + 2.0 * percentiles.betweenness_stddev;
+
+        // Risk level: composite score
+        let risk_level = if importance == "critical" && is_bridge {
+            "critical"
+        } else if importance == "critical" || (importance == "high" && is_bridge) {
+            "high"
+        } else if importance == "high" || (importance == "medium" && is_bridge) {
+            "medium"
+        } else {
+            "low"
+        };
+
+        // Build summary
+        let node_label = if metrics.node_type == "function" {
+            "function"
+        } else {
+            "file"
+        };
+
+        let mut parts: Vec<String> = Vec::new();
+
+        match importance {
+            "critical" => parts.push(format!(
+                "This {} is a critical hub (top 5% PageRank)",
+                node_label
+            )),
+            "high" => parts.push(format!(
+                "This {} is highly connected (top 20% PageRank)",
+                node_label
+            )),
+            "medium" => parts.push(format!(
+                "This {} has moderate structural importance",
+                node_label
+            )),
+            _ => parts.push(format!("This {} has low structural importance", node_label)),
+        }
+
+        if is_bridge {
+            parts.push("and acts as a bridge between communities (high betweenness)".to_string());
+        }
+
+        match risk_level {
+            "critical" | "high" => parts.push("Changes here have high blast radius.".to_string()),
+            "medium" => parts.push("Changes here may affect multiple dependents.".to_string()),
+            _ => parts.push("Changes here have limited impact.".to_string()),
+        }
+
+        let summary = parts.join(". ").replace(". and ", " and ");
+
+        crate::neo4j::models::NodeInterpretation {
+            importance: importance.to_string(),
+            is_bridge,
+            risk_level: risk_level.to_string(),
+            summary,
+        }
     }
 
     // ========================================================================
@@ -6304,5 +6598,842 @@ mod tests {
         // Original fields still present
         assert!(result.get("target").is_some());
         assert!(result.get("caller_count").is_some());
+    }
+
+    // ========================================================================
+    // Structural Analytics — get_code_communities
+    // ========================================================================
+
+    async fn create_handler_with_communities() -> ToolHandler {
+        use crate::graph::models::FileAnalyticsUpdate;
+
+        let graph = MockGraphStore::new();
+        let project = test_project_named("analytics-proj");
+        graph.create_project(&project).await.unwrap();
+
+        // Seed files with project association
+        let file_paths = vec![
+            "src/api/handlers.rs",
+            "src/api/routes.rs",
+            "src/api/models.rs",
+            "src/neo4j/client.rs",
+            "src/neo4j/models.rs",
+            "src/utils.rs",
+        ];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = crate::neo4j::models::FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Set community analytics — 2 communities + 1 orphan
+        graph
+            .batch_update_file_analytics(&[
+                FileAnalyticsUpdate {
+                    path: "src/api/handlers.rs".to_string(),
+                    pagerank: 0.8,
+                    betweenness: 0.1,
+                    community_id: 0,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.5,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/api/routes.rs".to_string(),
+                    pagerank: 0.6,
+                    betweenness: 0.05,
+                    community_id: 0,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.4,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/api/models.rs".to_string(),
+                    pagerank: 0.4,
+                    betweenness: 0.02,
+                    community_id: 0,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.3,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/neo4j/client.rs".to_string(),
+                    pagerank: 0.9,
+                    betweenness: 0.3,
+                    community_id: 1,
+                    community_label: "neo4j".to_string(),
+                    clustering_coefficient: 0.6,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/neo4j/models.rs".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    community_label: "neo4j".to_string(),
+                    clustering_coefficient: 0.5,
+                    component_id: 0,
+                },
+                // utils.rs has no analytics → orphan (no community)
+            ])
+            .await
+            .unwrap();
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    #[tokio::test]
+    async fn test_get_code_communities_with_data() {
+        let handler = create_handler_with_communities().await;
+
+        let result = handler
+            .handle(
+                "get_code_communities",
+                Some(json!({"project_slug": "analytics-proj"})),
+            )
+            .await
+            .unwrap();
+
+        let communities = result.get("communities").unwrap().as_array().unwrap();
+        assert!(
+            !communities.is_empty(),
+            "should return communities, got: {:?}",
+            result
+        );
+
+        // Check community count
+        let count = result.get("community_count").unwrap().as_u64().unwrap();
+        assert_eq!(count, 2, "should have 2 communities");
+
+        // Check sorted by size descending
+        let sizes: Vec<u64> = communities
+            .iter()
+            .map(|c| c.get("size").unwrap().as_u64().unwrap())
+            .collect();
+        assert!(sizes[0] >= sizes[1], "should be sorted by size desc");
+
+        // Check total_files
+        let total = result.get("total_files").unwrap().as_u64().unwrap();
+        assert_eq!(total, 5, "should count 5 files with communities");
+    }
+
+    #[tokio::test]
+    async fn test_get_code_communities_no_data() {
+        let handler = create_handler().await;
+
+        // Create a project with no analytics
+        let result = handler
+            .handle(
+                "create_project",
+                Some(json!({"name": "Empty Project", "root_path": "/tmp/empty"})),
+            )
+            .await
+            .unwrap();
+        let slug = result.get("slug").unwrap().as_str().unwrap();
+
+        let result = handler
+            .handle("get_code_communities", Some(json!({"project_slug": slug})))
+            .await
+            .unwrap();
+
+        // Should have fallback message
+        assert!(result.get("message").is_some());
+        let communities = result.get("communities").unwrap().as_array().unwrap();
+        assert!(communities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_code_communities_min_size_filter() {
+        let handler = create_handler_with_communities().await;
+
+        // With min_size=3, only api community (3 files) should pass
+        let result = handler
+            .handle(
+                "get_code_communities",
+                Some(json!({"project_slug": "analytics-proj", "min_size": 3})),
+            )
+            .await
+            .unwrap();
+
+        let communities = result.get("communities").unwrap().as_array().unwrap();
+        assert_eq!(
+            communities.len(),
+            1,
+            "min_size=3 should filter out neo4j community (2 files)"
+        );
+        let label = communities[0].get("label").unwrap().as_str().unwrap();
+        assert_eq!(label, "api");
+    }
+
+    // ========================================================================
+    // Structural Analytics — get_code_health
+    // ========================================================================
+
+    async fn create_handler_with_health_data() -> ToolHandler {
+        use crate::graph::models::FileAnalyticsUpdate;
+
+        let graph = MockGraphStore::new();
+        let project = test_project_named("health-proj");
+        graph.create_project(&project).await.unwrap();
+
+        // Files
+        let file_paths = vec!["src/main.rs", "src/lib.rs", "src/orphan.rs", "src/utils.rs"];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Functions — create a "god function" (many callers)
+        let god_fn = FunctionNode {
+            name: "god_function".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 5,
+            line_start: 1,
+            line_end: 50,
+            docstring: None,
+        };
+        graph.upsert_function(&god_fn).await.unwrap();
+
+        let helper_fn = FunctionNode {
+            name: "helper".to_string(),
+            file_path: "src/utils.rs".to_string(),
+            visibility: Visibility::Private,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        };
+        graph.upsert_function(&helper_fn).await.unwrap();
+
+        let main_fn = FunctionNode {
+            name: "main".to_string(),
+            file_path: "src/main.rs".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            line_start: 1,
+            line_end: 5,
+            docstring: None,
+        };
+        graph.upsert_function(&main_fn).await.unwrap();
+
+        // Call relationships: main -> god_function, helper -> god_function (2 callers)
+        graph
+            .call_relationships
+            .write()
+            .await
+            .entry("main".to_string())
+            .or_default()
+            .push("god_function".to_string());
+        graph
+            .call_relationships
+            .write()
+            .await
+            .entry("helper".to_string())
+            .or_default()
+            .push("god_function".to_string());
+        // god_function calls helper (1 callee)
+        graph
+            .call_relationships
+            .write()
+            .await
+            .entry("god_function".to_string())
+            .or_default()
+            .push("helper".to_string());
+
+        // Import relationships: main.rs -> lib.rs, lib.rs -> utils.rs
+        // orphan.rs has no imports and nothing imports it
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("src/main.rs".to_string())
+            .or_default()
+            .push("src/lib.rs".to_string());
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("src/lib.rs".to_string())
+            .or_default()
+            .push("src/utils.rs".to_string());
+
+        // File analytics (for coupling metrics)
+        graph
+            .batch_update_file_analytics(&[
+                FileAnalyticsUpdate {
+                    path: "src/main.rs".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.3,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/lib.rs".to_string(),
+                    pagerank: 0.9,
+                    betweenness: 0.5,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.7,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/utils.rs".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.05,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_god_functions() {
+        let handler = create_handler_with_health_data().await;
+
+        // threshold=2 → god_function has in_degree=2, should be flagged
+        let result = handler
+            .handle(
+                "get_code_health",
+                Some(json!({"project_slug": "health-proj", "god_function_threshold": 2})),
+            )
+            .await
+            .unwrap();
+
+        let god_fns = result.get("god_functions").unwrap().as_array().unwrap();
+        assert_eq!(god_fns.len(), 1, "should flag god_function");
+        assert_eq!(
+            god_fns[0].get("name").unwrap().as_str().unwrap(),
+            "god_function"
+        );
+        assert_eq!(god_fns[0].get("in_degree").unwrap().as_u64().unwrap(), 2);
+        assert_eq!(god_fns[0].get("out_degree").unwrap().as_u64().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_orphan_files() {
+        let handler = create_handler_with_health_data().await;
+
+        let result = handler
+            .handle(
+                "get_code_health",
+                Some(json!({"project_slug": "health-proj"})),
+            )
+            .await
+            .unwrap();
+
+        let orphans = result.get("orphan_files").unwrap().as_array().unwrap();
+        let orphan_strs: Vec<&str> = orphans.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            orphan_strs.contains(&"src/orphan.rs"),
+            "orphan.rs should be flagged (no imports, no dependents, no functions)"
+        );
+        // main.rs, lib.rs, utils.rs should NOT be orphans
+        assert!(!orphan_strs.contains(&"src/main.rs"));
+        assert!(!orphan_strs.contains(&"src/lib.rs"));
+        assert!(!orphan_strs.contains(&"src/utils.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_coupling_metrics() {
+        let handler = create_handler_with_health_data().await;
+
+        let result = handler
+            .handle(
+                "get_code_health",
+                Some(json!({"project_slug": "health-proj"})),
+            )
+            .await
+            .unwrap();
+
+        let coupling = result.get("coupling_metrics").unwrap();
+        assert!(!coupling.is_null(), "should have coupling metrics");
+
+        let avg = coupling
+            .get("avg_clustering_coefficient")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        // (0.3 + 0.7 + 0.2) / 3 = 0.4
+        assert!((avg - 0.4).abs() < 0.01, "avg should be ~0.4, got {}", avg);
+
+        let max = coupling
+            .get("max_clustering_coefficient")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((max - 0.7).abs() < 0.01, "max should be 0.7, got {}", max);
+
+        assert_eq!(
+            coupling.get("most_coupled_file").unwrap().as_str().unwrap(),
+            "src/lib.rs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_circular_dependencies() {
+        let graph = MockGraphStore::new();
+        let project = test_project_named("cycle-proj");
+        graph.create_project(&project).await.unwrap();
+
+        let file_paths = vec!["a.rs", "b.rs", "c.rs"];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Circular: a -> b -> c -> a
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("a.rs".to_string())
+            .or_default()
+            .push("b.rs".to_string());
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("b.rs".to_string())
+            .or_default()
+            .push("c.rs".to_string());
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("c.rs".to_string())
+            .or_default()
+            .push("a.rs".to_string());
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        let handler = ToolHandler::new(orchestrator);
+
+        let result = handler
+            .handle(
+                "get_code_health",
+                Some(json!({"project_slug": "cycle-proj"})),
+            )
+            .await
+            .unwrap();
+
+        let cycles = result
+            .get("circular_dependencies")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(
+            !cycles.is_empty(),
+            "should detect circular dependency a->b->c->a"
+        );
+        let count = result
+            .get("circular_dependency_count")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!(count >= 1, "should have at least 1 cycle");
+    }
+
+    // ========================================================================
+    // Structural Analytics — get_node_importance
+    // ========================================================================
+
+    async fn create_handler_with_importance_data() -> ToolHandler {
+        use crate::graph::models::{FileAnalyticsUpdate, FunctionAnalyticsUpdate};
+
+        let graph = MockGraphStore::new();
+        let project = test_project_named("importance-proj");
+        graph.create_project(&project).await.unwrap();
+
+        // 9 files to establish a reliable distribution for percentile calculations
+        let file_paths: Vec<&str> = vec![
+            "src/hub.rs",
+            "src/leaf.rs",
+            "src/bridge.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/c.rs",
+            "src/d.rs",
+            "src/e.rs",
+            "src/f.rs",
+        ];
+        graph
+            .project_files
+            .write()
+            .await
+            .entry(project.id)
+            .or_default()
+            .extend(file_paths.iter().map(|s| s.to_string()));
+
+        for path in &file_paths {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "test".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            graph.upsert_file(&file).await.unwrap();
+        }
+
+        // Function in hub.rs
+        let hub_fn = FunctionNode {
+            name: "hub_function".to_string(),
+            file_path: "src/hub.rs".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 10,
+            line_start: 1,
+            line_end: 100,
+            docstring: None,
+        };
+        graph.upsert_function(&hub_fn).await.unwrap();
+
+        // File analytics — 10 data points (9 files + 1 function)
+        // Distribution designed so:
+        //   hub.rs (pagerank=0.95) → critical (top 5%)
+        //   bridge.rs (betweenness=2.0) → bridge (>> mean+2σ)
+        //   leaf.rs (pagerank=0.01) → low
+        //   a-f.rs → low pagerank, low betweenness (bulk of distribution)
+        graph
+            .batch_update_file_analytics(&[
+                FileAnalyticsUpdate {
+                    path: "src/hub.rs".to_string(),
+                    pagerank: 0.95,
+                    betweenness: 0.1,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.8,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/leaf.rs".to_string(),
+                    pagerank: 0.01,
+                    betweenness: 0.02,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.1,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/bridge.rs".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 2.0,
+                    community_id: 1,
+                    community_label: "infra".to_string(),
+                    clustering_coefficient: 0.3,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/a.rs".to_string(),
+                    pagerank: 0.05,
+                    betweenness: 0.03,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/b.rs".to_string(),
+                    pagerank: 0.08,
+                    betweenness: 0.04,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/c.rs".to_string(),
+                    pagerank: 0.12,
+                    betweenness: 0.05,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/d.rs".to_string(),
+                    pagerank: 0.15,
+                    betweenness: 0.06,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/e.rs".to_string(),
+                    pagerank: 0.20,
+                    betweenness: 0.07,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+                FileAnalyticsUpdate {
+                    path: "src/f.rs".to_string(),
+                    pagerank: 0.25,
+                    betweenness: 0.08,
+                    community_id: 0,
+                    community_label: "core".to_string(),
+                    clustering_coefficient: 0.2,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        // Function analytics — hub_function has high pagerank
+        graph
+            .batch_update_function_analytics(&[FunctionAnalyticsUpdate {
+                name: "hub_function".to_string(),
+                pagerank: 0.90,
+                betweenness: 0.09,
+                community_id: 0,
+                clustering_coefficient: 0.7,
+                component_id: 0,
+            }])
+            .await
+            .unwrap();
+
+        // Import relationships for degree counting
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("src/leaf.rs".to_string())
+            .or_default()
+            .push("src/hub.rs".to_string());
+        graph
+            .import_relationships
+            .write()
+            .await
+            .entry("src/bridge.rs".to_string())
+            .or_default()
+            .push("src/hub.rs".to_string());
+
+        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(state).await.unwrap());
+        ToolHandler::new(orchestrator)
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_critical_file() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "src/hub.rs",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.get("node").unwrap().as_str().unwrap(), "src/hub.rs");
+        assert_eq!(result.get("node_type").unwrap().as_str().unwrap(), "file");
+
+        let interp = result.get("interpretation").unwrap();
+        let importance = interp.get("importance").unwrap().as_str().unwrap();
+        assert_eq!(
+            importance, "critical",
+            "hub.rs (top pagerank) should be critical"
+        );
+
+        let risk = interp.get("risk_level").unwrap().as_str().unwrap();
+        assert!(
+            risk == "critical" || risk == "high",
+            "risk should be critical or high, got {}",
+            risk
+        );
+
+        let summary = interp.get("summary").unwrap().as_str().unwrap();
+        assert!(
+            summary.contains("critical hub"),
+            "summary should mention critical hub, got: {}",
+            summary
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_low_file() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "src/leaf.rs",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await
+            .unwrap();
+
+        let interp = result.get("interpretation").unwrap();
+        let importance = interp.get("importance").unwrap().as_str().unwrap();
+        assert_eq!(importance, "low", "leaf.rs should be low importance");
+
+        let risk = interp.get("risk_level").unwrap().as_str().unwrap();
+        assert_eq!(risk, "low");
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_bridge_file() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "src/bridge.rs",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await
+            .unwrap();
+
+        let interp = result.get("interpretation").unwrap();
+        let is_bridge = interp.get("is_bridge").unwrap().as_bool().unwrap();
+        assert!(
+            is_bridge,
+            "bridge.rs should be detected as a bridge (betweenness=0.9)"
+        );
+
+        let summary = interp.get("summary").unwrap().as_str().unwrap();
+        assert!(
+            summary.contains("bridge"),
+            "summary should mention bridge, got: {}",
+            summary
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_function() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "hub_function",
+                    "node_type": "function",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.get("node_type").unwrap().as_str().unwrap(),
+            "function"
+        );
+
+        let metrics = result.get("metrics").unwrap();
+        assert!(metrics.get("pagerank").unwrap().as_f64().unwrap() > 0.0);
+
+        let interp = result.get("interpretation").unwrap();
+        let importance = interp.get("importance").unwrap().as_str().unwrap();
+        assert!(
+            importance == "critical" || importance == "high",
+            "hub_function (pagerank=0.90, at p80) should be critical or high, got {}",
+            importance
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_not_found() {
+        let handler = create_handler_with_importance_data().await;
+
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "node_path": "nonexistent.rs",
+                    "project_slug": "importance-proj"
+                })),
+            )
+            .await;
+
+        assert!(result.is_err(), "should error for non-existent node");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Node not found"),
+            "error should say Node not found, got: {}",
+            err_msg
+        );
     }
 }

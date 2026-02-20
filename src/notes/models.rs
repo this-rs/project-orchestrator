@@ -686,6 +686,10 @@ pub struct PropagatedNote {
     pub propagation_path: Vec<String>,
     /// Distance in the graph (0 = direct, 1+ = propagated)
     pub distance: u32,
+    /// Average PageRank of nodes on the propagation path (for debug/introspection).
+    /// Higher values mean the note was propagated through structurally important hubs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_pagerank: Option<f64>,
 }
 
 // ============================================================================
@@ -1006,5 +1010,72 @@ mod tests {
     #[test]
     fn test_note_scope_workspace_display() {
         assert_eq!(NoteScope::Workspace.to_string(), "workspace");
+    }
+
+    /// Conceptual test documenting PageRank-weighted propagation scoring.
+    ///
+    /// In Neo4j, the Cypher query computes:
+    ///   avg_path_pagerank = mean(COALESCE(node.pagerank, 0.05)) over path nodes
+    ///   score = (1/(distance+1)) * importance * (1 + avg_path_pagerank * 5)
+    ///
+    /// Expected behavior with two notes at equal distance (2 hops) and importance (high=0.8):
+    ///   - Note A propagated via hub (pagerank 0.15): multiplier = 1 + 0.15 * 5 = 1.75
+    ///     → score = (1/3) * 0.8 * 1.75 = 0.467
+    ///   - Note B propagated via leaf (pagerank 0.01): multiplier = 1 + 0.01 * 5 = 1.05
+    ///     → score = (1/3) * 0.8 * 1.05 = 0.280
+    ///   - Note A should rank higher than Note B.
+    ///
+    /// Fallback: if no pagerank on any node, avg = 0.05, multiplier = 1.25
+    ///   → score = (1/3) * 0.8 * 1.25 = 0.333 (slightly above old formula's 0.267)
+    #[test]
+    fn test_propagated_note_pagerank_scoring_documentation() {
+        // Simulate the scoring formula in Rust (mirrors the Cypher computation)
+        let distance: f64 = 2.0;
+        let importance_weight: f64 = 0.8; // "high"
+
+        // Via hub (pagerank 0.15)
+        let hub_pagerank = 0.15;
+        let hub_multiplier = 1.0 + hub_pagerank * 5.0;
+        let hub_score = (1.0 / (distance + 1.0)) * importance_weight * hub_multiplier;
+
+        // Via leaf (pagerank 0.01)
+        let leaf_pagerank = 0.01;
+        let leaf_multiplier = 1.0 + leaf_pagerank * 5.0;
+        let leaf_score = (1.0 / (distance + 1.0)) * importance_weight * leaf_multiplier;
+
+        // Via unknown node (no pagerank → default 0.05)
+        let default_pagerank = 0.05;
+        let default_multiplier = 1.0 + default_pagerank * 5.0;
+        let default_score = (1.0 / (distance + 1.0)) * importance_weight * default_multiplier;
+
+        // Old formula (without pagerank weighting)
+        let old_score = (1.0 / (distance + 1.0)) * importance_weight;
+
+        // Hub path scores higher than leaf path
+        assert!(
+            hub_score > leaf_score,
+            "Hub path ({:.3}) should score higher than leaf path ({:.3})",
+            hub_score,
+            leaf_score
+        );
+
+        // Both are higher than old formula (multiplier always >= 1.0)
+        assert!(hub_score > old_score);
+        assert!(leaf_score > old_score);
+
+        // Default (no pagerank data) is close to old formula (multiplier = 1.25)
+        assert!((default_score - old_score).abs() < 0.1_f64);
+
+        // Verify the PropagatedNote struct carries the path_pagerank field
+        let pn = PropagatedNote {
+            note: Note::new(None, NoteType::Tip, "test".to_string(), "test".to_string()),
+            relevance_score: hub_score,
+            source_entity: "hub_file".to_string(),
+            propagation_path: vec!["hub_file".to_string(), "target".to_string()],
+            distance: 2,
+            path_pagerank: Some(hub_pagerank),
+        };
+        assert_eq!(pn.path_pagerank, Some(0.15));
+        assert!(pn.relevance_score > 0.4);
     }
 }

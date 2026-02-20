@@ -721,12 +721,117 @@ pub struct FileSymbolNamesNode {
     pub enums: Vec<String>,
 }
 
-/// A file with connection counts (imports + dependents)
+/// A file with connection counts (imports + dependents) and optional GDS analytics scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectedFileNode {
     pub path: String,
     pub imports: i64,
     pub dependents: i64,
+    /// PageRank score from graph analytics (higher = more structurally important)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pagerank: Option<f64>,
+    /// Betweenness centrality score (higher = more bridge-like)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub betweenness: Option<f64>,
+    /// Human-readable community label (e.g., "MCP Tool Pipeline")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_label: Option<String>,
+    /// Numeric community identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_id: Option<i64>,
+}
+
+/// GDS analytics properties for a single node (File or Function).
+/// Returned by `get_node_analytics()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeAnalyticsRow {
+    pub pagerank: Option<f64>,
+    pub betweenness: Option<f64>,
+    pub community_id: Option<i64>,
+    pub community_label: Option<String>,
+}
+
+/// A community row returned by `get_project_communities()`.
+/// Represents a Louvain community detected by graph analytics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityRow {
+    /// Numeric community identifier
+    pub community_id: i64,
+    /// Human-readable community label
+    pub community_label: String,
+    /// Number of files in this community
+    pub file_count: usize,
+    /// Top files in this community (by pagerank, up to 3)
+    pub key_files: Vec<String>,
+}
+
+/// A "god function" — a function with too many callers/callees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GodFunction {
+    pub name: String,
+    pub file: String,
+    pub in_degree: usize,
+    pub out_degree: usize,
+}
+
+/// Structural health report for a project's codebase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeHealthReport {
+    pub god_functions: Vec<GodFunction>,
+    pub orphan_files: Vec<String>,
+    pub coupling_metrics: Option<CouplingMetrics>,
+}
+
+/// Coupling metrics from clustering coefficients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouplingMetrics {
+    pub avg_clustering_coefficient: f64,
+    pub max_clustering_coefficient: f64,
+    pub most_coupled_file: Option<String>,
+}
+
+/// GDS metrics for a single node (file or function).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeGdsMetrics {
+    pub node_path: String,
+    pub node_type: String, // "file" or "function"
+    pub pagerank: Option<f64>,
+    pub betweenness: Option<f64>,
+    pub clustering_coefficient: Option<f64>,
+    pub community_id: Option<i64>,
+    pub community_label: Option<String>,
+    pub in_degree: i64,
+    pub out_degree: i64,
+}
+
+/// Statistical percentiles for a project's GDS metrics distribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectPercentiles {
+    pub pagerank_p50: f64,
+    pub pagerank_p80: f64,
+    pub pagerank_p95: f64,
+    pub betweenness_p50: f64,
+    pub betweenness_p80: f64,
+    pub betweenness_p95: f64,
+    pub betweenness_mean: f64,
+    pub betweenness_stddev: f64,
+}
+
+/// Interpretation of a node's structural importance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInterpretation {
+    pub importance: String, // "critical", "high", "medium", "low"
+    pub is_bridge: bool,
+    pub risk_level: String, // "critical", "high", "medium", "low"
+    pub summary: String,
+}
+
+/// A file with high betweenness centrality (bridge between communities).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeFile {
+    pub path: String,
+    pub betweenness: f64,
+    pub community_label: Option<String>,
 }
 
 /// A feature graph — a named subgraph capturing all code entities related to a feature.

@@ -590,6 +590,63 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn get_project_communities(&self, project_id: Uuid) -> anyhow::Result<Vec<CommunityRow>> {
+        self.get_project_communities(project_id).await
+    }
+
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> anyhow::Result<Option<NodeAnalyticsRow>> {
+        self.get_node_analytics(identifier, node_type).await
+    }
+
+    async fn get_affected_communities(&self, file_paths: &[String]) -> anyhow::Result<Vec<String>> {
+        self.get_affected_communities(file_paths).await
+    }
+
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> anyhow::Result<crate::neo4j::models::CodeHealthReport> {
+        self.get_code_health_report(project_id, god_function_threshold)
+            .await
+    }
+
+    async fn get_circular_dependencies(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<Vec<String>>> {
+        self.get_circular_dependencies(project_id).await
+    }
+
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<NodeGdsMetrics>> {
+        self.get_node_gds_metrics(node_path, node_type, project_id)
+            .await
+    }
+
+    async fn get_project_percentiles(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<ProjectPercentiles> {
+        self.get_project_percentiles(project_id).await
+    }
+
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<BridgeFile>> {
+        self.get_top_bridges_by_betweenness(project_id, limit).await
+    }
+
     async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {
         self.get_file_symbol_names(path).await
     }
@@ -955,6 +1012,15 @@ impl GraphStore for Neo4jClient {
         commit_hash: &str,
     ) -> anyhow::Result<()> {
         self.add_commit_to_release(release_id, commit_hash).await
+    }
+
+    async fn remove_commit_from_release(
+        &self,
+        release_id: Uuid,
+        commit_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.remove_commit_from_release(release_id, commit_hash)
+            .await
     }
 
     async fn get_release_details(
@@ -1513,6 +1579,7 @@ impl GraphStore for Neo4jClient {
         entry_function: &str,
         depth: u32,
         include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
     ) -> anyhow::Result<FeatureGraphDetail> {
         self.auto_build_feature_graph(
             name,
@@ -1521,6 +1588,7 @@ impl GraphStore for Neo4jClient {
             entry_function,
             depth,
             include_relations,
+            filter_community,
         )
         .await
     }
@@ -1535,6 +1603,34 @@ impl GraphStore for Neo4jClient {
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
         self.get_top_entry_functions(project_id, limit).await
+    }
+
+    async fn get_project_import_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_project_import_edges(project_id).await
+    }
+
+    async fn get_project_call_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_project_call_edges(project_id).await
+    }
+
+    async fn batch_update_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FileAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        self.batch_update_file_analytics(updates).await
+    }
+
+    async fn batch_update_function_analytics(
+        &self,
+        updates: &[crate::graph::models::FunctionAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        self.batch_update_function_analytics(updates).await
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {

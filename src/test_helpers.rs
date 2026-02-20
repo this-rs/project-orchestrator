@@ -77,6 +77,36 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
     }
 }
 
+/// Create a mock AppState with a shared Arc<MockGraphStore> (allows direct access in tests)
+pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
+    AppState {
+        neo4j: graph,
+        meili: Arc::new(MockSearchStore::new()),
+        parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
+        config: Arc::new(crate::Config {
+            setup_completed: true,
+            neo4j_uri: "bolt://mock:7687".to_string(),
+            neo4j_user: "neo4j".to_string(),
+            neo4j_password: "mock".to_string(),
+            meilisearch_url: "http://mock:7700".to_string(),
+            meilisearch_key: "mock-key".to_string(),
+            nats_url: None,
+            workspace_path: ".".to_string(),
+            server_port: 0,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            public_url: None,
+            chat_permissions: None,
+            chat_default_model: None,
+            chat_max_sessions: None,
+            chat_max_turns: None,
+            chat_session_timeout_secs: None,
+            config_yaml_path: None,
+        }),
+    }
+}
+
 /// Create a test AuthConfig suitable for integration tests.
 ///
 /// Uses a fixed JWT secret and disables domain restriction.

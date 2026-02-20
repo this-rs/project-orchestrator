@@ -53,6 +53,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1.0"
 thiserror = "2.0"
 
+# Graph analytics
+petgraph = "0.7"
+rustworkx-core = "0.16"
+
 # Utilities
 uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

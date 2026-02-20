@@ -86,6 +86,10 @@ pub struct MockGraphStore {
     /// feature_graph_id -> Vec<(entity_type, entity_id, role)>
     #[allow(clippy::type_complexity)]
     pub feature_graph_entities: RwLock<HashMap<Uuid, Vec<(String, String, Option<String>)>>>,
+    /// Analytics scores stored for File nodes (keyed by path)
+    pub file_analytics: RwLock<HashMap<String, crate::graph::models::FileAnalyticsUpdate>>,
+    /// Analytics scores stored for Function nodes (keyed by name)
+    pub function_analytics: RwLock<HashMap<String, crate::graph::models::FunctionAnalyticsUpdate>>,
 }
 
 #[allow(dead_code)]
@@ -152,6 +156,8 @@ impl MockGraphStore {
             refresh_tokens: RwLock::new(HashMap::new()),
             feature_graphs: RwLock::new(HashMap::new()),
             feature_graph_entities: RwLock::new(HashMap::new()),
+            file_analytics: RwLock::new(HashMap::new()),
+            function_analytics: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1708,6 +1714,7 @@ impl GraphStore for MockGraphStore {
         limit: usize,
     ) -> Result<Vec<ConnectedFileNode>> {
         let ir = self.import_relationships.read().await;
+        let fa = self.file_analytics.read().await;
         let mut import_counts: HashMap<String, i64> = HashMap::new();
         let mut dependent_counts: HashMap<String, i64> = HashMap::new();
 
@@ -1726,14 +1733,28 @@ impl GraphStore for MockGraphStore {
 
         let mut result: Vec<ConnectedFileNode> = all_files
             .into_iter()
-            .map(|path| ConnectedFileNode {
-                imports: *import_counts.get(&path).unwrap_or(&0),
-                dependents: *dependent_counts.get(&path).unwrap_or(&0),
-                path,
+            .map(|path| {
+                let analytics = fa.get(&path);
+                ConnectedFileNode {
+                    imports: *import_counts.get(&path).unwrap_or(&0),
+                    dependents: *dependent_counts.get(&path).unwrap_or(&0),
+                    pagerank: analytics.map(|a| a.pagerank),
+                    betweenness: analytics.map(|a| a.betweenness),
+                    community_label: analytics.map(|a| a.community_label.clone()),
+                    community_id: analytics.map(|a| a.community_id as i64),
+                    path,
+                }
             })
             .collect();
 
-        result.sort_by(|a, b| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)));
+        // Sort by pagerank (descending) with fallback to degree
+        result.sort_by(|a, b| {
+            let pr_a = a.pagerank.unwrap_or(0.0);
+            let pr_b = b.pagerank.unwrap_or(0.0);
+            pr_b.partial_cmp(&pr_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)))
+        });
         result.truncate(limit);
         Ok(result)
     }
@@ -1751,6 +1772,7 @@ impl GraphStore for MockGraphStore {
             .collect();
 
         let ir = self.import_relationships.read().await;
+        let fa = self.file_analytics.read().await;
         let mut import_counts: HashMap<String, i64> = HashMap::new();
         let mut dependent_counts: HashMap<String, i64> = HashMap::new();
 
@@ -1774,16 +1796,457 @@ impl GraphStore for MockGraphStore {
 
         let mut result: Vec<ConnectedFileNode> = all_files
             .into_iter()
-            .map(|path| ConnectedFileNode {
-                imports: *import_counts.get(&path).unwrap_or(&0),
-                dependents: *dependent_counts.get(&path).unwrap_or(&0),
-                path,
+            .map(|path| {
+                let analytics = fa.get(&path);
+                ConnectedFileNode {
+                    imports: *import_counts.get(&path).unwrap_or(&0),
+                    dependents: *dependent_counts.get(&path).unwrap_or(&0),
+                    pagerank: analytics.map(|a| a.pagerank),
+                    betweenness: analytics.map(|a| a.betweenness),
+                    community_label: analytics.map(|a| a.community_label.clone()),
+                    community_id: analytics.map(|a| a.community_id as i64),
+                    path,
+                }
             })
             .collect();
 
-        result.sort_by(|a, b| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)));
+        // Sort by pagerank (descending) with fallback to degree
+        result.sort_by(|a, b| {
+            let pr_a = a.pagerank.unwrap_or(0.0);
+            let pr_b = b.pagerank.unwrap_or(0.0);
+            pr_b.partial_cmp(&pr_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)))
+        });
         result.truncate(limit);
         Ok(result)
+    }
+
+    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>> {
+        let files = self.files.read().await;
+        let fa = self.file_analytics.read().await;
+
+        // Collect files belonging to this project that have analytics
+        let project_paths: Vec<String> = files
+            .values()
+            .filter(|f| f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+
+        // Group by community_id
+        let mut communities: HashMap<u32, (String, Vec<String>)> = HashMap::new();
+        for path in &project_paths {
+            if let Some(analytics) = fa.get(path) {
+                let entry = communities
+                    .entry(analytics.community_id)
+                    .or_insert_with(|| (analytics.community_label.clone(), Vec::new()));
+                entry.1.push(path.clone());
+            }
+        }
+
+        // Build result sorted by file_count descending
+        let mut result: Vec<CommunityRow> = communities
+            .into_iter()
+            .map(|(cid, (label, paths))| {
+                let key_files: Vec<String> = paths.iter().take(3).cloned().collect();
+                CommunityRow {
+                    community_id: cid as i64,
+                    community_label: label,
+                    file_count: paths.len(),
+                    key_files,
+                }
+            })
+            .collect();
+
+        result.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+        Ok(result)
+    }
+
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>> {
+        if node_type == "function" {
+            let fa = self.function_analytics.read().await;
+            if let Some(analytics) = fa.get(identifier) {
+                return Ok(Some(NodeAnalyticsRow {
+                    pagerank: Some(analytics.pagerank),
+                    betweenness: Some(analytics.betweenness),
+                    community_id: Some(analytics.community_id as i64),
+                    community_label: None, // FunctionAnalyticsUpdate has no label
+                }));
+            }
+            Ok(None)
+        } else {
+            let fa = self.file_analytics.read().await;
+            if let Some(analytics) = fa.get(identifier) {
+                return Ok(Some(NodeAnalyticsRow {
+                    pagerank: Some(analytics.pagerank),
+                    betweenness: Some(analytics.betweenness),
+                    community_id: Some(analytics.community_id as i64),
+                    community_label: Some(analytics.community_label.clone()),
+                }));
+            }
+            Ok(None)
+        }
+    }
+
+    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>> {
+        let fa = self.file_analytics.read().await;
+        let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for path in file_paths {
+            if let Some(analytics) = fa.get(path) {
+                labels.insert(analytics.community_label.clone());
+            }
+        }
+        Ok(labels.into_iter().collect())
+    }
+
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> Result<CodeHealthReport> {
+        let pf = self.project_files.read().await;
+        let project_paths: Vec<String> = pf.get(&project_id).cloned().unwrap_or_default();
+        let project_paths_set: std::collections::HashSet<&str> =
+            project_paths.iter().map(|s| s.as_str()).collect();
+
+        // --- God functions ---
+        let functions = self.functions.read().await;
+        let cr = self.call_relationships.read().await;
+
+        // Only consider functions that belong to project files
+        let project_functions: Vec<&FunctionNode> = functions
+            .values()
+            .filter(|f| project_paths_set.contains(f.file_path.as_str()))
+            .collect();
+
+        let mut god_functions = Vec::new();
+        for func in &project_functions {
+            // in_degree: how many other functions call this one
+            let in_degree = cr
+                .iter()
+                .filter(|(_, callees)| callees.contains(&func.name))
+                .count();
+            // out_degree: how many functions this one calls
+            let out_degree = cr.get(&func.name).map(|callees| callees.len()).unwrap_or(0);
+            if in_degree >= god_function_threshold {
+                god_functions.push(GodFunction {
+                    name: func.name.clone(),
+                    file: func.file_path.clone(),
+                    in_degree,
+                    out_degree,
+                });
+            }
+        }
+        god_functions.sort_by(|a, b| b.in_degree.cmp(&a.in_degree));
+
+        // --- Orphan files ---
+        let ir = self.import_relationships.read().await;
+        let mut orphan_files = Vec::new();
+        for path in &project_paths {
+            // Orphan = no imports AND no other file imports it AND no functions
+            let has_imports = ir.get(path).map(|v| !v.is_empty()).unwrap_or(false);
+            let is_imported = ir.values().any(|targets| targets.contains(path));
+            let has_functions = project_functions.iter().any(|f| f.file_path == *path);
+            if !has_imports && !is_imported && !has_functions {
+                orphan_files.push(path.clone());
+            }
+        }
+
+        // --- Coupling metrics ---
+        let fa = self.file_analytics.read().await;
+        let project_analytics: Vec<&crate::graph::models::FileAnalyticsUpdate> = fa
+            .values()
+            .filter(|a| project_paths_set.contains(a.path.as_str()))
+            .collect();
+
+        let coupling_metrics = if project_analytics.is_empty() {
+            None
+        } else {
+            let sum: f64 = project_analytics
+                .iter()
+                .map(|a| a.clustering_coefficient)
+                .sum();
+            let avg = sum / project_analytics.len() as f64;
+            let (max_cc, most_coupled) = project_analytics.iter().fold(
+                (0.0_f64, None::<String>),
+                |(max_val, max_file), a| {
+                    if a.clustering_coefficient > max_val {
+                        (a.clustering_coefficient, Some(a.path.clone()))
+                    } else {
+                        (max_val, max_file)
+                    }
+                },
+            );
+            Some(CouplingMetrics {
+                avg_clustering_coefficient: avg,
+                max_clustering_coefficient: max_cc,
+                most_coupled_file: most_coupled,
+            })
+        };
+
+        Ok(CodeHealthReport {
+            god_functions,
+            orphan_files,
+            coupling_metrics,
+        })
+    }
+
+    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>> {
+        let pf = self.project_files.read().await;
+        let project_paths: Vec<String> = pf.get(&project_id).cloned().unwrap_or_default();
+        let project_paths_set: std::collections::HashSet<&str> =
+            project_paths.iter().map(|s| s.as_str()).collect();
+
+        let ir = self.import_relationships.read().await;
+
+        // DFS cycle detection
+        let mut cycles: Vec<Vec<String>> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for start in &project_paths {
+            if visited.contains(start) {
+                continue;
+            }
+            let mut stack: Vec<(String, Vec<String>)> = vec![(start.clone(), vec![start.clone()])];
+            let mut local_visited: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            while let Some((current, path)) = stack.pop() {
+                if let Some(neighbors) = ir.get(&current) {
+                    for neighbor in neighbors {
+                        if !project_paths_set.contains(neighbor.as_str()) {
+                            continue;
+                        }
+                        if *neighbor == *start && path.len() >= 2 {
+                            // Found a cycle — canonicalize by sorting to deduplicate
+                            let mut cycle = path.clone();
+                            cycle.push(neighbor.clone());
+                            let min_idx = cycle
+                                .iter()
+                                .take(cycle.len() - 1)
+                                .enumerate()
+                                .min_by(|a, b| a.1.cmp(b.1))
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            let mut canonical: Vec<String> =
+                                cycle[min_idx..cycle.len() - 1].to_vec();
+                            canonical.extend(cycle[..min_idx].to_vec());
+                            canonical.push(canonical[0].clone());
+                            if !cycles.iter().any(|c| c == &canonical) {
+                                cycles.push(canonical);
+                            }
+                        } else if !local_visited.contains(neighbor) && path.len() < 6 {
+                            local_visited.insert(neighbor.clone());
+                            let mut new_path = path.clone();
+                            new_path.push(neighbor.clone());
+                            stack.push((neighbor.clone(), new_path));
+                        }
+                    }
+                }
+            }
+            visited.insert(start.clone());
+        }
+
+        Ok(cycles)
+    }
+
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+
+        match node_type {
+            "function" => {
+                let functions = self.functions.read().await;
+                // Functions are keyed by "file_path::name", so find by name
+                let func = functions
+                    .values()
+                    .find(|f| f.name == node_path && project_paths.contains(&f.file_path));
+                if func.is_none() {
+                    return Ok(None);
+                }
+
+                let fa = self.function_analytics.read().await;
+                let cr = self.call_relationships.read().await;
+
+                let in_degree = cr
+                    .iter()
+                    .filter(|(_, callees)| callees.contains(&node_path.to_string()))
+                    .count() as i64;
+                let out_degree = cr.get(node_path).map(|c| c.len()).unwrap_or(0) as i64;
+
+                if let Some(analytics) = fa.get(node_path) {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "function".to_string(),
+                        pagerank: Some(analytics.pagerank),
+                        betweenness: Some(analytics.betweenness),
+                        clustering_coefficient: Some(analytics.clustering_coefficient),
+                        community_id: Some(analytics.community_id as i64),
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                    }))
+                } else {
+                    // Node exists but no GDS metrics
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "function".to_string(),
+                        pagerank: None,
+                        betweenness: None,
+                        clustering_coefficient: None,
+                        community_id: None,
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                    }))
+                }
+            }
+            _ => {
+                // File
+                if !project_paths.contains(&node_path.to_string()) {
+                    return Ok(None);
+                }
+
+                let fa = self.file_analytics.read().await;
+                let ir = self.import_relationships.read().await;
+
+                let in_degree = ir
+                    .iter()
+                    .filter(|(_, targets)| targets.contains(&node_path.to_string()))
+                    .count() as i64;
+                let out_degree = ir.get(node_path).map(|t| t.len()).unwrap_or(0) as i64;
+
+                if let Some(analytics) = fa.get(node_path) {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "file".to_string(),
+                        pagerank: Some(analytics.pagerank),
+                        betweenness: Some(analytics.betweenness),
+                        clustering_coefficient: Some(analytics.clustering_coefficient),
+                        community_id: Some(analytics.community_id as i64),
+                        community_label: Some(analytics.community_label.clone()),
+                        in_degree,
+                        out_degree,
+                    }))
+                } else {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "file".to_string(),
+                        pagerank: None,
+                        betweenness: None,
+                        clustering_coefficient: None,
+                        community_id: None,
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                    }))
+                }
+            }
+        }
+    }
+
+    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+
+        let fa = self.file_analytics.read().await;
+        let fna = self.function_analytics.read().await;
+
+        let mut pageranks: Vec<f64> = Vec::new();
+        let mut betweennesses: Vec<f64> = Vec::new();
+
+        // Collect from file analytics
+        for path in &project_paths {
+            if let Some(a) = fa.get(path) {
+                pageranks.push(a.pagerank);
+                betweennesses.push(a.betweenness);
+            }
+        }
+
+        // Collect from function analytics (functions belonging to project files)
+        let functions = self.functions.read().await;
+        for func in functions.values() {
+            if project_paths.contains(&func.file_path) {
+                if let Some(a) = fna.get(&func.name) {
+                    pageranks.push(a.pagerank);
+                    betweennesses.push(a.betweenness);
+                }
+            }
+        }
+
+        if pageranks.is_empty() {
+            return Ok(ProjectPercentiles {
+                pagerank_p50: 0.0,
+                pagerank_p80: 0.0,
+                pagerank_p95: 0.0,
+                betweenness_p50: 0.0,
+                betweenness_p80: 0.0,
+                betweenness_p95: 0.0,
+                betweenness_mean: 0.0,
+                betweenness_stddev: 0.0,
+            });
+        }
+
+        pageranks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        betweennesses.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let cnt = pageranks.len();
+        let percentile = |sorted: &[f64], p: f64| -> f64 {
+            let idx = ((cnt as f64 * p) as usize).min(cnt - 1);
+            sorted[idx]
+        };
+
+        let bw_mean: f64 = betweennesses.iter().sum::<f64>() / cnt as f64;
+        let bw_var: f64 = betweennesses
+            .iter()
+            .map(|x| (x - bw_mean).powi(2))
+            .sum::<f64>()
+            / cnt as f64;
+
+        Ok(ProjectPercentiles {
+            pagerank_p50: percentile(&pageranks, 0.5),
+            pagerank_p80: percentile(&pageranks, 0.8),
+            pagerank_p95: percentile(&pageranks, 0.95),
+            betweenness_p50: percentile(&betweennesses, 0.5),
+            betweenness_p80: percentile(&betweennesses, 0.8),
+            betweenness_p95: percentile(&betweennesses, 0.95),
+            betweenness_mean: bw_mean,
+            betweenness_stddev: bw_var.sqrt(),
+        })
+    }
+
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+        let fa = self.file_analytics.read().await;
+
+        let mut bridges: Vec<BridgeFile> = project_paths
+            .iter()
+            .filter_map(|path| {
+                fa.get(path).map(|a| BridgeFile {
+                    path: path.clone(),
+                    betweenness: a.betweenness,
+                    community_label: Some(a.community_label.clone()),
+                })
+            })
+            .collect();
+
+        bridges.sort_by(|a, b| b.betweenness.partial_cmp(&a.betweenness).unwrap());
+        bridges.truncate(limit);
+        Ok(bridges)
     }
 
     async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
@@ -2880,6 +3343,16 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
+        self.release_commits
+            .write()
+            .await
+            .entry(release_id)
+            .or_default()
+            .retain(|h| h != commit_hash);
+        Ok(())
+    }
+
     async fn get_release_details(
         &self,
         release_id: Uuid,
@@ -3586,6 +4059,7 @@ impl GraphStore for MockGraphStore {
                     propagation_path: vec![format!("workspace:{}", workspace.slug)],
                     distance: 1,
                     note: n,
+                    path_pagerank: None,
                 })
                 .collect())
         } else {
@@ -4150,6 +4624,7 @@ impl GraphStore for MockGraphStore {
         entry_function: &str,
         depth: u32,
         include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
     ) -> Result<FeatureGraphDetail> {
         let should_include = |rel: &str| -> bool {
             match &include_relations {
@@ -4157,6 +4632,7 @@ impl GraphStore for MockGraphStore {
                 Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
             }
         };
+        let filter_community = filter_community.unwrap_or(true);
         let depth = depth.clamp(1, 5);
 
         // Collect callees from the mock call_relationships
@@ -4164,14 +4640,21 @@ impl GraphStore for MockGraphStore {
         let mut all_functions = std::collections::HashSet::new();
         all_functions.insert(entry_function.to_string());
 
+        // Track direct (depth=1) connections for community filtering
+        let mut direct_connections: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         // Simple BFS traversal for callees
         let mut queue: Vec<String> = vec![entry_function.to_string()];
-        for _ in 0..depth {
+        for current_depth in 0..depth {
             let mut next_queue = Vec::new();
             for func in &queue {
                 // Check direct name match
                 if let Some(callees) = cr.get(func) {
                     for callee in callees {
+                        if current_depth == 0 {
+                            direct_connections.insert(callee.clone());
+                        }
                         if all_functions.insert(callee.clone()) {
                             next_queue.push(callee.clone());
                         }
@@ -4181,6 +4664,9 @@ impl GraphStore for MockGraphStore {
                 for (caller_id, callees) in cr.iter() {
                     if caller_id.ends_with(&format!("::{}", func)) {
                         for callee in callees {
+                            if current_depth == 0 {
+                                direct_connections.insert(callee.clone());
+                            }
                             if all_functions.insert(callee.clone()) {
                                 next_queue.push(callee.clone());
                             }
@@ -4191,13 +4677,33 @@ impl GraphStore for MockGraphStore {
             queue = next_queue;
         }
 
-        // Collect callers
+        // Collect callers (all are direct connections)
         for (caller, callees) in cr.iter() {
             if callees.contains(&entry_function.to_string()) {
                 all_functions.insert(caller.clone());
+                direct_connections.insert(caller.clone());
             }
         }
         drop(cr);
+
+        // Community-based filtering
+        if filter_community {
+            let fa = self.function_analytics.read().await;
+            let entry_community = fa.get(entry_function).map(|a| a.community_id as i64);
+
+            if let Some(entry_cid) = entry_community {
+                all_functions.retain(|fname| {
+                    fname == entry_function
+                        || direct_connections.contains(fname)
+                        || fa
+                            .get(fname)
+                            .map(|a| a.community_id as i64)
+                            .map(|c| c == entry_cid)
+                            .unwrap_or(true) // no analytics → keep
+                });
+            }
+            drop(fa);
+        }
 
         if all_functions.len() <= 1 {
             // Only entry function found — check it even exists in functions
@@ -4605,6 +5111,98 @@ impl GraphStore for MockGraphStore {
         sorted.truncate(limit);
 
         Ok(sorted.into_iter().map(|(name, _)| name).collect())
+    }
+
+    async fn get_project_import_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let ir = self.import_relationships.read().await;
+        let mut edges = Vec::new();
+
+        for (source, targets) in ir.iter() {
+            if project_paths.contains(source) {
+                for target in targets {
+                    if project_paths.contains(target) {
+                        edges.push((source.clone(), target.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn get_project_call_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+        let mut edges = Vec::new();
+
+        for (caller_id, callees) in cr.iter() {
+            // Check caller belongs to project and get its name
+            let caller_fn = match functions.get(caller_id) {
+                Some(f) if project_paths.contains(&f.file_path) => f,
+                _ => continue,
+            };
+            let caller_name = caller_fn.name.clone();
+            for callee_name in callees {
+                // Check callee belongs to project
+                let callee_in_project = functions
+                    .values()
+                    .any(|f| f.name == *callee_name && project_paths.contains(&f.file_path));
+                if callee_in_project {
+                    // Return simple names (matching the real Cypher: f1.name, f2.name)
+                    edges.push((caller_name.clone(), callee_name.clone()));
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn batch_update_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FileAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        let mut fa = self.file_analytics.write().await;
+        for update in updates {
+            fa.insert(update.path.clone(), update.clone());
+        }
+        Ok(())
+    }
+
+    async fn batch_update_function_analytics(
+        &self,
+        updates: &[crate::graph::models::FunctionAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        let mut fa = self.function_analytics.write().await;
+        for update in updates {
+            fa.insert(update.name.clone(), update.clone());
+        }
+        Ok(())
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {
@@ -5733,7 +6331,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-fg", None, pid, "handle_request", 2, None)
+            .auto_build_feature_graph("test-fg", None, pid, "handle_request", 2, None, None)
             .await
             .unwrap();
 
@@ -5806,7 +6404,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-imports", None, pid, "process", 2, None)
+            .auto_build_feature_graph("test-imports", None, pid, "process", 2, None, None)
             .await
             .unwrap();
 
@@ -5862,7 +6460,7 @@ mod tests {
 
         // Build feature graph for project A
         let detail = store
-            .auto_build_feature_graph("test-no-cross", None, pid_a, "shared_func", 2, None)
+            .auto_build_feature_graph("test-no-cross", None, pid_a, "shared_func", 2, None, None)
             .await
             .unwrap();
 
@@ -5928,7 +6526,7 @@ mod tests {
 
         // Build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2, None)
+            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2, None, None)
             .await
             .unwrap();
 
@@ -6091,6 +6689,290 @@ mod tests {
     }
 
     // ========================================================================
+    // Feature Graph — community filtering tests (Task 3.5)
+    // ========================================================================
+
+    /// Helper: set up a chain entry → F2 → F3 with communities, for community filtering tests.
+    /// Returns (store, project_id).
+    async fn setup_community_chain() -> (MockGraphStore, Uuid) {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed project files
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(vec![
+                "src/entry.rs".to_string(),
+                "src/direct.rs".to_string(),
+                "src/transitive.rs".to_string(),
+            ]);
+
+        // Create functions
+        store
+            .upsert_function(&make_function("entry_fn", "src/entry.rs", 1))
+            .await
+            .unwrap();
+        store
+            .upsert_function(&make_function("direct_fn", "src/direct.rs", 1))
+            .await
+            .unwrap();
+        store
+            .upsert_function(&make_function("transitive_fn", "src/transitive.rs", 1))
+            .await
+            .unwrap();
+
+        // Chain: entry_fn → direct_fn → transitive_fn
+        store
+            .create_call_relationship("entry_fn", "direct_fn", Some(pid))
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("direct_fn", "transitive_fn", Some(pid))
+            .await
+            .unwrap();
+
+        (store, pid)
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_excludes_transitive_different_community() {
+        // Entry in community 1, calls direct_fn (community 2, direct),
+        // direct_fn calls transitive_fn (community 3, transitive)
+        // → direct_fn kept (direct dependency), transitive_fn excluded
+        let (store, pid) = setup_community_chain().await;
+
+        // Set community IDs via function analytics
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    name: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 2,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 3,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph("test-community", None, pid, "entry_fn", 2, None, Some(true))
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(
+            func_names.contains(&"entry_fn"),
+            "entry should always be kept"
+        );
+        assert!(
+            func_names.contains(&"direct_fn"),
+            "direct callee should be kept even if different community"
+        );
+        assert!(
+            !func_names.contains(&"transitive_fn"),
+            "transitive function from different community should be excluded, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_no_community_data_keeps_all() {
+        // Entry without community_id → all functions kept (no filtering)
+        let (store, pid) = setup_community_chain().await;
+
+        // No function analytics set → no community data
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-no-community",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(true), // filter enabled but no community data
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "without community data, all functions should be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_disabled_keeps_all() {
+        // filter_community=false → all functions kept even with community data
+        let (store, pid) = setup_community_chain().await;
+
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    name: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 2,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 3,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-no-filter",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(false), // filtering disabled
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "with filter disabled, all functions should be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_same_community_keeps_all() {
+        // All nodes in same community → all kept
+        let (store, pid) = setup_community_chain().await;
+
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    name: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    name: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-same-community",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "same community functions should all be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    // ========================================================================
     // Feature Graph — refresh tests
     // ========================================================================
 
@@ -6123,7 +7005,7 @@ mod tests {
 
         // Auto-build the feature graph
         let detail = store
-            .auto_build_feature_graph("test-refresh", None, pid, "process", 2, None)
+            .auto_build_feature_graph("test-refresh", None, pid, "process", 2, None, None)
             .await
             .unwrap();
         let fg_id = detail.graph.id;
