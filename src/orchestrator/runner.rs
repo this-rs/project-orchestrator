@@ -311,8 +311,16 @@ impl Orchestrator {
                     })),
                 );
                 // Update the project's analytics_computed_at timestamp
-                if let Err(e) = self.neo4j().update_project_analytics_timestamp(project_id).await {
-                    tracing::warn!("Failed to update analytics_computed_at for project {}: {}", project_id, e);
+                if let Err(e) = self
+                    .neo4j()
+                    .update_project_analytics_timestamp(project_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to update analytics_computed_at for project {}: {}",
+                        project_id,
+                        e
+                    );
                 }
             }
             Err(e) => {
@@ -3497,7 +3505,10 @@ mod tests {
             .unwrap();
 
         let report = orch.check_analytics_staleness(project.id).await.unwrap();
-        assert!(!report.is_stale, "Analytics computed after sync should not be stale");
+        assert!(
+            !report.is_stale,
+            "Analytics computed after sync should not be stale"
+        );
         assert!(report.analytics_computed_at.is_some());
     }
 
@@ -3512,7 +3523,10 @@ mod tests {
         orch.create_project(&project).await.unwrap();
 
         let report = orch.check_analytics_staleness(project.id).await.unwrap();
-        assert!(report.is_stale, "Project synced after analytics should be stale");
+        assert!(
+            report.is_stale,
+            "Project synced after analytics should be stale"
+        );
         assert!(report.analytics_age.is_some());
     }
 

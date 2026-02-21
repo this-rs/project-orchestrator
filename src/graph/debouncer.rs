@@ -106,7 +106,11 @@ impl AnalyticsDebouncer {
                     // Update analytics_computed_at timestamp on the project
                     if let Some(ref store) = graph_store {
                         if let Err(e) = store.update_project_analytics_timestamp(last_pid).await {
-                            tracing::warn!("Failed to update analytics_computed_at for project {}: {}", last_pid, e);
+                            tracing::warn!(
+                                "Failed to update analytics_computed_at for project {}: {}",
+                                last_pid,
+                                e
+                            );
                         }
                     }
                 }

@@ -351,7 +351,7 @@ fn should_sync_file(path: &Path) -> bool {
     // All supported languages — must stay aligned with runner.rs sync_directory_for_project()
     let supported_extensions = [
         "rs", // Rust
-        "ts", "tsx", "js", "jsx", // TypeScript/JavaScript
+        "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
         "py",   // Python
         "go",   // Go
         "java", // Java
@@ -359,7 +359,7 @@ fn should_sync_file(path: &Path) -> bool {
         "cpp", "cc", "cxx", "hpp", "hxx", // C++
         "rb",  // Ruby
         "php", // PHP
-        "kt", "kts", // Kotlin
+        "kt", "kts",   // Kotlin
         "swift", // Swift
         "sh", "bash", // Bash
     ];
@@ -598,8 +598,7 @@ mod tests {
         assert_eq!(result.unwrap().project_id, child_id);
 
         // File in parent project (not in child) → should resolve to parent
-        let result =
-            resolve_project(Path::new("/projects/mono/src/lib.rs"), &map).await;
+        let result = resolve_project(Path::new("/projects/mono/src/lib.rs"), &map).await;
         assert!(result.is_some());
         assert_eq!(result.unwrap().project_id, parent_id);
     }
