@@ -1399,7 +1399,11 @@ mod tests {
     /// then return a new NoteManager WITH embedding provider for backfill testing.
     async fn create_notes_then_add_embeddings(
         count: usize,
-    ) -> (NoteManager, Vec<Uuid>, Arc<crate::neo4j::mock::MockGraphStore>) {
+    ) -> (
+        NoteManager,
+        Vec<Uuid>,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+    ) {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let meili = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
         let project = test_project();
@@ -1407,8 +1411,10 @@ mod tests {
         graph.create_project(&project).await.unwrap();
 
         // Create notes WITHOUT embedding provider (simulates existing notes)
-        let mgr_no_embed =
-            NoteManager::new(graph.clone() as Arc<dyn crate::neo4j::GraphStore>, meili.clone());
+        let mgr_no_embed = NoteManager::new(
+            graph.clone() as Arc<dyn crate::neo4j::GraphStore>,
+            meili.clone(),
+        );
         let mut note_ids = Vec::new();
         for i in 0..count {
             let req = make_create_request(project_id, &format!("Backfill note {i}"));
@@ -1418,7 +1424,11 @@ mod tests {
 
         // Verify no embeddings exist
         let embeddings = graph.note_embeddings.read().await;
-        assert_eq!(embeddings.len(), 0, "no embeddings should exist before backfill");
+        assert_eq!(
+            embeddings.len(),
+            0,
+            "no embeddings should exist before backfill"
+        );
         drop(embeddings);
 
         // Now create a NoteManager WITH embedding provider
@@ -1442,7 +1452,10 @@ mod tests {
         // Verify all notes have embeddings
         let embeddings = graph.note_embeddings.read().await;
         for id in &note_ids {
-            assert!(embeddings.contains_key(id), "note {id} should have embedding");
+            assert!(
+                embeddings.contains_key(id),
+                "note {id} should have embedding"
+            );
         }
     }
 
@@ -1492,7 +1505,10 @@ mod tests {
     async fn test_backfill_without_provider_errors() {
         let (mgr, _pid) = create_note_manager().await;
         let result = mgr.backfill_embeddings(50, None).await;
-        assert!(result.is_err(), "backfill should fail without embedding provider");
+        assert!(
+            result.is_err(),
+            "backfill should fail without embedding provider"
+        );
     }
 
     #[tokio::test]

@@ -125,7 +125,10 @@ mod tests {
         let provider = MockEmbeddingProvider::new(768);
         let emb1 = provider.embed_text("hello").await.unwrap();
         let emb2 = provider.embed_text("world").await.unwrap();
-        assert_ne!(emb1, emb2, "Different texts should produce different embeddings");
+        assert_ne!(
+            emb1, emb2,
+            "Different texts should produce different embeddings"
+        );
     }
 
     #[tokio::test]
@@ -154,11 +157,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_consistency() {
         let provider = MockEmbeddingProvider::new(768);
-        let texts = vec![
-            "hello".to_string(),
-            "world".to_string(),
-            "test".to_string(),
-        ];
+        let texts = vec!["hello".to_string(), "world".to_string(), "test".to_string()];
 
         let batch_results = provider.embed_batch(&texts).await.unwrap();
         assert_eq!(batch_results.len(), 3);

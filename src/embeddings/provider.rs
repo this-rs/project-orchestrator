@@ -114,10 +114,12 @@ impl HttpEmbeddingProvider {
             return None;
         }
 
-        let model = std::env::var("EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "nomic-embed-text".to_string());
+        let model =
+            std::env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
 
-        let api_key = std::env::var("EMBEDDING_API_KEY").ok().filter(|k| !k.is_empty());
+        let api_key = std::env::var("EMBEDDING_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
 
         let dimensions: usize = std::env::var("EMBEDDING_DIMENSIONS")
             .ok()
