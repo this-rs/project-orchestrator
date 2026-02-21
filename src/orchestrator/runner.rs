@@ -1,5 +1,6 @@
 //! Main orchestrator runner
 
+use crate::embeddings::{EmbeddingProvider, HttpEmbeddingProvider};
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
@@ -76,12 +77,36 @@ pub struct Orchestrator {
     event_emitter: Option<Arc<dyn EventEmitter>>,
 }
 
+/// Try to create an embedding provider from environment variables.
+///
+/// Returns `None` if disabled or not configured. Logs the result at info level.
+fn init_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
+    match HttpEmbeddingProvider::from_env() {
+        Some(provider) => {
+            tracing::info!(
+                model = provider.model_name(),
+                dimensions = provider.dimensions(),
+                "Embedding provider initialized"
+            );
+            Some(Arc::new(provider))
+        }
+        None => {
+            tracing::info!("Embedding provider disabled (set EMBEDDING_URL to enable)");
+            None
+        }
+    }
+}
+
 impl Orchestrator {
     /// Create a new orchestrator
     pub async fn new(state: AppState) -> Result<Self> {
         let plan_manager = Arc::new(PlanManager::new(state.neo4j.clone(), state.meili.clone()));
 
-        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
+        let mut note_manager = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        if let Some(provider) = init_embedding_provider() {
+            note_manager = note_manager.with_embedding_provider(provider);
+        }
+        let note_manager = Arc::new(note_manager);
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
@@ -136,11 +161,15 @@ impl Orchestrator {
             emitter.clone(),
         ));
 
-        let note_manager = Arc::new(NoteManager::with_event_emitter(
+        let mut note_manager = NoteManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
             emitter.clone(),
-        ));
+        );
+        if let Some(provider) = init_embedding_provider() {
+            note_manager = note_manager.with_embedding_provider(provider);
+        }
+        let note_manager = Arc::new(note_manager);
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
@@ -196,11 +225,15 @@ impl Orchestrator {
             emitter.clone(),
         ));
 
-        let note_manager = Arc::new(NoteManager::with_event_emitter(
+        let mut note_manager = NoteManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
             emitter.clone(),
-        ));
+        );
+        if let Some(provider) = init_embedding_provider() {
+            note_manager = note_manager.with_embedding_provider(provider);
+        }
+        let note_manager = Arc::new(note_manager);
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),

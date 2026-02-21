@@ -1021,6 +1021,34 @@ pub trait GraphStore: Send + Sync {
     /// Get anchors for a note
     async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>>;
 
+    /// Store a vector embedding on a Note node.
+    ///
+    /// Uses `db.create.setNodeVectorProperty` to ensure the correct type
+    /// for the HNSW vector index. Also stores the model name for traceability.
+    ///
+    /// This is a separate method from `create_note`/`update_note` to:
+    /// - Keep the CRUD API backward compatible (no signature changes)
+    /// - Allow the NoteManager to call it after creation (T1.4)
+    /// - Support the backfill use case (T1.5)
+    async fn set_note_embedding(
+        &self,
+        note_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()>;
+
+    /// Search notes by vector similarity using the HNSW index.
+    ///
+    /// Returns notes ordered by descending cosine similarity score,
+    /// filtered by optional project_id for data isolation.
+    /// Only returns notes with status 'active' or 'needs_review'.
+    async fn vector_search_notes(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(Note, f64)>>;
+
     // ========================================================================
     // Chat session operations
     // ========================================================================

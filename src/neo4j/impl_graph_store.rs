@@ -1351,6 +1351,25 @@ impl GraphStore for Neo4jClient {
         self.get_note_anchors(note_id).await
     }
 
+    async fn set_note_embedding(
+        &self,
+        note_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.set_note_embedding(note_id, embedding, model).await
+    }
+
+    async fn vector_search_notes(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(Note, f64)>> {
+        self.vector_search_notes(embedding, limit, project_id)
+            .await
+    }
+
     // ========================================================================
     // Chat session operations
     // ========================================================================

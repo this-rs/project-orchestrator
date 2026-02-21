@@ -229,6 +229,17 @@ impl Neo4jClient {
             "CREATE INDEX component_type IF NOT EXISTS FOR (c:Component) ON (c.component_type)",
         ];
 
+        // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)
+        let vector_indexes = vec![
+            // HNSW vector index for cosine similarity search on Note embeddings (768d = nomic-embed-text)
+            r#"CREATE VECTOR INDEX note_embeddings IF NOT EXISTS
+               FOR (n:Note) ON (n.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+        ];
+
         for constraint in constraints {
             if let Err(e) = self.graph.run(query(constraint)).await {
                 tracing::warn!("Constraint may already exist: {}", e);
@@ -238,6 +249,16 @@ impl Neo4jClient {
         for index in indexes {
             if let Err(e) = self.graph.run(query(index)).await {
                 tracing::warn!("Index may already exist: {}", e);
+            }
+        }
+
+        // Vector indexes — optional, don't fail startup if Neo4j doesn't support them
+        for vi in vector_indexes {
+            if let Err(e) = self.graph.run(query(vi)).await {
+                tracing::warn!(
+                    "Vector index creation skipped (Neo4j may not support vector indexes): {}",
+                    e
+                );
             }
         }
 
@@ -7621,6 +7642,91 @@ impl Neo4jClient {
         }
 
         Ok(anchors)
+    }
+
+    /// Store a vector embedding on a Note node.
+    ///
+    /// Uses `db.create.setNodeVectorProperty` to ensure the correct type
+    /// for the HNSW vector index. Also stores the model name for traceability.
+    pub async fn set_note_embedding(
+        &self,
+        note_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        // Convert f32 to f64 for neo4rs compatibility
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            CALL db.create.setNodeVectorProperty(n, 'embedding', $embedding)
+            SET n.embedding_model = $model,
+                n.embedded_at = datetime()
+            "#,
+        )
+        .param("id", note_id.to_string())
+        .param("embedding", embedding_f64)
+        .param("model", model.to_string());
+
+        self.graph.run(q).await.context(format!(
+            "Failed to set embedding on note {}",
+            note_id
+        ))?;
+
+        Ok(())
+    }
+
+    /// Search notes by vector similarity using the HNSW index.
+    ///
+    /// Returns notes ordered by descending cosine similarity score,
+    /// filtered by optional project_id for data isolation.
+    pub async fn vector_search_notes(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(Note, f64)>> {
+        // Convert f32 to f64 for neo4rs
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        // We query more than limit to allow for post-filtering by project_id and status
+        let query_limit = if project_id.is_some() {
+            limit * 3
+        } else {
+            limit * 2
+        };
+
+        let cypher = r#"
+            CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
+            YIELD node AS n, score
+            WHERE n.status IN ['active', 'needs_review']
+            AND ($project_id IS NULL OR $project_id = '' OR n.project_id = $project_id)
+            RETURN n, score
+            ORDER BY score DESC
+            LIMIT $limit
+        "#;
+
+        let q = query(cypher)
+            .param("query_limit", query_limit as i64)
+            .param("embedding", embedding_f64)
+            .param(
+                "project_id",
+                project_id.map(|id| id.to_string()).unwrap_or_default(),
+            )
+            .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            let score: f64 = row.get("score")?;
+            let note = self.node_to_note(&node)?;
+            notes.push((note, score));
+        }
+
+        Ok(notes)
     }
 
     // Helper function to convert Note scope to type string
