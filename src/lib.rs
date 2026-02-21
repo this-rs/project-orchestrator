@@ -674,8 +674,102 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     let orchestrator =
         Arc::new(orchestrator::Orchestrator::with_event_bus(state, event_bus.clone()).await?);
 
-    // Create file watcher
-    let watcher = orchestrator::FileWatcher::new(orchestrator.clone());
+    // Create file watcher and auto-register all projects
+    let watcher = {
+        let mut w = orchestrator::FileWatcher::new(orchestrator.clone());
+
+        // Auto-register all known projects for watching
+        match orchestrator.neo4j().list_projects().await {
+            Ok(projects) => {
+                let mut registered = 0usize;
+                let mut skipped = 0usize;
+                for project in &projects {
+                    let expanded = expand_tilde(&project.root_path);
+                    let path = std::path::Path::new(&expanded);
+                    if !path.exists() {
+                        tracing::warn!(
+                            "Auto-watch: skipping project '{}' — path does not exist: {}",
+                            project.slug,
+                            expanded
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    match w
+                        .register_project(path, project.id, project.slug.clone())
+                        .await
+                    {
+                        Ok(_) => registered += 1,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Auto-watch: failed to register project '{}': {}",
+                                project.slug,
+                                e
+                            );
+                            skipped += 1;
+                        }
+                    }
+                }
+                if registered > 0 {
+                    if let Err(e) = w.start().await {
+                        tracing::warn!("Auto-watch: failed to start watcher: {}", e);
+                    }
+                }
+                tracing::info!(
+                    "Auto-watch: {} projects registered, {} skipped",
+                    registered,
+                    skipped
+                );
+
+                // Spawn background analytics staleness check (non-blocking)
+                if registered > 0 {
+                    let orch_bg = orchestrator.clone();
+                    let project_ids: Vec<_> = projects
+                        .iter()
+                        .filter(|p| {
+                            let expanded = expand_tilde(&p.root_path);
+                            std::path::Path::new(&expanded).exists()
+                        })
+                        .map(|p| (p.id, p.slug.clone()))
+                        .collect();
+                    tokio::spawn(async move {
+                        let mut recomputed = 0usize;
+                        for (pid, slug) in &project_ids {
+                            match orch_bg.check_analytics_staleness(*pid).await {
+                                Ok(report) if report.is_stale => {
+                                    tracing::info!(
+                                        "Analytics stale for '{}', recomputing in background...",
+                                        slug
+                                    );
+                                    orch_bg.analyze_project_safe(*pid).await;
+                                    recomputed += 1;
+                                }
+                                Ok(_) => {} // fresh, skip
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to check staleness for '{}': {}",
+                                        slug,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        if recomputed > 0 {
+                            tracing::info!(
+                                "Auto-analyze: recomputed analytics for {}/{} stale projects",
+                                recomputed,
+                                project_ids.len()
+                            );
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Auto-watch: failed to list projects: {}", e);
+            }
+        }
+        w
+    };
 
     // Create chat manager (optional — requires Claude CLI)
     let chat_manager = {
