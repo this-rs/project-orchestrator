@@ -212,27 +212,112 @@ impl SpreadingActivationEngine {
             frontier = next_frontier;
         }
 
-        // Phase 3: Ranking — sort by score desc, limit to max_results
-        let mut results: Vec<ActivatedNote> = activations
+        // Phase 2.5: Connectivity re-ranking — boost direct matches that are
+        // connected to other activated notes via synapses ("hub bonus").
+        // This makes well-connected notes rank higher than isolated ones,
+        // differentiating search_neurons from plain vector search.
+        if config.connectivity_boost > 0.0 {
+            let activated_ids: HashSet<Uuid> = activations.keys().copied().collect();
+            let mut boost_map: HashMap<Uuid, f64> = HashMap::new();
+
+            for (note_id, (_, source, _)) in &activations {
+                if !matches!(source, ActivationSource::Direct) {
+                    continue;
+                }
+                // Count how many other activated notes this direct match
+                // is connected to via synapses
+                if let Ok(synapses) = self.graph_store.get_synapses(*note_id).await {
+                    let connected_activated = synapses
+                        .iter()
+                        .filter(|(neighbor_id, _)| {
+                            *neighbor_id != *note_id && activated_ids.contains(neighbor_id)
+                        })
+                        .count();
+                    if connected_activated > 0 {
+                        let bonus = config.connectivity_boost * connected_activated as f64;
+                        boost_map.insert(*note_id, bonus);
+                    }
+                }
+            }
+
+            // Apply boosts
+            for (note_id, bonus) in &boost_map {
+                if let Some(entry) = activations.get_mut(note_id) {
+                    entry.0 += bonus;
+                }
+            }
+
+            if !boost_map.is_empty() {
+                debug!(
+                    "Phase 2.5: connectivity boost applied to {} direct matches",
+                    boost_map.len()
+                );
+            }
+        }
+
+        // Phase 3: Ranking with slot reservation
+        //
+        // Problem: direct matches score ~0.91 while propagated notes score
+        // ~0.39 (after hop decay). Pure score ranking means propagated notes
+        // NEVER appear in top-N results — making spreading useless.
+        //
+        // Solution: reserve a fraction of slots for propagated results.
+        // With propagated_ratio=0.4 and max_results=10: 4 slots for
+        // propagated, 6 for direct. Unused slots overflow to the other pool.
+        let (mut direct, mut propagated): (Vec<ActivatedNote>, Vec<ActivatedNote>) = activations
             .into_values()
             .map(|(score, source, note)| ActivatedNote {
                 note,
                 activation_score: score,
                 source,
             })
-            .collect();
+            .partition(|r| matches!(r.source, ActivationSource::Direct));
 
-        results.sort_by(|a, b| {
+        // Sort each pool by score descending
+        let score_cmp = |a: &ActivatedNote, b: &ActivatedNote| {
             b.activation_score
                 .partial_cmp(&a.activation_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        };
+        direct.sort_by(score_cmp);
+        propagated.sort_by(score_cmp);
 
-        results.truncate(config.max_results);
+        let results = if config.propagated_ratio > 0.0 && !propagated.is_empty() {
+            let propagated_slots =
+                (config.max_results as f64 * config.propagated_ratio).ceil() as usize;
+            let direct_slots = config.max_results.saturating_sub(propagated_slots);
+
+            // Take from each pool up to their slot allocation
+            let taken_direct: Vec<ActivatedNote> = direct.into_iter().take(direct_slots).collect();
+            let taken_propagated: Vec<ActivatedNote> =
+                propagated.into_iter().take(propagated_slots).collect();
+
+            // Merge and re-sort by score
+            let mut merged = taken_direct;
+            merged.extend(taken_propagated);
+            merged.sort_by(score_cmp);
+            merged.truncate(config.max_results);
+            merged
+        } else {
+            // No reservation: pure score ranking (original behavior)
+            let mut all = direct;
+            all.extend(propagated);
+            all.sort_by(score_cmp);
+            all.truncate(config.max_results);
+            all
+        };
+
+        let direct_count = results
+            .iter()
+            .filter(|r| matches!(r.source, ActivationSource::Direct))
+            .count();
+        let propagated_count = results.len() - direct_count;
 
         debug!(
-            "Phase 3: returning {} activated notes (top score: {:.3})",
+            "Phase 3: returning {} activated notes ({} direct, {} propagated, top score: {:.3})",
             results.len(),
+            direct_count,
+            propagated_count,
             results.first().map(|r| r.activation_score).unwrap_or(0.0)
         );
 

@@ -36,6 +36,24 @@ pub struct SpreadingActivationConfig {
 
     /// Maximum number of results to return (Phase 3).
     pub max_results: usize,
+
+    /// Fraction of `max_results` reserved for propagated notes (0.0 - 1.0).
+    ///
+    /// With 0.4 and max_results=10: up to 4 slots reserved for propagated
+    /// notes, 6 for direct. If fewer propagated notes are available, the
+    /// remaining slots go to direct matches (and vice versa).
+    ///
+    /// Set to 0.0 to disable reservation (original behavior: pure score rank).
+    pub propagated_ratio: f64,
+
+    /// Bonus score added to direct matches for each activated synapse neighbour.
+    ///
+    /// When a direct match is connected via SYNAPSE to other activated notes,
+    /// it gets `connectivity_boost × num_activated_neighbors` added to its score.
+    /// This makes well-connected "hub" notes rank higher than isolated ones.
+    ///
+    /// Set to 0.0 to disable (original behavior: no re-ranking).
+    pub connectivity_boost: f64,
 }
 
 impl Default for SpreadingActivationConfig {
@@ -47,6 +65,8 @@ impl Default for SpreadingActivationConfig {
             decay_per_hop: 0.5,
             min_energy: 0.05,
             max_results: 10,
+            propagated_ratio: 0.4,
+            connectivity_boost: 0.02,
         }
     }
 }
@@ -103,5 +123,7 @@ mod tests {
         assert!((config.decay_per_hop - 0.5).abs() < f64::EPSILON);
         assert!((config.min_energy - 0.05).abs() < f64::EPSILON);
         assert_eq!(config.max_results, 10);
+        assert!((config.propagated_ratio - 0.4).abs() < f64::EPSILON);
+        assert!((config.connectivity_boost - 0.02).abs() < f64::EPSILON);
     }
 }
