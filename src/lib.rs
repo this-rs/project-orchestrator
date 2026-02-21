@@ -837,10 +837,20 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         });
     }
 
+    // Wrap watcher in Arc<RwLock<>> and spawn the event-driven bridge.
+    // The bridge listens to Project CRUD events and auto-registers/unregisters
+    // projects on the watcher, regardless of the entry point (API, MCP, NATS).
+    let watcher = Arc::new(RwLock::new(watcher));
+    orchestrator::spawn_project_watcher_bridge(
+        watcher.clone(),
+        event_bus.subscribe(),
+        orchestrator.neo4j_arc(),
+    );
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
-        watcher: Arc::new(RwLock::new(watcher)),
+        watcher,
         chat_manager,
         event_bus,
         nats_emitter,

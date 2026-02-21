@@ -147,26 +147,8 @@ pub async fn create_project(
     };
 
     state.orchestrator.create_project(&project).await?;
-
-    // Auto-register on the file watcher if root_path exists
-    {
-        let path = std::path::Path::new(&project.root_path);
-        if path.exists() {
-            let mut watcher = state.watcher.write().await;
-            if let Err(e) = watcher
-                .register_project(path, project.id, project.slug.clone())
-                .await
-            {
-                tracing::warn!(
-                    "Auto-watch: failed to register new project '{}': {}",
-                    project.slug,
-                    e
-                );
-            } else {
-                tracing::info!("Auto-watch: registered new project '{}'", project.slug);
-            }
-        }
-    }
+    // Auto-registration on the file watcher is handled by the ProjectWatcherBridge
+    // which listens to CrudEvent::Created events emitted by the orchestrator.
 
     Ok(Json(ProjectResponse {
         id: project.id.to_string(),
@@ -240,9 +222,11 @@ pub async fn update_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
+    // Use orchestrator.update_project() instead of neo4j() directly so that
+    // a CrudEvent::Updated is emitted — the ProjectWatcherBridge listens for
+    // root_path changes to re-register the project on the file watcher.
     state
         .orchestrator
-        .neo4j()
         .update_project(project.id, req.name, req.description, req.root_path)
         .await?;
 
@@ -261,17 +245,9 @@ pub async fn delete_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    // Unregister from file watcher before deleting
-    {
-        let watcher = state.watcher.read().await;
-        watcher.unregister_project(project.id).await;
-    }
-
-    state
-        .orchestrator
-        .neo4j()
-        .delete_project(project.id)
-        .await?;
+    // Auto-unregistration from the file watcher is handled by the ProjectWatcherBridge
+    // which listens to CrudEvent::Deleted events emitted by the orchestrator.
+    state.orchestrator.delete_project(project.id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

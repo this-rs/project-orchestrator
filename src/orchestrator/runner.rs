@@ -1582,7 +1582,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 CrudAction::Created,
                 project.id.to_string(),
             )
-            .with_payload(serde_json::json!({"name": &project.name, "slug": &project.slug})),
+            .with_payload(serde_json::json!({"name": &project.name, "slug": &project.slug, "root_path": &project.root_path})),
         );
         Ok(())
     }
@@ -1596,13 +1596,23 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         root_path: Option<String>,
     ) -> Result<()> {
         self.neo4j()
-            .update_project(id, name, description, root_path)
+            .update_project(id, name.clone(), description, root_path.clone())
             .await?;
-        self.emit(CrudEvent::new(
-            EventEntityType::Project,
-            CrudAction::Updated,
-            id.to_string(),
-        ));
+        let mut payload = serde_json::Map::new();
+        if let Some(ref n) = name {
+            payload.insert("name".into(), serde_json::json!(n));
+        }
+        if let Some(ref rp) = root_path {
+            payload.insert("root_path".into(), serde_json::json!(rp));
+        }
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Project,
+                CrudAction::Updated,
+                id.to_string(),
+            )
+            .with_payload(serde_json::Value::Object(payload)),
+        );
         Ok(())
     }
 

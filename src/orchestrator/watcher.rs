@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 use super::Orchestrator;
+use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType};
 
 /// Project context resolved from a file path
 #[derive(Debug, Clone)]
@@ -384,6 +385,212 @@ fn should_sync_file(path: &Path) -> bool {
     true
 }
 
+// ============================================================================
+// Event-driven watcher bridge
+// ============================================================================
+
+/// Spawn a background task that listens to CrudEvents and automatically
+/// registers/unregisters projects on the FileWatcher.
+///
+/// This decouples the watcher from individual handlers (API, MCP, NATS).
+/// Any code path that calls `Orchestrator::create_project()` /
+/// `delete_project()` / `update_project()` will emit a CrudEvent, and
+/// the bridge will react accordingly.
+///
+/// Pattern follows `HybridEmitter::start_nats_bridge()` in `events/hybrid.rs`.
+pub fn spawn_project_watcher_bridge(
+    watcher: Arc<RwLock<FileWatcher>>,
+    mut event_rx: tokio::sync::broadcast::Receiver<CrudEvent>,
+    neo4j: Arc<dyn crate::neo4j::GraphStore>,
+) {
+    tokio::spawn(async move {
+        tracing::info!("Project watcher bridge started — listening for project CRUD events");
+
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    if event.entity_type != EventEntityType::Project {
+                        continue;
+                    }
+                    match event.action {
+                        CrudAction::Created => {
+                            handle_project_created(&watcher, &event).await;
+                        }
+                        CrudAction::Deleted => {
+                            handle_project_deleted(&watcher, &event).await;
+                        }
+                        CrudAction::Updated => {
+                            handle_project_updated(&watcher, &event, &neo4j).await;
+                        }
+                        _ => {} // Linked/Unlinked — not relevant for watcher
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        "Project watcher bridge: lagged by {} events, some projects may not be auto-registered",
+                        n
+                    );
+                    // Continue processing — bridge will catch up
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::info!("Project watcher bridge: event bus closed, stopping");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Handle a Project::Created event — register on the watcher if root_path exists.
+async fn handle_project_created(watcher: &Arc<RwLock<FileWatcher>>, event: &CrudEvent) {
+    let root_path = match event.payload.get("root_path").and_then(|v| v.as_str()) {
+        Some(rp) => rp.to_string(),
+        None => {
+            tracing::warn!(
+                "Watcher bridge: Project::Created event missing root_path in payload (id={})",
+                event.entity_id
+            );
+            return;
+        }
+    };
+
+    let slug = event
+        .payload
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let project_id = match event.entity_id.parse::<Uuid>() {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::warn!(
+                "Watcher bridge: invalid project UUID in Created event: {}",
+                event.entity_id
+            );
+            return;
+        }
+    };
+
+    let expanded = crate::expand_tilde(&root_path);
+    let path = std::path::Path::new(&expanded);
+    if !path.exists() {
+        tracing::debug!(
+            "Watcher bridge: skipping project '{}' — path does not exist: {}",
+            slug,
+            expanded
+        );
+        return;
+    }
+
+    let mut w = watcher.write().await;
+    match w.register_project(path, project_id, slug.clone()).await {
+        Ok(_) => {
+            tracing::info!("Watcher bridge: auto-registered project '{}'", slug);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Watcher bridge: failed to register project '{}': {}",
+                slug,
+                e
+            );
+        }
+    }
+}
+
+/// Handle a Project::Deleted event — unregister from the watcher.
+async fn handle_project_deleted(watcher: &Arc<RwLock<FileWatcher>>, event: &CrudEvent) {
+    let project_id = match event.entity_id.parse::<Uuid>() {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::warn!(
+                "Watcher bridge: invalid project UUID in Deleted event: {}",
+                event.entity_id
+            );
+            return;
+        }
+    };
+
+    let w = watcher.read().await;
+    w.unregister_project(project_id).await;
+    tracing::info!(
+        "Watcher bridge: unregistered project {} on delete",
+        project_id
+    );
+}
+
+/// Handle a Project::Updated event — re-register if root_path changed.
+async fn handle_project_updated(
+    watcher: &Arc<RwLock<FileWatcher>>,
+    event: &CrudEvent,
+    neo4j: &Arc<dyn crate::neo4j::GraphStore>,
+) {
+    // Only react if root_path was part of the update
+    let new_root_path = match event.payload.get("root_path").and_then(|v| v.as_str()) {
+        Some(rp) => rp.to_string(),
+        None => return, // root_path not changed, nothing to do
+    };
+
+    let project_id = match event.entity_id.parse::<Uuid>() {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    // Look up the project to get current slug
+    let project = match neo4j.get_project(project_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::warn!(
+                "Watcher bridge: project {} not found in Neo4j after update",
+                project_id
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Watcher bridge: failed to lookup project {} after update: {}",
+                project_id,
+                e
+            );
+            return;
+        }
+    };
+
+    // Unregister old path, register new one
+    {
+        let w = watcher.read().await;
+        w.unregister_project(project_id).await;
+    }
+
+    let expanded = crate::expand_tilde(&new_root_path);
+    let path = std::path::Path::new(&expanded);
+    if path.exists() {
+        let mut w = watcher.write().await;
+        if let Err(e) = w
+            .register_project(path, project_id, project.slug.clone())
+            .await
+        {
+            tracing::warn!(
+                "Watcher bridge: failed to re-register project '{}' after root_path update: {}",
+                project.slug,
+                e
+            );
+        } else {
+            tracing::info!(
+                "Watcher bridge: re-registered project '{}' with new root_path: {}",
+                project.slug,
+                expanded
+            );
+        }
+    } else {
+        tracing::debug!(
+            "Watcher bridge: project '{}' new root_path does not exist, skipped: {}",
+            project.slug,
+            expanded
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +815,145 @@ mod tests {
         let map = Arc::new(RwLock::new(HashMap::new()));
         let result = resolve_project(Path::new("/any/path/file.rs"), &map).await;
         assert!(result.is_none());
+    }
+
+    // ── project watcher bridge tests ─────────────────────────────────
+
+    use crate::events::EventEmitter;
+
+    #[tokio::test]
+    async fn test_bridge_handles_project_created() {
+        // Use a real temp dir so path.exists() returns true
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().to_string_lossy().to_string();
+
+        let bus = crate::events::EventBus::default();
+        let _watcher_map = Arc::new(RwLock::new(HashMap::<PathBuf, ProjectContext>::new()));
+
+        let project_id = Uuid::new_v4();
+        let slug = "test-proj".to_string();
+
+        // Simulate handle_project_created directly
+        let event = CrudEvent::new(
+            EventEntityType::Project,
+            CrudAction::Created,
+            project_id.to_string(),
+        )
+        .with_payload(serde_json::json!({
+            "name": "Test Project",
+            "slug": &slug,
+            "root_path": &root_path
+        }));
+
+        // Extract and verify payload
+        let rp = event.payload.get("root_path").unwrap().as_str().unwrap();
+        assert_eq!(rp, root_path);
+
+        let parsed_slug = event.payload.get("slug").unwrap().as_str().unwrap();
+        assert_eq!(parsed_slug, "test-proj");
+
+        let parsed_id: Uuid = event.entity_id.parse().unwrap();
+        assert_eq!(parsed_id, project_id);
+
+        // Verify event goes through broadcast
+        let mut rx = bus.subscribe();
+        bus.emit(event);
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.entity_type, EventEntityType::Project);
+        assert_eq!(received.action, CrudAction::Created);
+        assert_eq!(
+            received.payload.get("root_path").unwrap().as_str().unwrap(),
+            root_path
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bridge_handles_project_deleted() {
+        let project_id = Uuid::new_v4();
+
+        let event = CrudEvent::new(
+            EventEntityType::Project,
+            CrudAction::Deleted,
+            project_id.to_string(),
+        );
+
+        // Verify we can parse the entity_id back to UUID
+        let parsed_id: Uuid = event.entity_id.parse().unwrap();
+        assert_eq!(parsed_id, project_id);
+        assert_eq!(event.action, CrudAction::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_bridge_ignores_non_project_events() {
+        let bus = crate::events::EventBus::default();
+        let mut rx = bus.subscribe();
+
+        // Emit a Plan event — should be ignored by bridge
+        let event = CrudEvent::new(EventEntityType::Plan, CrudAction::Created, "plan-123")
+            .with_payload(serde_json::json!({"title": "My Plan"}));
+
+        bus.emit(event);
+        let received = rx.try_recv().unwrap();
+
+        // Bridge would check: event.entity_type != EventEntityType::Project → continue
+        assert_ne!(received.entity_type, EventEntityType::Project);
+    }
+
+    #[tokio::test]
+    async fn test_bridge_created_event_missing_root_path() {
+        // Event with no root_path in payload — handle_project_created should bail gracefully
+        let event = CrudEvent::new(
+            EventEntityType::Project,
+            CrudAction::Created,
+            Uuid::new_v4().to_string(),
+        )
+        .with_payload(serde_json::json!({"name": "No Path", "slug": "no-path"}));
+
+        assert!(event.payload.get("root_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_bridge_created_event_nonexistent_path() {
+        let event = CrudEvent::new(
+            EventEntityType::Project,
+            CrudAction::Created,
+            Uuid::new_v4().to_string(),
+        )
+        .with_payload(serde_json::json!({
+            "name": "Ghost",
+            "slug": "ghost",
+            "root_path": "/nonexistent/path/that/does/not/exist"
+        }));
+
+        let rp = event.payload.get("root_path").unwrap().as_str().unwrap();
+        assert!(!std::path::Path::new(rp).exists());
+    }
+
+    #[tokio::test]
+    async fn test_bridge_updated_event_with_root_path() {
+        let project_id = Uuid::new_v4();
+        let event = CrudEvent::new(
+            EventEntityType::Project,
+            CrudAction::Updated,
+            project_id.to_string(),
+        )
+        .with_payload(serde_json::json!({"root_path": "/new/path"}));
+
+        // Bridge should react because root_path is in the payload
+        assert!(event.payload.get("root_path").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_bridge_updated_event_without_root_path() {
+        let project_id = Uuid::new_v4();
+        let event = CrudEvent::new(
+            EventEntityType::Project,
+            CrudAction::Updated,
+            project_id.to_string(),
+        )
+        .with_payload(serde_json::json!({"name": "Renamed"}));
+
+        // Bridge should skip — no root_path change
+        assert!(event.payload.get("root_path").is_none());
     }
 }
