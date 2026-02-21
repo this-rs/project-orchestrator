@@ -1033,6 +1033,13 @@ pub trait GraphStore: Send + Sync {
     async fn set_note_embedding(&self, note_id: Uuid, embedding: &[f32], model: &str)
         -> Result<()>;
 
+    /// Retrieve the stored embedding vector for a note.
+    ///
+    /// Returns `None` if the note has no embedding yet.
+    /// Used by the synapse backfill to get the vector and feed it
+    /// into `vector_search_notes` for finding nearest neighbours.
+    async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>>;
+
     /// Search notes by vector similarity using the HNSW index.
     ///
     /// Returns notes ordered by descending cosine similarity score,
@@ -1058,6 +1065,90 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<Note>, usize)>;
+
+    // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Create bidirectional SYNAPSE relationships between a note and its neighbors.
+    ///
+    /// Each neighbor is a tuple (neighbor_note_id, weight) where weight is the
+    /// cosine similarity score (0.0 - 1.0). Uses MERGE for idempotence — calling
+    /// this twice with the same data does not create duplicate relationships.
+    ///
+    /// Creates edges in both directions: (source)-[:SYNAPSE]->(neighbor)
+    /// AND (neighbor)-[:SYNAPSE]->(source) with the same weight.
+    async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize>;
+
+    /// Get all SYNAPSE relationships for a note.
+    ///
+    /// Returns a list of (neighbor_note_id, weight) tuples sorted by weight
+    /// descending. Includes synapses in both directions (outgoing + incoming).
+    async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>>;
+
+    /// Delete all SYNAPSE relationships for a note (both directions).
+    ///
+    /// Called when a note is deleted or when its content changes (before
+    /// re-creating synapses with the updated embedding). Returns the number
+    /// of deleted relationships.
+    async fn delete_synapses(&self, note_id: Uuid) -> Result<usize>;
+
+    // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Apply exponential energy decay to all active notes.
+    ///
+    /// For each note, computes: `energy = energy × exp(-days_idle / half_life)`
+    /// where `days_idle = (now - last_activated).days()`.
+    ///
+    /// This formula is **temporally idempotent**: calling it once after 30 days
+    /// gives the same result as calling it 30 times daily, because each call
+    /// recomputes from `last_activated` (absolute reference) rather than
+    /// multiplying a running value.
+    ///
+    /// Notes that decay below 0.05 are floored to 0.0 ("dead neuron").
+    /// Returns the number of notes updated.
+    async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize>;
+
+    /// Boost a note's energy by a given amount (capped at 1.0) and set
+    /// `last_activated` to now. Used when a note is retrieved, confirmed, or
+    /// reinforced through spreading activation.
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()>;
+
+    /// Reinforce synapses between co-activated notes (Hebbian learning).
+    ///
+    /// For every pair (i, j) in `note_ids`, MERGE a bidirectional SYNAPSE:
+    /// - **ON CREATE**: set weight = 0.5 (new connection)
+    /// - **ON MATCH**: set weight = min(weight + `boost`, 1.0)
+    ///
+    /// Returns the number of synapses reinforced (created + updated).
+    async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize>;
+
+    /// Apply decay to all synapses and prune weak ones.
+    ///
+    /// 1. Subtract `decay_amount` from every synapse weight
+    /// 2. Delete synapses where weight < `prune_threshold`
+    ///
+    /// Returns (decayed_count, pruned_count).
+    async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)>;
+
+    /// Initialize energy for all notes that don't have it set.
+    /// Sets energy = 1.0 and last_activated = coalesce(last_confirmed_at, created_at).
+    /// Idempotent. Returns the number of notes initialized.
+    async fn init_note_energy(&self) -> Result<usize>;
+
+    /// List notes that have an embedding but no outgoing SYNAPSE.
+    /// Used for synapse backfill. Returns (notes, total_count).
+    async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<crate::notes::Note>, usize)>;
 
     // ========================================================================
     // Chat session operations

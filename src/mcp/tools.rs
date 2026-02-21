@@ -1451,6 +1451,73 @@ fn note_tools() -> Vec<ToolDefinition> {
             },
         },
         ToolDefinition {
+            name: "update_energy_scores".to_string(),
+            description: "Apply exponential energy decay to all active notes. Formula: energy = energy × exp(-days_idle / half_life). Temporally idempotent — calling once after N days ≡ calling daily for N days. Notes below 0.05 are floored to 0.0 (dead neuron).".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "half_life": {
+                        "type": "number",
+                        "description": "Half-life in days for energy decay (default 90). After this many idle days, energy drops to ~50%."
+                    }
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "search_neurons".to_string(),
+            description: "Search notes using spreading activation — neural-style retrieval that finds semantically related notes AND their graph neighbors via synapses. Complements search_notes (BM25) and search_notes_semantic (vector-only). 3-phase algorithm: embed query → vector search → spread activation through synapses (weighted by energy and synapse strength). Returns notes ranked by activation score with provenance (direct match vs propagated).".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "query": {"type": "string", "description": "Natural language search query"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug (resolves to project_id)"},
+                    "max_results": {"type": "integer", "description": "Max results to return (default 10)"},
+                    "max_hops": {"type": "integer", "description": "Max spreading hops through synapses (default 2)"},
+                    "min_score": {"type": "number", "description": "Minimum activation score threshold (default 0.1)"}
+                })),
+                required: Some(vec!["query".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "reinforce_neurons".to_string(),
+            description: "Hebbian reinforcement: boost energy and strengthen synapses between co-activated notes. Call after a session where multiple notes were retrieved and used together. For each note: energy += boost (capped at 1.0). For each pair: synapse weight += boost (or created at 0.5 if new).".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_ids": {"type": "array", "items": {"type": "string"}, "description": "UUIDs of notes that were co-activated (min 2)"},
+                    "energy_boost": {"type": "number", "description": "Energy boost per note (default 0.2, capped at 1.0)"},
+                    "synapse_boost": {"type": "number", "description": "Synapse weight boost per pair (default 0.05, capped at 1.0)"}
+                })),
+                required: Some(vec!["note_ids".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "decay_synapses".to_string(),
+            description: "Apply decay to all synapse weights and prune weak ones. Synapses lose `decay_amount` weight (default 0.01). Synapses below `prune_threshold` (default 0.1) are deleted. Call periodically alongside update_energy_scores.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "decay_amount": {"type": "number", "description": "Weight to subtract from each synapse (default 0.01)"},
+                    "prune_threshold": {"type": "number", "description": "Synapses below this weight are deleted (default 0.1)"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
+            name: "backfill_synapses".to_string(),
+            description: "Backfill SYNAPSE relationships for notes that have embeddings but no synapses yet. Also initializes energy on notes missing it. Idempotent — re-running skips already-connected notes. Use after bulk note creation or embedding backfill.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "batch_size": {"type": "integer", "description": "Notes per batch (default 50)"},
+                    "min_similarity": {"type": "number", "description": "Minimum cosine similarity to create a synapse (default 0.75)"},
+                    "max_neighbors": {"type": "integer", "description": "Max synapses per note (default 10)"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
             name: "list_project_notes".to_string(),
             description: "List notes for a specific project".to_string(),
             input_schema: InputSchema {
@@ -2202,7 +2269,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 154, "Expected 154 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 159, "Expected 159 tools, got {}", tools.len());
     }
 
     #[test]

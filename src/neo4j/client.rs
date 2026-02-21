@@ -6908,6 +6908,8 @@ impl Neo4jClient {
                 last_confirmed_at: datetime($last_confirmed_at),
                 last_confirmed_by: $last_confirmed_by,
                 staleness_score: $staleness_score,
+                energy: $energy,
+                last_activated: datetime($last_activated),
                 changes_json: $changes_json,
                 assertion_rule_json: $assertion_rule_json
             })
@@ -6938,6 +6940,11 @@ impl Neo4jClient {
             note.last_confirmed_by.clone().unwrap_or_default(),
         )
         .param("staleness_score", note.staleness_score)
+        .param("energy", note.energy)
+        .param(
+            "last_activated",
+            note.last_activated.unwrap_or(note.created_at).to_rfc3339(),
+        )
         .param("changes_json", serde_json::to_string(&note.changes)?)
         .param(
             "assertion_rule_json",
@@ -7503,7 +7510,12 @@ impl Neo4jClient {
             SET n.last_confirmed_at = datetime(),
                 n.last_confirmed_by = $confirmed_by,
                 n.staleness_score = 0.0,
-                n.status = 'active'
+                n.status = 'active',
+                n.energy = CASE
+                    WHEN coalesce(n.energy, 1.0) + 0.3 > 1.0 THEN 1.0
+                    ELSE coalesce(n.energy, 1.0) + 0.3
+                END,
+                n.last_activated = datetime()
             RETURN n
             "#,
         )
@@ -7677,6 +7689,27 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Retrieve the stored embedding vector for a note.
+    pub async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            WHERE n.embedding IS NOT NULL
+            RETURN n.embedding AS embedding
+            "#,
+        )
+        .param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let embedding_f64: Vec<f64> = row.get("embedding")?;
+            let embedding_f32: Vec<f32> = embedding_f64.iter().map(|&x| x as f32).collect();
+            Ok(Some(embedding_f32))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Search notes by vector similarity using the HNSW index.
     ///
     /// Returns notes ordered by descending cosine similarity score,
@@ -7813,6 +7846,324 @@ impl Neo4jClient {
         Ok((notes, total))
     }
 
+    // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Create bidirectional SYNAPSE relationships between a note and its neighbors.
+    ///
+    /// Uses MERGE for idempotence. Creates edges in both directions with the same weight.
+    /// Returns the number of synapses created (counting each direction separately).
+    pub async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize> {
+        if neighbors.is_empty() {
+            return Ok(0);
+        }
+
+        // Build UNWIND list directly in Cypher (internal computed data, no injection risk)
+        let entries: Vec<String> = neighbors
+            .iter()
+            .map(|(nid, weight)| format!("{{id: '{}', weight: {}}}", nid, weight))
+            .collect();
+
+        let cypher = format!(
+            r#"
+            MATCH (source:Note {{id: $source_id}})
+            UNWIND [{}] AS neighbor
+            MATCH (target:Note {{id: neighbor.id}})
+            MERGE (source)-[s1:SYNAPSE]->(target)
+            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime()
+            ON MATCH SET s1.weight = neighbor.weight
+            MERGE (target)-[s2:SYNAPSE]->(source)
+            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime()
+            ON MATCH SET s2.weight = neighbor.weight
+            RETURN count(s1) + count(s2) AS total
+            "#,
+            entries.join(", ")
+        );
+
+        let q = query(&cypher).param("source_id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total")?;
+            Ok(total as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get all SYNAPSE relationships for a note (both directions).
+    ///
+    /// Returns (neighbor_id, weight) sorted by weight descending.
+    pub async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
+        let cypher = r#"
+            MATCH (n:Note {id: $id})-[s:SYNAPSE]-(neighbor:Note)
+            RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight
+            ORDER BY weight DESC
+        "#;
+
+        let q = query(cypher).param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut synapses = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let neighbor_id_str: String = row.get("neighbor_id")?;
+            let weight: f64 = row.get("weight")?;
+            if let Ok(nid) = neighbor_id_str.parse::<Uuid>() {
+                synapses.push((nid, weight));
+            }
+        }
+
+        Ok(synapses)
+    }
+
+    /// Delete all SYNAPSE relationships for a note (both directions).
+    ///
+    /// Returns the number of deleted relationships.
+    pub async fn delete_synapses(&self, note_id: Uuid) -> Result<usize> {
+        let cypher = r#"
+            MATCH (n:Note {id: $id})-[s:SYNAPSE]-()
+            DELETE s
+            RETURN count(s) AS deleted
+        "#;
+
+        let q = query(cypher).param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let deleted: i64 = row.get("deleted")?;
+            Ok(deleted as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Apply exponential energy decay to all active notes.
+    ///
+    /// Formula: `energy = energy × exp(-days_idle / half_life)`
+    /// where `days_idle = (now - last_activated).days()`.
+    ///
+    /// **Temporally idempotent**: the result depends only on the absolute elapsed
+    /// time since `last_activated`, NOT on how often this function is called.
+    /// Calling it once after 30 days ≡ calling it daily for 30 days.
+    ///
+    /// Notes decaying below 0.05 are floored to 0.0 ("dead neuron").
+    pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.status = 'active'
+              AND n.energy > 0.0
+              AND n.last_activated IS NOT NULL
+            WITH n,
+                 duration.between(datetime(n.last_activated), datetime()).days AS days_idle
+            WITH n,
+                 n.energy * exp(-1.0 * toFloat(days_idle) / $half_life) AS new_energy
+            WITH n,
+                 CASE WHEN new_energy < 0.05 THEN 0.0 ELSE new_energy END AS clamped_energy
+            WHERE abs(n.energy - clamped_energy) > 0.001
+            SET n.energy = clamped_energy
+            RETURN count(n) AS updated
+            "#,
+        )
+        .param("half_life", half_life_days);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let updated: i64 = row.get("updated")?;
+            Ok(updated as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Boost a note's energy by `amount` (capped at 1.0) and reset `last_activated` to now.
+    pub async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            SET n.energy = CASE
+                    WHEN n.energy + $amount > 1.0 THEN 1.0
+                    ELSE n.energy + $amount
+                END,
+                n.last_activated = datetime()
+            "#,
+        )
+        .param("id", note_id.to_string())
+        .param("amount", amount);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Reinforce synapses between co-activated notes (Hebbian learning).
+    /// For every pair (i, j) in note_ids, MERGE a bidirectional SYNAPSE.
+    pub async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
+        if note_ids.len() < 2 {
+            return Ok(0);
+        }
+
+        // Generate all unique pairs
+        let mut pairs = Vec::new();
+        for i in 0..note_ids.len() {
+            for j in (i + 1)..note_ids.len() {
+                pairs.push((note_ids[i], note_ids[j]));
+            }
+        }
+
+        let mut total = 0usize;
+        for (a, b) in &pairs {
+            // MERGE both directions for bidirectional synapse
+            let q = query(
+                r#"
+                MATCH (a:Note {id: $a_id}), (b:Note {id: $b_id})
+                MERGE (a)-[s1:SYNAPSE]->(b)
+                  ON CREATE SET s1.weight = 0.5, s1.created_at = datetime()
+                  ON MATCH SET s1.weight = CASE
+                      WHEN s1.weight + $boost > 1.0 THEN 1.0
+                      ELSE s1.weight + $boost
+                  END
+                MERGE (b)-[s2:SYNAPSE]->(a)
+                  ON CREATE SET s2.weight = 0.5, s2.created_at = datetime()
+                  ON MATCH SET s2.weight = CASE
+                      WHEN s2.weight + $boost > 1.0 THEN 1.0
+                      ELSE s2.weight + $boost
+                  END
+                RETURN count(s1) + count(s2) AS cnt
+                "#,
+            )
+            .param("a_id", a.to_string())
+            .param("b_id", b.to_string())
+            .param("boost", boost);
+
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// Decay all synapses and prune weak ones.
+    pub async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)> {
+        // Step 1: Decay all synapses
+        let decay_q = query(
+            r#"
+            MATCH ()-[s:SYNAPSE]->()
+            SET s.weight = s.weight - $decay_amount
+            RETURN count(s) AS decayed
+            "#,
+        )
+        .param("decay_amount", decay_amount);
+
+        let mut result = self.graph.execute(decay_q).await?;
+        let decayed = if let Some(row) = result.next().await? {
+            row.get::<i64>("decayed").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // Step 2: Prune weak synapses
+        let prune_q = query(
+            r#"
+            MATCH ()-[s:SYNAPSE]->()
+            WHERE s.weight < $threshold
+            DELETE s
+            RETURN count(s) AS pruned
+            "#,
+        )
+        .param("threshold", prune_threshold);
+
+        let mut result = self.graph.execute(prune_q).await?;
+        let pruned = if let Some(row) = result.next().await? {
+            row.get::<i64>("pruned").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok((decayed, pruned))
+    }
+
+    /// Initialize energy for notes that don't have it yet.
+    pub async fn init_note_energy(&self) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.energy IS NULL
+            SET n.energy = 1.0,
+                n.last_activated = coalesce(n.last_confirmed_at, n.created_at, datetime())
+            RETURN count(n) AS updated
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let updated = if let Some(row) = result.next().await? {
+            row.get::<i64>("updated").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok(updated)
+    }
+
+    /// List notes that have an embedding but no outgoing SYNAPSE.
+    pub async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Note>, usize)> {
+        // Count total
+        let count_q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+            RETURN count(n) AS total
+            "#,
+        );
+        let mut result = self.graph.execute(count_q).await?;
+        let total = if let Some(row) = result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if total == 0 || limit == 0 {
+            return Ok((vec![], total));
+        }
+
+        // Fetch batch
+        let fetch_q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+            RETURN n
+            ORDER BY n.created_at
+            SKIP $offset LIMIT $limit
+            "#,
+        )
+        .param("offset", offset as i64)
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(fetch_q).await?;
+        let mut notes = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            notes.push(self.node_to_note(&node)?);
+        }
+
+        Ok((notes, total))
+    }
+
     // Helper function to convert Note scope to type string
     fn scope_type_string(&self, scope: &NoteScope) -> String {
         match scope {
@@ -7901,6 +8252,11 @@ impl Neo4jClient {
                 .and_then(|s| s.parse().ok()),
             last_confirmed_by: node.get("last_confirmed_by").ok(),
             staleness_score: node.get("staleness_score").unwrap_or(0.0),
+            energy: node.get("energy").unwrap_or(1.0),
+            last_activated: node
+                .get::<String>("last_activated")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             supersedes: node
                 .get::<String>("supersedes")
                 .ok()

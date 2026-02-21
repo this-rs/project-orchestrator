@@ -481,6 +481,10 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         // Notes search
         .route("/api/notes/search", get(note_handlers::search_notes))
+        .route(
+            "/api/notes/neurons/search",
+            get(note_handlers::search_neurons),
+        )
         // Notes needing review
         .route(
             "/api/notes/needs-review",
@@ -540,6 +544,18 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/admin/backfill-embeddings/status",
             get(note_handlers::get_backfill_embeddings_status),
+        )
+        // ================================================================
+        // Admin — Synapse Backfill
+        // ================================================================
+        .route(
+            "/api/admin/backfill-synapses",
+            post(note_handlers::start_backfill_synapses)
+                .delete(note_handlers::cancel_backfill_synapses),
+        )
+        .route(
+            "/api/admin/backfill-synapses/status",
+            get(note_handlers::get_backfill_synapses_status),
         )
         // ================================================================
         // Meilisearch Maintenance

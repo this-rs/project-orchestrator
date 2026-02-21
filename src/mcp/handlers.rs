@@ -175,6 +175,11 @@ impl ToolHandler {
             "get_context_notes" => self.get_context_notes(args).await,
             "get_notes_needing_review" => self.get_notes_needing_review(args).await,
             "update_staleness_scores" => self.update_staleness_scores(args).await,
+            "update_energy_scores" => self.update_energy_scores(args).await,
+            "search_neurons" => self.search_neurons(args).await,
+            "reinforce_neurons" => self.reinforce_neurons(args).await,
+            "decay_synapses" => self.decay_synapses(args).await,
+            "backfill_synapses" => self.backfill_synapses(args).await,
             "list_project_notes" => self.list_project_notes(args).await,
             "get_propagated_notes" => self.get_propagated_notes(args).await,
             "get_entity_notes" => self.get_entity_notes(args).await,
@@ -1500,6 +1505,9 @@ impl ToolHandler {
 
         self.orchestrator.create_commit(&commit).await?;
 
+        // Clone files list before it's moved into the sync spawn
+        let ar_files_for_hook = files_changed.clone();
+
         // Trigger incremental sync if files_changed and project_id are provided
         let sync_triggered = !files_changed.is_empty() && project_id.is_some();
         if sync_triggered {
@@ -1527,6 +1535,50 @@ impl ToolHandler {
                 }
                 // Trigger debounced analytics recomputation (fire-and-forget)
                 orchestrator.analytics_debouncer().trigger(project_id);
+            });
+        }
+
+        // Hook Niveau 2: boost energy of notes linked to committed files
+        let ar_config = self.orchestrator.auto_reinforcement_config().clone();
+        if ar_config.enabled && !ar_files_for_hook.is_empty() {
+            let neo4j = self.orchestrator.neo4j_arc();
+            let files = ar_files_for_hook;
+            tokio::spawn(async move {
+                for file_path in &files {
+                    match neo4j
+                        .get_notes_for_entity(&crate::notes::EntityType::File, file_path)
+                        .await
+                    {
+                        Ok(notes) => {
+                            for note in &notes {
+                                if let Err(e) = neo4j
+                                    .boost_energy(note.id, ar_config.commit_energy_boost)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        note_id = %note.id,
+                                        error = %e,
+                                        "Auto-reinforce commit: energy boost failed"
+                                    );
+                                }
+                            }
+                            if !notes.is_empty() {
+                                tracing::debug!(
+                                    file = %file_path,
+                                    notes = notes.len(),
+                                    "Auto-reinforced notes linked to committed file"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                file = %file_path,
+                                error = %e,
+                                "Auto-reinforce commit: get_entity_notes failed"
+                            );
+                        }
+                    }
+                }
             });
         }
 
@@ -2509,6 +2561,234 @@ impl ToolHandler {
             .await?;
 
         Ok(json!({"notes_updated": count}))
+    }
+
+    async fn update_energy_scores(&self, args: Value) -> Result<Value> {
+        let half_life = args
+            .get("half_life")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(90.0);
+
+        let count = self
+            .orchestrator
+            .note_manager()
+            .update_energy_scores(half_life)
+            .await?;
+
+        Ok(json!({"notes_updated": count, "half_life_days": half_life}))
+    }
+
+    async fn search_neurons(&self, args: Value) -> Result<Value> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("query is required"))?;
+
+        let engine = self.orchestrator.activation_engine().ok_or_else(|| {
+            anyhow!(
+                "Spreading activation unavailable: no embedding provider configured. \
+                     Set EMBEDDING_PROVIDER=local or EMBEDDING_PROVIDER=http to enable."
+            )
+        })?;
+
+        // Resolve project_slug → project_id if provided
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            let project = self
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
+            Some(project.id)
+        } else {
+            None
+        };
+
+        let config = crate::neurons::SpreadingActivationConfig {
+            max_results: args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(10),
+            max_hops: args
+                .get("max_hops")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(2),
+            min_activation: args
+                .get("min_score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.1),
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        let results = engine.activate(query, project_id, &config).await?;
+        let query_time_ms = start.elapsed().as_millis() as u64;
+
+        let direct_matches = results
+            .iter()
+            .filter(|r| matches!(r.source, crate::neurons::ActivationSource::Direct))
+            .count();
+        let propagated_matches = results.len() - direct_matches;
+
+        let results_json: Vec<Value> = results
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.note.id,
+                    "content": r.note.content,
+                    "note_type": r.note.note_type,
+                    "importance": r.note.importance,
+                    "activation_score": r.activation_score,
+                    "source": r.source,
+                    "energy": r.note.energy,
+                    "tags": r.note.tags,
+                    "project_id": r.note.project_id,
+                })
+            })
+            .collect();
+
+        // Hook Niveau 1: auto-reinforce co-activated notes (fire-and-forget)
+        let ar_config = self.orchestrator.auto_reinforcement_config().clone();
+        if ar_config.enabled && !results.is_empty() {
+            let note_ids: Vec<Uuid> = results.iter().map(|r| r.note.id).collect();
+            let neo4j = self.orchestrator.neo4j_arc();
+            tokio::spawn(async move {
+                // Boost energy for each activated note
+                for id in &note_ids {
+                    if let Err(e) = neo4j.boost_energy(*id, ar_config.search_energy_boost).await {
+                        tracing::warn!(note_id = %id, error = %e, "Auto-reinforce: energy boost failed");
+                    }
+                }
+                // Reinforce synapses between co-activated notes
+                if note_ids.len() >= 2 {
+                    if let Err(e) = neo4j
+                        .reinforce_synapses(&note_ids, ar_config.search_synapse_boost)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "Auto-reinforce: synapse reinforcement failed");
+                    }
+                }
+                tracing::debug!(
+                    notes = note_ids.len(),
+                    "Auto-reinforcement completed for search_neurons results"
+                );
+            });
+        }
+
+        Ok(json!({
+            "results": results_json,
+            "metadata": {
+                "total_activated": results.len(),
+                "direct_matches": direct_matches,
+                "propagated_matches": propagated_matches,
+                "query_time_ms": query_time_ms,
+                "max_hops": config.max_hops,
+                "min_score": config.min_activation,
+            }
+        }))
+    }
+
+    async fn reinforce_neurons(&self, args: Value) -> Result<Value> {
+        let note_ids: Vec<Uuid> = args
+            .get("note_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("note_ids is required (array of UUIDs)"))?
+            .iter()
+            .filter_map(|v| v.as_str().and_then(|s| s.parse::<Uuid>().ok()))
+            .collect();
+
+        if note_ids.len() < 2 {
+            return Err(anyhow!(
+                "note_ids must contain at least 2 UUIDs (got {})",
+                note_ids.len()
+            ));
+        }
+
+        let energy_boost = args
+            .get("energy_boost")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.2);
+        let synapse_boost = args
+            .get("synapse_boost")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.05);
+
+        // 1. Boost energy for each note
+        let mut neurons_boosted = 0;
+        for note_id in &note_ids {
+            self.neo4j().boost_energy(*note_id, energy_boost).await?;
+            neurons_boosted += 1;
+        }
+
+        // 2. Reinforce synapses between all pairs
+        let synapses_reinforced = self
+            .neo4j()
+            .reinforce_synapses(&note_ids, synapse_boost)
+            .await?;
+
+        Ok(json!({
+            "neurons_boosted": neurons_boosted,
+            "synapses_reinforced": synapses_reinforced,
+            "energy_boost": energy_boost,
+            "synapse_boost": synapse_boost,
+        }))
+    }
+
+    async fn decay_synapses(&self, args: Value) -> Result<Value> {
+        let decay_amount = args
+            .get("decay_amount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.01);
+        let prune_threshold = args
+            .get("prune_threshold")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.1);
+
+        let (decayed, pruned) = self
+            .neo4j()
+            .decay_synapses(decay_amount, prune_threshold)
+            .await?;
+
+        Ok(json!({
+            "synapses_decayed": decayed,
+            "synapses_pruned": pruned,
+            "decay_amount": decay_amount,
+            "prune_threshold": prune_threshold,
+        }))
+    }
+
+    async fn backfill_synapses(&self, args: Value) -> Result<Value> {
+        let batch_size = args
+            .get("batch_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50) as usize;
+        let min_similarity = args
+            .get("min_similarity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.75);
+        let max_neighbors = args
+            .get("max_neighbors")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as usize;
+
+        let start = std::time::Instant::now();
+        let progress = self
+            .orchestrator
+            .note_manager()
+            .backfill_synapses(batch_size, min_similarity, max_neighbors, None)
+            .await?;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        Ok(json!({
+            "total": progress.total,
+            "processed": progress.processed,
+            "synapses_created": progress.synapses_created,
+            "errors": progress.errors,
+            "skipped": progress.skipped,
+            "energy_initialized": progress.energy_initialized,
+            "elapsed_ms": elapsed_ms,
+        }))
     }
 
     async fn list_project_notes(&self, args: Value) -> Result<Value> {

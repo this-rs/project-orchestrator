@@ -317,6 +317,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_energy() -> f64 {
+    1.0
+}
+
 impl NoteAnchor {
     /// Create a new anchor for a code entity
     pub fn new(entity_type: EntityType, entity_id: String) -> Self {
@@ -542,6 +546,16 @@ pub struct Note {
     #[serde(default)]
     pub staleness_score: f64,
 
+    // Neural energy (Phase 2)
+    /// Neural energy level (0.0-1.0). Represents "freshness" via exponential decay.
+    /// Starts at 1.0 on creation, decays with half_life=90 days, boosted on activation.
+    /// Coexists with staleness_score for dual-run comparison (Phase 3).
+    #[serde(default = "default_energy")]
+    pub energy: f64,
+    /// When this note's neuron was last activated (retrieved/used/confirmed).
+    /// Used to compute energy decay: energy × exp(-days_idle / half_life).
+    pub last_activated: Option<DateTime<Utc>>,
+
     // Succession
     /// ID of the note this one supersedes (if any)
     pub supersedes: Option<Uuid>,
@@ -584,6 +598,8 @@ impl Note {
             last_confirmed_at: Some(now),
             last_confirmed_by: Some(created_by.clone()),
             staleness_score: 0.0,
+            energy: 1.0,
+            last_activated: Some(now),
             supersedes: None,
             superseded_by: None,
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
@@ -618,6 +634,8 @@ impl Note {
             last_confirmed_at: Some(now),
             last_confirmed_by: Some(created_by.clone()),
             staleness_score: 0.0,
+            energy: 1.0,
+            last_activated: Some(now),
             supersedes: None,
             superseded_by: None,
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],

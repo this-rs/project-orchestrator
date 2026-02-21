@@ -1360,6 +1360,10 @@ impl GraphStore for Neo4jClient {
         self.set_note_embedding(note_id, embedding, model).await
     }
 
+    async fn get_note_embedding(&self, note_id: Uuid) -> anyhow::Result<Option<Vec<f32>>> {
+        self.get_note_embedding(note_id).await
+    }
+
     async fn vector_search_notes(
         &self,
         embedding: &[f32],
@@ -1377,6 +1381,62 @@ impl GraphStore for Neo4jClient {
         offset: usize,
     ) -> anyhow::Result<(Vec<Note>, usize)> {
         self.list_notes_without_embedding(limit, offset).await
+    }
+
+    // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn create_synapses(
+        &self,
+        note_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> anyhow::Result<usize> {
+        self.create_synapses(note_id, neighbors).await
+    }
+
+    async fn get_synapses(&self, note_id: Uuid) -> anyhow::Result<Vec<(Uuid, f64)>> {
+        self.get_synapses(note_id).await
+    }
+
+    async fn delete_synapses(&self, note_id: Uuid) -> anyhow::Result<usize> {
+        self.delete_synapses(note_id).await
+    }
+
+    // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn update_energy_scores(&self, half_life_days: f64) -> anyhow::Result<usize> {
+        self.update_energy_scores(half_life_days).await
+    }
+
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> anyhow::Result<()> {
+        self.boost_energy(note_id, amount).await
+    }
+
+    async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> anyhow::Result<usize> {
+        self.reinforce_synapses(note_ids, boost).await
+    }
+
+    async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> anyhow::Result<(usize, usize)> {
+        self.decay_synapses(decay_amount, prune_threshold).await
+    }
+
+    async fn init_note_energy(&self) -> anyhow::Result<usize> {
+        self.init_note_energy().await
+    }
+
+    async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::notes::Note>, usize)> {
+        self.list_notes_needing_synapses(limit, offset).await
     }
 
     // ========================================================================

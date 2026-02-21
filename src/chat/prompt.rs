@@ -688,6 +688,26 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "update_staleness_scores",
                 description: "Recalculer la fraîcheur",
             },
+            ToolRef {
+                name: "update_energy_scores",
+                description: "Recalculer l'énergie neuronale (decay)",
+            },
+            ToolRef {
+                name: "search_neurons",
+                description: "Recherche neuronale (spreading activation via synapses)",
+            },
+            ToolRef {
+                name: "reinforce_neurons",
+                description: "Renforcement hebbien (boost énergie + synapses)",
+            },
+            ToolRef {
+                name: "decay_synapses",
+                description: "Decay et pruning des synapses faibles",
+            },
+            ToolRef {
+                name: "backfill_synapses",
+                description: "Backfill synapses pour notes avec embedding sans synapse",
+            },
         ],
     },
     // ── Git tracking (5 tools) ───────────────────────────────────────
@@ -2523,11 +2543,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_154_tools() {
+    fn test_tool_groups_cover_all_159_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 154,
-            "TOOL_GROUPS must cover exactly 154 unique tools (got {}). \
+            count, 159,
+            "TOOL_GROUPS must cover exactly 159 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

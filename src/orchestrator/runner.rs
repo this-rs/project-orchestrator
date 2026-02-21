@@ -6,6 +6,7 @@ use crate::events::{
 };
 use crate::graph::{AnalyticsConfig, AnalyticsDebouncer, AnalyticsEngine, GraphAnalyticsEngine};
 use crate::neo4j::models::*;
+use crate::neurons::{AutoReinforcementConfig, SpreadingActivationEngine};
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
 use crate::plan::models::*;
@@ -73,6 +74,8 @@ pub struct Orchestrator {
     planner: Arc<super::ImplementationPlanner>,
     analytics: Arc<dyn AnalyticsEngine>,
     analytics_debouncer: AnalyticsDebouncer,
+    activation_engine: Option<Arc<SpreadingActivationEngine>>,
+    auto_reinforcement: AutoReinforcementConfig,
     event_bus: Option<Arc<HybridEmitter>>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
 }
@@ -147,11 +150,20 @@ impl Orchestrator {
     pub async fn new(state: AppState) -> Result<Self> {
         let plan_manager = Arc::new(PlanManager::new(state.neo4j.clone(), state.meili.clone()));
 
+        let embedding_provider = init_embedding_provider();
+
         let mut note_manager = NoteManager::new(state.neo4j.clone(), state.meili.clone());
-        if let Some(provider) = init_embedding_provider() {
-            note_manager = note_manager.with_embedding_provider(provider);
+        if let Some(ref provider) = embedding_provider {
+            note_manager = note_manager.with_embedding_provider(provider.clone());
         }
         let note_manager = Arc::new(note_manager);
+
+        let activation_engine = embedding_provider.map(|provider| {
+            Arc::new(SpreadingActivationEngine::new(
+                state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
+                provider,
+            ))
+        });
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
@@ -188,6 +200,8 @@ impl Orchestrator {
             planner,
             analytics,
             analytics_debouncer,
+            activation_engine,
+            auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: None,
             event_emitter: None,
         })
@@ -199,6 +213,7 @@ impl Orchestrator {
     /// (for WebSocket subscribe) and optional NATS (for inter-process sync).
     pub async fn with_event_bus(state: AppState, event_bus: Arc<HybridEmitter>) -> Result<Self> {
         let emitter: Arc<dyn EventEmitter> = event_bus.clone();
+        let embedding_provider = init_embedding_provider();
 
         let plan_manager = Arc::new(PlanManager::with_event_emitter(
             state.neo4j.clone(),
@@ -211,10 +226,17 @@ impl Orchestrator {
             state.meili.clone(),
             emitter.clone(),
         );
-        if let Some(provider) = init_embedding_provider() {
-            note_manager = note_manager.with_embedding_provider(provider);
+        if let Some(ref provider) = embedding_provider {
+            note_manager = note_manager.with_embedding_provider(provider.clone());
         }
         let note_manager = Arc::new(note_manager);
+
+        let activation_engine = embedding_provider.map(|provider| {
+            Arc::new(SpreadingActivationEngine::new(
+                state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
+                provider,
+            ))
+        });
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
@@ -251,6 +273,8 @@ impl Orchestrator {
             planner,
             analytics,
             analytics_debouncer,
+            activation_engine,
+            auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
         })
@@ -264,6 +288,8 @@ impl Orchestrator {
         state: AppState,
         emitter: Arc<dyn EventEmitter>,
     ) -> Result<Self> {
+        let embedding_provider = init_embedding_provider();
+
         let plan_manager = Arc::new(PlanManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
@@ -275,10 +301,17 @@ impl Orchestrator {
             state.meili.clone(),
             emitter.clone(),
         );
-        if let Some(provider) = init_embedding_provider() {
-            note_manager = note_manager.with_embedding_provider(provider);
+        if let Some(ref provider) = embedding_provider {
+            note_manager = note_manager.with_embedding_provider(provider.clone());
         }
         let note_manager = Arc::new(note_manager);
+
+        let activation_engine = embedding_provider.map(|provider| {
+            Arc::new(SpreadingActivationEngine::new(
+                state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
+                provider,
+            ))
+        });
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
@@ -315,6 +348,8 @@ impl Orchestrator {
             planner,
             analytics,
             analytics_debouncer,
+            activation_engine,
+            auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: None,
             event_emitter: Some(emitter),
         })
@@ -912,6 +947,18 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// Get the analytics debouncer (for incremental sync triggers)
     pub fn analytics_debouncer(&self) -> &AnalyticsDebouncer {
         &self.analytics_debouncer
+    }
+
+    /// Get the spreading activation engine (if embedding provider is available).
+    ///
+    /// Returns `None` when `EMBEDDING_PROVIDER=disabled` or initialization failed.
+    pub fn activation_engine(&self) -> Option<&Arc<SpreadingActivationEngine>> {
+        self.activation_engine.as_ref()
+    }
+
+    /// Get the auto-reinforcement configuration.
+    pub fn auto_reinforcement_config(&self) -> &AutoReinforcementConfig {
+        &self.auto_reinforcement
     }
 
     // ========================================================================

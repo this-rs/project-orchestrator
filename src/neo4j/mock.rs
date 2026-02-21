@@ -116,6 +116,8 @@ pub struct MockGraphStore {
     pub function_analytics: RwLock<HashMap<String, crate::graph::models::FunctionAnalyticsUpdate>>,
     /// Note embeddings (note_id -> (embedding, model_name))
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
+    /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
+    pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
 }
 
 #[allow(dead_code)]
@@ -185,6 +187,7 @@ impl MockGraphStore {
             file_analytics: RwLock::new(HashMap::new()),
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
+            note_synapses: RwLock::new(HashMap::new()),
         }
     }
 
@@ -3937,6 +3940,16 @@ impl GraphStore for MockGraphStore {
     async fn delete_note(&self, id: Uuid) -> Result<bool> {
         let removed = self.notes.write().await.remove(&id).is_some();
         self.note_anchors.write().await.remove(&id);
+        // Also clean up synapses (both directions)
+        if removed {
+            let mut synapses = self.note_synapses.write().await;
+            // Remove this note's outgoing synapses
+            synapses.remove(&id);
+            // Remove references to this note from all other notes' synapse lists
+            for neighbors in synapses.values_mut() {
+                neighbors.retain(|(nid, _)| *nid != id);
+            }
+        }
         Ok(removed)
     }
 
@@ -4122,6 +4135,9 @@ impl GraphStore for MockGraphStore {
         let mut notes = self.notes.write().await;
         if let Some(n) = notes.get_mut(&note_id) {
             n.confirm(confirmed_by);
+            // Energy boost: +0.3, capped at 1.0
+            n.energy = (n.energy + 0.3).min(1.0);
+            n.last_activated = Some(chrono::Utc::now());
             Ok(Some(n.clone()))
         } else {
             Ok(None)
@@ -4183,6 +4199,11 @@ impl GraphStore for MockGraphStore {
             .await
             .insert(note_id, (embedding.to_vec(), model.to_string()));
         Ok(())
+    }
+
+    async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let embeddings = self.note_embeddings.read().await;
+        Ok(embeddings.get(&note_id).map(|(emb, _)| emb.clone()))
     }
 
     async fn vector_search_notes(
@@ -4269,6 +4290,203 @@ impl GraphStore for MockGraphStore {
         let page: Vec<Note> = without.into_iter().skip(offset).take(limit).collect();
 
         Ok((page, total))
+    }
+
+    // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize> {
+        if neighbors.is_empty() {
+            return Ok(0);
+        }
+
+        let mut synapses = self.note_synapses.write().await;
+        let mut count = 0;
+
+        for &(neighbor_id, weight) in neighbors {
+            // Add source -> neighbor (upsert)
+            let entry = synapses.entry(note_id).or_default();
+            if let Some(existing) = entry.iter_mut().find(|(nid, _)| *nid == neighbor_id) {
+                existing.1 = weight;
+            } else {
+                entry.push((neighbor_id, weight));
+            }
+            count += 1;
+
+            // Add neighbor -> source (bidirectional, upsert)
+            let entry = synapses.entry(neighbor_id).or_default();
+            if let Some(existing) = entry.iter_mut().find(|(nid, _)| *nid == note_id) {
+                existing.1 = weight;
+            } else {
+                entry.push((note_id, weight));
+            }
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
+        let synapses = self.note_synapses.read().await;
+        let mut result = synapses.get(&note_id).cloned().unwrap_or_default();
+        // Sort by weight descending
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(result)
+    }
+
+    async fn delete_synapses(&self, note_id: Uuid) -> Result<usize> {
+        let mut synapses = self.note_synapses.write().await;
+
+        // Count outgoing synapses
+        let outgoing_count = synapses.get(&note_id).map(|v| v.len()).unwrap_or(0);
+
+        // Remove from all neighbors' lists
+        if let Some(neighbors) = synapses.remove(&note_id) {
+            for (neighbor_id, _) in &neighbors {
+                if let Some(neighbor_list) = synapses.get_mut(neighbor_id) {
+                    neighbor_list.retain(|(nid, _)| *nid != note_id);
+                }
+            }
+        }
+
+        // Return total deleted (bidirectional = outgoing * 2)
+        Ok(outgoing_count * 2)
+    }
+
+    // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let now = chrono::Utc::now();
+        let mut updated = 0usize;
+
+        for note in notes.values_mut() {
+            if note.status != crate::notes::NoteStatus::Active || note.energy <= 0.0 {
+                continue;
+            }
+            if let Some(last_activated) = note.last_activated {
+                let days_idle = (now - last_activated).num_seconds() as f64 / 86400.0;
+                let new_energy = note.energy * (-days_idle / half_life_days).exp();
+                let clamped = if new_energy < 0.05 { 0.0 } else { new_energy };
+                if (note.energy - clamped).abs() > 0.001 {
+                    note.energy = clamped;
+                    updated += 1;
+                }
+            }
+        }
+
+        Ok(updated)
+    }
+
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
+        let mut notes = self.notes.write().await;
+        if let Some(note) = notes.get_mut(&note_id) {
+            note.energy = (note.energy + amount).min(1.0);
+            note.last_activated = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
+        if note_ids.len() < 2 {
+            return Ok(0);
+        }
+
+        let mut synapses = self.note_synapses.write().await;
+        let mut count = 0usize;
+
+        for i in 0..note_ids.len() {
+            for j in (i + 1)..note_ids.len() {
+                let a = note_ids[i];
+                let b = note_ids[j];
+
+                // Reinforce or create A → B
+                let entry_a = synapses.entry(a).or_default();
+                if let Some(syn) = entry_a.iter_mut().find(|(id, _)| *id == b) {
+                    syn.1 = (syn.1 + boost).min(1.0);
+                } else {
+                    entry_a.push((b, 0.5));
+                }
+                count += 1;
+
+                // Reinforce or create B → A
+                let entry_b = synapses.entry(b).or_default();
+                if let Some(syn) = entry_b.iter_mut().find(|(id, _)| *id == a) {
+                    syn.1 = (syn.1 + boost).min(1.0);
+                } else {
+                    entry_b.push((a, 0.5));
+                }
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)> {
+        let mut synapses = self.note_synapses.write().await;
+        let mut decayed = 0usize;
+        let mut pruned = 0usize;
+
+        // Decay all synapses
+        for neighbors in synapses.values_mut() {
+            for syn in neighbors.iter_mut() {
+                syn.1 -= decay_amount;
+                decayed += 1;
+            }
+        }
+
+        // Prune weak synapses
+        for neighbors in synapses.values_mut() {
+            let before = neighbors.len();
+            neighbors.retain(|(_, w)| *w >= prune_threshold);
+            pruned += before - neighbors.len();
+        }
+
+        Ok((decayed, pruned))
+    }
+
+    async fn init_note_energy(&self) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let mut count = 0;
+        for note in notes.values_mut() {
+            // Simulate: only init if energy would have been NULL (we use 0.0 sentinel or check default)
+            // In mock, energy is always set by Note::new(), so this is a no-op
+            // But for completeness, ensure energy is at least 1.0 if it was 0.0 and never activated
+            if note.last_activated.is_none() && note.energy == 0.0 {
+                note.energy = 1.0;
+                note.last_activated = Some(chrono::Utc::now());
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        _offset: usize,
+    ) -> Result<(Vec<crate::notes::Note>, usize)> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+        let synapses = self.note_synapses.read().await;
+
+        let needing: Vec<crate::notes::Note> = notes
+            .values()
+            .filter(|n| embeddings.contains_key(&n.id) && !synapses.contains_key(&n.id))
+            .cloned()
+            .collect();
+
+        let total = needing.len();
+        let batch: Vec<crate::notes::Note> = needing.into_iter().take(limit).collect();
+        Ok((batch, total))
     }
 
     // ========================================================================

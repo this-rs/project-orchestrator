@@ -13,12 +13,34 @@ use anyhow::Result;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Configuration for automatic synapse creation between similar notes.
+#[derive(Debug, Clone)]
+pub struct SynapseConfig {
+    /// Minimum cosine similarity score to create a synapse (default: 0.75)
+    pub min_weight: f64,
+    /// Maximum number of neighbors to connect per note (default: 10)
+    pub max_neighbors: usize,
+    /// Whether auto-synapse creation is enabled (default: true)
+    pub enabled: bool,
+}
+
+impl Default for SynapseConfig {
+    fn default() -> Self {
+        Self {
+            min_weight: 0.75,
+            max_neighbors: 10,
+            enabled: true,
+        }
+    }
+}
+
 /// Manager for Knowledge Notes operations
 pub struct NoteManager {
     neo4j: Arc<dyn GraphStore>,
     meilisearch: Arc<dyn SearchStore>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    synapse_config: SynapseConfig,
 }
 
 impl NoteManager {
@@ -29,6 +51,7 @@ impl NoteManager {
             meilisearch,
             event_emitter: None,
             embedding_provider: None,
+            synapse_config: SynapseConfig::default(),
         }
     }
 
@@ -43,6 +66,7 @@ impl NoteManager {
             meilisearch,
             event_emitter: Some(emitter),
             embedding_provider: None,
+            synapse_config: SynapseConfig::default(),
         }
     }
 
@@ -52,6 +76,12 @@ impl NoteManager {
     /// Embedding failures are logged but do not block the note operation.
     pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embedding_provider = Some(provider);
+        self
+    }
+
+    /// Set synapse configuration (builder pattern).
+    pub fn with_synapse_config(mut self, config: SynapseConfig) -> Self {
+        self.synapse_config = config;
         self
     }
 
@@ -98,6 +128,96 @@ impl NoteManager {
         }
     }
 
+    /// Automatically create synapses between a note and its semantically similar neighbors.
+    ///
+    /// This is a best-effort, fire-and-forget operation: it runs after the note is
+    /// created/embedded. Failures are logged at warn level but never block the caller.
+    ///
+    /// Process:
+    /// 1. Get the note's embedding from the provider
+    /// 2. Vector search for K nearest neighbors (filtered by project_id)
+    /// 3. Filter by min_weight threshold
+    /// 4. Create bidirectional synapses via GraphStore
+    fn spawn_auto_connect_synapses(&self, note_id: Uuid, content: &str, project_id: Option<Uuid>) {
+        // Skip if no embedding provider or synapses disabled
+        let provider = match &self.embedding_provider {
+            Some(p) if self.synapse_config.enabled => p.clone(),
+            _ => return,
+        };
+
+        let neo4j = self.neo4j.clone();
+        let min_weight = self.synapse_config.min_weight;
+        let max_neighbors = self.synapse_config.max_neighbors;
+        let content = content.to_string();
+
+        tokio::spawn(async move {
+            // Step 1: Embed the note's content
+            let embedding = match provider.embed_text(&content).await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: failed to embed note content"
+                    );
+                    return;
+                }
+            };
+
+            // Step 2: Vector search for nearest neighbors
+            let candidates = match neo4j
+                .vector_search_notes(&embedding, max_neighbors + 1, project_id, None)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: vector search failed"
+                    );
+                    return;
+                }
+            };
+
+            // Step 3: Filter — exclude self, apply min_weight, limit to max_neighbors
+            let neighbors: Vec<(Uuid, f64)> = candidates
+                .into_iter()
+                .filter(|(note, score)| note.id != note_id && *score >= min_weight)
+                .take(max_neighbors)
+                .map(|(note, score)| (note.id, score))
+                .collect();
+
+            if neighbors.is_empty() {
+                tracing::debug!(
+                    note_id = %note_id,
+                    "Auto-synapse: no neighbors above threshold {:.2}",
+                    min_weight
+                );
+                return;
+            }
+
+            // Step 4: Create bidirectional synapses
+            match neo4j.create_synapses(note_id, &neighbors).await {
+                Ok(count) => {
+                    tracing::debug!(
+                        note_id = %note_id,
+                        neighbors = neighbors.len(),
+                        synapse_count = count,
+                        "Auto-synapse: created synapses"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: failed to create synapses"
+                    );
+                }
+            }
+        });
+    }
+
     // ========================================================================
     // CRUD Operations
     // ========================================================================
@@ -138,6 +258,9 @@ impl NoteManager {
 
         // Generate embedding (best-effort, non-blocking for note creation)
         self.embed_note(note.id, &note.content).await;
+
+        // Auto-connect synapses to semantically similar notes (fire-and-forget)
+        self.spawn_auto_connect_synapses(note.id, &note.content, note.project_id);
 
         self.emit(
             CrudEvent::new(
@@ -189,6 +312,19 @@ impl NoteManager {
             // Re-embed if content changed (best-effort)
             if content_changed {
                 self.embed_note(id, &note.content).await;
+
+                // Content changed → delete old synapses and re-connect
+                // delete_synapses is best-effort (non-critical for the update)
+                if self.synapse_config.enabled {
+                    if let Err(e) = self.neo4j.delete_synapses(id).await {
+                        tracing::warn!(
+                            note_id = %id,
+                            error = %e,
+                            "Failed to delete old synapses during update"
+                        );
+                    }
+                    self.spawn_auto_connect_synapses(id, &note.content, note.project_id);
+                }
             }
 
             self.emit(
@@ -202,7 +338,7 @@ impl NoteManager {
 
     /// Delete a note
     pub async fn delete_note(&self, id: Uuid) -> Result<bool> {
-        // Delete from Neo4j
+        // Delete from Neo4j (DETACH DELETE also removes SYNAPSE relationships)
         let deleted = self.neo4j.delete_note(id).await?;
 
         // Delete from Meilisearch
@@ -406,6 +542,17 @@ impl NoteManager {
     /// Update staleness scores for all active notes
     pub async fn update_staleness_scores(&self) -> Result<usize> {
         self.neo4j.update_staleness_scores().await
+    }
+
+    /// Apply exponential energy decay to all active notes.
+    ///
+    /// Formula: `energy = energy × exp(-days_idle / half_life)`
+    /// where `days_idle = (now - last_activated).days()`.
+    ///
+    /// Temporally idempotent: result depends only on elapsed time since
+    /// `last_activated`, not on call frequency.
+    pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        self.neo4j.update_energy_scores(half_life_days).await
     }
 
     // ========================================================================
@@ -840,6 +987,221 @@ impl NoteManager {
             skipped,
         })
     }
+
+    /// Backfill SYNAPSE relationships for notes that have embeddings but no
+    /// outgoing SYNAPSE edges yet.
+    ///
+    /// For each such note, retrieves its stored embedding, runs a vector
+    /// similarity search to find nearest neighbours, filters by
+    /// `min_similarity`, and creates bidirectional SYNAPSE relations.
+    ///
+    /// This is idempotent: notes that already have synapses are skipped
+    /// (they don't appear in `list_notes_needing_synapses`). On re-run,
+    /// only newly embedded notes or notes whose synapses were pruned are
+    /// processed.
+    ///
+    /// Also calls `init_note_energy()` first to ensure all notes have an
+    /// energy value.
+    pub async fn backfill_synapses(
+        &self,
+        batch_size: usize,
+        min_similarity: f64,
+        max_neighbors: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<SynapseBackfillProgress> {
+        let batch_size = if batch_size == 0 { 50 } else { batch_size };
+        let min_similarity = if min_similarity <= 0.0 {
+            0.75
+        } else {
+            min_similarity
+        };
+        let max_neighbors = if max_neighbors == 0 {
+            10
+        } else {
+            max_neighbors
+        };
+
+        // Phase 1: init energy on all notes that don't have it yet
+        let energy_init = self.neo4j.init_note_energy().await?;
+        if energy_init > 0 {
+            tracing::info!("Synapse backfill: initialized energy on {energy_init} notes");
+        }
+
+        // Phase 2: get total count of notes needing synapses
+        let (_, total) = self.neo4j.list_notes_needing_synapses(0, 0).await?;
+        if total == 0 {
+            tracing::info!("Synapse backfill: all notes with embeddings already have synapses");
+            return Ok(SynapseBackfillProgress {
+                total,
+                processed: 0,
+                synapses_created: 0,
+                errors: 0,
+                skipped: 0,
+                energy_initialized: energy_init,
+            });
+        }
+
+        tracing::info!("Synapse backfill: {total} notes need synapses");
+        let mut processed = 0usize;
+        let mut synapses_created = 0usize;
+        let mut errors = 0usize;
+        // Track offset for notes that couldn't get synapses (no eligible
+        // neighbours) — they stay in the query results, so we must skip past
+        // them on subsequent iterations to avoid an infinite loop.
+        let mut skip_offset = 0usize;
+
+        loop {
+            // Check cancellation
+            if let Some(flag) = cancel {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("Synapse backfill cancelled at {processed}/{total}");
+                    break;
+                }
+            }
+
+            // Fetch next batch. Notes that got synapses disappear from
+            // results (offset 0 works for those). But notes with no eligible
+            // neighbours stay, so we skip past them with `skip_offset`.
+            let (batch, remaining) = self
+                .neo4j
+                .list_notes_needing_synapses(batch_size, skip_offset)
+                .await?;
+            if batch.is_empty() || remaining == 0 {
+                break;
+            }
+
+            // Track how many notes in this batch couldn't be connected —
+            // if ALL of them fail, we've exhausted the connectable notes.
+            let mut batch_connected = 0usize;
+
+            for note in &batch {
+                // Check cancellation per-note for responsiveness
+                if let Some(flag) = cancel {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!("Synapse backfill cancelled at {processed}/{total}");
+                        let skipped = total.saturating_sub(processed + errors);
+                        return Ok(SynapseBackfillProgress {
+                            total,
+                            processed,
+                            synapses_created,
+                            errors,
+                            skipped,
+                            energy_initialized: energy_init,
+                        });
+                    }
+                }
+
+                // Get the stored embedding for this note
+                let embedding = match self.neo4j.get_note_embedding(note.id).await {
+                    Ok(Some(emb)) => emb,
+                    Ok(None) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            "Synapse backfill: note listed as needing synapses but has no embedding, skipping"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: failed to get embedding"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                };
+
+                // Vector search for nearest neighbours
+                let neighbors = match self
+                    .neo4j
+                    .vector_search_notes(&embedding, max_neighbors + 1, note.project_id, None)
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: vector search failed"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                };
+
+                // Filter: exclude self, apply min_similarity threshold
+                let synapse_targets: Vec<(Uuid, f64)> = neighbors
+                    .into_iter()
+                    .filter(|(n, score)| n.id != note.id && *score >= min_similarity)
+                    .map(|(n, score)| (n.id, score))
+                    .collect();
+
+                if synapse_targets.is_empty() {
+                    // No eligible neighbours — this note will stay in the
+                    // "needing synapses" list. Increment offset to skip past
+                    // it on the next iteration.
+                    tracing::debug!(
+                        note_id = %note.id,
+                        "Synapse backfill: no eligible neighbours above threshold {min_similarity}, skipping"
+                    );
+                    skip_offset += 1;
+                    processed += 1;
+                    continue;
+                }
+
+                match self.neo4j.create_synapses(note.id, &synapse_targets).await {
+                    Ok(created) => {
+                        synapses_created += created;
+                        batch_connected += 1;
+                        // Note now has synapses → will NOT appear in next
+                        // query at the same offset. Don't increment skip_offset.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: failed to create synapses"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
+                    }
+                }
+
+                processed += 1;
+            }
+
+            tracing::info!(
+                "Synapse backfill: {processed}/{total} notes processed, {synapses_created} synapses created ({errors} errors, {skip_offset} skipped)"
+            );
+
+            // If no note in this batch could be connected, all remaining
+            // notes are un-connectable — stop to avoid spinning forever.
+            if batch_connected == 0 {
+                tracing::info!("Synapse backfill: no more connectable notes found, stopping");
+                break;
+            }
+        }
+
+        let skipped = total.saturating_sub(processed + errors);
+        tracing::info!(
+            "Synapse backfill complete: {processed} processed, {synapses_created} synapses, {errors} errors, {skipped} skipped"
+        );
+
+        Ok(SynapseBackfillProgress {
+            total,
+            processed,
+            synapses_created,
+            errors,
+            skipped,
+            energy_initialized: energy_init,
+        })
+    }
 }
 
 /// Progress report for the embedding backfill operation.
@@ -853,6 +1215,23 @@ pub struct BackfillProgress {
     pub errors: usize,
     /// Number of notes skipped (cancelled before processing)
     pub skipped: usize,
+}
+
+/// Progress report for the synapse backfill operation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SynapseBackfillProgress {
+    /// Total number of notes that needed synapses at start
+    pub total: usize,
+    /// Number of notes successfully processed
+    pub processed: usize,
+    /// Number of SYNAPSE relationships created
+    pub synapses_created: usize,
+    /// Number of notes that failed processing
+    pub errors: usize,
+    /// Number of notes skipped (cancelled before processing)
+    pub skipped: usize,
+    /// Number of notes that had energy initialized
+    pub energy_initialized: usize,
 }
 
 #[cfg(test)]
