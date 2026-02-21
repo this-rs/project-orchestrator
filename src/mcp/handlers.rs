@@ -2312,11 +2312,12 @@ impl ToolHandler {
             None
         };
 
-        let workspace_slug = args
-            .get("workspace_slug")
-            .and_then(|v| v.as_str());
+        let workspace_slug = args.get("workspace_slug").and_then(|v| v.as_str());
 
-        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         let hits = self
             .orchestrator

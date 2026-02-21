@@ -502,9 +502,10 @@ impl NoteManager {
         };
 
         // Embed the query text
-        let query_embedding = provider.embed_text(query).await.map_err(|e| {
-            anyhow::anyhow!("Failed to embed search query: {}", e)
-        })?;
+        let query_embedding = provider
+            .embed_text(query)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to embed search query: {}", e))?;
 
         // Perform vector similarity search via Neo4j HNSW index
         let results = self
