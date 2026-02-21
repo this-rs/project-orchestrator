@@ -16,6 +16,7 @@ pub mod graph;
 pub mod mcp;
 pub mod meilisearch;
 pub mod neo4j;
+pub mod neurons;
 pub mod notes;
 pub mod orchestrator;
 pub mod parser;

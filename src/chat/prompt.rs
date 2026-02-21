@@ -688,6 +688,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "update_staleness_scores",
                 description: "Recalculer la fraîcheur",
             },
+            ToolRef {
+                name: "update_energy_scores",
+                description: "Recalculer l'énergie neuronale (decay)",
+            },
         ],
     },
     // ── Git tracking (5 tools) ───────────────────────────────────────
@@ -2523,11 +2527,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_154_tools() {
+    fn test_tool_groups_cover_all_155_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 154,
-            "TOOL_GROUPS must cover exactly 154 unique tools (got {}). \
+            count, 155,
+            "TOOL_GROUPS must cover exactly 155 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
