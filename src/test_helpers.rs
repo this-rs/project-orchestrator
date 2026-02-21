@@ -159,6 +159,7 @@ pub fn test_project() -> ProjectNode {
         description: Some("A test project".to_string()),
         created_at: chrono::Utc::now(),
         last_synced: None,
+        analytics_computed_at: None,
     }
 }
 
@@ -172,6 +173,7 @@ pub fn test_project_named(name: &str) -> ProjectNode {
         description: Some(format!("Test project: {}", name)),
         created_at: chrono::Utc::now(),
         last_synced: None,
+        analytics_computed_at: None,
     }
 }
 

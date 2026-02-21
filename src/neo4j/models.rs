@@ -18,6 +18,9 @@ pub struct ProjectNode {
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_synced: Option<DateTime<Utc>>,
+    /// When GDS analytics (PageRank, Louvain, etc.) were last computed for this project.
+    /// None if analytics have never been computed.
+    pub analytics_computed_at: Option<DateTime<Utc>>,
 }
 
 // ============================================================================

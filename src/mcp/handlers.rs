@@ -300,6 +300,7 @@ impl ToolHandler {
             description: description.map(|s| s.to_string()),
             created_at: chrono::Utc::now(),
             last_synced: None,
+            analytics_computed_at: None,
         };
 
         self.orchestrator.create_project(&project).await?;

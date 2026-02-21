@@ -1717,6 +1717,7 @@ mod tests {
             description: None,
             created_at: chrono::Utc::now(),
             last_synced: None,
+            analytics_computed_at: None,
         };
         app_state.neo4j.create_project(&project).await.unwrap();
         app_state
@@ -1861,6 +1862,7 @@ mod tests {
             root_path: "/tmp/test".to_string(),
             created_at: chrono::Utc::now(),
             last_synced: None,
+            analytics_computed_at: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -2040,6 +2042,7 @@ mod tests {
             root_path: "/tmp/analytics".to_string(),
             created_at: chrono::Utc::now(),
             last_synced: Some(chrono::Utc::now()),
+            analytics_computed_at: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -2236,6 +2239,7 @@ mod tests {
             root_path: "/tmp/ordering".to_string(),
             created_at: chrono::Utc::now(),
             last_synced: Some(chrono::Utc::now()),
+            analytics_computed_at: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -2372,6 +2376,7 @@ mod tests {
             root_path: "/tmp/impact".to_string(),
             created_at: chrono::Utc::now(),
             last_synced: Some(chrono::Utc::now()),
+            analytics_computed_at: None,
         };
         graph.create_project(&project).await.unwrap();
 

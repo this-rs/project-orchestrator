@@ -143,9 +143,30 @@ pub async fn create_project(
         description: req.description,
         created_at: chrono::Utc::now(),
         last_synced: None,
+        analytics_computed_at: None,
     };
 
     state.orchestrator.create_project(&project).await?;
+
+    // Auto-register on the file watcher if root_path exists
+    {
+        let path = std::path::Path::new(&project.root_path);
+        if path.exists() {
+            let mut watcher = state.watcher.write().await;
+            if let Err(e) = watcher
+                .register_project(path, project.id, project.slug.clone())
+                .await
+            {
+                tracing::warn!(
+                    "Auto-watch: failed to register new project '{}': {}",
+                    project.slug,
+                    e
+                );
+            } else {
+                tracing::info!("Auto-watch: registered new project '{}'", project.slug);
+            }
+        }
+    }
 
     Ok(Json(ProjectResponse {
         id: project.id.to_string(),
@@ -239,6 +260,12 @@ pub async fn delete_project(
         .get_project_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
+
+    // Unregister from file watcher before deleting
+    {
+        let watcher = state.watcher.read().await;
+        watcher.unregister_project(project.id).await;
+    }
 
     state
         .orchestrator

@@ -21,6 +21,24 @@ use walkdir::WalkDir;
 use super::context::ContextBuilder;
 
 // ============================================================================
+// Analytics Staleness
+// ============================================================================
+
+/// Report on the staleness of a project's GDS analytics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StalenessReport {
+    pub project_id: Uuid,
+    /// True if analytics need recomputation.
+    pub is_stale: bool,
+    /// How long ago analytics were last computed (None if never computed).
+    pub analytics_age: Option<std::time::Duration>,
+    /// When analytics were last computed (None if never).
+    pub analytics_computed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the project code was last synced.
+    pub last_synced: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+// ============================================================================
 // Feature Graph LLM Generation
 // ============================================================================
 
@@ -84,7 +102,11 @@ impl Orchestrator {
             state.neo4j.clone(),
             AnalyticsConfig::default(),
         ));
-        let analytics_debouncer = AnalyticsDebouncer::new(analytics.clone(), 2000);
+        let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
+            analytics.clone(),
+            2000,
+            Some(state.neo4j.clone()),
+        );
 
         Ok(Self {
             state,
@@ -139,7 +161,11 @@ impl Orchestrator {
             state.neo4j.clone(),
             AnalyticsConfig::default(),
         ));
-        let analytics_debouncer = AnalyticsDebouncer::new(analytics.clone(), 2000);
+        let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
+            analytics.clone(),
+            2000,
+            Some(state.neo4j.clone()),
+        );
 
         Ok(Self {
             state,
@@ -195,7 +221,11 @@ impl Orchestrator {
             state.neo4j.clone(),
             AnalyticsConfig::default(),
         ));
-        let analytics_debouncer = AnalyticsDebouncer::new(analytics.clone(), 2000);
+        let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
+            analytics.clone(),
+            2000,
+            Some(state.neo4j.clone()),
+        );
 
         Ok(Self {
             state,
@@ -280,6 +310,10 @@ impl Orchestrator {
                         "computation_ms": elapsed.as_millis() as u64,
                     })),
                 );
+                // Update the project's analytics_computed_at timestamp
+                if let Err(e) = self.neo4j().update_project_analytics_timestamp(project_id).await {
+                    tracing::warn!("Failed to update analytics_computed_at for project {}: {}", project_id, e);
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -289,6 +323,59 @@ impl Orchestrator {
                 );
             }
         }
+    }
+
+    /// Check whether analytics for a project are stale and need recomputation.
+    ///
+    /// A project's analytics are considered stale if:
+    /// - `analytics_computed_at` is `None` (never computed)
+    /// - `last_synced > analytics_computed_at` (code was synced since last analytics)
+    ///
+    /// Returns a `StalenessReport` with details about the staleness.
+    pub async fn check_analytics_staleness(&self, project_id: Uuid) -> Result<StalenessReport> {
+        let project = self
+            .neo4j()
+            .get_project(project_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Project {} not found", project_id))?;
+
+        let analytics_computed_at = project.analytics_computed_at;
+        let last_synced = project.last_synced;
+
+        let is_stale = match (analytics_computed_at, last_synced) {
+            // Never computed → stale
+            (None, _) => true,
+            // Computed but never synced → not stale (edge case, analytics exist but no code)
+            (Some(_), None) => false,
+            // Both exist → stale if synced after analytics
+            (Some(analytics), Some(synced)) => synced > analytics,
+        };
+
+        let analytics_age = analytics_computed_at.map(|at| {
+            let now = chrono::Utc::now();
+            (now - at).to_std().unwrap_or_default()
+        });
+
+        Ok(StalenessReport {
+            project_id,
+            is_stale,
+            analytics_age,
+            analytics_computed_at,
+            last_synced,
+        })
+    }
+
+    /// Check staleness for all projects and return a list of stale project IDs.
+    pub async fn get_stale_projects(&self) -> Result<Vec<StalenessReport>> {
+        let projects = self.neo4j().list_projects().await?;
+        let mut stale = Vec::new();
+        for project in &projects {
+            let report = self.check_analytics_staleness(project.id).await?;
+            if report.is_stale {
+                stale.push(report);
+            }
+        }
+        Ok(stale)
     }
 
     /// Spawn a background task that refreshes all auto-built feature graphs
@@ -3380,5 +3467,78 @@ mod tests {
 
         // Should not panic or error on empty project
         orch.analyze_project_safe(project.id).await;
+    }
+
+    // ── Staleness detection ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_staleness_never_computed_is_stale() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let project = test_project();
+        orch.create_project(&project).await.unwrap();
+
+        let report = orch.check_analytics_staleness(project.id).await.unwrap();
+        assert!(report.is_stale, "Project with no analytics should be stale");
+        assert!(report.analytics_computed_at.is_none());
+        assert!(report.analytics_age.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_staleness_computed_after_sync_is_fresh() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let mut project = test_project();
+        project.last_synced = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+        orch.create_project(&project).await.unwrap();
+
+        // Simulate analytics computed AFTER the sync
+        orch.neo4j()
+            .update_project_analytics_timestamp(project.id)
+            .await
+            .unwrap();
+
+        let report = orch.check_analytics_staleness(project.id).await.unwrap();
+        assert!(!report.is_stale, "Analytics computed after sync should not be stale");
+        assert!(report.analytics_computed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_staleness_synced_after_analytics_is_stale() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let mut project = test_project();
+        // Set analytics_computed_at in the past
+        project.analytics_computed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        // Set last_synced AFTER analytics
+        project.last_synced = Some(chrono::Utc::now());
+        orch.create_project(&project).await.unwrap();
+
+        let report = orch.check_analytics_staleness(project.id).await.unwrap();
+        assert!(report.is_stale, "Project synced after analytics should be stale");
+        assert!(report.analytics_age.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_staleness_nonexistent_project_errors() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let result = orch.check_analytics_staleness(Uuid::new_v4()).await;
+        assert!(result.is_err(), "Nonexistent project should error");
+    }
+
+    #[tokio::test]
+    async fn test_get_stale_projects_returns_only_stale() {
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+
+        // Project 1: never computed → stale
+        let p1 = test_project_named("stale-project");
+        orch.create_project(&p1).await.unwrap();
+
+        // Project 2: computed after sync → fresh
+        let mut p2 = test_project_named("fresh-project");
+        p2.last_synced = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+        p2.analytics_computed_at = Some(chrono::Utc::now());
+        orch.create_project(&p2).await.unwrap();
+
+        let stale = orch.get_stale_projects().await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].project_id, p1.id);
     }
 }

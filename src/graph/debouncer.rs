@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::engine::AnalyticsEngine;
+use crate::neo4j::traits::GraphStore;
 use std::sync::Arc;
 
 /// Debounced analytics trigger for incremental sync scenarios.
@@ -38,9 +39,20 @@ impl AnalyticsDebouncer {
     /// Create a new debouncer that waits `debounce_ms` of silence before computing.
     ///
     /// Spawns a background tokio task that lives until the debouncer is dropped.
+    /// Optionally accepts a `GraphStore` to update `analytics_computed_at` after success.
     pub fn new(analytics: Arc<dyn AnalyticsEngine>, debounce_ms: u64) -> Self {
+        Self::with_graph_store(analytics, debounce_ms, None)
+    }
+
+    /// Create a debouncer that also updates `analytics_computed_at` on the project
+    /// after a successful analytics computation.
+    pub fn with_graph_store(
+        analytics: Arc<dyn AnalyticsEngine>,
+        debounce_ms: u64,
+        graph_store: Option<Arc<dyn GraphStore>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Uuid>(64);
-        tokio::spawn(Self::run_loop(analytics, rx, debounce_ms));
+        tokio::spawn(Self::run_loop(analytics, rx, debounce_ms, graph_store));
         Self { trigger_tx: tx }
     }
 
@@ -57,6 +69,7 @@ impl AnalyticsDebouncer {
         analytics: Arc<dyn AnalyticsEngine>,
         mut rx: mpsc::Receiver<Uuid>,
         debounce_ms: u64,
+        graph_store: Option<Arc<dyn GraphStore>>,
     ) {
         let debounce = Duration::from_millis(debounce_ms);
 
@@ -90,6 +103,12 @@ impl AnalyticsDebouncer {
                         result.file_analytics.node_count,
                         result.function_analytics.node_count,
                     );
+                    // Update analytics_computed_at timestamp on the project
+                    if let Some(ref store) = graph_store {
+                        if let Err(e) = store.update_project_analytics_timestamp(last_pid).await {
+                            tracing::warn!("Failed to update analytics_computed_at for project {}: {}", last_pid, e);
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Debounced analytics failed for project {}: {}", last_pid, e);

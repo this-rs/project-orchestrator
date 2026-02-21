@@ -1177,6 +1177,7 @@ mod tests {
             description: None,
             created_at: chrono::Utc::now(),
             last_synced: None,
+            analytics_computed_at: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();

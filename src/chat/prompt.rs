@@ -2106,6 +2106,7 @@ mod tests {
                 description: Some("A test project".into()),
                 created_at: Utc::now(),
                 last_synced: None,
+                analytics_computed_at: None,
             }),
             ..Default::default()
         };
@@ -2133,6 +2134,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: None,
+                analytics_computed_at: None,
             }),
             ..Default::default()
         };
@@ -2153,6 +2155,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: Some(Utc::now()),
+                analytics_computed_at: None,
             }),
             language_stats: vec![LanguageStatsNode {
                 language: "Rust".into(),
@@ -2322,6 +2325,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: None,
+                analytics_computed_at: None,
             }),
             sibling_projects: vec![
                 ProjectNode {
@@ -2332,6 +2336,7 @@ mod tests {
                     description: Some("First sibling".into()),
                     created_at: Utc::now(),
                     last_synced: None,
+                    analytics_computed_at: None,
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -2341,6 +2346,7 @@ mod tests {
                     description: None,
                     created_at: Utc::now(),
                     last_synced: None,
+                    analytics_computed_at: None,
                 },
             ],
             ..Default::default()
@@ -2368,6 +2374,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: Some(Utc::now()),
+                analytics_computed_at: None,
             }),
             workspace: Some(WorkspaceNode {
                 id: uuid::Uuid::new_v4(),
@@ -2387,6 +2394,7 @@ mod tests {
                     description: Some("The API server".into()),
                     created_at: Utc::now(),
                     last_synced: None,
+                    analytics_computed_at: None,
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -2396,6 +2404,7 @@ mod tests {
                     description: None,
                     created_at: Utc::now(),
                     last_synced: None,
+                    analytics_computed_at: None,
                 },
             ],
             ..Default::default()
@@ -2471,6 +2480,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: Some(Utc::now()),
+                analytics_computed_at: None,
             }),
             global_guidelines: vec![{
                 let mut n = crate::notes::Note::new(
@@ -2691,6 +2701,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: Some(Utc::now()),
+                analytics_computed_at: None,
             }),
             ..Default::default()
         };
@@ -2746,6 +2757,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: Some(Utc::now()),
+                analytics_computed_at: None,
             }),
             feature_graphs: make_feature_graphs(3),
             ..Default::default()
@@ -2772,6 +2784,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: Some(Utc::now()),
+                analytics_computed_at: None,
             }),
             ..Default::default()
         };
@@ -2806,6 +2819,7 @@ mod tests {
                 description: None,
                 created_at: Utc::now(),
                 last_synced: Some(Utc::now()),
+                analytics_computed_at: None,
             }),
             feature_graphs: fgs,
             ..Default::default()
