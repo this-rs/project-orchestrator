@@ -136,9 +136,7 @@ fn init_http_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
             Some(Arc::new(provider))
         }
         None => {
-            tracing::info!(
-                "HTTP embedding provider not configured (set EMBEDDING_URL to enable)"
-            );
+            tracing::info!("HTTP embedding provider not configured (set EMBEDDING_URL to enable)");
             None
         }
     }

@@ -107,15 +107,14 @@ impl FastEmbedProvider {
         let dimensions = model_dimensions(&model_variant);
         let model_name = format!("{:?}", model_variant);
 
-        let mut options = TextInitOptions::new(model_variant)
-            .with_show_download_progress(true);
+        let mut options = TextInitOptions::new(model_variant).with_show_download_progress(true);
 
         if let Some(dir) = cache_dir {
             options = options.with_cache_dir(dir);
         }
 
-        let embedding = TextEmbedding::try_new(options)
-            .context("Failed to initialize fastembed ONNX model")?;
+        let embedding =
+            TextEmbedding::try_new(options).context("Failed to initialize fastembed ONNX model")?;
 
         tracing::info!(
             model = %model_name,
@@ -209,10 +208,7 @@ mod tests {
             parse_model_name("multilingual-e5-base"),
             EmbeddingModel::MultilingualE5Base
         );
-        assert_eq!(
-            parse_model_name("bge-m3"),
-            EmbeddingModel::BGEM3
-        );
+        assert_eq!(parse_model_name("bge-m3"), EmbeddingModel::BGEM3);
         assert_eq!(
             parse_model_name("nomic-embed-text-v1.5"),
             EmbeddingModel::NomicEmbedTextV15
@@ -245,11 +241,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ONNX model download (~400MB)"]
     async fn test_embed_text_dimensions() {
-        let provider = FastEmbedProvider::new(
-            EmbeddingModel::MultilingualE5Base,
-            None,
-        )
-        .expect("Failed to init FastEmbed");
+        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
+            .expect("Failed to init FastEmbed");
 
         let embedding = provider.embed_text("hello world").await.unwrap();
         assert_eq!(embedding.len(), 768, "MultilingualE5Base must produce 768d");
@@ -258,11 +251,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ONNX model download (~400MB)"]
     async fn test_embed_batch_consistency() {
-        let provider = FastEmbedProvider::new(
-            EmbeddingModel::MultilingualE5Base,
-            None,
-        )
-        .expect("Failed to init FastEmbed");
+        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
+            .expect("Failed to init FastEmbed");
 
         let texts = vec![
             "hello world".to_string(),
@@ -279,11 +269,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ONNX model download (~400MB)"]
     async fn test_embed_empty_batch() {
-        let provider = FastEmbedProvider::new(
-            EmbeddingModel::MultilingualE5Base,
-            None,
-        )
-        .expect("Failed to init FastEmbed");
+        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
+            .expect("Failed to init FastEmbed");
 
         let result = provider.embed_batch(&[]).await.unwrap();
         assert!(result.is_empty());
@@ -292,11 +279,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ONNX model download (~400MB)"]
     async fn test_model_name_accessor() {
-        let provider = FastEmbedProvider::new(
-            EmbeddingModel::MultilingualE5Base,
-            None,
-        )
-        .expect("Failed to init FastEmbed");
+        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
+            .expect("Failed to init FastEmbed");
 
         assert_eq!(provider.model_name(), "MultilingualE5Base");
         assert_eq!(provider.dimensions(), 768);
