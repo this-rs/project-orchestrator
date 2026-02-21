@@ -2584,15 +2584,12 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("query is required"))?;
 
-        let engine = self
-            .orchestrator
-            .activation_engine()
-            .ok_or_else(|| {
-                anyhow!(
-                    "Spreading activation unavailable: no embedding provider configured. \
+        let engine = self.orchestrator.activation_engine().ok_or_else(|| {
+            anyhow!(
+                "Spreading activation unavailable: no embedding provider configured. \
                      Set EMBEDDING_PROVIDER=local or EMBEDDING_PROVIDER=http to enable."
-                )
-            })?;
+            )
+        })?;
 
         // Resolve project_slug → project_id if provided
         let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {

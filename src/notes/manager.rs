@@ -138,12 +138,7 @@ impl NoteManager {
     /// 2. Vector search for K nearest neighbors (filtered by project_id)
     /// 3. Filter by min_weight threshold
     /// 4. Create bidirectional synapses via GraphStore
-    fn spawn_auto_connect_synapses(
-        &self,
-        note_id: Uuid,
-        content: &str,
-        project_id: Option<Uuid>,
-    ) {
+    fn spawn_auto_connect_synapses(&self, note_id: Uuid, content: &str, project_id: Option<Uuid>) {
         // Skip if no embedding provider or synapses disabled
         let provider = match &self.embedding_provider {
             Some(p) if self.synapse_config.enabled => p.clone(),
@@ -1015,8 +1010,16 @@ impl NoteManager {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<SynapseBackfillProgress> {
         let batch_size = if batch_size == 0 { 50 } else { batch_size };
-        let min_similarity = if min_similarity <= 0.0 { 0.75 } else { min_similarity };
-        let max_neighbors = if max_neighbors == 0 { 10 } else { max_neighbors };
+        let min_similarity = if min_similarity <= 0.0 {
+            0.75
+        } else {
+            min_similarity
+        };
+        let max_neighbors = if max_neighbors == 0 {
+            10
+        } else {
+            max_neighbors
+        };
 
         // Phase 1: init energy on all notes that don't have it yet
         let energy_init = self.neo4j.init_note_energy().await?;
@@ -1053,7 +1056,10 @@ impl NoteManager {
             }
 
             // Fetch next batch (always offset 0, processed notes disappear from results)
-            let (batch, remaining) = self.neo4j.list_notes_needing_synapses(batch_size, 0).await?;
+            let (batch, remaining) = self
+                .neo4j
+                .list_notes_needing_synapses(batch_size, 0)
+                .await?;
             if batch.is_empty() || remaining == 0 {
                 break;
             }

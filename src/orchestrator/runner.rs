@@ -1,12 +1,12 @@
 //! Main orchestrator runner
 
 use crate::embeddings::{EmbeddingProvider, FastEmbedProvider, HttpEmbeddingProvider};
-use crate::neurons::{AutoReinforcementConfig, SpreadingActivationEngine};
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
 use crate::graph::{AnalyticsConfig, AnalyticsDebouncer, AnalyticsEngine, GraphAnalyticsEngine};
 use crate::neo4j::models::*;
+use crate::neurons::{AutoReinforcementConfig, SpreadingActivationEngine};
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
 use crate::plan::models::*;

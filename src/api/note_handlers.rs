@@ -687,14 +687,11 @@ pub async fn search_neurons(
     State(state): State<OrchestratorState>,
     Query(query): Query<NeuronSearchQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let engine = state
-        .orchestrator
-        .activation_engine()
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "Spreading activation unavailable: no embedding provider configured".to_string(),
-            )
-        })?;
+    let engine = state.orchestrator.activation_engine().ok_or_else(|| {
+        AppError::BadRequest(
+            "Spreading activation unavailable: no embedding provider configured".to_string(),
+        )
+    })?;
 
     // Resolve project_slug → project_id
     let project_id = if let Some(ref slug) = query.project_slug {
@@ -861,7 +858,12 @@ pub async fn start_backfill_synapses(
 
     tokio::spawn(async move {
         let result = note_manager
-            .backfill_synapses(batch_size, min_similarity, max_neighbors, Some(&cancel_flag))
+            .backfill_synapses(
+                batch_size,
+                min_similarity,
+                max_neighbors,
+                Some(&cancel_flag),
+            )
             .await;
 
         let finished_at = chrono::Utc::now().to_rfc3339();

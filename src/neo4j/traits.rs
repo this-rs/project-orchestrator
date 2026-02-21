@@ -1078,11 +1078,7 @@ pub trait GraphStore: Send + Sync {
     ///
     /// Creates edges in both directions: (source)-[:SYNAPSE]->(neighbor)
     /// AND (neighbor)-[:SYNAPSE]->(source) with the same weight.
-    async fn create_synapses(
-        &self,
-        note_id: Uuid,
-        neighbors: &[(Uuid, f64)],
-    ) -> Result<usize>;
+    async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize>;
 
     /// Get all SYNAPSE relationships for a note.
     ///

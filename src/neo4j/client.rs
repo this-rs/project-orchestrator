@@ -6943,9 +6943,7 @@ impl Neo4jClient {
         .param("energy", note.energy)
         .param(
             "last_activated",
-            note.last_activated
-                .unwrap_or(note.created_at)
-                .to_rfc3339(),
+            note.last_activated.unwrap_or(note.created_at).to_rfc3339(),
         )
         .param("changes_json", serde_json::to_string(&note.changes)?)
         .param(
@@ -7856,11 +7854,7 @@ impl Neo4jClient {
     ///
     /// Uses MERGE for idempotence. Creates edges in both directions with the same weight.
     /// Returns the number of synapses created (counting each direction separately).
-    pub async fn create_synapses(
-        &self,
-        note_id: Uuid,
-        neighbors: &[(Uuid, f64)],
-    ) -> Result<usize> {
+    pub async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize> {
         if neighbors.is_empty() {
             return Ok(0);
         }
@@ -7868,9 +7862,7 @@ impl Neo4jClient {
         // Build UNWIND list directly in Cypher (internal computed data, no injection risk)
         let entries: Vec<String> = neighbors
             .iter()
-            .map(|(nid, weight)| {
-                format!("{{id: '{}', weight: {}}}", nid, weight)
-            })
+            .map(|(nid, weight)| format!("{{id: '{}', weight: {}}}", nid, weight))
             .collect();
 
         let cypher = format!(
@@ -7889,8 +7881,7 @@ impl Neo4jClient {
             entries.join(", ")
         );
 
-        let q = query(&cypher)
-            .param("source_id", note_id.to_string());
+        let q = query(&cypher).param("source_id", note_id.to_string());
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {

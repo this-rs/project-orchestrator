@@ -4296,11 +4296,7 @@ impl GraphStore for MockGraphStore {
     // Synapse operations (Phase 2 — Neural Network)
     // ========================================================================
 
-    async fn create_synapses(
-        &self,
-        note_id: Uuid,
-        neighbors: &[(Uuid, f64)],
-    ) -> Result<usize> {
+    async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize> {
         if neighbors.is_empty() {
             return Ok(0);
         }
@@ -4333,10 +4329,7 @@ impl GraphStore for MockGraphStore {
 
     async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
         let synapses = self.note_synapses.read().await;
-        let mut result = synapses
-            .get(&note_id)
-            .cloned()
-            .unwrap_or_default();
+        let mut result = synapses.get(&note_id).cloned().unwrap_or_default();
         // Sort by weight descending
         result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(result)
@@ -4346,10 +4339,7 @@ impl GraphStore for MockGraphStore {
         let mut synapses = self.note_synapses.write().await;
 
         // Count outgoing synapses
-        let outgoing_count = synapses
-            .get(&note_id)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let outgoing_count = synapses.get(&note_id).map(|v| v.len()).unwrap_or(0);
 
         // Remove from all neighbors' lists
         if let Some(neighbors) = synapses.remove(&note_id) {
@@ -4490,9 +4480,7 @@ impl GraphStore for MockGraphStore {
 
         let needing: Vec<crate::notes::Note> = notes
             .values()
-            .filter(|n| {
-                embeddings.contains_key(&n.id) && !synapses.contains_key(&n.id)
-            })
+            .filter(|n| embeddings.contains_key(&n.id) && !synapses.contains_key(&n.id))
             .cloned()
             .collect();
 
