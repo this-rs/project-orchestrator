@@ -1300,6 +1300,16 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn create_imports_symbol_relationship(
+        &self,
+        _import_id: &str,
+        _symbol_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<()> {
+        // Mock: no-op, IMPORTS_SYMBOL relationships are not tracked in mock store
+        Ok(())
+    }
+
     async fn create_call_relationship(
         &self,
         caller_id: &str,
@@ -1397,6 +1407,19 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(deleted)
+    }
+
+    async fn cleanup_sync_data(&self) -> Result<i64> {
+        let mut total = 0i64;
+        total += self.functions.write().await.drain().count() as i64;
+        total += self.structs_map.write().await.drain().count() as i64;
+        total += self.traits_map.write().await.drain().count() as i64;
+        total += self.enums_map.write().await.drain().count() as i64;
+        total += self.impls_map.write().await.drain().count() as i64;
+        total += self.imports.write().await.drain().count() as i64;
+        self.call_relationships.write().await.clear();
+        self.import_relationships.write().await.clear();
+        Ok(total)
     }
 
     async fn get_callees(&self, function_id: &str, _depth: u32) -> Result<Vec<FunctionNode>> {

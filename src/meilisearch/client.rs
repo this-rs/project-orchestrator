@@ -44,7 +44,8 @@ impl MeiliClient {
                 .context(format!("Failed to create index {}", index_name))?;
 
             // Wait for index creation
-            task.wait_for_completion(&self.client, None, None).await?;
+            task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+                .await?;
         }
 
         // Configure code index
@@ -75,7 +76,8 @@ impl MeiliClient {
             .with_sortable_attributes(["path"]);
 
         let task = index.set_settings(&settings).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
 
         Ok(())
     }
@@ -96,7 +98,8 @@ impl MeiliClient {
             .with_sortable_attributes(["timestamp"]);
 
         let task = index.set_settings(&settings).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
 
         Ok(())
     }
@@ -126,7 +129,8 @@ impl MeiliClient {
             .with_sortable_attributes(["created_at", "staleness_score", "importance"]);
 
         let task = index.set_settings(&settings).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
 
         Ok(())
     }
@@ -144,7 +148,8 @@ impl MeiliClient {
     pub async fn index_code(&self, doc: &CodeDocument) -> Result<()> {
         let index = self.client.index(index_names::CODE);
         let task = index.add_documents(&[doc], Some("id")).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -155,7 +160,8 @@ impl MeiliClient {
         }
         let index = self.client.index(index_names::CODE);
         let task = index.add_documents(docs, Some("id")).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -238,7 +244,8 @@ impl MeiliClient {
         let index = self.client.index(index_names::CODE);
         let id = Self::path_to_id(path);
         let task = index.delete_document(&id).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -252,7 +259,8 @@ impl MeiliClient {
         query.with_filter(&filter);
 
         let task = index.delete_documents_with(&query).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -266,7 +274,8 @@ impl MeiliClient {
         query.with_filter("project_id IS EMPTY OR project_slug IS EMPTY");
 
         let task = index.delete_documents_with(&query).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -288,7 +297,8 @@ impl MeiliClient {
     pub async fn index_decision(&self, doc: &DecisionDocument) -> Result<()> {
         let index = self.client.index(index_names::DECISIONS);
         let task = index.add_documents(&[doc], Some("id")).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -327,7 +337,8 @@ impl MeiliClient {
     pub async fn delete_decision(&self, id: &str) -> Result<()> {
         let index = self.client.index(index_names::DECISIONS);
         let task = index.delete_document(id).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -341,7 +352,8 @@ impl MeiliClient {
         query.with_filter(&filter);
 
         let task = index.delete_documents_with(&query).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -355,7 +367,8 @@ impl MeiliClient {
         query.with_filter(&filter);
 
         let task = index.delete_documents_with(&query).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -367,7 +380,8 @@ impl MeiliClient {
     pub async fn index_note(&self, doc: &NoteDocument) -> Result<()> {
         let index = self.client.index(index_names::NOTES);
         let task = index.add_documents(&[doc], Some("id")).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -378,7 +392,8 @@ impl MeiliClient {
         }
         let index = self.client.index(index_names::NOTES);
         let task = index.add_documents(docs, Some("id")).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -465,7 +480,8 @@ impl MeiliClient {
     pub async fn delete_note(&self, id: &str) -> Result<()> {
         let index = self.client.index(index_names::NOTES);
         let task = index.delete_document(id).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -479,7 +495,8 @@ impl MeiliClient {
         query.with_filter(&filter);
 
         let task = index.delete_documents_with(&query).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 
@@ -496,7 +513,8 @@ impl MeiliClient {
         if let Some(mut doc) = doc {
             doc.status = status.to_string();
             let task = index.add_documents(&[doc], Some("id")).await?;
-            task.wait_for_completion(&self.client, None, None).await?;
+            task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+                .await?;
         }
 
         Ok(())
@@ -543,7 +561,8 @@ impl MeiliClient {
     ) -> Result<()> {
         let index = self.client.index(index_name);
         let task = index.add_documents(&[doc], Some("id")).await?;
-        task.wait_for_completion(&self.client, None, None).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(30)))
+            .await?;
         Ok(())
     }
 

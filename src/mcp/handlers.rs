@@ -158,6 +158,7 @@ impl ToolHandler {
             "get_meilisearch_stats" => self.get_meilisearch_stats(args).await,
             "delete_meilisearch_orphans" => self.delete_meilisearch_orphans(args).await,
             "cleanup_cross_project_calls" => self.cleanup_cross_project_calls(args).await,
+            "cleanup_sync_data" => self.cleanup_sync_data(args).await,
 
             // Notes
             "list_notes" => self.list_notes(args).await,
@@ -380,6 +381,8 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("slug is required"))?;
 
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
         let project = self
             .neo4j()
             .get_project_by_slug(slug)
@@ -390,13 +393,18 @@ impl ToolHandler {
         let path = std::path::Path::new(&expanded);
         let result = self
             .orchestrator
-            .sync_directory_for_project(path, Some(project.id), Some(&project.slug))
+            .sync_directory_for_project_with_options(
+                path,
+                Some(project.id),
+                Some(&project.slug),
+                force,
+            )
             .await?;
 
         self.neo4j().update_project_synced(project.id).await?;
 
-        // Compute graph analytics (PageRank, communities, etc.) — best-effort, synchronous
-        self.orchestrator.analyze_project_safe(project.id).await;
+        // Compute graph analytics (PageRank, communities, etc.) — best-effort, background
+        self.orchestrator.spawn_analyze_project(project.id);
 
         // Refresh auto-built feature graphs in background (best-effort)
         self.orchestrator.spawn_refresh_feature_graphs(project.id);
@@ -2081,8 +2089,8 @@ impl ToolHandler {
         // Update last_synced, compute analytics, and refresh feature graphs when project context is available
         if let Some(pid) = project_id {
             self.neo4j().update_project_synced(pid).await?;
-            // Compute graph analytics (PageRank, communities, etc.) — best-effort, synchronous
-            self.orchestrator.analyze_project_safe(pid).await;
+            // Compute graph analytics (PageRank, communities, etc.) — best-effort, background
+            self.orchestrator.spawn_analyze_project(pid);
             // Refresh auto-built feature graphs in background (best-effort)
             self.orchestrator.spawn_refresh_feature_graphs(pid);
         }
@@ -2127,6 +2135,17 @@ impl ToolHandler {
     async fn cleanup_cross_project_calls(&self, _args: Value) -> Result<Value> {
         let deleted = self.neo4j().cleanup_cross_project_calls().await?;
         Ok(json!({"deleted_count": deleted}))
+    }
+
+    async fn cleanup_sync_data(&self, _args: Value) -> Result<Value> {
+        let deleted = self.neo4j().cleanup_sync_data().await?;
+        // Also clean up the Meilisearch code index
+        if let Err(e) = self.meili().delete_orphan_code_documents().await {
+            tracing::warn!("Failed to clean Meilisearch code index: {}", e);
+        }
+        Ok(
+            json!({"deleted_count": deleted as i64, "message": "Sync data cleaned. Run sync_project to rebuild."}),
+        )
     }
 
     // ========================================================================

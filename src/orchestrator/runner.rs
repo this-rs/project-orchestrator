@@ -22,6 +22,60 @@ use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
 
+/// Normalize a file path to an absolute canonical form.
+/// - Resolves `~` to home directory
+/// - Resolves `.` and `..`
+/// - Makes relative paths absolute using current_dir
+/// - Returns the path as a String
+fn normalize_path(path: &str) -> String {
+    let expanded = if let Some(rest) = path.strip_prefix('~') {
+        if let Some(home) = dirs::home_dir() {
+            home.join(rest.trim_start_matches('/'))
+                .to_string_lossy()
+                .to_string()
+        } else {
+            path.to_string()
+        }
+    } else {
+        path.to_string()
+    };
+
+    let p = std::path::Path::new(&expanded);
+    if p.is_absolute() {
+        // Try to canonicalize (resolves symlinks and ..)
+        match p.canonicalize() {
+            Ok(canonical) => canonical.to_string_lossy().to_string(),
+            Err(_) => {
+                // File might not exist yet — do manual cleanup of . and ..
+                let mut components = Vec::new();
+                for component in p.components() {
+                    match component {
+                        std::path::Component::ParentDir => {
+                            components.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        other => components.push(other),
+                    }
+                }
+                let cleaned: std::path::PathBuf = components.iter().collect();
+                cleaned.to_string_lossy().to_string()
+            }
+        }
+    } else {
+        // Relative path — prepend current_dir
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                let abs = cwd.join(p);
+                match abs.canonicalize() {
+                    Ok(canonical) => canonical.to_string_lossy().to_string(),
+                    Err(_) => abs.to_string_lossy().to_string(),
+                }
+            }
+            Err(_) => expanded,
+        }
+    }
+}
+
 // ============================================================================
 // Analytics Staleness
 // ============================================================================
@@ -385,6 +439,66 @@ impl Orchestrator {
     /// Get the graph store as Arc (for sharing with ChatManager etc.)
     pub fn neo4j_arc(&self) -> Arc<dyn crate::neo4j::GraphStore> {
         self.state.neo4j.clone()
+    }
+
+    /// Spawn analytics computation in background (non-blocking).
+    ///
+    /// Same as `analyze_project_safe` but runs in a `tokio::spawn` so the caller
+    /// returns immediately. Used by sync_project to avoid blocking the MCP/REST
+    /// response while analytics are computed.
+    pub fn spawn_analyze_project(&self, project_id: Uuid) {
+        let analytics = self.analytics.clone();
+        let neo4j = self.neo4j_arc();
+        let emitter: Option<Arc<dyn EventEmitter>> = self.event_emitter.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            match analytics.analyze_project(project_id).await {
+                Ok(result) => {
+                    let elapsed = start.elapsed();
+                    tracing::info!(
+                        "Analytics computed for project {} in {:?} (files: {} nodes/{} edges, functions: {} nodes/{} edges)",
+                        project_id,
+                        elapsed,
+                        result.file_analytics.node_count,
+                        result.file_analytics.edge_count,
+                        result.function_analytics.node_count,
+                        result.function_analytics.edge_count,
+                    );
+                    if let Some(emitter) = &emitter {
+                        emitter.emit(
+                            CrudEvent::new(
+                                EventEntityType::Project,
+                                CrudAction::Updated,
+                                project_id.to_string(),
+                            )
+                            .with_payload(serde_json::json!({
+                                "type": "analytics_computed",
+                                "file_nodes": result.file_analytics.node_count,
+                                "file_edges": result.file_analytics.edge_count,
+                                "file_communities": result.file_analytics.communities.len(),
+                                "function_nodes": result.function_analytics.node_count,
+                                "function_edges": result.function_analytics.edge_count,
+                                "computation_ms": elapsed.as_millis() as u64,
+                            })),
+                        );
+                    }
+                    if let Err(e) = neo4j.update_project_analytics_timestamp(project_id).await {
+                        tracing::warn!(
+                            "Failed to update analytics_computed_at for project {}: {}",
+                            project_id,
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Background analytics computation failed for project {}: {}",
+                        project_id,
+                        e
+                    );
+                }
+            }
+        });
     }
 
     /// Compute graph analytics for a project (synchronous, best-effort).
@@ -977,6 +1091,18 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         project_id: Option<Uuid>,
         project_slug: Option<&str>,
     ) -> Result<SyncResult> {
+        self.sync_directory_for_project_with_options(dir_path, project_id, project_slug, false)
+            .await
+    }
+
+    /// Sync a directory to the knowledge base for a specific project, with options
+    pub async fn sync_directory_for_project_with_options(
+        &self,
+        dir_path: &Path,
+        project_id: Option<Uuid>,
+        project_slug: Option<&str>,
+        force: bool,
+    ) -> Result<SyncResult> {
         let project_slug = project_slug.map(|s| s.to_string());
         let mut result = SyncResult::default();
         let mut synced_paths: HashSet<String> = HashSet::new();
@@ -1027,7 +1153,12 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             synced_paths.insert(path_str.to_string());
 
             match self
-                .sync_file_for_project(path, project_id, project_slug.as_deref())
+                .sync_file_for_project_with_options(
+                    path,
+                    project_id,
+                    project_slug.as_deref(),
+                    force,
+                )
                 .await
             {
                 Ok(synced) => {
@@ -1073,27 +1204,42 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         project_id: Option<Uuid>,
         project_slug: Option<&str>,
     ) -> Result<bool> {
+        self.sync_file_for_project_with_options(path, project_id, project_slug, false)
+            .await
+    }
+
+    /// Sync a single file with force option (skip hash check when force=true)
+    pub async fn sync_file_for_project_with_options(
+        &self,
+        path: &Path,
+        project_id: Option<Uuid>,
+        project_slug: Option<&str>,
+        force: bool,
+    ) -> Result<bool> {
         let content = tokio::fs::read_to_string(path)
             .await
             .context("Failed to read file")?;
 
-        // Check if file has changed
-        let path_str = path.to_string_lossy().to_string();
-        if let Some(existing) = self.state.neo4j.get_file(&path_str).await? {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(content.as_bytes());
-            let hash = hex::encode(hasher.finalize());
+        // Normalize path to absolute form for consistent Neo4j storage
+        let path_str = normalize_path(&path.to_string_lossy());
+        if !force {
+            if let Some(existing) = self.state.neo4j.get_file(&path_str).await? {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(content.as_bytes());
+                let hash = hex::encode(hasher.finalize());
 
-            if existing.hash == hash {
-                return Ok(false); // File unchanged
+                if existing.hash == hash {
+                    return Ok(false); // File unchanged
+                }
             }
         }
 
-        // Parse the file
+        // Parse the file using normalized path
+        let norm_path = std::path::Path::new(&path_str);
         let parsed = {
             let mut parser = self.parser.write().await;
-            parser.parse_file(path, &content)?
+            parser.parse_file(norm_path, &content)?
         };
 
         // Store in Neo4j with project association
@@ -1184,8 +1330,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         self.verify_notes_for_file_symbols(file_path, &file_info)
             .await?;
 
-        // Verify assertion notes
-        self.verify_assertions_for_file(file_path, &file_info)
+        // Verify assertion notes (pass already-fetched notes to avoid duplicate query)
+        self.verify_assertions_for_file(file_path, &file_info, &notes)
             .await?;
 
         Ok(())
@@ -1196,19 +1342,15 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         &self,
         file_path: &str,
         file_info: &crate::notes::FileInfo,
+        file_notes: &[crate::notes::Note],
     ) -> Result<()> {
         use crate::notes::{NoteStatus, NoteType, ViolationAction};
 
-        // Get all assertion notes that might apply to this file
-        let notes = self
-            .state
-            .neo4j
-            .get_notes_for_entity(&EntityType::File, file_path)
-            .await?;
-
-        let assertion_notes: Vec<_> = notes
-            .into_iter()
+        // Filter assertion notes from the already-fetched file notes
+        let assertion_notes: Vec<_> = file_notes
+            .iter()
             .filter(|n| n.note_type == NoteType::Assertion)
+            .cloned()
             .collect();
 
         if assertion_notes.is_empty() {
@@ -1289,7 +1431,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ) -> Result<()> {
         // Verify notes attached to functions
         for func in &file_info.functions {
-            let func_id = format!("{}::{}", file_path, func.name);
+            let func_id = format!("{}:{}:{}", file_path, func.name, func.line_start);
             let notes = self
                 .state
                 .neo4j
@@ -1339,7 +1481,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Verify notes attached to structs
         for s in &file_info.structs {
-            let struct_id = format!("{}::{}", file_path, s.name);
+            let struct_id = format!("{}:{}", file_path, s.name);
             let notes = self
                 .state
                 .neo4j
@@ -1396,9 +1538,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         parsed: &ParsedFile,
         project_id: Option<Uuid>,
     ) -> Result<()> {
-        // Store file node
+        // Store file node (path already normalized in sync_file_for_project)
         let file_node = FileNode {
-            path: parsed.path.clone(),
+            path: normalize_path(&parsed.path),
             language: parsed.language.clone(),
             hash: parsed.hash.clone(),
             last_parsed: chrono::Utc::now(),
@@ -1431,18 +1573,30 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             self.state.neo4j.upsert_impl(impl_block).await?;
         }
 
-        // Store imports and create File→IMPORTS→File relationships
+        // Store imports and create File→IMPORTS→File + IMPORTS_SYMBOL relationships
         for import in &parsed.imports {
             self.state.neo4j.upsert_import(import).await?;
 
-            // Try to resolve import to a file path and create relationship
-            if let Some(target_file) = self.resolve_rust_import(&import.path, &parsed.path) {
-                // Only create relationship if target file exists in our graph
+            // Resolve imports to file paths (language-aware)
+            let resolved_files =
+                self.resolve_imports_for_language(import, &parsed.path, &parsed.language);
+            for target_file in &resolved_files {
                 self.state
                     .neo4j
-                    .create_import_relationship(&parsed.path, &target_file, &import.path)
+                    .create_import_relationship(&parsed.path, target_file, &import.path)
                     .await
                     .ok(); // Ignore errors (target file might not exist yet)
+            }
+
+            // Create IMPORTS_SYMBOL relationships for imported symbols
+            let import_id = format!("{}:{}:{}", import.file_path, import.line, import.path);
+            let symbols = Self::extract_imported_symbols(import);
+            for symbol_name in &symbols {
+                self.state
+                    .neo4j
+                    .create_imports_symbol_relationship(&import_id, symbol_name, project_id)
+                    .await
+                    .ok(); // Ignore errors (symbol might not exist yet)
             }
         }
 
@@ -1457,16 +1611,167 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         Ok(())
     }
 
-    /// Resolve a Rust import path to an actual file path
+    /// Extract imported symbol names from an ImportNode.
+    ///
+    /// Sources:
+    /// - `items` field (populated by TS/Python parsers)
+    /// - Rust import path terminal segment (e.g., `crate::types::Message` → `Message`)
+    /// - Rust grouped imports (e.g., `{Result, SdkError}` → `["Result", "SdkError"]`)
+    fn extract_imported_symbols(import: &ImportNode) -> Vec<String> {
+        let mut symbols = Vec::new();
+
+        // Use items field if populated (TS/Python parsers)
+        if !import.items.is_empty() {
+            for item in &import.items {
+                let name = item.trim();
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false)
+                {
+                    symbols.push(name.to_string());
+                }
+            }
+        }
+
+        // For Rust, extract from the path
+        let path = &import.path;
+        if let Some(brace_start) = path.rfind('{') {
+            // Grouped: extract names from {A, B, C}
+            if let Some(brace_end) = path.rfind('}') {
+                let inner = &path[brace_start + 1..brace_end];
+                for item in inner.split(',') {
+                    let name = item.trim();
+                    // Only include type-like names (start with uppercase)
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_uppercase())
+                            .unwrap_or(false)
+                    {
+                        // Handle nested like `errors::{Result}` — take the last segment
+                        let final_name = name.rsplit("::").next().unwrap_or(name).trim();
+                        if !final_name.is_empty() && !symbols.contains(&final_name.to_string()) {
+                            symbols.push(final_name.to_string());
+                        }
+                    }
+                }
+            }
+        } else {
+            // Flat: take the last segment if it looks like a type
+            let last = path.rsplit("::").next().unwrap_or(path);
+            if !last.is_empty()
+                && last
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                && !symbols.contains(&last.to_string())
+            {
+                symbols.push(last.to_string());
+            }
+        }
+
+        symbols
+    }
+
+    /// Flatten grouped Rust imports into individual module paths.
     ///
     /// Examples:
-    /// - `crate::neo4j::client` → `src/neo4j/client.rs` or `src/neo4j/client/mod.rs`
-    /// - `super::models` → parent_dir/models.rs
-    /// - `self::utils` → current_dir/utils.rs
-    /// - External crates (std::, serde::) → None
-    fn resolve_rust_import(&self, import_path: &str, source_file: &str) -> Option<String> {
-        // Skip external crates (no :: prefix or starts with known external)
-        let path = import_path.split("::").collect::<Vec<_>>();
+    /// - `crate::{errors::{Result}, transport::Transport}` → `["crate::errors", "crate::transport"]`
+    /// - `crate::neo4j::client` → `["crate::neo4j::client"]` (unchanged)
+    fn flatten_grouped_import(import_path: &str) -> Vec<String> {
+        let trimmed = import_path.trim();
+
+        // If no braces, return as-is
+        if !trimmed.contains('{') {
+            return vec![trimmed.to_string()];
+        }
+
+        // Find the prefix before the first `{`
+        let brace_pos = match trimmed.find('{') {
+            Some(p) => p,
+            None => return vec![trimmed.to_string()],
+        };
+
+        let prefix = trimmed[..brace_pos].trim_end_matches("::");
+
+        // Extract content inside the outermost braces
+        let inner = &trimmed[brace_pos + 1..];
+        let inner = inner.trim();
+        // Remove trailing }
+        let inner = if let Some(stripped) = inner.strip_suffix('}') {
+            stripped
+        } else {
+            inner
+        };
+
+        let mut results = Vec::new();
+        let mut depth = 0;
+        let mut current = String::new();
+
+        for ch in inner.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                '}' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    let item = current.trim().to_string();
+                    if !item.is_empty() {
+                        let full = format!("{}::{}", prefix, item);
+                        results.extend(Self::flatten_grouped_import(&full));
+                    }
+                    current.clear();
+                }
+                _ => {
+                    current.push(ch);
+                }
+            }
+        }
+
+        // Handle last item
+        let item = current.trim().to_string();
+        if !item.is_empty() {
+            let full = format!("{}::{}", prefix, item);
+            results.extend(Self::flatten_grouped_import(&full));
+        }
+
+        results
+    }
+
+    /// Resolve a Rust import path to actual file paths.
+    /// Returns multiple paths for grouped imports like `crate::{errors, transport}`.
+    ///
+    /// Examples:
+    /// - `crate::neo4j::client` → `["src/neo4j/client.rs"]`
+    /// - `crate::{errors::{Result}, transport::Transport}` → `["src/errors.rs", "src/transport.rs"]`
+    /// - External crates (std::, serde::) → `[]`
+    fn resolve_rust_imports(&self, import_path: &str, source_file: &str) -> Vec<String> {
+        let paths = Self::flatten_grouped_import(import_path);
+        let mut resolved = Vec::new();
+
+        for path in paths {
+            if let Some(file) = self.resolve_single_rust_import(&path, source_file) {
+                if !resolved.contains(&file) {
+                    resolved.push(file);
+                }
+            }
+        }
+
+        resolved
+    }
+
+    /// Resolve a single (non-grouped) Rust import path to a file path
+    fn resolve_single_rust_import(&self, import_path: &str, source_file: &str) -> Option<String> {
+        let path: Vec<&str> = import_path.split("::").collect();
         if path.is_empty() {
             return None;
         }
@@ -1482,11 +1787,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let source_path = Path::new(source_file);
         let source_dir = source_path.parent()?;
 
-        // Find the project root (where src/ is)
+        // Find the project root (where Cargo.toml is)
         let mut project_root = source_dir;
         while !project_root.join("Cargo.toml").exists() {
             project_root = project_root.parent()?;
-            // Safety limit
             if project_root.as_os_str().is_empty() {
                 return None;
             }
@@ -1497,11 +1801,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Build the target path based on import type
         let target_path = match first {
             "crate" => {
-                // crate::foo::bar → src/foo/bar.rs or src/foo/bar/mod.rs
                 if path.len() < 2 {
                     return None;
                 }
-                let module_path = &path[1..path.len().saturating_sub(1)]; // Exclude the final item (might be a type)
+                let module_path = &path[1..path.len().saturating_sub(1)];
                 if module_path.is_empty() {
                     return None;
                 }
@@ -1512,7 +1815,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 target
             }
             "super" => {
-                // super::foo → ../foo.rs relative to current file
                 let mut target = source_dir.to_path_buf();
                 for part in &path[1..path.len().saturating_sub(1)] {
                     if *part == "super" {
@@ -1524,7 +1826,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 target
             }
             "self" => {
-                // self::foo → ./foo.rs relative to current file's module
                 let mut target = source_dir.to_path_buf();
                 for part in &path[1..path.len().saturating_sub(1)] {
                     target = target.join(part);
@@ -1537,38 +1838,196 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Try .rs file first, then mod.rs
         let rs_file = target_path.with_extension("rs");
         if rs_file.exists() {
-            return Some(rs_file.to_string_lossy().to_string());
+            return Some(normalize_path(&rs_file.to_string_lossy()));
         }
 
         let mod_file = target_path.join("mod.rs");
         if mod_file.exists() {
-            return Some(mod_file.to_string_lossy().to_string());
+            return Some(normalize_path(&mod_file.to_string_lossy()));
         }
 
         // Also try without removing the last segment (in case it's a module not a type)
-        let full_path = match first {
-            "crate" => {
-                let module_path = &path[1..];
-                let mut target = src_dir;
-                for part in module_path {
-                    target = target.join(part);
-                }
-                target
+        if first == "crate" {
+            let module_path = &path[1..];
+            let mut target = src_dir;
+            for part in module_path {
+                target = target.join(part);
             }
-            _ => return None,
-        };
 
-        let rs_file = full_path.with_extension("rs");
-        if rs_file.exists() {
-            return Some(rs_file.to_string_lossy().to_string());
-        }
+            let rs_file = target.with_extension("rs");
+            if rs_file.exists() {
+                return Some(normalize_path(&rs_file.to_string_lossy()));
+            }
 
-        let mod_file = full_path.join("mod.rs");
-        if mod_file.exists() {
-            return Some(mod_file.to_string_lossy().to_string());
+            let mod_file = target.join("mod.rs");
+            if mod_file.exists() {
+                return Some(normalize_path(&mod_file.to_string_lossy()));
+            }
         }
 
         None
+    }
+
+    /// Resolve a TypeScript/JavaScript import path to a file path
+    ///
+    /// Handles: `./relative`, `../parent`, `@/alias` paths.
+    /// Tries extensions: .ts, .tsx, .js, .jsx, then /index.ts, /index.js
+    /// Skips bare specifiers (npm packages like `react`, `lodash`).
+    fn resolve_typescript_import(&self, import_path: &str, source_file: &str) -> Option<String> {
+        // Only resolve relative imports
+        if !import_path.starts_with('.') && !import_path.starts_with('@') {
+            return None; // npm package — skip
+        }
+
+        let source_path = Path::new(source_file);
+        let source_dir = source_path.parent()?;
+
+        let target = if import_path.starts_with('.') {
+            source_dir.join(import_path)
+        } else {
+            // @/ alias — try to find project root with tsconfig
+            let mut root = source_dir;
+            loop {
+                if root.join("tsconfig.json").exists() || root.join("package.json").exists() {
+                    break;
+                }
+                root = root.parent()?;
+                if root.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            root.join("src").join(&import_path[2..]) // @/foo → src/foo
+        };
+
+        // Try extensions in order
+        let extensions = [".ts", ".tsx", ".js", ".jsx"];
+        for ext in &extensions {
+            let with_ext = target.with_extension(&ext[1..]);
+            if with_ext.exists() {
+                return Some(normalize_path(&with_ext.to_string_lossy()));
+            }
+        }
+
+        // Try index files
+        let index_files = ["index.ts", "index.tsx", "index.js", "index.jsx"];
+        for idx in &index_files {
+            let index_path = target.join(idx);
+            if index_path.exists() {
+                return Some(normalize_path(&index_path.to_string_lossy()));
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a Python import path to a file path
+    ///
+    /// Handles relative imports (`from . import foo`, `from ..models import Bar`)
+    /// and absolute imports starting with project package name.
+    /// Tries `module.py` then `module/__init__.py`.
+    /// Skips stdlib and pip packages.
+    fn resolve_python_import(&self, import_path: &str, source_file: &str) -> Option<String> {
+        // Python imports from tree-sitter look like "." or ".models" or "..utils" or "package.module"
+        if !import_path.starts_with('.') {
+            // Absolute import — might be project-local or external
+            // Heuristic: check if the first segment matches a directory in project root
+            let source_path = Path::new(source_file);
+            let source_dir = source_path.parent()?;
+
+            // Find project root
+            let mut root = source_dir;
+            loop {
+                if root.join("setup.py").exists()
+                    || root.join("pyproject.toml").exists()
+                    || root.join("setup.cfg").exists()
+                {
+                    break;
+                }
+                root = root.parent()?;
+                if root.as_os_str().is_empty() {
+                    return None; // No project root found — likely external
+                }
+            }
+
+            let parts: Vec<&str> = import_path.split('.').collect();
+            if parts.is_empty() {
+                return None;
+            }
+
+            // Check if the first part is a local package
+            if !root.join(parts[0]).is_dir() {
+                return None; // External package
+            }
+
+            let mut target = root.to_path_buf();
+            for part in &parts {
+                target = target.join(part);
+            }
+
+            let py_file = target.with_extension("py");
+            if py_file.exists() {
+                return Some(normalize_path(&py_file.to_string_lossy()));
+            }
+
+            let init_file = target.join("__init__.py");
+            if init_file.exists() {
+                return Some(normalize_path(&init_file.to_string_lossy()));
+            }
+
+            return None;
+        }
+
+        // Relative import
+        let source_path = Path::new(source_file);
+        let source_dir = source_path.parent()?;
+
+        // Count leading dots
+        let dots = import_path.chars().take_while(|c| *c == '.').count();
+        let module_part = &import_path[dots..];
+
+        let mut target = source_dir.to_path_buf();
+        for _ in 1..dots {
+            target = target.parent()?.to_path_buf();
+        }
+
+        if !module_part.is_empty() {
+            for part in module_part.split('.') {
+                target = target.join(part);
+            }
+        }
+
+        let py_file = target.with_extension("py");
+        if py_file.exists() {
+            return Some(normalize_path(&py_file.to_string_lossy()));
+        }
+
+        let init_file = target.join("__init__.py");
+        if init_file.exists() {
+            return Some(normalize_path(&init_file.to_string_lossy()));
+        }
+
+        None
+    }
+
+    /// Resolve import paths to file paths based on language
+    fn resolve_imports_for_language(
+        &self,
+        import: &ImportNode,
+        parsed_path: &str,
+        language: &str,
+    ) -> Vec<String> {
+        match language {
+            "rust" => self.resolve_rust_imports(&import.path, parsed_path),
+            "typescript" | "javascript" | "tsx" | "jsx" => self
+                .resolve_typescript_import(&import.path, parsed_path)
+                .into_iter()
+                .collect(),
+            "python" => self
+                .resolve_python_import(&import.path, parsed_path)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     // ========================================================================

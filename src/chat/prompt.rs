@@ -1117,6 +1117,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "cleanup_cross_project_calls",
                 description: "Supprimer les CALLS cross-projet",
             },
+            ToolRef {
+                name: "cleanup_sync_data",
+                description: "Supprimer toutes les données de sync (File, Function, etc.)",
+            },
         ],
     },
     // ── Chat (5 tools) ───────────────────────────────────────────────
@@ -2543,11 +2547,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_159_tools() {
+    fn test_tool_groups_cover_all_160_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 159,
-            "TOOL_GROUPS must cover exactly 159 unique tools (got {}). \
+            count, 160,
+            "TOOL_GROUPS must cover exactly 160 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
