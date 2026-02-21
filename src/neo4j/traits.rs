@@ -1060,6 +1060,37 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<(Vec<Note>, usize)>;
 
     // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Create bidirectional SYNAPSE relationships between a note and its neighbors.
+    ///
+    /// Each neighbor is a tuple (neighbor_note_id, weight) where weight is the
+    /// cosine similarity score (0.0 - 1.0). Uses MERGE for idempotence — calling
+    /// this twice with the same data does not create duplicate relationships.
+    ///
+    /// Creates edges in both directions: (source)-[:SYNAPSE]->(neighbor)
+    /// AND (neighbor)-[:SYNAPSE]->(source) with the same weight.
+    async fn create_synapses(
+        &self,
+        note_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> Result<usize>;
+
+    /// Get all SYNAPSE relationships for a note.
+    ///
+    /// Returns a list of (neighbor_note_id, weight) tuples sorted by weight
+    /// descending. Includes synapses in both directions (outgoing + incoming).
+    async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>>;
+
+    /// Delete all SYNAPSE relationships for a note (both directions).
+    ///
+    /// Called when a note is deleted or when its content changes (before
+    /// re-creating synapses with the updated embedding). Returns the number
+    /// of deleted relationships.
+    async fn delete_synapses(&self, note_id: Uuid) -> Result<usize>;
+
+    // ========================================================================
     // Chat session operations
     // ========================================================================
 

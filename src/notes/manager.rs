@@ -13,12 +13,34 @@ use anyhow::Result;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Configuration for automatic synapse creation between similar notes.
+#[derive(Debug, Clone)]
+pub struct SynapseConfig {
+    /// Minimum cosine similarity score to create a synapse (default: 0.75)
+    pub min_weight: f64,
+    /// Maximum number of neighbors to connect per note (default: 10)
+    pub max_neighbors: usize,
+    /// Whether auto-synapse creation is enabled (default: true)
+    pub enabled: bool,
+}
+
+impl Default for SynapseConfig {
+    fn default() -> Self {
+        Self {
+            min_weight: 0.75,
+            max_neighbors: 10,
+            enabled: true,
+        }
+    }
+}
+
 /// Manager for Knowledge Notes operations
 pub struct NoteManager {
     neo4j: Arc<dyn GraphStore>,
     meilisearch: Arc<dyn SearchStore>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    synapse_config: SynapseConfig,
 }
 
 impl NoteManager {
@@ -29,6 +51,7 @@ impl NoteManager {
             meilisearch,
             event_emitter: None,
             embedding_provider: None,
+            synapse_config: SynapseConfig::default(),
         }
     }
 
@@ -43,6 +66,7 @@ impl NoteManager {
             meilisearch,
             event_emitter: Some(emitter),
             embedding_provider: None,
+            synapse_config: SynapseConfig::default(),
         }
     }
 
@@ -52,6 +76,12 @@ impl NoteManager {
     /// Embedding failures are logged but do not block the note operation.
     pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embedding_provider = Some(provider);
+        self
+    }
+
+    /// Set synapse configuration (builder pattern).
+    pub fn with_synapse_config(mut self, config: SynapseConfig) -> Self {
+        self.synapse_config = config;
         self
     }
 
@@ -98,6 +128,101 @@ impl NoteManager {
         }
     }
 
+    /// Automatically create synapses between a note and its semantically similar neighbors.
+    ///
+    /// This is a best-effort, fire-and-forget operation: it runs after the note is
+    /// created/embedded. Failures are logged at warn level but never block the caller.
+    ///
+    /// Process:
+    /// 1. Get the note's embedding from the provider
+    /// 2. Vector search for K nearest neighbors (filtered by project_id)
+    /// 3. Filter by min_weight threshold
+    /// 4. Create bidirectional synapses via GraphStore
+    fn spawn_auto_connect_synapses(
+        &self,
+        note_id: Uuid,
+        content: &str,
+        project_id: Option<Uuid>,
+    ) {
+        // Skip if no embedding provider or synapses disabled
+        let provider = match &self.embedding_provider {
+            Some(p) if self.synapse_config.enabled => p.clone(),
+            _ => return,
+        };
+
+        let neo4j = self.neo4j.clone();
+        let min_weight = self.synapse_config.min_weight;
+        let max_neighbors = self.synapse_config.max_neighbors;
+        let content = content.to_string();
+
+        tokio::spawn(async move {
+            // Step 1: Embed the note's content
+            let embedding = match provider.embed_text(&content).await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: failed to embed note content"
+                    );
+                    return;
+                }
+            };
+
+            // Step 2: Vector search for nearest neighbors
+            let candidates = match neo4j
+                .vector_search_notes(&embedding, max_neighbors + 1, project_id, None)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: vector search failed"
+                    );
+                    return;
+                }
+            };
+
+            // Step 3: Filter — exclude self, apply min_weight, limit to max_neighbors
+            let neighbors: Vec<(Uuid, f64)> = candidates
+                .into_iter()
+                .filter(|(note, score)| note.id != note_id && *score >= min_weight)
+                .take(max_neighbors)
+                .map(|(note, score)| (note.id, score))
+                .collect();
+
+            if neighbors.is_empty() {
+                tracing::debug!(
+                    note_id = %note_id,
+                    "Auto-synapse: no neighbors above threshold {:.2}",
+                    min_weight
+                );
+                return;
+            }
+
+            // Step 4: Create bidirectional synapses
+            match neo4j.create_synapses(note_id, &neighbors).await {
+                Ok(count) => {
+                    tracing::debug!(
+                        note_id = %note_id,
+                        neighbors = neighbors.len(),
+                        synapse_count = count,
+                        "Auto-synapse: created synapses"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Auto-synapse: failed to create synapses"
+                    );
+                }
+            }
+        });
+    }
+
     // ========================================================================
     // CRUD Operations
     // ========================================================================
@@ -138,6 +263,9 @@ impl NoteManager {
 
         // Generate embedding (best-effort, non-blocking for note creation)
         self.embed_note(note.id, &note.content).await;
+
+        // Auto-connect synapses to semantically similar notes (fire-and-forget)
+        self.spawn_auto_connect_synapses(note.id, &note.content, note.project_id);
 
         self.emit(
             CrudEvent::new(
@@ -189,6 +317,19 @@ impl NoteManager {
             // Re-embed if content changed (best-effort)
             if content_changed {
                 self.embed_note(id, &note.content).await;
+
+                // Content changed → delete old synapses and re-connect
+                // delete_synapses is best-effort (non-critical for the update)
+                if self.synapse_config.enabled {
+                    if let Err(e) = self.neo4j.delete_synapses(id).await {
+                        tracing::warn!(
+                            note_id = %id,
+                            error = %e,
+                            "Failed to delete old synapses during update"
+                        );
+                    }
+                    self.spawn_auto_connect_synapses(id, &note.content, note.project_id);
+                }
             }
 
             self.emit(
@@ -202,7 +343,7 @@ impl NoteManager {
 
     /// Delete a note
     pub async fn delete_note(&self, id: Uuid) -> Result<bool> {
-        // Delete from Neo4j
+        // Delete from Neo4j (DETACH DELETE also removes SYNAPSE relationships)
         let deleted = self.neo4j.delete_note(id).await?;
 
         // Delete from Meilisearch

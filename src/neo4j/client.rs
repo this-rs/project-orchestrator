@@ -7813,6 +7813,106 @@ impl Neo4jClient {
         Ok((notes, total))
     }
 
+    // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Create bidirectional SYNAPSE relationships between a note and its neighbors.
+    ///
+    /// Uses MERGE for idempotence. Creates edges in both directions with the same weight.
+    /// Returns the number of synapses created (counting each direction separately).
+    pub async fn create_synapses(
+        &self,
+        note_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> Result<usize> {
+        if neighbors.is_empty() {
+            return Ok(0);
+        }
+
+        // Build UNWIND list directly in Cypher (internal computed data, no injection risk)
+        let entries: Vec<String> = neighbors
+            .iter()
+            .map(|(nid, weight)| {
+                format!("{{id: '{}', weight: {}}}", nid, weight)
+            })
+            .collect();
+
+        let cypher = format!(
+            r#"
+            MATCH (source:Note {{id: $source_id}})
+            UNWIND [{}] AS neighbor
+            MATCH (target:Note {{id: neighbor.id}})
+            MERGE (source)-[s1:SYNAPSE]->(target)
+            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime()
+            ON MATCH SET s1.weight = neighbor.weight
+            MERGE (target)-[s2:SYNAPSE]->(source)
+            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime()
+            ON MATCH SET s2.weight = neighbor.weight
+            RETURN count(s1) + count(s2) AS total
+            "#,
+            entries.join(", ")
+        );
+
+        let q = query(&cypher)
+            .param("source_id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total")?;
+            Ok(total as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get all SYNAPSE relationships for a note (both directions).
+    ///
+    /// Returns (neighbor_id, weight) sorted by weight descending.
+    pub async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
+        let cypher = r#"
+            MATCH (n:Note {id: $id})-[s:SYNAPSE]-(neighbor:Note)
+            RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight
+            ORDER BY weight DESC
+        "#;
+
+        let q = query(cypher).param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut synapses = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let neighbor_id_str: String = row.get("neighbor_id")?;
+            let weight: f64 = row.get("weight")?;
+            if let Ok(nid) = neighbor_id_str.parse::<Uuid>() {
+                synapses.push((nid, weight));
+            }
+        }
+
+        Ok(synapses)
+    }
+
+    /// Delete all SYNAPSE relationships for a note (both directions).
+    ///
+    /// Returns the number of deleted relationships.
+    pub async fn delete_synapses(&self, note_id: Uuid) -> Result<usize> {
+        let cypher = r#"
+            MATCH (n:Note {id: $id})-[s:SYNAPSE]-()
+            DELETE s
+            RETURN count(s) AS deleted
+        "#;
+
+        let q = query(cypher).param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let deleted: i64 = row.get("deleted")?;
+            Ok(deleted as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
     // Helper function to convert Note scope to type string
     fn scope_type_string(&self, scope: &NoteScope) -> String {
         match scope {

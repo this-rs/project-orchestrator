@@ -116,6 +116,8 @@ pub struct MockGraphStore {
     pub function_analytics: RwLock<HashMap<String, crate::graph::models::FunctionAnalyticsUpdate>>,
     /// Note embeddings (note_id -> (embedding, model_name))
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
+    /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
+    pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
 }
 
 #[allow(dead_code)]
@@ -185,6 +187,7 @@ impl MockGraphStore {
             file_analytics: RwLock::new(HashMap::new()),
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
+            note_synapses: RwLock::new(HashMap::new()),
         }
     }
 
@@ -3937,6 +3940,16 @@ impl GraphStore for MockGraphStore {
     async fn delete_note(&self, id: Uuid) -> Result<bool> {
         let removed = self.notes.write().await.remove(&id).is_some();
         self.note_anchors.write().await.remove(&id);
+        // Also clean up synapses (both directions)
+        if removed {
+            let mut synapses = self.note_synapses.write().await;
+            // Remove this note's outgoing synapses
+            synapses.remove(&id);
+            // Remove references to this note from all other notes' synapse lists
+            for neighbors in synapses.values_mut() {
+                neighbors.retain(|(nid, _)| *nid != id);
+            }
+        }
         Ok(removed)
     }
 
@@ -4269,6 +4282,78 @@ impl GraphStore for MockGraphStore {
         let page: Vec<Note> = without.into_iter().skip(offset).take(limit).collect();
 
         Ok((page, total))
+    }
+
+    // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn create_synapses(
+        &self,
+        note_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> Result<usize> {
+        if neighbors.is_empty() {
+            return Ok(0);
+        }
+
+        let mut synapses = self.note_synapses.write().await;
+        let mut count = 0;
+
+        for &(neighbor_id, weight) in neighbors {
+            // Add source -> neighbor (upsert)
+            let entry = synapses.entry(note_id).or_default();
+            if let Some(existing) = entry.iter_mut().find(|(nid, _)| *nid == neighbor_id) {
+                existing.1 = weight;
+            } else {
+                entry.push((neighbor_id, weight));
+            }
+            count += 1;
+
+            // Add neighbor -> source (bidirectional, upsert)
+            let entry = synapses.entry(neighbor_id).or_default();
+            if let Some(existing) = entry.iter_mut().find(|(nid, _)| *nid == note_id) {
+                existing.1 = weight;
+            } else {
+                entry.push((note_id, weight));
+            }
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
+        let synapses = self.note_synapses.read().await;
+        let mut result = synapses
+            .get(&note_id)
+            .cloned()
+            .unwrap_or_default();
+        // Sort by weight descending
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(result)
+    }
+
+    async fn delete_synapses(&self, note_id: Uuid) -> Result<usize> {
+        let mut synapses = self.note_synapses.write().await;
+
+        // Count outgoing synapses
+        let outgoing_count = synapses
+            .get(&note_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        // Remove from all neighbors' lists
+        if let Some(neighbors) = synapses.remove(&note_id) {
+            for (neighbor_id, _) in &neighbors {
+                if let Some(neighbor_list) = synapses.get_mut(neighbor_id) {
+                    neighbor_list.retain(|(nid, _)| *nid != note_id);
+                }
+            }
+        }
+
+        // Return total deleted (bidirectional = outgoing * 2)
+        Ok(outgoing_count * 2)
     }
 
     // ========================================================================

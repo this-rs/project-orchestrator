@@ -1380,6 +1380,26 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn create_synapses(
+        &self,
+        note_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> anyhow::Result<usize> {
+        self.create_synapses(note_id, neighbors).await
+    }
+
+    async fn get_synapses(&self, note_id: Uuid) -> anyhow::Result<Vec<(Uuid, f64)>> {
+        self.get_synapses(note_id).await
+    }
+
+    async fn delete_synapses(&self, note_id: Uuid) -> anyhow::Result<usize> {
+        self.delete_synapses(note_id).await
+    }
+
+    // ========================================================================
     // Chat session operations
     // ========================================================================
 
