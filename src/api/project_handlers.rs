@@ -143,9 +143,12 @@ pub async fn create_project(
         description: req.description,
         created_at: chrono::Utc::now(),
         last_synced: None,
+        analytics_computed_at: None,
     };
 
     state.orchestrator.create_project(&project).await?;
+    // Auto-registration on the file watcher is handled by the ProjectWatcherBridge
+    // which listens to CrudEvent::Created events emitted by the orchestrator.
 
     Ok(Json(ProjectResponse {
         id: project.id.to_string(),
@@ -219,9 +222,11 @@ pub async fn update_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
+    // Use orchestrator.update_project() instead of neo4j() directly so that
+    // a CrudEvent::Updated is emitted — the ProjectWatcherBridge listens for
+    // root_path changes to re-register the project on the file watcher.
     state
         .orchestrator
-        .neo4j()
         .update_project(project.id, req.name, req.description, req.root_path)
         .await?;
 
@@ -240,11 +245,9 @@ pub async fn delete_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    state
-        .orchestrator
-        .neo4j()
-        .delete_project(project.id)
-        .await?;
+    // Auto-unregistration from the file watcher is handled by the ProjectWatcherBridge
+    // which listens to CrudEvent::Deleted events emitted by the orchestrator.
+    state.orchestrator.delete_project(project.id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

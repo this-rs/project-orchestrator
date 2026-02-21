@@ -48,6 +48,9 @@ pub trait GraphStore: Send + Sync {
     /// Update project last_synced timestamp
     async fn update_project_synced(&self, id: Uuid) -> Result<()>;
 
+    /// Update project analytics_computed_at timestamp
+    async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()>;
+
     /// Delete a project and all its data
     async fn delete_project(&self, id: Uuid) -> Result<()>;
 

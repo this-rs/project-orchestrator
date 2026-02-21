@@ -370,6 +370,13 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()> {
+        if let Some(p) = self.projects.write().await.get_mut(&id) {
+            p.analytics_computed_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
     async fn delete_project(&self, id: Uuid) -> Result<()> {
         self.projects.write().await.remove(&id);
         // Cascade: remove project files

@@ -366,6 +366,7 @@ async fn test_neo4j_stale_file_cleanup() {
         description: Some("Project for testing stale file cleanup".to_string()),
         created_at: chrono::Utc::now(),
         last_synced: None,
+        analytics_computed_at: None,
     };
     state.neo4j.create_project(&project).await.unwrap();
 
