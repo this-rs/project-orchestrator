@@ -1480,6 +1480,31 @@ fn note_tools() -> Vec<ToolDefinition> {
             },
         },
         ToolDefinition {
+            name: "reinforce_neurons".to_string(),
+            description: "Hebbian reinforcement: boost energy and strengthen synapses between co-activated notes. Call after a session where multiple notes were retrieved and used together. For each note: energy += boost (capped at 1.0). For each pair: synapse weight += boost (or created at 0.5 if new).".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "note_ids": {"type": "array", "items": {"type": "string"}, "description": "UUIDs of notes that were co-activated (min 2)"},
+                    "energy_boost": {"type": "number", "description": "Energy boost per note (default 0.2, capped at 1.0)"},
+                    "synapse_boost": {"type": "number", "description": "Synapse weight boost per pair (default 0.05, capped at 1.0)"}
+                })),
+                required: Some(vec!["note_ids".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "decay_synapses".to_string(),
+            description: "Apply decay to all synapse weights and prune weak ones. Synapses lose `decay_amount` weight (default 0.01). Synapses below `prune_threshold` (default 0.1) are deleted. Call periodically alongside update_energy_scores.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "decay_amount": {"type": "number", "description": "Weight to subtract from each synapse (default 0.01)"},
+                    "prune_threshold": {"type": "number", "description": "Synapses below this weight are deleted (default 0.1)"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
             name: "list_project_notes".to_string(),
             description: "List notes for a specific project".to_string(),
             input_schema: InputSchema {
@@ -2231,7 +2256,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 156, "Expected 156 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 158, "Expected 158 tools, got {}", tools.len());
     }
 
     #[test]

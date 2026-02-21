@@ -7989,6 +7989,99 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Reinforce synapses between co-activated notes (Hebbian learning).
+    /// For every pair (i, j) in note_ids, MERGE a bidirectional SYNAPSE.
+    pub async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
+        if note_ids.len() < 2 {
+            return Ok(0);
+        }
+
+        // Generate all unique pairs
+        let mut pairs = Vec::new();
+        for i in 0..note_ids.len() {
+            for j in (i + 1)..note_ids.len() {
+                pairs.push((note_ids[i], note_ids[j]));
+            }
+        }
+
+        let mut total = 0usize;
+        for (a, b) in &pairs {
+            // MERGE both directions for bidirectional synapse
+            let q = query(
+                r#"
+                MATCH (a:Note {id: $a_id}), (b:Note {id: $b_id})
+                MERGE (a)-[s1:SYNAPSE]->(b)
+                  ON CREATE SET s1.weight = 0.5, s1.created_at = datetime()
+                  ON MATCH SET s1.weight = CASE
+                      WHEN s1.weight + $boost > 1.0 THEN 1.0
+                      ELSE s1.weight + $boost
+                  END
+                MERGE (b)-[s2:SYNAPSE]->(a)
+                  ON CREATE SET s2.weight = 0.5, s2.created_at = datetime()
+                  ON MATCH SET s2.weight = CASE
+                      WHEN s2.weight + $boost > 1.0 THEN 1.0
+                      ELSE s2.weight + $boost
+                  END
+                RETURN count(s1) + count(s2) AS cnt
+                "#,
+            )
+            .param("a_id", a.to_string())
+            .param("b_id", b.to_string())
+            .param("boost", boost);
+
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// Decay all synapses and prune weak ones.
+    pub async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)> {
+        // Step 1: Decay all synapses
+        let decay_q = query(
+            r#"
+            MATCH ()-[s:SYNAPSE]->()
+            SET s.weight = s.weight - $decay_amount
+            RETURN count(s) AS decayed
+            "#,
+        )
+        .param("decay_amount", decay_amount);
+
+        let mut result = self.graph.execute(decay_q).await?;
+        let decayed = if let Some(row) = result.next().await? {
+            row.get::<i64>("decayed").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // Step 2: Prune weak synapses
+        let prune_q = query(
+            r#"
+            MATCH ()-[s:SYNAPSE]->()
+            WHERE s.weight < $threshold
+            DELETE s
+            RETURN count(s) AS pruned
+            "#,
+        )
+        .param("threshold", prune_threshold);
+
+        let mut result = self.graph.execute(prune_q).await?;
+        let pruned = if let Some(row) = result.next().await? {
+            row.get::<i64>("pruned").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok((decayed, pruned))
+    }
+
     // Helper function to convert Note scope to type string
     fn scope_type_string(&self, scope: &NoteScope) -> String {
         match scope {

@@ -4395,6 +4395,69 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
+        if note_ids.len() < 2 {
+            return Ok(0);
+        }
+
+        let mut synapses = self.note_synapses.write().await;
+        let mut count = 0usize;
+
+        for i in 0..note_ids.len() {
+            for j in (i + 1)..note_ids.len() {
+                let a = note_ids[i];
+                let b = note_ids[j];
+
+                // Reinforce or create A → B
+                let entry_a = synapses.entry(a).or_default();
+                if let Some(syn) = entry_a.iter_mut().find(|(id, _)| *id == b) {
+                    syn.1 = (syn.1 + boost).min(1.0);
+                } else {
+                    entry_a.push((b, 0.5));
+                }
+                count += 1;
+
+                // Reinforce or create B → A
+                let entry_b = synapses.entry(b).or_default();
+                if let Some(syn) = entry_b.iter_mut().find(|(id, _)| *id == a) {
+                    syn.1 = (syn.1 + boost).min(1.0);
+                } else {
+                    entry_b.push((a, 0.5));
+                }
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)> {
+        let mut synapses = self.note_synapses.write().await;
+        let mut decayed = 0usize;
+        let mut pruned = 0usize;
+
+        // Decay all synapses
+        for neighbors in synapses.values_mut() {
+            for syn in neighbors.iter_mut() {
+                syn.1 -= decay_amount;
+                decayed += 1;
+            }
+        }
+
+        // Prune weak synapses
+        for neighbors in synapses.values_mut() {
+            let before = neighbors.len();
+            neighbors.retain(|(_, w)| *w >= prune_threshold);
+            pruned += before - neighbors.len();
+        }
+
+        Ok((decayed, pruned))
+    }
+
     // ========================================================================
     // Chat session operations
     // ========================================================================

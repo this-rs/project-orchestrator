@@ -1411,6 +1411,18 @@ impl GraphStore for Neo4jClient {
         self.boost_energy(note_id, amount).await
     }
 
+    async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> anyhow::Result<usize> {
+        self.reinforce_synapses(note_ids, boost).await
+    }
+
+    async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> anyhow::Result<(usize, usize)> {
+        self.decay_synapses(decay_amount, prune_threshold).await
+    }
+
     // ========================================================================
     // Chat session operations
     // ========================================================================

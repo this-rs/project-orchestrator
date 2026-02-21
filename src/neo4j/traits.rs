@@ -1113,6 +1113,27 @@ pub trait GraphStore: Send + Sync {
     /// reinforced through spreading activation.
     async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()>;
 
+    /// Reinforce synapses between co-activated notes (Hebbian learning).
+    ///
+    /// For every pair (i, j) in `note_ids`, MERGE a bidirectional SYNAPSE:
+    /// - **ON CREATE**: set weight = 0.5 (new connection)
+    /// - **ON MATCH**: set weight = min(weight + `boost`, 1.0)
+    ///
+    /// Returns the number of synapses reinforced (created + updated).
+    async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize>;
+
+    /// Apply decay to all synapses and prune weak ones.
+    ///
+    /// 1. Subtract `decay_amount` from every synapse weight
+    /// 2. Delete synapses where weight < `prune_threshold`
+    ///
+    /// Returns (decayed_count, pruned_count).
+    async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)>;
+
     // ========================================================================
     // Chat session operations
     // ========================================================================

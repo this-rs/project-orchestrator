@@ -177,6 +177,8 @@ impl ToolHandler {
             "update_staleness_scores" => self.update_staleness_scores(args).await,
             "update_energy_scores" => self.update_energy_scores(args).await,
             "search_neurons" => self.search_neurons(args).await,
+            "reinforce_neurons" => self.reinforce_neurons(args).await,
+            "decay_synapses" => self.decay_synapses(args).await,
             "list_project_notes" => self.list_project_notes(args).await,
             "get_propagated_notes" => self.get_propagated_notes(args).await,
             "get_entity_notes" => self.get_entity_notes(args).await,
@@ -2611,6 +2613,75 @@ impl ToolHandler {
                 "max_hops": config.max_hops,
                 "min_score": config.min_activation,
             }
+        }))
+    }
+
+    async fn reinforce_neurons(&self, args: Value) -> Result<Value> {
+        let note_ids: Vec<Uuid> = args
+            .get("note_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("note_ids is required (array of UUIDs)"))?
+            .iter()
+            .filter_map(|v| v.as_str().and_then(|s| s.parse::<Uuid>().ok()))
+            .collect();
+
+        if note_ids.len() < 2 {
+            return Err(anyhow!(
+                "note_ids must contain at least 2 UUIDs (got {})",
+                note_ids.len()
+            ));
+        }
+
+        let energy_boost = args
+            .get("energy_boost")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.2);
+        let synapse_boost = args
+            .get("synapse_boost")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.05);
+
+        // 1. Boost energy for each note
+        let mut neurons_boosted = 0;
+        for note_id in &note_ids {
+            self.neo4j().boost_energy(*note_id, energy_boost).await?;
+            neurons_boosted += 1;
+        }
+
+        // 2. Reinforce synapses between all pairs
+        let synapses_reinforced = self
+            .neo4j()
+            .reinforce_synapses(&note_ids, synapse_boost)
+            .await?;
+
+        Ok(json!({
+            "neurons_boosted": neurons_boosted,
+            "synapses_reinforced": synapses_reinforced,
+            "energy_boost": energy_boost,
+            "synapse_boost": synapse_boost,
+        }))
+    }
+
+    async fn decay_synapses(&self, args: Value) -> Result<Value> {
+        let decay_amount = args
+            .get("decay_amount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.01);
+        let prune_threshold = args
+            .get("prune_threshold")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.1);
+
+        let (decayed, pruned) = self
+            .neo4j()
+            .decay_synapses(decay_amount, prune_threshold)
+            .await?;
+
+        Ok(json!({
+            "synapses_decayed": decayed,
+            "synapses_pruned": pruned,
+            "decay_amount": decay_amount,
+            "prune_threshold": prune_threshold,
         }))
     }
 
