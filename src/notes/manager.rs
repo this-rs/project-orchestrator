@@ -992,6 +992,175 @@ impl NoteManager {
             skipped,
         })
     }
+
+    /// Backfill SYNAPSE relationships for notes that have embeddings but no
+    /// outgoing SYNAPSE edges yet.
+    ///
+    /// For each such note, retrieves its stored embedding, runs a vector
+    /// similarity search to find nearest neighbours, filters by
+    /// `min_similarity`, and creates bidirectional SYNAPSE relations.
+    ///
+    /// This is idempotent: notes that already have synapses are skipped
+    /// (they don't appear in `list_notes_needing_synapses`). On re-run,
+    /// only newly embedded notes or notes whose synapses were pruned are
+    /// processed.
+    ///
+    /// Also calls `init_note_energy()` first to ensure all notes have an
+    /// energy value.
+    pub async fn backfill_synapses(
+        &self,
+        batch_size: usize,
+        min_similarity: f64,
+        max_neighbors: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<SynapseBackfillProgress> {
+        let batch_size = if batch_size == 0 { 50 } else { batch_size };
+        let min_similarity = if min_similarity <= 0.0 { 0.75 } else { min_similarity };
+        let max_neighbors = if max_neighbors == 0 { 10 } else { max_neighbors };
+
+        // Phase 1: init energy on all notes that don't have it yet
+        let energy_init = self.neo4j.init_note_energy().await?;
+        if energy_init > 0 {
+            tracing::info!("Synapse backfill: initialized energy on {energy_init} notes");
+        }
+
+        // Phase 2: get total count of notes needing synapses
+        let (_, total) = self.neo4j.list_notes_needing_synapses(0, 0).await?;
+        if total == 0 {
+            tracing::info!("Synapse backfill: all notes with embeddings already have synapses");
+            return Ok(SynapseBackfillProgress {
+                total,
+                processed: 0,
+                synapses_created: 0,
+                errors: 0,
+                skipped: 0,
+                energy_initialized: energy_init,
+            });
+        }
+
+        tracing::info!("Synapse backfill: {total} notes need synapses");
+        let mut processed = 0usize;
+        let mut synapses_created = 0usize;
+        let mut errors = 0usize;
+
+        loop {
+            // Check cancellation
+            if let Some(flag) = cancel {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("Synapse backfill cancelled at {processed}/{total}");
+                    break;
+                }
+            }
+
+            // Fetch next batch (always offset 0, processed notes disappear from results)
+            let (batch, remaining) = self.neo4j.list_notes_needing_synapses(batch_size, 0).await?;
+            if batch.is_empty() || remaining == 0 {
+                break;
+            }
+
+            for note in &batch {
+                // Check cancellation per-note for responsiveness
+                if let Some(flag) = cancel {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!("Synapse backfill cancelled at {processed}/{total}");
+                        let skipped = total.saturating_sub(processed + errors);
+                        return Ok(SynapseBackfillProgress {
+                            total,
+                            processed,
+                            synapses_created,
+                            errors,
+                            skipped,
+                            energy_initialized: energy_init,
+                        });
+                    }
+                }
+
+                // Get the stored embedding for this note
+                let embedding = match self.neo4j.get_note_embedding(note.id).await {
+                    Ok(Some(emb)) => emb,
+                    Ok(None) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            "Synapse backfill: note listed as needing synapses but has no embedding, skipping"
+                        );
+                        errors += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: failed to get embedding"
+                        );
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                // Vector search for nearest neighbours
+                let neighbors = match self
+                    .neo4j
+                    .vector_search_notes(&embedding, max_neighbors + 1, note.project_id, None)
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: vector search failed"
+                        );
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                // Filter: exclude self, apply min_similarity threshold
+                let synapse_targets: Vec<(Uuid, f64)> = neighbors
+                    .into_iter()
+                    .filter(|(n, score)| n.id != note.id && *score >= min_similarity)
+                    .map(|(n, score)| (n.id, score))
+                    .collect();
+
+                if !synapse_targets.is_empty() {
+                    match self.neo4j.create_synapses(note.id, &synapse_targets).await {
+                        Ok(created) => {
+                            synapses_created += created;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                note_id = %note.id,
+                                error = %e,
+                                "Synapse backfill: failed to create synapses"
+                            );
+                            errors += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                processed += 1;
+            }
+
+            tracing::info!(
+                "Synapse backfill: {processed}/{total} notes processed, {synapses_created} synapses created ({errors} errors)"
+            );
+        }
+
+        let skipped = total.saturating_sub(processed + errors);
+        tracing::info!(
+            "Synapse backfill complete: {processed} processed, {synapses_created} synapses, {errors} errors, {skipped} skipped"
+        );
+
+        Ok(SynapseBackfillProgress {
+            total,
+            processed,
+            synapses_created,
+            errors,
+            skipped,
+            energy_initialized: energy_init,
+        })
+    }
 }
 
 /// Progress report for the embedding backfill operation.
@@ -1005,6 +1174,23 @@ pub struct BackfillProgress {
     pub errors: usize,
     /// Number of notes skipped (cancelled before processing)
     pub skipped: usize,
+}
+
+/// Progress report for the synapse backfill operation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SynapseBackfillProgress {
+    /// Total number of notes that needed synapses at start
+    pub total: usize,
+    /// Number of notes successfully processed
+    pub processed: usize,
+    /// Number of SYNAPSE relationships created
+    pub synapses_created: usize,
+    /// Number of notes that failed processing
+    pub errors: usize,
+    /// Number of notes skipped (cancelled before processing)
+    pub skipped: usize,
+    /// Number of notes that had energy initialized
+    pub energy_initialized: usize,
 }
 
 #[cfg(test)]

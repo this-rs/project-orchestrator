@@ -546,6 +546,18 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(note_handlers::get_backfill_embeddings_status),
         )
         // ================================================================
+        // Admin — Synapse Backfill
+        // ================================================================
+        .route(
+            "/api/admin/backfill-synapses",
+            post(note_handlers::start_backfill_synapses)
+                .delete(note_handlers::cancel_backfill_synapses),
+        )
+        .route(
+            "/api/admin/backfill-synapses/status",
+            get(note_handlers::get_backfill_synapses_status),
+        )
+        // ================================================================
         // Meilisearch Maintenance
         // ================================================================
         .route(

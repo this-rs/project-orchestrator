@@ -1505,6 +1505,19 @@ fn note_tools() -> Vec<ToolDefinition> {
             },
         },
         ToolDefinition {
+            name: "backfill_synapses".to_string(),
+            description: "Backfill SYNAPSE relationships for notes that have embeddings but no synapses yet. Also initializes energy on notes missing it. Idempotent — re-running skips already-connected notes. Use after bulk note creation or embedding backfill.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "batch_size": {"type": "integer", "description": "Notes per batch (default 50)"},
+                    "min_similarity": {"type": "number", "description": "Minimum cosine similarity to create a synapse (default 0.75)"},
+                    "max_neighbors": {"type": "integer", "description": "Max synapses per note (default 10)"}
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
             name: "list_project_notes".to_string(),
             description: "List notes for a specific project".to_string(),
             input_schema: InputSchema {
@@ -2256,7 +2269,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 158, "Expected 158 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 159, "Expected 159 tools, got {}", tools.len());
     }
 
     #[test]

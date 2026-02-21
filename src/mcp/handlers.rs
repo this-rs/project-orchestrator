@@ -179,6 +179,7 @@ impl ToolHandler {
             "search_neurons" => self.search_neurons(args).await,
             "reinforce_neurons" => self.reinforce_neurons(args).await,
             "decay_synapses" => self.decay_synapses(args).await,
+            "backfill_synapses" => self.backfill_synapses(args).await,
             "list_project_notes" => self.list_project_notes(args).await,
             "get_propagated_notes" => self.get_propagated_notes(args).await,
             "get_entity_notes" => self.get_entity_notes(args).await,
@@ -2757,6 +2758,39 @@ impl ToolHandler {
             "synapses_pruned": pruned,
             "decay_amount": decay_amount,
             "prune_threshold": prune_threshold,
+        }))
+    }
+
+    async fn backfill_synapses(&self, args: Value) -> Result<Value> {
+        let batch_size = args
+            .get("batch_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50) as usize;
+        let min_similarity = args
+            .get("min_similarity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.75);
+        let max_neighbors = args
+            .get("max_neighbors")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as usize;
+
+        let start = std::time::Instant::now();
+        let progress = self
+            .orchestrator
+            .note_manager()
+            .backfill_synapses(batch_size, min_similarity, max_neighbors, None)
+            .await?;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        Ok(json!({
+            "total": progress.total,
+            "processed": progress.processed,
+            "synapses_created": progress.synapses_created,
+            "errors": progress.errors,
+            "skipped": progress.skipped,
+            "energy_initialized": progress.energy_initialized,
+            "elapsed_ms": elapsed_ms,
         }))
     }
 

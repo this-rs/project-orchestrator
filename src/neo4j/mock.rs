@@ -4201,6 +4201,11 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let embeddings = self.note_embeddings.read().await;
+        Ok(embeddings.get(&note_id).map(|(emb, _)| emb.clone()))
+    }
+
     async fn vector_search_notes(
         &self,
         embedding: &[f32],
@@ -4456,6 +4461,44 @@ impl GraphStore for MockGraphStore {
         }
 
         Ok((decayed, pruned))
+    }
+
+    async fn init_note_energy(&self) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let mut count = 0;
+        for note in notes.values_mut() {
+            // Simulate: only init if energy would have been NULL (we use 0.0 sentinel or check default)
+            // In mock, energy is always set by Note::new(), so this is a no-op
+            // But for completeness, ensure energy is at least 1.0 if it was 0.0 and never activated
+            if note.last_activated.is_none() && note.energy == 0.0 {
+                note.energy = 1.0;
+                note.last_activated = Some(chrono::Utc::now());
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        _offset: usize,
+    ) -> Result<(Vec<crate::notes::Note>, usize)> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+        let synapses = self.note_synapses.read().await;
+
+        let needing: Vec<crate::notes::Note> = notes
+            .values()
+            .filter(|n| {
+                embeddings.contains_key(&n.id) && !synapses.contains_key(&n.id)
+            })
+            .cloned()
+            .collect();
+
+        let total = needing.len();
+        let batch: Vec<crate::notes::Note> = needing.into_iter().take(limit).collect();
+        Ok((batch, total))
     }
 
     // ========================================================================

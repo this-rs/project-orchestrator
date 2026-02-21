@@ -7691,6 +7691,27 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Retrieve the stored embedding vector for a note.
+    pub async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            WHERE n.embedding IS NOT NULL
+            RETURN n.embedding AS embedding
+            "#,
+        )
+        .param("id", note_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let embedding_f64: Vec<f64> = row.get("embedding")?;
+            let embedding_f32: Vec<f32> = embedding_f64.iter().map(|&x| x as f32).collect();
+            Ok(Some(embedding_f32))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Search notes by vector similarity using the HNSW index.
     ///
     /// Returns notes ordered by descending cosine similarity score,
@@ -8080,6 +8101,76 @@ impl Neo4jClient {
         };
 
         Ok((decayed, pruned))
+    }
+
+    /// Initialize energy for notes that don't have it yet.
+    pub async fn init_note_energy(&self) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.energy IS NULL
+            SET n.energy = 1.0,
+                n.last_activated = coalesce(n.last_confirmed_at, n.created_at, datetime())
+            RETURN count(n) AS updated
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let updated = if let Some(row) = result.next().await? {
+            row.get::<i64>("updated").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok(updated)
+    }
+
+    /// List notes that have an embedding but no outgoing SYNAPSE.
+    pub async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Note>, usize)> {
+        // Count total
+        let count_q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+            RETURN count(n) AS total
+            "#,
+        );
+        let mut result = self.graph.execute(count_q).await?;
+        let total = if let Some(row) = result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if total == 0 || limit == 0 {
+            return Ok((vec![], total));
+        }
+
+        // Fetch batch
+        let fetch_q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+            RETURN n
+            ORDER BY n.created_at
+            SKIP $offset LIMIT $limit
+            "#,
+        )
+        .param("offset", offset as i64)
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(fetch_q).await?;
+        let mut notes = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            notes.push(self.node_to_note(&node)?);
+        }
+
+        Ok((notes, total))
     }
 
     // Helper function to convert Note scope to type string

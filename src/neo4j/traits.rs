@@ -1033,6 +1033,13 @@ pub trait GraphStore: Send + Sync {
     async fn set_note_embedding(&self, note_id: Uuid, embedding: &[f32], model: &str)
         -> Result<()>;
 
+    /// Retrieve the stored embedding vector for a note.
+    ///
+    /// Returns `None` if the note has no embedding yet.
+    /// Used by the synapse backfill to get the vector and feed it
+    /// into `vector_search_notes` for finding nearest neighbours.
+    async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>>;
+
     /// Search notes by vector similarity using the HNSW index.
     ///
     /// Returns notes ordered by descending cosine similarity score,
@@ -1133,6 +1140,19 @@ pub trait GraphStore: Send + Sync {
         decay_amount: f64,
         prune_threshold: f64,
     ) -> Result<(usize, usize)>;
+
+    /// Initialize energy for all notes that don't have it set.
+    /// Sets energy = 1.0 and last_activated = coalesce(last_confirmed_at, created_at).
+    /// Idempotent. Returns the number of notes initialized.
+    async fn init_note_energy(&self) -> Result<usize>;
+
+    /// List notes that have an embedding but no outgoing SYNAPSE.
+    /// Used for synapse backfill. Returns (notes, total_count).
+    async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<crate::notes::Note>, usize)>;
 
     // ========================================================================
     // Chat session operations

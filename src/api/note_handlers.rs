@@ -5,7 +5,7 @@ use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::notes::{
     BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
     NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus,
-    NoteType, PropagatedNote, UpdateNoteRequest,
+    NoteType, PropagatedNote, SynapseBackfillProgress, UpdateNoteRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -757,5 +757,167 @@ pub async fn search_neurons(
             "max_hops": config.max_hops,
             "min_score": config.min_activation,
         }
+    })))
+}
+
+// ============================================================================
+// Synapse backfill (async background job)
+// ============================================================================
+
+/// Request body for starting a synapse backfill
+#[derive(Debug, Deserialize)]
+pub struct StartSynapseBackfillBody {
+    /// Notes per batch (default: 50)
+    pub batch_size: Option<usize>,
+    /// Minimum cosine similarity to create a synapse (default: 0.75)
+    pub min_similarity: Option<f64>,
+    /// Max synapses per note (default: 10)
+    pub max_neighbors: Option<usize>,
+}
+
+/// Singleton state for the synapse backfill job
+static SYNAPSE_BACKFILL_STATE: LazyLock<Arc<RwLock<SynapseBackfillJobState>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(SynapseBackfillJobState::default())));
+
+/// Cancellation flag for the synapse backfill job
+static SYNAPSE_BACKFILL_CANCEL: LazyLock<Arc<AtomicBool>> =
+    LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+
+/// State of the synapse backfill job
+#[derive(Debug, Clone, Serialize)]
+pub struct SynapseBackfillJobState {
+    pub status: BackfillJobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<SynapseBackfillProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Default for SynapseBackfillJobState {
+    fn default() -> Self {
+        Self {
+            status: BackfillJobStatus::Idle,
+            progress: None,
+            started_at: None,
+            finished_at: None,
+            error: None,
+        }
+    }
+}
+
+/// POST /api/admin/backfill-synapses — Start synapse backfill in background
+///
+/// Returns 202 Accepted immediately. The backfill runs asynchronously.
+/// Use GET /api/admin/backfill-synapses/status to monitor progress.
+/// Returns 409 Conflict if a backfill is already running.
+pub async fn start_backfill_synapses(
+    State(state): State<OrchestratorState>,
+    body: Option<Json<StartSynapseBackfillBody>>,
+) -> Result<(StatusCode, Json<SynapseBackfillJobState>), AppError> {
+    let (batch_size, min_similarity, max_neighbors) = match body {
+        Some(Json(b)) => (
+            b.batch_size.unwrap_or(50),
+            b.min_similarity.unwrap_or(0.75),
+            b.max_neighbors.unwrap_or(10),
+        ),
+        None => (50, 0.75, 10),
+    };
+
+    // Check if already running
+    {
+        let current = SYNAPSE_BACKFILL_STATE.read().await;
+        if current.status == BackfillJobStatus::Running {
+            return Err(AppError::Conflict(
+                "A synapse backfill job is already running. Use DELETE to cancel it first."
+                    .to_string(),
+            ));
+        }
+    }
+
+    // Reset cancel flag
+    SYNAPSE_BACKFILL_CANCEL.store(false, Ordering::SeqCst);
+
+    // Set state to Running
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let mut s = SYNAPSE_BACKFILL_STATE.write().await;
+        *s = SynapseBackfillJobState {
+            status: BackfillJobStatus::Running,
+            progress: None,
+            started_at: Some(now),
+            finished_at: None,
+            error: None,
+        };
+    }
+
+    // Clone what we need for the background task
+    let note_manager = state.orchestrator.note_manager().clone();
+    let cancel_flag = SYNAPSE_BACKFILL_CANCEL.clone();
+    let job_state = SYNAPSE_BACKFILL_STATE.clone();
+
+    tokio::spawn(async move {
+        let result = note_manager
+            .backfill_synapses(batch_size, min_similarity, max_neighbors, Some(&cancel_flag))
+            .await;
+
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let mut s = job_state.write().await;
+
+        match result {
+            Ok(progress) => {
+                let was_cancelled = cancel_flag.load(Ordering::SeqCst);
+                s.status = if was_cancelled {
+                    BackfillJobStatus::Cancelled
+                } else {
+                    BackfillJobStatus::Completed
+                };
+                s.progress = Some(progress);
+                s.finished_at = Some(finished_at);
+            }
+            Err(e) => {
+                tracing::error!("Backfill synapses failed: {e:#}");
+                s.status = BackfillJobStatus::Failed;
+                s.error = Some(e.to_string());
+                s.finished_at = Some(finished_at);
+            }
+        }
+    });
+
+    // Return 202 with current state
+    let current = SYNAPSE_BACKFILL_STATE.read().await;
+    Ok((StatusCode::ACCEPTED, Json(current.clone())))
+}
+
+/// GET /api/admin/backfill-synapses/status — Get synapse backfill job status
+pub async fn get_backfill_synapses_status(
+    State(_state): State<OrchestratorState>,
+) -> Result<Json<SynapseBackfillJobState>, AppError> {
+    let current = SYNAPSE_BACKFILL_STATE.read().await;
+    Ok(Json(current.clone()))
+}
+
+/// DELETE /api/admin/backfill-synapses — Cancel a running synapse backfill
+pub async fn cancel_backfill_synapses(
+    State(_state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let is_running = {
+        let current = SYNAPSE_BACKFILL_STATE.read().await;
+        current.status == BackfillJobStatus::Running
+    };
+
+    if !is_running {
+        return Err(AppError::BadRequest(
+            "No synapse backfill job is currently running".to_string(),
+        ));
+    }
+
+    SYNAPSE_BACKFILL_CANCEL.store(true, Ordering::SeqCst);
+
+    Ok(Json(serde_json::json!({
+        "message": "Cancellation requested. The job will stop after the current note."
     })))
 }

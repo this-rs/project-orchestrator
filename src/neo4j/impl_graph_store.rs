@@ -1360,6 +1360,10 @@ impl GraphStore for Neo4jClient {
         self.set_note_embedding(note_id, embedding, model).await
     }
 
+    async fn get_note_embedding(&self, note_id: Uuid) -> anyhow::Result<Option<Vec<f32>>> {
+        self.get_note_embedding(note_id).await
+    }
+
     async fn vector_search_notes(
         &self,
         embedding: &[f32],
@@ -1421,6 +1425,18 @@ impl GraphStore for Neo4jClient {
         prune_threshold: f64,
     ) -> anyhow::Result<(usize, usize)> {
         self.decay_synapses(decay_amount, prune_threshold).await
+    }
+
+    async fn init_note_energy(&self) -> anyhow::Result<usize> {
+        self.init_note_energy().await
+    }
+
+    async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::notes::Note>, usize)> {
+        self.list_notes_needing_synapses(limit, offset).await
     }
 
     // ========================================================================
