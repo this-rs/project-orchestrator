@@ -1045,6 +1045,10 @@ impl NoteManager {
         let mut processed = 0usize;
         let mut synapses_created = 0usize;
         let mut errors = 0usize;
+        // Track offset for notes that couldn't get synapses (no eligible
+        // neighbours) — they stay in the query results, so we must skip past
+        // them on subsequent iterations to avoid an infinite loop.
+        let mut skip_offset = 0usize;
 
         loop {
             // Check cancellation
@@ -1055,14 +1059,20 @@ impl NoteManager {
                 }
             }
 
-            // Fetch next batch (always offset 0, processed notes disappear from results)
+            // Fetch next batch. Notes that got synapses disappear from
+            // results (offset 0 works for those). But notes with no eligible
+            // neighbours stay, so we skip past them with `skip_offset`.
             let (batch, remaining) = self
                 .neo4j
-                .list_notes_needing_synapses(batch_size, 0)
+                .list_notes_needing_synapses(batch_size, skip_offset)
                 .await?;
             if batch.is_empty() || remaining == 0 {
                 break;
             }
+
+            // Track how many notes in this batch couldn't be connected —
+            // if ALL of them fail, we've exhausted the connectable notes.
+            let mut batch_connected = 0usize;
 
             for note in &batch {
                 // Check cancellation per-note for responsiveness
@@ -1090,6 +1100,7 @@ impl NoteManager {
                             "Synapse backfill: note listed as needing synapses but has no embedding, skipping"
                         );
                         errors += 1;
+                        skip_offset += 1;
                         continue;
                     }
                     Err(e) => {
@@ -1099,6 +1110,7 @@ impl NoteManager {
                             "Synapse backfill: failed to get embedding"
                         );
                         errors += 1;
+                        skip_offset += 1;
                         continue;
                     }
                 };
@@ -1117,6 +1129,7 @@ impl NoteManager {
                             "Synapse backfill: vector search failed"
                         );
                         errors += 1;
+                        skip_offset += 1;
                         continue;
                     }
                 };
@@ -1128,20 +1141,35 @@ impl NoteManager {
                     .map(|(n, score)| (n.id, score))
                     .collect();
 
-                if !synapse_targets.is_empty() {
-                    match self.neo4j.create_synapses(note.id, &synapse_targets).await {
-                        Ok(created) => {
-                            synapses_created += created;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                note_id = %note.id,
-                                error = %e,
-                                "Synapse backfill: failed to create synapses"
-                            );
-                            errors += 1;
-                            continue;
-                        }
+                if synapse_targets.is_empty() {
+                    // No eligible neighbours — this note will stay in the
+                    // "needing synapses" list. Increment offset to skip past
+                    // it on the next iteration.
+                    tracing::debug!(
+                        note_id = %note.id,
+                        "Synapse backfill: no eligible neighbours above threshold {min_similarity}, skipping"
+                    );
+                    skip_offset += 1;
+                    processed += 1;
+                    continue;
+                }
+
+                match self.neo4j.create_synapses(note.id, &synapse_targets).await {
+                    Ok(created) => {
+                        synapses_created += created;
+                        batch_connected += 1;
+                        // Note now has synapses → will NOT appear in next
+                        // query at the same offset. Don't increment skip_offset.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Synapse backfill: failed to create synapses"
+                        );
+                        errors += 1;
+                        skip_offset += 1;
+                        continue;
                     }
                 }
 
@@ -1149,8 +1177,15 @@ impl NoteManager {
             }
 
             tracing::info!(
-                "Synapse backfill: {processed}/{total} notes processed, {synapses_created} synapses created ({errors} errors)"
+                "Synapse backfill: {processed}/{total} notes processed, {synapses_created} synapses created ({errors} errors, {skip_offset} skipped)"
             );
+
+            // If no note in this batch could be connected, all remaining
+            // notes are un-connectable — stop to avoid spinning forever.
+            if batch_connected == 0 {
+                tracing::info!("Synapse backfill: no more connectable notes found, stopping");
+                break;
+            }
         }
 
         let skipped = total.saturating_sub(processed + errors);
