@@ -12,4 +12,4 @@ pub mod activation;
 pub mod config;
 
 pub use activation::{ActivatedNote, ActivationSource, SpreadingActivationEngine};
-pub use config::SpreadingActivationConfig;
+pub use config::{AutoReinforcementConfig, SpreadingActivationConfig};

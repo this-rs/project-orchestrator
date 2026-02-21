@@ -51,6 +51,45 @@ impl Default for SpreadingActivationConfig {
     }
 }
 
+/// Configuration for automatic Hebbian reinforcement hooks.
+///
+/// Controls implicit learning that happens during normal operations:
+/// - **search**: notes returned by `search_neurons` get boosted
+/// - **commit**: notes linked to committed files get boosted
+/// - **context**: notes included in chat system prompts get boosted
+///
+/// All hooks are async/non-blocking (`tokio::spawn`, best-effort).
+/// Set `enabled = false` to disable all implicit reinforcement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoReinforcementConfig {
+    /// Master switch — when false, all implicit hooks are skipped.
+    pub enabled: bool,
+
+    /// Energy boost per note when returned by search_neurons.
+    pub search_energy_boost: f64,
+
+    /// Synapse weight boost between co-returned notes from search_neurons.
+    pub search_synapse_boost: f64,
+
+    /// Energy boost per note linked to files in a commit.
+    pub commit_energy_boost: f64,
+
+    /// Energy boost per note included in a chat system prompt context.
+    pub context_energy_boost: f64,
+}
+
+impl Default for AutoReinforcementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            search_energy_boost: 0.1,
+            search_synapse_boost: 0.03,
+            commit_energy_boost: 0.15,
+            context_energy_boost: 0.05,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

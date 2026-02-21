@@ -1504,6 +1504,9 @@ impl ToolHandler {
 
         self.orchestrator.create_commit(&commit).await?;
 
+        // Clone files list before it's moved into the sync spawn
+        let ar_files_for_hook = files_changed.clone();
+
         // Trigger incremental sync if files_changed and project_id are provided
         let sync_triggered = !files_changed.is_empty() && project_id.is_some();
         if sync_triggered {
@@ -1531,6 +1534,50 @@ impl ToolHandler {
                 }
                 // Trigger debounced analytics recomputation (fire-and-forget)
                 orchestrator.analytics_debouncer().trigger(project_id);
+            });
+        }
+
+        // Hook Niveau 2: boost energy of notes linked to committed files
+        let ar_config = self.orchestrator.auto_reinforcement_config().clone();
+        if ar_config.enabled && !ar_files_for_hook.is_empty() {
+            let neo4j = self.orchestrator.neo4j_arc();
+            let files = ar_files_for_hook;
+            tokio::spawn(async move {
+                for file_path in &files {
+                    match neo4j
+                        .get_notes_for_entity(&crate::notes::EntityType::File, file_path)
+                        .await
+                    {
+                        Ok(notes) => {
+                            for note in &notes {
+                                if let Err(e) = neo4j
+                                    .boost_energy(note.id, ar_config.commit_energy_boost)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        note_id = %note.id,
+                                        error = %e,
+                                        "Auto-reinforce commit: energy boost failed"
+                                    );
+                                }
+                            }
+                            if !notes.is_empty() {
+                                tracing::debug!(
+                                    file = %file_path,
+                                    notes = notes.len(),
+                                    "Auto-reinforced notes linked to committed file"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                file = %file_path,
+                                error = %e,
+                                "Auto-reinforce commit: get_entity_notes failed"
+                            );
+                        }
+                    }
+                }
             });
         }
 
@@ -2602,6 +2649,34 @@ impl ToolHandler {
                 })
             })
             .collect();
+
+        // Hook Niveau 1: auto-reinforce co-activated notes (fire-and-forget)
+        let ar_config = self.orchestrator.auto_reinforcement_config().clone();
+        if ar_config.enabled && !results.is_empty() {
+            let note_ids: Vec<Uuid> = results.iter().map(|r| r.note.id).collect();
+            let neo4j = self.orchestrator.neo4j_arc();
+            tokio::spawn(async move {
+                // Boost energy for each activated note
+                for id in &note_ids {
+                    if let Err(e) = neo4j.boost_energy(*id, ar_config.search_energy_boost).await {
+                        tracing::warn!(note_id = %id, error = %e, "Auto-reinforce: energy boost failed");
+                    }
+                }
+                // Reinforce synapses between co-activated notes
+                if note_ids.len() >= 2 {
+                    if let Err(e) = neo4j
+                        .reinforce_synapses(&note_ids, ar_config.search_synapse_boost)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "Auto-reinforce: synapse reinforcement failed");
+                    }
+                }
+                tracing::debug!(
+                    notes = note_ids.len(),
+                    "Auto-reinforcement completed for search_neurons results"
+                );
+            });
+        }
 
         Ok(json!({
             "results": results_json,

@@ -1,7 +1,7 @@
 //! Main orchestrator runner
 
 use crate::embeddings::{EmbeddingProvider, FastEmbedProvider, HttpEmbeddingProvider};
-use crate::neurons::SpreadingActivationEngine;
+use crate::neurons::{AutoReinforcementConfig, SpreadingActivationEngine};
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
@@ -75,6 +75,7 @@ pub struct Orchestrator {
     analytics: Arc<dyn AnalyticsEngine>,
     analytics_debouncer: AnalyticsDebouncer,
     activation_engine: Option<Arc<SpreadingActivationEngine>>,
+    auto_reinforcement: AutoReinforcementConfig,
     event_bus: Option<Arc<HybridEmitter>>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
 }
@@ -200,6 +201,7 @@ impl Orchestrator {
             analytics,
             analytics_debouncer,
             activation_engine,
+            auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: None,
             event_emitter: None,
         })
@@ -272,6 +274,7 @@ impl Orchestrator {
             analytics,
             analytics_debouncer,
             activation_engine,
+            auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
         })
@@ -346,6 +349,7 @@ impl Orchestrator {
             analytics,
             analytics_debouncer,
             activation_engine,
+            auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: None,
             event_emitter: Some(emitter),
         })
@@ -950,6 +954,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// Returns `None` when `EMBEDDING_PROVIDER=disabled` or initialization failed.
     pub fn activation_engine(&self) -> Option<&Arc<SpreadingActivationEngine>> {
         self.activation_engine.as_ref()
+    }
+
+    /// Get the auto-reinforcement configuration.
+    pub fn auto_reinforcement_config(&self) -> &AutoReinforcementConfig {
+        &self.auto_reinforcement
     }
 
     // ========================================================================

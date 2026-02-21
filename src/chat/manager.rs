@@ -963,6 +963,42 @@ impl ChatManager {
             }
         };
 
+        // Hook Niveau 3: auto-boost notes included in the system prompt context
+        {
+            let mut note_ids: Vec<uuid::Uuid> = Vec::new();
+            for n in &ctx.guidelines {
+                note_ids.push(n.id);
+            }
+            for n in &ctx.gotchas {
+                note_ids.push(n.id);
+            }
+            for n in &ctx.global_guidelines {
+                note_ids.push(n.id);
+            }
+            for n in &ctx.global_gotchas {
+                note_ids.push(n.id);
+            }
+            if !note_ids.is_empty() {
+                let graph = self.graph.clone();
+                let boost = 0.05; // context_energy_boost
+                tokio::spawn(async move {
+                    for id in &note_ids {
+                        if let Err(e) = graph.boost_energy(*id, boost).await {
+                            tracing::warn!(
+                                note_id = %id,
+                                error = %e,
+                                "Auto-reinforce context: energy boost failed"
+                            );
+                        }
+                    }
+                    tracing::debug!(
+                        notes = note_ids.len(),
+                        "Auto-reinforced notes included in system prompt"
+                    );
+                });
+            }
+        }
+
         // Try oneshot Opus refinement (with tool catalog for tool-aware prompting)
         let dynamic_section = if self.config.enable_oneshot_refinement {
             let context_json = context_to_json(&ctx);
