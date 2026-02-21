@@ -20,9 +20,21 @@ use uuid::Uuid;
 /// Compute cosine similarity between two vectors.
 /// Returns a value in [-1.0, 1.0] (1.0 = identical direction).
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| *x as f64 * *y as f64).sum();
-    let norm_a: f64 = a.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
-    let norm_b: f64 = b.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    let dot: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| *x as f64 * *y as f64)
+        .sum();
+    let norm_a: f64 = a
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt();
+    let norm_b: f64 = b
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt();
     if norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }
@@ -4209,6 +4221,29 @@ impl GraphStore for MockGraphStore {
         scored.truncate(limit);
 
         Ok(scored)
+    }
+
+    async fn list_notes_without_embedding(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Note>, usize)> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+
+        let mut without: Vec<Note> = notes
+            .values()
+            .filter(|n| !embeddings.contains_key(&n.id))
+            .cloned()
+            .collect();
+
+        // Sort by created_at ASC for deterministic ordering
+        without.sort_by_key(|n| n.created_at);
+
+        let total = without.len();
+        let page: Vec<Note> = without.into_iter().skip(offset).take(limit).collect();
+
+        Ok((page, total))
     }
 
     // ========================================================================

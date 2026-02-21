@@ -1366,8 +1366,15 @@ impl GraphStore for Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<(Note, f64)>> {
-        self.vector_search_notes(embedding, limit, project_id)
-            .await
+        self.vector_search_notes(embedding, limit, project_id).await
+    }
+
+    async fn list_notes_without_embedding(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<Note>, usize)> {
+        self.list_notes_without_embedding(limit, offset).await
     }
 
     // ========================================================================

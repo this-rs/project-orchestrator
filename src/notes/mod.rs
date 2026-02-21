@@ -13,5 +13,5 @@ pub mod models;
 
 pub use hashing::*;
 pub use lifecycle::*;
-pub use manager::NoteManager;
+pub use manager::{BackfillProgress, NoteManager};
 pub use models::*;

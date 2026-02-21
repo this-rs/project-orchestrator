@@ -7669,10 +7669,10 @@ impl Neo4jClient {
         .param("embedding", embedding_f64)
         .param("model", model.to_string());
 
-        self.graph.run(q).await.context(format!(
-            "Failed to set embedding on note {}",
-            note_id
-        ))?;
+        self.graph
+            .run(q)
+            .await
+            .context(format!("Failed to set embedding on note {}", note_id))?;
 
         Ok(())
     }
@@ -7727,6 +7727,55 @@ impl Neo4jClient {
         }
 
         Ok(notes)
+    }
+
+    pub async fn list_notes_without_embedding(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Note>, usize)> {
+        // Count total notes without embedding
+        let count_cypher = r#"
+            MATCH (n:Note)
+            WHERE n.embedding IS NULL
+            RETURN count(n) AS total
+        "#;
+        let mut count_result = self.graph.execute(query(count_cypher)).await?;
+        let total: usize = if let Some(row) = count_result.next().await? {
+            let count: i64 = row.get("total")?;
+            count as usize
+        } else {
+            0
+        };
+
+        if total == 0 {
+            return Ok((vec![], 0));
+        }
+
+        // Fetch notes without embedding
+        let cypher = r#"
+            MATCH (n:Note)
+            WHERE n.embedding IS NULL
+            RETURN n
+            ORDER BY n.created_at ASC
+            SKIP $offset
+            LIMIT $limit
+        "#;
+
+        let q = query(cypher)
+            .param("offset", offset as i64)
+            .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut notes = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("n")?;
+            let note = self.node_to_note(&node)?;
+            notes.push(note);
+        }
+
+        Ok((notes, total))
     }
 
     // Helper function to convert Note scope to type string

@@ -1030,12 +1030,8 @@ pub trait GraphStore: Send + Sync {
     /// - Keep the CRUD API backward compatible (no signature changes)
     /// - Allow the NoteManager to call it after creation (T1.4)
     /// - Support the backfill use case (T1.5)
-    async fn set_note_embedding(
-        &self,
-        note_id: Uuid,
-        embedding: &[f32],
-        model: &str,
-    ) -> Result<()>;
+    async fn set_note_embedding(&self, note_id: Uuid, embedding: &[f32], model: &str)
+        -> Result<()>;
 
     /// Search notes by vector similarity using the HNSW index.
     ///
@@ -1048,6 +1044,17 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         project_id: Option<Uuid>,
     ) -> Result<Vec<(Note, f64)>>;
+
+    /// List notes that don't have an embedding yet.
+    ///
+    /// Used by the backfill process (T1.5) to find notes that need embedding.
+    /// Returns (notes, total_count) where total_count is the total number of
+    /// notes without embeddings. Results are ordered by created_at ASC.
+    async fn list_notes_without_embedding(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Note>, usize)>;
 
     // ========================================================================
     // Chat session operations
