@@ -665,3 +665,97 @@ pub async fn cancel_backfill_embeddings(
         "message": "Cancellation requested. The job will stop after the current batch."
     })))
 }
+
+// ============================================================================
+// Neural search (spreading activation)
+// ============================================================================
+
+/// Query parameters for neural search
+#[derive(Debug, Deserialize)]
+pub struct NeuronSearchQuery {
+    pub query: String,
+    pub project_slug: Option<String>,
+    pub max_results: Option<usize>,
+    pub max_hops: Option<usize>,
+    pub min_score: Option<f64>,
+}
+
+/// Search notes using spreading activation (neural-style retrieval).
+///
+/// GET /api/notes/neurons/search?query=...&project_slug=...&max_results=10&max_hops=2&min_score=0.1
+pub async fn search_neurons(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<NeuronSearchQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let engine = state
+        .orchestrator
+        .activation_engine()
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Spreading activation unavailable: no embedding provider configured".to_string(),
+            )
+        })?;
+
+    // Resolve project_slug → project_id
+    let project_id = if let Some(ref slug) = query.project_slug {
+        let project = state
+            .orchestrator
+            .neo4j()
+            .get_project_by_slug(slug)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+        Some(project.id)
+    } else {
+        None
+    };
+
+    let config = crate::neurons::SpreadingActivationConfig {
+        max_results: query.max_results.unwrap_or(10),
+        max_hops: query.max_hops.unwrap_or(2),
+        min_activation: query.min_score.unwrap_or(0.1),
+        ..Default::default()
+    };
+
+    let start = std::time::Instant::now();
+    let results = engine
+        .activate(&query.query, project_id, &config)
+        .await
+        .map_err(AppError::Internal)?;
+    let query_time_ms = start.elapsed().as_millis() as u64;
+
+    let direct_matches = results
+        .iter()
+        .filter(|r| matches!(r.source, crate::neurons::ActivationSource::Direct))
+        .count();
+    let propagated_matches = results.len() - direct_matches;
+
+    let results_json: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.note.id,
+                "content": r.note.content,
+                "note_type": r.note.note_type,
+                "importance": r.note.importance,
+                "activation_score": r.activation_score,
+                "source": r.source,
+                "energy": r.note.energy,
+                "tags": r.note.tags,
+                "project_id": r.note.project_id,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "results": results_json,
+        "metadata": {
+            "total_activated": results.len(),
+            "direct_matches": direct_matches,
+            "propagated_matches": propagated_matches,
+            "query_time_ms": query_time_ms,
+            "max_hops": config.max_hops,
+            "min_score": config.min_activation,
+        }
+    })))
+}

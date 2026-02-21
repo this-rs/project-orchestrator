@@ -481,6 +481,10 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         // Notes search
         .route("/api/notes/search", get(note_handlers::search_notes))
+        .route(
+            "/api/notes/neurons/search",
+            get(note_handlers::search_neurons),
+        )
         // Notes needing review
         .route(
             "/api/notes/needs-review",

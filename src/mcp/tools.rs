@@ -1465,6 +1465,21 @@ fn note_tools() -> Vec<ToolDefinition> {
             },
         },
         ToolDefinition {
+            name: "search_neurons".to_string(),
+            description: "Search notes using spreading activation — neural-style retrieval that finds semantically related notes AND their graph neighbors via synapses. Complements search_notes (BM25) and search_notes_semantic (vector-only). 3-phase algorithm: embed query → vector search → spread activation through synapses (weighted by energy and synapse strength). Returns notes ranked by activation score with provenance (direct match vs propagated).".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "query": {"type": "string", "description": "Natural language search query"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug (resolves to project_id)"},
+                    "max_results": {"type": "integer", "description": "Max results to return (default 10)"},
+                    "max_hops": {"type": "integer", "description": "Max spreading hops through synapses (default 2)"},
+                    "min_score": {"type": "number", "description": "Minimum activation score threshold (default 0.1)"}
+                })),
+                required: Some(vec!["query".to_string()]),
+            },
+        },
+        ToolDefinition {
             name: "list_project_notes".to_string(),
             description: "List notes for a specific project".to_string(),
             input_schema: InputSchema {
@@ -2216,7 +2231,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 155, "Expected 155 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 156, "Expected 156 tools, got {}", tools.len());
     }
 
     #[test]

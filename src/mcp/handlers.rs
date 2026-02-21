@@ -176,6 +176,7 @@ impl ToolHandler {
             "get_notes_needing_review" => self.get_notes_needing_review(args).await,
             "update_staleness_scores" => self.update_staleness_scores(args).await,
             "update_energy_scores" => self.update_energy_scores(args).await,
+            "search_neurons" => self.search_neurons(args).await,
             "list_project_notes" => self.list_project_notes(args).await,
             "get_propagated_notes" => self.get_propagated_notes(args).await,
             "get_entity_notes" => self.get_entity_notes(args).await,
@@ -2525,6 +2526,92 @@ impl ToolHandler {
             .await?;
 
         Ok(json!({"notes_updated": count, "half_life_days": half_life}))
+    }
+
+    async fn search_neurons(&self, args: Value) -> Result<Value> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("query is required"))?;
+
+        let engine = self
+            .orchestrator
+            .activation_engine()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Spreading activation unavailable: no embedding provider configured. \
+                     Set EMBEDDING_PROVIDER=local or EMBEDDING_PROVIDER=http to enable."
+                )
+            })?;
+
+        // Resolve project_slug → project_id if provided
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            let project = self
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
+            Some(project.id)
+        } else {
+            None
+        };
+
+        let config = crate::neurons::SpreadingActivationConfig {
+            max_results: args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(10),
+            max_hops: args
+                .get("max_hops")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(2),
+            min_activation: args
+                .get("min_score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.1),
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        let results = engine.activate(query, project_id, &config).await?;
+        let query_time_ms = start.elapsed().as_millis() as u64;
+
+        let direct_matches = results
+            .iter()
+            .filter(|r| matches!(r.source, crate::neurons::ActivationSource::Direct))
+            .count();
+        let propagated_matches = results.len() - direct_matches;
+
+        let results_json: Vec<Value> = results
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.note.id,
+                    "content": r.note.content,
+                    "note_type": r.note.note_type,
+                    "importance": r.note.importance,
+                    "activation_score": r.activation_score,
+                    "source": r.source,
+                    "energy": r.note.energy,
+                    "tags": r.note.tags,
+                    "project_id": r.note.project_id,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "results": results_json,
+            "metadata": {
+                "total_activated": results.len(),
+                "direct_matches": direct_matches,
+                "propagated_matches": propagated_matches,
+                "query_time_ms": query_time_ms,
+                "max_hops": config.max_hops,
+                "min_score": config.min_activation,
+            }
+        }))
     }
 
     async fn list_project_notes(&self, args: Value) -> Result<Value> {
