@@ -530,6 +530,18 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(note_handlers::get_entity_notes),
         )
         // ================================================================
+        // Admin — Embedding Backfill
+        // ================================================================
+        .route(
+            "/api/admin/backfill-embeddings",
+            post(note_handlers::start_backfill_embeddings)
+                .delete(note_handlers::cancel_backfill_embeddings),
+        )
+        .route(
+            "/api/admin/backfill-embeddings/status",
+            get(note_handlers::get_backfill_embeddings_status),
+        )
+        // ================================================================
         // Meilisearch Maintenance
         // ================================================================
         .route(

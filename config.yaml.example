@@ -58,6 +58,43 @@ meilisearch:
 #   url: "nats://localhost:4222"     # NATS_URL env override
 
 # -----------------------------------------------------------------------------
+# Embeddings — Vector embedding provider for semantic search
+# -----------------------------------------------------------------------------
+# Two providers available:
+#
+# 1. Local (default) — In-process ONNX Runtime via fastembed-rs
+#    Zero external dependency, ~3-50ms latency, works offline.
+#    Embeddings are available out of the box with no configuration needed.
+#
+# 2. HTTP (opt-in) — Any OpenAI-compatible /v1/embeddings endpoint
+#    For premium/specialized models (OpenAI, Voyage, Cohere, etc.)
+#    Set EMBEDDING_PROVIDER=http to switch to an external provider.
+#
+# Set EMBEDDING_PROVIDER=disabled to turn off embeddings entirely.
+#
+# embedding:
+#   # Provider selection: "local" (default), "http", or "disabled"
+#   provider: "local"              # EMBEDDING_PROVIDER env override
+#
+#   # ── Local provider settings (default, zero config) ────────────────
+#   # fastembed_model: "multilingual-e5-base"    # FASTEMBED_MODEL env override
+#   # fastembed_cache_dir: ".fastembed_cache"     # FASTEMBED_CACHE_DIR env override
+#   #
+#   # Supported local models (768d, compatible with Neo4j index):
+#   #   multilingual-e5-base (default, FR/EN/100+ languages)
+#   #   nomic-embed-text-v1.5, bge-base-en-v1.5, gte-base-en-v1.5
+#   #
+#   # Other dimensions (require Neo4j index reconfiguration):
+#   #   384d: all-minilm-l6-v2, bge-small-en-v1.5
+#   #   1024d: bge-m3 (multilingual), bge-large-en-v1.5, multilingual-e5-large
+#
+#   # ── HTTP provider settings (opt-in for premium models) ────────────
+#   # url: "https://api.openai.com/v1/embeddings"   # EMBEDDING_URL env override
+#   # model: "text-embedding-3-small"                # EMBEDDING_MODEL env override
+#   # api_key: "sk-..."                              # EMBEDDING_API_KEY env override
+#   # dimensions: 768                                # EMBEDDING_DIMENSIONS env override
+
+# -----------------------------------------------------------------------------
 # Chat — Claude Code integration (optional, uses env vars)
 # -----------------------------------------------------------------------------
 chat:

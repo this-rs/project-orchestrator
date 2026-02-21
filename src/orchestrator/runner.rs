@@ -1,5 +1,6 @@
 //! Main orchestrator runner
 
+use crate::embeddings::{EmbeddingProvider, FastEmbedProvider, HttpEmbeddingProvider};
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
@@ -76,12 +77,81 @@ pub struct Orchestrator {
     event_emitter: Option<Arc<dyn EventEmitter>>,
 }
 
+/// Try to create an embedding provider from environment variables.
+///
+/// Provider selection via `EMBEDDING_PROVIDER` env var:
+/// - `local` (default) → [`FastEmbedProvider`] using in-process ONNX Runtime (zero external dependency)
+/// - `http` → [`HttpEmbeddingProvider`] using any OpenAI-compatible API (for premium/external models)
+/// - `disabled` → No embedding provider (semantic search unavailable)
+///
+/// Returns `None` if disabled or initialization fails. Logs the result at info level.
+fn init_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
+    let provider_type = std::env::var("EMBEDDING_PROVIDER")
+        .unwrap_or_else(|_| "local".to_string())
+        .to_lowercase();
+
+    match provider_type.as_str() {
+        "http" => init_http_embedding_provider(),
+        "disabled" | "none" | "off" => {
+            tracing::info!("Embedding provider disabled (EMBEDDING_PROVIDER=disabled)");
+            None
+        }
+        // Default: local fastembed
+        _ => init_local_embedding_provider(),
+    }
+}
+
+/// Initialize the local fastembed ONNX embedding provider (default).
+fn init_local_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
+    match FastEmbedProvider::from_env() {
+        Ok(provider) => {
+            tracing::info!(
+                model = provider.model_name(),
+                dimensions = provider.dimensions(),
+                provider = "local",
+                "Embedding provider initialized (local ONNX via fastembed)"
+            );
+            Some(Arc::new(provider))
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Failed to initialize local embedding provider"
+            );
+            None
+        }
+    }
+}
+
+/// Initialize the HTTP-based embedding provider (Ollama, OpenAI, etc.)
+fn init_http_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
+    match HttpEmbeddingProvider::from_env() {
+        Some(provider) => {
+            tracing::info!(
+                model = provider.model_name(),
+                dimensions = provider.dimensions(),
+                provider = "http",
+                "Embedding provider initialized (HTTP)"
+            );
+            Some(Arc::new(provider))
+        }
+        None => {
+            tracing::info!("HTTP embedding provider not configured (set EMBEDDING_URL to enable)");
+            None
+        }
+    }
+}
+
 impl Orchestrator {
     /// Create a new orchestrator
     pub async fn new(state: AppState) -> Result<Self> {
         let plan_manager = Arc::new(PlanManager::new(state.neo4j.clone(), state.meili.clone()));
 
-        let note_manager = Arc::new(NoteManager::new(state.neo4j.clone(), state.meili.clone()));
+        let mut note_manager = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        if let Some(provider) = init_embedding_provider() {
+            note_manager = note_manager.with_embedding_provider(provider);
+        }
+        let note_manager = Arc::new(note_manager);
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
@@ -136,11 +206,15 @@ impl Orchestrator {
             emitter.clone(),
         ));
 
-        let note_manager = Arc::new(NoteManager::with_event_emitter(
+        let mut note_manager = NoteManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
             emitter.clone(),
-        ));
+        );
+        if let Some(provider) = init_embedding_provider() {
+            note_manager = note_manager.with_embedding_provider(provider);
+        }
+        let note_manager = Arc::new(note_manager);
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),
@@ -196,11 +270,15 @@ impl Orchestrator {
             emitter.clone(),
         ));
 
-        let note_manager = Arc::new(NoteManager::with_event_emitter(
+        let mut note_manager = NoteManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
             emitter.clone(),
-        ));
+        );
+        if let Some(provider) = init_embedding_provider() {
+            note_manager = note_manager.with_embedding_provider(provider);
+        }
+        let note_manager = Arc::new(note_manager);
 
         let context_builder = Arc::new(ContextBuilder::new(
             state.neo4j.clone(),

@@ -17,6 +17,30 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+/// Compute cosine similarity between two vectors.
+/// Returns a value in [-1.0, 1.0] (1.0 = identical direction).
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| *x as f64 * *y as f64)
+        .sum();
+    let norm_a: f64 = a
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt();
+    let norm_b: f64 = b
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
+}
+
 /// In-memory mock implementation of GraphStore for testing.
 pub struct MockGraphStore {
     // Entity stores
@@ -90,6 +114,8 @@ pub struct MockGraphStore {
     pub file_analytics: RwLock<HashMap<String, crate::graph::models::FileAnalyticsUpdate>>,
     /// Analytics scores stored for Function nodes (keyed by name)
     pub function_analytics: RwLock<HashMap<String, crate::graph::models::FunctionAnalyticsUpdate>>,
+    /// Note embeddings (note_id -> (embedding, model_name))
+    pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
 }
 
 #[allow(dead_code)]
@@ -158,6 +184,7 @@ impl MockGraphStore {
             feature_graph_entities: RwLock::new(HashMap::new()),
             file_analytics: RwLock::new(HashMap::new()),
             function_analytics: RwLock::new(HashMap::new()),
+            note_embeddings: RwLock::new(HashMap::new()),
         }
     }
 
@@ -4143,6 +4170,105 @@ impl GraphStore for MockGraphStore {
             .get(&note_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn set_note_embedding(
+        &self,
+        note_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        self.note_embeddings
+            .write()
+            .await
+            .insert(note_id, (embedding.to_vec(), model.to_string()));
+        Ok(())
+    }
+
+    async fn vector_search_notes(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<(Note, f64)>> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+
+        // Resolve workspace_slug to a set of project IDs
+        let workspace_project_ids: Option<Vec<Uuid>> = if project_id.is_none() {
+            if let Some(slug) = workspace_slug {
+                let ws = self.get_workspace_by_slug(slug).await?;
+                if let Some(ws) = ws {
+                    let wp = self.workspace_projects.read().await;
+                    Some(wp.get(&ws.id).cloned().unwrap_or_default())
+                } else {
+                    Some(vec![]) // unknown workspace → no results
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut scored: Vec<(Note, f64)> = notes
+            .values()
+            .filter(|n| {
+                // Filter by status
+                matches!(n.status, NoteStatus::Active | NoteStatus::NeedsReview)
+            })
+            .filter(|n| {
+                // Filter by project_id or workspace projects
+                if let Some(pid) = project_id {
+                    n.project_id == Some(pid)
+                } else if let Some(ref ws_pids) = workspace_project_ids {
+                    // Include notes from workspace projects + global notes
+                    match n.project_id {
+                        Some(pid) => ws_pids.contains(&pid),
+                        None => true, // global notes included
+                    }
+                } else {
+                    true // no filter
+                }
+            })
+            .filter_map(|n| {
+                // Must have an embedding
+                embeddings.get(&n.id).map(|(emb, _model)| {
+                    let score = cosine_similarity(embedding, emb);
+                    (n.clone(), score)
+                })
+            })
+            .collect();
+
+        // Sort by score descending
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored)
+    }
+
+    async fn list_notes_without_embedding(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Note>, usize)> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+
+        let mut without: Vec<Note> = notes
+            .values()
+            .filter(|n| !embeddings.contains_key(&n.id))
+            .cloned()
+            .collect();
+
+        // Sort by created_at ASC for deterministic ordering
+        without.sort_by_key(|n| n.created_at);
+
+        let total = without.len();
+        let page: Vec<Note> = without.into_iter().skip(offset).take(limit).collect();
+
+        Ok((page, total))
     }
 
     // ========================================================================

@@ -108,9 +108,10 @@ Workspace
 ### Phase 0 — Warm-up (OBLIGATOIRE au début de chaque conversation)
 
 Avant tout travail, charger les connaissances pertinentes :
-1. `search_notes(query)` — chercher les notes liées au sujet de la demande
+1. `search_notes_semantic(query)` — recherche vectorielle de notes (cosine similarity, trouve les notes sémantiquement proches même sans correspondance de mots-clés)
 2. `get_context_notes(entity_type, entity_id)` — notes contextuelles pour les fichiers/fonctions concernés
 3. `search_decisions(query)` — décisions architecturales passées sur le sujet
+4. `search_notes(query)` — recherche BM25 complémentaire si besoin de correspondance exacte de mots-clés
 
 Cela évite de refaire un travail déjà documenté ou de violer une convention déjà établie.
 
@@ -280,7 +281,12 @@ Hiérarchie de recherche (du plus recommandé au moins recommandé) :
 7. **Types et traits** → `find_trait_implementations(trait)` / `find_type_traits(type)` / `get_impl_blocks(type)`
    - Naviguer le système de types via le graphe
 
-8. **Dernier recours** → Grep/Read de Claude Code
+8. **Recherche de notes** → `search_notes_semantic(query)` (vectorielle) / `search_notes(query)` (BM25)
+   - `search_notes_semantic` : recherche par similarité cosine via embeddings — trouve les notes conceptuellement proches même sans correspondance de mots-clés. Préférer pour les questions en langage naturel.
+   - `search_notes` : recherche BM25 classique — meilleure pour les mots-clés exacts, noms de fonctions, identifiants.
+   - **Utilise ceci au lieu de** : parcourir manuellement les notes ou deviner leur existence
+
+9. **Dernier recours** → Grep/Read de Claude Code
    - UNIQUEMENT pour des chaînes littérales exactes (messages d'erreur, constantes, URLs)
    - UNIQUEMENT si les outils MCP ci-dessus ne retournent pas de résultat pertinent
 
@@ -627,8 +633,12 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 description: "Supprimer une note",
             },
             ToolRef {
+                name: "search_notes_semantic",
+                description: "Recherche vectorielle de notes (cosine similarity)",
+            },
+            ToolRef {
                 name: "search_notes",
-                description: "Recherche sémantique de notes",
+                description: "Recherche BM25 de notes (mots-clés)",
             },
             ToolRef {
                 name: "list_notes",
@@ -2057,6 +2067,7 @@ mod tests {
         // T6 behavioral directives
         assert!(BASE_SYSTEM_PROMPT.contains("Warm-up"));
         assert!(BASE_SYSTEM_PROMPT.contains("search_notes"));
+        assert!(BASE_SYSTEM_PROMPT.contains("search_notes_semantic"));
         assert!(BASE_SYSTEM_PROMPT.contains("Capture des connaissances (OBLIGATOIRE)"));
         assert!(BASE_SYSTEM_PROMPT.contains("create_note"));
         assert!(BASE_SYSTEM_PROMPT.contains("link_note_to_entity"));
@@ -2512,11 +2523,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_153_tools() {
+    fn test_tool_groups_cover_all_154_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 153,
-            "TOOL_GROUPS must cover exactly 153 unique tools (got {}). \
+            count, 154,
+            "TOOL_GROUPS must cover exactly 154 unique tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

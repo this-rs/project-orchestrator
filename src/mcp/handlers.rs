@@ -166,6 +166,7 @@ impl ToolHandler {
             "update_note" => self.update_note(args).await,
             "delete_note" => self.delete_note(args).await,
             "search_notes" => self.search_notes(args).await,
+            "search_notes_semantic" => self.search_notes_semantic(args).await,
             "confirm_note" => self.confirm_note(args).await,
             "invalidate_note" => self.invalidate_note(args).await,
             "supersede_note" => self.supersede_note(args).await,
@@ -2288,6 +2289,40 @@ impl ToolHandler {
             .orchestrator
             .note_manager()
             .search_notes(query, &filters)
+            .await?;
+
+        Ok(serde_json::to_value(hits)?)
+    }
+
+    async fn search_notes_semantic(&self, args: Value) -> Result<Value> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("query is required"))?;
+
+        // Resolve project_slug → project_id if provided
+        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+            let project = self
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await?
+                .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
+            Some(project.id)
+        } else {
+            None
+        };
+
+        let workspace_slug = args.get("workspace_slug").and_then(|v| v.as_str());
+
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let hits = self
+            .orchestrator
+            .note_manager()
+            .semantic_search_notes(query, project_id, workspace_slug, limit)
             .await?;
 
         Ok(serde_json::to_value(hits)?)

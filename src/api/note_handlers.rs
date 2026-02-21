@@ -3,9 +3,9 @@
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::notes::{
-    CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note, NoteContextResponse,
-    NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus, NoteType, PropagatedNote,
-    UpdateNoteRequest,
+    BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
+    NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus,
+    NoteType, PropagatedNote, UpdateNoteRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -13,6 +13,9 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 // ============================================================================
@@ -491,4 +494,174 @@ pub async fn get_entity_notes(
         .await?;
 
     Ok(Json(notes))
+}
+
+// ============================================================================
+// Embedding Backfill (Admin)
+// ============================================================================
+
+/// Status of the embedding backfill job
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackfillJobStatus {
+    /// No backfill has been run
+    Idle,
+    /// Backfill is currently running
+    Running,
+    /// Backfill completed successfully
+    Completed,
+    /// Backfill failed with an error
+    Failed,
+    /// Backfill was cancelled by user
+    Cancelled,
+}
+
+/// Full state of the embedding backfill job (returned by status endpoint)
+#[derive(Debug, Clone, Serialize)]
+pub struct BackfillJobState {
+    pub status: BackfillJobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<BackfillProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Default for BackfillJobState {
+    fn default() -> Self {
+        Self {
+            status: BackfillJobStatus::Idle,
+            progress: None,
+            started_at: None,
+            finished_at: None,
+            error: None,
+        }
+    }
+}
+
+/// Request body for starting a backfill
+#[derive(Debug, Deserialize)]
+pub struct StartBackfillBody {
+    /// Number of notes per batch (default: 50)
+    pub batch_size: Option<usize>,
+}
+
+/// Singleton state for the backfill job (only one can run at a time)
+static BACKFILL_STATE: LazyLock<Arc<RwLock<BackfillJobState>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(BackfillJobState::default())));
+
+/// Cancellation flag for the backfill job
+static BACKFILL_CANCEL: LazyLock<Arc<AtomicBool>> =
+    LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+
+/// POST /api/admin/backfill-embeddings — Start embedding backfill in background
+///
+/// Returns 202 Accepted immediately. The backfill runs asynchronously.
+/// Use GET /api/admin/backfill-embeddings/status to monitor progress.
+/// Returns 409 Conflict if a backfill is already running.
+pub async fn start_backfill_embeddings(
+    State(state): State<OrchestratorState>,
+    body: Option<Json<StartBackfillBody>>,
+) -> Result<(StatusCode, Json<BackfillJobState>), AppError> {
+    let batch_size = body.and_then(|b| b.batch_size).unwrap_or(50);
+
+    // Check if already running
+    {
+        let current = BACKFILL_STATE.read().await;
+        if current.status == BackfillJobStatus::Running {
+            return Err(AppError::Conflict(
+                "A backfill job is already running. Use DELETE to cancel it first.".to_string(),
+            ));
+        }
+    }
+
+    // Reset cancel flag
+    BACKFILL_CANCEL.store(false, Ordering::SeqCst);
+
+    // Set state to Running
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let mut s = BACKFILL_STATE.write().await;
+        *s = BackfillJobState {
+            status: BackfillJobStatus::Running,
+            progress: None,
+            started_at: Some(now),
+            finished_at: None,
+            error: None,
+        };
+    }
+
+    // Clone what we need for the background task
+    let note_manager = state.orchestrator.note_manager().clone();
+    let cancel_flag = BACKFILL_CANCEL.clone();
+    let job_state = BACKFILL_STATE.clone();
+
+    // Spawn background task
+    tokio::spawn(async move {
+        let result = note_manager
+            .backfill_embeddings(batch_size, Some(&cancel_flag))
+            .await;
+
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let mut s = job_state.write().await;
+
+        match result {
+            Ok(progress) => {
+                let was_cancelled = cancel_flag.load(Ordering::SeqCst);
+                s.status = if was_cancelled {
+                    BackfillJobStatus::Cancelled
+                } else {
+                    BackfillJobStatus::Completed
+                };
+                s.progress = Some(progress);
+                s.finished_at = Some(finished_at);
+            }
+            Err(e) => {
+                tracing::error!("Backfill embeddings failed: {e:#}");
+                s.status = BackfillJobStatus::Failed;
+                s.error = Some(e.to_string());
+                s.finished_at = Some(finished_at);
+            }
+        }
+    });
+
+    // Return 202 Accepted with current state
+    let current = BACKFILL_STATE.read().await;
+    Ok((StatusCode::ACCEPTED, Json(current.clone())))
+}
+
+/// GET /api/admin/backfill-embeddings/status — Get backfill job status
+pub async fn get_backfill_embeddings_status(
+    State(_state): State<OrchestratorState>,
+) -> Result<Json<BackfillJobState>, AppError> {
+    let current = BACKFILL_STATE.read().await;
+    Ok(Json(current.clone()))
+}
+
+/// DELETE /api/admin/backfill-embeddings — Cancel a running backfill job
+///
+/// Sets the cancellation flag. The background task will stop after
+/// finishing its current batch and update the status to Cancelled.
+pub async fn cancel_backfill_embeddings(
+    State(_state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let is_running = {
+        let current = BACKFILL_STATE.read().await;
+        current.status == BackfillJobStatus::Running
+    };
+
+    if !is_running {
+        return Err(AppError::BadRequest(
+            "No backfill job is currently running".to_string(),
+        ));
+    }
+
+    BACKFILL_CANCEL.store(true, Ordering::SeqCst);
+
+    Ok(Json(serde_json::json!({
+        "message": "Cancellation requested. The job will stop after the current batch."
+    })))
 }

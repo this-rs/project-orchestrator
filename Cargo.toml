@@ -99,6 +99,9 @@ rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 rand = "0.10.0"
 
+# Local embeddings via ONNX Runtime (default provider — zero external dependency)
+fastembed = "5.11"
+
 [features]
 default = []
 embedded-frontend = ["dep:rust-embed", "dep:mime_guess"]

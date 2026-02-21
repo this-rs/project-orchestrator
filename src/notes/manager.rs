@@ -4,6 +4,7 @@
 //! including linking notes to entities and managing note lifecycle.
 
 use super::models::*;
+use crate::embeddings::EmbeddingProvider;
 use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter};
 use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
@@ -17,6 +18,7 @@ pub struct NoteManager {
     neo4j: Arc<dyn GraphStore>,
     meilisearch: Arc<dyn SearchStore>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl NoteManager {
@@ -26,6 +28,7 @@ impl NoteManager {
             neo4j,
             meilisearch,
             event_emitter: None,
+            embedding_provider: None,
         }
     }
 
@@ -39,13 +42,59 @@ impl NoteManager {
             neo4j,
             meilisearch,
             event_emitter: Some(emitter),
+            embedding_provider: None,
         }
+    }
+
+    /// Add an embedding provider to this NoteManager (builder pattern).
+    ///
+    /// When set, notes will be automatically embedded on creation and update.
+    /// Embedding failures are logged but do not block the note operation.
+    pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedding_provider = Some(provider);
+        self
     }
 
     /// Emit a CRUD event (no-op if event_emitter is None)
     fn emit(&self, event: crate::events::CrudEvent) {
         if let Some(emitter) = &self.event_emitter {
             emitter.emit(event);
+        }
+    }
+
+    /// Generate and store an embedding for a note's content.
+    ///
+    /// This is a best-effort operation: if the embedding provider is not configured
+    /// or the embedding fails, the note is still created/updated successfully.
+    /// Embedding errors are logged at warn level but never propagated.
+    async fn embed_note(&self, note_id: Uuid, content: &str) {
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => return,
+        };
+
+        match provider.embed_text(content).await {
+            Ok(embedding) => {
+                let model = provider.model_name().to_string();
+                if let Err(e) = self
+                    .neo4j
+                    .set_note_embedding(note_id, &embedding, &model)
+                    .await
+                {
+                    tracing::warn!(
+                        note_id = %note_id,
+                        error = %e,
+                        "Failed to store note embedding"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    note_id = %note_id,
+                    error = %e,
+                    "Failed to generate note embedding"
+                );
+            }
         }
     }
 
@@ -87,6 +136,9 @@ impl NoteManager {
             }
         }
 
+        // Generate embedding (best-effort, non-blocking for note creation)
+        self.embed_note(note.id, &note.content).await;
+
         self.emit(
             CrudEvent::new(
                 EventEntityType::Note,
@@ -115,6 +167,8 @@ impl NoteManager {
 
     /// Update a note
     pub async fn update_note(&self, id: Uuid, input: UpdateNoteRequest) -> Result<Option<Note>> {
+        let content_changed = input.content.is_some();
+
         let updated = self
             .neo4j
             .update_note(
@@ -131,6 +185,11 @@ impl NoteManager {
         if let Some(ref note) = updated {
             let doc = self.note_to_document(note, None).await?;
             self.meilisearch.index_note(&doc).await?;
+
+            // Re-embed if content changed (best-effort)
+            if content_changed {
+                self.embed_note(id, &note.content).await;
+            }
 
             self.emit(
                 CrudEvent::new(EventEntityType::Note, CrudAction::Updated, id.to_string())
@@ -406,6 +465,65 @@ impl NoteManager {
         Ok(results)
     }
 
+    /// Search notes using vector similarity (cosine) via Neo4j HNSW index.
+    ///
+    /// Embeds the query text using the configured embedding provider, then
+    /// performs a vector similarity search against stored note embeddings.
+    /// Falls back to BM25 text search (Meilisearch) if no embedding provider
+    /// is configured.
+    ///
+    /// # Arguments
+    /// * `query` - Natural language search query
+    /// * `project_id` - Optional filter by project UUID
+    /// * `workspace_slug` - Optional filter by workspace (includes all projects in workspace + global notes)
+    /// * `limit` - Maximum number of results (default 20)
+    pub async fn semantic_search_notes(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<NoteSearchHit>> {
+        let limit = limit.unwrap_or(20);
+
+        // If no embedding provider, fall back to BM25 text search
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "semantic_search_notes: no embedding provider configured, falling back to BM25 text search"
+                );
+                let filters = NoteFilters {
+                    limit: Some(limit as i64),
+                    ..Default::default()
+                };
+                return self.search_notes(query, &filters).await;
+            }
+        };
+
+        // Embed the query text
+        let query_embedding = provider
+            .embed_text(query)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to embed search query: {}", e))?;
+
+        // Perform vector similarity search via Neo4j HNSW index
+        let results = self
+            .neo4j
+            .vector_search_notes(&query_embedding, limit, project_id, workspace_slug)
+            .await?;
+
+        // Convert to NoteSearchHit
+        Ok(results
+            .into_iter()
+            .map(|(note, score)| NoteSearchHit {
+                note,
+                score,
+                highlights: None,
+            })
+            .collect())
+    }
+
     // ========================================================================
     // Context Operations
     // ========================================================================
@@ -582,6 +700,159 @@ impl NoteManager {
             staleness_score: note.staleness_score,
         })
     }
+
+    // ========================================================================
+    // Embedding Backfill
+    // ========================================================================
+
+    /// Backfill embeddings for all notes that don't have one yet.
+    ///
+    /// Processes notes in batches, generating embeddings and storing them.
+    /// This operation is **idempotent**: re-running it only processes notes
+    /// that still lack an embedding.
+    ///
+    /// Returns a `BackfillProgress` with the final counts.
+    ///
+    /// # Arguments
+    /// * `batch_size` - Number of notes to process per batch (default: 50)
+    /// * `cancel` - Optional cancellation flag; set to `true` to stop early
+    pub async fn backfill_embeddings(
+        &self,
+        batch_size: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<BackfillProgress> {
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => anyhow::bail!("No embedding provider configured"),
+        };
+
+        let batch_size = if batch_size == 0 { 50 } else { batch_size };
+
+        // Get total count first
+        let (_, total) = self.neo4j.list_notes_without_embedding(0, 0).await?;
+        if total == 0 {
+            tracing::info!("Backfill: all notes already have embeddings");
+            return Ok(BackfillProgress {
+                total,
+                processed: 0,
+                errors: 0,
+                skipped: 0,
+            });
+        }
+
+        tracing::info!("Backfill: {total} notes need embeddings");
+        let mut processed = 0usize;
+        let mut errors = 0usize;
+
+        loop {
+            // Check cancellation
+            if let Some(flag) = cancel {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("Backfill cancelled at {processed}/{total}");
+                    break;
+                }
+            }
+
+            // Fetch next batch (always offset 0 because processed notes disappear)
+            let (batch, remaining) = self
+                .neo4j
+                .list_notes_without_embedding(batch_size, 0)
+                .await?;
+            if batch.is_empty() || remaining == 0 {
+                break;
+            }
+
+            // Collect texts for batch embedding
+            let texts: Vec<String> = batch.iter().map(|n| n.content.clone()).collect();
+            let note_ids: Vec<Uuid> = batch.iter().map(|n| n.id).collect();
+
+            match provider.embed_batch(&texts).await {
+                Ok(embeddings) => {
+                    let model = provider.model_name().to_string();
+                    for (i, embedding) in embeddings.into_iter().enumerate() {
+                        if let Err(e) = self
+                            .neo4j
+                            .set_note_embedding(note_ids[i], &embedding, &model)
+                            .await
+                        {
+                            tracing::warn!(
+                                note_id = %note_ids[i],
+                                error = %e,
+                                "Backfill: failed to store embedding"
+                            );
+                            errors += 1;
+                        } else {
+                            processed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Batch embedding failed — try one by one as fallback
+                    tracing::warn!(
+                        error = %e,
+                        batch_size = texts.len(),
+                        "Backfill: batch embedding failed, falling back to individual"
+                    );
+                    for (i, text) in texts.iter().enumerate() {
+                        match provider.embed_text(text).await {
+                            Ok(embedding) => {
+                                let model = provider.model_name().to_string();
+                                if let Err(e) = self
+                                    .neo4j
+                                    .set_note_embedding(note_ids[i], &embedding, &model)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        note_id = %note_ids[i],
+                                        error = %e,
+                                        "Backfill: failed to store embedding"
+                                    );
+                                    errors += 1;
+                                } else {
+                                    processed += 1;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    note_id = %note_ids[i],
+                                    error = %e,
+                                    "Backfill: failed to embed note, skipping"
+                                );
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::info!("Backfill: {processed}/{total} notes embedded ({errors} errors)");
+        }
+
+        let skipped = total.saturating_sub(processed + errors);
+        tracing::info!(
+            "Backfill complete: {processed} processed, {errors} errors, {skipped} skipped"
+        );
+
+        Ok(BackfillProgress {
+            total,
+            processed,
+            errors,
+            skipped,
+        })
+    }
+}
+
+/// Progress report for the embedding backfill operation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackfillProgress {
+    /// Total number of notes that needed embedding at start
+    pub total: usize,
+    /// Number of notes successfully embedded
+    pub processed: usize,
+    /// Number of notes that failed embedding
+    pub errors: usize,
+    /// Number of notes skipped (cancelled before processing)
+    pub skipped: usize,
 }
 
 #[cfg(test)]
@@ -1032,6 +1303,273 @@ mod tests {
         assert_eq!(project_notes[0].project_id, Some(project.id));
     }
 
+    // ====================================================================
+    // Embedding integration
+    // ====================================================================
+
+    /// Helper: build a NoteManager backed by mock stores **with** a MockEmbeddingProvider.
+    /// Returns (NoteManager, project_id, Arc<MockGraphStore>) so tests can inspect embeddings.
+    async fn create_note_manager_with_embeddings(
+    ) -> (NoteManager, Uuid, Arc<crate::neo4j::mock::MockGraphStore>) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let meili = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = test_project();
+        let project_id = project.id;
+        graph.create_project(&project).await.unwrap();
+
+        let provider = Arc::new(crate::embeddings::MockEmbeddingProvider::new(768));
+
+        let manager = NoteManager::new(graph.clone() as Arc<dyn crate::neo4j::GraphStore>, meili)
+            .with_embedding_provider(provider);
+
+        (manager, project_id, graph)
+    }
+
+    #[tokio::test]
+    async fn test_create_note_generates_embedding() {
+        let (mgr, pid, graph) = create_note_manager_with_embeddings().await;
+        let req = make_create_request(pid, "Always handle errors with Result");
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Verify embedding was stored in the graph
+        let embeddings = graph.note_embeddings.read().await;
+        let (embedding, model) = embeddings
+            .get(&note.id)
+            .expect("embedding should be stored");
+        assert_eq!(embedding.len(), 768);
+        assert_eq!(model, "mock-hash-embedding");
+    }
+
+    #[tokio::test]
+    async fn test_update_note_content_regenerates_embedding() {
+        let (mgr, pid, graph) = create_note_manager_with_embeddings().await;
+        let req = make_create_request(pid, "Original content for embedding");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Grab original embedding
+        let original_embedding = {
+            let embeddings = graph.note_embeddings.read().await;
+            embeddings.get(&note.id).unwrap().0.clone()
+        };
+
+        // Update content — should regenerate embedding
+        let update = UpdateNoteRequest {
+            content: Some("Completely different content for re-embedding".to_string()),
+            importance: None,
+            status: None,
+            tags: None,
+        };
+        mgr.update_note(note.id, update).await.unwrap();
+
+        // Verify embedding changed (different content → different hash → different vector)
+        let embeddings = graph.note_embeddings.read().await;
+        let (new_embedding, model) = embeddings.get(&note.id).unwrap();
+        assert_eq!(new_embedding.len(), 768);
+        assert_eq!(model, "mock-hash-embedding");
+        assert_ne!(
+            &original_embedding, new_embedding,
+            "embedding should change when content changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_note_without_content_keeps_embedding() {
+        let (mgr, pid, graph) = create_note_manager_with_embeddings().await;
+        let req = make_create_request(pid, "Stable content");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Grab original embedding
+        let original_embedding = {
+            let embeddings = graph.note_embeddings.read().await;
+            embeddings.get(&note.id).unwrap().0.clone()
+        };
+
+        // Update only importance — should NOT regenerate embedding
+        let update = UpdateNoteRequest {
+            content: None,
+            importance: Some(NoteImportance::Critical),
+            status: None,
+            tags: None,
+        };
+        mgr.update_note(note.id, update).await.unwrap();
+
+        // Verify embedding is unchanged
+        let embeddings = graph.note_embeddings.read().await;
+        let (same_embedding, _) = embeddings.get(&note.id).unwrap();
+        assert_eq!(
+            &original_embedding, same_embedding,
+            "embedding should not change when content is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_note_without_provider_no_embedding() {
+        // Use the standard helper (no embedding provider)
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "No embedding expected");
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // NoteManager without embedding provider — note should still be created
+        let stored = mgr.get_note(note.id).await.unwrap();
+        assert!(stored.is_some());
+        // We can't directly check embeddings in the standard helper (no Arc<MockGraphStore> access),
+        // but the fact that create_note succeeds without a provider is the key assertion.
+    }
+
+    #[tokio::test]
+    async fn test_supersede_note_embeds_new_note() {
+        let (mgr, pid, graph) = create_note_manager_with_embeddings().await;
+        let old_req = make_create_request(pid, "Old guideline content");
+        let old_note = mgr.create_note(old_req, "agent-1").await.unwrap();
+
+        let new_req = make_create_request(pid, "New improved guideline content");
+        let new_note = mgr
+            .supersede_note(old_note.id, new_req, "agent-2")
+            .await
+            .unwrap();
+
+        // Both old and new notes should have embeddings
+        let embeddings = graph.note_embeddings.read().await;
+        assert!(
+            embeddings.contains_key(&old_note.id),
+            "old note should have embedding"
+        );
+        assert!(
+            embeddings.contains_key(&new_note.id),
+            "new note should have embedding"
+        );
+
+        // Embeddings should be different (different content)
+        let old_emb = &embeddings.get(&old_note.id).unwrap().0;
+        let new_emb = &embeddings.get(&new_note.id).unwrap().0;
+        assert_ne!(
+            old_emb, new_emb,
+            "different content should produce different embeddings"
+        );
+    }
+
+    // ====================================================================
+    // Backfill
+    // ====================================================================
+
+    /// Helper: create a NoteManager WITHOUT embedding provider, create notes,
+    /// then return a new NoteManager WITH embedding provider for backfill testing.
+    async fn create_notes_then_add_embeddings(
+        count: usize,
+    ) -> (
+        NoteManager,
+        Vec<Uuid>,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+    ) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let meili = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = test_project();
+        let project_id = project.id;
+        graph.create_project(&project).await.unwrap();
+
+        // Create notes WITHOUT embedding provider (simulates existing notes)
+        let mgr_no_embed = NoteManager::new(
+            graph.clone() as Arc<dyn crate::neo4j::GraphStore>,
+            meili.clone(),
+        );
+        let mut note_ids = Vec::new();
+        for i in 0..count {
+            let req = make_create_request(project_id, &format!("Backfill note {i}"));
+            let note = mgr_no_embed.create_note(req, "agent-1").await.unwrap();
+            note_ids.push(note.id);
+        }
+
+        // Verify no embeddings exist
+        let embeddings = graph.note_embeddings.read().await;
+        assert_eq!(
+            embeddings.len(),
+            0,
+            "no embeddings should exist before backfill"
+        );
+        drop(embeddings);
+
+        // Now create a NoteManager WITH embedding provider
+        let provider = Arc::new(crate::embeddings::MockEmbeddingProvider::new(768));
+        let mgr = NoteManager::new(graph.clone() as Arc<dyn crate::neo4j::GraphStore>, meili)
+            .with_embedding_provider(provider);
+
+        (mgr, note_ids, graph)
+    }
+
+    #[tokio::test]
+    async fn test_backfill_embeddings_all_notes() {
+        let (mgr, note_ids, graph) = create_notes_then_add_embeddings(10).await;
+
+        let progress = mgr.backfill_embeddings(50, None).await.unwrap();
+
+        assert_eq!(progress.total, 10);
+        assert_eq!(progress.processed, 10);
+        assert_eq!(progress.errors, 0);
+
+        // Verify all notes have embeddings
+        let embeddings = graph.note_embeddings.read().await;
+        for id in &note_ids {
+            assert!(
+                embeddings.contains_key(id),
+                "note {id} should have embedding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backfill_is_idempotent() {
+        let (mgr, _note_ids, _graph) = create_notes_then_add_embeddings(5).await;
+
+        // First backfill
+        let p1 = mgr.backfill_embeddings(50, None).await.unwrap();
+        assert_eq!(p1.processed, 5);
+
+        // Second backfill — should do nothing
+        let p2 = mgr.backfill_embeddings(50, None).await.unwrap();
+        assert_eq!(p2.total, 0);
+        assert_eq!(p2.processed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_respects_batch_size() {
+        let (mgr, _note_ids, graph) = create_notes_then_add_embeddings(7).await;
+
+        // Backfill with batch size 3 — should still process all 7
+        let progress = mgr.backfill_embeddings(3, None).await.unwrap();
+
+        assert_eq!(progress.total, 7);
+        assert_eq!(progress.processed, 7);
+
+        let embeddings = graph.note_embeddings.read().await;
+        assert_eq!(embeddings.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_cancellation() {
+        let (mgr, _note_ids, graph) = create_notes_then_add_embeddings(10).await;
+
+        // Set cancel flag immediately
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let progress = mgr.backfill_embeddings(3, Some(&cancel)).await.unwrap();
+
+        // Should have processed 0 notes (cancelled before first batch)
+        assert_eq!(progress.processed, 0);
+        let embeddings = graph.note_embeddings.read().await;
+        assert_eq!(embeddings.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_without_provider_errors() {
+        let (mgr, _pid) = create_note_manager().await;
+        let result = mgr.backfill_embeddings(50, None).await;
+        assert!(
+            result.is_err(),
+            "backfill should fail without embedding provider"
+        );
+    }
+
     #[tokio::test]
     async fn test_global_notes_still_work_with_project_notes() {
         let state = mock_app_state();
@@ -1071,5 +1609,86 @@ mod tests {
             .unwrap();
         assert_eq!(updated.content, "Updated global rule");
         assert!(updated.project_id.is_none());
+    }
+
+    // ====================================================================
+    // Semantic (vector) search
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_returns_similar_notes() {
+        let (mgr, pid, _graph) = create_note_manager_with_embeddings().await;
+
+        // Create several notes with different content
+        let req1 = make_create_request(pid, "Always handle errors with Result type in Rust");
+        let note1 = mgr.create_note(req1, "agent-1").await.unwrap();
+
+        let req2 = make_create_request(pid, "Error handling best practices and conventions");
+        let note2 = mgr.create_note(req2, "agent-1").await.unwrap();
+
+        let req3 = make_create_request(pid, "Database connection pooling and timeout settings");
+        let _note3 = mgr.create_note(req3, "agent-1").await.unwrap();
+
+        // Search for error-handling related notes
+        let results = mgr
+            .semantic_search_notes("how to handle errors", None, None, Some(10))
+            .await
+            .unwrap();
+
+        // Should return results (mock provider uses deterministic hash-based embeddings)
+        assert!(!results.is_empty(), "semantic search should return results");
+
+        // Each result should have a finite score (mock cosine similarity can be near-zero
+        // for random high-dimensional vectors, which is mathematically correct)
+        for hit in &results {
+            assert!(hit.score.is_finite(), "score should be finite");
+        }
+
+        // Verify the notes we created are in results
+        let result_ids: Vec<Uuid> = results.iter().map(|h| h.note.id).collect();
+        assert!(
+            result_ids.contains(&note1.id) || result_ids.contains(&note2.id),
+            "should find at least one of the error-handling notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_without_provider_falls_back() {
+        let (mgr, pid) = create_note_manager().await;
+
+        // Create a note
+        let req = make_create_request(pid, "Test fallback content");
+        mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Semantic search without provider should fall back to BM25 (no panic, no error)
+        let results = mgr
+            .semantic_search_notes("test", None, None, Some(10))
+            .await;
+
+        // Should not error — falls back gracefully to Meilisearch
+        assert!(results.is_ok(), "should fall back to BM25 without error");
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_with_project_filter() {
+        let (mgr, pid, _graph) = create_note_manager_with_embeddings().await;
+
+        let req = make_create_request(pid, "Project-specific guideline");
+        mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Search with project filter
+        let results = mgr
+            .semantic_search_notes("guideline", Some(pid), None, Some(10))
+            .await
+            .unwrap();
+
+        // All results should belong to the project
+        for hit in &results {
+            assert_eq!(
+                hit.note.project_id,
+                Some(pid),
+                "all results should belong to the filtered project"
+            );
+        }
     }
 }
