@@ -13,6 +13,12 @@ pub mod mock;
 pub mod provider;
 pub mod traits;
 
+#[cfg(feature = "local-embeddings")]
+pub mod fastembed;
+
 pub use mock::MockEmbeddingProvider;
 pub use provider::HttpEmbeddingProvider;
 pub use traits::EmbeddingProvider;
+
+#[cfg(feature = "local-embeddings")]
+pub use fastembed::FastEmbedProvider;

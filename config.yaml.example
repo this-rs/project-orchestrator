@@ -58,6 +58,42 @@ meilisearch:
 #   url: "nats://localhost:4222"     # NATS_URL env override
 
 # -----------------------------------------------------------------------------
+# Embeddings — Vector embedding provider for semantic search (optional)
+# -----------------------------------------------------------------------------
+# Two providers available:
+#
+# 1. HTTP (default) — Any OpenAI-compatible /v1/embeddings endpoint
+#    Works with Ollama, OpenAI, LiteLLM, vLLM, Voyage, etc.
+#    Set EMBEDDING_URL=disabled to turn off embeddings entirely.
+#
+# 2. Local (opt-in) — In-process ONNX Runtime via fastembed-rs
+#    Zero external dependency, ~3-50ms latency, works offline.
+#    Requires building with: cargo build --features local-embeddings
+#    Adds ~30-80MB to the binary size.
+#
+# embedding:
+#   # Provider selection: "http" (default) or "local"
+#   provider: "http"               # EMBEDDING_PROVIDER env override
+#
+#   # ── HTTP provider settings ────────────────────────────────────────
+#   url: "http://localhost:11434/v1/embeddings"  # EMBEDDING_URL env override
+#   model: "nomic-embed-text"                    # EMBEDDING_MODEL env override
+#   # api_key: "sk-..."                          # EMBEDDING_API_KEY env override
+#   dimensions: 768                              # EMBEDDING_DIMENSIONS env override
+#
+#   # ── Local provider settings (requires --features local-embeddings) ─
+#   # fastembed_model: "multilingual-e5-base"    # FASTEMBED_MODEL env override
+#   # fastembed_cache_dir: ".fastembed_cache"     # FASTEMBED_CACHE_DIR env override
+#   #
+#   # Supported local models (768d, compatible with Neo4j index):
+#   #   multilingual-e5-base (default, FR/EN/100+ languages)
+#   #   nomic-embed-text-v1.5, bge-base-en-v1.5, gte-base-en-v1.5
+#   #
+#   # Other dimensions (require Neo4j index reconfiguration):
+#   #   384d: all-minilm-l6-v2, bge-small-en-v1.5
+#   #   1024d: bge-m3 (multilingual), bge-large-en-v1.5, multilingual-e5-large
+
+# -----------------------------------------------------------------------------
 # Chat — Claude Code integration (optional, uses env vars)
 # -----------------------------------------------------------------------------
 chat:
