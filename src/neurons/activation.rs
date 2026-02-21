@@ -534,4 +534,243 @@ mod tests {
             "Higher energy note should have higher activation score"
         );
     }
+
+    /// **E2E Integration Test (T2.7)**
+    ///
+    /// Validates the full Phase 2 neural network lifecycle:
+    /// 1. Create notes → embed them → build synapses
+    /// 2. Spreading activation retrieval (direct + propagated)
+    /// 3. Hebbian reinforcement (co-activation boosts synapses)
+    /// 4. Energy decay + synapse decay/pruning
+    /// 5. Project isolation (no cross-project synapses)
+    #[tokio::test]
+    async fn test_e2e_neural_network_lifecycle() {
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+        let provider = mock_embedding_provider();
+
+        // ── Phase 1: Setup — 2 isolated projects ────────────────────────
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+
+        // Project A: auth cluster (3 notes)
+        let auth_login = note_with_energy(Uuid::new_v4(), Some(project_a), "authentication login flow with JWT tokens", 1.0);
+        let auth_session = note_with_energy(Uuid::new_v4(), Some(project_a), "session management and cookie handling", 1.0);
+        let auth_password = note_with_energy(Uuid::new_v4(), Some(project_a), "password hashing with bcrypt", 1.0);
+
+        // Project A: database cluster (2 notes)
+        let db_query = note_with_energy(Uuid::new_v4(), Some(project_a), "database query optimization with indexes", 1.0);
+        let db_migration = note_with_energy(Uuid::new_v4(), Some(project_a), "database migration strategy", 1.0);
+
+        // Project B: auth notes (should NOT connect to project A)
+        let b_auth = note_with_energy(Uuid::new_v4(), Some(project_b), "authentication OAuth2 flow", 1.0);
+
+        // Global note (can connect to both projects)
+        let global_note = note_with_energy(Uuid::new_v4(), None, "security best practices for web apps", 1.0);
+
+        // Create all notes
+        for note in [&auth_login, &auth_session, &auth_password, &db_query, &db_migration, &b_auth, &global_note] {
+            store.create_note(note).await.unwrap();
+        }
+
+        // Embed ONLY the entry point notes — and use the QUERY text as the
+        // embedding content, not the note content.
+        //
+        // Why: the MockEmbeddingProvider produces deterministic but different
+        // vectors per text (hash-based). For vector_search_notes to return a
+        // high cosine similarity, the stored embedding must match the query
+        // embedding. By embedding auth_login with the query text "authentication
+        // login", the vector search finds it as a strong direct match, while
+        // all other project A notes are discovered only via synapse propagation.
+        let query_text = "authentication login";
+        let query_emb = provider.embed_text(query_text).await.unwrap();
+        store.set_note_embedding(auth_login.id, &query_emb, "mock").await.unwrap();
+
+        // Also embed b_auth with its own query for the project B isolation test
+        let b_query_emb = provider.embed_text("authentication").await.unwrap();
+        store.set_note_embedding(b_auth.id, &b_query_emb, "mock").await.unwrap();
+
+        // Build synapses — auth cluster in project A
+        store.create_synapses(auth_login.id, &[
+            (auth_session.id, 0.92),  // login ↔ session (very related)
+            (auth_password.id, 0.85), // login ↔ password (related)
+        ]).await.unwrap();
+        store.create_synapses(auth_session.id, &[
+            (auth_password.id, 0.80), // session ↔ password (somewhat related)
+        ]).await.unwrap();
+
+        // Database cluster in project A
+        store.create_synapses(db_query.id, &[
+            (db_migration.id, 0.88), // query ↔ migration
+        ]).await.unwrap();
+
+        // Cross-cluster weak link (auth needs db for user storage)
+        store.create_synapses(auth_login.id, &[
+            (db_query.id, 0.60),
+        ]).await.unwrap();
+
+        // ── Phase 2: Spreading Activation ───────────────────────────────
+        let engine = SpreadingActivationEngine::new(store.clone(), provider.clone());
+
+        let config = SpreadingActivationConfig {
+            max_results: 10,
+            max_hops: 2,
+            min_activation: 0.01,
+            decay_per_hop: 0.5,
+            min_energy: 0.0,
+            ..Default::default()
+        };
+
+        let results = engine
+            .activate("authentication login", Some(project_a), &config)
+            .await
+            .unwrap();
+
+        // Should have direct matches
+        let direct_count = results.iter()
+            .filter(|r| matches!(r.source, ActivationSource::Direct))
+            .count();
+        assert!(direct_count >= 1, "Should have at least 1 direct match, got {}", direct_count);
+
+        // Should have propagated matches via synapses
+        let propagated_count = results.iter()
+            .filter(|r| matches!(r.source, ActivationSource::Propagated { .. }))
+            .count();
+        assert!(propagated_count >= 1, "Should have at least 1 propagated match, got {}", propagated_count);
+
+        // Auth notes should appear (they're in the same project, connected via synapses)
+        let result_ids: Vec<Uuid> = results.iter().map(|r| r.note.id).collect();
+        // auth_session should be propagated from auth_login via synapse
+        assert!(
+            result_ids.contains(&auth_session.id),
+            "auth_session should be found via synapse propagation"
+        );
+
+        // Project B notes should NOT appear (project isolation)
+        assert!(
+            !result_ids.contains(&b_auth.id),
+            "Project B notes must not appear in Project A search"
+        );
+
+        // Metadata consistency
+        let total = results.len();
+        assert_eq!(total, direct_count + propagated_count, "total = direct + propagated");
+
+        // ── Phase 3: Hebbian Reinforcement ──────────────────────────────
+        // Simulate co-activation of auth_login, auth_session, auth_password
+        let co_activated = vec![auth_login.id, auth_session.id, auth_password.id];
+
+        // Get original synapse weight before reinforcement
+        let original_synapses = store.get_synapses(auth_login.id).await.unwrap();
+        let original_session_weight = original_synapses.iter()
+            .find(|(id, _)| *id == auth_session.id)
+            .map(|(_, w)| *w)
+            .unwrap_or(0.0);
+
+        // Reinforce synapses between co-activated notes
+        let reinforced = store.reinforce_synapses(&co_activated, 0.05).await.unwrap();
+        assert!(reinforced > 0, "Should have reinforced some synapses");
+
+        // Verify synapse weight increased
+        let after_synapses = store.get_synapses(auth_login.id).await.unwrap();
+        let new_session_weight = after_synapses.iter()
+            .find(|(id, _)| *id == auth_session.id)
+            .map(|(_, w)| *w)
+            .unwrap_or(0.0);
+        assert!(
+            new_session_weight > original_session_weight,
+            "Synapse weight should increase after reinforcement: {} > {}",
+            new_session_weight, original_session_weight
+        );
+
+        // Boost energy of co-activated notes
+        for &id in &co_activated {
+            store.boost_energy(id, 0.1).await.unwrap();
+        }
+
+        // Verify energy boosted (capped at 1.0)
+        let notes = store.list_notes(None, None, &Default::default()).await.unwrap();
+        let boosted_login = notes.0.iter().find(|n| n.id == auth_login.id).unwrap();
+        assert!(
+            boosted_login.energy >= 1.0,
+            "auth_login energy should be >= 1.0 after boost"
+        );
+        assert!(
+            boosted_login.last_activated.is_some(),
+            "last_activated should be set after boost"
+        );
+
+        // Second reinforcement — weights should increase further
+        let reinforced2 = store.reinforce_synapses(&co_activated, 0.05).await.unwrap();
+        assert!(reinforced2 > 0);
+        let after2_synapses = store.get_synapses(auth_login.id).await.unwrap();
+        let weight_after_2 = after2_synapses.iter()
+            .find(|(id, _)| *id == auth_session.id)
+            .map(|(_, w)| *w)
+            .unwrap_or(0.0);
+        assert!(
+            weight_after_2 > new_session_weight,
+            "Second reinforcement should further increase weight: {} > {}",
+            weight_after_2, new_session_weight
+        );
+        assert!(weight_after_2 <= 1.0, "Weight capped at 1.0");
+
+        // ── Phase 4: Decay and Pruning ──────────────────────────────────
+        // Create a very weak synapse to test pruning
+        store.create_synapses(db_query.id, &[
+            (auth_password.id, 0.15), // weak cross-cluster link
+        ]).await.unwrap();
+
+        // Apply heavy decay
+        let (decayed, _pruned) = store.decay_synapses(0.5, 0.1).await.unwrap();
+        assert!(decayed > 0, "Should have decayed some synapses");
+
+        // The weak synapse (0.15 - 0.5 = -0.35) should be pruned
+        let db_synapses_after = store.get_synapses(db_query.id).await.unwrap();
+        let weak_link = db_synapses_after.iter()
+            .find(|(id, _)| *id == auth_password.id);
+        assert!(
+            weak_link.is_none(),
+            "Weak synapse should have been pruned after heavy decay"
+        );
+
+        // Strong synapses should survive (original 0.92 + boosts - 0.5 decay)
+        let login_synapses_after = store.get_synapses(auth_login.id).await.unwrap();
+        let session_link = login_synapses_after.iter()
+            .find(|(id, _)| *id == auth_session.id);
+        assert!(
+            session_link.is_some(),
+            "Strong synapse (auth_login ↔ auth_session) should survive decay"
+        );
+
+        // ── Phase 5: Verify isolation persists after all operations ─────
+        // Search in project B should only see project B notes
+        let results_b = engine
+            .activate("authentication", Some(project_b), &config)
+            .await
+            .unwrap();
+        let b_result_ids: Vec<Uuid> = results_b.iter().map(|r| r.note.id).collect();
+        for &project_a_id in &[auth_login.id, auth_session.id, auth_password.id, db_query.id, db_migration.id] {
+            assert!(
+                !b_result_ids.contains(&project_a_id),
+                "Project A notes must not appear in Project B search"
+            );
+        }
+
+        // ── Phase 6: Cleanup verification ───────────────────────────────
+        // Delete a note and verify its synapses are cleaned up
+        store.delete_synapses(auth_password.id).await.unwrap();
+        let password_synapses = store.get_synapses(auth_password.id).await.unwrap();
+        assert!(
+            password_synapses.is_empty(),
+            "Synapses should be cleaned up after delete"
+        );
+
+        // Existing notes still function normally
+        let final_results = engine
+            .activate("authentication", Some(project_a), &config)
+            .await
+            .unwrap();
+        assert!(!final_results.is_empty(), "System should still work after cleanup");
+    }
 }
