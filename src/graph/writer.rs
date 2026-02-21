@@ -74,7 +74,7 @@ impl AnalyticsWriter {
                 }
                 CodeNodeType::Function => {
                     function_updates.push(FunctionAnalyticsUpdate {
-                        name: node_id.clone(),
+                        id: node_id.clone(),
                         pagerank: metrics.pagerank,
                         betweenness: metrics.betweenness,
                         community_id: metrics.community_id,

@@ -339,8 +339,8 @@ pub struct FileAnalyticsUpdate {
 /// in a single UNWIND query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionAnalyticsUpdate {
-    /// Function name (matches the `name` property on Function nodes)
-    pub name: String,
+    /// Function ID (matches the `id` property on Function nodes, format: "file_path:name:line_start")
+    pub id: String,
     /// PageRank score
     pub pagerank: f64,
     /// Betweenness centrality score

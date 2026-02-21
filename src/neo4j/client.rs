@@ -180,6 +180,11 @@ impl Neo4jClient {
             "CREATE CONSTRAINT function_id IF NOT EXISTS FOR (f:Function) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT struct_id IF NOT EXISTS FOR (s:Struct) REQUIRE s.id IS UNIQUE",
             "CREATE CONSTRAINT trait_id IF NOT EXISTS FOR (t:Trait) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT enum_id IF NOT EXISTS FOR (e:Enum) REQUIRE e.id IS UNIQUE",
+            "CREATE CONSTRAINT impl_id IF NOT EXISTS FOR (i:Impl) REQUIRE i.id IS UNIQUE",
+            "CREATE CONSTRAINT import_id IF NOT EXISTS FOR (i:Import) REQUIRE i.id IS UNIQUE",
+            // Commit constraint
+            "CREATE CONSTRAINT commit_hash IF NOT EXISTS FOR (c:Commit) REQUIRE c.hash IS UNIQUE",
             // Plan constraints
             "CREATE CONSTRAINT plan_id IF NOT EXISTS FOR (p:Plan) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT task_id IF NOT EXISTS FOR (t:Task) REQUIRE t.id IS UNIQUE",
@@ -2425,35 +2430,100 @@ impl Neo4jClient {
         self.graph.run(q).await?;
 
         // Create IMPLEMENTS_FOR relationship to the struct/enum
+        // Strategy: prefer same-file match (most common case), fall back to any match within project
+        // The old query had `WHERE s.file_path = $file_path OR s.name = $type_name` which was
+        // tautological (the OR branch was always true after MATCH {name: $type_name}), causing
+        // IMPLEMENTS_FOR to link to ALL same-named structs across all files.
+
+        // Try struct — prefer same-file, fall back to same-project via File→Project chain
         let q = query(
             r#"
             MATCH (i:Impl {id: $impl_id})
-            MATCH (s:Struct {name: $type_name})
-            WHERE s.file_path = $file_path OR s.name = $type_name
-            MERGE (i)-[:IMPLEMENTS_FOR]->(s)
+            MATCH (file:File {path: $file_path})
+            OPTIONAL MATCH (s_local:Struct {name: $type_name})
+            WHERE s_local.file_path = $file_path
+            WITH i, file, collect(s_local) AS locals
+            WITH i, file, CASE WHEN size(locals) > 0 THEN locals[0] ELSE null END AS target
+            WITH i, file, target
+            WHERE target IS NOT NULL
+            MERGE (i)-[:IMPLEMENTS_FOR]->(target)
+            RETURN count(*) AS linked
             "#,
         )
         .param("impl_id", id.clone())
         .param("type_name", impl_node.for_type.clone())
         .param("file_path", impl_node.file_path.clone());
 
-        // Try struct first, ignore error if not found
-        let _ = self.graph.run(q).await;
+        let same_file_struct_linked = match self.graph.execute(q).await {
+            Ok(mut result) => {
+                if let Ok(Some(row)) = result.next().await {
+                    row.get::<i64>("linked").unwrap_or(0) > 0
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        };
 
-        // Try enum too
+        // Fall back to project-scoped struct if no same-file match
+        if !same_file_struct_linked {
+            let q = query(
+                r#"
+                MATCH (i:Impl {id: $impl_id})
+                MATCH (file:File {path: $file_path})<-[:CONTAINS]-(p:Project)
+                MATCH (s:Struct {name: $type_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                WITH i, s LIMIT 1
+                MERGE (i)-[:IMPLEMENTS_FOR]->(s)
+                "#,
+            )
+            .param("impl_id", id.clone())
+            .param("type_name", impl_node.for_type.clone())
+            .param("file_path", impl_node.file_path.clone());
+
+            let _ = self.graph.run(q).await;
+        }
+
+        // Try enum — same strategy: prefer same-file, fall back to same-project
         let q = query(
             r#"
             MATCH (i:Impl {id: $impl_id})
             MATCH (e:Enum {name: $type_name})
-            WHERE e.file_path = $file_path OR e.name = $type_name
+            WHERE e.file_path = $file_path
             MERGE (i)-[:IMPLEMENTS_FOR]->(e)
+            RETURN count(*) AS linked
             "#,
         )
         .param("impl_id", id.clone())
         .param("type_name", impl_node.for_type.clone())
         .param("file_path", impl_node.file_path.clone());
 
-        let _ = self.graph.run(q).await;
+        let same_file_enum_linked = match self.graph.execute(q).await {
+            Ok(mut result) => {
+                if let Ok(Some(row)) = result.next().await {
+                    row.get::<i64>("linked").unwrap_or(0) > 0
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        };
+
+        if !same_file_enum_linked {
+            let q = query(
+                r#"
+                MATCH (i:Impl {id: $impl_id})
+                MATCH (file:File {path: $file_path})<-[:CONTAINS]-(p:Project)
+                MATCH (e:Enum {name: $type_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                WITH i, e LIMIT 1
+                MERGE (i)-[:IMPLEMENTS_FOR]->(e)
+                "#,
+            )
+            .param("impl_id", id.clone())
+            .param("type_name", impl_node.for_type.clone())
+            .param("file_path", impl_node.file_path.clone());
+
+            let _ = self.graph.run(q).await;
+        }
 
         // Create IMPLEMENTS_TRAIT relationship if this is a trait impl
         if let Some(ref trait_name) = impl_node.trait_name {
@@ -2733,12 +2803,14 @@ impl Neo4jClient {
     ///
     /// Returns the number of deleted relationships.
     pub async fn cleanup_cross_project_calls(&self) -> Result<i64> {
+        // Optimized: instead of scanning ALL CALLS relationships globally (O(total_calls)),
+        // anchor on each project and find CALLS that cross project boundaries.
+        // This leverages the Project->File->Function index chain.
         let q = query(
             r#"
-            MATCH (caller:Function)-[r:CALLS]->(callee:Function)
+            MATCH (p:Project)-[:CONTAINS]->(f:File)-[:CONTAINS]->(caller:Function)-[r:CALLS]->(callee:Function)
             WHERE NOT EXISTS {
-                MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project),
-                      (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                MATCH (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
             }
             DELETE r
             RETURN count(r) AS deleted
@@ -10021,7 +10093,7 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(:File)-[:CONTAINS]->(f1:Function)-[:CALLS]->(f2:Function)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
-            RETURN f1.name AS source, f2.name AS target
+            RETURN f1.id AS source, f2.id AS target
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -10098,8 +10170,8 @@ impl Neo4jClient {
             .iter()
             .map(|u| {
                 format!(
-                    "{{name: '{}', pagerank: {}, betweenness: {}, community_id: {}, clustering_coefficient: {}, component_id: {}}}",
-                    u.name.replace('\'', "\\'"),
+                    "{{id: '{}', pagerank: {}, betweenness: {}, community_id: {}, clustering_coefficient: {}, component_id: {}}}",
+                    u.id.replace('\'', "\\'"),
                     u.pagerank,
                     u.betweenness,
                     u.community_id,
@@ -10112,7 +10184,7 @@ impl Neo4jClient {
         let cypher = format!(
             r#"
             UNWIND [{}] AS u
-            MATCH (f:Function {{name: u.name}})
+            MATCH (f:Function {{id: u.id}})
             SET f.pagerank = u.pagerank,
                 f.betweenness = u.betweenness,
                 f.community_id = u.community_id,

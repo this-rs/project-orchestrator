@@ -314,7 +314,7 @@ mod tests {
         let func_a = store.function_analytics.read().await;
         assert_eq!(func_a.len(), 8);
 
-        let main_fn = &func_a["main"];
+        let main_fn = &func_a["src/main.rs:main:0"];
         assert!(main_fn.pagerank > 0.0);
     }
 

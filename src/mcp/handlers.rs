@@ -7573,7 +7573,7 @@ mod tests {
         // Function analytics — hub_function has high pagerank
         graph
             .batch_update_function_analytics(&[FunctionAnalyticsUpdate {
-                name: "hub_function".to_string(),
+                id: "hub_function".to_string(),
                 pagerank: 0.90,
                 betweenness: 0.09,
                 community_id: 0,
