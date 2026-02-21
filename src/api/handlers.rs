@@ -822,19 +822,25 @@ pub async fn start_watch(
     State(state): State<OrchestratorState>,
     Json(req): Json<WatchRequest>,
 ) -> Result<Json<WatchStatusResponse>, AppError> {
-    let path = std::path::Path::new(&req.path);
+    let expanded = crate::expand_tilde(&req.path);
+    let path = std::path::Path::new(&expanded);
     let mut watcher = state.watcher.write().await;
 
-    // Set project context if project_id is provided
+    // Register project context if project_id is provided (multi-project aware)
     if let Some(ref pid_str) = req.project_id {
         if let Ok(pid) = uuid::Uuid::parse_str(pid_str) {
             if let Some(project) = state.orchestrator.neo4j().get_project(pid).await? {
-                watcher.set_project_context(project.id, project.slug);
+                watcher
+                    .register_project(path, project.id, project.slug)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to register project: {}", e))?;
             }
         }
+    } else {
+        // Legacy: watch without project context
+        watcher.watch(path).await?;
     }
 
-    watcher.watch(path).await?;
     watcher.start().await?;
 
     let paths = watcher.watched_paths().await;
