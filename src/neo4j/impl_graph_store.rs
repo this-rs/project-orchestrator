@@ -1400,6 +1400,18 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn update_energy_scores(&self, half_life_days: f64) -> anyhow::Result<usize> {
+        self.update_energy_scores(half_life_days).await
+    }
+
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> anyhow::Result<()> {
+        self.boost_energy(note_id, amount).await
+    }
+
+    // ========================================================================
     // Chat session operations
     // ========================================================================
 

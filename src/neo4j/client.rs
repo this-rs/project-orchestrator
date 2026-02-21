@@ -6908,6 +6908,8 @@ impl Neo4jClient {
                 last_confirmed_at: datetime($last_confirmed_at),
                 last_confirmed_by: $last_confirmed_by,
                 staleness_score: $staleness_score,
+                energy: $energy,
+                last_activated: datetime($last_activated),
                 changes_json: $changes_json,
                 assertion_rule_json: $assertion_rule_json
             })
@@ -6938,6 +6940,13 @@ impl Neo4jClient {
             note.last_confirmed_by.clone().unwrap_or_default(),
         )
         .param("staleness_score", note.staleness_score)
+        .param("energy", note.energy)
+        .param(
+            "last_activated",
+            note.last_activated
+                .unwrap_or(note.created_at)
+                .to_rfc3339(),
+        )
         .param("changes_json", serde_json::to_string(&note.changes)?)
         .param(
             "assertion_rule_json",
@@ -7503,7 +7512,12 @@ impl Neo4jClient {
             SET n.last_confirmed_at = datetime(),
                 n.last_confirmed_by = $confirmed_by,
                 n.staleness_score = 0.0,
-                n.status = 'active'
+                n.status = 'active',
+                n.energy = CASE
+                    WHEN coalesce(n.energy, 1.0) + 0.3 > 1.0 THEN 1.0
+                    ELSE coalesce(n.energy, 1.0) + 0.3
+                END,
+                n.last_activated = datetime()
             RETURN n
             "#,
         )
@@ -7913,6 +7927,68 @@ impl Neo4jClient {
         }
     }
 
+    // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Apply exponential energy decay to all active notes.
+    ///
+    /// Formula: `energy = energy × exp(-days_idle / half_life)`
+    /// where `days_idle = (now - last_activated).days()`.
+    ///
+    /// **Temporally idempotent**: the result depends only on the absolute elapsed
+    /// time since `last_activated`, NOT on how often this function is called.
+    /// Calling it once after 30 days ≡ calling it daily for 30 days.
+    ///
+    /// Notes decaying below 0.05 are floored to 0.0 ("dead neuron").
+    pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.status = 'active'
+              AND n.energy > 0.0
+              AND n.last_activated IS NOT NULL
+            WITH n,
+                 duration.between(datetime(n.last_activated), datetime()).days AS days_idle
+            WITH n,
+                 n.energy * exp(-1.0 * toFloat(days_idle) / $half_life) AS new_energy
+            WITH n,
+                 CASE WHEN new_energy < 0.05 THEN 0.0 ELSE new_energy END AS clamped_energy
+            WHERE abs(n.energy - clamped_energy) > 0.001
+            SET n.energy = clamped_energy
+            RETURN count(n) AS updated
+            "#,
+        )
+        .param("half_life", half_life_days);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let updated: i64 = row.get("updated")?;
+            Ok(updated as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Boost a note's energy by `amount` (capped at 1.0) and reset `last_activated` to now.
+    pub async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            SET n.energy = CASE
+                    WHEN n.energy + $amount > 1.0 THEN 1.0
+                    ELSE n.energy + $amount
+                END,
+                n.last_activated = datetime()
+            "#,
+        )
+        .param("id", note_id.to_string())
+        .param("amount", amount);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     // Helper function to convert Note scope to type string
     fn scope_type_string(&self, scope: &NoteScope) -> String {
         match scope {
@@ -8001,6 +8077,11 @@ impl Neo4jClient {
                 .and_then(|s| s.parse().ok()),
             last_confirmed_by: node.get("last_confirmed_by").ok(),
             staleness_score: node.get("staleness_score").unwrap_or(0.0),
+            energy: node.get("energy").unwrap_or(1.0),
+            last_activated: node
+                .get::<String>("last_activated")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             supersedes: node
                 .get::<String>("supersedes")
                 .ok()

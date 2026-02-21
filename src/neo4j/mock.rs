@@ -4135,6 +4135,9 @@ impl GraphStore for MockGraphStore {
         let mut notes = self.notes.write().await;
         if let Some(n) = notes.get_mut(&note_id) {
             n.confirm(confirmed_by);
+            // Energy boost: +0.3, capped at 1.0
+            n.energy = (n.energy + 0.3).min(1.0);
+            n.last_activated = Some(chrono::Utc::now());
             Ok(Some(n.clone()))
         } else {
             Ok(None)
@@ -4354,6 +4357,42 @@ impl GraphStore for MockGraphStore {
 
         // Return total deleted (bidirectional = outgoing * 2)
         Ok(outgoing_count * 2)
+    }
+
+    // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let now = chrono::Utc::now();
+        let mut updated = 0usize;
+
+        for note in notes.values_mut() {
+            if note.status != crate::notes::NoteStatus::Active || note.energy <= 0.0 {
+                continue;
+            }
+            if let Some(last_activated) = note.last_activated {
+                let days_idle = (now - last_activated).num_seconds() as f64 / 86400.0;
+                let new_energy = note.energy * (-days_idle / half_life_days).exp();
+                let clamped = if new_energy < 0.05 { 0.0 } else { new_energy };
+                if (note.energy - clamped).abs() > 0.001 {
+                    note.energy = clamped;
+                    updated += 1;
+                }
+            }
+        }
+
+        Ok(updated)
+    }
+
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
+        let mut notes = self.notes.write().await;
+        if let Some(note) = notes.get_mut(&note_id) {
+            note.energy = (note.energy + amount).min(1.0);
+            note.last_activated = Some(chrono::Utc::now());
+        }
+        Ok(())
     }
 
     // ========================================================================

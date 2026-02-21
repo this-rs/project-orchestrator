@@ -549,6 +549,17 @@ impl NoteManager {
         self.neo4j.update_staleness_scores().await
     }
 
+    /// Apply exponential energy decay to all active notes.
+    ///
+    /// Formula: `energy = energy × exp(-days_idle / half_life)`
+    /// where `days_idle = (now - last_activated).days()`.
+    ///
+    /// Temporally idempotent: result depends only on elapsed time since
+    /// `last_activated`, not on call frequency.
+    pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        self.neo4j.update_energy_scores(half_life_days).await
+    }
+
     // ========================================================================
     // Search Operations
     // ========================================================================

@@ -1451,6 +1451,20 @@ fn note_tools() -> Vec<ToolDefinition> {
             },
         },
         ToolDefinition {
+            name: "update_energy_scores".to_string(),
+            description: "Apply exponential energy decay to all active notes. Formula: energy = energy × exp(-days_idle / half_life). Temporally idempotent — calling once after N days ≡ calling daily for N days. Notes below 0.05 are floored to 0.0 (dead neuron).".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "half_life": {
+                        "type": "number",
+                        "description": "Half-life in days for energy decay (default 90). After this many idle days, energy drops to ~50%."
+                    }
+                })),
+                required: None,
+            },
+        },
+        ToolDefinition {
             name: "list_project_notes".to_string(),
             description: "List notes for a specific project".to_string(),
             input_schema: InputSchema {
@@ -2202,7 +2216,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 154, "Expected 154 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 155, "Expected 155 tools, got {}", tools.len());
     }
 
     #[test]

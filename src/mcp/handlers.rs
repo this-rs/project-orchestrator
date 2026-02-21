@@ -175,6 +175,7 @@ impl ToolHandler {
             "get_context_notes" => self.get_context_notes(args).await,
             "get_notes_needing_review" => self.get_notes_needing_review(args).await,
             "update_staleness_scores" => self.update_staleness_scores(args).await,
+            "update_energy_scores" => self.update_energy_scores(args).await,
             "list_project_notes" => self.list_project_notes(args).await,
             "get_propagated_notes" => self.get_propagated_notes(args).await,
             "get_entity_notes" => self.get_entity_notes(args).await,
@@ -2509,6 +2510,21 @@ impl ToolHandler {
             .await?;
 
         Ok(json!({"notes_updated": count}))
+    }
+
+    async fn update_energy_scores(&self, args: Value) -> Result<Value> {
+        let half_life = args
+            .get("half_life")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(90.0);
+
+        let count = self
+            .orchestrator
+            .note_manager()
+            .update_energy_scores(half_life)
+            .await?;
+
+        Ok(json!({"notes_updated": count, "half_life_days": half_life}))
     }
 
     async fn list_project_notes(&self, args: Value) -> Result<Value> {

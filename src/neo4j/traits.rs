@@ -1091,6 +1091,29 @@ pub trait GraphStore: Send + Sync {
     async fn delete_synapses(&self, note_id: Uuid) -> Result<usize>;
 
     // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    /// Apply exponential energy decay to all active notes.
+    ///
+    /// For each note, computes: `energy = energy × exp(-days_idle / half_life)`
+    /// where `days_idle = (now - last_activated).days()`.
+    ///
+    /// This formula is **temporally idempotent**: calling it once after 30 days
+    /// gives the same result as calling it 30 times daily, because each call
+    /// recomputes from `last_activated` (absolute reference) rather than
+    /// multiplying a running value.
+    ///
+    /// Notes that decay below 0.05 are floored to 0.0 ("dead neuron").
+    /// Returns the number of notes updated.
+    async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize>;
+
+    /// Boost a note's energy by a given amount (capped at 1.0) and set
+    /// `last_activated` to now. Used when a note is retrieved, confirmed, or
+    /// reinforced through spreading activation.
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()>;
+
+    // ========================================================================
     // Chat session operations
     // ========================================================================
 
