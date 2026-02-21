@@ -4190,9 +4190,27 @@ impl GraphStore for MockGraphStore {
         embedding: &[f32],
         limit: usize,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
     ) -> Result<Vec<(Note, f64)>> {
         let notes = self.notes.read().await;
         let embeddings = self.note_embeddings.read().await;
+
+        // Resolve workspace_slug to a set of project IDs
+        let workspace_project_ids: Option<Vec<Uuid>> = if project_id.is_none() {
+            if let Some(slug) = workspace_slug {
+                let ws = self.get_workspace_by_slug(slug).await?;
+                if let Some(ws) = ws {
+                    let wp = self.workspace_projects.read().await;
+                    Some(wp.get(&ws.id).cloned().unwrap_or_default())
+                } else {
+                    Some(vec![]) // unknown workspace → no results
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let mut scored: Vec<(Note, f64)> = notes
             .values()
@@ -4201,10 +4219,17 @@ impl GraphStore for MockGraphStore {
                 matches!(n.status, NoteStatus::Active | NoteStatus::NeedsReview)
             })
             .filter(|n| {
-                // Filter by project_id
-                match project_id {
-                    Some(pid) => n.project_id == Some(pid),
-                    None => true,
+                // Filter by project_id or workspace projects
+                if let Some(pid) = project_id {
+                    n.project_id == Some(pid)
+                } else if let Some(ref ws_pids) = workspace_project_ids {
+                    // Include notes from workspace projects + global notes
+                    match n.project_id {
+                        Some(pid) => ws_pids.contains(&pid),
+                        None => true, // global notes included
+                    }
+                } else {
+                    true // no filter
                 }
             })
             .filter_map(|n| {

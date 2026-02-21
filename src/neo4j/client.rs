@@ -7680,41 +7680,76 @@ impl Neo4jClient {
     /// Search notes by vector similarity using the HNSW index.
     ///
     /// Returns notes ordered by descending cosine similarity score,
-    /// filtered by optional project_id for data isolation.
+    /// filtered by optional project_id or workspace_slug for data isolation.
+    ///
+    /// Filtering priority: `project_id` > `workspace_slug` > global (no filter).
     pub async fn vector_search_notes(
         &self,
         embedding: &[f32],
         limit: usize,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
     ) -> Result<Vec<(Note, f64)>> {
         // Convert f32 to f64 for neo4rs
         let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
 
-        // We query more than limit to allow for post-filtering by project_id and status
-        let query_limit = if project_id.is_some() {
-            limit * 3
+        // We query more than limit to allow for post-filtering by project_id/workspace and status
+        let has_filter = project_id.is_some() || workspace_slug.is_some();
+        let query_limit = if has_filter { limit * 3 } else { limit * 2 };
+
+        // Build Cypher with the appropriate project filter
+        let (cypher, project_filter_value) = if let Some(pid) = project_id {
+            // Direct project_id filter
+            let cypher = r#"
+                CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
+                YIELD node AS n, score
+                WHERE n.status IN ['active', 'needs_review']
+                AND n.project_id = $project_id
+                RETURN n, score
+                ORDER BY score DESC
+                LIMIT $limit
+            "#;
+            (cypher.to_string(), Some(pid.to_string()))
+        } else if let Some(ws_slug) = workspace_slug {
+            // Workspace filter: match notes belonging to any project in the workspace,
+            // plus global notes (project_id IS NULL) for completeness
+            let cypher = format!(
+                r#"
+                CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
+                YIELD node AS n, score
+                WHERE n.status IN ['active', 'needs_review']
+                AND (
+                    n.project_id IN [(w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]
+                    OR n.project_id IS NULL
+                )
+                RETURN n, score
+                ORDER BY score DESC
+                LIMIT $limit
+                "#,
+                ws_slug
+            );
+            (cypher, None)
         } else {
-            limit * 2
+            // No filter — return all notes
+            let cypher = r#"
+                CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
+                YIELD node AS n, score
+                WHERE n.status IN ['active', 'needs_review']
+                RETURN n, score
+                ORDER BY score DESC
+                LIMIT $limit
+            "#;
+            (cypher.to_string(), None)
         };
 
-        let cypher = r#"
-            CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
-            YIELD node AS n, score
-            WHERE n.status IN ['active', 'needs_review']
-            AND ($project_id IS NULL OR $project_id = '' OR n.project_id = $project_id)
-            RETURN n, score
-            ORDER BY score DESC
-            LIMIT $limit
-        "#;
-
-        let q = query(cypher)
+        let mut q = query(&cypher)
             .param("query_limit", query_limit as i64)
             .param("embedding", embedding_f64)
-            .param(
-                "project_id",
-                project_id.map(|id| id.to_string()).unwrap_or_default(),
-            )
             .param("limit", limit as i64);
+
+        if let Some(pid) = project_filter_value {
+            q = q.param("project_id", pid);
+        }
 
         let mut result = self.graph.execute(q).await?;
         let mut notes = Vec::new();

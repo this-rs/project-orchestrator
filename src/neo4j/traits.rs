@@ -1036,13 +1036,16 @@ pub trait GraphStore: Send + Sync {
     /// Search notes by vector similarity using the HNSW index.
     ///
     /// Returns notes ordered by descending cosine similarity score,
-    /// filtered by optional project_id for data isolation.
+    /// filtered by optional project_id or workspace_slug for data isolation.
     /// Only returns notes with status 'active' or 'needs_review'.
+    ///
+    /// Filtering priority: `project_id` > `workspace_slug` > global (no filter).
     async fn vector_search_notes(
         &self,
         embedding: &[f32],
         limit: usize,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
     ) -> Result<Vec<(Note, f64)>>;
 
     /// List notes that don't have an embedding yet.
