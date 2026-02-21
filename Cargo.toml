@@ -99,13 +99,12 @@ rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 rand = "0.10.0"
 
-# Local embeddings via ONNX Runtime (optional — adds ~30-50MB to binary)
-fastembed = { version = "5.11", optional = true }
+# Local embeddings via ONNX Runtime (default provider — zero external dependency)
+fastembed = "5.11"
 
 [features]
 default = []
 embedded-frontend = ["dep:rust-embed", "dep:mime_guess"]
-local-embeddings = ["dep:fastembed"]
 
 [dev-dependencies]
 tokio-test = "0.4"

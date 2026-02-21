@@ -1,6 +1,6 @@
 //! Main orchestrator runner
 
-use crate::embeddings::{EmbeddingProvider, HttpEmbeddingProvider};
+use crate::embeddings::{EmbeddingProvider, FastEmbedProvider, HttpEmbeddingProvider};
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
@@ -80,18 +80,46 @@ pub struct Orchestrator {
 /// Try to create an embedding provider from environment variables.
 ///
 /// Provider selection via `EMBEDDING_PROVIDER` env var:
-/// - `http` (default) → [`HttpEmbeddingProvider`] using any OpenAI-compatible API
-/// - `local` → [`FastEmbedProvider`] using in-process ONNX Runtime (requires `local-embeddings` feature)
+/// - `local` (default) → [`FastEmbedProvider`] using in-process ONNX Runtime (zero external dependency)
+/// - `http` → [`HttpEmbeddingProvider`] using any OpenAI-compatible API (for premium/external models)
+/// - `disabled` → No embedding provider (semantic search unavailable)
 ///
-/// Returns `None` if disabled or not configured. Logs the result at info level.
+/// Returns `None` if disabled or initialization fails. Logs the result at info level.
 fn init_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
     let provider_type = std::env::var("EMBEDDING_PROVIDER")
-        .unwrap_or_else(|_| "http".to_string())
+        .unwrap_or_else(|_| "local".to_string())
         .to_lowercase();
 
     match provider_type.as_str() {
-        "local" | "fastembed" => init_local_embedding_provider(),
-        _ => init_http_embedding_provider(),
+        "http" => init_http_embedding_provider(),
+        "disabled" | "none" | "off" => {
+            tracing::info!("Embedding provider disabled (EMBEDDING_PROVIDER=disabled)");
+            None
+        }
+        // Default: local fastembed
+        _ => init_local_embedding_provider(),
+    }
+}
+
+/// Initialize the local fastembed ONNX embedding provider (default).
+fn init_local_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
+    match FastEmbedProvider::from_env() {
+        Ok(provider) => {
+            tracing::info!(
+                model = provider.model_name(),
+                dimensions = provider.dimensions(),
+                provider = "local",
+                "Embedding provider initialized (local ONNX via fastembed)"
+            );
+            Some(Arc::new(provider))
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Failed to initialize local embedding provider"
+            );
+            None
+        }
     }
 }
 
@@ -108,47 +136,11 @@ fn init_http_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
             Some(Arc::new(provider))
         }
         None => {
-            tracing::info!("Embedding provider disabled (set EMBEDDING_URL to enable)");
+            tracing::info!(
+                "HTTP embedding provider not configured (set EMBEDDING_URL to enable)"
+            );
             None
         }
-    }
-}
-
-/// Initialize the local fastembed ONNX embedding provider.
-///
-/// Falls back to HTTP provider if the `local-embeddings` feature is not enabled.
-fn init_local_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
-    #[cfg(feature = "local-embeddings")]
-    {
-        use crate::embeddings::FastEmbedProvider;
-
-        match FastEmbedProvider::from_env() {
-            Ok(provider) => {
-                tracing::info!(
-                    model = provider.model_name(),
-                    dimensions = provider.dimensions(),
-                    provider = "local",
-                    "Embedding provider initialized (local ONNX via fastembed)"
-                );
-                Some(Arc::new(provider))
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "Failed to initialize local embedding provider, falling back to HTTP"
-                );
-                init_http_embedding_provider()
-            }
-        }
-    }
-
-    #[cfg(not(feature = "local-embeddings"))]
-    {
-        tracing::warn!(
-            "EMBEDDING_PROVIDER=local requested but `local-embeddings` feature is not enabled. \
-             Rebuild with `--features local-embeddings` to use fastembed. Falling back to HTTP provider."
-        );
-        init_http_embedding_provider()
     }
 }
 

@@ -5,20 +5,18 @@
 //!
 //! Architecture follows the project pattern (trait + impl + mock):
 //! - `EmbeddingProvider` trait: async interface for embedding generation
-//! - `HttpEmbeddingProvider`: real implementation using any OpenAI-compatible API
-//!   (Ollama, OpenAI, LiteLLM, vLLM, etc.)
+//! - `FastEmbedProvider`: default implementation using local ONNX inference
+//!   via fastembed-rs (zero external dependency, works offline)
+//! - `HttpEmbeddingProvider`: optional implementation using any OpenAI-compatible
+//!   `/v1/embeddings` API (Ollama, OpenAI, LiteLLM, vLLM, etc.)
 //! - `MockEmbeddingProvider`: deterministic mock for tests
 
+pub mod fastembed;
 pub mod mock;
 pub mod provider;
 pub mod traits;
 
-#[cfg(feature = "local-embeddings")]
-pub mod fastembed;
-
+pub use fastembed::FastEmbedProvider;
 pub use mock::MockEmbeddingProvider;
 pub use provider::HttpEmbeddingProvider;
 pub use traits::EmbeddingProvider;
-
-#[cfg(feature = "local-embeddings")]
-pub use fastembed::FastEmbedProvider;

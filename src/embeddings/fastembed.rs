@@ -1,10 +1,8 @@
 //! Local embedding provider using fastembed-rs (ONNX Runtime)
 //!
-//! Implements `EmbeddingProvider` using fastembed's in-process ONNX inference.
+//! Default embedding provider — uses fastembed's in-process ONNX inference.
 //! This eliminates the need for an external embedding server (Ollama, OpenAI, etc.)
 //! at the cost of a larger binary (+30-80 MB) and in-process model memory (~200-400 MB).
-//!
-//! **Feature-gated**: Only available with `--features local-embeddings`.
 //!
 //! Configuration via environment variables:
 //! - `FASTEMBED_MODEL` (default: `multilingual-e5-base`) — model identifier
@@ -243,7 +241,7 @@ mod tests {
 
     // Integration tests that actually load the ONNX model
     // These download the model on first run (~400MB) so they are slow.
-    // Run explicitly: cargo test --features local-embeddings -- fastembed --ignored
+    // Run explicitly: cargo test -- fastembed --ignored
     #[tokio::test]
     #[ignore = "requires ONNX model download (~400MB)"]
     async fn test_embed_text_dimensions() {
