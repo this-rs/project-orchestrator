@@ -465,6 +465,64 @@ impl NoteManager {
         Ok(results)
     }
 
+    /// Search notes using vector similarity (cosine) via Neo4j HNSW index.
+    ///
+    /// Embeds the query text using the configured embedding provider, then
+    /// performs a vector similarity search against stored note embeddings.
+    /// Falls back to BM25 text search (Meilisearch) if no embedding provider
+    /// is configured.
+    ///
+    /// # Arguments
+    /// * `query` - Natural language search query
+    /// * `project_id` - Optional filter by project UUID
+    /// * `workspace_slug` - Optional filter by workspace (includes all projects in workspace + global notes)
+    /// * `limit` - Maximum number of results (default 20)
+    pub async fn semantic_search_notes(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<NoteSearchHit>> {
+        let limit = limit.unwrap_or(20);
+
+        // If no embedding provider, fall back to BM25 text search
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "semantic_search_notes: no embedding provider configured, falling back to BM25 text search"
+                );
+                let filters = NoteFilters {
+                    limit: Some(limit as i64),
+                    ..Default::default()
+                };
+                return self.search_notes(query, &filters).await;
+            }
+        };
+
+        // Embed the query text
+        let query_embedding = provider.embed_text(query).await.map_err(|e| {
+            anyhow::anyhow!("Failed to embed search query: {}", e)
+        })?;
+
+        // Perform vector similarity search via Neo4j HNSW index
+        let results = self
+            .neo4j
+            .vector_search_notes(&query_embedding, limit, project_id, workspace_slug)
+            .await?;
+
+        // Convert to NoteSearchHit
+        Ok(results
+            .into_iter()
+            .map(|(note, score)| NoteSearchHit {
+                note,
+                score,
+                highlights: None,
+            })
+            .collect())
+    }
+
     // ========================================================================
     // Context Operations
     // ========================================================================
@@ -1550,5 +1608,86 @@ mod tests {
             .unwrap();
         assert_eq!(updated.content, "Updated global rule");
         assert!(updated.project_id.is_none());
+    }
+
+    // ====================================================================
+    // Semantic (vector) search
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_returns_similar_notes() {
+        let (mgr, pid, _graph) = create_note_manager_with_embeddings().await;
+
+        // Create several notes with different content
+        let req1 = make_create_request(pid, "Always handle errors with Result type in Rust");
+        let note1 = mgr.create_note(req1, "agent-1").await.unwrap();
+
+        let req2 = make_create_request(pid, "Error handling best practices and conventions");
+        let note2 = mgr.create_note(req2, "agent-1").await.unwrap();
+
+        let req3 = make_create_request(pid, "Database connection pooling and timeout settings");
+        let _note3 = mgr.create_note(req3, "agent-1").await.unwrap();
+
+        // Search for error-handling related notes
+        let results = mgr
+            .semantic_search_notes("how to handle errors", None, None, Some(10))
+            .await
+            .unwrap();
+
+        // Should return results (mock provider uses deterministic hash-based embeddings)
+        assert!(!results.is_empty(), "semantic search should return results");
+
+        // Each result should have a finite score (mock cosine similarity can be near-zero
+        // for random high-dimensional vectors, which is mathematically correct)
+        for hit in &results {
+            assert!(hit.score.is_finite(), "score should be finite");
+        }
+
+        // Verify the notes we created are in results
+        let result_ids: Vec<Uuid> = results.iter().map(|h| h.note.id).collect();
+        assert!(
+            result_ids.contains(&note1.id) || result_ids.contains(&note2.id),
+            "should find at least one of the error-handling notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_without_provider_falls_back() {
+        let (mgr, pid) = create_note_manager().await;
+
+        // Create a note
+        let req = make_create_request(pid, "Test fallback content");
+        mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Semantic search without provider should fall back to BM25 (no panic, no error)
+        let results = mgr
+            .semantic_search_notes("test", None, None, Some(10))
+            .await;
+
+        // Should not error — falls back gracefully to Meilisearch
+        assert!(results.is_ok(), "should fall back to BM25 without error");
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_notes_with_project_filter() {
+        let (mgr, pid, _graph) = create_note_manager_with_embeddings().await;
+
+        let req = make_create_request(pid, "Project-specific guideline");
+        mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Search with project filter
+        let results = mgr
+            .semantic_search_notes("guideline", Some(pid), None, Some(10))
+            .await
+            .unwrap();
+
+        // All results should belong to the project
+        for hit in &results {
+            assert_eq!(
+                hit.note.project_id,
+                Some(pid),
+                "all results should belong to the filtered project"
+            );
+        }
     }
 }

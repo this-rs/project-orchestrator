@@ -1307,7 +1307,7 @@ fn note_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "search_notes".to_string(),
-            description: "Search notes using semantic search".to_string(),
+            description: "Search notes using full-text search (BM25 via Meilisearch). Good for keyword matching. For semantic/conceptual search, prefer search_notes_semantic.".to_string(),
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
@@ -1316,6 +1316,22 @@ fn note_tools() -> Vec<ToolDefinition> {
                     "note_type": {"type": "string", "description": "Filter by note type"},
                     "status": {"type": "string", "description": "Filter by status"},
                     "importance": {"type": "string", "description": "Filter by importance"},
+                    "limit": {"type": "integer", "description": "Max results (default 20)"}
+                })),
+                required: Some(vec!["query".to_string()]),
+            },
+        },
+        ToolDefinition {
+            name: "search_notes_semantic".to_string(),
+            description: "Search notes using vector similarity (cosine) via embeddings. Best for natural language queries and conceptual search — finds semantically related notes even without keyword overlap. Uses local ONNX embeddings + Neo4j HNSW index. Falls back to BM25 if embeddings are unavailable.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({
+                    "query": {"type": "string", "description": "Natural language search query (e.g. 'how to handle database errors')"},
+                    "project_slug": {"type": "string", "description": "Filter by project slug (resolves to project_id)"},
+                    "workspace_slug": {"type": "string", "description": "Filter by workspace (includes all projects in workspace + global notes)"},
+                    "note_type": {"type": "string", "description": "Filter by note type (guideline, gotcha, pattern, context, tip, observation, assertion)"},
+                    "importance": {"type": "string", "description": "Filter by importance (critical, high, medium, low)"},
                     "limit": {"type": "integer", "description": "Max results (default 20)"}
                 })),
                 required: Some(vec!["query".to_string()]),
@@ -2186,7 +2202,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 153, "Expected 153 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 154, "Expected 154 tools, got {}", tools.len());
     }
 
     #[test]
