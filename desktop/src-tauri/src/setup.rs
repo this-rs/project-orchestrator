@@ -661,8 +661,8 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             } else {
                 Some(config.chat_claude_cli_path.trim().to_string())
             },
-            auto_update_cli: if config.chat_auto_update_cli { Some(true) } else { None },
-            auto_update_app: if !config.chat_auto_update_app { Some(false) } else { None },
+            auto_update_cli: Some(config.chat_auto_update_cli),
+            auto_update_app: Some(config.chat_auto_update_app),
         }),
         auth,
     };
