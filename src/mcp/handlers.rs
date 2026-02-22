@@ -2144,7 +2144,7 @@ impl ToolHandler {
             tracing::warn!("Failed to clean Meilisearch code index: {}", e);
         }
         Ok(
-            json!({"deleted_count": deleted as i64, "message": "Sync data cleaned. Run sync_project to rebuild."}),
+            json!({"deleted_count": deleted, "message": "Sync data cleaned. Run sync_project to rebuild."}),
         )
     }
 
