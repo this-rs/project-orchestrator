@@ -71,9 +71,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-# TODO: revert to git after merging feat/configurable-path-and-cli-update on nexus
-# nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "b97e3d8", features = ["memory", "auto-download"] }
-nexus-claude = { path = "/Users/triviere/projects/project-orchestrator/nexus/claude-code-sdk-rs", features = ["memory", "auto-download"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "68274b1", features = ["memory", "auto-download"] }
 tokio-stream = "0.1"
 
 # Auth

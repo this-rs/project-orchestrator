@@ -177,6 +177,10 @@ fn is_local_build(cli_path: &Path) -> bool {
         "/opt/homebrew/bin/claude",
         "/opt/homebrew/Cellar/",
         "/usr/local/Cellar/",
+        // Official Anthropic installer (curl https://claude.ai/install.sh | bash)
+        // Installs to ~/.local/share/claude/versions/<ver>/ with symlink at ~/.local/bin/claude
+        ".local/bin/claude",
+        ".local/share/claude/",
     ];
 
     // Also check if it's the cc-sdk cached path specifically
@@ -232,6 +236,31 @@ mod tests {
         assert!(
             !is_local_build(Path::new("/home/me/.cache/cc-sdk/cli/claude")),
             "Linux cc-sdk cache should not be local"
+        );
+    }
+
+    #[test]
+    fn test_is_local_build_anthropic_installer() {
+        // Official Anthropic installer paths are NOT local builds
+        assert!(
+            !is_local_build(Path::new("/home/me/.local/bin/claude")),
+            "~/.local/bin/claude (Anthropic installer symlink) should not be local"
+        );
+        assert!(
+            !is_local_build(Path::new("/Users/me/.local/bin/claude")),
+            "macOS ~/.local/bin/claude should not be local"
+        );
+        assert!(
+            !is_local_build(Path::new(
+                "/home/me/.local/share/claude/versions/2.1.50/claude"
+            )),
+            "~/.local/share/claude/versions/<ver>/claude should not be local"
+        );
+        assert!(
+            !is_local_build(Path::new(
+                "/Users/me/.local/share/claude/versions/2.1.50/claude"
+            )),
+            "macOS ~/.local/share/claude/versions/<ver>/claude should not be local"
         );
     }
 

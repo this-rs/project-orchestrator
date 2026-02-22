@@ -933,68 +933,71 @@ jobs:
           echo "=== Checksums ==="
           cat checksums-sha256.txt
 
+      - name: Debug — list release-files before latest.json generation
+        run: |
+          echo "=== All files in release-files/ ==="
+          ls -la release-files/ || echo "No release files found"
+          echo ""
+          echo "=== Updater-relevant files ==="
+          ls release-files/*.app.tar.gz release-files/*.app.tar.gz.sig 2>/dev/null || echo "  No macOS updater bundles"
+          ls release-files/*.AppImage.tar.gz release-files/*.AppImage.tar.gz.sig 2>/dev/null || echo "  No Linux updater bundles"
+          ls release-files/*.nsis.zip release-files/*.nsis.zip.sig 2>/dev/null || echo "  No Windows updater bundles"
+
       - name: Generate Tauri updater latest.json
         shell: bash
         run: |
           VERSION="${RELEASE_TAG#v}"
           REPO="${{ github.repository }}"
           BASE_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
-          NOTES=$(cat <<'EOFNOTES'
-          See release notes at https://github.com/${REPO}/releases/tag/${RELEASE_TAG}
-          EOFNOTES
-          )
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          # Read signatures from .sig files
-          DARWIN_AARCH64_SIG=""
-          DARWIN_X86_64_SIG=""
-          LINUX_X86_64_SIG=""
-          WINDOWS_X86_64_SIG=""
+          # --- macOS ---
+          # Tauri produces "Product.Name.app.tar.gz" without arch in the filename.
+          # Both aarch64 and x86_64 builds produce the same name — after flatten,
+          # only one survives. Both darwin platforms use the same URL.
+          MACOS_URL=""
+          MACOS_SIG=""
+          for f in release-files/*.app.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && MACOS_URL="${BASE_URL}/$(basename "$f")" && break
+          done
+          for f in release-files/*.app.tar.gz.sig; do
+            [ -f "$f" ] && MACOS_SIG=$(cat "$f") && break
+          done
 
-          # macOS signatures (.app.tar.gz.sig)
-          for f in release-files/*aarch64-apple-darwin*.app.tar.gz.sig release-files/*aarch64*.app.tar.gz.sig; do
-            [ -f "$f" ] && DARWIN_AARCH64_SIG=$(cat "$f") && break
+          # --- Linux ---
+          # Tauri produces "Product.Name_version_amd64.AppImage.tar.gz"
+          LINUX_X86_64_URL=""
+          LINUX_X86_64_SIG=""
+          for f in release-files/*.AppImage.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && LINUX_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
           done
-          for f in release-files/*x86_64-apple-darwin*.app.tar.gz.sig release-files/*x86_64*.app.tar.gz.sig; do
-            [ -f "$f" ] && DARWIN_X86_64_SIG=$(cat "$f") && break
-          done
-          # Linux signatures (.AppImage.tar.gz.sig)
-          for f in release-files/*x86_64*linux*.AppImage.tar.gz.sig; do
+          for f in release-files/*.AppImage.tar.gz.sig; do
             [ -f "$f" ] && LINUX_X86_64_SIG=$(cat "$f") && break
           done
-          # Windows signatures (.nsis.zip.sig)
-          for f in release-files/*x86_64*windows*.nsis.zip.sig; do
+
+          # --- Windows ---
+          # Tauri produces "Product.Name_version_x64-setup.nsis.zip"
+          WINDOWS_X86_64_URL=""
+          WINDOWS_X86_64_SIG=""
+          for f in release-files/*.nsis.zip; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && WINDOWS_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
+          done
+          for f in release-files/*.nsis.zip.sig; do
             [ -f "$f" ] && WINDOWS_X86_64_SIG=$(cat "$f") && break
           done
 
-          # Find the actual artifact filenames for URLs
-          DARWIN_AARCH64_URL=""
-          DARWIN_X86_64_URL=""
-          LINUX_X86_64_URL=""
-          WINDOWS_X86_64_URL=""
-
-          for f in release-files/*aarch64-apple-darwin*.app.tar.gz; do
-            [ -f "$f" ] && [[ "$f" != *.sig ]] && DARWIN_AARCH64_URL="${BASE_URL}/$(basename "$f")" && break
-          done
-          for f in release-files/*x86_64-apple-darwin*.app.tar.gz; do
-            [ -f "$f" ] && [[ "$f" != *.sig ]] && DARWIN_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
-          done
-          for f in release-files/*x86_64*linux*.AppImage.tar.gz; do
-            [ -f "$f" ] && [[ "$f" != *.sig ]] && LINUX_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
-          done
-          for f in release-files/*x86_64*windows*.nsis.zip; do
-            [ -f "$f" ] && [[ "$f" != *.sig ]] && WINDOWS_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
-          done
+          # --- Validation ---
+          if [ -z "$MACOS_URL" ] && [ -z "$LINUX_X86_64_URL" ] && [ -z "$WINDOWS_X86_64_URL" ]; then
+            echo "::warning::All updater URLs are empty — latest.json will not enable auto-updates. Check that TAURI_SIGNING_PRIVATE_KEY is set and updater bundles were generated."
+          fi
 
           # Build JSON using jq
           jq -n \
             --arg version "$VERSION" \
             --arg notes "See full release notes on GitHub" \
             --arg pub_date "$PUB_DATE" \
-            --arg darwin_aarch64_url "$DARWIN_AARCH64_URL" \
-            --arg darwin_aarch64_sig "$DARWIN_AARCH64_SIG" \
-            --arg darwin_x86_64_url "$DARWIN_X86_64_URL" \
-            --arg darwin_x86_64_sig "$DARWIN_X86_64_SIG" \
+            --arg macos_url "$MACOS_URL" \
+            --arg macos_sig "$MACOS_SIG" \
             --arg linux_x86_64_url "$LINUX_X86_64_URL" \
             --arg linux_x86_64_sig "$LINUX_X86_64_SIG" \
             --arg windows_x86_64_url "$WINDOWS_X86_64_URL" \
@@ -1004,8 +1007,8 @@ jobs:
               notes: $notes,
               pub_date: $pub_date,
               platforms: {
-                "darwin-aarch64": { url: $darwin_aarch64_url, signature: $darwin_aarch64_sig },
-                "darwin-x86_64": { url: $darwin_x86_64_url, signature: $darwin_x86_64_sig },
+                "darwin-aarch64": { url: $macos_url, signature: $macos_sig },
+                "darwin-x86_64": { url: $macos_url, signature: $macos_sig },
                 "linux-x86_64": { url: $linux_x86_64_url, signature: $linux_x86_64_sig },
                 "windows-x86_64": { url: $windows_x86_64_url, signature: $windows_x86_64_sig }
               }
