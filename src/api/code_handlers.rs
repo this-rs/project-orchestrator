@@ -474,12 +474,12 @@ pub async fn analyze_impact(
         let direct = state
             .orchestrator
             .neo4j()
-            .find_dependent_files(&query.target, 1, project_id)
+            .find_impacted_files(&query.target, 1, project_id)
             .await?;
         let transitive = state
             .orchestrator
             .neo4j()
-            .find_dependent_files(&query.target, 3, project_id)
+            .find_impacted_files(&query.target, 3, project_id)
             .await?;
         let count = direct.len() as i64;
         (direct, transitive, count)

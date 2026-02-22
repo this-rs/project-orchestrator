@@ -1876,11 +1876,11 @@ impl ToolHandler {
         let (directly_affected, transitively_affected, caller_count) = if target_type == "file" {
             let direct = self
                 .neo4j()
-                .find_dependent_files(target, 1, project_id)
+                .find_impacted_files(target, 1, project_id)
                 .await?;
             let transitive = self
                 .neo4j()
-                .find_dependent_files(target, 3, project_id)
+                .find_impacted_files(target, 3, project_id)
                 .await?;
             let caller_count = direct.len() as i64;
             (direct, transitive, caller_count)

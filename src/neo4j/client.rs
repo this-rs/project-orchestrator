@@ -5858,6 +5858,72 @@ impl Neo4jClient {
         Ok(paths)
     }
 
+    /// Find all files impacted by a change to a given file.
+    ///
+    /// Combines two traversal axes:
+    /// 1. **IMPORTS** — files that import (directly or transitively) the target file
+    /// 2. **CALLS**  — files whose functions call functions defined in the target file
+    ///
+    /// Returns a deduplicated list of file paths (excluding the target itself).
+    pub async fn find_impacted_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
+        let q = match project_id {
+            Some(pid) => query(&format!(
+                r#"
+                MATCH (f:File {{path: $path}})<-[:CONTAINS]-(p:Project {{id: $project_id}})
+                // Axis 1: files that import the target (transitively)
+                OPTIONAL MATCH (f)<-[:IMPORTS*1..{}]-(imp:File)
+                WHERE imp IS NULL OR EXISTS {{ MATCH (imp)<-[:CONTAINS]-(p) }}
+                // Axis 2: files whose functions call functions in the target
+                WITH f, p, COLLECT(DISTINCT imp.path) AS import_paths
+                OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)<-[:CALLS]-(caller:Function)<-[:CONTAINS]-(caller_file:File)
+                WHERE caller_file <> f AND EXISTS {{ MATCH (caller_file)<-[:CONTAINS]-(p) }}
+                WITH import_paths, COLLECT(DISTINCT caller_file.path) AS call_paths
+                // Merge both axes
+                WITH import_paths + call_paths AS all_paths
+                UNWIND all_paths AS path
+                WITH path WHERE path IS NOT NULL
+                RETURN DISTINCT path
+                "#,
+                depth
+            ))
+            .param("path", file_path)
+            .param("project_id", pid.to_string()),
+            None => query(&format!(
+                r#"
+                MATCH (f:File {{path: $path}})
+                // Axis 1: files that import the target (transitively)
+                OPTIONAL MATCH (f)<-[:IMPORTS*1..{}]-(imp:File)
+                // Axis 2: files whose functions call functions in the target
+                WITH f, COLLECT(DISTINCT imp.path) AS import_paths
+                OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)<-[:CALLS]-(caller:Function)<-[:CONTAINS]-(caller_file:File)
+                WHERE caller_file <> f
+                WITH import_paths, COLLECT(DISTINCT caller_file.path) AS call_paths
+                // Merge both axes
+                WITH import_paths + call_paths AS all_paths
+                UNWIND all_paths AS path
+                WITH path WHERE path IS NOT NULL
+                RETURN DISTINCT path
+                "#,
+                depth
+            ))
+            .param("path", file_path),
+        };
+
+        let mut result = self.graph.execute(q).await?;
+        let mut paths = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            paths.push(row.get("path")?);
+        }
+
+        Ok(paths)
+    }
+
     /// Find all functions that call a given function
     pub async fn find_callers(
         &self,

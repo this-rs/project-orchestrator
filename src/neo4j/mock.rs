@@ -3205,6 +3205,58 @@ impl GraphStore for MockGraphStore {
         Ok(dependents)
     }
 
+    async fn find_impacted_files(
+        &self,
+        file_path: &str,
+        _depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
+        let mut impacted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Axis 1: files that import the target (same as find_dependent_files)
+        let ir = self.import_relationships.read().await;
+        for (from, tos) in ir.iter() {
+            if tos.contains(&file_path.to_string()) {
+                impacted.insert(from.clone());
+            }
+        }
+
+        // Axis 2: files whose functions call functions defined in the target file
+        let functions = self.functions.read().await;
+        let cr = self.call_relationships.read().await;
+
+        // Collect function names defined in the target file
+        let target_func_names: Vec<String> = functions
+            .values()
+            .filter(|f| f.file_path == file_path)
+            .map(|f| f.name.clone())
+            .collect();
+
+        // Find callers of those functions and their files
+        for (caller_id, callees) in cr.iter() {
+            if callees.iter().any(|c| target_func_names.contains(c)) {
+                if let Some(caller_fn) = functions.get(caller_id) {
+                    if caller_fn.file_path != file_path {
+                        impacted.insert(caller_fn.file_path.clone());
+                    }
+                }
+            }
+        }
+
+        // Filter by project if project_id is provided
+        let mut result: Vec<String> = impacted.into_iter().collect();
+        if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            if let Some(project_paths) = pf.get(&pid) {
+                result.retain(|p| project_paths.contains(p));
+            } else {
+                result.clear();
+            }
+        }
+
+        Ok(result)
+    }
+
     async fn find_callers(
         &self,
         function_id: &str,
@@ -6639,6 +6691,122 @@ mod tests {
             .await
             .unwrap();
         assert!(deps.is_empty());
+    }
+
+    // ========================================================================
+    // find_impacted_files tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_find_impacted_files_combines_imports_and_calls() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("impact-project");
+
+        // Setup: lib.rs defines functions, handler.rs imports lib.rs, service.rs calls lib functions
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/lib.rs", &["execute", "helper"]),
+                ("src/handler.rs", &[]),
+                ("src/service.rs", &["do_work"]),
+            ],
+        )
+        .await;
+
+        // handler.rs imports lib.rs (IMPORTS axis)
+        store
+            .create_import_relationship("src/handler.rs", "src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        // service.rs::do_work calls lib.rs::execute (CALLS axis)
+        store
+            .create_call_relationship("src/service.rs::do_work", "execute", Some(project.id))
+            .await
+            .unwrap();
+
+        // find_impacted_files should return BOTH handler.rs (imports) and service.rs (calls)
+        let impacted = store
+            .find_impacted_files("src/lib.rs", 3, Some(project.id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            impacted.len(),
+            2,
+            "Expected 2 impacted files, got: {:?}",
+            impacted
+        );
+        assert!(impacted.contains(&"src/handler.rs".to_string()));
+        assert!(impacted.contains(&"src/service.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_find_impacted_files_excludes_self() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("self-project");
+
+        // A file that has a function calling its own function should NOT list itself
+        seed_project(&store, &project, &[("src/lib.rs", &["fn_a", "fn_b"])]).await;
+
+        store
+            .create_call_relationship("src/lib.rs::fn_a", "fn_b", Some(project.id))
+            .await
+            .unwrap();
+
+        let impacted = store
+            .find_impacted_files("src/lib.rs", 3, Some(project.id))
+            .await
+            .unwrap();
+
+        assert!(
+            impacted.is_empty(),
+            "Self-calls should not appear in impacted files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_impacted_files_scoped_by_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("proj-a");
+        let project_b = test_project_named("proj-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[
+                ("a/src/lib.rs", &["target"]),
+                ("a/src/caller.rs", &["call_it"]),
+            ],
+        )
+        .await;
+        seed_project(&store, &project_b, &[("b/src/caller.rs", &["call_it_b"])]).await;
+
+        // Both projects' functions call target in project_a
+        store
+            .create_call_relationship("a/src/caller.rs::call_it", "target", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/caller.rs::call_it_b", "target", None)
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only a/src/caller.rs
+        let impacted_a = store
+            .find_impacted_files("a/src/lib.rs", 3, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(impacted_a.len(), 1);
+        assert_eq!(impacted_a[0], "a/src/caller.rs");
+
+        // Without scope: both
+        let impacted_all = store
+            .find_impacted_files("a/src/lib.rs", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(impacted_all.len(), 2);
     }
 
     // ========================================================================

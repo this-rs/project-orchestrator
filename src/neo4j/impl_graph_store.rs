@@ -943,6 +943,15 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn find_impacted_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.find_impacted_files(file_path, depth, project_id).await
+    }
+
     async fn find_callers(
         &self,
         function_id: &str,
