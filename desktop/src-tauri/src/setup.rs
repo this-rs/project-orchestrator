@@ -711,6 +711,24 @@ pub async fn detect_shell_path() -> Result<Option<String>, String> {
     Ok(project_orchestrator::chat::path_detect::detect_user_path().await)
 }
 
+/// Check CLI version status directly via Tauri (no backend/auth required).
+///
+/// This is used by the setup wizard which runs BEFORE the backend is available.
+/// Calls `check_cli_status()` from the shared `cli_version` module.
+#[tauri::command]
+pub async fn check_cli_status() -> Result<project_orchestrator::chat::cli_version::CliVersionStatus, String> {
+    Ok(project_orchestrator::chat::cli_version::check_cli_status().await)
+}
+
+/// Install or upgrade the Claude CLI directly via Tauri (no backend/auth required).
+///
+/// Same rationale as `check_cli_status` — the setup wizard needs this before
+/// the API server is running.
+#[tauri::command]
+pub async fn install_cli(version: Option<String>) -> Result<project_orchestrator::chat::cli_version::CliInstallResult, String> {
+    Ok(project_orchestrator::chat::cli_version::install_or_upgrade_cli(version.as_deref()).await)
+}
+
 /// Result of the Claude Code MCP setup, sent to the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

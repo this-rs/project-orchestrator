@@ -144,6 +144,8 @@ fn main() {
             setup::read_config,
             setup::detect_claude_code,
             setup::detect_shell_path,
+            setup::check_cli_status,
+            setup::install_cli,
             setup::setup_claude_code,
             setup::verify_oidc_discovery,
             // Docker management commands
