@@ -1427,6 +1427,7 @@ pub async fn plan_implementation(
         entry_points: body.entry_points,
         scope,
         auto_create_plan: body.auto_create_plan,
+        root_path: Some(project.root_path),
     };
 
     let plan = state

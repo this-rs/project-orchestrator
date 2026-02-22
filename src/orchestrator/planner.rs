@@ -47,6 +47,9 @@ pub struct PlanRequest {
     /// If true, auto-create a Plan MCP with Tasks/Steps
     #[serde(default)]
     pub auto_create_plan: Option<bool>,
+    /// Project root path (for resolving relative file paths to absolute)
+    #[serde(default)]
+    pub root_path: Option<String>,
 }
 
 // ============================================================================
@@ -208,6 +211,26 @@ pub struct ModificationDag {
 }
 
 // ============================================================================
+// Path resolution helper
+// ============================================================================
+
+/// Resolve a potentially relative file path to absolute using the project root_path.
+/// - If `path` is already absolute (starts with `/`), return it as-is.
+/// - If `root_path` is provided and `path` is relative, prepend the expanded root.
+/// - Otherwise return `path` unchanged.
+fn resolve_path(root_path: Option<&str>, path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    if let Some(root) = root_path {
+        let expanded = crate::expand_tilde(root);
+        format!("{}/{}", expanded.trim_end_matches('/'), path)
+    } else {
+        path.to_string()
+    }
+}
+
+// ============================================================================
 // Planner
 // ============================================================================
 
@@ -252,32 +275,36 @@ impl ImplementationPlanner {
     /// If the entry point looks like a file path (contains `/` or `.`), resolve via
     /// `get_file_symbol_names`. Otherwise treat it as a symbol name and use
     /// `find_symbol_references` to locate the file.
+    ///
+    /// Relative file paths are resolved to absolute using the project `root_path`.
     async fn resolve_explicit_entries(
         &self,
         entry_points: &[String],
         project_id: Uuid,
+        root_path: Option<&str>,
     ) -> Result<Vec<RelevantZone>> {
         let mut zones = Vec::new();
         for entry in entry_points {
             if entry.contains('/') || entry.contains('.') {
-                // File path — get symbols in this file
-                match self.neo4j.get_file_symbol_names(entry).await {
+                // File path — resolve to absolute, then get symbols
+                let resolved = resolve_path(root_path, entry);
+                match self.neo4j.get_file_symbol_names(&resolved).await {
                     Ok(symbols) => {
                         let mut functions = symbols.functions;
                         functions.extend(symbols.structs);
                         functions.extend(symbols.traits);
                         functions.extend(symbols.enums);
                         zones.push(RelevantZone {
-                            file_path: entry.clone(),
+                            file_path: resolved,
                             functions,
                             relevance_score: 1.0,
                             source: ZoneSource::ExplicitEntry,
                         });
                     }
                     Err(_) => {
-                        // File not in graph — still add it with no symbols
+                        // File not in graph — still add it with resolved path
                         zones.push(RelevantZone {
-                            file_path: entry.clone(),
+                            file_path: resolved,
                             functions: vec![],
                             relevance_score: 1.0,
                             source: ZoneSource::ExplicitEntry,
@@ -320,31 +347,41 @@ impl ImplementationPlanner {
         let mut zones = Vec::new();
 
         // Code search results
-        if let Ok(hits) = code_results {
-            for hit in hits {
-                zones.push(RelevantZone {
-                    file_path: hit.document.path.clone(),
-                    functions: hit.document.symbols.clone(),
-                    relevance_score: hit.score.min(1.0),
-                    source: ZoneSource::SemanticSearch,
-                });
+        match code_results {
+            Ok(hits) => {
+                for hit in hits {
+                    zones.push(RelevantZone {
+                        file_path: hit.document.path.clone(),
+                        functions: hit.document.symbols.clone(),
+                        relevance_score: hit.score.min(1.0),
+                        source: ZoneSource::SemanticSearch,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Planner: semantic code search failed: {}", e);
             }
         }
 
         // Note search results — extract file paths from anchor entities
-        if let Ok(notes) = note_results {
-            for note in notes {
-                for anchor in &note.anchor_entities {
-                    // Anchor entities that look like file paths
-                    if anchor.contains('/') || anchor.contains('.') {
-                        zones.push(RelevantZone {
-                            file_path: anchor.clone(),
-                            functions: vec![],
-                            relevance_score: 0.5, // Lower score for note-sourced zones
-                            source: ZoneSource::NoteReference,
-                        });
+        match note_results {
+            Ok(notes) => {
+                for note in notes {
+                    for anchor in &note.anchor_entities {
+                        // Anchor entities that look like file paths
+                        if anchor.contains('/') || anchor.contains('.') {
+                            zones.push(RelevantZone {
+                                file_path: anchor.clone(),
+                                functions: vec![],
+                                relevance_score: 0.5, // Lower score for note-sourced zones
+                                source: ZoneSource::NoteReference,
+                            });
+                        }
                     }
                 }
+            }
+            Err(e) => {
+                tracing::warn!("Planner: note search failed: {}", e);
             }
         }
 
@@ -355,9 +392,10 @@ impl ImplementationPlanner {
     /// otherwise fall back to semantic search. Dedup by file_path (keep best score),
     /// sort by score descending, limit to MAX_ZONES.
     async fn identify_zones(&self, request: &PlanRequest) -> Result<Vec<RelevantZone>> {
+        let root_path = request.root_path.as_deref();
         let zones = if let Some(ref entries) = request.entry_points {
             if !entries.is_empty() {
-                self.resolve_explicit_entries(entries, request.project_id)
+                self.resolve_explicit_entries(entries, request.project_id, root_path)
                     .await?
             } else {
                 self.search_semantic_zones(&request.description, request.project_slug.as_deref())
@@ -367,6 +405,17 @@ impl ImplementationPlanner {
             self.search_semantic_zones(&request.description, request.project_slug.as_deref())
                 .await?
         };
+
+        // Normalize all zone file paths to absolute using project root_path.
+        // This ensures dedup works correctly even when Meilisearch returns
+        // both relative and absolute paths for the same file.
+        let zones: Vec<RelevantZone> = zones
+            .into_iter()
+            .map(|mut zone| {
+                zone.file_path = resolve_path(root_path, &zone.file_path);
+                zone
+            })
+            .collect();
 
         // Dedup by file_path — keep the highest relevance_score
         let mut best: HashMap<String, RelevantZone> = HashMap::new();
@@ -391,8 +440,9 @@ impl ImplementationPlanner {
     // Phase 2 — DAG construction (Task 3)
     // ========================================================================
 
-    /// Expand dependencies for each zone: find dependent files (files that import
-    /// this zone's file) and direct imports. Returns (dependents_map, imports_map).
+    /// Expand dependencies for each zone: find impacted files (files that import
+    /// OR call functions from this zone's file) and direct imports.
+    /// Returns (dependents_map, imports_map).
     async fn expand_dependencies(
         &self,
         zones: &[RelevantZone],
@@ -403,7 +453,7 @@ impl ImplementationPlanner {
 
         for zone in zones {
             let (dependents, imports) = tokio::join!(
-                self.neo4j.find_dependent_files(
+                self.neo4j.find_impacted_files(
                     &zone.file_path,
                     MAX_DEPENDENCY_DEPTH,
                     Some(project_id)
@@ -1085,6 +1135,7 @@ mod tests {
             entry_points: Some(vec!["src/chat/mod.rs".to_string()]),
             scope: Some(PlanScope::Module),
             auto_create_plan: Some(false),
+            root_path: Some("~/.openclaw/workspace/my-project".to_string()),
         };
         let json = serde_json::to_string(&request).unwrap();
         let parsed: PlanRequest = serde_json::from_str(&json).unwrap();
@@ -1273,7 +1324,7 @@ mod tests {
         let (planner, pid) = setup_planner_with_data().await;
 
         let zones = planner
-            .resolve_explicit_entries(&["src/models.rs".to_string()], pid)
+            .resolve_explicit_entries(&["src/models.rs".to_string()], pid, None)
             .await
             .unwrap();
 
@@ -1290,7 +1341,7 @@ mod tests {
         let (planner, pid) = setup_planner_with_data().await;
 
         let zones = planner
-            .resolve_explicit_entries(&["src/unknown.rs".to_string()], pid)
+            .resolve_explicit_entries(&["src/unknown.rs".to_string()], pid, None)
             .await
             .unwrap();
 
@@ -1314,6 +1365,7 @@ mod tests {
             ]),
             scope: None,
             auto_create_plan: None,
+            root_path: None,
         };
 
         let zones = planner.identify_zones(&request).await.unwrap();
@@ -1338,6 +1390,7 @@ mod tests {
             ]),
             scope: None,
             auto_create_plan: None,
+            root_path: None,
         };
 
         let zones = planner.identify_zones(&request).await.unwrap();
@@ -1356,6 +1409,7 @@ mod tests {
             entry_points: None,
             scope: None,
             auto_create_plan: None,
+            root_path: None,
         };
 
         // With empty mocks, should return empty (no semantic matches)
@@ -1891,6 +1945,7 @@ mod tests {
             ]),
             scope: Some(PlanScope::Module),
             auto_create_plan: None,
+            root_path: None,
         };
 
         let plan = planner.plan_implementation(request).await.unwrap();
@@ -1918,6 +1973,7 @@ mod tests {
             entry_points: None, // No explicit entries, semantic search won't match
             scope: None,
             auto_create_plan: None,
+            root_path: None,
         };
 
         let plan = planner.plan_implementation(request).await.unwrap();
@@ -1939,6 +1995,7 @@ mod tests {
             ]),
             scope: None,
             auto_create_plan: Some(true),
+            root_path: None,
         };
 
         let plan = planner.plan_implementation(request).await.unwrap();

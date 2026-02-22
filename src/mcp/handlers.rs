@@ -2166,12 +2166,12 @@ impl ToolHandler {
 
     async fn cleanup_sync_data(&self, _args: Value) -> Result<Value> {
         let deleted = self.neo4j().cleanup_sync_data().await?;
-        // Also clean up the Meilisearch code index
-        if let Err(e) = self.meili().delete_orphan_code_documents().await {
+        // Also clean ALL Meilisearch code documents to avoid stale/duplicate entries
+        if let Err(e) = self.meili().delete_all_code().await {
             tracing::warn!("Failed to clean Meilisearch code index: {}", e);
         }
         Ok(
-            json!({"deleted_count": deleted, "message": "Sync data cleaned. Run sync_project to rebuild."}),
+            json!({"deleted_count": deleted, "message": "Sync data and Meilisearch code index cleaned. Run sync_project to rebuild."}),
         )
     }
 
@@ -4554,6 +4554,7 @@ impl ToolHandler {
             entry_points,
             scope,
             auto_create_plan,
+            root_path: Some(project.root_path),
         };
 
         let plan = self
