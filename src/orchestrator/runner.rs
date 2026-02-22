@@ -4312,6 +4312,165 @@ mod tests {
         assert_eq!(stale[0].project_id, p1.id);
     }
 
+    // ── store_parsed_file_for_project (batch integration) ─────────
+
+    #[tokio::test]
+    async fn test_store_parsed_file_for_project_uses_batch_methods() {
+        use crate::neo4j::models::*;
+        use crate::parser::{FunctionCall, ParsedFile};
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        // Use absolute path to avoid normalize_path prepending cwd
+        let file_path = "/tmp/test-project/src/lib.rs".to_string();
+
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            functions: vec![
+                FunctionNode {
+                    name: "foo".to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_path.clone(),
+                    line_start: 1,
+                    line_end: 10,
+                    docstring: None,
+                },
+                FunctionNode {
+                    name: "bar".to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_path.clone(),
+                    line_start: 20,
+                    line_end: 30,
+                    docstring: None,
+                },
+            ],
+            structs: vec![StructNode {
+                name: "MyStruct".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: file_path.clone(),
+                line_start: 40,
+                line_end: 50,
+                docstring: None,
+            }],
+            traits: vec![TraitNode {
+                name: "MyTrait".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: file_path.clone(),
+                line_start: 60,
+                line_end: 70,
+                docstring: None,
+                is_external: false,
+                source: None,
+            }],
+            enums: vec![EnumNode {
+                name: "MyEnum".to_string(),
+                visibility: Visibility::Public,
+                variants: vec!["A".to_string(), "B".to_string()],
+                file_path: file_path.clone(),
+                line_start: 80,
+                line_end: 90,
+                docstring: None,
+            }],
+            impl_blocks: vec![ImplNode {
+                for_type: "MyStruct".to_string(),
+                trait_name: Some("MyTrait".to_string()),
+                generics: vec![],
+                where_clause: None,
+                file_path: file_path.clone(),
+                line_start: 100,
+                line_end: 110,
+            }],
+            imports: vec![ImportNode {
+                path: "std::fmt".to_string(),
+                alias: None,
+                items: vec!["Display".to_string()],
+                file_path: file_path.clone(),
+                line: 1,
+            }],
+            function_calls: vec![FunctionCall {
+                caller_id: format!("{}:foo:1", file_path),
+                callee_name: "bar".to_string(),
+                line: 5,
+            }],
+            symbols: vec!["foo".to_string(), "bar".to_string()],
+        };
+
+        // Call without project_id to avoid mock's project-scoped call filtering
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+
+        // Verify all entity types were stored via batch methods
+        assert_eq!(mock_store.functions.read().await.len(), 2, "functions");
+        assert_eq!(mock_store.structs_map.read().await.len(), 1, "structs");
+        assert_eq!(mock_store.traits_map.read().await.len(), 1, "traits");
+        assert_eq!(mock_store.enums_map.read().await.len(), 1, "enums");
+        assert_eq!(mock_store.impls_map.read().await.len(), 1, "impls");
+        assert_eq!(mock_store.imports.read().await.len(), 1, "imports");
+        assert!(
+            !mock_store.call_relationships.read().await.is_empty(),
+            "call_relationships should not be empty"
+        );
+
+        // Verify file was stored (normalize_path keeps absolute paths)
+        let files = mock_store.files.read().await;
+        assert_eq!(files.len(), 1, "exactly one file stored");
+        assert!(
+            files.values().next().unwrap().language == "rust",
+            "file has correct language"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_parsed_file_for_project_empty_parsed_file() {
+        use crate::parser::ParsedFile;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let parsed = ParsedFile {
+            path: "/tmp/test-project/src/empty.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "empty".to_string(),
+            functions: vec![],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+
+        // Only the file node should be stored
+        let files = mock_store.files.read().await;
+        assert_eq!(files.len(), 1, "exactly one file stored");
+        assert_eq!(mock_store.functions.read().await.len(), 0);
+    }
+
     // ── code embedding tests ────────────────────────────────────────
 
     #[test]

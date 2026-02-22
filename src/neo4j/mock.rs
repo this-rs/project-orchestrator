@@ -8498,4 +8498,244 @@ mod tests {
         let results = store.vector_search_files(&emb, 10, None).await.unwrap();
         assert_eq!(results.len(), 2);
     }
+
+    // ========================================================================
+    // Batch upsert operations (UNWIND mock)
+    // ========================================================================
+
+    fn make_struct_node(name: &str, file_path: &str) -> StructNode {
+        StructNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        }
+    }
+
+    fn make_trait_node(name: &str, file_path: &str) -> TraitNode {
+        TraitNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+            is_external: false,
+            source: None,
+        }
+    }
+
+    fn make_enum_node(name: &str, file_path: &str) -> EnumNode {
+        EnumNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            variants: vec!["A".to_string(), "B".to_string()],
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        }
+    }
+
+    fn make_impl_node(for_type: &str, trait_name: Option<&str>, file_path: &str) -> ImplNode {
+        ImplNode {
+            for_type: for_type.to_string(),
+            trait_name: trait_name.map(|s| s.to_string()),
+            generics: vec![],
+            where_clause: None,
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+        }
+    }
+
+    fn make_import_node(path: &str, file_path: &str, line: u32) -> ImportNode {
+        ImportNode {
+            path: path.to_string(),
+            alias: None,
+            items: vec!["Item1".to_string()],
+            file_path: file_path.to_string(),
+            line,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_functions() {
+        let store = MockGraphStore::new();
+        let funcs = vec![
+            make_function("foo", "src/lib.rs", 1),
+            make_function("bar", "src/lib.rs", 20),
+            make_function("baz", "src/main.rs", 1),
+        ];
+
+        store.batch_upsert_functions(&funcs).await.unwrap();
+
+        let fns = store.functions.read().await;
+        assert_eq!(fns.len(), 3);
+        assert!(fns.values().any(|f| f.name == "foo"));
+        assert!(fns.values().any(|f| f.name == "bar"));
+        assert!(fns.values().any(|f| f.name == "baz"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_functions_empty() {
+        let store = MockGraphStore::new();
+        store.batch_upsert_functions(&[]).await.unwrap();
+        assert_eq!(store.functions.read().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_structs() {
+        let store = MockGraphStore::new();
+        let structs = vec![
+            make_struct_node("Foo", "src/lib.rs"),
+            make_struct_node("Bar", "src/lib.rs"),
+        ];
+
+        store.batch_upsert_structs(&structs).await.unwrap();
+
+        let s = store.structs_map.read().await;
+        assert_eq!(s.len(), 2);
+        assert!(s.values().any(|x| x.name == "Foo"));
+        assert!(s.values().any(|x| x.name == "Bar"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_traits() {
+        let store = MockGraphStore::new();
+        let traits = vec![
+            make_trait_node("Display", "src/lib.rs"),
+            make_trait_node("Debug", "src/lib.rs"),
+        ];
+
+        store.batch_upsert_traits(&traits).await.unwrap();
+
+        let t = store.traits_map.read().await;
+        assert_eq!(t.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_enums() {
+        let store = MockGraphStore::new();
+        let enums = vec![
+            make_enum_node("Color", "src/lib.rs"),
+            make_enum_node("Shape", "src/lib.rs"),
+        ];
+
+        store.batch_upsert_enums(&enums).await.unwrap();
+
+        let e = store.enums_map.read().await;
+        assert_eq!(e.len(), 2);
+        assert!(e.values().any(|x| x.name == "Color"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_impls() {
+        let store = MockGraphStore::new();
+        let impls = vec![
+            make_impl_node("Foo", None, "src/lib.rs"),
+            make_impl_node("Bar", Some("Display"), "src/lib.rs"),
+        ];
+
+        store.batch_upsert_impls(&impls).await.unwrap();
+
+        let i = store.impls_map.read().await;
+        assert_eq!(i.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_imports() {
+        let store = MockGraphStore::new();
+        let imports = vec![
+            make_import_node("std::fmt", "src/lib.rs", 1),
+            make_import_node("serde::Serialize", "src/lib.rs", 2),
+        ];
+
+        store.batch_upsert_imports(&imports).await.unwrap();
+
+        let i = store.imports.read().await;
+        assert_eq!(i.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_create_call_relationships() {
+        let store = MockGraphStore::new();
+        let calls = vec![
+            crate::parser::FunctionCall {
+                caller_id: "src/lib.rs:foo:1".to_string(),
+                callee_name: "bar".to_string(),
+                line: 5,
+            },
+            crate::parser::FunctionCall {
+                caller_id: "src/lib.rs:foo:1".to_string(),
+                callee_name: "baz".to_string(),
+                line: 6,
+            },
+        ];
+
+        store
+            .batch_create_call_relationships(&calls, None)
+            .await
+            .unwrap();
+
+        let rels = store.call_relationships.read().await;
+        // The mock delegates to create_call_relationship which stores caller->callee
+        assert!(!rels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batch_create_import_relationships() {
+        let store = MockGraphStore::new();
+        let rels = vec![
+            (
+                "src/lib.rs".to_string(),
+                "src/utils.rs".to_string(),
+                "crate::utils".to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "src/models.rs".to_string(),
+                "crate::models".to_string(),
+            ),
+        ];
+
+        store
+            .batch_create_import_relationships(&rels)
+            .await
+            .unwrap();
+
+        let ir = store.import_relationships.read().await;
+        // src/lib.rs -> [src/utils.rs, src/models.rs]
+        assert!(ir.contains_key("src/lib.rs"));
+        assert_eq!(ir["src/lib.rs"].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_create_imports_symbol_relationships() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+        let rels = vec![
+            (
+                "src/lib.rs:1:serde".to_string(),
+                "Serialize".to_string(),
+                Some(pid),
+            ),
+            (
+                "src/lib.rs:2:std::fmt".to_string(),
+                "Display".to_string(),
+                None,
+            ),
+        ];
+
+        store
+            .batch_create_imports_symbol_relationships(&rels)
+            .await
+            .unwrap();
+
+        // Verify no error — mock delegates to individual create_imports_symbol_relationship
+    }
 }
