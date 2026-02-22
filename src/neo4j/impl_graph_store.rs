@@ -484,6 +484,61 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    // ========================================================================
+    // Batch upsert operations (UNWIND)
+    // ========================================================================
+
+    async fn batch_upsert_functions(
+        &self,
+        functions: &[FunctionNode],
+    ) -> anyhow::Result<()> {
+        self.batch_upsert_functions(functions).await
+    }
+
+    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> anyhow::Result<()> {
+        self.batch_upsert_structs(structs).await
+    }
+
+    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> anyhow::Result<()> {
+        self.batch_upsert_traits(traits).await
+    }
+
+    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> anyhow::Result<()> {
+        self.batch_upsert_enums(enums).await
+    }
+
+    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> anyhow::Result<()> {
+        self.batch_upsert_impls(impls).await
+    }
+
+    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> anyhow::Result<()> {
+        self.batch_upsert_imports(imports).await
+    }
+
+    async fn batch_create_import_relationships(
+        &self,
+        relationships: &[(String, String, String)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_import_relationships(relationships).await
+    }
+
+    async fn batch_create_imports_symbol_relationships(
+        &self,
+        relationships: &[(String, String, Option<uuid::Uuid>)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_imports_symbol_relationships(relationships)
+            .await
+    }
+
+    async fn batch_create_call_relationships(
+        &self,
+        calls: &[crate::parser::FunctionCall],
+        project_id: Option<uuid::Uuid>,
+    ) -> anyhow::Result<()> {
+        self.batch_create_call_relationships(calls, project_id)
+            .await
+    }
+
     async fn cleanup_cross_project_calls(&self) -> anyhow::Result<i64> {
         self.cleanup_cross_project_calls().await
     }

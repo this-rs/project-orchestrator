@@ -2950,6 +2950,690 @@ impl Neo4jClient {
         Ok(())
     }
 
+    // ========================================================================
+    // Batch upsert operations (UNWIND)
+    // ========================================================================
+
+    /// Batch upsert functions using UNWIND for a single Neo4j transaction per call.
+    /// Produces identical nodes/relationships as calling upsert_function individually.
+    pub async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()> {
+        if functions.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = functions
+            .iter()
+            .map(|func| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), format!("{}:{}:{}", func.file_path, func.name, func.line_start).into());
+                m.insert("name".into(), func.name.clone().into());
+                m.insert("visibility".into(), format!("{:?}", func.visibility).into());
+                m.insert("params".into(), serde_json::to_string(&func.params).unwrap_or_default().into());
+                m.insert("return_type".into(), func.return_type.clone().unwrap_or_default().into());
+                m.insert("generics".into(), func.generics.clone().into());
+                m.insert("is_async".into(), func.is_async.into());
+                m.insert("is_unsafe".into(), func.is_unsafe.into());
+                m.insert("complexity".into(), (func.complexity as i64).into());
+                m.insert("file_path".into(), func.file_path.clone().into());
+                m.insert("line_start".into(), (func.line_start as i64).into());
+                m.insert("line_end".into(), (func.line_end as i64).into());
+                m.insert("docstring".into(), func.docstring.clone().unwrap_or_default().into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS func
+            MERGE (f:Function {id: func.id})
+            SET f.name = func.name,
+                f.visibility = func.visibility,
+                f.params = func.params,
+                f.return_type = func.return_type,
+                f.generics = func.generics,
+                f.is_async = func.is_async,
+                f.is_unsafe = func.is_unsafe,
+                f.complexity = func.complexity,
+                f.file_path = func.file_path,
+                f.line_start = func.line_start,
+                f.line_end = func.line_end,
+                f.docstring = func.docstring
+            WITH f, func
+            MATCH (file:File {path: func.file_path})
+            MERGE (file)-[:CONTAINS]->(f)
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Batch upsert structs using UNWIND.
+    pub async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()> {
+        if structs.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = structs
+            .iter()
+            .map(|s| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), format!("{}:{}", s.file_path, s.name).into());
+                m.insert("name".into(), s.name.clone().into());
+                m.insert("visibility".into(), format!("{:?}", s.visibility).into());
+                m.insert("generics".into(), s.generics.clone().into());
+                m.insert("file_path".into(), s.file_path.clone().into());
+                m.insert("line_start".into(), (s.line_start as i64).into());
+                m.insert("line_end".into(), (s.line_end as i64).into());
+                m.insert("docstring".into(), s.docstring.clone().unwrap_or_default().into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS s
+            MERGE (st:Struct {id: s.id})
+            SET st.name = s.name,
+                st.visibility = s.visibility,
+                st.generics = s.generics,
+                st.file_path = s.file_path,
+                st.line_start = s.line_start,
+                st.line_end = s.line_end,
+                st.docstring = s.docstring
+            WITH st, s
+            MATCH (file:File {path: s.file_path})
+            MERGE (file)-[:CONTAINS]->(st)
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Batch upsert traits using UNWIND.
+    pub async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()> {
+        if traits.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = traits
+            .iter()
+            .map(|t| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), format!("{}:{}", t.file_path, t.name).into());
+                m.insert("name".into(), t.name.clone().into());
+                m.insert("visibility".into(), format!("{:?}", t.visibility).into());
+                m.insert("generics".into(), t.generics.clone().into());
+                m.insert("file_path".into(), t.file_path.clone().into());
+                m.insert("line_start".into(), (t.line_start as i64).into());
+                m.insert("line_end".into(), (t.line_end as i64).into());
+                m.insert("docstring".into(), t.docstring.clone().unwrap_or_default().into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS t
+            MERGE (tr:Trait {id: t.id})
+            SET tr.name = t.name,
+                tr.visibility = t.visibility,
+                tr.generics = t.generics,
+                tr.file_path = t.file_path,
+                tr.line_start = t.line_start,
+                tr.line_end = t.line_end,
+                tr.docstring = t.docstring
+            WITH tr, t
+            MATCH (file:File {path: t.file_path})
+            MERGE (file)-[:CONTAINS]->(tr)
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Batch upsert enums using UNWIND.
+    pub async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()> {
+        if enums.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = enums
+            .iter()
+            .map(|e| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), format!("{}:{}", e.file_path, e.name).into());
+                m.insert("name".into(), e.name.clone().into());
+                m.insert("visibility".into(), format!("{:?}", e.visibility).into());
+                m.insert("variants".into(), e.variants.clone().into());
+                m.insert("file_path".into(), e.file_path.clone().into());
+                m.insert("line_start".into(), (e.line_start as i64).into());
+                m.insert("line_end".into(), (e.line_end as i64).into());
+                m.insert("docstring".into(), e.docstring.clone().unwrap_or_default().into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS e
+            MERGE (en:Enum {id: e.id})
+            SET en.name = e.name,
+                en.visibility = e.visibility,
+                en.variants = e.variants,
+                en.file_path = e.file_path,
+                en.line_start = e.line_start,
+                en.line_end = e.line_end,
+                en.docstring = e.docstring
+            WITH en, e
+            MATCH (file:File {path: e.file_path})
+            MERGE (file)-[:CONTAINS]->(en)
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Batch upsert impl blocks using UNWIND — 3 phases matching upsert_impl behavior:
+    /// Phase 1: MERGE Impl nodes + CONTAINS relationship
+    /// Phase 2: IMPLEMENTS_FOR (same-file direct match, then project-scoped fallback)
+    /// Phase 3: IMPLEMENTS_TRAIT (local trait match, then external trait creation)
+    pub async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()> {
+        if impls.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 1: MERGE Impl nodes + CONTAINS
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = impls
+            .iter()
+            .map(|imp| {
+                let id = format!(
+                    "{}:impl:{}:{}",
+                    imp.file_path,
+                    imp.for_type,
+                    imp.trait_name.as_deref().unwrap_or("self")
+                );
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), id.into());
+                m.insert("for_type".into(), imp.for_type.clone().into());
+                m.insert("trait_name".into(), imp.trait_name.clone().unwrap_or_default().into());
+                m.insert("generics".into(), imp.generics.clone().into());
+                m.insert("where_clause".into(), imp.where_clause.clone().unwrap_or_default().into());
+                m.insert("file_path".into(), imp.file_path.clone().into());
+                m.insert("line_start".into(), (imp.line_start as i64).into());
+                m.insert("line_end".into(), (imp.line_end as i64).into());
+                // Pre-computed IDs for Phase 2
+                m.insert("struct_id".into(), format!("{}:{}", imp.file_path, imp.for_type).into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS imp
+            MERGE (i:Impl {id: imp.id})
+            SET i.for_type = imp.for_type,
+                i.trait_name = imp.trait_name,
+                i.generics = imp.generics,
+                i.where_clause = imp.where_clause,
+                i.file_path = imp.file_path,
+                i.line_start = imp.line_start,
+                i.line_end = imp.line_end
+            WITH i, imp
+            MATCH (file:File {path: imp.file_path})
+            MERGE (file)-[:CONTAINS]->(i)
+            "#,
+        )
+        .param("items", items.clone());
+
+        self.graph.run(q).await?;
+
+        // Phase 2a: IMPLEMENTS_FOR — direct ID match (same-file struct/enum)
+        let q = query(
+            r#"
+            UNWIND $items AS imp
+            MATCH (i:Impl {id: imp.id})
+            OPTIONAL MATCH (s:Struct {id: imp.struct_id})
+            OPTIONAL MATCH (e:Enum {id: imp.struct_id})
+            WITH i, imp, COALESCE(s, e) AS target
+            WHERE target IS NOT NULL
+            MERGE (i)-[:IMPLEMENTS_FOR]->(target)
+            RETURN imp.id AS linked_id
+            "#,
+        )
+        .param("items", items.clone());
+
+        let mut linked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            if let Ok(id) = row.get::<String>("linked_id") {
+                linked_ids.insert(id);
+            }
+        }
+
+        // Phase 2b: IMPLEMENTS_FOR — project-scoped fallback for unresolved
+        let unresolved: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = items
+            .iter()
+            .filter(|m| {
+                let id = match m.get("id") {
+                    Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                    _ => String::new(),
+                };
+                !linked_ids.contains(&id)
+            })
+            .cloned()
+            .collect();
+
+        if !unresolved.is_empty() {
+            let q = query(
+                r#"
+                UNWIND $items AS imp
+                CALL {
+                    WITH imp
+                    MATCH (i:Impl {id: imp.id})
+                    MATCH (file:File {path: imp.file_path})<-[:CONTAINS]-(p:Project)
+                    OPTIONAL MATCH (s:Struct {name: imp.for_type})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                    OPTIONAL MATCH (e:Enum {name: imp.for_type})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                    WITH i, COALESCE(s, e) AS target
+                    WHERE target IS NOT NULL
+                    WITH i, target LIMIT 1
+                    MERGE (i)-[:IMPLEMENTS_FOR]->(target)
+                }
+                "#,
+            )
+            .param("items", unresolved);
+
+            let _ = self.graph.run(q).await;
+        }
+
+        // Phase 3: IMPLEMENTS_TRAIT (only for trait impls)
+        let trait_impls: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = impls
+            .iter()
+            .filter(|imp| imp.trait_name.is_some())
+            .map(|imp| {
+                let trait_name = imp.trait_name.as_deref().unwrap();
+                let id = format!("{}:impl:{}:{}", imp.file_path, imp.for_type, trait_name);
+                let (simple_name, source) = Self::parse_trait_path(trait_name);
+                let external_id = format!("external:trait:{}", trait_name);
+
+                let mut m = std::collections::HashMap::new();
+                m.insert("impl_id".into(), id.into());
+                m.insert("trait_name".into(), trait_name.to_string().into());
+                m.insert("simple_name".into(), simple_name.into());
+                m.insert("source".into(), source.into());
+                m.insert("full_path".into(), trait_name.to_string().into());
+                m.insert("external_id".into(), external_id.into());
+                m
+            })
+            .collect();
+
+        if !trait_impls.is_empty() {
+            // Phase 3a: Try linking to existing local trait
+            let q = query(
+                r#"
+                UNWIND $items AS imp
+                MATCH (i:Impl {id: imp.impl_id})
+                MATCH (t:Trait {name: imp.trait_name})
+                WHERE t.is_external IS NULL OR t.is_external = false
+                MERGE (i)-[:IMPLEMENTS_TRAIT]->(t)
+                RETURN imp.impl_id AS linked_id
+                "#,
+            )
+            .param("items", trait_impls.clone());
+
+            let mut trait_linked: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut result = self.graph.execute(q).await?;
+            while let Some(row) = result.next().await? {
+                if let Ok(id) = row.get::<String>("linked_id") {
+                    trait_linked.insert(id);
+                }
+            }
+
+            // Phase 3b: Create/link external traits for unresolved
+            let unresolved_traits: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = trait_impls
+                .into_iter()
+                .filter(|m| {
+                    let id = match m.get("impl_id") {
+                        Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                        _ => String::new(),
+                    };
+                    !trait_linked.contains(&id)
+                })
+                .collect();
+
+            if !unresolved_traits.is_empty() {
+                let q = query(
+                    r#"
+                    UNWIND $items AS imp
+                    MERGE (t:Trait {id: imp.external_id})
+                    ON CREATE SET
+                        t.name = imp.simple_name,
+                        t.full_path = imp.full_path,
+                        t.is_external = true,
+                        t.source = imp.source,
+                        t.visibility = 'public',
+                        t.generics = [],
+                        t.file_path = '',
+                        t.line_start = 0,
+                        t.line_end = 0
+                    ON MATCH SET
+                        t.source = CASE WHEN t.source = 'unknown' THEN imp.source ELSE t.source END
+                    WITH t, imp
+                    MATCH (i:Impl {id: imp.impl_id})
+                    MERGE (i)-[:IMPLEMENTS_TRAIT]->(t)
+                    "#,
+                )
+                .param("items", unresolved_traits);
+
+                let _ = self.graph.run(q).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Batch upsert imports using UNWIND.
+    pub async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()> {
+        if imports.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = imports
+            .iter()
+            .map(|imp| {
+                let id = format!("{}:{}:{}", imp.file_path, imp.line, imp.path);
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), id.into());
+                m.insert("path".into(), imp.path.clone().into());
+                m.insert("alias".into(), imp.alias.clone().unwrap_or_default().into());
+                m.insert("items".into(), imp.items.clone().into());
+                m.insert("file_path".into(), imp.file_path.clone().into());
+                m.insert("line".into(), (imp.line as i64).into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS imp
+            MERGE (i:Import {id: imp.id})
+            SET i.path = imp.path,
+                i.alias = imp.alias,
+                i.items = imp.items,
+                i.file_path = imp.file_path,
+                i.line = imp.line
+            WITH i, imp
+            MATCH (file:File {path: imp.file_path})
+            MERGE (file)-[:HAS_IMPORT]->(i)
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Batch create File→IMPORTS→File relationships using UNWIND.
+    /// Takes a list of (source_file_path, target_file_path, import_path) tuples.
+    pub async fn batch_create_import_relationships(
+        &self,
+        relationships: &[(String, String, String)],
+    ) -> Result<()> {
+        if relationships.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = relationships
+            .iter()
+            .map(|(source, target, import_path)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("source".into(), source.clone().into());
+                m.insert("target".into(), target.clone().into());
+                m.insert("import_path".into(), import_path.clone().into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS rel
+            MATCH (source:File {path: rel.source})
+            MATCH (target:File {path: rel.target})
+            MERGE (source)-[r:IMPORTS]->(target)
+            SET r.import_path = rel.import_path
+            "#,
+        )
+        .param("items", items);
+
+        let _ = self.graph.run(q).await;
+        Ok(())
+    }
+
+    /// Batch create Import→IMPORTS_SYMBOL→(Struct|Enum|Trait) relationships using UNWIND.
+    /// Takes a list of (import_id, symbol_name, project_id) tuples.
+    pub async fn batch_create_imports_symbol_relationships(
+        &self,
+        relationships: &[(String, String, Option<Uuid>)],
+    ) -> Result<()> {
+        if relationships.is_empty() {
+            return Ok(());
+        }
+
+        // Split by project_id presence for different Cypher queries
+        let with_project: Vec<_> = relationships
+            .iter()
+            .filter(|(_, _, pid)| pid.is_some())
+            .collect();
+        let without_project: Vec<_> = relationships
+            .iter()
+            .filter(|(_, _, pid)| pid.is_none())
+            .collect();
+
+        if !with_project.is_empty() {
+            // Group by project_id for efficiency
+            let mut by_project: std::collections::HashMap<Uuid, Vec<(String, String)>> =
+                std::collections::HashMap::new();
+            for (import_id, symbol_name, pid) in &with_project {
+                by_project
+                    .entry(pid.unwrap())
+                    .or_default()
+                    .push((import_id.clone(), symbol_name.clone()));
+            }
+
+            for (pid, rels) in by_project {
+                let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = rels
+                    .iter()
+                    .map(|(import_id, symbol_name)| {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("import_id".into(), import_id.clone().into());
+                        m.insert("symbol_name".into(), symbol_name.clone().into());
+                        m
+                    })
+                    .collect();
+
+                let q = query(
+                    r#"
+                    UNWIND $items AS rel
+                    CALL {
+                        WITH rel
+                        MATCH (i:Import {id: rel.import_id})
+                        MATCH (i)<-[:HAS_IMPORT]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                        OPTIONAL MATCH (s:Struct {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                        OPTIONAL MATCH (e:Enum {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                        OPTIONAL MATCH (t:Trait {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                        WITH i, COALESCE(s, e, t) AS target
+                        WHERE target IS NOT NULL
+                        WITH i, target LIMIT 1
+                        MERGE (i)-[:IMPORTS_SYMBOL]->(target)
+                    }
+                    "#,
+                )
+                .param("items", items)
+                .param("project_id", pid.to_string());
+
+                let _ = self.graph.run(q).await;
+            }
+        }
+
+        if !without_project.is_empty() {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = without_project
+                .iter()
+                .map(|(import_id, symbol_name, _)| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("import_id".into(), import_id.clone().into());
+                    m.insert("symbol_name".into(), symbol_name.clone().into());
+                    m
+                })
+                .collect();
+
+            let q = query(
+                r#"
+                UNWIND $items AS rel
+                CALL {
+                    WITH rel
+                    MATCH (i:Import {id: rel.import_id})
+                    OPTIONAL MATCH (s:Struct {name: rel.symbol_name})
+                    OPTIONAL MATCH (e:Enum {name: rel.symbol_name})
+                    OPTIONAL MATCH (t:Trait {name: rel.symbol_name})
+                    WITH i, COALESCE(s, e, t) AS target
+                    WHERE target IS NOT NULL
+                    WITH i, target LIMIT 1
+                    MERGE (i)-[:IMPORTS_SYMBOL]->(target)
+                }
+                "#,
+            )
+            .param("items", items);
+
+            let _ = self.graph.run(q).await;
+        }
+
+        Ok(())
+    }
+
+    /// Batch create CALLS relationships using UNWIND — 2-phase strategy:
+    /// Phase 1: same-file callee match (most common, O(1) via index)
+    /// Phase 2: project-scoped fallback for unresolved calls
+    pub async fn batch_create_call_relationships(
+        &self,
+        calls: &[crate::parser::FunctionCall],
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = calls
+            .iter()
+            .map(|call| {
+                let caller_file_path = call
+                    .caller_id
+                    .rsplitn(3, ':')
+                    .last()
+                    .unwrap_or(&call.caller_id)
+                    .to_string();
+                let mut m = std::collections::HashMap::new();
+                m.insert("caller_id".into(), call.caller_id.clone().into());
+                m.insert("callee_name".into(), call.callee_name.clone().into());
+                m.insert("caller_file_path".into(), caller_file_path.into());
+                m
+            })
+            .collect();
+
+        // Phase 1: same-file match with CALL {} subquery for per-row LIMIT 1
+        let q = query(
+            r#"
+            UNWIND $items AS call
+            CALL {
+                WITH call
+                MATCH (caller:Function {id: call.caller_id})
+                MATCH (callee:Function {name: call.callee_name})
+                WHERE callee.file_path = call.caller_file_path AND callee.id <> call.caller_id
+                WITH caller, callee LIMIT 1
+                MERGE (caller)-[:CALLS]->(callee)
+                RETURN caller.id AS resolved_caller, callee.name AS resolved_callee
+            }
+            RETURN resolved_caller, resolved_callee
+            "#,
+        )
+        .param("items", items.clone());
+
+        let mut resolved: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        match self.graph.execute(q).await {
+            Ok(mut result) => {
+                while let Ok(Some(row)) = result.next().await {
+                    if let (Ok(caller), Ok(callee)) = (
+                        row.get::<String>("resolved_caller"),
+                        row.get::<String>("resolved_callee"),
+                    ) {
+                        resolved.insert((caller, callee));
+                    }
+                }
+            }
+            Err(_) => {} // Phase 1 failure is not fatal, Phase 2 will try all
+        }
+
+        // Phase 2: project-scoped fallback for unresolved calls
+        let unresolved: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = items
+            .into_iter()
+            .filter(|m| {
+                let caller = match m.get("caller_id") {
+                    Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                    _ => String::new(),
+                };
+                let callee = match m.get("callee_name") {
+                    Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                    _ => String::new(),
+                };
+                !resolved.contains(&(caller, callee))
+            })
+            .collect();
+
+        if !unresolved.is_empty() {
+            let q = match project_id {
+                Some(pid) => query(
+                    r#"
+                    UNWIND $items AS call
+                    CALL {
+                        WITH call
+                        MATCH (caller:Function {id: call.caller_id})
+                        MATCH (callee:Function {name: call.callee_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                        WHERE callee.id <> call.caller_id
+                        WITH caller, callee LIMIT 1
+                        MERGE (caller)-[:CALLS]->(callee)
+                    }
+                    "#,
+                )
+                .param("items", unresolved)
+                .param("project_id", pid.to_string()),
+                None => query(
+                    r#"
+                    UNWIND $items AS call
+                    CALL {
+                        WITH call
+                        MATCH (caller:Function {id: call.caller_id})
+                        MATCH (callee:Function {name: call.callee_name})
+                        WHERE callee.id <> call.caller_id
+                        WITH caller, callee LIMIT 1
+                        MERGE (caller)-[:CALLS]->(callee)
+                    }
+                    "#,
+                )
+                .param("items", unresolved),
+            };
+
+            let _ = self.graph.run(q).await;
+        }
+
+        Ok(())
+    }
+
     /// Clean up ALL sync-generated data from Neo4j.
     /// This deletes File, Function, Struct, Trait, Enum, Impl, Import nodes
     /// and their relationships (CALLS, IMPORTS, IMPLEMENTS_FOR, IMPLEMENTS_TRAIT, CONTAINS, HAS_IMPORT).

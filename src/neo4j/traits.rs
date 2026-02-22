@@ -9,6 +9,7 @@ use crate::neo4j::models::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
+use crate::parser::FunctionCall;
 use crate::plan::models::{TaskDetails, UpdateTaskRequest};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -372,6 +373,47 @@ pub trait GraphStore: Send + Sync {
         &self,
         caller_id: &str,
         callee_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    // ========================================================================
+    // Batch upsert operations (UNWIND)
+    // ========================================================================
+
+    /// Batch upsert functions using UNWIND for a single Neo4j transaction per call.
+    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()>;
+
+    /// Batch upsert structs using UNWIND.
+    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()>;
+
+    /// Batch upsert traits using UNWIND.
+    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()>;
+
+    /// Batch upsert enums using UNWIND.
+    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()>;
+
+    /// Batch upsert impl blocks using UNWIND — 3 phases matching upsert_impl behavior.
+    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()>;
+
+    /// Batch upsert imports using UNWIND.
+    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()>;
+
+    /// Batch create File→IMPORTS→File relationships using UNWIND.
+    async fn batch_create_import_relationships(
+        &self,
+        relationships: &[(String, String, String)],
+    ) -> Result<()>;
+
+    /// Batch create Import→IMPORTS_SYMBOL→(Struct|Enum|Trait) relationships using UNWIND.
+    async fn batch_create_imports_symbol_relationships(
+        &self,
+        relationships: &[(String, String, Option<Uuid>)],
+    ) -> Result<()>;
+
+    /// Batch create CALLS relationships using UNWIND — 2-phase strategy.
+    async fn batch_create_call_relationships(
+        &self,
+        calls: &[FunctionCall],
         project_id: Option<Uuid>,
     ) -> Result<()>;
 

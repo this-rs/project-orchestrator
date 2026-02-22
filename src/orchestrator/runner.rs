@@ -1562,65 +1562,71 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         };
         self.state.neo4j.upsert_file(&file_node).await?;
 
-        // Store functions
-        for func in &parsed.functions {
-            self.state.neo4j.upsert_function(func).await?;
-        }
+        // Batch upsert all entity types (UNWIND — one Neo4j query each)
+        self.state
+            .neo4j
+            .batch_upsert_functions(&parsed.functions)
+            .await?;
+        self.state
+            .neo4j
+            .batch_upsert_structs(&parsed.structs)
+            .await?;
+        self.state
+            .neo4j
+            .batch_upsert_traits(&parsed.traits)
+            .await?;
+        self.state
+            .neo4j
+            .batch_upsert_enums(&parsed.enums)
+            .await?;
+        // Impls AFTER structs/traits/enums (IMPLEMENTS_FOR/IMPLEMENTS_TRAIT need targets)
+        self.state
+            .neo4j
+            .batch_upsert_impls(&parsed.impl_blocks)
+            .await?;
 
-        // Store structs
-        for s in &parsed.structs {
-            self.state.neo4j.upsert_struct(s).await?;
-        }
+        // Batch upsert imports, then resolve relationships (logic stays in runner)
+        self.state
+            .neo4j
+            .batch_upsert_imports(&parsed.imports)
+            .await?;
 
-        // Store traits
-        for t in &parsed.traits {
-            self.state.neo4j.upsert_trait(t).await?;
-        }
-
-        // Store enums
-        for e in &parsed.enums {
-            self.state.neo4j.upsert_enum(e).await?;
-        }
-
-        // Store impl blocks with relationships
-        for impl_block in &parsed.impl_blocks {
-            self.state.neo4j.upsert_impl(impl_block).await?;
-        }
-
-        // Store imports and create File→IMPORTS→File + IMPORTS_SYMBOL relationships
+        // Collect resolved import relationships in memory, then batch-write
+        let mut import_rels: Vec<(String, String, String)> = Vec::new();
+        let mut symbol_rels: Vec<(String, String, Option<Uuid>)> = Vec::new();
         for import in &parsed.imports {
-            self.state.neo4j.upsert_import(import).await?;
-
             // Resolve imports to file paths (language-aware)
             let resolved_files =
                 self.resolve_imports_for_language(import, &parsed.path, &parsed.language);
             for target_file in &resolved_files {
-                self.state
-                    .neo4j
-                    .create_import_relationship(&parsed.path, target_file, &import.path)
-                    .await
-                    .ok(); // Ignore errors (target file might not exist yet)
+                import_rels.push((
+                    parsed.path.clone(),
+                    target_file.clone(),
+                    import.path.clone(),
+                ));
             }
 
-            // Create IMPORTS_SYMBOL relationships for imported symbols
+            // Collect IMPORTS_SYMBOL relationships for imported symbols
             let import_id = format!("{}:{}:{}", import.file_path, import.line, import.path);
             let symbols = Self::extract_imported_symbols(import);
             for symbol_name in &symbols {
-                self.state
-                    .neo4j
-                    .create_imports_symbol_relationship(&import_id, symbol_name, project_id)
-                    .await
-                    .ok(); // Ignore errors (symbol might not exist yet)
+                symbol_rels.push((import_id.clone(), symbol_name.clone(), project_id));
             }
         }
+        self.state
+            .neo4j
+            .batch_create_import_relationships(&import_rels)
+            .await?;
+        self.state
+            .neo4j
+            .batch_create_imports_symbol_relationships(&symbol_rels)
+            .await?;
 
-        // Store function call relationships (scoped to project to prevent cross-project pollution)
-        for call in &parsed.function_calls {
-            self.state
-                .neo4j
-                .create_call_relationship(&call.caller_id, &call.callee_name, project_id)
-                .await?;
-        }
+        // Batch create CALLS relationships (scoped to project to prevent cross-project pollution)
+        self.state
+            .neo4j
+            .batch_create_call_relationships(&parsed.function_calls, project_id)
+            .await?;
 
         // Embed file and functions (best-effort, non-blocking)
         if self.embedding_provider.is_some() {

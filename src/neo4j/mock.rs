@@ -1353,6 +1353,86 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    // ========================================================================
+    // Batch upsert operations (delegates to individual methods)
+    // ========================================================================
+
+    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()> {
+        for func in functions {
+            self.upsert_function(func).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()> {
+        for s in structs {
+            self.upsert_struct(s).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()> {
+        for t in traits {
+            self.upsert_trait(t).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()> {
+        for e in enums {
+            self.upsert_enum(e).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()> {
+        for imp in impls {
+            self.upsert_impl(imp).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()> {
+        for imp in imports {
+            self.upsert_import(imp).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_create_import_relationships(
+        &self,
+        relationships: &[(String, String, String)],
+    ) -> Result<()> {
+        for (source, target, import_path) in relationships {
+            self.create_import_relationship(source, target, import_path)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_create_imports_symbol_relationships(
+        &self,
+        relationships: &[(String, String, Option<Uuid>)],
+    ) -> Result<()> {
+        for (import_id, symbol_name, project_id) in relationships {
+            self.create_imports_symbol_relationship(import_id, symbol_name, *project_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_create_call_relationships(
+        &self,
+        calls: &[crate::parser::FunctionCall],
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        for call in calls {
+            self.create_call_relationship(&call.caller_id, &call.callee_name, project_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn cleanup_cross_project_calls(&self) -> Result<i64> {
         let mut cr = self.call_relationships.write().await;
         let functions = self.functions.read().await;
