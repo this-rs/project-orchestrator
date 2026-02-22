@@ -1844,43 +1844,70 @@ impl ToolHandler {
     }
 
     async fn analyze_impact(&self, args: Value) -> Result<Value> {
-        let target = args
+        let raw_target = args
             .get("target")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("target is required"))?;
 
-        let project_id = if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
-            Some(
-                self.neo4j()
+        let (project_id, project_root) =
+            if let Some(slug) = args.get("project_slug").and_then(|v| v.as_str()) {
+                let project = self
+                    .neo4j()
                     .get_project_by_slug(slug)
                     .await?
-                    .ok_or_else(|| anyhow!("Project not found: {}", slug))?
-                    .id,
-            )
-        } else {
-            None
-        };
+                    .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
+                (Some(project.id), Some(project.root_path))
+            } else {
+                (None, None)
+            };
 
         // Auto-detect target_type: contains '/' or '.' → file, otherwise symbol
         let target_type = args
             .get("target_type")
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| {
-                if target.contains('/') || target.contains('.') {
+                if raw_target.contains('/') || raw_target.contains('.') {
                     "file"
                 } else {
                     "symbol"
                 }
             });
 
+        // Resolve relative file paths to absolute using project root_path
+        let resolved = if target_type == "file" && !raw_target.starts_with('/') {
+            if let Some(ref root) = project_root {
+                let expanded = crate::expand_tilde(root);
+                format!("{}/{}", expanded.trim_end_matches('/'), raw_target)
+            } else {
+                raw_target.to_string()
+            }
+        } else {
+            raw_target.to_string()
+        };
+        let target = resolved.as_str();
+
         let (directly_affected, transitively_affected, caller_count) = if target_type == "file" {
             let direct = self
                 .neo4j()
                 .find_impacted_files(target, 1, project_id)
                 .await?;
+            // Fallback: if resolved path found nothing, retry with the raw input
+            let (direct, effective) = if direct.is_empty() && target != raw_target {
+                let fallback = self
+                    .neo4j()
+                    .find_impacted_files(raw_target, 1, project_id)
+                    .await?;
+                if !fallback.is_empty() {
+                    (fallback, raw_target)
+                } else {
+                    (direct, target)
+                }
+            } else {
+                (direct, target)
+            };
             let transitive = self
                 .neo4j()
-                .find_impacted_files(target, 3, project_id)
+                .find_impacted_files(effective, 3, project_id)
                 .await?;
             let caller_count = direct.len() as i64;
             (direct, transitive, caller_count)
