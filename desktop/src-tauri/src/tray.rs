@@ -22,7 +22,6 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
     let open_item = MenuItemBuilder::with_id("open", "Open").build(app)?;
     let settings_item = MenuItemBuilder::with_id("settings", "Settings...").build(app)?;
-    let reconfig_item = MenuItemBuilder::with_id("reconfigure", "Reconfigure...").build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     // Build the tray menu
@@ -35,7 +34,6 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .separator()
         .item(&open_item)
         .item(&settings_item)
-        .item(&reconfig_item)
         .separator()
         .item(&quit_item)
         .build()?;
@@ -69,22 +67,15 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Handle tray menu item clicks.
 ///
-/// Any menu item that navigates the frontend must include `?from=tray` in the
-/// URL so that the frontend route guards (SetupGuard, etc.) respect the user's
-/// intended destination instead of auto-redirecting.
+/// The "settings" handler navigates to `/setup?from=tray` so the setup wizard
+/// opens in reconfigure mode. The `?from=tray` parameter is read synchronously
+/// by `trayNavigationAtom` so that route guards respect the intended destination.
 fn handle_menu_event(app: &AppHandle, item_id: &str) {
     match item_id {
         "open" => {
             show_main_window(app);
         }
         "settings" => {
-            if let Some(window) = app.get_webview_window("main") {
-                window.show().ok();
-                window.set_focus().ok();
-                let _ = window.eval("window.location.href = '/settings'");
-            }
-        }
-        "reconfigure" => {
             if let Some(window) = app.get_webview_window("main") {
                 window.show().ok();
                 window.set_focus().ok();
