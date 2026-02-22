@@ -10252,15 +10252,42 @@ impl Neo4jClient {
     /// These are ubiquitous traits (std, serde, tokio) that don't convey feature-specific meaning.
     const FEATURE_GRAPH_TRAIT_BLACKLIST: &'static [&'static str] = &[
         // std derives
-        "Debug", "Display", "Clone", "Copy", "Default", "PartialEq", "Eq",
-        "PartialOrd", "Ord", "Hash", "From", "Into", "TryFrom", "TryInto",
-        "AsRef", "AsMut", "Deref", "DerefMut", "Drop", "Send", "Sync", "Sized",
+        "Debug",
+        "Display",
+        "Clone",
+        "Copy",
+        "Default",
+        "PartialEq",
+        "Eq",
+        "PartialOrd",
+        "Ord",
+        "Hash",
+        "From",
+        "Into",
+        "TryFrom",
+        "TryInto",
+        "AsRef",
+        "AsMut",
+        "Deref",
+        "DerefMut",
+        "Drop",
+        "Send",
+        "Sync",
+        "Sized",
         // serde
-        "Serialize", "Deserialize", "Serializer", "Deserializer",
+        "Serialize",
+        "Deserialize",
+        "Serializer",
+        "Deserializer",
         // tokio / async
-        "AsyncRead", "AsyncWrite", "AsyncSeek", "AsyncBufRead",
+        "AsyncRead",
+        "AsyncWrite",
+        "AsyncSeek",
+        "AsyncBufRead",
         // common derives
-        "Error", "Future", "Stream",
+        "Error",
+        "Future",
+        "Stream",
     ];
 
     /// Check if a trait name is in the standard blacklist
@@ -10533,7 +10560,13 @@ impl Neo4jClient {
                 "core_logic"
             };
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "function", func_name, Some(role), Some(project_id))
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "function",
+                    func_name,
+                    Some(role),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
@@ -10547,7 +10580,13 @@ impl Neo4jClient {
         // Add files with role: support
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "file", file_path, Some("support"), Some(project_id))
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "file",
+                    file_path,
+                    Some("support"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
@@ -10561,7 +10600,13 @@ impl Neo4jClient {
         // Add structs/enums discovered via IMPLEMENTS_FOR with role: data_model
         for struct_name in &structs {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "struct", struct_name, Some("data_model"), Some(project_id))
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "struct",
+                    struct_name,
+                    Some("data_model"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
@@ -10575,7 +10620,13 @@ impl Neo4jClient {
         // Add traits discovered via IMPLEMENTS_TRAIT with role: trait_contract
         for trait_name in &traits {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "trait", trait_name, Some("trait_contract"), Some(project_id))
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "trait",
+                    trait_name,
+                    Some("trait_contract"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
@@ -10763,7 +10814,13 @@ impl Neo4jClient {
                 "core_logic"
             };
             let _ = self
-                .add_entity_to_feature_graph(id, "function", func_name, Some(role), Some(project_id))
+                .add_entity_to_feature_graph(
+                    id,
+                    "function",
+                    func_name,
+                    Some(role),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
@@ -10776,7 +10833,13 @@ impl Neo4jClient {
 
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(id, "file", file_path, Some("support"), Some(project_id))
+                .add_entity_to_feature_graph(
+                    id,
+                    "file",
+                    file_path,
+                    Some("support"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
@@ -10789,7 +10852,13 @@ impl Neo4jClient {
 
         for struct_name in &structs {
             let _ = self
-                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"), Some(project_id))
+                .add_entity_to_feature_graph(
+                    id,
+                    "struct",
+                    struct_name,
+                    Some("data_model"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
@@ -10802,7 +10871,13 @@ impl Neo4jClient {
 
         for trait_name in &traits {
             let _ = self
-                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"), Some(project_id))
+                .add_entity_to_feature_graph(
+                    id,
+                    "trait",
+                    trait_name,
+                    Some("trait_contract"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),

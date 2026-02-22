@@ -1209,7 +1209,13 @@ pub async fn add_entity_to_feature_graph(
     state
         .orchestrator
         .neo4j()
-        .add_entity_to_feature_graph(id, &body.entity_type, &body.entity_id, body.role.as_deref(), project_id)
+        .add_entity_to_feature_graph(
+            id,
+            &body.entity_type,
+            &body.entity_id,
+            body.role.as_deref(),
+            project_id,
+        )
         .await?;
     Ok(Json(serde_json::json!({
         "added": true,
