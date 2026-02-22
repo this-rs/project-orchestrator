@@ -137,33 +137,54 @@ pub struct Orchestrator {
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
-/// Try to create an embedding provider from environment variables.
+/// Create an embedding provider from resolved [`Config`] fields.
 ///
-/// Provider selection via `EMBEDDING_PROVIDER` env var:
+/// The `Config` already merges env var > YAML > defaults, so this function
+/// simply reads the final values without touching `std::env` directly.
+///
+/// Provider selection via `config.embedding_provider`:
 /// - `local` (default) → [`FastEmbedProvider`] using in-process ONNX Runtime (zero external dependency)
-/// - `http` → [`HttpEmbeddingProvider`] using any OpenAI-compatible API (for premium/external models)
-/// - `disabled` → No embedding provider (semantic search unavailable)
+/// - `http` → [`HttpEmbeddingProvider`] using any OpenAI-compatible API (Ollama, OpenAI, LiteLLM…)
+/// - `disabled` / `none` / `off` → No embedding provider (semantic search unavailable)
 ///
 /// Returns `None` if disabled or initialization fails. Logs the result at info level.
-fn init_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
-    let provider_type = std::env::var("EMBEDDING_PROVIDER")
-        .unwrap_or_else(|_| "local".to_string())
+fn init_embedding_provider(config: &crate::Config) -> Option<Arc<dyn EmbeddingProvider>> {
+    let provider_type = config
+        .embedding_provider
+        .as_deref()
+        .unwrap_or("local")
         .to_lowercase();
 
     match provider_type.as_str() {
-        "http" => init_http_embedding_provider(),
+        "http" => init_http_embedding_provider(config),
         "disabled" | "none" | "off" => {
-            tracing::info!("Embedding provider disabled (EMBEDDING_PROVIDER=disabled)");
+            tracing::info!("Embedding provider disabled (provider=disabled)");
             None
         }
         // Default: local fastembed
-        _ => init_local_embedding_provider(),
+        _ => init_local_embedding_provider(config),
     }
 }
 
 /// Initialize the local fastembed ONNX embedding provider (default).
-fn init_local_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
-    match FastEmbedProvider::from_env() {
+fn init_local_embedding_provider(config: &crate::Config) -> Option<Arc<dyn EmbeddingProvider>> {
+    // Build from Config fields (already merged env var > YAML > None)
+    use fastembed::EmbeddingModel;
+    use std::path::PathBuf;
+
+    let model_variant = config
+        .embedding_fastembed_model
+        .as_deref()
+        .map(crate::embeddings::fastembed::parse_model_name_pub)
+        .unwrap_or(EmbeddingModel::MultilingualE5Base);
+
+    let cache_dir = config
+        .embedding_fastembed_cache_dir
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    match FastEmbedProvider::new(model_variant, cache_dir) {
         Ok(provider) => {
             tracing::info!(
                 model = provider.model_name(),
@@ -184,22 +205,32 @@ fn init_local_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
 }
 
 /// Initialize the HTTP-based embedding provider (Ollama, OpenAI, etc.)
-fn init_http_embedding_provider() -> Option<Arc<dyn EmbeddingProvider>> {
-    match HttpEmbeddingProvider::from_env() {
-        Some(provider) => {
-            tracing::info!(
-                model = provider.model_name(),
-                dimensions = provider.dimensions(),
-                provider = "http",
-                "Embedding provider initialized (HTTP)"
-            );
-            Some(Arc::new(provider))
-        }
-        None => {
-            tracing::info!("HTTP embedding provider not configured (set EMBEDDING_URL to enable)");
-            None
-        }
+fn init_http_embedding_provider(config: &crate::Config) -> Option<Arc<dyn EmbeddingProvider>> {
+    let url = config.embedding_url.clone()
+        .unwrap_or_else(|| "http://localhost:11434/v1/embeddings".to_string());
+
+    // Allow explicit opt-out
+    if url.is_empty() || url.eq_ignore_ascii_case("disabled") {
+        tracing::info!("HTTP embedding provider not configured (url empty/disabled)");
+        return None;
     }
+
+    let model = config.embedding_model.clone()
+        .unwrap_or_else(|| "nomic-embed-text".to_string());
+
+    let api_key = config.embedding_api_key.clone()
+        .filter(|k| !k.is_empty());
+
+    let dimensions = config.embedding_dimensions.unwrap_or(768);
+
+    let provider = HttpEmbeddingProvider::new(url, model, api_key, dimensions);
+    tracing::info!(
+        model = provider.model_name(),
+        dimensions = provider.dimensions(),
+        provider = "http",
+        "Embedding provider initialized (HTTP)"
+    );
+    Some(Arc::new(provider))
 }
 
 impl Orchestrator {
@@ -207,7 +238,7 @@ impl Orchestrator {
     pub async fn new(state: AppState) -> Result<Self> {
         let plan_manager = Arc::new(PlanManager::new(state.neo4j.clone(), state.meili.clone()));
 
-        let embedding_provider = init_embedding_provider();
+        let embedding_provider = init_embedding_provider(&state.config);
 
         let mut note_manager = NoteManager::new(state.neo4j.clone(), state.meili.clone());
         if let Some(ref provider) = embedding_provider {
@@ -275,7 +306,7 @@ impl Orchestrator {
     /// (for WebSocket subscribe) and optional NATS (for inter-process sync).
     pub async fn with_event_bus(state: AppState, event_bus: Arc<HybridEmitter>) -> Result<Self> {
         let emitter: Arc<dyn EventEmitter> = event_bus.clone();
-        let embedding_provider = init_embedding_provider();
+        let embedding_provider = init_embedding_provider(&state.config);
 
         let plan_manager = Arc::new(PlanManager::with_event_emitter(
             state.neo4j.clone(),
@@ -355,7 +386,7 @@ impl Orchestrator {
         state: AppState,
         emitter: Arc<dyn EventEmitter>,
     ) -> Result<Self> {
-        let embedding_provider = init_embedding_provider();
+        let embedding_provider = init_embedding_provider(&state.config);
 
         let plan_manager = Arc::new(PlanManager::with_event_emitter(
             state.neo4j.clone(),

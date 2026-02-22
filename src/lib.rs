@@ -68,6 +68,7 @@ pub struct YamlConfig {
     pub meilisearch: MeilisearchYamlConfig,
     pub nats: NatsYamlConfig,
     pub chat: ChatYamlConfig,
+    pub embeddings: EmbeddingsYamlConfig,
     /// Auth section — if absent, auth_config will be None (deny-by-default)
     pub auth: Option<AuthConfig>,
 }
@@ -171,6 +172,36 @@ pub struct ChatYamlConfig {
     pub auto_update_cli: Option<bool>,
     /// Enable automatic Tauri application updates on startup (default: true).
     pub auto_update_app: Option<bool>,
+}
+
+/// Embedding provider configuration section.
+///
+/// Controls how vector embeddings are generated for knowledge notes,
+/// enabling semantic search and automatic synapse creation.
+///
+/// Three provider modes:
+/// - `local` (default): In-process ONNX inference via fastembed-rs (zero external dependency)
+/// - `http`: Any OpenAI-compatible `/v1/embeddings` API (Ollama, OpenAI, LiteLLM, vLLM…)
+/// - `disabled`: No embeddings (semantic search unavailable)
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct EmbeddingsYamlConfig {
+    /// Provider type: "local", "http", or "disabled" (default: "local")
+    pub provider: Option<String>,
+    /// Model name for local fastembed provider (default: "multilingual-e5-base").
+    /// See `fastembed.rs` for the full list of supported model identifiers.
+    pub fastembed_model: Option<String>,
+    /// Cache directory for ONNX model files (default: ".fastembed_cache")
+    pub fastembed_cache_dir: Option<String>,
+    /// URL for HTTP embedding provider (default: "http://localhost:11434/v1/embeddings")
+    pub url: Option<String>,
+    /// Model name for HTTP provider (default: "nomic-embed-text")
+    pub model: Option<String>,
+    /// API key for authenticated HTTP endpoints (e.g., OpenAI, Voyage)
+    pub api_key: Option<String>,
+    /// Expected embedding dimensions for HTTP provider (default: 768).
+    /// Must match the model output dimensions.
+    pub dimensions: Option<usize>,
 }
 
 /// Authentication configuration — flexible multi-provider auth.
@@ -448,6 +479,30 @@ pub struct Config {
     /// Enable automatic Tauri application updates on startup.
     /// Priority: env var (CHAT_AUTO_UPDATE_APP) > YAML (chat.auto_update_app) > None (true).
     pub chat_auto_update_app: Option<bool>,
+
+    // ── Embedding provider config ────────────────────────────────────────
+    /// Embedding provider type: "local", "http", or "disabled".
+    /// Priority: env var (EMBEDDING_PROVIDER) > YAML (embeddings.provider) > "local".
+    pub embedding_provider: Option<String>,
+    /// Local fastembed model name (e.g. "multilingual-e5-base").
+    /// Priority: env var (FASTEMBED_MODEL) > YAML (embeddings.fastembed_model) > None.
+    pub embedding_fastembed_model: Option<String>,
+    /// Local fastembed ONNX model cache directory.
+    /// Priority: env var (FASTEMBED_CACHE_DIR) > YAML (embeddings.fastembed_cache_dir) > None.
+    pub embedding_fastembed_cache_dir: Option<String>,
+    /// HTTP embedding API URL (e.g. "http://localhost:11434/v1/embeddings").
+    /// Priority: env var (EMBEDDING_URL) > YAML (embeddings.url) > None.
+    pub embedding_url: Option<String>,
+    /// HTTP embedding model name (e.g. "nomic-embed-text").
+    /// Priority: env var (EMBEDDING_MODEL) > YAML (embeddings.model) > None.
+    pub embedding_model: Option<String>,
+    /// HTTP embedding API key (for OpenAI, Voyage, etc.).
+    /// Priority: env var (EMBEDDING_API_KEY) > YAML (embeddings.api_key) > None.
+    pub embedding_api_key: Option<String>,
+    /// HTTP embedding dimensions (must match model output).
+    /// Priority: env var (EMBEDDING_DIMENSIONS) > YAML (embeddings.dimensions) > None.
+    pub embedding_dimensions: Option<usize>,
+
     /// Resolved path to the config.yaml file that was loaded (if any).
     /// Used for persisting runtime changes back to disk.
     pub config_yaml_path: Option<std::path::PathBuf>,
@@ -510,6 +565,29 @@ impl Config {
                 .ok()
                 .map(|v| v == "true" || v == "1")
                 .or(yaml.chat.auto_update_app),
+            // Embedding provider config (env var > YAML > None)
+            embedding_provider: std::env::var("EMBEDDING_PROVIDER")
+                .ok()
+                .or(yaml.embeddings.provider),
+            embedding_fastembed_model: std::env::var("FASTEMBED_MODEL")
+                .ok()
+                .or(yaml.embeddings.fastembed_model),
+            embedding_fastembed_cache_dir: std::env::var("FASTEMBED_CACHE_DIR")
+                .ok()
+                .or(yaml.embeddings.fastembed_cache_dir),
+            embedding_url: std::env::var("EMBEDDING_URL")
+                .ok()
+                .or(yaml.embeddings.url),
+            embedding_model: std::env::var("EMBEDDING_MODEL")
+                .ok()
+                .or(yaml.embeddings.model),
+            embedding_api_key: std::env::var("EMBEDDING_API_KEY")
+                .ok()
+                .or(yaml.embeddings.api_key),
+            embedding_dimensions: std::env::var("EMBEDDING_DIMENSIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or(yaml.embeddings.dimensions),
             config_yaml_path: resolved_path,
         })
     }
