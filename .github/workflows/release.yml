@@ -955,10 +955,15 @@ jobs:
           # Tauri produces "Product.Name.app.tar.gz" without arch in the filename.
           # Both aarch64 and x86_64 builds produce the same name — after flatten,
           # only one survives. Both darwin platforms use the same URL.
+          # Helper: GitHub Releases replaces spaces with dots in asset names.
+          # e.g. "Project Orchestrator.app.tar.gz" → "Project.Orchestrator.app.tar.gz"
+          # We must apply the same transform when building download URLs.
+          gh_asset_name() { basename "$1" | tr ' ' '.'; }
+
           MACOS_URL=""
           MACOS_SIG=""
           for f in release-files/*.app.tar.gz; do
-            [ -f "$f" ] && [[ "$f" != *.sig ]] && MACOS_URL="${BASE_URL}/$(basename "$f")" && break
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && MACOS_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
           done
           for f in release-files/*.app.tar.gz.sig; do
             [ -f "$f" ] && MACOS_SIG=$(cat "$f") && break
@@ -969,7 +974,7 @@ jobs:
           LINUX_X86_64_URL=""
           LINUX_X86_64_SIG=""
           for f in release-files/*.AppImage.tar.gz; do
-            [ -f "$f" ] && [[ "$f" != *.sig ]] && LINUX_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && LINUX_X86_64_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
           done
           for f in release-files/*.AppImage.tar.gz.sig; do
             [ -f "$f" ] && LINUX_X86_64_SIG=$(cat "$f") && break
@@ -980,7 +985,7 @@ jobs:
           WINDOWS_X86_64_URL=""
           WINDOWS_X86_64_SIG=""
           for f in release-files/*.nsis.zip; do
-            [ -f "$f" ] && [[ "$f" != *.sig ]] && WINDOWS_X86_64_URL="${BASE_URL}/$(basename "$f")" && break
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && WINDOWS_X86_64_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
           done
           for f in release-files/*.nsis.zip.sig; do
             [ -f "$f" ] && WINDOWS_X86_64_SIG=$(cat "$f") && break
