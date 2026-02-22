@@ -1430,8 +1430,7 @@ mod tests {
 
     #[test]
     fn test_retrying_event_deserialize_from_json() {
-        let json =
-            r#"{"type":"retrying","attempt":1,"max_attempts":3,"delay_ms":1000,"error_message":"api_error"}"#;
+        let json = r#"{"type":"retrying","attempt":1,"max_attempts":3,"delay_ms":1000,"error_message":"api_error"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.event_type(), "retrying");
         if let ChatEvent::Retrying {
@@ -1507,10 +1506,7 @@ mod tests {
     fn test_classify_api_error_non_retryable_rate_limit() {
         let msg = r#"API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#;
         let kind = classify_api_error(msg);
-        assert_eq!(
-            kind,
-            ApiErrorKind::NonRetryable("rate_limit_error".into())
-        );
+        assert_eq!(kind, ApiErrorKind::NonRetryable("rate_limit_error".into()));
         assert!(!kind.is_retryable());
     }
 
