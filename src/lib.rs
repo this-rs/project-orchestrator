@@ -712,10 +712,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                         }
                     }
                 }
-                if registered > 0 {
-                    if let Err(e) = w.start().await {
-                        tracing::warn!("Auto-watch: failed to start watcher: {}", e);
-                    }
+                // Always start the watcher — even with 0 projects it will be
+                // ready to accept dynamically registered projects via the bridge.
+                if let Err(e) = w.start().await {
+                    tracing::warn!("Auto-watch: failed to start watcher: {}", e);
                 }
                 tracing::info!(
                     "Auto-watch: {} projects registered, {} skipped",
