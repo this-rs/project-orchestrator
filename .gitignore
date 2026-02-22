@@ -27,3 +27,6 @@ tarpaulin-report.json
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
 desktop/dist/
+
+
+.fastembed_cache/

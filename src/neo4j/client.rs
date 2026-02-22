@@ -8318,13 +8318,10 @@ impl Neo4jClient {
         .param("embedding", embedding_f64)
         .param("model", model.to_string());
 
-        self.graph
-            .run(q)
-            .await
-            .context(format!(
-                "Failed to set embedding on function {} in {}",
-                function_name, file_path
-            ))?;
+        self.graph.run(q).await.context(format!(
+            "Failed to set embedding on function {} in {}",
+            function_name, file_path
+        ))?;
 
         Ok(())
     }
@@ -10448,9 +10445,7 @@ impl Neo4jClient {
         // For each file's community, adds top-5 peers by PageRank that aren't already included
         {
             let file_list: Vec<String> = files.iter().cloned().collect();
-            let community_files = self
-                .expand_by_community(&file_list, project_id, 5)
-                .await;
+            let community_files = self.expand_by_community(&file_list, project_id, 5).await;
 
             for file_path in community_files {
                 files.insert(file_path);

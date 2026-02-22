@@ -4383,10 +4383,10 @@ impl GraphStore for MockGraphStore {
         embedding: &[f32],
         model: &str,
     ) -> Result<()> {
-        self.file_embeddings
-            .write()
-            .await
-            .insert(file_path.to_string(), (embedding.to_vec(), model.to_string()));
+        self.file_embeddings.write().await.insert(
+            file_path.to_string(),
+            (embedding.to_vec(), model.to_string()),
+        );
         Ok(())
     }
 
@@ -8221,11 +8221,10 @@ mod tests {
 
         {
             let mut pf = store.project_files.write().await;
-            pf.insert(pid, vec![
-                file1.to_string(),
-                file2.to_string(),
-                file3.to_string(),
-            ]);
+            pf.insert(
+                pid,
+                vec![file1.to_string(), file2.to_string(), file3.to_string()],
+            );
         }
 
         // Create embeddings — file1 and file2 are similar (API-related), file3 is different
@@ -8233,22 +8232,43 @@ mod tests {
         let emb_api_similar = vec![0.9, 0.1, 0.0, 0.0]; // similar to API
         let emb_chat = vec![0.0, 0.0, 1.0, 0.0]; // chat direction
 
-        store.set_file_embedding(file1, &emb_api, "test-model").await.unwrap();
-        store.set_file_embedding(file2, &emb_api_similar, "test-model").await.unwrap();
-        store.set_file_embedding(file3, &emb_chat, "test-model").await.unwrap();
+        store
+            .set_file_embedding(file1, &emb_api, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file2, &emb_api_similar, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file3, &emb_chat, "test-model")
+            .await
+            .unwrap();
 
         // Search with API-like query
-        let results = store.vector_search_files(&emb_api, 10, Some(pid)).await.unwrap();
+        let results = store
+            .vector_search_files(&emb_api, 10, Some(pid))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
         // file1 should be top result (exact match)
         assert_eq!(results[0].0, file1);
-        assert!(results[0].1 > 0.99, "exact match should have score near 1.0");
+        assert!(
+            results[0].1 > 0.99,
+            "exact match should have score near 1.0"
+        );
         // file2 should be second (similar)
         assert_eq!(results[1].0, file2);
-        assert!(results[1].1 > 0.9, "similar embedding should have high score");
+        assert!(
+            results[1].1 > 0.9,
+            "similar embedding should have high score"
+        );
         // file3 should be last (orthogonal)
         assert_eq!(results[2].0, file3);
-        assert!(results[2].1.abs() < 0.01, "orthogonal embedding should have score near 0");
+        assert!(
+            results[2].1.abs() < 0.01,
+            "orthogonal embedding should have score near 0"
+        );
     }
 
     #[tokio::test]
@@ -8268,11 +8288,20 @@ mod tests {
         let emb_auth = vec![1.0_f32, 0.0, 0.0];
         let emb_list = vec![0.0, 1.0, 0.0];
 
-        store.set_function_embedding("authenticate", file, &emb_auth, "test-model").await.unwrap();
-        store.set_function_embedding("list_items", file, &emb_list, "test-model").await.unwrap();
+        store
+            .set_function_embedding("authenticate", file, &emb_auth, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("list_items", file, &emb_list, "test-model")
+            .await
+            .unwrap();
 
         // Search for auth-like function
-        let results = store.vector_search_functions(&emb_auth, 10, Some(pid)).await.unwrap();
+        let results = store
+            .vector_search_functions(&emb_auth, 10, Some(pid))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "authenticate");
         assert_eq!(results[0].1, file);
@@ -8286,10 +8315,16 @@ mod tests {
         // No embeddings stored — search should return empty
         let query_emb = vec![1.0_f32, 0.0, 0.0];
 
-        let file_results = store.vector_search_files(&query_emb, 10, None).await.unwrap();
+        let file_results = store
+            .vector_search_files(&query_emb, 10, None)
+            .await
+            .unwrap();
         assert!(file_results.is_empty(), "expected empty file results");
 
-        let func_results = store.vector_search_functions(&query_emb, 10, None).await.unwrap();
+        let func_results = store
+            .vector_search_functions(&query_emb, 10, None)
+            .await
+            .unwrap();
         assert!(func_results.is_empty(), "expected empty function results");
     }
 
@@ -8313,11 +8348,20 @@ mod tests {
         }
 
         let emb = vec![1.0_f32, 0.0, 0.0];
-        store.set_file_embedding(file_a, &emb, "test").await.unwrap();
-        store.set_file_embedding(file_b, &emb, "test").await.unwrap();
+        store
+            .set_file_embedding(file_a, &emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file_b, &emb, "test")
+            .await
+            .unwrap();
 
         // Search with project A filter — should only find file_a
-        let results = store.vector_search_files(&emb, 10, Some(pid_a)).await.unwrap();
+        let results = store
+            .vector_search_files(&emb, 10, Some(pid_a))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, file_a);
 

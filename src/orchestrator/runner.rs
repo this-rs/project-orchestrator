@@ -1629,7 +1629,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             let parsed_clone = parsed.clone();
             let file_path = normalize_path(&parsed.path);
             tokio::spawn(async move {
-                if let Err(e) = Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path).await {
+                if let Err(e) =
+                    Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path).await
+                {
                     tracing::warn!(file = %file_path, error = %e, "Failed to embed file (best-effort)");
                 }
             });
@@ -1718,10 +1720,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .iter()
             .filter(|f| {
                 f.docstring.is_some()
-                    || matches!(
-                        f.visibility,
-                        crate::neo4j::models::Visibility::Public
-                    )
+                    || matches!(f.visibility, crate::neo4j::models::Visibility::Public)
             })
             .collect();
 
@@ -4323,33 +4322,29 @@ mod tests {
             path: "src/api/handlers.rs".to_string(),
             language: "rust".to_string(),
             hash: "abc123".to_string(),
-            functions: vec![
-                FunctionNode {
-                    name: "create_plan".to_string(),
-                    visibility: Visibility::Public,
-                    params: vec![],
-                    return_type: Some("Result<Plan>".to_string()),
-                    generics: vec![],
-                    is_async: true,
-                    is_unsafe: false,
-                    complexity: 3,
-                    file_path: "src/api/handlers.rs".to_string(),
-                    line_start: 10,
-                    line_end: 50,
-                    docstring: None,
-                },
-            ],
-            structs: vec![
-                StructNode {
-                    name: "PlanRequest".to_string(),
-                    file_path: "src/api/handlers.rs".to_string(),
-                    visibility: Visibility::Public,
-                    generics: vec![],
-                    line_start: 1,
-                    line_end: 5,
-                    docstring: None,
-                },
-            ],
+            functions: vec![FunctionNode {
+                name: "create_plan".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: Some("Result<Plan>".to_string()),
+                generics: vec![],
+                is_async: true,
+                is_unsafe: false,
+                complexity: 3,
+                file_path: "src/api/handlers.rs".to_string(),
+                line_start: 10,
+                line_end: 50,
+                docstring: None,
+            }],
+            structs: vec![StructNode {
+                name: "PlanRequest".to_string(),
+                file_path: "src/api/handlers.rs".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
             traits: vec![],
             enums: vec![],
             imports: vec![],
@@ -4372,12 +4367,10 @@ mod tests {
         let func = FunctionNode {
             name: "plan_implementation".to_string(),
             visibility: Visibility::Public,
-            params: vec![
-                Parameter {
-                    name: "request".to_string(),
-                    type_name: Some("PlanRequest".to_string()),
-                },
-            ],
+            params: vec![Parameter {
+                name: "request".to_string(),
+                type_name: Some("PlanRequest".to_string()),
+            }],
             return_type: Some("Result<ImplementationPlan>".to_string()),
             generics: vec![],
             is_async: true,

@@ -57,7 +57,7 @@ pub struct PlanRequest {
 // ============================================================================
 
 /// Risk level for a modification
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     #[default]
@@ -819,12 +819,20 @@ impl ImplementationPlanner {
                 self.resolve_explicit_entries(entries, request.project_id, root_path)
                     .await?
             } else {
-                self.search_semantic_zones(&request.description, request.project_slug.as_deref(), Some(request.project_id))
-                    .await?
+                self.search_semantic_zones(
+                    &request.description,
+                    request.project_slug.as_deref(),
+                    Some(request.project_id),
+                )
+                .await?
             }
         } else {
-            self.search_semantic_zones(&request.description, request.project_slug.as_deref(), Some(request.project_id))
-                .await?
+            self.search_semantic_zones(
+                &request.description,
+                request.project_slug.as_deref(),
+                Some(request.project_id),
+            )
+            .await?
         };
 
         // Normalize all zone file paths to absolute using project root_path.
@@ -902,10 +910,8 @@ impl ImplementationPlanner {
             // Community expansion: if file has 0 structural dependents and has a
             // community_id, find peer files in the same community (best-effort).
             if dep_count == 0 {
-                if let Ok(Some(analytics)) = self
-                    .neo4j
-                    .get_node_analytics(&zone.file_path, "file")
-                    .await
+                if let Ok(Some(analytics)) =
+                    self.neo4j.get_node_analytics(&zone.file_path, "file").await
                 {
                     if let Some(community_id) = analytics.community_id {
                         // Fetch all communities for the project, find the matching one
@@ -932,8 +938,7 @@ impl ImplementationPlanner {
                                         community_id,
                                         peers
                                     );
-                                    community_peers_map
-                                        .insert(zone.file_path.clone(), peers);
+                                    community_peers_map.insert(zone.file_path.clone(), peers);
                                 }
                             }
                         }
@@ -955,14 +960,10 @@ impl ImplementationPlanner {
         community_peers_map: &HashMap<String, Vec<String>>,
         project_id: Uuid,
     ) -> Result<ModificationDag> {
-        let zone_files: HashSet<String> = zones.iter().map(|z| z.file_path.clone()).collect();
+        let _zone_files: HashSet<String> = zones.iter().map(|z| z.file_path.clone()).collect();
 
         // Fetch project percentiles once for GDS-based risk scoring (best-effort)
-        let percentiles = self
-            .neo4j
-            .get_project_percentiles(project_id)
-            .await
-            .ok();
+        let percentiles = self.neo4j.get_project_percentiles(project_id).await.ok();
 
         // Build nodes for all zone files
         let mut nodes: HashMap<String, DagNode> = HashMap::new();
@@ -1075,13 +1076,55 @@ impl ImplementationPlanner {
             );
         }
 
+        // Add community peers as DAG nodes (they were discovered in expand_dependencies
+        // but need to be real nodes for compute_phases to include them in output).
+        // Community peers are files in the same Louvain cluster that should be co-modified.
+        let peer_files: Vec<(String, Option<u32>)> = nodes
+            .values()
+            .flat_map(|n| {
+                n.community_peers
+                    .iter()
+                    .map(move |p| (p.clone(), n.community_id))
+            })
+            .collect();
+
+        for (peer_path, community_id) in peer_files {
+            if nodes.contains_key(&peer_path) {
+                continue; // Already in the DAG
+            }
+
+            let symbols = match self.neo4j.get_file_symbol_names(&peer_path).await {
+                Ok(s) => {
+                    let mut all = s.functions;
+                    all.extend(s.structs);
+                    all.extend(s.traits);
+                    all.extend(s.enums);
+                    all
+                }
+                Err(_) => vec![],
+            };
+
+            nodes.insert(
+                peer_path.clone(),
+                DagNode {
+                    file_path: peer_path,
+                    symbols,
+                    risk: RiskLevel::Low,
+                    test_files: vec![],
+                    dependents_count: 0,
+                    community_id,
+                    community_peers: vec![],
+                },
+            );
+        }
+
         // Build edges: if zone A has dependent B (B imports A), and B is also
         // a zone file, then A→B (A must be modified before B)
         let mut edges = Vec::new();
         for zone in zones {
             if let Some(deps) = dependents_map.get(&zone.file_path) {
                 for dep in deps {
-                    if zone_files.contains(dep) && dep != &zone.file_path {
+                    if nodes.contains_key(dep) && dep != &zone.file_path {
                         edges.push((zone.file_path.clone(), dep.clone()));
                     }
                 }
@@ -1575,7 +1618,12 @@ impl ImplementationPlanner {
 
         // Step 3: Build DAG (with GDS risk scoring)
         let dag = self
-            .build_dag(&zones, &dependents_map, &community_peers_map, request.project_id)
+            .build_dag(
+                &zones,
+                &dependents_map,
+                &community_peers_map,
+                request.project_id,
+            )
             .await?;
 
         // Step 4: Topological sort
@@ -1961,7 +2009,8 @@ mod tests {
             },
         ];
 
-        let (dependents_map, _, community_peers_map) = planner.expand_dependencies(&zones, pid).await.unwrap();
+        let (dependents_map, _, community_peers_map) =
+            planner.expand_dependencies(&zones, pid).await.unwrap();
         let dag = planner
             .build_dag(&zones, &dependents_map, &community_peers_map, pid)
             .await
@@ -1990,7 +2039,8 @@ mod tests {
             source: ZoneSource::ExplicitEntry,
         }];
 
-        let (dependents_map, _, community_peers_map) = planner.expand_dependencies(&zones, pid).await.unwrap();
+        let (dependents_map, _, community_peers_map) =
+            planner.expand_dependencies(&zones, pid).await.unwrap();
         let dag = planner
             .build_dag(&zones, &dependents_map, &community_peers_map, pid)
             .await
@@ -2015,7 +2065,7 @@ mod tests {
                 test_files: vec![],
                 dependents_count: 0,
                 community_id: None,
-                    community_peers: vec![],
+                community_peers: vec![],
             },
         );
         nodes.insert(
@@ -2027,7 +2077,7 @@ mod tests {
                 test_files: vec![],
                 dependents_count: 0,
                 community_id: None,
-                    community_peers: vec![],
+                community_peers: vec![],
             },
         );
 
@@ -2053,7 +2103,8 @@ mod tests {
             source: ZoneSource::ExplicitEntry,
         }];
 
-        let (dependents_map, _, community_peers_map) = planner.expand_dependencies(&zones, pid).await.unwrap();
+        let (dependents_map, _, community_peers_map) =
+            planner.expand_dependencies(&zones, pid).await.unwrap();
         let dag = planner
             .build_dag(&zones, &dependents_map, &community_peers_map, pid)
             .await
@@ -2144,7 +2195,7 @@ mod tests {
                 test_files: vec![],
                 dependents_count: 1,
                 community_id: None,
-                    community_peers: vec![],
+                community_peers: vec![],
             },
         );
         nodes.insert(
@@ -2156,7 +2207,7 @@ mod tests {
                 test_files: vec![],
                 dependents_count: 0,
                 community_id: None,
-                    community_peers: vec![],
+                community_peers: vec![],
             },
         );
         let dag = ModificationDag {
@@ -2595,7 +2646,10 @@ mod tests {
         let fused = reciprocal_rank_fusion(&bm25, &vector, 10);
 
         // b.rs appears in both lists → should be ranked highest (boosted by RRF)
-        assert_eq!(fused[0].0, "b.rs", "b.rs should be top result (in both lists)");
+        assert_eq!(
+            fused[0].0, "b.rs",
+            "b.rs should be top result (in both lists)"
+        );
 
         // a.rs also appears in both → should be second
         assert_eq!(fused[1].0, "a.rs", "a.rs should be second (in both lists)");
@@ -2781,8 +2835,8 @@ mod tests {
                 },
                 FileAnalyticsUpdate {
                     path: "src/utils.rs".to_string(),
-                    pagerank: 0.50,       // Very high — above p95
-                    betweenness: 0.90,    // Very high — bridge file
+                    pagerank: 0.50,    // Very high — above p95
+                    betweenness: 0.90, // Very high — bridge file
                     community_id: 99,
                     community_label: "utilities".to_string(),
                     clustering_coefficient: 0.0,
@@ -2831,10 +2885,7 @@ mod tests {
         let peers = peers.unwrap();
         // handlers.rs and client.rs are in the same community
         // (they appear as key_files since the mock computes top files by pagerank)
-        assert!(
-            !peers.is_empty(),
-            "Should find at least one community peer"
-        );
+        assert!(!peers.is_empty(), "Should find at least one community peer");
         // Peers should NOT include routes.rs itself
         assert!(
             !peers.contains(&"src/routes.rs".to_string()),
@@ -2867,7 +2918,7 @@ mod tests {
 
         // No community expansion since it has dependents
         assert!(
-            community_peers_map.get("src/models.rs").is_none(),
+            !community_peers_map.contains_key("src/models.rs"),
             "models.rs should NOT have community peers (has dependents)"
         );
     }
@@ -3009,14 +3060,20 @@ mod tests {
 
         // Seed file embeddings for vector search
         let embedding_provider = MockEmbeddingProvider::new(384);
-        let query_embedding = embedding_provider.embed_text("webhook notifications").await.unwrap();
+        let query_embedding = embedding_provider
+            .embed_text("webhook notifications")
+            .await
+            .unwrap();
         // Give notify.rs an embedding identical to the query → highest cosine similarity
         graph
             .set_file_embedding("src/notify.rs", &query_embedding, "mock")
             .await
             .unwrap();
         // Give events.rs a slightly different embedding
-        let events_emb = embedding_provider.embed_text("event system hooks").await.unwrap();
+        let events_emb = embedding_provider
+            .embed_text("event system hooks")
+            .await
+            .unwrap();
         graph
             .set_file_embedding("src/events.rs", &events_emb, "mock")
             .await
@@ -3070,10 +3127,7 @@ mod tests {
         // notify.rs appears in BOTH BM25 (substring match "webhook") AND vector (identical embedding)
         // → should be boosted by RRF to top or near-top
         let paths: Vec<&str> = zones.iter().map(|z| z.file_path.as_str()).collect();
-        assert!(
-            !zones.is_empty(),
-            "Hybrid search should return results"
-        );
+        assert!(!zones.is_empty(), "Hybrid search should return results");
         assert!(
             paths.contains(&"src/notify.rs"),
             "notify.rs should appear (in both BM25 and vector)"
@@ -3092,6 +3146,206 @@ mod tests {
                 notify_idx <= webhook_idx,
                 "notify.rs (BM25+vector) should rank >= webhook.rs (BM25 only)"
             );
+        }
+    }
+
+    /// E2E test: validates that plan_implementation produces better results with
+    /// vector search + GDS community expansion than call-graph/BM25 alone.
+    ///
+    /// Scenario: "REST endpoint stats" — routes.rs has 0 dependents, but the
+    /// community expansion should pull in handlers.rs and client.rs as peers.
+    /// The planner should also use GDS risk scoring (high pagerank = higher risk).
+    #[tokio::test]
+    async fn test_plan_implementation_e2e_with_community_expansion() {
+        let (planner, pid) = setup_planner_with_analytics().await;
+
+        // Run plan_implementation with routes.rs as entry point
+        let plan = planner
+            .plan_implementation(PlanRequest {
+                project_id: pid,
+                project_slug: Some("test-project-gds".to_string()),
+                description: "Add a stats endpoint to the REST API".to_string(),
+                entry_points: Some(vec!["src/routes.rs".to_string()]),
+                scope: None,
+                auto_create_plan: None,
+                root_path: None,
+            })
+            .await
+            .unwrap();
+
+        // The plan should not be empty
+        assert!(
+            !plan.phases.is_empty(),
+            "plan should have at least one phase"
+        );
+
+        // Collect all files from all phases (modifications + branches)
+        let all_files: Vec<&str> = plan
+            .phases
+            .iter()
+            .flat_map(|p| {
+                p.modifications.iter().map(|m| m.file.as_str()).chain(
+                    p.branches
+                        .iter()
+                        .flat_map(|b| b.files.iter().map(|f| f.as_str())),
+                )
+            })
+            .collect();
+
+        // routes.rs should be in the plan (explicit entry point)
+        assert!(
+            all_files.contains(&"src/routes.rs"),
+            "routes.rs should be in plan, got: {:?}",
+            all_files
+        );
+
+        // handlers.rs should be added via community expansion (same community 42)
+        // This was the key problem: routes.rs had 0 dependents, so handlers.rs was missing
+        assert!(
+            all_files.contains(&"src/handlers.rs"),
+            "handlers.rs should be added via community expansion, got: {:?}",
+            all_files
+        );
+
+        // client.rs should also be in the plan (same community 42)
+        assert!(
+            all_files.contains(&"src/client.rs"),
+            "client.rs should be added via community expansion, got: {:?}",
+            all_files
+        );
+
+        // utils.rs has very high pagerank (0.50) and betweenness (0.90) — if present,
+        // it should have Medium or High risk
+        if let Some(utils_mod) = plan
+            .phases
+            .iter()
+            .flat_map(|p| p.modifications.iter())
+            .find(|m| m.file == "src/utils.rs")
+        {
+            assert!(
+                utils_mod.risk >= RiskLevel::Medium,
+                "utils.rs (high pagerank+betweenness) should have risk >= Medium, got: {:?}",
+                utils_mod.risk
+            );
+        }
+    }
+
+    /// E2E test: validates that plan_implementation works correctly WITHOUT embeddings
+    /// or GDS data — graceful fallback to structural analysis only.
+    #[tokio::test]
+    async fn test_plan_implementation_e2e_fallback_no_gds() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{FileNode, FunctionNode, ProjectNode, Visibility};
+
+        let graph = MockGraphStore::new();
+        let project = ProjectNode {
+            id: Uuid::new_v4(),
+            name: "fallback-test".to_string(),
+            slug: "fallback-test".to_string(),
+            root_path: "/tmp/fallback".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+        };
+        let pid = project.id;
+        graph.create_project(&project).await.unwrap();
+
+        // Seed files without any analytics or embeddings
+        for path in &["src/main.rs", "src/lib.rs", "src/helpers.rs"] {
+            graph
+                .upsert_file(&FileNode {
+                    path: path.to_string(),
+                    language: "rust".to_string(),
+                    hash: "abc".to_string(),
+                    last_parsed: chrono::Utc::now(),
+                    project_id: Some(pid),
+                })
+                .await
+                .unwrap();
+            graph.link_file_to_project(path, pid).await.unwrap();
+        }
+
+        // Seed a function
+        graph
+            .upsert_function(&FunctionNode {
+                name: "main_handler".to_string(),
+                file_path: "src/main.rs".to_string(),
+                line_start: 1,
+                line_end: 20,
+                visibility: Visibility::Public,
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                docstring: None,
+            })
+            .await
+            .unwrap();
+
+        // Import relationship: main.rs imports lib.rs
+        graph
+            .create_import_relationship("src/main.rs", "src/lib.rs", "crate::lib")
+            .await
+            .unwrap();
+
+        let neo4j: Arc<dyn crate::neo4j::GraphStore> = Arc::new(graph);
+        let meili: Arc<dyn crate::meilisearch::SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let plan_manager = Arc::new(PlanManager::new(neo4j.clone(), meili.clone()));
+        let note_manager = Arc::new(NoteManager::new(neo4j.clone(), meili.clone()));
+
+        let planner = ImplementationPlanner::new(neo4j, meili, plan_manager, note_manager);
+        // No embedding provider — should still work
+
+        let plan = planner
+            .plan_implementation(PlanRequest {
+                project_id: pid,
+                project_slug: Some("fallback-test".to_string()),
+                description: "Refactor the main handler".to_string(),
+                entry_points: Some(vec!["src/main.rs".to_string()]),
+                scope: None,
+                auto_create_plan: None,
+                root_path: None,
+            })
+            .await
+            .unwrap();
+
+        // Plan should work without errors — structural analysis only
+        assert!(
+            !plan.phases.is_empty(),
+            "plan should have phases even without embeddings/GDS"
+        );
+
+        let all_files: Vec<&str> = plan
+            .phases
+            .iter()
+            .flat_map(|p| {
+                p.modifications.iter().map(|m| m.file.as_str()).chain(
+                    p.branches
+                        .iter()
+                        .flat_map(|b| b.files.iter().map(|f| f.as_str())),
+                )
+            })
+            .collect();
+
+        assert!(
+            all_files.contains(&"src/main.rs"),
+            "main.rs should be in plan (explicit entry point)"
+        );
+
+        // All risks should be Low (no GDS data to boost)
+        for phase in &plan.phases {
+            for modif in &phase.modifications {
+                assert_eq!(
+                    modif.risk,
+                    RiskLevel::Low,
+                    "without GDS, {} should have Low risk",
+                    modif.file
+                );
+            }
         }
     }
 }
