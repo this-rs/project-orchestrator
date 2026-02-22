@@ -25,6 +25,12 @@ ignore:
   - "src/api/ws_chat_handler.rs"
   - "src/api/chat_handlers.rs"
   - "src/chat/**"
+  # Neo4j client — all methods require a running Neo4j instance.
+  # Tested by integration tests (ci.yml: integration-tests, api-tests jobs).
+  # Unit tests use MockGraphStore (mock.rs) which is fully covered.
+  - "src/neo4j/client.rs"
+  # Pure trait→client delegation — untestable without Neo4j, zero logic.
+  - "src/neo4j/impl_graph_store.rs"
   # Main entry points
   - "src/main.rs"
   - "src/bin/**"
