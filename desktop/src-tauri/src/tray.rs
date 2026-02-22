@@ -21,6 +21,7 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .enabled(false)
         .build(app)?;
     let open_item = MenuItemBuilder::with_id("open", "Open").build(app)?;
+    let settings_item = MenuItemBuilder::with_id("settings", "Settings...").build(app)?;
     let reconfig_item = MenuItemBuilder::with_id("reconfigure", "Reconfigure...").build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
@@ -33,6 +34,7 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .item(&api_item)
         .separator()
         .item(&open_item)
+        .item(&settings_item)
         .item(&reconfig_item)
         .separator()
         .item(&quit_item)
@@ -74,6 +76,13 @@ fn handle_menu_event(app: &AppHandle, item_id: &str) {
     match item_id {
         "open" => {
             show_main_window(app);
+        }
+        "settings" => {
+            if let Some(window) = app.get_webview_window("main") {
+                window.show().ok();
+                window.set_focus().ok();
+                let _ = window.eval("window.location.href = '/settings'");
+            }
         }
         "reconfigure" => {
             if let Some(window) = app.get_webview_window("main") {
