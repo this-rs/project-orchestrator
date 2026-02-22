@@ -4165,8 +4165,15 @@ impl ToolHandler {
 
         let role = args.get("role").and_then(|v| v.as_str());
 
+        // Resolve the feature graph's project_id for proper scoping
+        let project_id = self
+            .neo4j()
+            .get_feature_graph_detail(feature_graph_id)
+            .await?
+            .map(|detail| detail.graph.project_id);
+
         self.neo4j()
-            .add_entity_to_feature_graph(feature_graph_id, entity_type, entity_id, role)
+            .add_entity_to_feature_graph(feature_graph_id, entity_type, entity_id, role, project_id)
             .await?;
 
         Ok(json!({

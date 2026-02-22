@@ -118,6 +118,10 @@ pub struct MockGraphStore {
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
+    /// File embeddings (file_path -> (embedding, model_name))
+    pub file_embeddings: RwLock<HashMap<String, (Vec<f32>, String)>>,
+    /// Function embeddings ("file_path::func_name" -> (embedding, model_name))
+    pub function_embeddings: RwLock<HashMap<String, (Vec<f32>, String)>>,
 }
 
 #[allow(dead_code)]
@@ -188,6 +192,8 @@ impl MockGraphStore {
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
             note_synapses: RwLock::new(HashMap::new()),
+            file_embeddings: RwLock::new(HashMap::new()),
+            function_embeddings: RwLock::new(HashMap::new()),
         }
     }
 
@@ -4368,6 +4374,118 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
+    // Code embedding operations (File & Function vector search)
+    // ========================================================================
+
+    async fn set_file_embedding(
+        &self,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        self.file_embeddings.write().await.insert(
+            file_path.to_string(),
+            (embedding.to_vec(), model.to_string()),
+        );
+        Ok(())
+    }
+
+    async fn set_function_embedding(
+        &self,
+        function_name: &str,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let key = format!("{}::{}", file_path, function_name);
+        self.function_embeddings
+            .write()
+            .await
+            .insert(key, (embedding.to_vec(), model.to_string()));
+        Ok(())
+    }
+
+    async fn vector_search_files(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, f64)>> {
+        let file_embeddings = self.file_embeddings.read().await;
+
+        // If project_id is specified, get the set of file paths belonging to that project
+        let project_files: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            pf.get(&pid).cloned()
+        } else {
+            None
+        };
+
+        let mut scored: Vec<(String, f64)> = file_embeddings
+            .iter()
+            .filter(|(path, _)| {
+                if let Some(ref pfiles) = project_files {
+                    pfiles.contains(path)
+                } else {
+                    true
+                }
+            })
+            .map(|(path, (emb, _))| {
+                let score = cosine_similarity(embedding, emb);
+                (path.clone(), score)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    async fn vector_search_functions(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let func_embeddings = self.function_embeddings.read().await;
+
+        // If project_id is specified, get the set of file paths belonging to that project
+        let project_files: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            pf.get(&pid).cloned()
+        } else {
+            None
+        };
+
+        let mut scored: Vec<(String, String, f64)> = func_embeddings
+            .iter()
+            .filter_map(|(key, (emb, _))| {
+                // key format: "file_path::func_name"
+                let parts: Vec<&str> = key.splitn(2, "::").collect();
+                if parts.len() != 2 {
+                    return None;
+                }
+                let fpath = parts[0];
+                let fname = parts[1];
+
+                // Filter by project
+                if let Some(ref pfiles) = project_files {
+                    if !pfiles.contains(&fpath.to_string()) {
+                        return None;
+                    }
+                }
+
+                let score = cosine_similarity(embedding, emb);
+                Some((fname.to_string(), fpath.to_string(), score))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    // ========================================================================
     // Synapse operations (Phase 2 — Neural Network)
     // ========================================================================
 
@@ -4955,6 +5073,7 @@ impl GraphStore for MockGraphStore {
                         entity_id: eid.clone(),
                         name: Some(eid.clone()),
                         role: role.clone(),
+                        importance_score: None,
                     })
                     .collect()
             })
@@ -5000,6 +5119,7 @@ impl GraphStore for MockGraphStore {
         entity_type: &str,
         entity_id: &str,
         role: Option<&str>,
+        _project_id: Option<Uuid>,
     ) -> Result<()> {
         let mut entities = self.feature_graph_entities.write().await;
         let list = entities.entry(feature_graph_id).or_default();
@@ -5204,6 +5324,85 @@ impl GraphStore for MockGraphStore {
             drop(ir);
         } // end if should_include imports
 
+        // Step 1d: Expand via vector similarity (best-effort)
+        // For each function with an embedding, find semantically similar functions
+        let mut vector_expanded_funcs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        {
+            let func_embeddings = self.function_embeddings.read().await;
+            let funcs_map = self.functions.read().await;
+
+            // Collect embeddings for all current functions
+            let mut func_with_embeddings: Vec<Vec<f32>> = Vec::new();
+            for func_name in all_functions.iter() {
+                if let Some(func) = funcs_map.values().find(|f| f.name == *func_name) {
+                    let key = format!("{}::{}", func.file_path, func_name);
+                    if let Some((emb, _)) = func_embeddings.get(&key) {
+                        func_with_embeddings.push(emb.clone());
+                    }
+                }
+            }
+            drop(func_embeddings);
+            drop(funcs_map);
+
+            let entry_cid = if filter_community {
+                let fa = self.function_analytics.read().await;
+                fa.get(entry_function).map(|a| a.community_id)
+            } else {
+                None
+            };
+
+            for embedding in &func_with_embeddings {
+                let neighbors = self
+                    .vector_search_functions(embedding, 5, Some(project_id))
+                    .await
+                    .unwrap_or_default();
+                for (neighbor_name, neighbor_path, score) in neighbors {
+                    if score < 0.8 || all_functions.contains(&neighbor_name) {
+                        continue;
+                    }
+                    // Community filter
+                    if let Some(target_cid) = entry_cid {
+                        let fa = self.function_analytics.read().await;
+                        if let Some(analytics) = fa.get(&neighbor_name) {
+                            if analytics.community_id != target_cid {
+                                continue;
+                            }
+                        }
+                    }
+                    vector_expanded_funcs.insert(neighbor_name.clone());
+                    all_functions.insert(neighbor_name);
+                    files.insert(neighbor_path);
+                }
+            }
+        }
+
+        // Step 1e: Expand via community — find related files in same Louvain cluster (best-effort)
+        {
+            let fa = self.file_analytics.read().await;
+            let mut seen_communities: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            for file_path in files.iter() {
+                if let Some(analytics) = fa.get(file_path) {
+                    seen_communities.insert(analytics.community_id);
+                }
+            }
+            let original_files: std::collections::HashSet<String> = files.clone();
+            for cid in &seen_communities {
+                let mut peers: Vec<(String, f64)> = Vec::new();
+                for (path, analytics) in fa.iter() {
+                    if analytics.community_id == *cid && !original_files.contains(path) {
+                        peers.push((path.clone(), analytics.pagerank));
+                    }
+                }
+                peers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (path, _) in peers.into_iter().take(5) {
+                    files.insert(path);
+                }
+            }
+            drop(fa);
+        }
+
         // Create the feature graph (with build params for refresh)
         let fg = FeatureGraphNode {
             id: Uuid::new_v4(),
@@ -5224,54 +5423,84 @@ impl GraphStore for MockGraphStore {
         for func_name in &all_functions {
             let role = if func_name == entry_function {
                 "entry_point"
+            } else if vector_expanded_funcs.contains(func_name) {
+                "support"
             } else {
                 "core_logic"
             };
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "function", func_name, Some(role))
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "function",
+                    func_name,
+                    Some(role),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
                 entity_id: func_name.clone(),
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
+                importance_score: None,
             });
         }
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "file", file_path, Some("support"))
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "file",
+                    file_path,
+                    Some("support"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
+                importance_score: None,
             });
         }
 
         // Add structs/enums discovered via IMPLEMENTS_FOR with role: data_model
         for struct_name in &discovered_structs {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "struct", struct_name, Some("data_model"))
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "struct",
+                    struct_name,
+                    Some("data_model"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
                 entity_id: struct_name.clone(),
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
+                importance_score: None,
             });
         }
 
         // Add traits discovered via IMPLEMENTS_TRAIT with role: trait_contract
         for trait_name in &discovered_traits {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "trait", trait_name, Some("trait_contract"))
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "trait",
+                    trait_name,
+                    Some("trait_contract"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
                 entity_id: trait_name.clone(),
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
+                importance_score: None,
             });
         }
 
@@ -5300,7 +5529,7 @@ impl GraphStore for MockGraphStore {
 
         let depth = fg.build_depth.unwrap_or(2);
         let include_relations = fg.include_relations.clone();
-        let _project_id = fg.project_id;
+        let project_id = fg.project_id;
 
         let should_include = |rel: &str| -> bool {
             match &include_relations {
@@ -5438,46 +5667,74 @@ impl GraphStore for MockGraphStore {
                 "core_logic"
             };
             let _ = self
-                .add_entity_to_feature_graph(id, "function", func_name, Some(role))
+                .add_entity_to_feature_graph(
+                    id,
+                    "function",
+                    func_name,
+                    Some(role),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
                 entity_id: func_name.clone(),
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
+                importance_score: None,
             });
         }
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(id, "file", file_path, Some("support"))
+                .add_entity_to_feature_graph(
+                    id,
+                    "file",
+                    file_path,
+                    Some("support"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
+                importance_score: None,
             });
         }
         for struct_name in &discovered_structs {
             let _ = self
-                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"))
+                .add_entity_to_feature_graph(
+                    id,
+                    "struct",
+                    struct_name,
+                    Some("data_model"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
                 entity_id: struct_name.clone(),
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
+                importance_score: None,
             });
         }
         for trait_name in &discovered_traits {
             let _ = self
-                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"))
+                .add_entity_to_feature_graph(
+                    id,
+                    "trait",
+                    trait_name,
+                    Some("trait_contract"),
+                    Some(project_id),
+                )
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
                 entity_id: trait_name.clone(),
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
+                importance_score: None,
             });
         }
 
@@ -7172,13 +7429,13 @@ mod tests {
 
         // Add entity without role
         store
-            .add_entity_to_feature_graph(fg.id, "function", "func_a", None)
+            .add_entity_to_feature_graph(fg.id, "function", "func_a", None, None)
             .await
             .unwrap();
 
         // Add entity with role
         store
-            .add_entity_to_feature_graph(fg.id, "function", "func_b", Some("entry_point"))
+            .add_entity_to_feature_graph(fg.id, "function", "func_b", Some("entry_point"), None)
             .await
             .unwrap();
 
@@ -7209,7 +7466,7 @@ mod tests {
 
         // Update role on existing entity
         store
-            .add_entity_to_feature_graph(fg.id, "function", "func_a", Some("core_logic"))
+            .add_entity_to_feature_graph(fg.id, "function", "func_a", Some("core_logic"), None)
             .await
             .unwrap();
 
@@ -7643,7 +7900,7 @@ mod tests {
 
         // Add an entity manually
         store
-            .add_entity_to_feature_graph(fg.id, "function", "my_func", Some("entry_point"))
+            .add_entity_to_feature_graph(fg.id, "function", "my_func", Some("entry_point"), None)
             .await
             .unwrap();
 
@@ -7683,5 +7940,482 @@ mod tests {
             "error should mention 'not found', got: {}",
             err_msg
         );
+    }
+
+    // ========================================================================
+    // Feature Graph — Vector expansion & community expansion tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_auto_build_with_vector_expansion() {
+        // Setup: entry_fn calls helper_fn. unrelated_fn is NOT in call graph
+        // but has a very similar embedding to entry_fn, same community → should be added.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/main.rs", &["entry_fn"]),
+                ("src/helper.rs", &["helper_fn"]),
+                ("src/similar.rs", &["unrelated_fn"]),
+            ],
+        )
+        .await;
+
+        // entry_fn calls helper_fn (call graph link)
+        store
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None)
+            .await
+            .unwrap();
+
+        // Set embeddings: entry_fn and unrelated_fn have very similar vectors
+        // helper_fn has a different vector
+        let entry_emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let similar_emb = vec![0.99_f32, 0.01, 0.0, 0.0]; // cosine ~0.9999
+        let different_emb = vec![0.0_f32, 1.0, 0.0, 0.0]; // cosine ~0.0
+
+        store
+            .set_function_embedding("entry_fn", "src/main.rs", &entry_emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("unrelated_fn", "src/similar.rs", &similar_emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("helper_fn", "src/helper.rs", &different_emb, "test")
+            .await
+            .unwrap();
+
+        // Set same community for entry_fn and unrelated_fn (community filtering enabled)
+        {
+            let mut fa = store.function_analytics.write().await;
+            fa.insert(
+                "entry_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/main.rs::entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "unrelated_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/similar.rs::unrelated_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 1, // same community
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "helper_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/helper.rs::helper_fn".to_string(),
+                    pagerank: 0.2,
+                    betweenness: 0.0,
+                    community_id: 2, // different community
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+        }
+
+        let result = store
+            .auto_build_feature_graph(
+                "test-vector-expansion",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let entity_ids: Vec<&str> = result
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // entry_fn and helper_fn should be there (call graph)
+        assert!(
+            entity_ids.contains(&"entry_fn"),
+            "should contain entry_fn, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            entity_ids.contains(&"helper_fn"),
+            "should contain helper_fn, got: {:?}",
+            entity_ids
+        );
+        // unrelated_fn should be added by vector expansion (similar embedding, same community)
+        assert!(
+            entity_ids.contains(&"unrelated_fn"),
+            "should contain unrelated_fn via vector expansion, got: {:?}",
+            entity_ids
+        );
+        // unrelated_fn should have role "support" (not "core_logic")
+        let unrelated_entity = result
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "unrelated_fn")
+            .expect("unrelated_fn should be in entities");
+        assert_eq!(
+            unrelated_entity.role.as_deref(),
+            Some("support"),
+            "vector-expanded function should have role 'support'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_build_with_community_expansion() {
+        // Setup: entry_fn is in src/api/routes.rs (community 1).
+        // src/api/handlers.rs is in the same community but NOT in call graph.
+        // It should be added by community expansion.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/api/routes.rs", &["entry_fn"]),
+                ("src/api/handlers.rs", &["handle_request"]),
+                ("src/db/client.rs", &["query_db"]),
+            ],
+        )
+        .await;
+
+        // No call graph links — entry_fn is isolated
+
+        // Set file analytics: routes.rs and handlers.rs in community 1, client.rs in community 2
+        {
+            let mut fa = store.file_analytics.write().await;
+            fa.insert(
+                "src/api/routes.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/api/routes.rs".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.2,
+                    community_id: 1,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "src/api/handlers.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/api/handlers.rs".to_string(),
+                    pagerank: 0.4,
+                    betweenness: 0.1,
+                    community_id: 1, // same community
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "src/db/client.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/db/client.rs".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.0,
+                    community_id: 2, // different community
+                    community_label: "db".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+        }
+
+        let result = store
+            .auto_build_feature_graph(
+                "test-community-expansion",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(false), // disable community filtering to keep all call graph results
+            )
+            .await
+            .unwrap();
+
+        let file_entities: Vec<&str> = result
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "file")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // routes.rs should be there (entry function's file)
+        assert!(
+            file_entities.contains(&"src/api/routes.rs"),
+            "should contain routes.rs, got: {:?}",
+            file_entities
+        );
+        // handlers.rs should be added by community expansion (same community)
+        assert!(
+            file_entities.contains(&"src/api/handlers.rs"),
+            "should contain handlers.rs via community expansion, got: {:?}",
+            file_entities
+        );
+        // client.rs should NOT be there (different community, no call graph link)
+        assert!(
+            !file_entities.contains(&"src/db/client.rs"),
+            "should NOT contain client.rs (different community), got: {:?}",
+            file_entities
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_build_fallback_without_embeddings() {
+        // When no embeddings or analytics are set, auto_build should work
+        // exactly as before — only call graph traversal, no expansion.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/main.rs", &["entry_fn"]),
+                ("src/helper.rs", &["helper_fn"]),
+                ("src/unrelated.rs", &["unrelated_fn"]),
+            ],
+        )
+        .await;
+
+        // entry_fn calls helper_fn
+        store
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None)
+            .await
+            .unwrap();
+
+        // No embeddings, no analytics — should work fine without expansion
+        let result = store
+            .auto_build_feature_graph(
+                "test-fallback",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let func_ids: Vec<&str> = result
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // Should contain only call-graph functions
+        assert!(
+            func_ids.contains(&"entry_fn"),
+            "should contain entry_fn, got: {:?}",
+            func_ids
+        );
+        assert!(
+            func_ids.contains(&"helper_fn"),
+            "should contain helper_fn (via call graph), got: {:?}",
+            func_ids
+        );
+        // unrelated_fn should NOT be included (no call graph, no embeddings)
+        assert!(
+            !func_ids.contains(&"unrelated_fn"),
+            "should NOT contain unrelated_fn (no call graph, no embeddings), got: {:?}",
+            func_ids
+        );
+
+        // All functions should have core_logic or entry_point role (no "support")
+        for entity in &result.entities {
+            if entity.entity_type == "function" {
+                let role = entity.role.as_deref().unwrap_or("none");
+                assert!(
+                    role == "entry_point" || role == "core_logic",
+                    "function {} should have entry_point or core_logic role, got: {}",
+                    entity.entity_id,
+                    role
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // Code embedding tests (File & Function vector search)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_set_and_search_file_embedding() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        let store = store.with_project(project).await;
+
+        // Register files in the project
+        let file1 = "/src/api/handlers.rs";
+        let file2 = "/src/api/routes.rs";
+        let file3 = "/src/chat/manager.rs";
+
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(
+                pid,
+                vec![file1.to_string(), file2.to_string(), file3.to_string()],
+            );
+        }
+
+        // Create embeddings — file1 and file2 are similar (API-related), file3 is different
+        let emb_api = vec![1.0_f32, 0.0, 0.0, 0.0]; // API direction
+        let emb_api_similar = vec![0.9, 0.1, 0.0, 0.0]; // similar to API
+        let emb_chat = vec![0.0, 0.0, 1.0, 0.0]; // chat direction
+
+        store
+            .set_file_embedding(file1, &emb_api, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file2, &emb_api_similar, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file3, &emb_chat, "test-model")
+            .await
+            .unwrap();
+
+        // Search with API-like query
+        let results = store
+            .vector_search_files(&emb_api, 10, Some(pid))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        // file1 should be top result (exact match)
+        assert_eq!(results[0].0, file1);
+        assert!(
+            results[0].1 > 0.99,
+            "exact match should have score near 1.0"
+        );
+        // file2 should be second (similar)
+        assert_eq!(results[1].0, file2);
+        assert!(
+            results[1].1 > 0.9,
+            "similar embedding should have high score"
+        );
+        // file3 should be last (orthogonal)
+        assert_eq!(results[2].0, file3);
+        assert!(
+            results[2].1.abs() < 0.01,
+            "orthogonal embedding should have score near 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_and_search_function_embedding() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        let store = store.with_project(project).await;
+
+        let file = "/src/api/handlers.rs";
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(pid, vec![file.to_string()]);
+        }
+
+        // Embed two functions
+        let emb_auth = vec![1.0_f32, 0.0, 0.0];
+        let emb_list = vec![0.0, 1.0, 0.0];
+
+        store
+            .set_function_embedding("authenticate", file, &emb_auth, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("list_items", file, &emb_list, "test-model")
+            .await
+            .unwrap();
+
+        // Search for auth-like function
+        let results = store
+            .vector_search_functions(&emb_auth, 10, Some(pid))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "authenticate");
+        assert_eq!(results[0].1, file);
+        assert!(results[0].2 > 0.99);
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_empty_returns_empty() {
+        let store = MockGraphStore::new();
+
+        // No embeddings stored — search should return empty
+        let query_emb = vec![1.0_f32, 0.0, 0.0];
+
+        let file_results = store
+            .vector_search_files(&query_emb, 10, None)
+            .await
+            .unwrap();
+        assert!(file_results.is_empty(), "expected empty file results");
+
+        let func_results = store
+            .vector_search_functions(&query_emb, 10, None)
+            .await
+            .unwrap();
+        assert!(func_results.is_empty(), "expected empty function results");
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_files_project_filter() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("Project A");
+        let project_b = test_project_named("Project B");
+        let pid_a = project_a.id;
+        let pid_b = project_b.id;
+        let store = store.with_project(project_a).await;
+        let store = store.with_project(project_b).await;
+
+        let file_a = "/project-a/src/main.rs";
+        let file_b = "/project-b/src/main.rs";
+
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(pid_a, vec![file_a.to_string()]);
+            pf.insert(pid_b, vec![file_b.to_string()]);
+        }
+
+        let emb = vec![1.0_f32, 0.0, 0.0];
+        store
+            .set_file_embedding(file_a, &emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file_b, &emb, "test")
+            .await
+            .unwrap();
+
+        // Search with project A filter — should only find file_a
+        let results = store
+            .vector_search_files(&emb, 10, Some(pid_a))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, file_a);
+
+        // Search without filter — should find both
+        let results = store.vector_search_files(&emb, 10, None).await.unwrap();
+        assert_eq!(results.len(), 2);
     }
 }
