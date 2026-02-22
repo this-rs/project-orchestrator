@@ -112,7 +112,7 @@ pub struct MockGraphStore {
     pub feature_graph_entities: RwLock<HashMap<Uuid, Vec<(String, String, Option<String>)>>>,
     /// Analytics scores stored for File nodes (keyed by path)
     pub file_analytics: RwLock<HashMap<String, crate::graph::models::FileAnalyticsUpdate>>,
-    /// Analytics scores stored for Function nodes (keyed by name)
+    /// Analytics scores stored for Function nodes (keyed by function id: "file_path:name:line_start")
     pub function_analytics: RwLock<HashMap<String, crate::graph::models::FunctionAnalyticsUpdate>>,
     /// Note embeddings (note_id -> (embedding, model_name))
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
@@ -1300,6 +1300,16 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn create_imports_symbol_relationship(
+        &self,
+        _import_id: &str,
+        _symbol_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<()> {
+        // Mock: no-op, IMPORTS_SYMBOL relationships are not tracked in mock store
+        Ok(())
+    }
+
     async fn create_call_relationship(
         &self,
         caller_id: &str,
@@ -1397,6 +1407,19 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(deleted)
+    }
+
+    async fn cleanup_sync_data(&self) -> Result<i64> {
+        let mut total = 0i64;
+        total += self.functions.write().await.drain().count() as i64;
+        total += self.structs_map.write().await.drain().count() as i64;
+        total += self.traits_map.write().await.drain().count() as i64;
+        total += self.enums_map.write().await.drain().count() as i64;
+        total += self.impls_map.write().await.drain().count() as i64;
+        total += self.imports.write().await.drain().count() as i64;
+        self.call_relationships.write().await.clear();
+        self.import_relationships.write().await.clear();
+        Ok(total)
     }
 
     async fn get_callees(&self, function_id: &str, _depth: u32) -> Result<Vec<FunctionNode>> {
@@ -5513,20 +5536,28 @@ impl GraphStore for MockGraphStore {
         let mut edges = Vec::new();
 
         for (caller_id, callees) in cr.iter() {
-            // Check caller belongs to project and get its name
+            // Check caller belongs to project and get its id
             let caller_fn = match functions.get(caller_id) {
                 Some(f) if project_paths.contains(&f.file_path) => f,
                 _ => continue,
             };
-            let caller_name = caller_fn.name.clone();
+            // Build function id matching Neo4j format: "file_path:name:line_start"
+            let caller_func_id = format!(
+                "{}:{}:{}",
+                caller_fn.file_path, caller_fn.name, caller_fn.line_start
+            );
             for callee_name in callees {
-                // Check callee belongs to project
-                let callee_in_project = functions
+                // Check callee belongs to project and get its id
+                if let Some(callee_fn) = functions
                     .values()
-                    .any(|f| f.name == *callee_name && project_paths.contains(&f.file_path));
-                if callee_in_project {
-                    // Return simple names (matching the real Cypher: f1.name, f2.name)
-                    edges.push((caller_name.clone(), callee_name.clone()));
+                    .find(|f| f.name == *callee_name && project_paths.contains(&f.file_path))
+                {
+                    let callee_func_id = format!(
+                        "{}:{}:{}",
+                        callee_fn.file_path, callee_fn.name, callee_fn.line_start
+                    );
+                    // Return function IDs (matching the real Cypher: f1.id, f2.id)
+                    edges.push((caller_func_id.clone(), callee_func_id));
                 }
             }
         }
@@ -5551,7 +5582,7 @@ impl GraphStore for MockGraphStore {
     ) -> anyhow::Result<()> {
         let mut fa = self.function_analytics.write().await;
         for update in updates {
-            fa.insert(update.name.clone(), update.clone());
+            fa.insert(update.id.clone(), update.clone());
         }
         Ok(())
     }
@@ -7103,7 +7134,7 @@ mod tests {
         store
             .batch_update_function_analytics(&[
                 FunctionAnalyticsUpdate {
-                    name: "entry_fn".to_string(),
+                    id: "entry_fn".to_string(),
                     pagerank: 0.5,
                     betweenness: 0.1,
                     community_id: 1,
@@ -7111,7 +7142,7 @@ mod tests {
                     component_id: 0,
                 },
                 FunctionAnalyticsUpdate {
-                    name: "direct_fn".to_string(),
+                    id: "direct_fn".to_string(),
                     pagerank: 0.3,
                     betweenness: 0.1,
                     community_id: 2,
@@ -7119,7 +7150,7 @@ mod tests {
                     component_id: 0,
                 },
                 FunctionAnalyticsUpdate {
-                    name: "transitive_fn".to_string(),
+                    id: "transitive_fn".to_string(),
                     pagerank: 0.1,
                     betweenness: 0.0,
                     community_id: 3,
@@ -7202,7 +7233,7 @@ mod tests {
         store
             .batch_update_function_analytics(&[
                 FunctionAnalyticsUpdate {
-                    name: "entry_fn".to_string(),
+                    id: "entry_fn".to_string(),
                     pagerank: 0.5,
                     betweenness: 0.1,
                     community_id: 1,
@@ -7210,7 +7241,7 @@ mod tests {
                     component_id: 0,
                 },
                 FunctionAnalyticsUpdate {
-                    name: "direct_fn".to_string(),
+                    id: "direct_fn".to_string(),
                     pagerank: 0.3,
                     betweenness: 0.1,
                     community_id: 2,
@@ -7218,7 +7249,7 @@ mod tests {
                     component_id: 0,
                 },
                 FunctionAnalyticsUpdate {
-                    name: "transitive_fn".to_string(),
+                    id: "transitive_fn".to_string(),
                     pagerank: 0.1,
                     betweenness: 0.0,
                     community_id: 3,
@@ -7267,7 +7298,7 @@ mod tests {
         store
             .batch_update_function_analytics(&[
                 FunctionAnalyticsUpdate {
-                    name: "entry_fn".to_string(),
+                    id: "entry_fn".to_string(),
                     pagerank: 0.5,
                     betweenness: 0.1,
                     community_id: 42,
@@ -7275,7 +7306,7 @@ mod tests {
                     component_id: 0,
                 },
                 FunctionAnalyticsUpdate {
-                    name: "direct_fn".to_string(),
+                    id: "direct_fn".to_string(),
                     pagerank: 0.3,
                     betweenness: 0.1,
                     community_id: 42,
@@ -7283,7 +7314,7 @@ mod tests {
                     component_id: 0,
                 },
                 FunctionAnalyticsUpdate {
-                    name: "transitive_fn".to_string(),
+                    id: "transitive_fn".to_string(),
                     pagerank: 0.1,
                     betweenness: 0.0,
                     community_id: 42,

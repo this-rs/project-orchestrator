@@ -303,9 +303,9 @@ mod tests {
         assert_eq!(graph.node_count(), 8);
         assert_eq!(graph.edge_count(), 10);
 
-        // Verify specific nodes exist
-        assert!(graph.get_node("main").is_some());
-        assert!(graph.get_node("respond").is_some());
+        // Verify specific nodes exist (function IDs are now "file_path:name:line_start")
+        assert!(graph.get_node("src/main.rs:main:0").is_some());
+        assert!(graph.get_node("src/main.rs:respond:70").is_some());
     }
 
     #[tokio::test]

@@ -180,6 +180,11 @@ impl Neo4jClient {
             "CREATE CONSTRAINT function_id IF NOT EXISTS FOR (f:Function) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT struct_id IF NOT EXISTS FOR (s:Struct) REQUIRE s.id IS UNIQUE",
             "CREATE CONSTRAINT trait_id IF NOT EXISTS FOR (t:Trait) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT enum_id IF NOT EXISTS FOR (e:Enum) REQUIRE e.id IS UNIQUE",
+            "CREATE CONSTRAINT impl_id IF NOT EXISTS FOR (i:Impl) REQUIRE i.id IS UNIQUE",
+            "CREATE CONSTRAINT import_id IF NOT EXISTS FOR (i:Import) REQUIRE i.id IS UNIQUE",
+            // Commit constraint
+            "CREATE CONSTRAINT commit_hash IF NOT EXISTS FOR (c:Commit) REQUIRE c.hash IS UNIQUE",
             // Plan constraints
             "CREATE CONSTRAINT plan_id IF NOT EXISTS FOR (p:Plan) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT task_id IF NOT EXISTS FOR (t:Task) REQUIRE t.id IS UNIQUE",
@@ -259,6 +264,62 @@ impl Neo4jClient {
                     "Vector index creation skipped (Neo4j may not support vector indexes): {}",
                     e
                 );
+            }
+        }
+
+        // Verify all constraints were created successfully
+        let expected_constraints = vec![
+            "project_id",
+            "project_slug",
+            "file_path",
+            "function_id",
+            "struct_id",
+            "trait_id",
+            "enum_id",
+            "impl_id",
+            "import_id",
+            "commit_hash",
+            "plan_id",
+            "task_id",
+            "step_id",
+            "decision_id",
+            "constraint_id",
+            "agent_id",
+            "note_id",
+            "workspace_id",
+            "workspace_slug",
+            "workspace_milestone_id",
+            "resource_id",
+            "component_id",
+        ];
+        match self
+            .graph
+            .execute(query(
+                "SHOW CONSTRAINTS YIELD name RETURN collect(name) AS names",
+            ))
+            .await
+        {
+            Ok(mut result) => {
+                if let Ok(Some(row)) = result.next().await {
+                    let names: Vec<String> = row.get("names").unwrap_or_default();
+                    for expected in &expected_constraints {
+                        if !names.iter().any(|n| n == *expected) {
+                            tracing::error!(
+                                "MISSING CONSTRAINT: {} — MERGE operations will do full label scans. \
+                                 Clean up duplicates with cleanup_sync_data and restart.",
+                                expected
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        "Schema verification: {}/{} constraints present",
+                        names.len(),
+                        expected_constraints.len()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Could not verify constraints: {}", e);
             }
         }
 
@@ -2425,35 +2486,58 @@ impl Neo4jClient {
         self.graph.run(q).await?;
 
         // Create IMPLEMENTS_FOR relationship to the struct/enum
+        // Strategy: try direct ID match first (O(1) via uniqueness constraint),
+        // then fall back to project-scoped name match with LIMIT 1
+        let struct_id = format!("{}:{}", impl_node.file_path, impl_node.for_type);
+        let enum_id = format!("{}:{}", impl_node.file_path, impl_node.for_type);
+
+        // Phase 1: Direct ID match (same-file struct or enum)
         let q = query(
             r#"
             MATCH (i:Impl {id: $impl_id})
-            MATCH (s:Struct {name: $type_name})
-            WHERE s.file_path = $file_path OR s.name = $type_name
-            MERGE (i)-[:IMPLEMENTS_FOR]->(s)
+            OPTIONAL MATCH (s:Struct {id: $struct_id})
+            OPTIONAL MATCH (e:Enum {id: $enum_id})
+            WITH i, COALESCE(s, e) AS target
+            WHERE target IS NOT NULL
+            MERGE (i)-[:IMPLEMENTS_FOR]->(target)
+            RETURN count(*) AS linked
             "#,
         )
         .param("impl_id", id.clone())
-        .param("type_name", impl_node.for_type.clone())
-        .param("file_path", impl_node.file_path.clone());
+        .param("struct_id", struct_id)
+        .param("enum_id", enum_id);
 
-        // Try struct first, ignore error if not found
-        let _ = self.graph.run(q).await;
+        let direct_linked = match self.graph.execute(q).await {
+            Ok(mut result) => {
+                if let Ok(Some(row)) = result.next().await {
+                    row.get::<i64>("linked").unwrap_or(0) > 0
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        };
 
-        // Try enum too
-        let q = query(
-            r#"
-            MATCH (i:Impl {id: $impl_id})
-            MATCH (e:Enum {name: $type_name})
-            WHERE e.file_path = $file_path OR e.name = $type_name
-            MERGE (i)-[:IMPLEMENTS_FOR]->(e)
-            "#,
-        )
-        .param("impl_id", id.clone())
-        .param("type_name", impl_node.for_type.clone())
-        .param("file_path", impl_node.file_path.clone());
+        // Phase 2: Project-scoped fallback (struct/enum in a different file)
+        if !direct_linked {
+            let q = query(
+                r#"
+                MATCH (i:Impl {id: $impl_id})
+                MATCH (file:File {path: $file_path})<-[:CONTAINS]-(p:Project)
+                OPTIONAL MATCH (s:Struct {name: $type_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                OPTIONAL MATCH (e:Enum {name: $type_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                WITH i, COALESCE(s, e) AS target
+                WHERE target IS NOT NULL
+                WITH i, target LIMIT 1
+                MERGE (i)-[:IMPLEMENTS_FOR]->(target)
+                "#,
+            )
+            .param("impl_id", id.clone())
+            .param("type_name", impl_node.for_type.clone())
+            .param("file_path", impl_node.file_path.clone());
 
-        let _ = self.graph.run(q).await;
+            let _ = self.graph.run(q).await;
+        }
 
         // Create IMPLEMENTS_TRAIT relationship if this is a trait impl
         if let Some(ref trait_name) = impl_node.trait_name {
@@ -2694,19 +2778,55 @@ impl Neo4jClient {
     // ========================================================================
 
     /// Create a CALLS relationship between functions, scoped to the same project.
-    /// When project_id is provided, the callee is matched only within the same project
-    /// to prevent cross-project CALLS pollution.
+    /// Uses a 2-phase strategy: prefer same-file callee, then project-scoped with LIMIT 1
+    /// to avoid Cartesian products on common names like "new", "default", "from".
     pub async fn create_call_relationship(
         &self,
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
     ) -> Result<()> {
+        // Phase 1: Try same-file match (most common case, O(1) via index)
+        // Extract file_path from caller_id (format: "file_path:func_name:line_start")
+        let caller_file_path = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
+
+        let same_file_q = query(
+            r#"
+            MATCH (caller:Function {id: $caller_id})
+            MATCH (callee:Function {name: $callee_name})
+            WHERE callee.file_path = $caller_file_path AND callee.id <> $caller_id
+            WITH caller, callee LIMIT 1
+            MERGE (caller)-[:CALLS]->(callee)
+            RETURN count(*) AS linked
+            "#,
+        )
+        .param("caller_id", caller_id)
+        .param("callee_name", callee_name)
+        .param("caller_file_path", caller_file_path);
+
+        let same_file_linked = match self.graph.execute(same_file_q).await {
+            Ok(mut result) => {
+                if let Ok(Some(row)) = result.next().await {
+                    row.get::<i64>("linked").unwrap_or(0) > 0
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        };
+
+        if same_file_linked {
+            return Ok(());
+        }
+
+        // Phase 2: Project-scoped fallback with LIMIT 1
         let q = match project_id {
             Some(pid) => query(
                 r#"
                 MATCH (caller:Function {id: $caller_id})
                 MATCH (callee:Function {name: $callee_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                WHERE callee.id <> $caller_id
+                WITH caller, callee LIMIT 1
                 MERGE (caller)-[:CALLS]->(callee)
                 "#,
             )
@@ -2717,6 +2837,8 @@ impl Neo4jClient {
                 r#"
                 MATCH (caller:Function {id: $caller_id})
                 MATCH (callee:Function {name: $callee_name})
+                WHERE callee.id <> $caller_id
+                WITH caller, callee LIMIT 1
                 MERGE (caller)-[:CALLS]->(callee)
                 "#,
             )
@@ -2729,16 +2851,188 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Create an IMPORTS_SYMBOL relationship from an Import node to a matching symbol
+    /// (Struct, Enum, Trait, or Function) within the same project.
+    pub async fn create_imports_symbol_relationship(
+        &self,
+        import_id: &str,
+        symbol_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (i:Import {id: $import_id})
+                MATCH (i)<-[:HAS_IMPORT]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                OPTIONAL MATCH (s:Struct {name: $symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                OPTIONAL MATCH (e:Enum {name: $symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                OPTIONAL MATCH (t:Trait {name: $symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                WITH i, COALESCE(s, e, t) AS target
+                WHERE target IS NOT NULL
+                WITH i, target LIMIT 1
+                MERGE (i)-[:IMPORTS_SYMBOL]->(target)
+                "#,
+            )
+            .param("import_id", import_id)
+            .param("symbol_name", symbol_name)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (i:Import {id: $import_id})
+                OPTIONAL MATCH (s:Struct {name: $symbol_name})
+                OPTIONAL MATCH (e:Enum {name: $symbol_name})
+                OPTIONAL MATCH (t:Trait {name: $symbol_name})
+                WITH i, COALESCE(s, e, t) AS target
+                WHERE target IS NOT NULL
+                WITH i, target LIMIT 1
+                MERGE (i)-[:IMPORTS_SYMBOL]->(target)
+                "#,
+            )
+            .param("import_id", import_id)
+            .param("symbol_name", symbol_name),
+        };
+
+        let _ = self.graph.run(q).await;
+        Ok(())
+    }
+
+    /// Clean up ALL sync-generated data from Neo4j.
+    /// This deletes File, Function, Struct, Trait, Enum, Impl, Import nodes
+    /// and their relationships (CALLS, IMPORTS, IMPLEMENTS_FOR, IMPLEMENTS_TRAIT, CONTAINS, HAS_IMPORT).
+    /// Project management data (Project, Plan, Task, Note, etc.) is preserved.
+    /// FeatureGraph nodes are also deleted since they depend on code entities.
+    pub async fn cleanup_sync_data(&self) -> Result<i64> {
+        let mut total_deleted: i64 = 0;
+        let batch_size = 10_000;
+
+        // Delete code relationships first (batched to avoid massive transactions)
+        // CALLS alone can be 300k+ rels — unbatched DELETE causes OOM/timeout
+        let rel_types = vec![
+            "CALLS",
+            "IMPORTS",
+            "IMPLEMENTS_FOR",
+            "IMPLEMENTS_TRAIT",
+            "HAS_IMPORT",
+            "INCLUDES_ENTITY",
+        ];
+
+        for rel_type in &rel_types {
+            let mut rel_deleted: i64 = 0;
+            loop {
+                let cypher = format!(
+                    "MATCH ()-[r:{}]->() WITH r LIMIT {} DELETE r RETURN count(r) AS cnt",
+                    rel_type, batch_size
+                );
+                match self.graph.execute(query(&cypher)).await {
+                    Ok(mut result) => {
+                        if let Ok(Some(row)) = result.next().await {
+                            let cnt: i64 = row.get("cnt").unwrap_or(0);
+                            if cnt == 0 {
+                                break;
+                            }
+                            rel_deleted += cnt;
+                            total_deleted += cnt;
+                            tracing::info!(
+                                "cleanup_sync_data: deleted batch of {} {} rels (total: {})",
+                                cnt,
+                                rel_type,
+                                rel_deleted
+                            );
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "cleanup_sync_data rel query failed for {}: {}",
+                            rel_type,
+                            e
+                        );
+                        break;
+                    }
+                }
+            }
+            if rel_deleted > 0 {
+                tracing::info!(
+                    "cleanup_sync_data: finished {} — deleted {} total",
+                    rel_type,
+                    rel_deleted
+                );
+            }
+        }
+
+        // Delete code entity nodes (batched DETACH DELETE removes remaining CONTAINS edges)
+        let node_labels = vec![
+            "Function",
+            "Struct",
+            "Trait",
+            "Enum",
+            "Impl",
+            "Import",
+            "File",
+            "FeatureGraph",
+        ];
+
+        for label in &node_labels {
+            let mut node_deleted: i64 = 0;
+            loop {
+                let cypher = format!(
+                    "MATCH (n:{}) WITH n LIMIT {} DETACH DELETE n RETURN count(n) AS cnt",
+                    label, batch_size
+                );
+                match self.graph.execute(query(&cypher)).await {
+                    Ok(mut result) => {
+                        if let Ok(Some(row)) = result.next().await {
+                            let cnt: i64 = row.get("cnt").unwrap_or(0);
+                            if cnt == 0 {
+                                break;
+                            }
+                            node_deleted += cnt;
+                            total_deleted += cnt;
+                            tracing::info!(
+                                "cleanup_sync_data: deleted batch of {} {} nodes (total: {})",
+                                cnt,
+                                label,
+                                node_deleted
+                            );
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("cleanup_sync_data node query failed for {}: {}", label, e);
+                        break;
+                    }
+                }
+            }
+            if node_deleted > 0 {
+                tracing::info!(
+                    "cleanup_sync_data: finished {} — deleted {} total",
+                    label,
+                    node_deleted
+                );
+            }
+        }
+
+        tracing::info!(
+            "cleanup_sync_data: deleted {} entities/relationships total",
+            total_deleted
+        );
+        Ok(total_deleted)
+    }
+
     /// Delete all CALLS relationships where caller and callee belong to different projects.
     ///
     /// Returns the number of deleted relationships.
     pub async fn cleanup_cross_project_calls(&self) -> Result<i64> {
+        // Optimized: instead of scanning ALL CALLS relationships globally (O(total_calls)),
+        // anchor on each project and find CALLS that cross project boundaries.
+        // This leverages the Project->File->Function index chain.
         let q = query(
             r#"
-            MATCH (caller:Function)-[r:CALLS]->(callee:Function)
+            MATCH (p:Project)-[:CONTAINS]->(f:File)-[:CONTAINS]->(caller:Function)-[r:CALLS]->(callee:Function)
             WHERE NOT EXISTS {
-                MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project),
-                      (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+                MATCH (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
             }
             DELETE r
             RETURN count(r) AS deleted
@@ -10021,7 +10315,7 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(:File)-[:CONTAINS]->(f1:Function)-[:CALLS]->(f2:Function)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
-            RETURN f1.name AS source, f2.name AS target
+            RETURN f1.id AS source, f2.id AS target
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -10098,8 +10392,8 @@ impl Neo4jClient {
             .iter()
             .map(|u| {
                 format!(
-                    "{{name: '{}', pagerank: {}, betweenness: {}, community_id: {}, clustering_coefficient: {}, component_id: {}}}",
-                    u.name.replace('\'', "\\'"),
+                    "{{id: '{}', pagerank: {}, betweenness: {}, community_id: {}, clustering_coefficient: {}, component_id: {}}}",
+                    u.id.replace('\'', "\\'"),
                     u.pagerank,
                     u.betweenness,
                     u.community_id,
@@ -10112,7 +10406,7 @@ impl Neo4jClient {
         let cypher = format!(
             r#"
             UNWIND [{}] AS u
-            MATCH (f:Function {{name: u.name}})
+            MATCH (f:Function {{id: u.id}})
             SET f.pagerank = u.pagerank,
                 f.betweenness = u.betweenness,
                 f.community_id = u.community_id,

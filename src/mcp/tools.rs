@@ -89,7 +89,8 @@ fn project_tools() -> Vec<ToolDefinition> {
             input_schema: InputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
-                    "slug": {"type": "string", "description": "Project slug"}
+                    "slug": {"type": "string", "description": "Project slug"},
+                    "force": {"type": "boolean", "description": "Force re-sync all files, ignoring hash check (default: false)"}
                 })),
                 required: Some(vec!["slug".to_string()]),
             },
@@ -1221,6 +1222,15 @@ fn meilisearch_tools() -> Vec<ToolDefinition> {
                 required: None,
             },
         },
+        ToolDefinition {
+            name: "cleanup_sync_data".to_string(),
+            description: "Delete ALL sync-generated code data (File, Function, Struct, Trait, Enum, Impl, Import nodes and relationships). Preserves project management data (Project, Plan, Task, Note, etc.). Use before re-sync to fix corrupted data.".to_string(),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({})),
+                required: None,
+            },
+        },
     ]
 }
 
@@ -2269,7 +2279,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 159, "Expected 159 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 160, "Expected 160 tools, got {}", tools.len());
     }
 
     #[test]

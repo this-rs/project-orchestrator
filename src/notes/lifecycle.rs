@@ -52,6 +52,7 @@ pub struct FunctionInfo {
     pub is_async: bool,
     pub is_unsafe: bool,
     pub body: String,
+    pub line_start: u32,
 }
 
 /// Information about a parsed file for verification
@@ -151,6 +152,7 @@ impl NoteLifecycleManager {
             is_async: func.is_async,
             is_unsafe: func.is_unsafe,
             body,
+            line_start: func.line_start,
         }
     }
 
@@ -744,6 +746,7 @@ mod tests {
                 is_async: false,
                 is_unsafe: false,
                 body: "let result = x.to_string(); result".to_string(),
+                line_start: 1,
             }],
             structs: vec![StructInfo {
                 name: "TestStruct".to_string(),

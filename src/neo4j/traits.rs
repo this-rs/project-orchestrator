@@ -357,6 +357,14 @@ pub trait GraphStore: Send + Sync {
     /// Store an import node (for tracking even unresolved imports)
     async fn upsert_import(&self, import: &ImportNode) -> Result<()>;
 
+    /// Create an IMPORTS_SYMBOL relationship from an Import to a matching Struct/Enum/Trait
+    async fn create_imports_symbol_relationship(
+        &self,
+        import_id: &str,
+        symbol_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
+
     /// Create a CALLS relationship between functions, scoped to the same project.
     /// When project_id is provided, the callee is matched only within the same project
     /// to prevent cross-project CALLS pollution.
@@ -370,6 +378,10 @@ pub trait GraphStore: Send + Sync {
     /// Delete all CALLS relationships where caller and callee belong to different projects.
     /// Returns the number of deleted relationships.
     async fn cleanup_cross_project_calls(&self) -> Result<i64>;
+
+    /// Clean up ALL sync-generated data (File, Function, Struct, Trait, Enum, Impl, Import, FeatureGraph).
+    /// Returns the total number of deleted entities/relationships.
+    async fn cleanup_sync_data(&self) -> Result<i64>;
 
     /// Get all functions called by a function
     async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>>;

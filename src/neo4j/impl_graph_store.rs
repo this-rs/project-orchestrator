@@ -464,6 +464,16 @@ impl GraphStore for Neo4jClient {
         self.upsert_import(import).await
     }
 
+    async fn create_imports_symbol_relationship(
+        &self,
+        import_id: &str,
+        symbol_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.create_imports_symbol_relationship(import_id, symbol_name, project_id)
+            .await
+    }
+
     async fn create_call_relationship(
         &self,
         caller_id: &str,
@@ -476,6 +486,10 @@ impl GraphStore for Neo4jClient {
 
     async fn cleanup_cross_project_calls(&self) -> anyhow::Result<i64> {
         self.cleanup_cross_project_calls().await
+    }
+
+    async fn cleanup_sync_data(&self) -> anyhow::Result<i64> {
+        self.cleanup_sync_data().await
     }
 
     async fn get_callees(
