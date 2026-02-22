@@ -72,6 +72,20 @@ pub struct SetupConfig {
     /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions"
     #[serde(default = "default_permission_mode")]
     pub chat_permission_mode: String,
+
+    // Desktop-only settings (PATH, CLI, auto-update)
+    /// PATH to inject into the Claude Code subprocess.
+    #[serde(default)]
+    pub chat_process_path: String,
+    /// Explicit path to the Claude CLI binary (optional, auto-detected by default).
+    #[serde(default)]
+    pub chat_claude_cli_path: String,
+    /// Enable automatic CLI version updates on startup (default: false).
+    #[serde(default)]
+    pub chat_auto_update_cli: bool,
+    /// Enable automatic Tauri application updates on startup (default: true).
+    #[serde(default = "default_true")]
+    pub chat_auto_update_app: bool,
 }
 
 fn default_max_turns() -> u32 {
@@ -161,6 +175,14 @@ struct ChatSection {
     max_turns: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     permissions: Option<ChatPermissionsSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_cli_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_update_cli: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_update_app: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -629,6 +651,18 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             } else {
                 None
             },
+            process_path: if config.chat_process_path.trim().is_empty() {
+                None
+            } else {
+                Some(config.chat_process_path.trim().to_string())
+            },
+            claude_cli_path: if config.chat_claude_cli_path.trim().is_empty() {
+                None
+            } else {
+                Some(config.chat_claude_cli_path.trim().to_string())
+            },
+            auto_update_cli: if config.chat_auto_update_cli { Some(true) } else { None },
+            auto_update_app: if !config.chat_auto_update_app { Some(false) } else { None },
         }),
         auth,
     };
@@ -883,6 +917,10 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         chat_permission_mode: yaml.chat.permissions
             .map(|p| p.mode)
             .unwrap_or_else(|| "default".into()),
+        chat_process_path: yaml.chat.process_path.unwrap_or_default(),
+        chat_claude_cli_path: yaml.chat.claude_cli_path.unwrap_or_default(),
+        chat_auto_update_cli: yaml.chat.auto_update_cli.unwrap_or(false),
+        chat_auto_update_app: yaml.chat.auto_update_app.unwrap_or(true),
         has_oidc_secret,
         has_neo4j_password,
         has_meilisearch_key,
@@ -929,6 +967,11 @@ pub struct ReadConfigResponse {
     pub chat_max_sessions: u32,
     pub chat_max_turns: u32,
     pub chat_permission_mode: String,
+    // Desktop-only settings
+    pub chat_process_path: String,
+    pub chat_claude_cli_path: String,
+    pub chat_auto_update_cli: bool,
+    pub chat_auto_update_app: bool,
     // Indicators for existing secrets (reconfigure mode)
     pub has_oidc_secret: bool,
     pub has_neo4j_password: bool,
