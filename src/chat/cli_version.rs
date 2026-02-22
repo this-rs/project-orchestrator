@@ -5,10 +5,50 @@
 
 use nexus_claude::{
     check_latest_npm_version, download_cli, find_claude_cli, get_cached_cli_path, get_cli_version,
+    SemVer,
 };
 use serde::Serialize;
 use std::path::Path;
 use tracing::{debug, info, warn};
+
+/// Run `<cli_path> --version` and parse the raw output ourselves.
+///
+/// The CLI outputs strings like "2.1.50 (Claude Code)\n". Nexus's `SemVer::parse`
+/// cannot handle the trailing `(Claude Code)` suffix — it parses "50 (Claude Code)"
+/// as patch and `u32::parse` fails, falling back to 0. So we strip the suffix first.
+///
+/// Falls back to Nexus's `get_cli_version()` if our parsing fails.
+async fn get_cli_version_robust(cli_path: &Path) -> Option<SemVer> {
+    // Try running the binary directly
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(cli_path)
+            .arg("--version")
+            .stderr(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let raw = raw.trim();
+    debug!(raw_version = %raw, "Raw CLI --version output");
+
+    // Extract just the version part: take everything before the first space.
+    // "2.1.50 (Claude Code)" → "2.1.50"
+    // "2.1.50" → "2.1.50"
+    let version_str = raw.split_whitespace().next().unwrap_or(raw);
+
+    // Try parsing with Nexus SemVer (now that we stripped the suffix)
+    if let Some(v) = SemVer::parse(version_str) {
+        return Some(v);
+    }
+
+    // Last resort: let Nexus try its own parsing on the full output
+    debug!("Robust parsing failed, falling back to nexus get_cli_version");
+    get_cli_version(cli_path).await
+}
 
 /// Full CLI version status — returned by `check_cli_status()`.
 #[derive(Debug, Clone, Serialize)]
@@ -66,8 +106,8 @@ pub async fn check_cli_status() -> CliVersionStatus {
     }
     let cli_path_ref = cli_path.as_ref().unwrap();
 
-    // 2. Get installed version
-    let installed_version = get_cli_version(cli_path_ref).await;
+    // 2. Get installed version (using our robust parser that handles "X.Y.Z (Claude Code)" suffix)
+    let installed_version = get_cli_version_robust(cli_path_ref).await;
     let installed_str = installed_version.as_ref().map(|v| v.to_string());
     debug!(
         version = ?installed_str,
@@ -118,8 +158,8 @@ pub async fn install_or_upgrade_cli(target_version: Option<&str>) -> CliInstallR
 
     match download_cli(target_version, None).await {
         Ok(installed_path) => {
-            // Verify the installed version
-            let version = get_cli_version(&installed_path).await;
+            // Verify the installed version (robust parsing for "(Claude Code)" suffix)
+            let version = get_cli_version_robust(&installed_path).await;
             let version_str = version.as_ref().map(|v| v.to_string());
             let path_str = installed_path.to_string_lossy().to_string();
 
@@ -297,6 +337,27 @@ mod tests {
         assert!(json.contains("\"installed\":true"));
         assert!(json.contains("\"installed_version\":\"2.5.1\""));
         assert!(json.contains("\"update_available\":true"));
+    }
+
+    #[test]
+    fn test_semver_parse_with_claude_code_suffix() {
+        // The real CLI outputs "2.1.50 (Claude Code)\n"
+        // SemVer::parse must work after we strip the suffix via split_whitespace
+        let raw = "2.1.50 (Claude Code)";
+        let version_str = raw.split_whitespace().next().unwrap();
+        let v = SemVer::parse(version_str).expect("Should parse '2.1.50'");
+        assert_eq!(v.to_string(), "2.1.50", "Patch must be 50, not 0");
+
+        // Also test plain version without suffix (npm-style)
+        let v2 = SemVer::parse("2.6.0").expect("Should parse '2.6.0'");
+        assert_eq!(v2.to_string(), "2.6.0");
+
+        // Test that Nexus SemVer::parse alone FAILS with the suffix (the bug we're fixing)
+        let buggy = SemVer::parse(raw);
+        assert!(
+            buggy.is_none() || buggy.unwrap().to_string() == "2.1.0",
+            "Nexus SemVer::parse on raw '2.1.50 (Claude Code)' should either fail or produce 2.1.0"
+        );
     }
 
     #[test]
