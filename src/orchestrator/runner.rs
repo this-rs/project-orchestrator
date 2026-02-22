@@ -132,6 +132,9 @@ pub struct Orchestrator {
     auto_reinforcement: AutoReinforcementConfig,
     event_bus: Option<Arc<HybridEmitter>>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
+    /// Embedding provider for code embeddings (File/Function nodes).
+    /// Shared with NoteManager and SpreadingActivationEngine.
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 /// Try to create an embedding provider from environment variables.
@@ -212,7 +215,7 @@ impl Orchestrator {
         }
         let note_manager = Arc::new(note_manager);
 
-        let activation_engine = embedding_provider.map(|provider| {
+        let activation_engine = embedding_provider.clone().map(|provider| {
             Arc::new(SpreadingActivationEngine::new(
                 state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
                 provider,
@@ -258,6 +261,7 @@ impl Orchestrator {
             auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: None,
             event_emitter: None,
+            embedding_provider: embedding_provider.clone(),
         })
     }
 
@@ -285,7 +289,7 @@ impl Orchestrator {
         }
         let note_manager = Arc::new(note_manager);
 
-        let activation_engine = embedding_provider.map(|provider| {
+        let activation_engine = embedding_provider.clone().map(|provider| {
             Arc::new(SpreadingActivationEngine::new(
                 state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
                 provider,
@@ -331,6 +335,7 @@ impl Orchestrator {
             auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
+            embedding_provider: embedding_provider.clone(),
         })
     }
 
@@ -360,7 +365,7 @@ impl Orchestrator {
         }
         let note_manager = Arc::new(note_manager);
 
-        let activation_engine = embedding_provider.map(|provider| {
+        let activation_engine = embedding_provider.clone().map(|provider| {
             Arc::new(SpreadingActivationEngine::new(
                 state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
                 provider,
@@ -406,6 +411,7 @@ impl Orchestrator {
             auto_reinforcement: AutoReinforcementConfig::default(),
             event_bus: None,
             event_emitter: Some(emitter),
+            embedding_provider: embedding_provider.clone(),
         })
     }
 
@@ -1603,6 +1609,155 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 .create_call_relationship(&call.caller_id, &call.callee_name, project_id)
                 .await?;
         }
+
+        // Embed file and functions (best-effort, non-blocking)
+        if self.embedding_provider.is_some() {
+            let provider = self.embedding_provider.clone().unwrap();
+            let neo4j = self.state.neo4j.clone();
+            let parsed_clone = parsed.clone();
+            let file_path = normalize_path(&parsed.path);
+            tokio::spawn(async move {
+                if let Err(e) = Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path).await {
+                    tracing::warn!(file = %file_path, error = %e, "Failed to embed file (best-effort)");
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Build a summary text for embedding a file.
+    ///
+    /// Format: "path (language) — symbols: fn1, fn2, struct1, trait1..."
+    /// This captures the semantic identity of the file without its full content.
+    fn build_file_embedding_text(parsed: &ParsedFile) -> String {
+        let mut symbols = Vec::new();
+
+        for func in &parsed.functions {
+            symbols.push(format!("fn {}", func.name));
+        }
+        for s in &parsed.structs {
+            symbols.push(format!("struct {}", s.name));
+        }
+        for t in &parsed.traits {
+            symbols.push(format!("trait {}", t.name));
+        }
+        for e in &parsed.enums {
+            symbols.push(format!("enum {}", e.name));
+        }
+
+        let symbols_str = if symbols.is_empty() {
+            String::new()
+        } else {
+            format!(" — symbols: {}", symbols.join(", "))
+        };
+
+        format!("{} ({}){}", parsed.path, parsed.language, symbols_str)
+    }
+
+    /// Build a summary text for embedding a function.
+    ///
+    /// Format: "name(param1: Type, param2: Type) -> ReturnType — docstring"
+    fn build_function_embedding_text(func: &crate::neo4j::models::FunctionNode) -> String {
+        let params = func
+            .params
+            .iter()
+            .map(|p| {
+                if let Some(ref ty) = p.type_name {
+                    format!("{}: {}", p.name, ty)
+                } else {
+                    p.name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let ret = func
+            .return_type
+            .as_ref()
+            .map(|r| format!(" -> {}", r))
+            .unwrap_or_default();
+
+        let doc = func
+            .docstring
+            .as_ref()
+            .map(|d| format!(" — {}", d))
+            .unwrap_or_default();
+
+        format!("{}({}){}{}", func.name, params, ret, doc)
+    }
+
+    /// Embed a parsed file and its public functions into Neo4j.
+    ///
+    /// Best-effort: logs warnings on failure but never returns errors that block sync.
+    /// Uses embed_batch for efficiency (one API call for file + all functions).
+    async fn embed_parsed_file(
+        provider: &Arc<dyn EmbeddingProvider>,
+        neo4j: &Arc<dyn crate::neo4j::GraphStore>,
+        parsed: &ParsedFile,
+        file_path: &str,
+    ) -> Result<()> {
+        // Build texts to embed
+        let file_text = Self::build_file_embedding_text(parsed);
+
+        // Collect functions that are worth embedding (public or have docstrings)
+        let embeddable_functions: Vec<&crate::neo4j::models::FunctionNode> = parsed
+            .functions
+            .iter()
+            .filter(|f| {
+                f.docstring.is_some()
+                    || matches!(
+                        f.visibility,
+                        crate::neo4j::models::Visibility::Public
+                    )
+            })
+            .collect();
+
+        let func_texts: Vec<String> = embeddable_functions
+            .iter()
+            .map(|f| Self::build_function_embedding_text(f))
+            .collect();
+
+        // Build batch: file text first, then function texts
+        let mut all_texts = vec![file_text];
+        all_texts.extend(func_texts.clone());
+
+        // Single batch embed call
+        let embeddings = provider.embed_batch(&all_texts).await?;
+
+        if embeddings.is_empty() {
+            return Ok(());
+        }
+
+        let model = provider.model_name().to_string();
+
+        // Store file embedding (first result)
+        neo4j
+            .set_file_embedding(file_path, &embeddings[0], &model)
+            .await?;
+
+        // Store function embeddings (remaining results)
+        for (i, func) in embeddable_functions.iter().enumerate() {
+            if let Some(emb) = embeddings.get(i + 1) {
+                if let Err(e) = neo4j
+                    .set_function_embedding(&func.name, file_path, emb, &model)
+                    .await
+                {
+                    tracing::warn!(
+                        function = %func.name,
+                        file = %file_path,
+                        error = %e,
+                        "Failed to store function embedding"
+                    );
+                }
+            }
+        }
+
+        tracing::debug!(
+            file = %file_path,
+            functions = embeddable_functions.len(),
+            "Embedded file and functions"
+        );
 
         Ok(())
     }
@@ -4144,5 +4299,111 @@ mod tests {
         let stale = orch.get_stale_projects().await.unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].project_id, p1.id);
+    }
+
+    // ── code embedding tests ────────────────────────────────────────
+
+    #[test]
+    fn test_build_file_embedding_text() {
+        use crate::neo4j::models::{FunctionNode, StructNode, Visibility};
+
+        let parsed = ParsedFile {
+            path: "src/api/handlers.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            functions: vec![
+                FunctionNode {
+                    name: "create_plan".to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: Some("Result<Plan>".to_string()),
+                    generics: vec![],
+                    is_async: true,
+                    is_unsafe: false,
+                    complexity: 3,
+                    file_path: "src/api/handlers.rs".to_string(),
+                    line_start: 10,
+                    line_end: 50,
+                    docstring: None,
+                },
+            ],
+            structs: vec![
+                StructNode {
+                    name: "PlanRequest".to_string(),
+                    file_path: "src/api/handlers.rs".to_string(),
+                    visibility: Visibility::Public,
+                    generics: vec![],
+                    line_start: 1,
+                    line_end: 5,
+                    docstring: None,
+                },
+            ],
+            traits: vec![],
+            enums: vec![],
+            imports: vec![],
+            impl_blocks: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+
+        let text = Orchestrator::build_file_embedding_text(&parsed);
+        assert!(text.contains("src/api/handlers.rs"));
+        assert!(text.contains("(rust)"));
+        assert!(text.contains("fn create_plan"));
+        assert!(text.contains("struct PlanRequest"));
+    }
+
+    #[test]
+    fn test_build_function_embedding_text() {
+        use crate::neo4j::models::{FunctionNode, Parameter, Visibility};
+
+        let func = FunctionNode {
+            name: "plan_implementation".to_string(),
+            visibility: Visibility::Public,
+            params: vec![
+                Parameter {
+                    name: "request".to_string(),
+                    type_name: Some("PlanRequest".to_string()),
+                },
+            ],
+            return_type: Some("Result<ImplementationPlan>".to_string()),
+            generics: vec![],
+            is_async: true,
+            is_unsafe: false,
+            complexity: 10,
+            file_path: "src/orchestrator/planner.rs".to_string(),
+            line_start: 100,
+            line_end: 200,
+            docstring: Some("Generate implementation phases from code analysis".to_string()),
+        };
+
+        let text = Orchestrator::build_function_embedding_text(&func);
+        assert!(text.contains("plan_implementation"));
+        assert!(text.contains("request: PlanRequest"));
+        assert!(text.contains("-> Result<ImplementationPlan>"));
+        assert!(text.contains("Generate implementation phases"));
+    }
+
+    #[test]
+    fn test_build_function_embedding_text_minimal() {
+        use crate::neo4j::models::{FunctionNode, Visibility};
+
+        let func = FunctionNode {
+            name: "main".to_string(),
+            visibility: Visibility::Private,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 3,
+            docstring: None,
+        };
+
+        let text = Orchestrator::build_function_embedding_text(&func);
+        assert_eq!(text, "main()");
     }
 }
