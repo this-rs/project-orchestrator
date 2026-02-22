@@ -2965,11 +2965,22 @@ impl Neo4jClient {
             .iter()
             .map(|func| {
                 let mut m = std::collections::HashMap::new();
-                m.insert("id".into(), format!("{}:{}:{}", func.file_path, func.name, func.line_start).into());
+                m.insert(
+                    "id".into(),
+                    format!("{}:{}:{}", func.file_path, func.name, func.line_start).into(),
+                );
                 m.insert("name".into(), func.name.clone().into());
                 m.insert("visibility".into(), format!("{:?}", func.visibility).into());
-                m.insert("params".into(), serde_json::to_string(&func.params).unwrap_or_default().into());
-                m.insert("return_type".into(), func.return_type.clone().unwrap_or_default().into());
+                m.insert(
+                    "params".into(),
+                    serde_json::to_string(&func.params)
+                        .unwrap_or_default()
+                        .into(),
+                );
+                m.insert(
+                    "return_type".into(),
+                    func.return_type.clone().unwrap_or_default().into(),
+                );
                 m.insert("generics".into(), func.generics.clone().into());
                 m.insert("is_async".into(), func.is_async.into());
                 m.insert("is_unsafe".into(), func.is_unsafe.into());
@@ -2977,7 +2988,10 @@ impl Neo4jClient {
                 m.insert("file_path".into(), func.file_path.clone().into());
                 m.insert("line_start".into(), (func.line_start as i64).into());
                 m.insert("line_end".into(), (func.line_end as i64).into());
-                m.insert("docstring".into(), func.docstring.clone().unwrap_or_default().into());
+                m.insert(
+                    "docstring".into(),
+                    func.docstring.clone().unwrap_or_default().into(),
+                );
                 m
             })
             .collect();
@@ -3026,7 +3040,10 @@ impl Neo4jClient {
                 m.insert("file_path".into(), s.file_path.clone().into());
                 m.insert("line_start".into(), (s.line_start as i64).into());
                 m.insert("line_end".into(), (s.line_end as i64).into());
-                m.insert("docstring".into(), s.docstring.clone().unwrap_or_default().into());
+                m.insert(
+                    "docstring".into(),
+                    s.docstring.clone().unwrap_or_default().into(),
+                );
                 m
             })
             .collect();
@@ -3070,7 +3087,10 @@ impl Neo4jClient {
                 m.insert("file_path".into(), t.file_path.clone().into());
                 m.insert("line_start".into(), (t.line_start as i64).into());
                 m.insert("line_end".into(), (t.line_end as i64).into());
-                m.insert("docstring".into(), t.docstring.clone().unwrap_or_default().into());
+                m.insert(
+                    "docstring".into(),
+                    t.docstring.clone().unwrap_or_default().into(),
+                );
                 m
             })
             .collect();
@@ -3114,7 +3134,10 @@ impl Neo4jClient {
                 m.insert("file_path".into(), e.file_path.clone().into());
                 m.insert("line_start".into(), (e.line_start as i64).into());
                 m.insert("line_end".into(), (e.line_end as i64).into());
-                m.insert("docstring".into(), e.docstring.clone().unwrap_or_default().into());
+                m.insert(
+                    "docstring".into(),
+                    e.docstring.clone().unwrap_or_default().into(),
+                );
                 m
             })
             .collect();
@@ -3163,14 +3186,23 @@ impl Neo4jClient {
                 let mut m = std::collections::HashMap::new();
                 m.insert("id".into(), id.into());
                 m.insert("for_type".into(), imp.for_type.clone().into());
-                m.insert("trait_name".into(), imp.trait_name.clone().unwrap_or_default().into());
+                m.insert(
+                    "trait_name".into(),
+                    imp.trait_name.clone().unwrap_or_default().into(),
+                );
                 m.insert("generics".into(), imp.generics.clone().into());
-                m.insert("where_clause".into(), imp.where_clause.clone().unwrap_or_default().into());
+                m.insert(
+                    "where_clause".into(),
+                    imp.where_clause.clone().unwrap_or_default().into(),
+                );
                 m.insert("file_path".into(), imp.file_path.clone().into());
                 m.insert("line_start".into(), (imp.line_start as i64).into());
                 m.insert("line_end".into(), (imp.line_end as i64).into());
                 // Pre-computed IDs for Phase 2
-                m.insert("struct_id".into(), format!("{}:{}", imp.file_path, imp.for_type).into());
+                m.insert(
+                    "struct_id".into(),
+                    format!("{}:{}", imp.file_path, imp.for_type).into(),
+                );
                 m
             })
             .collect();
@@ -3288,7 +3320,8 @@ impl Neo4jClient {
             )
             .param("items", trait_impls.clone());
 
-            let mut trait_linked: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut trait_linked: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut result = self.graph.execute(q).await?;
             while let Some(row) = result.next().await? {
                 if let Ok(id) = row.get::<String>("linked_id") {
@@ -3297,16 +3330,17 @@ impl Neo4jClient {
             }
 
             // Phase 3b: Create/link external traits for unresolved
-            let unresolved_traits: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = trait_impls
-                .into_iter()
-                .filter(|m| {
-                    let id = match m.get("impl_id") {
-                        Some(neo4rs::BoltType::String(s)) => s.value.clone(),
-                        _ => String::new(),
-                    };
-                    !trait_linked.contains(&id)
-                })
-                .collect();
+            let unresolved_traits: Vec<std::collections::HashMap<String, neo4rs::BoltType>> =
+                trait_impls
+                    .into_iter()
+                    .filter(|m| {
+                        let id = match m.get("impl_id") {
+                            Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                            _ => String::new(),
+                        };
+                        !trait_linked.contains(&id)
+                    })
+                    .collect();
 
             if !unresolved_traits.is_empty() {
                 let q = query(
@@ -3564,7 +3598,8 @@ impl Neo4jClient {
         )
         .param("items", items.clone());
 
-        let mut resolved: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut resolved: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         match self.graph.execute(q).await {
             Ok(mut result) => {
                 while let Ok(Some(row)) = result.next().await {

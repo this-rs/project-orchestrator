@@ -488,10 +488,7 @@ impl GraphStore for Neo4jClient {
     // Batch upsert operations (UNWIND)
     // ========================================================================
 
-    async fn batch_upsert_functions(
-        &self,
-        functions: &[FunctionNode],
-    ) -> anyhow::Result<()> {
+    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> anyhow::Result<()> {
         self.batch_upsert_functions(functions).await
     }
 

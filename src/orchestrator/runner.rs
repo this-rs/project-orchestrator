@@ -1571,14 +1571,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .neo4j
             .batch_upsert_structs(&parsed.structs)
             .await?;
-        self.state
-            .neo4j
-            .batch_upsert_traits(&parsed.traits)
-            .await?;
-        self.state
-            .neo4j
-            .batch_upsert_enums(&parsed.enums)
-            .await?;
+        self.state.neo4j.batch_upsert_traits(&parsed.traits).await?;
+        self.state.neo4j.batch_upsert_enums(&parsed.enums).await?;
         // Impls AFTER structs/traits/enums (IMPLEMENTS_FOR/IMPLEMENTS_TRAIT need targets)
         self.state
             .neo4j
