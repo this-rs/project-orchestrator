@@ -276,6 +276,20 @@ impl Neo4jClient {
                    `vector.dimensions`: 768,
                    `vector.similarity_function`: 'cosine'
                }}"#,
+            // HNSW vector index for cosine similarity search on File embeddings
+            r#"CREATE VECTOR INDEX file_embedding_index IF NOT EXISTS
+               FOR (f:File) ON (f.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+            // HNSW vector index for cosine similarity search on Function embeddings
+            r#"CREATE VECTOR INDEX function_embedding_index IF NOT EXISTS
+               FOR (fn:Function) ON (fn.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
         ];
 
         for constraint in constraints {
@@ -8244,6 +8258,178 @@ impl Neo4jClient {
         }
 
         Ok((notes, total))
+    }
+
+    // ========================================================================
+    // Code embedding operations (File & Function vector search)
+    // ========================================================================
+
+    /// Store a vector embedding on a File node.
+    pub async fn set_file_embedding(
+        &self,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})
+            CALL db.create.setNodeVectorProperty(f, 'embedding', $embedding)
+            SET f.embedding_model = $model,
+                f.embedded_at = datetime()
+            "#,
+        )
+        .param("path", file_path.to_string())
+        .param("embedding", embedding_f64)
+        .param("model", model.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .context(format!("Failed to set embedding on file {}", file_path))?;
+
+        Ok(())
+    }
+
+    /// Store a vector embedding on a Function node.
+    pub async fn set_function_embedding(
+        &self,
+        function_name: &str,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        let q = query(
+            r#"
+            MATCH (fn:Function)<-[:CONTAINS]-(f:File {path: $file_path})
+            WHERE fn.name = $name
+            WITH fn LIMIT 1
+            CALL db.create.setNodeVectorProperty(fn, 'embedding', $embedding)
+            SET fn.embedding_model = $model,
+                fn.embedded_at = datetime()
+            "#,
+        )
+        .param("name", function_name.to_string())
+        .param("file_path", file_path.to_string())
+        .param("embedding", embedding_f64)
+        .param("model", model.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .context(format!(
+                "Failed to set embedding on function {} in {}",
+                function_name, file_path
+            ))?;
+
+        Ok(())
+    }
+
+    /// Search files by vector similarity using the HNSW index.
+    pub async fn vector_search_files(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, f64)>> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+        let query_limit = (limit * 3) as i64; // over-fetch for post-filtering
+
+        let cypher = if let Some(_pid) = project_id {
+            r#"
+            CALL db.index.vector.queryNodes('file_embedding_index', $query_limit, $embedding)
+            YIELD node AS f, score
+            WHERE EXISTS { MATCH (f)<-[:CONTAINS]-(p:Project {id: $project_id}) }
+            RETURN f.path AS path, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        } else {
+            r#"
+            CALL db.index.vector.queryNodes('file_embedding_index', $query_limit, $embedding)
+            YIELD node AS f, score
+            RETURN f.path AS path, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        };
+
+        let mut q = query(cypher)
+            .param("embedding", embedding_f64)
+            .param("query_limit", query_limit)
+            .param("limit", limit as i64);
+
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut results = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let path: String = row.get("path")?;
+            let score: f64 = row.get("score")?;
+            results.push((path, score));
+        }
+
+        Ok(results)
+    }
+
+    /// Search functions by vector similarity using the HNSW index.
+    pub async fn vector_search_functions(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+        let query_limit = (limit * 3) as i64;
+
+        let cypher = if let Some(_pid) = project_id {
+            r#"
+            CALL db.index.vector.queryNodes('function_embedding_index', $query_limit, $embedding)
+            YIELD node AS fn, score
+            MATCH (fn)<-[:CONTAINS]-(f:File)
+            WHERE EXISTS { MATCH (f)<-[:CONTAINS]-(p:Project {id: $project_id}) }
+            RETURN fn.name AS name, f.path AS path, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        } else {
+            r#"
+            CALL db.index.vector.queryNodes('function_embedding_index', $query_limit, $embedding)
+            YIELD node AS fn, score
+            MATCH (fn)<-[:CONTAINS]-(f:File)
+            RETURN fn.name AS name, f.path AS path, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        };
+
+        let mut q = query(cypher)
+            .param("embedding", embedding_f64)
+            .param("query_limit", query_limit)
+            .param("limit", limit as i64);
+
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut results = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name")?;
+            let path: String = row.get("path")?;
+            let score: f64 = row.get("score")?;
+            results.push((name, path, score));
+        }
+
+        Ok(results)
     }
 
     // ========================================================================

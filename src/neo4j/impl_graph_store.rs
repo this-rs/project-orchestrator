@@ -1407,6 +1407,49 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Code embedding operations (File & Function vector search)
+    // ========================================================================
+
+    async fn set_file_embedding(
+        &self,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.set_file_embedding(file_path, embedding, model).await
+    }
+
+    async fn set_function_embedding(
+        &self,
+        function_name: &str,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.set_function_embedding(function_name, file_path, embedding, model)
+            .await
+    }
+
+    async fn vector_search_files(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(String, f64)>> {
+        self.vector_search_files(embedding, limit, project_id).await
+    }
+
+    async fn vector_search_functions(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        self.vector_search_functions(embedding, limit, project_id)
+            .await
+    }
+
+    // ========================================================================
     // Synapse operations (Phase 2 — Neural Network)
     // ========================================================================
 

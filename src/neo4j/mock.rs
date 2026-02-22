@@ -118,6 +118,10 @@ pub struct MockGraphStore {
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
+    /// File embeddings (file_path -> (embedding, model_name))
+    pub file_embeddings: RwLock<HashMap<String, (Vec<f32>, String)>>,
+    /// Function embeddings ("file_path::func_name" -> (embedding, model_name))
+    pub function_embeddings: RwLock<HashMap<String, (Vec<f32>, String)>>,
 }
 
 #[allow(dead_code)]
@@ -188,6 +192,8 @@ impl MockGraphStore {
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
             note_synapses: RwLock::new(HashMap::new()),
+            file_embeddings: RwLock::new(HashMap::new()),
+            function_embeddings: RwLock::new(HashMap::new()),
         }
     }
 
@@ -4368,6 +4374,118 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
+    // Code embedding operations (File & Function vector search)
+    // ========================================================================
+
+    async fn set_file_embedding(
+        &self,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        self.file_embeddings
+            .write()
+            .await
+            .insert(file_path.to_string(), (embedding.to_vec(), model.to_string()));
+        Ok(())
+    }
+
+    async fn set_function_embedding(
+        &self,
+        function_name: &str,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let key = format!("{}::{}", file_path, function_name);
+        self.function_embeddings
+            .write()
+            .await
+            .insert(key, (embedding.to_vec(), model.to_string()));
+        Ok(())
+    }
+
+    async fn vector_search_files(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, f64)>> {
+        let file_embeddings = self.file_embeddings.read().await;
+
+        // If project_id is specified, get the set of file paths belonging to that project
+        let project_files: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            pf.get(&pid).cloned()
+        } else {
+            None
+        };
+
+        let mut scored: Vec<(String, f64)> = file_embeddings
+            .iter()
+            .filter(|(path, _)| {
+                if let Some(ref pfiles) = project_files {
+                    pfiles.contains(path)
+                } else {
+                    true
+                }
+            })
+            .map(|(path, (emb, _))| {
+                let score = cosine_similarity(embedding, emb);
+                (path.clone(), score)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    async fn vector_search_functions(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let func_embeddings = self.function_embeddings.read().await;
+
+        // If project_id is specified, get the set of file paths belonging to that project
+        let project_files: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            pf.get(&pid).cloned()
+        } else {
+            None
+        };
+
+        let mut scored: Vec<(String, String, f64)> = func_embeddings
+            .iter()
+            .filter_map(|(key, (emb, _))| {
+                // key format: "file_path::func_name"
+                let parts: Vec<&str> = key.splitn(2, "::").collect();
+                if parts.len() != 2 {
+                    return None;
+                }
+                let fpath = parts[0];
+                let fname = parts[1];
+
+                // Filter by project
+                if let Some(ref pfiles) = project_files {
+                    if !pfiles.contains(&fpath.to_string()) {
+                        return None;
+                    }
+                }
+
+                let score = cosine_similarity(embedding, emb);
+                Some((fname.to_string(), fpath.to_string(), score))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    // ========================================================================
     // Synapse operations (Phase 2 — Neural Network)
     // ========================================================================
 
@@ -7683,5 +7801,128 @@ mod tests {
             "error should mention 'not found', got: {}",
             err_msg
         );
+    }
+
+    // ========================================================================
+    // Code embedding tests (File & Function vector search)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_set_and_search_file_embedding() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        let store = store.with_project(project).await;
+
+        // Register files in the project
+        let file1 = "/src/api/handlers.rs";
+        let file2 = "/src/api/routes.rs";
+        let file3 = "/src/chat/manager.rs";
+
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(pid, vec![
+                file1.to_string(),
+                file2.to_string(),
+                file3.to_string(),
+            ]);
+        }
+
+        // Create embeddings — file1 and file2 are similar (API-related), file3 is different
+        let emb_api = vec![1.0_f32, 0.0, 0.0, 0.0]; // API direction
+        let emb_api_similar = vec![0.9, 0.1, 0.0, 0.0]; // similar to API
+        let emb_chat = vec![0.0, 0.0, 1.0, 0.0]; // chat direction
+
+        store.set_file_embedding(file1, &emb_api, "test-model").await.unwrap();
+        store.set_file_embedding(file2, &emb_api_similar, "test-model").await.unwrap();
+        store.set_file_embedding(file3, &emb_chat, "test-model").await.unwrap();
+
+        // Search with API-like query
+        let results = store.vector_search_files(&emb_api, 10, Some(pid)).await.unwrap();
+        assert_eq!(results.len(), 3);
+        // file1 should be top result (exact match)
+        assert_eq!(results[0].0, file1);
+        assert!(results[0].1 > 0.99, "exact match should have score near 1.0");
+        // file2 should be second (similar)
+        assert_eq!(results[1].0, file2);
+        assert!(results[1].1 > 0.9, "similar embedding should have high score");
+        // file3 should be last (orthogonal)
+        assert_eq!(results[2].0, file3);
+        assert!(results[2].1.abs() < 0.01, "orthogonal embedding should have score near 0");
+    }
+
+    #[tokio::test]
+    async fn test_set_and_search_function_embedding() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        let store = store.with_project(project).await;
+
+        let file = "/src/api/handlers.rs";
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(pid, vec![file.to_string()]);
+        }
+
+        // Embed two functions
+        let emb_auth = vec![1.0_f32, 0.0, 0.0];
+        let emb_list = vec![0.0, 1.0, 0.0];
+
+        store.set_function_embedding("authenticate", file, &emb_auth, "test-model").await.unwrap();
+        store.set_function_embedding("list_items", file, &emb_list, "test-model").await.unwrap();
+
+        // Search for auth-like function
+        let results = store.vector_search_functions(&emb_auth, 10, Some(pid)).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "authenticate");
+        assert_eq!(results[0].1, file);
+        assert!(results[0].2 > 0.99);
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_empty_returns_empty() {
+        let store = MockGraphStore::new();
+
+        // No embeddings stored — search should return empty
+        let query_emb = vec![1.0_f32, 0.0, 0.0];
+
+        let file_results = store.vector_search_files(&query_emb, 10, None).await.unwrap();
+        assert!(file_results.is_empty(), "expected empty file results");
+
+        let func_results = store.vector_search_functions(&query_emb, 10, None).await.unwrap();
+        assert!(func_results.is_empty(), "expected empty function results");
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_files_project_filter() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("Project A");
+        let project_b = test_project_named("Project B");
+        let pid_a = project_a.id;
+        let pid_b = project_b.id;
+        let store = store.with_project(project_a).await;
+        let store = store.with_project(project_b).await;
+
+        let file_a = "/project-a/src/main.rs";
+        let file_b = "/project-b/src/main.rs";
+
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(pid_a, vec![file_a.to_string()]);
+            pf.insert(pid_b, vec![file_b.to_string()]);
+        }
+
+        let emb = vec![1.0_f32, 0.0, 0.0];
+        store.set_file_embedding(file_a, &emb, "test").await.unwrap();
+        store.set_file_embedding(file_b, &emb, "test").await.unwrap();
+
+        // Search with project A filter — should only find file_a
+        let results = store.vector_search_files(&emb, 10, Some(pid_a)).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, file_a);
+
+        // Search without filter — should find both
+        let results = store.vector_search_files(&emb, 10, None).await.unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

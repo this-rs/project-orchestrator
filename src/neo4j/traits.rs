@@ -1090,6 +1090,50 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<(Vec<Note>, usize)>;
 
     // ========================================================================
+    // Code embedding operations (File & Function vector search)
+    // ========================================================================
+
+    /// Store a vector embedding on a File node.
+    /// Uses `db.create.setNodeVectorProperty` to ensure the correct type
+    /// for the HNSW vector index.
+    async fn set_file_embedding(
+        &self,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()>;
+
+    /// Store a vector embedding on a Function node.
+    /// Identifies the function by name + file_path for uniqueness.
+    async fn set_function_embedding(
+        &self,
+        function_name: &str,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()>;
+
+    /// Search files by vector similarity using the HNSW index.
+    /// Returns file paths with cosine similarity scores, ordered descending.
+    /// Optionally filtered by project_id.
+    async fn vector_search_files(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, f64)>>;
+
+    /// Search functions by vector similarity using the HNSW index.
+    /// Returns (function_name, file_path, score) tuples, ordered by score descending.
+    /// Optionally filtered by project_id.
+    async fn vector_search_functions(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64)>>;
+
+    // ========================================================================
     // Synapse operations (Phase 2 — Neural Network)
     // ========================================================================
 
