@@ -2903,49 +2903,114 @@ impl Neo4jClient {
     /// FeatureGraph nodes are also deleted since they depend on code entities.
     pub async fn cleanup_sync_data(&self) -> Result<i64> {
         let mut total_deleted: i64 = 0;
+        let batch_size = 10_000;
 
-        // Delete code relationships first
-        let rel_queries = vec![
-            "MATCH ()-[r:CALLS]->() DELETE r RETURN count(r) AS cnt",
-            "MATCH ()-[r:IMPORTS]->() DELETE r RETURN count(r) AS cnt",
-            "MATCH ()-[r:IMPLEMENTS_FOR]->() DELETE r RETURN count(r) AS cnt",
-            "MATCH ()-[r:IMPLEMENTS_TRAIT]->() DELETE r RETURN count(r) AS cnt",
-            "MATCH ()-[r:HAS_IMPORT]->() DELETE r RETURN count(r) AS cnt",
+        // Delete code relationships first (batched to avoid massive transactions)
+        // CALLS alone can be 300k+ rels — unbatched DELETE causes OOM/timeout
+        let rel_types = vec![
+            "CALLS",
+            "IMPORTS",
+            "IMPLEMENTS_FOR",
+            "IMPLEMENTS_TRAIT",
+            "HAS_IMPORT",
+            "INCLUDES_ENTITY",
         ];
 
-        for cypher in &rel_queries {
-            match self.graph.execute(query(cypher)).await {
-                Ok(mut result) => {
-                    if let Ok(Some(row)) = result.next().await {
-                        let cnt: i64 = row.get("cnt").unwrap_or(0);
-                        total_deleted += cnt;
+        for rel_type in &rel_types {
+            let mut rel_deleted: i64 = 0;
+            loop {
+                let cypher = format!(
+                    "MATCH ()-[r:{}]->() WITH r LIMIT {} DELETE r RETURN count(r) AS cnt",
+                    rel_type, batch_size
+                );
+                match self.graph.execute(query(&cypher)).await {
+                    Ok(mut result) => {
+                        if let Ok(Some(row)) = result.next().await {
+                            let cnt: i64 = row.get("cnt").unwrap_or(0);
+                            if cnt == 0 {
+                                break;
+                            }
+                            rel_deleted += cnt;
+                            total_deleted += cnt;
+                            tracing::info!(
+                                "cleanup_sync_data: deleted batch of {} {} rels (total: {})",
+                                cnt,
+                                rel_type,
+                                rel_deleted
+                            );
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "cleanup_sync_data rel query failed for {}: {}",
+                            rel_type,
+                            e
+                        );
+                        break;
                     }
                 }
-                Err(e) => tracing::warn!("cleanup_sync_data rel query failed: {}", e),
+            }
+            if rel_deleted > 0 {
+                tracing::info!(
+                    "cleanup_sync_data: finished {} — deleted {} total",
+                    rel_type,
+                    rel_deleted
+                );
             }
         }
 
-        // Delete code entity nodes (DETACH DELETE removes remaining CONTAINS edges)
-        let node_queries = vec![
-            "MATCH (n:Function) DETACH DELETE n RETURN count(n) AS cnt",
-            "MATCH (n:Struct) DETACH DELETE n RETURN count(n) AS cnt",
-            "MATCH (n:Trait) DETACH DELETE n RETURN count(n) AS cnt",
-            "MATCH (n:Enum) DETACH DELETE n RETURN count(n) AS cnt",
-            "MATCH (n:Impl) DETACH DELETE n RETURN count(n) AS cnt",
-            "MATCH (n:Import) DETACH DELETE n RETURN count(n) AS cnt",
-            "MATCH (n:File) DETACH DELETE n RETURN count(n) AS cnt",
-            "MATCH (n:FeatureGraph) DETACH DELETE n RETURN count(n) AS cnt",
+        // Delete code entity nodes (batched DETACH DELETE removes remaining CONTAINS edges)
+        let node_labels = vec![
+            "Function",
+            "Struct",
+            "Trait",
+            "Enum",
+            "Impl",
+            "Import",
+            "File",
+            "FeatureGraph",
         ];
 
-        for cypher in &node_queries {
-            match self.graph.execute(query(cypher)).await {
-                Ok(mut result) => {
-                    if let Ok(Some(row)) = result.next().await {
-                        let cnt: i64 = row.get("cnt").unwrap_or(0);
-                        total_deleted += cnt;
+        for label in &node_labels {
+            let mut node_deleted: i64 = 0;
+            loop {
+                let cypher = format!(
+                    "MATCH (n:{}) WITH n LIMIT {} DETACH DELETE n RETURN count(n) AS cnt",
+                    label, batch_size
+                );
+                match self.graph.execute(query(&cypher)).await {
+                    Ok(mut result) => {
+                        if let Ok(Some(row)) = result.next().await {
+                            let cnt: i64 = row.get("cnt").unwrap_or(0);
+                            if cnt == 0 {
+                                break;
+                            }
+                            node_deleted += cnt;
+                            total_deleted += cnt;
+                            tracing::info!(
+                                "cleanup_sync_data: deleted batch of {} {} nodes (total: {})",
+                                cnt,
+                                label,
+                                node_deleted
+                            );
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("cleanup_sync_data node query failed for {}: {}", label, e);
+                        break;
                     }
                 }
-                Err(e) => tracing::warn!("cleanup_sync_data node query failed: {}", e),
+            }
+            if node_deleted > 0 {
+                tracing::info!(
+                    "cleanup_sync_data: finished {} — deleted {} total",
+                    label,
+                    node_deleted
+                );
             }
         }
 
