@@ -399,6 +399,184 @@ pub async fn update_chat_permissions(
     Ok(Json(updated))
 }
 
+// ============================================================================
+// Chat environment config (PATH, CLI path, auto-update)
+// ============================================================================
+
+/// Response for GET /api/chat/config
+#[derive(Debug, Serialize)]
+pub struct ChatConfigResponse {
+    pub mode: String,
+    pub allowed_tools: Vec<String>,
+    pub disallowed_tools: Vec<String>,
+    pub default_model: String,
+    pub process_path: Option<String>,
+    pub claude_cli_path: Option<String>,
+    pub auto_update_cli: bool,
+}
+
+/// GET /api/chat/config — Return full chat configuration
+pub async fn get_chat_config(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<ChatConfigResponse>, AppError> {
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    let perm = chat_manager.get_permission_config().await;
+    let env = chat_manager.get_env_config().await;
+
+    Ok(Json(ChatConfigResponse {
+        mode: perm.mode,
+        allowed_tools: perm.allowed_tools,
+        disallowed_tools: perm.disallowed_tools,
+        default_model: chat_manager.config.default_model.clone(),
+        process_path: env.process_path,
+        claude_cli_path: env.claude_cli_path,
+        auto_update_cli: env.auto_update_cli,
+    }))
+}
+
+/// Request body for PATCH /api/chat/config
+#[derive(Debug, Deserialize)]
+pub struct UpdateChatConfigRequest {
+    /// Permission mode override
+    pub mode: Option<String>,
+    /// Allowed tool patterns override
+    pub allowed_tools: Option<Vec<String>>,
+    /// Disallowed tool patterns override
+    pub disallowed_tools: Option<Vec<String>>,
+    /// Process PATH (empty string = clear, non-empty = set)
+    pub process_path: Option<String>,
+    /// Claude CLI path (empty string = clear, non-empty = set)
+    pub claude_cli_path: Option<String>,
+    /// Auto-update CLI toggle
+    pub auto_update_cli: Option<bool>,
+}
+
+/// PATCH /api/chat/config — Update chat configuration (partial merge).
+/// Persists changes to config.yaml.
+pub async fn update_chat_config(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<UpdateChatConfigRequest>,
+) -> Result<Json<ChatConfigResponse>, AppError> {
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    // Update permission fields if provided
+    if body.mode.is_some() || body.allowed_tools.is_some() || body.disallowed_tools.is_some() {
+        let current = chat_manager.get_permission_config().await;
+        let new_perm = crate::chat::PermissionConfig {
+            mode: body.mode.unwrap_or(current.mode),
+            allowed_tools: body.allowed_tools.unwrap_or(current.allowed_tools),
+            disallowed_tools: body.disallowed_tools.unwrap_or(current.disallowed_tools),
+        };
+        // Validate mode
+        if !crate::chat::config::PermissionConfig::is_valid_mode(&new_perm.mode) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid permission mode '{}'. Valid modes: {:?}",
+                new_perm.mode,
+                crate::chat::config::PermissionConfig::valid_modes()
+            )));
+        }
+        chat_manager
+            .update_permission_config(new_perm)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    }
+
+    // Update environment config fields
+    // Empty string means "clear" (set to None), non-empty means "set"
+    if let Some(ref path_val) = body.process_path {
+        let new_val = if path_val.is_empty() {
+            None
+        } else {
+            Some(path_val.clone())
+        };
+        chat_manager.update_process_path(new_val).await;
+    }
+    if let Some(ref cli_val) = body.claude_cli_path {
+        let new_val = if cli_val.is_empty() {
+            None
+        } else {
+            Some(cli_val.clone())
+        };
+        chat_manager.update_claude_cli_path(new_val).await;
+    }
+    if let Some(auto_update) = body.auto_update_cli {
+        chat_manager.update_auto_update_cli(auto_update).await;
+    }
+
+    // Persist to config.yaml if path is known
+    chat_manager
+        .persist_chat_config_to_yaml()
+        .await
+        .map_err(|e| {
+            tracing::warn!("Failed to persist chat config to YAML: {}", e);
+            AppError::Internal(anyhow::anyhow!("Failed to persist config: {}", e))
+        })?;
+
+    // Return updated config
+    let perm = chat_manager.get_permission_config().await;
+    let env = chat_manager.get_env_config().await;
+    Ok(Json(ChatConfigResponse {
+        mode: perm.mode,
+        allowed_tools: perm.allowed_tools,
+        disallowed_tools: perm.disallowed_tools,
+        default_model: chat_manager.config.default_model.clone(),
+        process_path: env.process_path,
+        claude_cli_path: env.claude_cli_path,
+        auto_update_cli: env.auto_update_cli,
+    }))
+}
+
+/// GET /api/chat/detect-path — Detect user's PATH from login shell
+pub async fn detect_path() -> Json<serde_json::Value> {
+    match crate::chat::path_detect::detect_user_path().await {
+        Some(path) => Json(serde_json::json!({ "path": path })),
+        None => Json(serde_json::json!({
+            "path": null,
+            "error": "Could not detect PATH from login shell"
+        })),
+    }
+}
+
+// ============================================================================
+// CLI version management (check + install/upgrade)
+// ============================================================================
+
+/// GET /api/chat/cli/status — Check installed CLI version and update availability.
+///
+/// Returns the full CLI version status including installed version, latest
+/// npm version, whether an update is available, and whether it's a local build.
+/// The npm version check has a 10s timeout built-in — will return `latest_version: null`
+/// if npm is unreachable.
+pub async fn get_cli_status() -> Json<crate::chat::cli_version::CliVersionStatus> {
+    Json(crate::chat::cli_version::check_cli_status().await)
+}
+
+/// Request body for POST /api/chat/cli/install
+#[derive(Debug, Deserialize)]
+pub struct InstallCliRequest {
+    /// Target version to install (e.g., "2.6.0"). None means "latest".
+    pub version: Option<String>,
+}
+
+/// POST /api/chat/cli/install — Download/upgrade the Claude Code CLI.
+///
+/// Always returns 200 with `success: true/false` — the frontend displays the message.
+/// No 500 for installation failures (they are expected user-facing scenarios).
+pub async fn install_cli(
+    Json(body): Json<InstallCliRequest>,
+) -> Json<crate::chat::cli_version::CliInstallResult> {
+    Json(
+        crate::chat::cli_version::install_or_upgrade_cli(body.version.as_deref()).await,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

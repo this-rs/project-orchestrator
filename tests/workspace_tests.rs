@@ -31,6 +31,9 @@ fn test_config() -> Config {
         chat_max_sessions: None,
         chat_max_turns: None,
         chat_session_timeout_secs: None,
+        chat_process_path: None,
+        chat_claude_cli_path: None,
+        chat_auto_update_cli: None,
         config_yaml_path: None,
     }
 }

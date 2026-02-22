@@ -42,6 +42,9 @@ pub fn mock_app_state() -> AppState {
             chat_max_sessions: None,
             chat_max_turns: None,
             chat_session_timeout_secs: None,
+            chat_process_path: None,
+            chat_claude_cli_path: None,
+            chat_auto_update_cli: None,
             config_yaml_path: None,
         }),
     }
@@ -72,6 +75,9 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             chat_max_sessions: None,
             chat_max_turns: None,
             chat_session_timeout_secs: None,
+            chat_process_path: None,
+            chat_claude_cli_path: None,
+            chat_auto_update_cli: None,
             config_yaml_path: None,
         }),
     }
@@ -102,6 +108,9 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
             chat_max_sessions: None,
             chat_max_turns: None,
             chat_session_timeout_secs: None,
+            chat_process_path: None,
+            chat_claude_cli_path: None,
+            chat_auto_update_cli: None,
             config_yaml_path: None,
         }),
     }

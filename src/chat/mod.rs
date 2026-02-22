@@ -3,8 +3,10 @@
 //! Provides WebSocket streaming chat with bidirectional communication,
 //! event persistence with replay, session management, and auto-resume capabilities.
 
+pub mod cli_version;
 pub mod config;
 pub mod manager;
+pub mod path_detect;
 pub mod prompt;
 pub mod types;
 

@@ -161,6 +161,14 @@ pub struct ChatYamlConfig {
     /// When absent, falls back to env vars or defaults (BypassPermissions).
     #[serde(default)]
     pub permissions: Option<chat::config::PermissionConfig>,
+    /// PATH to inject into the Claude Code subprocess (overrides inherited PATH).
+    /// Colon-separated on Unix. Example: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    pub process_path: Option<String>,
+    /// Absolute path to the Claude CLI binary. Skips find_claude_cli() search.
+    /// Example: "/opt/homebrew/bin/claude"
+    pub claude_cli_path: Option<String>,
+    /// Enable automatic CLI version updates on startup (default: false).
+    pub auto_update_cli: Option<bool>,
 }
 
 /// Authentication configuration — flexible multi-provider auth.
@@ -426,6 +434,15 @@ pub struct Config {
     pub chat_max_turns: Option<i32>,
     /// Chat session timeout from YAML (if present).
     pub chat_session_timeout_secs: Option<u64>,
+    /// PATH to inject into the Claude Code subprocess.
+    /// Priority: env var (CHAT_PROCESS_PATH) > YAML (chat.process_path) > None (inherit parent).
+    pub chat_process_path: Option<String>,
+    /// Absolute path to the Claude CLI binary.
+    /// Priority: env var (CLAUDE_CLI_PATH) > YAML (chat.claude_cli_path) > None (auto-detect).
+    pub chat_claude_cli_path: Option<String>,
+    /// Enable automatic CLI version updates on startup.
+    /// Priority: env var (CHAT_AUTO_UPDATE_CLI) > YAML (chat.auto_update_cli) > None (false).
+    pub chat_auto_update_cli: Option<bool>,
     /// Resolved path to the config.yaml file that was loaded (if any).
     /// Used for persisting runtime changes back to disk.
     pub config_yaml_path: Option<std::path::PathBuf>,
@@ -474,6 +491,16 @@ impl Config {
             chat_max_sessions: yaml.chat.max_sessions,
             chat_max_turns: yaml.chat.max_turns,
             chat_session_timeout_secs: yaml.chat.session_timeout_secs,
+            chat_process_path: std::env::var("CHAT_PROCESS_PATH")
+                .ok()
+                .or(yaml.chat.process_path),
+            chat_claude_cli_path: std::env::var("CLAUDE_CLI_PATH")
+                .ok()
+                .or(yaml.chat.claude_cli_path),
+            chat_auto_update_cli: std::env::var("CHAT_AUTO_UPDATE_CLI")
+                .ok()
+                .map(|v| v == "true" || v == "1")
+                .or(yaml.chat.auto_update_cli),
             config_yaml_path: resolved_path,
         })
     }
@@ -803,6 +830,16 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         }
         if let Some(timeout_secs) = config.chat_session_timeout_secs {
             chat_config.session_timeout = std::time::Duration::from_secs(timeout_secs);
+        }
+        // Override PATH / CLI path / auto-update from YAML if present.
+        if let Some(ref path) = config.chat_process_path {
+            chat_config.process_path = Some(path.clone());
+        }
+        if let Some(ref cli) = config.chat_claude_cli_path {
+            chat_config.claude_cli_path = Some(cli.clone());
+        }
+        if let Some(auto_update) = config.chat_auto_update_cli {
+            chat_config.auto_update_cli = auto_update;
         }
         let mut cm = chat::ChatManager::new(
             orchestrator.neo4j_arc(),
@@ -1583,5 +1620,85 @@ auth:
         // Domain still works
         assert!(auth.is_email_allowed("user@ffs.holdings"));
         assert!(!auth.is_email_allowed("user@gmail.com"));
+    }
+
+    // ========================================================================
+    // Chat config: process_path, claude_cli_path, auto_update_cli
+    // ========================================================================
+
+    #[test]
+    fn test_chat_yaml_config_new_fields() {
+        // With all new fields present
+        let yaml = r#"
+chat:
+  process_path: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+  claude_cli_path: "/opt/homebrew/bin/claude"
+  auto_update_cli: true
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.chat.process_path.as_deref(),
+            Some("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            config.chat.claude_cli_path.as_deref(),
+            Some("/opt/homebrew/bin/claude")
+        );
+        assert_eq!(config.chat.auto_update_cli, Some(true));
+    }
+
+    #[test]
+    fn test_chat_yaml_config_new_fields_absent() {
+        // Without new fields — backward compat: all None
+        let yaml = r#"
+chat:
+  default_model: "claude-sonnet-4-6"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.chat.process_path.is_none());
+        assert!(config.chat.claude_cli_path.is_none());
+        assert!(config.chat.auto_update_cli.is_none());
+        assert_eq!(config.chat.default_model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_chat_config_env_override_yaml() {
+        // YAML sets process_path, env var overrides it
+        let yaml = r#"
+chat:
+  process_path: "/yaml/path"
+  claude_cli_path: "/yaml/claude"
+  auto_update_cli: false
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("config.yaml");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        // Clear first
+        std::env::remove_var("CHAT_PROCESS_PATH");
+        std::env::remove_var("CLAUDE_CLI_PATH");
+        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+
+        // Without env overrides → YAML values used
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert_eq!(config.chat_process_path.as_deref(), Some("/yaml/path"));
+        assert_eq!(config.chat_claude_cli_path.as_deref(), Some("/yaml/claude"));
+        assert_eq!(config.chat_auto_update_cli, Some(false));
+
+        // Env vars override YAML
+        std::env::set_var("CHAT_PROCESS_PATH", "/env/path");
+        std::env::set_var("CLAUDE_CLI_PATH", "/env/claude");
+        std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
+
+        let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
+        assert_eq!(config.chat_process_path.as_deref(), Some("/env/path"));
+        assert_eq!(config.chat_claude_cli_path.as_deref(), Some("/env/claude"));
+        assert_eq!(config.chat_auto_update_cli, Some(true));
+
+        // Cleanup
+        std::env::remove_var("CHAT_PROCESS_PATH");
+        std::env::remove_var("CLAUDE_CLI_PATH");
+        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
     }
 }

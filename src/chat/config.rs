@@ -171,6 +171,13 @@ pub struct ChatConfig {
     pub auto_continue: bool,
     /// Retry configuration for transient API errors (5xx)
     pub retry: RetryConfig,
+    /// PATH to inject into the Claude Code subprocess. When Some, overrides the inherited PATH.
+    /// Colon-separated on Unix (e.g. "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").
+    pub process_path: Option<String>,
+    /// Absolute path to the Claude CLI binary. When Some, skips find_claude_cli() lookup.
+    pub claude_cli_path: Option<String>,
+    /// Enable automatic CLI version updates on startup (default: false).
+    pub auto_update_cli: bool,
 }
 
 impl ChatConfig {
@@ -236,6 +243,11 @@ impl ChatConfig {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             retry: RetryConfig::from_env(),
+            process_path: std::env::var("CHAT_PROCESS_PATH").ok(),
+            claude_cli_path: std::env::var("CLAUDE_CLI_PATH").ok(),
+            auto_update_cli: std::env::var("CHAT_AUTO_UPDATE_CLI")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         }
     }
 
@@ -313,6 +325,9 @@ mod tests {
             enable_oneshot_refinement: true,
             auto_continue: false,
             retry: RetryConfig::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -332,6 +347,9 @@ mod tests {
         std::env::remove_var("CHAT_PERMISSION_MODE");
         std::env::remove_var("CHAT_ALLOWED_TOOLS");
         std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        std::env::remove_var("CHAT_PROCESS_PATH");
+        std::env::remove_var("CLAUDE_CLI_PATH");
+        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
 
         let config = ChatConfig::from_env();
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -344,6 +362,10 @@ mod tests {
             vec!["mcp__project-orchestrator__*"]
         );
         assert!(config.permission.disallowed_tools.is_empty());
+        // New fields — defaults when env vars are absent
+        assert!(config.process_path.is_none());
+        assert!(config.claude_cli_path.is_none());
+        assert!(!config.auto_update_cli);
 
         // Phase 2: custom values
         std::env::set_var("CHAT_DEFAULT_MODEL", "claude-sonnet-4-20250514");
@@ -356,6 +378,9 @@ mod tests {
             "Bash(git *),Read,mcp__project-orchestrator__*",
         );
         std::env::set_var("CHAT_DISALLOWED_TOOLS", "Bash(rm -rf *), Bash(sudo *)");
+        std::env::set_var("CHAT_PROCESS_PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+        std::env::set_var("CLAUDE_CLI_PATH", "/opt/homebrew/bin/claude");
+        std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
 
         let config = ChatConfig::from_env();
         assert_eq!(config.default_model, "claude-sonnet-4-20250514");
@@ -374,6 +399,16 @@ mod tests {
             config.permission.disallowed_tools,
             vec!["Bash(rm -rf *)", "Bash(sudo *)"]
         );
+        // New fields — custom values from env
+        assert_eq!(
+            config.process_path.as_deref(),
+            Some("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            config.claude_cli_path.as_deref(),
+            Some("/opt/homebrew/bin/claude")
+        );
+        assert!(config.auto_update_cli);
 
         // Phase 2b: CSV parsing edge cases for tools
         std::env::set_var("CHAT_ALLOWED_TOOLS", "Bash(git *), Read, Edit");
@@ -416,6 +451,9 @@ mod tests {
         std::env::remove_var("CHAT_PERMISSION_MODE");
         std::env::remove_var("CHAT_ALLOWED_TOOLS");
         std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        std::env::remove_var("CHAT_PROCESS_PATH");
+        std::env::remove_var("CLAUDE_CLI_PATH");
+        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
     }
 
     #[test]
@@ -437,6 +475,9 @@ mod tests {
             enable_oneshot_refinement: true,
             auto_continue: false,
             retry: RetryConfig::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
         };
 
         let json = config.mcp_server_config();
@@ -465,6 +506,9 @@ mod tests {
             enable_oneshot_refinement: true,
             auto_continue: false,
             retry: RetryConfig::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
         };
 
         let json = config.mcp_server_config();

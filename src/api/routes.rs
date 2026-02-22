@@ -694,6 +694,25 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/config/permissions",
             get(chat_handlers::get_chat_permissions).put(chat_handlers::update_chat_permissions),
         )
+        // Chat full configuration (GET/PATCH — includes permissions + env config)
+        .route(
+            "/api/chat/config",
+            get(chat_handlers::get_chat_config).patch(chat_handlers::update_chat_config),
+        )
+        // Detect user PATH from login shell
+        .route(
+            "/api/chat/detect-path",
+            get(chat_handlers::detect_path),
+        )
+        // CLI version management (check + install/upgrade)
+        .route(
+            "/api/chat/cli/status",
+            get(chat_handlers::get_cli_status),
+        )
+        .route(
+            "/api/chat/cli/install",
+            post(chat_handlers::install_cli),
+        )
 }
 
 // ============================================================================
