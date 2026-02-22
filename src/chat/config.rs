@@ -84,6 +84,57 @@ impl Default for PermissionConfig {
     }
 }
 
+/// Retry configuration for transient API errors (5xx).
+///
+/// When the Anthropic API returns a retryable error (e.g., 500 api_error,
+/// 529 overloaded_error), the chat system automatically retries with
+/// exponential backoff. Only retries when no tokens have been emitted yet.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts (default: 3)
+    pub max_attempts: u32,
+    /// Initial delay in milliseconds before the first retry (default: 1000)
+    pub initial_delay_ms: u64,
+    /// Backoff multiplier applied after each retry (default: 2.0).
+    /// Delay = initial_delay_ms × multiplier^(attempt-1)
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Read retry config from environment variables with fallback to defaults.
+    pub fn from_env() -> Self {
+        Self {
+            max_attempts: std::env::var("CHAT_RETRY_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+            initial_delay_ms: std::env::var("CHAT_RETRY_INITIAL_DELAY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000),
+            backoff_multiplier: std::env::var("CHAT_RETRY_BACKOFF_MULTIPLIER")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2.0),
+        }
+    }
+
+    /// Calculate the delay for a given attempt (1-indexed).
+    pub fn delay_for_attempt(&self, attempt: u32) -> u64 {
+        (self.initial_delay_ms as f64 * self.backoff_multiplier.powi(attempt as i32 - 1)) as u64
+    }
+}
+
 /// Configuration for the chat system
 #[derive(Debug, Clone)]
 pub struct ChatConfig {
@@ -118,6 +169,8 @@ pub struct ChatConfig {
     /// When `true`, the backend automatically sends "Continue" after error_max_turns.
     /// Can be toggled per-session via WebSocket.
     pub auto_continue: bool,
+    /// Retry configuration for transient API errors (5xx)
+    pub retry: RetryConfig,
 }
 
 impl ChatConfig {
@@ -182,6 +235,7 @@ impl ChatConfig {
             auto_continue: std::env::var("CHAT_AUTO_CONTINUE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            retry: RetryConfig::from_env(),
         }
     }
 
@@ -258,6 +312,7 @@ mod tests {
             permission: PermissionConfig::default(),
             enable_oneshot_refinement: true,
             auto_continue: false,
+            retry: RetryConfig::default(),
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -381,6 +436,7 @@ mod tests {
             permission: PermissionConfig::default(),
             enable_oneshot_refinement: true,
             auto_continue: false,
+            retry: RetryConfig::default(),
         };
 
         let json = config.mcp_server_config();
@@ -408,6 +464,7 @@ mod tests {
             permission: PermissionConfig::default(),
             enable_oneshot_refinement: true,
             auto_continue: false,
+            retry: RetryConfig::default(),
         };
 
         let json = config.mcp_server_config();
@@ -520,5 +577,56 @@ mod tests {
             serde_json::from_str(r#"{"mode":"default","allowed_tools":[]}"#).unwrap();
         assert_eq!(config.mode, "default");
         assert!(config.allowed_tools.is_empty());
+    }
+
+    // ====================================================================
+    // RetryConfig
+    // ====================================================================
+
+    #[test]
+    fn test_retry_config_defaults() {
+        let config = RetryConfig::default();
+        assert_eq!(config.max_attempts, 3);
+        assert_eq!(config.initial_delay_ms, 1000);
+        assert!((config.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retry_config_delay_calculation() {
+        let config = RetryConfig {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            backoff_multiplier: 2.0,
+        };
+        assert_eq!(config.delay_for_attempt(1), 1000); // 1000 * 2^0
+        assert_eq!(config.delay_for_attempt(2), 2000); // 1000 * 2^1
+        assert_eq!(config.delay_for_attempt(3), 4000); // 1000 * 2^2
+    }
+
+    #[test]
+    fn test_retry_config_from_env() {
+        // Clear any existing vars
+        std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
+        std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
+        std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
+
+        // Defaults
+        let config = RetryConfig::from_env();
+        assert_eq!(config.max_attempts, 3);
+        assert_eq!(config.initial_delay_ms, 1000);
+
+        // Custom values
+        std::env::set_var("CHAT_RETRY_MAX_ATTEMPTS", "5");
+        std::env::set_var("CHAT_RETRY_INITIAL_DELAY_MS", "500");
+        std::env::set_var("CHAT_RETRY_BACKOFF_MULTIPLIER", "1.5");
+        let config = RetryConfig::from_env();
+        assert_eq!(config.max_attempts, 5);
+        assert_eq!(config.initial_delay_ms, 500);
+        assert!((config.backoff_multiplier - 1.5).abs() < f64::EPSILON);
+
+        // Cleanup
+        std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
+        std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
+        std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
     }
 }

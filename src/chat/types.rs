@@ -204,6 +204,18 @@ pub enum ChatEvent {
     },
     /// Auto-continue state changed for a session (broadcast to sync all frontends)
     AutoContinueStateChanged { session_id: String, enabled: bool },
+    /// Backend is retrying after a transient API error (5xx).
+    /// Emitted before each retry attempt so the frontend can show a "Retrying..." indicator.
+    Retrying {
+        /// Current retry attempt (1-indexed)
+        attempt: u32,
+        /// Maximum number of retry attempts
+        max_attempts: u32,
+        /// Delay in milliseconds before this retry
+        delay_ms: u64,
+        /// The error message that triggered the retry
+        error_message: String,
+    },
 }
 
 impl ChatEvent {
@@ -232,6 +244,7 @@ impl ChatEvent {
             ChatEvent::SystemInit { .. } => "system_init",
             ChatEvent::AutoContinue { .. } => "auto_continue",
             ChatEvent::AutoContinueStateChanged { .. } => "auto_continue_state_changed",
+            ChatEvent::Retrying { .. } => "retrying",
         }
     }
 
@@ -305,6 +318,12 @@ impl ChatEvent {
                 "auto_continue_state_changed:{}:{}",
                 session_id, enabled
             )),
+
+            ChatEvent::Retrying {
+                attempt,
+                max_attempts,
+                ..
+            } => Some(format!("retrying:{}:{}", attempt, max_attempts)),
 
             // StreamDelta and StreamingStatus are never in the snapshot
             ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. } => None,
@@ -462,6 +481,77 @@ pub fn truncate_snippet(text: &str, max_len: usize) -> String {
     } else {
         format!("{}...", truncated)
     }
+}
+
+// ============================================================================
+// API error classification (for retry logic)
+// ============================================================================
+
+/// Classification of API errors for retry logic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApiErrorKind {
+    /// Retryable server-side error (5xx: api_error, overloaded_error)
+    Retryable(String),
+    /// Non-retryable client-side error (4xx: invalid_request, auth, rate_limit, etc.)
+    NonRetryable(String),
+}
+
+impl ApiErrorKind {
+    /// Returns `true` if the error is retryable.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ApiErrorKind::Retryable(_))
+    }
+}
+
+/// Known Anthropic API error types that are safe to retry.
+const RETRYABLE_ERROR_TYPES: &[&str] = &["api_error", "overloaded_error"];
+
+/// Classify an API error message as retryable or non-retryable.
+///
+/// Parses error messages from the Anthropic API to determine if they should
+/// be retried. Handles multiple error formats:
+/// - `"API Error: 500 {"type":"error","error":{"type":"api_error",...}}"`
+/// - `"Error: {"type":"error","error":{"type":"api_error",...}}"`
+/// - Raw JSON: `{"type":"error","error":{"type":"api_error",...}}`
+/// - Plain text containing error type keywords
+///
+/// **Retryable** (5xx): `api_error`, `overloaded_error`
+/// **Non-retryable** (4xx): `invalid_request_error`, `authentication_error`,
+/// `rate_limit_error`, `not_found_error`, `permission_error`
+pub fn classify_api_error(error_message: &str) -> ApiErrorKind {
+    // Try to extract JSON from the error message and parse the error type
+    if let Some(json_start) = error_message.find('{') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&error_message[json_start..])
+        {
+            // Anthropic format: {"type":"error","error":{"type":"api_error","message":"..."}}
+            if let Some(error_type) = parsed
+                .get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+            {
+                if RETRYABLE_ERROR_TYPES.contains(&error_type) {
+                    return ApiErrorKind::Retryable(error_type.to_string());
+                }
+                return ApiErrorKind::NonRetryable(error_type.to_string());
+            }
+        }
+    }
+
+    // Fallback: check for known error type strings in the message text
+    for retryable in RETRYABLE_ERROR_TYPES {
+        if error_message.contains(retryable) {
+            return ApiErrorKind::Retryable(retryable.to_string());
+        }
+    }
+
+    // Check for HTTP 5xx status codes in the message
+    for code in &["500 ", "502 ", "503 ", "529 "] {
+        if error_message.contains(code) {
+            return ApiErrorKind::Retryable("http_5xx".to_string());
+        }
+    }
+
+    ApiErrorKind::NonRetryable("unknown".to_string())
 }
 
 #[cfg(test)]
@@ -721,6 +811,12 @@ mod tests {
             ChatEvent::AutoContinueStateChanged {
                 session_id: "sess-auto-3".into(),
                 enabled: false,
+            },
+            ChatEvent::Retrying {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 1000,
+                error_message: "api_error: Internal server error".into(),
             },
         ];
 
@@ -1306,5 +1402,157 @@ mod tests {
         }"#;
         let result: MessageSearchResult = serde_json::from_str(json).unwrap();
         assert!(result.workspace_slug.is_none());
+    }
+
+    // ====================================================================
+    // Retrying event
+    // ====================================================================
+
+    #[test]
+    fn test_retrying_event_serde_roundtrip() {
+        let event = ChatEvent::Retrying {
+            attempt: 2,
+            max_attempts: 3,
+            delay_ms: 2000,
+            error_message: "api_error: Internal server error".into(),
+        };
+        assert_eq!(event.event_type(), "retrying");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"retrying\""));
+        assert!(json.contains("\"attempt\":2"));
+        assert!(json.contains("\"max_attempts\":3"));
+        assert!(json.contains("\"delay_ms\":2000"));
+
+        let deserialized: ChatEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.event_type(), "retrying");
+    }
+
+    #[test]
+    fn test_retrying_event_deserialize_from_json() {
+        let json =
+            r#"{"type":"retrying","attempt":1,"max_attempts":3,"delay_ms":1000,"error_message":"api_error"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_type(), "retrying");
+        if let ChatEvent::Retrying {
+            attempt,
+            max_attempts,
+            delay_ms,
+            ..
+        } = event
+        {
+            assert_eq!(attempt, 1);
+            assert_eq!(max_attempts, 3);
+            assert_eq!(delay_ms, 1000);
+        } else {
+            panic!("Expected Retrying variant");
+        }
+    }
+
+    #[test]
+    fn test_retrying_event_fingerprint() {
+        let event = ChatEvent::Retrying {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 1000,
+            error_message: "err".into(),
+        };
+        assert_eq!(event.fingerprint(), Some("retrying:1:3".to_string()));
+    }
+
+    // ====================================================================
+    // classify_api_error
+    // ====================================================================
+
+    #[test]
+    fn test_classify_api_error_retryable_json() {
+        // Standard Anthropic 500 error format
+        let msg = r#"API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"},"request_id":"req_abc"}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(kind, ApiErrorKind::Retryable("api_error".into()));
+        assert!(kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_overloaded() {
+        let msg = r#"API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(kind, ApiErrorKind::Retryable("overloaded_error".into()));
+        assert!(kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_non_retryable_invalid_request() {
+        let msg = r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Bad request"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(
+            kind,
+            ApiErrorKind::NonRetryable("invalid_request_error".into())
+        );
+        assert!(!kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_non_retryable_auth() {
+        let msg = r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid API key"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(
+            kind,
+            ApiErrorKind::NonRetryable("authentication_error".into())
+        );
+        assert!(!kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_non_retryable_rate_limit() {
+        let msg = r#"API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(
+            kind,
+            ApiErrorKind::NonRetryable("rate_limit_error".into())
+        );
+        assert!(!kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_non_retryable_not_found() {
+        let msg = r#"{"type":"error","error":{"type":"not_found_error","message":"Not found"}}"#;
+        let kind = classify_api_error(msg);
+        assert_eq!(kind, ApiErrorKind::NonRetryable("not_found_error".into()));
+    }
+
+    #[test]
+    fn test_classify_api_error_fallback_keyword() {
+        // No JSON, but contains the keyword
+        let kind = classify_api_error("Something went wrong: api_error occurred");
+        assert_eq!(kind, ApiErrorKind::Retryable("api_error".into()));
+
+        let kind = classify_api_error("overloaded_error: try again");
+        assert_eq!(kind, ApiErrorKind::Retryable("overloaded_error".into()));
+    }
+
+    #[test]
+    fn test_classify_api_error_fallback_http_status() {
+        let kind = classify_api_error("HTTP 500 Internal Server Error");
+        assert_eq!(kind, ApiErrorKind::Retryable("http_5xx".into()));
+
+        let kind = classify_api_error("Error 503 Service Unavailable");
+        assert_eq!(kind, ApiErrorKind::Retryable("http_5xx".into()));
+
+        let kind = classify_api_error("Error 529 Overloaded");
+        assert_eq!(kind, ApiErrorKind::Retryable("http_5xx".into()));
+    }
+
+    #[test]
+    fn test_classify_api_error_unknown() {
+        let kind = classify_api_error("Something completely unknown happened");
+        assert_eq!(kind, ApiErrorKind::NonRetryable("unknown".into()));
+        assert!(!kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_empty_message() {
+        let kind = classify_api_error("");
+        assert_eq!(kind, ApiErrorKind::NonRetryable("unknown".into()));
     }
 }
