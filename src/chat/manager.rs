@@ -11,8 +11,8 @@
 
 use super::config::ChatConfig;
 use super::types::{
-    truncate_snippet, ChatEvent, ChatEventPage, ChatRequest, CreateSessionResponse,
-    MessageSearchHit, MessageSearchResult,
+    classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
+    CreateSessionResponse, MessageSearchHit, MessageSearchResult,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -614,6 +614,7 @@ impl ChatManager {
         let graph = self.graph.clone();
         let context_injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
+        let retry_config = self.config.retry.clone();
 
         tokio::spawn(async move {
             let mut subscriber = match nats.subscribe_rpc_send(&session_id).await {
@@ -865,6 +866,7 @@ impl ChatManager {
                             let injector = context_injector.clone();
                             let event_emitter_clone = event_emitter.clone();
                             let nats_clone = Some(nats.clone());
+                            let retry_config_clone = retry_config.clone();
 
                             tokio::spawn(async move {
                                 Self::stream_response(
@@ -887,6 +889,7 @@ impl ChatManager {
                                     sdk_control_rx,
                                     interrupt_token,
                                     auto_continue,
+                                    retry_config_clone,
                                 )
                                 .await;
                             });
@@ -1760,6 +1763,7 @@ impl ChatManager {
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
         let nats = self.nats.clone();
+        let retry_config = self.config.retry.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -1782,6 +1786,7 @@ impl ChatManager {
                 sdk_control_rx,
                 interrupt_token,
                 auto_continue,
+                retry_config,
             )
             .await;
         });
@@ -1816,6 +1821,7 @@ impl ChatManager {
         >,
         interrupt_token: CancellationToken,
         auto_continue: Arc<AtomicBool>,
+        retry_config: super::config::RetryConfig,
     ) {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
@@ -1860,23 +1866,14 @@ impl ChatManager {
 
         // Events are persisted in Neo4j — the WebSocket replay handles late-joining clients.
 
-        // Use send_and_receive_stream() for real-time token streaming.
-        // The stream's lifetime is tied to the MutexGuard, so we hold the client lock
-        // during the stream. However, the underlying transport uses separate stdin/stdout
-        // channels, so other operations (like interrupt) can still proceed via the
-        // interrupt_flag mechanism.
+        // Variables that persist across retry iterations (needed after the retry loop)
+        let session_uuid = Uuid::parse_str(&session_id).ok();
         let mut assistant_text_parts: Vec<String> = Vec::new();
         let mut events_to_persist: Vec<ChatEventRecord> = Vec::new();
-        // Maps tool_use ID → index in events_to_persist, so we can update
-        // the persisted record when AssistantMessage provides the full input.
         let mut emitted_tool_use_ids: std::collections::HashMap<String, Option<usize>> =
             std::collections::HashMap::new();
-        // Track pending tool calls (ToolUse without a corresponding ToolResult).
-        // Maps tool_use ID → parent_tool_use_id. On interrupt, ToolCancelled is
-        // emitted for each remaining entry so the frontend stops showing "running...".
         let mut pending_tool_calls: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
-        let session_uuid = Uuid::parse_str(&session_id).ok();
 
         // Temporarily take the SDK control receiver from the shared slot.
         // This allows us to listen for control protocol messages (e.g., `can_use_tool`
@@ -1910,521 +1907,666 @@ impl ChatManager {
             c.hook_callbacks()
         };
 
-        {
-            let mut c = client.lock().await;
-            let stream_result = c.send_and_receive_stream(prompt).await;
+        // ===== RETRY LOOP =====
+        // Wraps the entire streaming block. On retryable API errors (500, 529) with
+        // 0 tokens emitted, we retry with exponential backoff instead of propagating.
+        let mut retry_attempt = 0u32;
 
-            let mut stream = match stream_result {
-                Ok(s) => std::pin::pin!(s),
-                Err(e) => {
-                    error!("Error starting stream for session {}: {}", session_id, e);
-                    emit_chat(
-                        ChatEvent::Error {
-                            message: format!("Error: {}", e),
-                            parent_tool_use_id: None,
-                        },
-                        &events_tx,
-                        &nats,
-                        &session_id,
-                    );
-                    is_streaming.store(false, Ordering::SeqCst);
-                    if let Some(ref emitter) = event_emitter {
-                        emitter.emit_updated(
-                            crate::events::EntityType::ChatSession,
-                            &session_id,
-                            serde_json::json!({ "is_streaming": false }),
-                            None,
-                        );
-                    }
-                    streaming_text.lock().await.clear();
-                    streaming_events.lock().await.clear();
-                    return;
-                }
-            };
+        'retry_loop: loop {
+            // Per-attempt state — reset on each retry iteration
+            let mut should_retry = false;
+            let mut last_retry_error = String::new();
 
-            // Track the current parent_tool_use_id from stream events.
-            // When a sub-agent is active, its stream Messages carry parent_tool_use_id.
-            // We capture this so permission requests (which arrive via a separate control
-            // channel without parent info) can be attributed to the correct agent.
-            let mut current_parent_tool_use_id: Option<String> = None;
+            // Reset per-attempt accumulators (they may have partial data from a failed attempt)
+            if retry_attempt > 0 {
+                assistant_text_parts.clear();
+                events_to_persist.clear();
+                emitted_tool_use_ids.clear();
+                pending_tool_calls.clear();
+                streaming_text.lock().await.clear();
+                streaming_events.lock().await.clear();
+            }
 
-            // Helper closure: process an SDK control message (permission or AskUserQuestion).
-            // Returns Some(ChatEvent) if a can_use_tool was parsed, None otherwise.
-            // The caller is responsible for adding the event to streaming_events (async)
-            // and for auto-allowing AskUserQuestion events via stdin_tx.
-            let handle_control_msg = |control_msg: serde_json::Value,
-                                      events_to_persist: &mut Vec<ChatEventRecord>,
-                                      next_seq: &std::sync::atomic::AtomicI64,
-                                      current_parent: Option<String>|
-             -> Option<ChatEvent> {
-                let event = parse_permission_control_msg(&control_msg, current_parent)?;
+            {
+                let mut c = client.lock().await;
 
-                match &event {
-                    ChatEvent::PermissionRequest { id, tool, .. } => {
-                        info!(
-                            session_id = %session_id,
-                            tool = %tool,
-                            request_id = %id,
-                            "Permission request from CLI"
-                        );
-                    }
-                    ChatEvent::AskUserQuestion { id, .. } => {
-                        info!(
-                            session_id = %session_id,
-                            request_id = %id,
-                            "AskUserQuestion from CLI (will auto-allow)"
-                        );
-                    }
-                    _ => {}
-                }
+                // Try to start the stream. If it fails with a retryable error,
+                // set should_retry and break to the retry decision block.
+                let stream_start = c.send_and_receive_stream(prompt.clone()).await;
+                let stream_ok = match stream_start {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        let err_str = format!("{}", e);
+                        let kind = classify_api_error(&err_str);
 
-                // Persist the event
-                if let Some(uuid) = session_uuid {
-                    let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-                    events_to_persist.push(ChatEventRecord {
-                        id: Uuid::new_v4(),
-                        session_id: uuid,
-                        seq,
-                        event_type: event.event_type().to_string(),
-                        data: serde_json::to_string(&event).unwrap_or_default(),
-                        created_at: chrono::Utc::now(),
-                    });
-                }
-
-                // Broadcast to WebSocket clients
-                emit_chat(event.clone(), &events_tx, &nats, &session_id);
-                Some(event)
-            };
-
-            // Main stream loop — uses tokio::select! to listen for BOTH stream
-            // events AND SDK control messages (permission requests) concurrently.
-            //
-            // BUG FIX: Previously used `stream.next().await` followed by
-            // `rx.try_recv()`. When the CLI blocks waiting for permission approval,
-            // it stops sending stream events, so `stream.next()` would never yield
-            // and `try_recv()` was never reached — permission requests were lost.
-            //
-            // Now we select! between the two sources so control messages are
-            // processed even when the stream is idle (waiting for permission).
-            loop {
-                let result = if let Some(ref mut rx) = sdk_control_rx {
-                    tokio::select! {
-                        biased;  // Prioritize interrupt > control messages > stream events
-
-                        // Interrupt token: immediately unblocks the select! when cancelled,
-                        // even if stream.next() is blocked waiting for CLI output (e.g., sleep 60).
-                        // This is the core fix for the interrupt-during-long-tool bug.
-                        _ = interrupt_token.cancelled() => {
-                            info!(
-                                "Interrupt token cancelled during stream for session {}",
-                                session_id
-                            );
-                            break;
-                        }
-
-                        control_msg = rx.recv() => {
-                            match control_msg {
-                                Some(msg) => {
-                                    // Hook callbacks: dispatch via lock-free registry, send response via stdin_tx
-                                    if is_hook_callback(&msg) {
-                                        let request_id = msg.get("request_id")
-                                            .or_else(|| msg.get("request").and_then(|r| r.get("request_id")))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        if let Some(result) = dispatch_hook_from_registry(&msg, &hook_callbacks_registry).await {
-                                            info!(session_id = %session_id, request_id = %request_id, "Hook callback dispatched");
-                                            if let Some(ref tx) = stdin_tx_for_auto_allow {
-                                                let response_json = build_hook_response_json(&request_id, &result);
-                                                let _ = tx.send(response_json).await;
-                                                debug!(request_id = %request_id, "Hook response sent to CLI");
-                                            }
-                                        }
-                                        continue;
-                                    }
-
-                                    if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
-                                        // AskUserQuestion: auto-allow the control request so the CLI
-                                        // waits for the tool_result (user's answer) instead of blocking.
-                                        // Do NOT store in pending_perm_inputs (it's not a permission).
-                                        if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
-                                            if let Some(ref tx) = stdin_tx_for_auto_allow {
-                                                let control_response = serde_json::json!({
-                                                    "type": "control_response",
-                                                    "response": {
-                                                        "subtype": "success",
-                                                        "request_id": id,
-                                                        "response": {
-                                                            "behavior": "allow",
-                                                            "updatedInput": input
-                                                        }
-                                                    }
-                                                });
-                                                if let Ok(json) = serde_json::to_string(&control_response) {
-                                                    let _ = tx.send(json).await;
-                                                    info!(request_id = %id, "Auto-allowed AskUserQuestion control request");
-                                                }
-                                            }
-                                        } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
-                                            // Regular permission: store original input for later response
-                                            if !id.is_empty() {
-                                                store_pending_perm_input(&pending_perm_inputs, id, input).await;
-                                            }
-                                        }
-                                        streaming_events.lock().await.push(evt);
-                                    }
-                                    continue; // Go back to select! for next event
-                                }
-                                None => {
-                                    debug!("SDK control channel closed");
-                                    sdk_control_rx = None;
-                                    continue;
-                                }
-                            }
-                        }
-
-                        stream_item = stream.next() => {
-                            match stream_item {
-                                Some(result) => {
-                                    // Also drain any buffered control messages
-                                    while let Ok(msg) = rx.try_recv() {
-                                        // Hook callbacks: dispatch inline (same as select! branch)
-                                        if is_hook_callback(&msg) {
-                                            let request_id = msg.get("request_id")
-                                                .or_else(|| msg.get("request").and_then(|r| r.get("request_id")))
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            if let Some(result) = dispatch_hook_from_registry(&msg, &hook_callbacks_registry).await {
-                                                info!(session_id = %session_id, request_id = %request_id, "Hook callback dispatched (drain)");
-                                                if let Some(ref tx) = stdin_tx_for_auto_allow {
-                                                    let response_json = build_hook_response_json(&request_id, &result);
-                                                    let _ = tx.try_send(response_json);
-                                                }
-                                            }
-                                            continue;
-                                        }
-
-                                        if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
-                                            // AskUserQuestion: auto-allow (same logic as above)
-                                            if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
-                                                if let Some(ref tx) = stdin_tx_for_auto_allow {
-                                                    let control_response = serde_json::json!({
-                                                        "type": "control_response",
-                                                        "response": {
-                                                            "subtype": "success",
-                                                            "request_id": id,
-                                                            "response": {
-                                                                "behavior": "allow",
-                                                                "updatedInput": input
-                                                            }
-                                                        }
-                                                    });
-                                                    if let Ok(json) = serde_json::to_string(&control_response) {
-                                                        // try_send here because we're in a sync-ish drain loop
-                                                        let _ = tx.try_send(json);
-                                                        info!(request_id = %id, "Auto-allowed AskUserQuestion control request (drain)");
-                                                    }
-                                                }
-                                            } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
-                                                if !id.is_empty() {
-                                                    store_pending_perm_input(&pending_perm_inputs, id, input).await;
-                                                }
-                                            }
-                                            streaming_events.lock().await.push(evt);
-                                        }
-                                    }
-                                    result
-                                }
-                                None => break, // Stream ended
-                            }
-                        }
-                    }
-                } else {
-                    // No control channel — use select! with interrupt token + stream
-                    tokio::select! {
-                        biased;
-
-                        _ = interrupt_token.cancelled() => {
-                            info!(
-                                "Interrupt token cancelled during stream for session {} (no control channel)",
-                                session_id
-                            );
-                            break;
-                        }
-
-                        stream_item = stream.next() => {
-                            match stream_item {
-                                Some(result) => result,
-                                None => break,
-                            }
-                        }
-                    }
-                };
-
-                match result {
-                    Ok(ref msg) => {
-                        // Track the current parent_tool_use_id from every stream message.
-                        // This is used by handle_control_msg to attribute permission
-                        // requests to the correct sub-agent. We update on every message
-                        // (including top-level ones where parent is None) so the tracker
-                        // resets correctly when switching between agents.
-                        current_parent_tool_use_id =
-                            msg.parent_tool_use_id().map(|s| s.to_string());
-
-                        // Handle StreamEvent — emit StreamDelta for text tokens directly
-                        // stream_delta are NOT persisted (too many writes)
-                        if let Message::StreamEvent {
-                            event:
-                                StreamEventData::ContentBlockDelta {
-                                    delta: StreamDelta::TextDelta { ref text },
-                                    ..
-                                },
-                            ..
-                        } = msg
+                        if kind.is_retryable()
+                            && retry_attempt < retry_config.max_attempts
+                            && !interrupt_flag.load(Ordering::SeqCst)
                         {
-                            let parent = msg.parent_tool_use_id().map(|s| s.to_string());
-                            // Accumulate for mid-stream join snapshot
-                            streaming_text.lock().await.push_str(text);
+                            // Retryable — set flag, will handle after client lock release
+                            should_retry = true;
+                            last_retry_error = err_str;
+                        } else {
+                            // Not retryable or max retries exceeded — propagate error
+                            error!("Error starting stream for session {}: {}", session_id, e);
                             emit_chat(
-                                ChatEvent::StreamDelta {
-                                    text: text.clone(),
-                                    parent_tool_use_id: parent,
+                                ChatEvent::Error {
+                                    message: format!("Error: {}", e),
+                                    parent_tool_use_id: None,
                                 },
                                 &events_tx,
                                 &nats,
                                 &session_id,
                             );
-                            continue;
+                            is_streaming.store(false, Ordering::SeqCst);
+                            if let Some(ref emitter) = event_emitter {
+                                emitter.emit_updated(
+                                    crate::events::EntityType::ChatSession,
+                                    &session_id,
+                                    serde_json::json!({ "is_streaming": false }),
+                                    None,
+                                );
+                            }
+                            streaming_text.lock().await.clear();
+                            streaming_events.lock().await.clear();
+                            return;
+                        }
+                        None
+                    }
+                };
+
+                if let Some(s) = stream_ok {
+                    let mut stream = std::pin::pin!(s);
+
+                    // Track the current parent_tool_use_id from stream events.
+                    // When a sub-agent is active, its stream Messages carry parent_tool_use_id.
+                    // We capture this so permission requests (which arrive via a separate control
+                    // channel without parent info) can be attributed to the correct agent.
+                    let mut current_parent_tool_use_id: Option<String> = None;
+
+                    // Helper closure: process an SDK control message (permission or AskUserQuestion).
+                    // Returns Some(ChatEvent) if a can_use_tool was parsed, None otherwise.
+                    // The caller is responsible for adding the event to streaming_events (async)
+                    // and for auto-allowing AskUserQuestion events via stdin_tx.
+                    let handle_control_msg = |control_msg: serde_json::Value,
+                                              events_to_persist: &mut Vec<ChatEventRecord>,
+                                              next_seq: &std::sync::atomic::AtomicI64,
+                                              current_parent: Option<String>|
+                     -> Option<ChatEvent> {
+                        let event = parse_permission_control_msg(&control_msg, current_parent)?;
+
+                        match &event {
+                            ChatEvent::PermissionRequest { id, tool, .. } => {
+                                info!(
+                                    session_id = %session_id,
+                                    tool = %tool,
+                                    request_id = %id,
+                                    "Permission request from CLI"
+                                );
+                            }
+                            ChatEvent::AskUserQuestion { id, .. } => {
+                                info!(
+                                    session_id = %session_id,
+                                    request_id = %id,
+                                    "AskUserQuestion from CLI (will auto-allow)"
+                                );
+                            }
+                            _ => {}
                         }
 
-                        // Extract cli_session_id from Result message
-                        if let Message::Result {
-                            session_id: ref cli_sid,
-                            total_cost_usd: ref cost,
-                            ..
-                        } = msg
-                        {
-                            // Update Neo4j with cli_session_id and cost
-                            if let Some(uuid) = session_uuid {
-                                let _ = graph
-                                    .update_chat_session(
-                                        uuid,
-                                        Some(cli_sid.clone()),
-                                        None,
-                                        Some(1),
-                                        *cost,
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                            }
-
-                            // Update active session's cli_session_id
-                            let mut sessions = active_sessions.write().await;
-                            if let Some(active) = sessions.get_mut(&session_id) {
-                                active.cli_session_id = Some(cli_sid.clone());
-                                active.last_activity = Instant::now();
-                            }
+                        // Persist the event
+                        if let Some(uuid) = session_uuid {
+                            let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                            events_to_persist.push(ChatEventRecord {
+                                id: Uuid::new_v4(),
+                                session_id: uuid,
+                                seq,
+                                event_type: event.event_type().to_string(),
+                                data: serde_json::to_string(&event).unwrap_or_default(),
+                                created_at: chrono::Utc::now(),
+                            });
                         }
 
-                        // Extract cli_session_id and model from System init message
-                        if let Message::System { subtype, ref data } = msg {
-                            if subtype == "init" {
-                                let cli_sid = data
-                                    .get("session_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if let Some(uuid) = session_uuid {
-                                    let _ = graph
-                                        .update_chat_session(
-                                            uuid,
-                                            Some(cli_sid.clone()),
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                        )
-                                        .await;
+                        // Broadcast to WebSocket clients
+                        emit_chat(event.clone(), &events_tx, &nats, &session_id);
+                        Some(event)
+                    };
+
+                    // Main stream loop — uses tokio::select! to listen for BOTH stream
+                    // events AND SDK control messages (permission requests) concurrently.
+                    //
+                    // BUG FIX: Previously used `stream.next().await` followed by
+                    // `rx.try_recv()`. When the CLI blocks waiting for permission approval,
+                    // it stops sending stream events, so `stream.next()` would never yield
+                    // and `try_recv()` was never reached — permission requests were lost.
+                    //
+                    // Now we select! between the two sources so control messages are
+                    // processed even when the stream is idle (waiting for permission).
+                    loop {
+                        let result = if let Some(ref mut rx) = sdk_control_rx {
+                            tokio::select! {
+                                biased;  // Prioritize interrupt > control messages > stream events
+
+                                // Interrupt token: immediately unblocks the select! when cancelled,
+                                // even if stream.next() is blocked waiting for CLI output (e.g., sleep 60).
+                                // This is the core fix for the interrupt-during-long-tool bug.
+                                _ = interrupt_token.cancelled() => {
+                                    info!(
+                                        "Interrupt token cancelled during stream for session {}",
+                                        session_id
+                                    );
+                                    break;
                                 }
-                                // Update active session
-                                let mut sessions = active_sessions.write().await;
-                                if let Some(active) = sessions.get_mut(&session_id) {
-                                    active.cli_session_id = Some(cli_sid);
-                                    active.last_activity = Instant::now();
+
+                                control_msg = rx.recv() => {
+                                    match control_msg {
+                                        Some(msg) => {
+                                            // Hook callbacks: dispatch via lock-free registry, send response via stdin_tx
+                                            if is_hook_callback(&msg) {
+                                                let request_id = msg.get("request_id")
+                                                    .or_else(|| msg.get("request").and_then(|r| r.get("request_id")))
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                if let Some(result) = dispatch_hook_from_registry(&msg, &hook_callbacks_registry).await {
+                                                    info!(session_id = %session_id, request_id = %request_id, "Hook callback dispatched");
+                                                    if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                        let response_json = build_hook_response_json(&request_id, &result);
+                                                        let _ = tx.send(response_json).await;
+                                                        debug!(request_id = %request_id, "Hook response sent to CLI");
+                                                    }
+                                                }
+                                                continue;
+                                            }
+
+                                            if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
+                                                // AskUserQuestion: auto-allow the control request so the CLI
+                                                // waits for the tool_result (user's answer) instead of blocking.
+                                                // Do NOT store in pending_perm_inputs (it's not a permission).
+                                                if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
+                                                    if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                        let control_response = serde_json::json!({
+                                                            "type": "control_response",
+                                                            "response": {
+                                                                "subtype": "success",
+                                                                "request_id": id,
+                                                                "response": {
+                                                                    "behavior": "allow",
+                                                                    "updatedInput": input
+                                                                }
+                                                            }
+                                                        });
+                                                        if let Ok(json) = serde_json::to_string(&control_response) {
+                                                            let _ = tx.send(json).await;
+                                                            info!(request_id = %id, "Auto-allowed AskUserQuestion control request");
+                                                        }
+                                                    }
+                                                } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                                    // Regular permission: store original input for later response
+                                                    if !id.is_empty() {
+                                                        store_pending_perm_input(&pending_perm_inputs, id, input).await;
+                                                    }
+                                                }
+                                                streaming_events.lock().await.push(evt);
+                                            }
+                                            continue; // Go back to select! for next event
+                                        }
+                                        None => {
+                                            debug!("SDK control channel closed");
+                                            sdk_control_rx = None;
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                stream_item = stream.next() => {
+                                    match stream_item {
+                                        Some(result) => {
+                                            // Also drain any buffered control messages
+                                            while let Ok(msg) = rx.try_recv() {
+                                                // Hook callbacks: dispatch inline (same as select! branch)
+                                                if is_hook_callback(&msg) {
+                                                    let request_id = msg.get("request_id")
+                                                        .or_else(|| msg.get("request").and_then(|r| r.get("request_id")))
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    if let Some(result) = dispatch_hook_from_registry(&msg, &hook_callbacks_registry).await {
+                                                        info!(session_id = %session_id, request_id = %request_id, "Hook callback dispatched (drain)");
+                                                        if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                            let response_json = build_hook_response_json(&request_id, &result);
+                                                            let _ = tx.try_send(response_json);
+                                                        }
+                                                    }
+                                                    continue;
+                                                }
+
+                                                if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
+                                                    // AskUserQuestion: auto-allow (same logic as above)
+                                                    if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
+                                                        if let Some(ref tx) = stdin_tx_for_auto_allow {
+                                                            let control_response = serde_json::json!({
+                                                                "type": "control_response",
+                                                                "response": {
+                                                                    "subtype": "success",
+                                                                    "request_id": id,
+                                                                    "response": {
+                                                                        "behavior": "allow",
+                                                                        "updatedInput": input
+                                                                    }
+                                                                }
+                                                            });
+                                                            if let Ok(json) = serde_json::to_string(&control_response) {
+                                                                // try_send here because we're in a sync-ish drain loop
+                                                                let _ = tx.try_send(json);
+                                                                info!(request_id = %id, "Auto-allowed AskUserQuestion control request (drain)");
+                                                            }
+                                                        }
+                                                    } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                                        if !id.is_empty() {
+                                                            store_pending_perm_input(&pending_perm_inputs, id, input).await;
+                                                        }
+                                                    }
+                                                    streaming_events.lock().await.push(evt);
+                                                }
+                                            }
+                                            result
+                                        }
+                                        None => break, // Stream ended
+                                    }
                                 }
                             }
-                        }
+                        } else {
+                            // No control channel — use select! with interrupt token + stream
+                            tokio::select! {
+                                biased;
 
-                        // Collect assistant text for memory
-                        if let Message::Assistant {
-                            message: ref am, ..
-                        } = msg
-                        {
-                            for block in &am.content {
-                                if let ContentBlock::Text(t) = block {
-                                    assistant_text_parts.push(t.text.clone());
+                                _ = interrupt_token.cancelled() => {
+                                    info!(
+                                        "Interrupt token cancelled during stream for session {} (no control channel)",
+                                        session_id
+                                    );
+                                    break;
+                                }
+
+                                stream_item = stream.next() => {
+                                    match stream_item {
+                                        Some(result) => result,
+                                        None => break,
+                                    }
                                 }
                             }
-                        }
+                        };
 
-                        // Convert to ChatEvent(s) and emit + persist structured events
-                        let events = Self::message_to_events(msg);
-                        for event in events {
-                            // Deduplicate ToolUse events — ContentBlockStart and
-                            // AssistantMessage can both produce the same tool_use.
-                            //
-                            // ContentBlockStart arrives first with input: {} (empty),
-                            // AssistantMessage arrives later with the FULL input params.
-                            //
-                            // Strategy:
-                            // 1. First occurrence (ContentBlockStart): emit + persist normally
-                            // 2. Second occurrence (AssistantMessage): DON'T re-emit to broadcast
-                            //    (clients already have the tool_use), but UPDATE the persisted
-                            //    record and streaming_events with the full input.
-                            if let ChatEvent::ToolUse {
-                                ref id,
-                                ref input,
-                                ref parent_tool_use_id,
-                                ..
-                            } = event
-                            {
-                                if let Some(persist_idx) = emitted_tool_use_ids.get(id) {
-                                    // Duplicate — update persisted record with full input
-                                    let has_real_input = input.is_object()
-                                        && input.as_object().is_some_and(|o| !o.is_empty());
-                                    if has_real_input {
-                                        if let Some(idx) = persist_idx {
-                                            if let Some(record) = events_to_persist.get_mut(*idx) {
-                                                record.data = serde_json::to_string(&event)
-                                                    .unwrap_or_default();
-                                                debug!(
+                        match result {
+                            Ok(ref msg) => {
+                                // Track the current parent_tool_use_id from every stream message.
+                                // This is used by handle_control_msg to attribute permission
+                                // requests to the correct sub-agent. We update on every message
+                                // (including top-level ones where parent is None) so the tracker
+                                // resets correctly when switching between agents.
+                                current_parent_tool_use_id =
+                                    msg.parent_tool_use_id().map(|s| s.to_string());
+
+                                // Handle StreamEvent — emit StreamDelta for text tokens directly
+                                // stream_delta are NOT persisted (too many writes)
+                                if let Message::StreamEvent {
+                                    event:
+                                        StreamEventData::ContentBlockDelta {
+                                            delta: StreamDelta::TextDelta { ref text },
+                                            ..
+                                        },
+                                    ..
+                                } = msg
+                                {
+                                    let parent = msg.parent_tool_use_id().map(|s| s.to_string());
+                                    // Accumulate for mid-stream join snapshot
+                                    streaming_text.lock().await.push_str(text);
+                                    emit_chat(
+                                        ChatEvent::StreamDelta {
+                                            text: text.clone(),
+                                            parent_tool_use_id: parent,
+                                        },
+                                        &events_tx,
+                                        &nats,
+                                        &session_id,
+                                    );
+                                    continue;
+                                }
+
+                                // Extract cli_session_id from Result message
+                                if let Message::Result {
+                                    session_id: ref cli_sid,
+                                    total_cost_usd: ref cost,
+                                    ..
+                                } = msg
+                                {
+                                    // Update Neo4j with cli_session_id and cost
+                                    if let Some(uuid) = session_uuid {
+                                        let _ = graph
+                                            .update_chat_session(
+                                                uuid,
+                                                Some(cli_sid.clone()),
+                                                None,
+                                                Some(1),
+                                                *cost,
+                                                None,
+                                                None,
+                                            )
+                                            .await;
+                                    }
+
+                                    // Update active session's cli_session_id
+                                    let mut sessions = active_sessions.write().await;
+                                    if let Some(active) = sessions.get_mut(&session_id) {
+                                        active.cli_session_id = Some(cli_sid.clone());
+                                        active.last_activity = Instant::now();
+                                    }
+                                }
+
+                                // Extract cli_session_id and model from System init message
+                                if let Message::System { subtype, ref data } = msg {
+                                    if subtype == "init" {
+                                        let cli_sid = data
+                                            .get("session_id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if let Some(uuid) = session_uuid {
+                                            let _ = graph
+                                                .update_chat_session(
+                                                    uuid,
+                                                    Some(cli_sid.clone()),
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    None,
+                                                )
+                                                .await;
+                                        }
+                                        // Update active session
+                                        let mut sessions = active_sessions.write().await;
+                                        if let Some(active) = sessions.get_mut(&session_id) {
+                                            active.cli_session_id = Some(cli_sid);
+                                            active.last_activity = Instant::now();
+                                        }
+                                    }
+                                }
+
+                                // Check for retryable API error in Result message.
+                                // If retryable and no tokens were emitted, skip event emission
+                                // and break to retry the entire stream.
+                                if let Message::Result {
+                                    is_error: true,
+                                    result: Some(ref text),
+                                    ..
+                                } = msg
+                                {
+                                    let kind = classify_api_error(text);
+                                    let text_empty = streaming_text.lock().await.is_empty();
+                                    if kind.is_retryable()
+                                        && text_empty
+                                        && retry_attempt < retry_config.max_attempts
+                                        && !interrupt_flag.load(Ordering::SeqCst)
+                                    {
+                                        should_retry = true;
+                                        last_retry_error = text.clone();
+                                        break; // break inner stream loop
+                                    }
+                                }
+
+                                // Collect assistant text for memory
+                                if let Message::Assistant {
+                                    message: ref am, ..
+                                } = msg
+                                {
+                                    for block in &am.content {
+                                        if let ContentBlock::Text(t) = block {
+                                            assistant_text_parts.push(t.text.clone());
+                                        }
+                                    }
+                                }
+
+                                // Convert to ChatEvent(s) and emit + persist structured events
+                                let events = Self::message_to_events(msg);
+                                for event in events {
+                                    // Deduplicate ToolUse events — ContentBlockStart and
+                                    // AssistantMessage can both produce the same tool_use.
+                                    //
+                                    // ContentBlockStart arrives first with input: {} (empty),
+                                    // AssistantMessage arrives later with the FULL input params.
+                                    //
+                                    // Strategy:
+                                    // 1. First occurrence (ContentBlockStart): emit + persist normally
+                                    // 2. Second occurrence (AssistantMessage): DON'T re-emit to broadcast
+                                    //    (clients already have the tool_use), but UPDATE the persisted
+                                    //    record and streaming_events with the full input.
+                                    if let ChatEvent::ToolUse {
+                                        ref id,
+                                        ref input,
+                                        ref parent_tool_use_id,
+                                        ..
+                                    } = event
+                                    {
+                                        if let Some(persist_idx) = emitted_tool_use_ids.get(id) {
+                                            // Duplicate — update persisted record with full input
+                                            let has_real_input = input.is_object()
+                                                && input.as_object().is_some_and(|o| !o.is_empty());
+                                            if has_real_input {
+                                                if let Some(idx) = persist_idx {
+                                                    if let Some(record) =
+                                                        events_to_persist.get_mut(*idx)
+                                                    {
+                                                        record.data = serde_json::to_string(&event)
+                                                            .unwrap_or_default();
+                                                        debug!(
                                                     "Updated persisted ToolUse input for id={}",
                                                     id
                                                 );
-                                            }
-                                        }
-                                        // Also update in streaming_events snapshot
-                                        let mut se = streaming_events.lock().await;
-                                        if let Some(existing) = se.iter_mut().find(|e| {
+                                                    }
+                                                }
+                                                // Also update in streaming_events snapshot
+                                                let mut se = streaming_events.lock().await;
+                                                if let Some(existing) = se.iter_mut().find(|e| {
                                             matches!(e, ChatEvent::ToolUse { id: ref eid, .. } if eid == id)
                                         }) {
                                             *existing = event.clone();
                                         }
-                                        // Emit ToolUseInputResolved so the frontend can
-                                        // update the existing tool_use block's input
-                                        emit_chat(
-                                            ChatEvent::ToolUseInputResolved {
-                                                id: id.clone(),
-                                                input: input.clone(),
-                                                parent_tool_use_id: parent_tool_use_id.clone(),
-                                            },
-                                            &events_tx,
-                                            &nats,
-                                            &session_id,
-                                        );
+                                                // Emit ToolUseInputResolved so the frontend can
+                                                // update the existing tool_use block's input
+                                                emit_chat(
+                                                    ChatEvent::ToolUseInputResolved {
+                                                        id: id.clone(),
+                                                        input: input.clone(),
+                                                        parent_tool_use_id: parent_tool_use_id
+                                                            .clone(),
+                                                    },
+                                                    &events_tx,
+                                                    &nats,
+                                                    &session_id,
+                                                );
+                                            }
+                                            debug!("Skipping duplicate ToolUse broadcast (id={}), sent input_resolved", id);
+                                            continue;
+                                        }
+                                        // First occurrence — record it
+                                        emitted_tool_use_ids.insert(id.clone(), None);
+                                        // Track as pending (no ToolResult yet)
+                                        pending_tool_calls
+                                            .insert(id.clone(), parent_tool_use_id.clone());
                                     }
-                                    debug!("Skipping duplicate ToolUse broadcast (id={}), sent input_resolved", id);
-                                    continue;
-                                }
-                                // First occurrence — record it
-                                emitted_tool_use_ids.insert(id.clone(), None);
-                                // Track as pending (no ToolResult yet)
-                                pending_tool_calls.insert(id.clone(), parent_tool_use_id.clone());
-                            }
 
-                            // When a ToolResult arrives, the tool is no longer pending
-                            if let ChatEvent::ToolResult { ref id, .. } = event {
-                                pending_tool_calls.remove(id);
-                            }
-
-                            // Persist structured events (skip transient: stream_delta, streaming_status)
-                            if !matches!(
-                                event,
-                                ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. }
-                            ) {
-                                if let Some(uuid) = session_uuid {
-                                    let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-                                    let persist_idx = events_to_persist.len();
-                                    events_to_persist.push(ChatEventRecord {
-                                        id: Uuid::new_v4(),
-                                        session_id: uuid,
-                                        seq,
-                                        event_type: event.event_type().to_string(),
-                                        data: serde_json::to_string(&event).unwrap_or_default(),
-                                        created_at: chrono::Utc::now(),
-                                    });
-                                    // Track persist index for ToolUse so we can update later
-                                    if let ChatEvent::ToolUse { ref id, .. } = event {
-                                        emitted_tool_use_ids.insert(id.clone(), Some(persist_idx));
+                                    // When a ToolResult arrives, the tool is no longer pending
+                                    if let ChatEvent::ToolResult { ref id, .. } = event {
+                                        pending_tool_calls.remove(id);
                                     }
+
+                                    // Persist structured events (skip transient: stream_delta, streaming_status)
+                                    if !matches!(
+                                        event,
+                                        ChatEvent::StreamDelta { .. }
+                                            | ChatEvent::StreamingStatus { .. }
+                                    ) {
+                                        if let Some(uuid) = session_uuid {
+                                            let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                                            let persist_idx = events_to_persist.len();
+                                            events_to_persist.push(ChatEventRecord {
+                                                id: Uuid::new_v4(),
+                                                session_id: uuid,
+                                                seq,
+                                                event_type: event.event_type().to_string(),
+                                                data: serde_json::to_string(&event)
+                                                    .unwrap_or_default(),
+                                                created_at: chrono::Utc::now(),
+                                            });
+                                            // Track persist index for ToolUse so we can update later
+                                            if let ChatEvent::ToolUse { ref id, .. } = event {
+                                                emitted_tool_use_ids
+                                                    .insert(id.clone(), Some(persist_idx));
+                                            }
+                                        }
+                                    }
+
+                                    // Accumulate structured events for mid-stream join snapshot.
+                                    // Excluded:
+                                    // - StreamDelta: text is in streaming_text (sent as partial_text)
+                                    // - StreamingStatus: transient, sent explicitly in Phase 1.5
+                                    // - AssistantText: duplicates streaming_text content (sent as partial_text)
+                                    if !matches!(
+                                        event,
+                                        ChatEvent::StreamDelta { .. }
+                                            | ChatEvent::StreamingStatus { .. }
+                                            | ChatEvent::AssistantText { .. }
+                                    ) {
+                                        // Flush accumulated text before non-text events (ToolUse,
+                                        // ToolResult, etc.) so the snapshot preserves correct ordering.
+                                        // Without this, partial_text would contain "Text A + Text B"
+                                        // with no way to know Text A came before ToolUse.
+                                        // After flushing, partial_text only contains text streamed
+                                        // AFTER the last structured event.
+                                        {
+                                            let mut st = streaming_text.lock().await;
+                                            if !st.is_empty() {
+                                                // Note: streaming_text is a flat buffer that doesn't track
+                                                // per-agent text. The parent_tool_use_id is set to None here.
+                                                // The frontend uses individual streaming_events (which carry
+                                                // parent_tool_use_id) for agent grouping, not partial_text.
+                                                streaming_events.lock().await.push(
+                                                    ChatEvent::AssistantText {
+                                                        content: st.clone(),
+                                                        parent_tool_use_id: None,
+                                                    },
+                                                );
+                                                st.clear();
+                                            }
+                                        }
+                                        streaming_events.lock().await.push(event.clone());
+                                    }
+
+                                    // Detect error_max_turns for auto-continue
+                                    if let ChatEvent::Result { ref subtype, .. } = event {
+                                        if subtype == "error_max_turns" {
+                                            hit_error_max_turns = true;
+                                        }
+                                    }
+
+                                    emit_chat(event, &events_tx, &nats, &session_id);
                                 }
                             }
+                            Err(e) => {
+                                let err_str = format!("{}", e);
+                                let kind = classify_api_error(&err_str);
+                                let text_empty = streaming_text.lock().await.is_empty();
 
-                            // Accumulate structured events for mid-stream join snapshot.
-                            // Excluded:
-                            // - StreamDelta: text is in streaming_text (sent as partial_text)
-                            // - StreamingStatus: transient, sent explicitly in Phase 1.5
-                            // - AssistantText: duplicates streaming_text content (sent as partial_text)
-                            if !matches!(
-                                event,
-                                ChatEvent::StreamDelta { .. }
-                                    | ChatEvent::StreamingStatus { .. }
-                                    | ChatEvent::AssistantText { .. }
-                            ) {
-                                // Flush accumulated text before non-text events (ToolUse,
-                                // ToolResult, etc.) so the snapshot preserves correct ordering.
-                                // Without this, partial_text would contain "Text A + Text B"
-                                // with no way to know Text A came before ToolUse.
-                                // After flushing, partial_text only contains text streamed
-                                // AFTER the last structured event.
+                                if kind.is_retryable()
+                                    && text_empty
+                                    && retry_attempt < retry_config.max_attempts
+                                    && !interrupt_flag.load(Ordering::SeqCst)
                                 {
-                                    let mut st = streaming_text.lock().await;
-                                    if !st.is_empty() {
-                                        // Note: streaming_text is a flat buffer that doesn't track
-                                        // per-agent text. The parent_tool_use_id is set to None here.
-                                        // The frontend uses individual streaming_events (which carry
-                                        // parent_tool_use_id) for agent grouping, not partial_text.
-                                        streaming_events.lock().await.push(
-                                            ChatEvent::AssistantText {
-                                                content: st.clone(),
-                                                parent_tool_use_id: None,
-                                            },
-                                        );
-                                        st.clear();
-                                    }
+                                    // Retryable stream error with 0 tokens — will retry
+                                    should_retry = true;
+                                    last_retry_error = err_str;
+                                } else {
+                                    // Not retryable — propagate error
+                                    error!("Stream error for session {}: {}", session_id, e);
+                                    emit_chat(
+                                        ChatEvent::Error {
+                                            message: format!("Error: {}", e),
+                                            parent_tool_use_id: None,
+                                        },
+                                        &events_tx,
+                                        &nats,
+                                        &session_id,
+                                    );
                                 }
-                                streaming_events.lock().await.push(event.clone());
+                                break;
                             }
-
-                            // Detect error_max_turns for auto-continue
-                            if let ChatEvent::Result { ref subtype, .. } = event {
-                                if subtype == "error_max_turns" {
-                                    hit_error_max_turns = true;
-                                }
-                            }
-
-                            emit_chat(event, &events_tx, &nats, &session_id);
                         }
                     }
-                    Err(e) => {
-                        error!("Stream error for session {}: {}", session_id, e);
-                        emit_chat(
-                            ChatEvent::Error {
-                                message: format!("Error: {}", e),
-                                parent_tool_use_id: None,
-                            },
-                            &events_tx,
-                            &nats,
-                            &session_id,
-                        );
-                        break;
-                    }
+                } // end if let Some(s) = stream_ok
+            } // client lock released here
+
+            // ===== RETRY DECISION =====
+            // If should_retry is set (from stream item error or Result is_error),
+            // emit Retrying event, sleep with backoff, and continue the retry loop.
+            if should_retry {
+                retry_attempt += 1;
+                let delay = retry_config.delay_for_attempt(retry_attempt);
+                warn!(
+                    session_id = %session_id,
+                    attempt = retry_attempt,
+                    max_attempts = retry_config.max_attempts,
+                    delay_ms = delay,
+                    error = %last_retry_error,
+                    "Retryable stream error (0 tokens emitted), will retry"
+                );
+
+                // Emit Retrying event so frontend can show indicator
+                let retry_event = ChatEvent::Retrying {
+                    attempt: retry_attempt,
+                    max_attempts: retry_config.max_attempts,
+                    delay_ms: delay,
+                    error_message: last_retry_error.clone(),
+                };
+                emit_chat(retry_event.clone(), &events_tx, &nats, &session_id);
+
+                // Persist the Retrying event
+                if let Some(uuid) = session_uuid {
+                    let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                    let record = ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: uuid,
+                        seq,
+                        event_type: retry_event.event_type().to_string(),
+                        data: serde_json::to_string(&retry_event).unwrap_or_default(),
+                        created_at: chrono::Utc::now(),
+                    };
+                    let _ = graph.store_chat_events(uuid, vec![record]).await;
                 }
+
+                // Reset streaming buffers for the retry
+                streaming_text.lock().await.clear();
+                streaming_events.lock().await.clear();
+
+                // Interruptible backoff sleep
+                let cancelled = tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => false,
+                    _ = interrupt_token.cancelled() => true,
+                };
+                if cancelled {
+                    info!(
+                        session_id = %session_id,
+                        "Retry cancelled by interrupt during backoff"
+                    );
+                    break 'retry_loop;
+                }
+
+                continue 'retry_loop;
             }
-        } // client lock released here
+
+            break 'retry_loop;
+        } // end 'retry_loop
 
         // Put the SDK control receiver back into the shared slot so the next
         // stream_response invocation can reuse it (fixes permission requests
@@ -2681,6 +2823,7 @@ impl ChatManager {
                 shared_sdk_control_rx,
                 fresh_interrupt_token,
                 auto_continue,
+                retry_config,
             ))
             .await;
         }
@@ -2854,6 +2997,7 @@ impl ChatManager {
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
         let nats = self.nats.clone();
+        let retry_config = self.config.retry.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -2876,6 +3020,7 @@ impl ChatManager {
                 sdk_control_rx,
                 interrupt_token,
                 auto_continue,
+                retry_config,
             )
             .await;
         });
@@ -3510,6 +3655,7 @@ impl ChatManager {
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
         let nats = self.nats.clone();
+        let retry_config = self.config.retry.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -3532,6 +3678,7 @@ impl ChatManager {
                 sdk_control_rx,
                 interrupt_token,
                 auto_continue,
+                retry_config,
             )
             .await;
         });
@@ -4116,6 +4263,7 @@ mod tests {
             permission: crate::chat::config::PermissionConfig::default(),
             enable_oneshot_refinement: false,
             auto_continue: false,
+            retry: crate::chat::config::RetryConfig::default(),
         }
     }
 
