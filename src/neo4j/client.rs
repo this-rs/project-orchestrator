@@ -3600,18 +3600,16 @@ impl Neo4jClient {
 
         let mut resolved: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
-        match self.graph.execute(q).await {
-            Ok(mut result) => {
-                while let Ok(Some(row)) = result.next().await {
-                    if let (Ok(caller), Ok(callee)) = (
-                        row.get::<String>("resolved_caller"),
-                        row.get::<String>("resolved_callee"),
-                    ) {
-                        resolved.insert((caller, callee));
-                    }
+        // Phase 1 failure is not fatal — Phase 2 will try all calls
+        if let Ok(mut result) = self.graph.execute(q).await {
+            while let Ok(Some(row)) = result.next().await {
+                if let (Ok(caller), Ok(callee)) = (
+                    row.get::<String>("resolved_caller"),
+                    row.get::<String>("resolved_callee"),
+                ) {
+                    resolved.insert((caller, callee));
                 }
             }
-            Err(_) => {} // Phase 1 failure is not fatal, Phase 2 will try all
         }
 
         // Phase 2: project-scoped fallback for unresolved calls
