@@ -244,6 +244,307 @@ pub struct ImplementationPlanner {
 
 /// Maximum number of zones to consider
 const MAX_ZONES: usize = 20;
+
+/// Common stop words (French + English) that never appear in code and
+/// dilute Meilisearch keyword matching when the user's description is
+/// in natural language.
+const STOP_WORDS: &[&str] = &[
+    // French
+    "le",
+    "la",
+    "les",
+    "un",
+    "une",
+    "des",
+    "du",
+    "de",
+    "d",
+    "l",
+    "et",
+    "ou",
+    "en",
+    "au",
+    "aux",
+    "ce",
+    "ces",
+    "cette",
+    "mon",
+    "ma",
+    "mes",
+    "ton",
+    "ta",
+    "tes",
+    "son",
+    "sa",
+    "ses",
+    "notre",
+    "nos",
+    "votre",
+    "vos",
+    "leur",
+    "leurs",
+    "qui",
+    "que",
+    "quoi",
+    "dont",
+    "dans",
+    "sur",
+    "sous",
+    "avec",
+    "sans",
+    "pour",
+    "par",
+    "vers",
+    "chez",
+    "entre",
+    "comme",
+    "plus",
+    "moins",
+    "très",
+    "trop",
+    "je",
+    "tu",
+    "il",
+    "elle",
+    "nous",
+    "vous",
+    "ils",
+    "elles",
+    "on",
+    "ne",
+    "pas",
+    "est",
+    "sont",
+    "être",
+    "avoir",
+    "fait",
+    "faire",
+    "faut",
+    "peut",
+    "doit",
+    "dois",
+    "quand",
+    "si",
+    "mais",
+    "car",
+    "donc",
+    "ni",
+    "puis",
+    "aussi",
+    "bien",
+    "tout",
+    "tous",
+    "toute",
+    "toutes",
+    "même",
+    "autre",
+    "autres",
+    "quel",
+    "quelle",
+    "quels",
+    "quelles",
+    "chaque",
+    "quelque",
+    "quelques",
+    "comment",
+    "combien",
+    "où",
+    "ya",
+    "y",
+    "a",
+    "à",
+    // French verbs commonly used in feature descriptions
+    "ajouter",
+    "créer",
+    "modifier",
+    "supprimer",
+    "mettre",
+    "jour",
+    "implémenter",
+    "implementer",
+    "corriger",
+    "refactorer",
+    // English
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "shall",
+    "can",
+    "of",
+    "in",
+    "to",
+    "for",
+    "with",
+    "on",
+    "at",
+    "from",
+    "by",
+    "up",
+    "about",
+    "into",
+    "through",
+    "during",
+    "before",
+    "after",
+    "above",
+    "below",
+    "between",
+    "out",
+    "off",
+    "over",
+    "under",
+    "again",
+    "further",
+    "then",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "each",
+    "every",
+    "both",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "no",
+    "nor",
+    "not",
+    "only",
+    "own",
+    "same",
+    "so",
+    "than",
+    "too",
+    "very",
+    "and",
+    "but",
+    "or",
+    "if",
+    "while",
+    "as",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+    "i",
+    "me",
+    "my",
+    "we",
+    "our",
+    "you",
+    "your",
+    "he",
+    "him",
+    "his",
+    "she",
+    "her",
+    "they",
+    "them",
+    "their",
+    "what",
+    "which",
+    "who",
+    "whom",
+    // English verbs commonly used in feature descriptions
+    "add",
+    "create",
+    "update",
+    "delete",
+    "remove",
+    "fix",
+    "implement",
+    "change",
+    "modify",
+    "refactor",
+    "move",
+    "need",
+    "want",
+    "new",
+    "make",
+    "get",
+    "set",
+    "use",
+    "using",
+    "like",
+];
+
+/// Extract code-relevant keywords from a natural language description.
+///
+/// Strips stop words (FR/EN), short tokens (< 2 chars), and returns
+/// the remaining terms joined by spaces. Falls back to the original
+/// description if filtering removes everything.
+fn extract_search_keywords(description: &str) -> String {
+    let stop_set: HashSet<&str> = STOP_WORDS.iter().copied().collect();
+
+    // Trim only common natural-language punctuation from edges.
+    // Preserve code-relevant chars: _ - / : # . @ (paths, URLs, identifiers)
+    let trim_chars = |c: char| {
+        matches!(
+            c,
+            ',' | ';'
+                | '!'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '"'
+                | '\''
+                | '«'
+                | '»'
+                | '—'
+                | '–'
+                | '\u{2019}'
+        )
+    };
+
+    let keywords: Vec<&str> = description
+        .split_whitespace()
+        // Split on apostrophes within words (e.g. "l'endpoint" → ["l", "endpoint"])
+        .flat_map(|w| w.split('\''))
+        .flat_map(|w| w.split('\u{2019}')) // curly apostrophe
+        .map(|w| w.trim_matches(trim_chars))
+        .filter(|w| !w.is_empty())
+        .filter(|w| w.len() >= 2)
+        .filter(|w| !stop_set.contains(&w.to_lowercase().as_str()))
+        .collect();
+
+    if keywords.is_empty() {
+        description.to_string()
+    } else {
+        keywords.join(" ")
+    }
+}
 /// Maximum depth for dependency expansion
 const MAX_DEPENDENCY_DEPTH: u32 = 2;
 /// Threshold for high risk (dependents count)
@@ -332,14 +633,24 @@ impl ImplementationPlanner {
 
     /// Fallback: search for relevant zones via semantic code search + note search.
     /// Uses `tokio::join!` to parallelize the two independent queries.
+    ///
+    /// The description is pre-processed with `extract_search_keywords` to strip
+    /// natural-language stop words (FR/EN) that would dilute Meilisearch matching.
     async fn search_semantic_zones(
         &self,
         description: &str,
         project_slug: Option<&str>,
     ) -> Result<Vec<RelevantZone>> {
+        let keywords = extract_search_keywords(description);
+        tracing::debug!(
+            "Planner: semantic search — raw={:?}, keywords={:?}",
+            description,
+            keywords
+        );
+
         let (code_results, note_results) = tokio::join!(
             self.meili
-                .search_code_with_scores(description, 10, None, project_slug, None),
+                .search_code_with_scores(&keywords, 10, None, project_slug, None),
             self.meili
                 .search_notes_with_filters(description, 10, project_slug, None, None, None),
         );
@@ -2005,5 +2316,44 @@ mod tests {
         assert!(!plan_id_str.is_empty());
         // Verify it's a valid UUID
         Uuid::parse_str(&plan_id_str).unwrap();
+    }
+
+    #[test]
+    fn test_extract_search_keywords_french() {
+        let result = extract_search_keywords("ajouter un endpoint REST pour les releases");
+        assert_eq!(result, "endpoint REST releases");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_english() {
+        let result = extract_search_keywords("add a new REST endpoint for releases");
+        assert_eq!(result, "REST endpoint releases");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_technical() {
+        // Technical terms should be preserved
+        let result = extract_search_keywords("implement WebSocket streaming for chat sessions");
+        assert_eq!(result, "WebSocket streaming chat sessions");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_code_terms_only() {
+        let result = extract_search_keywords("get_release create_milestone");
+        assert_eq!(result, "get_release create_milestone");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_all_stopwords_fallback() {
+        // If all words are stop words, fall back to original
+        let result = extract_search_keywords("un de la");
+        assert_eq!(result, "un de la");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_mixed_punctuation() {
+        let result = extract_search_keywords("ajouter l'endpoint /api/releases/:id");
+        assert!(result.contains("endpoint"));
+        assert!(result.contains("/api/releases/:id"));
     }
 }
