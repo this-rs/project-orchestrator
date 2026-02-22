@@ -5119,6 +5119,7 @@ impl GraphStore for MockGraphStore {
         entity_type: &str,
         entity_id: &str,
         role: Option<&str>,
+        _project_id: Option<Uuid>,
     ) -> Result<()> {
         let mut entities = self.feature_graph_entities.write().await;
         let list = entities.entry(feature_graph_id).or_default();
@@ -5428,7 +5429,7 @@ impl GraphStore for MockGraphStore {
                 "core_logic"
             };
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "function", func_name, Some(role))
+                .add_entity_to_feature_graph(fg.id, "function", func_name, Some(role), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
@@ -5440,7 +5441,7 @@ impl GraphStore for MockGraphStore {
         }
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "file", file_path, Some("support"))
+                .add_entity_to_feature_graph(fg.id, "file", file_path, Some("support"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
@@ -5454,7 +5455,7 @@ impl GraphStore for MockGraphStore {
         // Add structs/enums discovered via IMPLEMENTS_FOR with role: data_model
         for struct_name in &discovered_structs {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "struct", struct_name, Some("data_model"))
+                .add_entity_to_feature_graph(fg.id, "struct", struct_name, Some("data_model"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
@@ -5468,7 +5469,7 @@ impl GraphStore for MockGraphStore {
         // Add traits discovered via IMPLEMENTS_TRAIT with role: trait_contract
         for trait_name in &discovered_traits {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "trait", trait_name, Some("trait_contract"))
+                .add_entity_to_feature_graph(fg.id, "trait", trait_name, Some("trait_contract"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
@@ -5504,7 +5505,7 @@ impl GraphStore for MockGraphStore {
 
         let depth = fg.build_depth.unwrap_or(2);
         let include_relations = fg.include_relations.clone();
-        let _project_id = fg.project_id;
+        let project_id = fg.project_id;
 
         let should_include = |rel: &str| -> bool {
             match &include_relations {
@@ -5642,7 +5643,7 @@ impl GraphStore for MockGraphStore {
                 "core_logic"
             };
             let _ = self
-                .add_entity_to_feature_graph(id, "function", func_name, Some(role))
+                .add_entity_to_feature_graph(id, "function", func_name, Some(role), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
@@ -5654,7 +5655,7 @@ impl GraphStore for MockGraphStore {
         }
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(id, "file", file_path, Some("support"))
+                .add_entity_to_feature_graph(id, "file", file_path, Some("support"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
@@ -5666,7 +5667,7 @@ impl GraphStore for MockGraphStore {
         }
         for struct_name in &discovered_structs {
             let _ = self
-                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"))
+                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
@@ -5678,7 +5679,7 @@ impl GraphStore for MockGraphStore {
         }
         for trait_name in &discovered_traits {
             let _ = self
-                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"))
+                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
@@ -7380,13 +7381,13 @@ mod tests {
 
         // Add entity without role
         store
-            .add_entity_to_feature_graph(fg.id, "function", "func_a", None)
+            .add_entity_to_feature_graph(fg.id, "function", "func_a", None, None)
             .await
             .unwrap();
 
         // Add entity with role
         store
-            .add_entity_to_feature_graph(fg.id, "function", "func_b", Some("entry_point"))
+            .add_entity_to_feature_graph(fg.id, "function", "func_b", Some("entry_point"), None)
             .await
             .unwrap();
 
@@ -7417,7 +7418,7 @@ mod tests {
 
         // Update role on existing entity
         store
-            .add_entity_to_feature_graph(fg.id, "function", "func_a", Some("core_logic"))
+            .add_entity_to_feature_graph(fg.id, "function", "func_a", Some("core_logic"), None)
             .await
             .unwrap();
 
@@ -7851,7 +7852,7 @@ mod tests {
 
         // Add an entity manually
         store
-            .add_entity_to_feature_graph(fg.id, "function", "my_func", Some("entry_point"))
+            .add_entity_to_feature_graph(fg.id, "function", "my_func", Some("entry_point"), None)
             .await
             .unwrap();
 

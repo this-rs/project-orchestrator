@@ -1384,13 +1384,16 @@ pub trait GraphStore: Send + Sync {
     /// Delete a feature graph and all its INCLUDES_ENTITY relationships
     async fn delete_feature_graph(&self, id: Uuid) -> Result<bool>;
 
-    /// Add an entity (file, function, struct, trait) to a feature graph
+    /// Add an entity (file, function, struct, trait) to a feature graph.
+    /// When `project_id` is provided, MATCH queries for Function/Struct/Trait/Enum
+    /// are scoped to that project to avoid cross-project contamination.
     async fn add_entity_to_feature_graph(
         &self,
         feature_graph_id: Uuid,
         entity_type: &str,
         entity_id: &str,
         role: Option<&str>,
+        project_id: Option<Uuid>,
     ) -> Result<()>;
 
     /// Remove an entity from a feature graph

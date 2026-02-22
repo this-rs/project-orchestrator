@@ -1198,10 +1198,18 @@ pub async fn add_entity_to_feature_graph(
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<AddEntityBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Resolve the feature graph's project_id for proper scoping
+    let project_id = state
+        .orchestrator
+        .neo4j()
+        .get_feature_graph_detail(id)
+        .await?
+        .map(|detail| detail.graph.project_id);
+
     state
         .orchestrator
         .neo4j()
-        .add_entity_to_feature_graph(id, &body.entity_type, &body.entity_id, body.role.as_deref())
+        .add_entity_to_feature_graph(id, &body.entity_type, &body.entity_id, body.role.as_deref(), project_id)
         .await?;
     Ok(Json(serde_json::json!({
         "added": true,

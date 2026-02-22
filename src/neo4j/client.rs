@@ -9945,6 +9945,7 @@ impl Neo4jClient {
         entity_type: &str,
         entity_id: &str,
         role: Option<&str>,
+        project_id: Option<Uuid>,
     ) -> Result<()> {
         let role_clause = if role.is_some() {
             " SET r.role = $role"
@@ -9952,10 +9953,20 @@ impl Neo4jClient {
             ""
         };
 
+        // When project_id is provided, scope Function/Struct/Trait/Enum matches
+        // to prevent cross-project contamination. File uses unique `path`, so no scoping needed.
+        let has_project = project_id.is_some();
+
         let cypher = match entity_type.to_lowercase().as_str() {
             "file" => format!(
                 "MATCH (fg:FeatureGraph {{id: $fg_id}})
                  MATCH (e:File {{path: $entity_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
+            "function" if has_project => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:Function {{name: $entity_id}})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(:Project {{id: $project_id}})
                  MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
                 role_clause
             ),
@@ -9965,15 +9976,33 @@ impl Neo4jClient {
                  MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
                 role_clause
             ),
+            "struct" if has_project => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:Struct {{name: $entity_id}})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(:Project {{id: $project_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
             "struct" => format!(
                 "MATCH (fg:FeatureGraph {{id: $fg_id}})
                  MATCH (e:Struct {{name: $entity_id}})
                  MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
                 role_clause
             ),
+            "trait" if has_project => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:Trait {{name: $entity_id}})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(:Project {{id: $project_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
             "trait" => format!(
                 "MATCH (fg:FeatureGraph {{id: $fg_id}})
                  MATCH (e:Trait {{name: $entity_id}})
+                 MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
+                role_clause
+            ),
+            "enum" if has_project => format!(
+                "MATCH (fg:FeatureGraph {{id: $fg_id}})
+                 MATCH (e:Enum {{name: $entity_id}})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(:Project {{id: $project_id}})
                  MERGE (fg)-[r:INCLUDES_ENTITY]->(e){}",
                 role_clause
             ),
@@ -9996,6 +10025,9 @@ impl Neo4jClient {
             .param("entity_id", entity_id.to_string());
         if let Some(r) = role {
             q = q.param("role", r.to_string());
+        }
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
         }
         self.execute_with_params(q).await?;
 
@@ -10216,6 +10248,26 @@ impl Neo4jClient {
         }
     }
 
+    /// Standard/derive traits that are noise in feature graphs.
+    /// These are ubiquitous traits (std, serde, tokio) that don't convey feature-specific meaning.
+    const FEATURE_GRAPH_TRAIT_BLACKLIST: &'static [&'static str] = &[
+        // std derives
+        "Debug", "Display", "Clone", "Copy", "Default", "PartialEq", "Eq",
+        "PartialOrd", "Ord", "Hash", "From", "Into", "TryFrom", "TryInto",
+        "AsRef", "AsMut", "Deref", "DerefMut", "Drop", "Send", "Sync", "Sized",
+        // serde
+        "Serialize", "Deserialize", "Serializer", "Deserializer",
+        // tokio / async
+        "AsyncRead", "AsyncWrite", "AsyncSeek", "AsyncBufRead",
+        // common derives
+        "Error", "Future", "Stream",
+    ];
+
+    /// Check if a trait name is in the standard blacklist
+    fn is_blacklisted_trait(name: &str) -> bool {
+        Self::FEATURE_GRAPH_TRAIT_BLACKLIST.contains(&name)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn auto_build_feature_graph(
         &self,
@@ -10382,7 +10434,7 @@ impl Neo4jClient {
                 }
                 if let Ok(trait_list) = row.get::<Vec<String>>("trait_names") {
                     for t in trait_list {
-                        if !t.is_empty() {
+                        if !t.is_empty() && !Self::is_blacklisted_trait(&t) {
                             traits.insert(t);
                         }
                     }
@@ -10481,7 +10533,7 @@ impl Neo4jClient {
                 "core_logic"
             };
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "function", func_name, Some(role))
+                .add_entity_to_feature_graph(fg.id, "function", func_name, Some(role), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
@@ -10495,7 +10547,7 @@ impl Neo4jClient {
         // Add files with role: support
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "file", file_path, Some("support"))
+                .add_entity_to_feature_graph(fg.id, "file", file_path, Some("support"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
@@ -10509,7 +10561,7 @@ impl Neo4jClient {
         // Add structs/enums discovered via IMPLEMENTS_FOR with role: data_model
         for struct_name in &structs {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "struct", struct_name, Some("data_model"))
+                .add_entity_to_feature_graph(fg.id, "struct", struct_name, Some("data_model"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
@@ -10523,7 +10575,7 @@ impl Neo4jClient {
         // Add traits discovered via IMPLEMENTS_TRAIT with role: trait_contract
         for trait_name in &traits {
             let _ = self
-                .add_entity_to_feature_graph(fg.id, "trait", trait_name, Some("trait_contract"))
+                .add_entity_to_feature_graph(fg.id, "trait", trait_name, Some("trait_contract"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
@@ -10660,7 +10712,7 @@ impl Neo4jClient {
                 }
                 if let Ok(trait_list) = row.get::<Vec<String>>("trait_names") {
                     for t in trait_list {
-                        if !t.is_empty() {
+                        if !t.is_empty() && !Self::is_blacklisted_trait(&t) {
                             traits.insert(t);
                         }
                     }
@@ -10711,7 +10763,7 @@ impl Neo4jClient {
                 "core_logic"
             };
             let _ = self
-                .add_entity_to_feature_graph(id, "function", func_name, Some(role))
+                .add_entity_to_feature_graph(id, "function", func_name, Some(role), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "function".to_string(),
@@ -10724,7 +10776,7 @@ impl Neo4jClient {
 
         for file_path in &files {
             let _ = self
-                .add_entity_to_feature_graph(id, "file", file_path, Some("support"))
+                .add_entity_to_feature_graph(id, "file", file_path, Some("support"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "file".to_string(),
@@ -10737,7 +10789,7 @@ impl Neo4jClient {
 
         for struct_name in &structs {
             let _ = self
-                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"))
+                .add_entity_to_feature_graph(id, "struct", struct_name, Some("data_model"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "struct".to_string(),
@@ -10750,7 +10802,7 @@ impl Neo4jClient {
 
         for trait_name in &traits {
             let _ = self
-                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"))
+                .add_entity_to_feature_graph(id, "trait", trait_name, Some("trait_contract"), Some(project_id))
                 .await;
             entities.push(FeatureGraphEntity {
                 entity_type: "trait".to_string(),
