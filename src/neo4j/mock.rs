@@ -5073,6 +5073,7 @@ impl GraphStore for MockGraphStore {
                         entity_id: eid.clone(),
                         name: Some(eid.clone()),
                         role: role.clone(),
+                        importance_score: None,
                     })
                     .collect()
             })
@@ -5322,6 +5323,85 @@ impl GraphStore for MockGraphStore {
             drop(ir);
         } // end if should_include imports
 
+        // Step 1d: Expand via vector similarity (best-effort)
+        // For each function with an embedding, find semantically similar functions
+        let mut vector_expanded_funcs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        {
+            let func_embeddings = self.function_embeddings.read().await;
+            let funcs_map = self.functions.read().await;
+
+            // Collect embeddings for all current functions
+            let mut func_with_embeddings: Vec<Vec<f32>> = Vec::new();
+            for func_name in all_functions.iter() {
+                if let Some(func) = funcs_map.values().find(|f| f.name == *func_name) {
+                    let key = format!("{}::{}", func.file_path, func_name);
+                    if let Some((emb, _)) = func_embeddings.get(&key) {
+                        func_with_embeddings.push(emb.clone());
+                    }
+                }
+            }
+            drop(func_embeddings);
+            drop(funcs_map);
+
+            let entry_cid = if filter_community {
+                let fa = self.function_analytics.read().await;
+                fa.get(entry_function).map(|a| a.community_id)
+            } else {
+                None
+            };
+
+            for embedding in &func_with_embeddings {
+                let neighbors = self
+                    .vector_search_functions(embedding, 5, Some(project_id))
+                    .await
+                    .unwrap_or_default();
+                for (neighbor_name, neighbor_path, score) in neighbors {
+                    if score < 0.8 || all_functions.contains(&neighbor_name) {
+                        continue;
+                    }
+                    // Community filter
+                    if let Some(target_cid) = entry_cid {
+                        let fa = self.function_analytics.read().await;
+                        if let Some(analytics) = fa.get(&neighbor_name) {
+                            if analytics.community_id != target_cid {
+                                continue;
+                            }
+                        }
+                    }
+                    vector_expanded_funcs.insert(neighbor_name.clone());
+                    all_functions.insert(neighbor_name);
+                    files.insert(neighbor_path);
+                }
+            }
+        }
+
+        // Step 1e: Expand via community — find related files in same Louvain cluster (best-effort)
+        {
+            let fa = self.file_analytics.read().await;
+            let mut seen_communities: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            for file_path in files.iter() {
+                if let Some(analytics) = fa.get(file_path) {
+                    seen_communities.insert(analytics.community_id);
+                }
+            }
+            let original_files: std::collections::HashSet<String> = files.clone();
+            for cid in &seen_communities {
+                let mut peers: Vec<(String, f64)> = Vec::new();
+                for (path, analytics) in fa.iter() {
+                    if analytics.community_id == *cid && !original_files.contains(path) {
+                        peers.push((path.clone(), analytics.pagerank));
+                    }
+                }
+                peers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (path, _) in peers.into_iter().take(5) {
+                    files.insert(path);
+                }
+            }
+            drop(fa);
+        }
+
         // Create the feature graph (with build params for refresh)
         let fg = FeatureGraphNode {
             id: Uuid::new_v4(),
@@ -5342,6 +5422,8 @@ impl GraphStore for MockGraphStore {
         for func_name in &all_functions {
             let role = if func_name == entry_function {
                 "entry_point"
+            } else if vector_expanded_funcs.contains(func_name) {
+                "support"
             } else {
                 "core_logic"
             };
@@ -5353,6 +5435,7 @@ impl GraphStore for MockGraphStore {
                 entity_id: func_name.clone(),
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
+                importance_score: None,
             });
         }
         for file_path in &files {
@@ -5364,6 +5447,7 @@ impl GraphStore for MockGraphStore {
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
+                importance_score: None,
             });
         }
 
@@ -5377,6 +5461,7 @@ impl GraphStore for MockGraphStore {
                 entity_id: struct_name.clone(),
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
+                importance_score: None,
             });
         }
 
@@ -5390,6 +5475,7 @@ impl GraphStore for MockGraphStore {
                 entity_id: trait_name.clone(),
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
+                importance_score: None,
             });
         }
 
@@ -5563,6 +5649,7 @@ impl GraphStore for MockGraphStore {
                 entity_id: func_name.clone(),
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
+                importance_score: None,
             });
         }
         for file_path in &files {
@@ -5574,6 +5661,7 @@ impl GraphStore for MockGraphStore {
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
+                importance_score: None,
             });
         }
         for struct_name in &discovered_structs {
@@ -5585,6 +5673,7 @@ impl GraphStore for MockGraphStore {
                 entity_id: struct_name.clone(),
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
+                importance_score: None,
             });
         }
         for trait_name in &discovered_traits {
@@ -5596,6 +5685,7 @@ impl GraphStore for MockGraphStore {
                 entity_id: trait_name.clone(),
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
+                importance_score: None,
             });
         }
 
@@ -7801,6 +7891,316 @@ mod tests {
             "error should mention 'not found', got: {}",
             err_msg
         );
+    }
+
+    // ========================================================================
+    // Feature Graph — Vector expansion & community expansion tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_auto_build_with_vector_expansion() {
+        // Setup: entry_fn calls helper_fn. unrelated_fn is NOT in call graph
+        // but has a very similar embedding to entry_fn, same community → should be added.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/main.rs", &["entry_fn"]),
+                ("src/helper.rs", &["helper_fn"]),
+                ("src/similar.rs", &["unrelated_fn"]),
+            ],
+        )
+        .await;
+
+        // entry_fn calls helper_fn (call graph link)
+        store
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None)
+            .await
+            .unwrap();
+
+        // Set embeddings: entry_fn and unrelated_fn have very similar vectors
+        // helper_fn has a different vector
+        let entry_emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let similar_emb = vec![0.99_f32, 0.01, 0.0, 0.0]; // cosine ~0.9999
+        let different_emb = vec![0.0_f32, 1.0, 0.0, 0.0]; // cosine ~0.0
+
+        store
+            .set_function_embedding("entry_fn", "src/main.rs", &entry_emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("unrelated_fn", "src/similar.rs", &similar_emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("helper_fn", "src/helper.rs", &different_emb, "test")
+            .await
+            .unwrap();
+
+        // Set same community for entry_fn and unrelated_fn (community filtering enabled)
+        {
+            let mut fa = store.function_analytics.write().await;
+            fa.insert(
+                "entry_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/main.rs::entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "unrelated_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/similar.rs::unrelated_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 1, // same community
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "helper_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/helper.rs::helper_fn".to_string(),
+                    pagerank: 0.2,
+                    betweenness: 0.0,
+                    community_id: 2, // different community
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+        }
+
+        let result = store
+            .auto_build_feature_graph(
+                "test-vector-expansion",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let entity_ids: Vec<&str> = result
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // entry_fn and helper_fn should be there (call graph)
+        assert!(
+            entity_ids.contains(&"entry_fn"),
+            "should contain entry_fn, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            entity_ids.contains(&"helper_fn"),
+            "should contain helper_fn, got: {:?}",
+            entity_ids
+        );
+        // unrelated_fn should be added by vector expansion (similar embedding, same community)
+        assert!(
+            entity_ids.contains(&"unrelated_fn"),
+            "should contain unrelated_fn via vector expansion, got: {:?}",
+            entity_ids
+        );
+        // unrelated_fn should have role "support" (not "core_logic")
+        let unrelated_entity = result
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "unrelated_fn")
+            .expect("unrelated_fn should be in entities");
+        assert_eq!(
+            unrelated_entity.role.as_deref(),
+            Some("support"),
+            "vector-expanded function should have role 'support'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_build_with_community_expansion() {
+        // Setup: entry_fn is in src/api/routes.rs (community 1).
+        // src/api/handlers.rs is in the same community but NOT in call graph.
+        // It should be added by community expansion.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/api/routes.rs", &["entry_fn"]),
+                ("src/api/handlers.rs", &["handle_request"]),
+                ("src/db/client.rs", &["query_db"]),
+            ],
+        )
+        .await;
+
+        // No call graph links — entry_fn is isolated
+
+        // Set file analytics: routes.rs and handlers.rs in community 1, client.rs in community 2
+        {
+            let mut fa = store.file_analytics.write().await;
+            fa.insert(
+                "src/api/routes.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/api/routes.rs".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.2,
+                    community_id: 1,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "src/api/handlers.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/api/handlers.rs".to_string(),
+                    pagerank: 0.4,
+                    betweenness: 0.1,
+                    community_id: 1, // same community
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "src/db/client.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/db/client.rs".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.0,
+                    community_id: 2, // different community
+                    community_label: "db".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+        }
+
+        let result = store
+            .auto_build_feature_graph(
+                "test-community-expansion",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(false), // disable community filtering to keep all call graph results
+            )
+            .await
+            .unwrap();
+
+        let file_entities: Vec<&str> = result
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "file")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // routes.rs should be there (entry function's file)
+        assert!(
+            file_entities.contains(&"src/api/routes.rs"),
+            "should contain routes.rs, got: {:?}",
+            file_entities
+        );
+        // handlers.rs should be added by community expansion (same community)
+        assert!(
+            file_entities.contains(&"src/api/handlers.rs"),
+            "should contain handlers.rs via community expansion, got: {:?}",
+            file_entities
+        );
+        // client.rs should NOT be there (different community, no call graph link)
+        assert!(
+            !file_entities.contains(&"src/db/client.rs"),
+            "should NOT contain client.rs (different community), got: {:?}",
+            file_entities
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_build_fallback_without_embeddings() {
+        // When no embeddings or analytics are set, auto_build should work
+        // exactly as before — only call graph traversal, no expansion.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/main.rs", &["entry_fn"]),
+                ("src/helper.rs", &["helper_fn"]),
+                ("src/unrelated.rs", &["unrelated_fn"]),
+            ],
+        )
+        .await;
+
+        // entry_fn calls helper_fn
+        store
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None)
+            .await
+            .unwrap();
+
+        // No embeddings, no analytics — should work fine without expansion
+        let result = store
+            .auto_build_feature_graph(
+                "test-fallback",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let func_ids: Vec<&str> = result
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // Should contain only call-graph functions
+        assert!(
+            func_ids.contains(&"entry_fn"),
+            "should contain entry_fn, got: {:?}",
+            func_ids
+        );
+        assert!(
+            func_ids.contains(&"helper_fn"),
+            "should contain helper_fn (via call graph), got: {:?}",
+            func_ids
+        );
+        // unrelated_fn should NOT be included (no call graph, no embeddings)
+        assert!(
+            !func_ids.contains(&"unrelated_fn"),
+            "should NOT contain unrelated_fn (no call graph, no embeddings), got: {:?}",
+            func_ids
+        );
+
+        // All functions should have core_logic or entry_point role (no "support")
+        for entity in &result.entities {
+            if entity.entity_type == "function" {
+                let role = entity.role.as_deref().unwrap_or("none");
+                assert!(
+                    role == "entry_point" || role == "core_logic",
+                    "function {} should have entry_point or core_logic role, got: {}",
+                    entity.entity_id,
+                    role
+                );
+            }
+        }
     }
 
     // ========================================================================

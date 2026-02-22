@@ -886,6 +886,10 @@ pub struct FeatureGraphEntity {
     /// Role of this entity in the feature (entry_point, core_logic, data_model, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Normalized PageRank score (0.0–1.0) if GDS analytics are available.
+    /// Allows visualizing the most important nodes in the feature graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub importance_score: Option<f64>,
 }
 
 /// Full feature graph with its included entities.

@@ -9851,21 +9851,39 @@ impl Neo4jClient {
         let Some(fg) = fg else { return Ok(None) };
 
         let q = query(
-            "MATCH (fg:FeatureGraph {id: $id})-[:INCLUDES_ENTITY]->(e)
+            "MATCH (fg:FeatureGraph {id: $id})-[r:INCLUDES_ENTITY]->(e)
              RETURN labels(e)[0] AS entity_type,
                     COALESCE(e.path, e.id) AS entity_id,
-                    COALESCE(e.name, e.path) AS name",
+                    COALESCE(e.name, e.path) AS name,
+                    r.role AS role,
+                    e.pagerank AS pagerank",
         )
         .param("id", id.to_string());
 
         let rows = self.execute_with_params(q).await?;
+
+        // Find max pagerank for normalization (0.0–1.0 within the feature graph)
+        let max_pr = rows
+            .iter()
+            .filter_map(|row| row.get::<f64>("pagerank").ok())
+            .fold(0.0_f64, f64::max);
+
         let entities = rows
             .iter()
-            .map(|row| FeatureGraphEntity {
-                entity_type: row.get::<String>("entity_type").unwrap_or_default(),
-                entity_id: row.get::<String>("entity_id").unwrap_or_default(),
-                name: row.get::<String>("name").ok(),
-                role: row.get::<String>("role").ok(),
+            .map(|row| {
+                let raw_pr: Option<f64> = row.get::<f64>("pagerank").ok();
+                let importance_score = if max_pr > 0.0 {
+                    raw_pr.map(|pr| pr / max_pr)
+                } else {
+                    None
+                };
+                FeatureGraphEntity {
+                    entity_type: row.get::<String>("entity_type").unwrap_or_default(),
+                    entity_id: row.get::<String>("entity_id").unwrap_or_default(),
+                    name: row.get::<String>("name").ok(),
+                    role: row.get::<String>("role").ok(),
+                    importance_score,
+                }
             })
             .collect();
 
@@ -10028,6 +10046,176 @@ impl Neo4jClient {
             Ok(deleted > 0)
         } else {
             Ok(false)
+        }
+    }
+
+    /// Expand a feature graph by finding semantically similar functions via vector search.
+    ///
+    /// For each input function that has an embedding stored in Neo4j, performs HNSW vector
+    /// search to find the top-5 most similar functions in the project. Results are filtered
+    /// by cosine score > 0.8 and optionally by Louvain community membership.
+    ///
+    /// Returns `(function_name, file_path, cosine_score)` for new functions not already
+    /// in the input set, deduplicated by keeping the best score per function.
+    ///
+    /// Best-effort: returns empty Vec on any error (embeddings not available, index missing, etc.)
+    pub async fn expand_by_vector_similarity(
+        &self,
+        functions: &[String],
+        project_id: Uuid,
+        community_filter: Option<i64>,
+    ) -> Vec<(String, String, f64)> {
+        let func_set: std::collections::HashSet<&str> =
+            functions.iter().map(|s| s.as_str()).collect();
+
+        // Batch-retrieve embeddings for all input functions
+        let q = query(
+            r#"
+            MATCH (fn:Function)<-[:CONTAINS]-(f:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+            WHERE fn.name IN $names AND fn.embedding IS NOT NULL
+            RETURN fn.name AS name, fn.embedding AS embedding
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("names", functions.to_vec());
+
+        let rows = match self.execute_with_params(q).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(
+                    "expand_by_vector_similarity: failed to get embeddings: {}",
+                    e
+                );
+                return Vec::new();
+            }
+        };
+
+        if rows.is_empty() {
+            return Vec::new();
+        }
+
+        // For each function with an embedding, do vector search for neighbors
+        let mut candidates: Vec<(String, String, f64)> = Vec::new();
+        for row in &rows {
+            let _name: String = match row.get("name") {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let embedding: Vec<f64> = match row.get("embedding") {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let embedding_f32: Vec<f32> = embedding.iter().map(|&x| x as f32).collect();
+
+            let neighbors = match self
+                .vector_search_functions(&embedding_f32, 5, Some(project_id))
+                .await
+            {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            for (func_name, file_path, score) in neighbors {
+                if func_set.contains(func_name.as_str()) || score < 0.8 {
+                    continue;
+                }
+                candidates.push((func_name, file_path, score));
+            }
+        }
+
+        // Deduplicate: keep best score per function
+        let mut best: std::collections::HashMap<String, (String, f64)> =
+            std::collections::HashMap::new();
+        for (name, path, score) in candidates {
+            let entry = best.entry(name).or_insert((path.clone(), 0.0));
+            if score > entry.1 {
+                *entry = (path, score);
+            }
+        }
+
+        // Apply community filter if provided — single batch query
+        if let Some(target_cid) = community_filter {
+            let candidate_names: Vec<String> = best.keys().cloned().collect();
+            if !candidate_names.is_empty() {
+                let cq = query(
+                    r#"
+                    MATCH (fn:Function)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                    WHERE fn.name IN $names
+                    RETURN fn.name AS name, fn.community_id AS cid
+                    "#,
+                )
+                .param("project_id", project_id.to_string())
+                .param("names", candidate_names);
+
+                if let Ok(crows) = self.execute_with_params(cq).await {
+                    let mut allowed: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for crow in &crows {
+                        if let Ok(name) = crow.get::<String>("name") {
+                            let cid: Option<i64> = crow.get::<i64>("cid").ok();
+                            // Allow if same community or no community data
+                            if cid.is_none() || cid == Some(target_cid) {
+                                allowed.insert(name);
+                            }
+                        }
+                    }
+                    best.retain(|name, _| allowed.contains(name));
+                }
+            }
+        }
+
+        best.into_iter()
+            .map(|(name, (path, score))| (name, path, score))
+            .collect()
+    }
+
+    /// Expand a feature graph by finding related files from the same Louvain community.
+    ///
+    /// For each input file that has a `community_id` in Neo4j, finds other files in the
+    /// same community sorted by PageRank (descending), limited to `max_per_community` per
+    /// community. Only returns files not already in the input set.
+    ///
+    /// Uses a single Cypher query for efficiency (no N+1 pattern).
+    ///
+    /// Best-effort: returns empty Vec on any error (GDS not run, no community data, etc.)
+    pub async fn expand_by_community(
+        &self,
+        file_paths: &[String],
+        project_id: Uuid,
+        max_per_community: usize,
+    ) -> Vec<String> {
+        if file_paths.is_empty() {
+            return Vec::new();
+        }
+
+        // Single query: for each input file's community, find top-N peers by pagerank
+        let q = query(
+            r#"
+            MATCH (source:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+            WHERE source.path IN $paths AND source.community_id IS NOT NULL
+            WITH DISTINCT source.community_id AS cid, p
+            MATCH (peer:File)<-[:CONTAINS]-(p)
+            WHERE peer.community_id = cid AND NOT peer.path IN $paths
+            WITH cid, peer
+            ORDER BY COALESCE(peer.pagerank, 0.0) DESC
+            WITH cid, collect(peer.path)[..$limit] AS top_peers
+            UNWIND top_peers AS peer_path
+            RETURN DISTINCT peer_path
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("paths", file_paths.to_vec())
+        .param("limit", max_per_community as i64);
+
+        match self.execute_with_params(q).await {
+            Ok(rows) => rows
+                .iter()
+                .filter_map(|row| row.get::<String>("peer_path").ok())
+                .collect(),
+            Err(e) => {
+                tracing::debug!("expand_by_community failed: {}", e);
+                Vec::new()
+            }
         }
     }
 
@@ -10228,6 +10416,47 @@ impl Neo4jClient {
             }
         }
 
+        // Step 1d: Expand via vector similarity — find semantically similar functions (best-effort)
+        // Uses HNSW vector search on function embeddings, filtered by community if enabled
+        // Functions added here get role "support" instead of "core_logic"
+        let mut vector_expanded_funcs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        {
+            let func_names: Vec<String> = functions.iter().map(|(n, _, _)| n.clone()).collect();
+            let entry_cid = functions
+                .iter()
+                .find(|(n, _, _)| n == entry_function)
+                .and_then(|(_, _, cid)| *cid);
+            let community_filter = if filter_community { entry_cid } else { None };
+
+            let vector_neighbors = self
+                .expand_by_vector_similarity(&func_names, project_id, community_filter)
+                .await;
+
+            for (func_name, file_path, _score) in vector_neighbors {
+                if !functions.iter().any(|(n, _, _)| n == &func_name) {
+                    if !file_path.is_empty() {
+                        files.insert(file_path.clone());
+                    }
+                    vector_expanded_funcs.insert(func_name.clone());
+                    functions.push((func_name, Some(file_path), None));
+                }
+            }
+        }
+
+        // Step 1e: Expand via community — find related files in the same Louvain cluster (best-effort)
+        // For each file's community, adds top-5 peers by PageRank that aren't already included
+        {
+            let file_list: Vec<String> = files.iter().cloned().collect();
+            let community_files = self
+                .expand_by_community(&file_list, project_id, 5)
+                .await;
+
+            for file_path in community_files {
+                files.insert(file_path);
+            }
+        }
+
         // Step 2: Create the FeatureGraph (with build params for refresh)
         let fg = FeatureGraphNode {
             id: Uuid::new_v4(),
@@ -10246,10 +10475,13 @@ impl Neo4jClient {
         // Step 3: Add all entities with auto-assigned roles
         let mut entities = Vec::new();
 
-        // Add functions with role: entry_point for the entry function, core_logic for others
+        // Add functions with role: entry_point for the entry function,
+        // support for vector-expanded functions, core_logic for others
         for (func_name, _file_path, _) in &functions {
             let role = if func_name == entry_function {
                 "entry_point"
+            } else if vector_expanded_funcs.contains(func_name) {
+                "support"
             } else {
                 "core_logic"
             };
@@ -10261,6 +10493,7 @@ impl Neo4jClient {
                 entity_id: func_name.clone(),
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
+                importance_score: None,
             });
         }
 
@@ -10274,6 +10507,7 @@ impl Neo4jClient {
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
+                importance_score: None,
             });
         }
 
@@ -10287,6 +10521,7 @@ impl Neo4jClient {
                 entity_id: struct_name.clone(),
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
+                importance_score: None,
             });
         }
 
@@ -10300,6 +10535,7 @@ impl Neo4jClient {
                 entity_id: trait_name.clone(),
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
+                importance_score: None,
             });
         }
 
@@ -10487,6 +10723,7 @@ impl Neo4jClient {
                 entity_id: func_name.clone(),
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
+                importance_score: None,
             });
         }
 
@@ -10499,6 +10736,7 @@ impl Neo4jClient {
                 entity_id: file_path.clone(),
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
+                importance_score: None,
             });
         }
 
@@ -10511,6 +10749,7 @@ impl Neo4jClient {
                 entity_id: struct_name.clone(),
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
+                importance_score: None,
             });
         }
 
@@ -10523,6 +10762,7 @@ impl Neo4jClient {
                 entity_id: trait_name.clone(),
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
+                importance_score: None,
             });
         }
 

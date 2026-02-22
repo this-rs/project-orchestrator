@@ -231,12 +231,16 @@ impl Orchestrator {
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
-        let planner = Arc::new(super::ImplementationPlanner::new(
+        let mut planner = super::ImplementationPlanner::new(
             state.neo4j.clone(),
             state.meili.clone(),
             plan_manager.clone(),
             note_manager.clone(),
-        ));
+        );
+        if let Some(ref provider) = embedding_provider {
+            planner = planner.with_embedding_provider(provider.clone());
+        }
+        let planner = Arc::new(planner);
         let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
             state.neo4j.clone(),
             AnalyticsConfig::default(),
@@ -305,12 +309,16 @@ impl Orchestrator {
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
-        let planner = Arc::new(super::ImplementationPlanner::new(
+        let mut planner = super::ImplementationPlanner::new(
             state.neo4j.clone(),
             state.meili.clone(),
             plan_manager.clone(),
             note_manager.clone(),
-        ));
+        );
+        if let Some(ref provider) = embedding_provider {
+            planner = planner.with_embedding_provider(provider.clone());
+        }
+        let planner = Arc::new(planner);
         let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
             state.neo4j.clone(),
             AnalyticsConfig::default(),
@@ -381,12 +389,16 @@ impl Orchestrator {
 
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
-        let planner = Arc::new(super::ImplementationPlanner::new(
+        let mut planner = super::ImplementationPlanner::new(
             state.neo4j.clone(),
             state.meili.clone(),
             plan_manager.clone(),
             note_manager.clone(),
-        ));
+        );
+        if let Some(ref provider) = embedding_provider {
+            planner = planner.with_embedding_provider(provider.clone());
+        }
+        let planner = Arc::new(planner);
         let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
             state.neo4j.clone(),
             AnalyticsConfig::default(),
