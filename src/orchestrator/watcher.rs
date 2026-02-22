@@ -371,14 +371,8 @@ fn should_sync_file(path: &Path) -> bool {
 
     let path_str = path.to_string_lossy();
 
-    // Skip common non-source directories
-    if path_str.contains("node_modules")
-        || path_str.contains("/target/")
-        || path_str.contains("/.git/")
-        || path_str.contains("__pycache__")
-        || path_str.contains("/dist/")
-        || path_str.contains("/build/")
-    {
+    // Skip ignored directories (shared constant with runner.rs)
+    if super::should_ignore_path(&path_str) {
         return false;
     }
 
@@ -726,6 +720,36 @@ mod tests {
     fn test_should_not_sync_dist_build_directories() {
         assert!(!should_sync_file(Path::new("/project/dist/bundle.js")));
         assert!(!should_sync_file(Path::new("/project/build/output.js")));
+    }
+
+    #[test]
+    fn test_should_not_sync_vendor_directory() {
+        assert!(!should_sync_file(Path::new(
+            "/project/vendor/github.com/lib/pq/conn.go"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/vendor/bundle/ruby/3.0.0/gems/lib.rb"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_sync_next_nuxt_directories() {
+        assert!(!should_sync_file(Path::new(
+            "/project/.next/server/chunks/main.js"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/.nuxt/dist/server/index.js"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_sync_coverage_cache_directories() {
+        assert!(!should_sync_file(Path::new(
+            "/project/coverage/lcov-report/index.js"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/.cache/babel-loader/hash.js"
+        )));
     }
 
     #[test]
