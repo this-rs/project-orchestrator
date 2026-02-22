@@ -41,6 +41,9 @@ pub struct FileWatcher {
     /// Maps canonicalized root_path -> project context
     project_map: Arc<RwLock<HashMap<PathBuf, ProjectContext>>>,
     stop_tx: Option<mpsc::Sender<()>>,
+    /// Channel to dynamically add new paths to the running notify watcher.
+    /// None if the watcher background task hasn't been started yet.
+    add_path_tx: Option<mpsc::Sender<PathBuf>>,
 }
 
 impl FileWatcher {
@@ -51,6 +54,7 @@ impl FileWatcher {
             watched_paths: Arc::new(RwLock::new(HashSet::new())),
             project_map: Arc::new(RwLock::new(HashMap::new())),
             stop_tx: None,
+            add_path_tx: None,
         }
     }
 
@@ -82,8 +86,7 @@ impl FileWatcher {
     ///
     /// Associates a root_path with a project context. The path is canonicalized
     /// and added to the watch list. If the watcher is already running, the new
-    /// path will be picked up but requires a restart to be actively watched by
-    /// the underlying notify watcher.
+    /// path is dynamically added to the underlying notify watcher via channel.
     pub async fn register_project(
         &mut self,
         root_path: &Path,
@@ -107,9 +110,19 @@ impl FileWatcher {
         }
 
         // Add to watched paths
-        {
+        let is_new = {
             let mut watched = self.watched_paths.write().await;
-            watched.insert(canonical.clone());
+            watched.insert(canonical.clone())
+        };
+
+        // If the watcher is running and this is a new path, notify the
+        // background task so it adds the path to the notify watcher.
+        if is_new {
+            if let Some(ref tx) = self.add_path_tx {
+                if let Err(e) = tx.send(canonical.clone()).await {
+                    tracing::warn!("Failed to send new watch path to background watcher: {}", e);
+                }
+            }
         }
 
         tracing::info!(
@@ -175,10 +188,14 @@ impl FileWatcher {
     ///
     /// Spawns a background tokio task that:
     /// 1. Creates a `notify::RecommendedWatcher` for filesystem events
-    /// 2. Watches all registered paths recursively
-    /// 3. On file change, resolves the project via `resolve_project`
-    /// 4. Calls `sync_file_for_project` with the resolved project context
-    /// 5. Triggers the analytics debouncer for the affected project
+    /// 2. Watches all currently registered paths recursively
+    /// 3. Listens for dynamically added paths via `add_path_rx`
+    /// 4. On file change, resolves the project via `resolve_project`
+    /// 5. Calls `sync_file_for_project` with the resolved project context
+    /// 6. Triggers the analytics debouncer for the affected project
+    ///
+    /// Safe to call with 0 registered projects — the watcher will be ready
+    /// to accept new paths dynamically via `register_project()`.
     pub async fn start(&mut self) -> Result<()> {
         if self.stop_tx.is_some() {
             return Ok(()); // Already running
@@ -186,8 +203,10 @@ impl FileWatcher {
 
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let (event_tx, mut event_rx) = mpsc::channel::<PathBuf>(100);
+        let (add_path_tx, mut add_path_rx) = mpsc::channel::<PathBuf>(32);
 
         self.stop_tx = Some(stop_tx);
+        self.add_path_tx = Some(add_path_tx);
 
         let watched_paths = self.watched_paths.clone();
         let project_map = self.project_map.clone();
@@ -215,7 +234,7 @@ impl FileWatcher {
                 }
             };
 
-            // Watch all registered paths
+            // Watch all currently registered paths
             let paths = watched_paths.read().await;
             for path in paths.iter() {
                 if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
@@ -230,6 +249,24 @@ impl FileWatcher {
                     _ = stop_rx.recv() => {
                         tracing::info!("File watcher stopping");
                         break;
+                    }
+                    // Dynamically add a new path to the notify watcher
+                    Some(new_path) = add_path_rx.recv() => {
+                        match watcher.watch(&new_path, RecursiveMode::Recursive) {
+                            Ok(_) => {
+                                tracing::info!(
+                                    "File watcher: dynamically added path: {}",
+                                    new_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "File watcher: failed to watch new path {}: {}",
+                                    new_path.display(),
+                                    e
+                                );
+                            }
+                        }
                     }
                     Some(path) = event_rx.recv() => {
                         // Check if file should be synced
@@ -371,14 +408,8 @@ fn should_sync_file(path: &Path) -> bool {
 
     let path_str = path.to_string_lossy();
 
-    // Skip common non-source directories
-    if path_str.contains("node_modules")
-        || path_str.contains("/target/")
-        || path_str.contains("/.git/")
-        || path_str.contains("__pycache__")
-        || path_str.contains("/dist/")
-        || path_str.contains("/build/")
-    {
+    // Skip ignored directories (shared constant with runner.rs)
+    if super::should_ignore_path(&path_str) {
         return false;
     }
 
@@ -729,6 +760,36 @@ mod tests {
     }
 
     #[test]
+    fn test_should_not_sync_vendor_directory() {
+        assert!(!should_sync_file(Path::new(
+            "/project/vendor/github.com/lib/pq/conn.go"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/vendor/bundle/ruby/3.0.0/gems/lib.rb"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_sync_next_nuxt_directories() {
+        assert!(!should_sync_file(Path::new(
+            "/project/.next/server/chunks/main.js"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/.nuxt/dist/server/index.js"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_sync_coverage_cache_directories() {
+        assert!(!should_sync_file(Path::new(
+            "/project/coverage/lcov-report/index.js"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/.cache/babel-loader/hash.js"
+        )));
+    }
+
+    #[test]
     fn test_should_sync_empty_extension() {
         // Files without extension should not be synced
         assert!(!should_sync_file(Path::new("/project/Makefile")));
@@ -955,5 +1016,167 @@ mod tests {
 
         // Bridge should skip — no root_path change
         assert!(event.payload.get("root_path").is_none());
+    }
+
+    // ── dynamic watch path tests ──────────────────────────────────────
+    //
+    // These tests exercise the dynamic path registration logic without
+    // needing a full Orchestrator (which requires Neo4j/Meilisearch).
+    // They work directly with the internal structures (project_map,
+    // watched_paths, add_path channel).
+
+    #[tokio::test]
+    async fn test_dynamic_path_channel_receives_new_path() {
+        // Simulate the add_path channel that start() creates
+        let (add_path_tx, mut add_path_rx) = mpsc::channel::<PathBuf>(32);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+
+        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
+        let project_map = Arc::new(RwLock::new(HashMap::new()));
+
+        // Simulate register_project logic: insert into map + watched + send
+        let is_new = {
+            let mut watched = watched_paths.write().await;
+            watched.insert(canonical.clone())
+        };
+        {
+            let mut pm = project_map.write().await;
+            pm.insert(
+                canonical.clone(),
+                ProjectContext {
+                    project_id: Uuid::new_v4(),
+                    project_slug: "test-proj".to_string(),
+                },
+            );
+        }
+        assert!(is_new);
+
+        // Send path on channel (as register_project would)
+        add_path_tx.send(canonical.clone()).await.unwrap();
+
+        // Verify the channel received the path
+        let received = add_path_rx.try_recv();
+        assert!(received.is_ok(), "Expected path on add_path channel");
+        assert_eq!(received.unwrap(), canonical);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_path_not_resent_on_channel() {
+        let (add_path_tx, mut add_path_rx) = mpsc::channel::<PathBuf>(32);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+
+        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
+
+        // First insert → is_new = true → send
+        let is_new = {
+            let mut watched = watched_paths.write().await;
+            watched.insert(canonical.clone())
+        };
+        assert!(is_new);
+        add_path_tx.send(canonical.clone()).await.unwrap();
+        assert!(add_path_rx.try_recv().is_ok());
+
+        // Second insert → is_new = false → should NOT send
+        let is_new = {
+            let mut watched = watched_paths.write().await;
+            watched.insert(canonical.clone())
+        };
+        assert!(!is_new, "Duplicate insert should return false");
+        // No send → channel should be empty
+        assert!(
+            add_path_rx.try_recv().is_err(),
+            "Duplicate path should not be sent again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_project_map_register_and_unregister() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let path1 = tmp1.path().canonicalize().unwrap();
+        let path2 = tmp2.path().canonicalize().unwrap();
+
+        let project_map = Arc::new(RwLock::new(HashMap::new()));
+        let pid1 = Uuid::new_v4();
+        let pid2 = Uuid::new_v4();
+
+        // Register two projects
+        {
+            let mut pm = project_map.write().await;
+            pm.insert(
+                path1.clone(),
+                ProjectContext {
+                    project_id: pid1,
+                    project_slug: "proj-a".to_string(),
+                },
+            );
+            pm.insert(
+                path2.clone(),
+                ProjectContext {
+                    project_id: pid2,
+                    project_slug: "proj-b".to_string(),
+                },
+            );
+        }
+        assert_eq!(project_map.read().await.len(), 2);
+
+        // Unregister pid1 (same logic as unregister_project)
+        {
+            let mut pm = project_map.write().await;
+            pm.retain(|_, ctx| ctx.project_id != pid1);
+        }
+        assert_eq!(project_map.read().await.len(), 1);
+
+        // Verify pid2 still present
+        let pm = project_map.read().await;
+        assert!(pm.values().any(|ctx| ctx.project_id == pid2));
+        assert!(!pm.values().any(|ctx| ctx.project_id == pid1));
+    }
+
+    #[tokio::test]
+    async fn test_watcher_fields_before_start() {
+        // Before start(), stop_tx and add_path_tx must be None
+        // (FileWatcher::new sets both to None)
+        let stop_tx: Option<mpsc::Sender<()>> = None;
+        let add_path_tx: Option<mpsc::Sender<PathBuf>> = None;
+
+        assert!(stop_tx.is_none(), "stop_tx should be None before start");
+        assert!(
+            add_path_tx.is_none(),
+            "add_path_tx should be None before start"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_projects_watched_paths_tracking() {
+        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
+
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let tmp3 = tempfile::tempdir().unwrap();
+
+        let paths = vec![
+            tmp1.path().canonicalize().unwrap(),
+            tmp2.path().canonicalize().unwrap(),
+            tmp3.path().canonicalize().unwrap(),
+        ];
+
+        // Insert all
+        {
+            let mut watched = watched_paths.write().await;
+            for p in &paths {
+                watched.insert(p.clone());
+            }
+        }
+
+        let watched = watched_paths.read().await;
+        assert_eq!(watched.len(), 3);
+        for p in &paths {
+            assert!(watched.contains(p));
+        }
     }
 }

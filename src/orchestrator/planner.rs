@@ -47,6 +47,9 @@ pub struct PlanRequest {
     /// If true, auto-create a Plan MCP with Tasks/Steps
     #[serde(default)]
     pub auto_create_plan: Option<bool>,
+    /// Project root path (for resolving relative file paths to absolute)
+    #[serde(default)]
+    pub root_path: Option<String>,
 }
 
 // ============================================================================
@@ -208,6 +211,26 @@ pub struct ModificationDag {
 }
 
 // ============================================================================
+// Path resolution helper
+// ============================================================================
+
+/// Resolve a potentially relative file path to absolute using the project root_path.
+/// - If `path` is already absolute (starts with `/`), return it as-is.
+/// - If `root_path` is provided and `path` is relative, prepend the expanded root.
+/// - Otherwise return `path` unchanged.
+fn resolve_path(root_path: Option<&str>, path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    if let Some(root) = root_path {
+        let expanded = crate::expand_tilde(root);
+        format!("{}/{}", expanded.trim_end_matches('/'), path)
+    } else {
+        path.to_string()
+    }
+}
+
+// ============================================================================
 // Planner
 // ============================================================================
 
@@ -221,6 +244,307 @@ pub struct ImplementationPlanner {
 
 /// Maximum number of zones to consider
 const MAX_ZONES: usize = 20;
+
+/// Common stop words (French + English) that never appear in code and
+/// dilute Meilisearch keyword matching when the user's description is
+/// in natural language.
+const STOP_WORDS: &[&str] = &[
+    // French
+    "le",
+    "la",
+    "les",
+    "un",
+    "une",
+    "des",
+    "du",
+    "de",
+    "d",
+    "l",
+    "et",
+    "ou",
+    "en",
+    "au",
+    "aux",
+    "ce",
+    "ces",
+    "cette",
+    "mon",
+    "ma",
+    "mes",
+    "ton",
+    "ta",
+    "tes",
+    "son",
+    "sa",
+    "ses",
+    "notre",
+    "nos",
+    "votre",
+    "vos",
+    "leur",
+    "leurs",
+    "qui",
+    "que",
+    "quoi",
+    "dont",
+    "dans",
+    "sur",
+    "sous",
+    "avec",
+    "sans",
+    "pour",
+    "par",
+    "vers",
+    "chez",
+    "entre",
+    "comme",
+    "plus",
+    "moins",
+    "très",
+    "trop",
+    "je",
+    "tu",
+    "il",
+    "elle",
+    "nous",
+    "vous",
+    "ils",
+    "elles",
+    "on",
+    "ne",
+    "pas",
+    "est",
+    "sont",
+    "être",
+    "avoir",
+    "fait",
+    "faire",
+    "faut",
+    "peut",
+    "doit",
+    "dois",
+    "quand",
+    "si",
+    "mais",
+    "car",
+    "donc",
+    "ni",
+    "puis",
+    "aussi",
+    "bien",
+    "tout",
+    "tous",
+    "toute",
+    "toutes",
+    "même",
+    "autre",
+    "autres",
+    "quel",
+    "quelle",
+    "quels",
+    "quelles",
+    "chaque",
+    "quelque",
+    "quelques",
+    "comment",
+    "combien",
+    "où",
+    "ya",
+    "y",
+    "a",
+    "à",
+    // French verbs commonly used in feature descriptions
+    "ajouter",
+    "créer",
+    "modifier",
+    "supprimer",
+    "mettre",
+    "jour",
+    "implémenter",
+    "implementer",
+    "corriger",
+    "refactorer",
+    // English
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "shall",
+    "can",
+    "of",
+    "in",
+    "to",
+    "for",
+    "with",
+    "on",
+    "at",
+    "from",
+    "by",
+    "up",
+    "about",
+    "into",
+    "through",
+    "during",
+    "before",
+    "after",
+    "above",
+    "below",
+    "between",
+    "out",
+    "off",
+    "over",
+    "under",
+    "again",
+    "further",
+    "then",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "each",
+    "every",
+    "both",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "no",
+    "nor",
+    "not",
+    "only",
+    "own",
+    "same",
+    "so",
+    "than",
+    "too",
+    "very",
+    "and",
+    "but",
+    "or",
+    "if",
+    "while",
+    "as",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+    "i",
+    "me",
+    "my",
+    "we",
+    "our",
+    "you",
+    "your",
+    "he",
+    "him",
+    "his",
+    "she",
+    "her",
+    "they",
+    "them",
+    "their",
+    "what",
+    "which",
+    "who",
+    "whom",
+    // English verbs commonly used in feature descriptions
+    "add",
+    "create",
+    "update",
+    "delete",
+    "remove",
+    "fix",
+    "implement",
+    "change",
+    "modify",
+    "refactor",
+    "move",
+    "need",
+    "want",
+    "new",
+    "make",
+    "get",
+    "set",
+    "use",
+    "using",
+    "like",
+];
+
+/// Extract code-relevant keywords from a natural language description.
+///
+/// Strips stop words (FR/EN), short tokens (< 2 chars), and returns
+/// the remaining terms joined by spaces. Falls back to the original
+/// description if filtering removes everything.
+fn extract_search_keywords(description: &str) -> String {
+    let stop_set: HashSet<&str> = STOP_WORDS.iter().copied().collect();
+
+    // Trim only common natural-language punctuation from edges.
+    // Preserve code-relevant chars: _ - / : # . @ (paths, URLs, identifiers)
+    let trim_chars = |c: char| {
+        matches!(
+            c,
+            ',' | ';'
+                | '!'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '"'
+                | '\''
+                | '«'
+                | '»'
+                | '—'
+                | '–'
+                | '\u{2019}'
+        )
+    };
+
+    let keywords: Vec<&str> = description
+        .split_whitespace()
+        // Split on apostrophes within words (e.g. "l'endpoint" → ["l", "endpoint"])
+        .flat_map(|w| w.split('\''))
+        .flat_map(|w| w.split('\u{2019}')) // curly apostrophe
+        .map(|w| w.trim_matches(trim_chars))
+        .filter(|w| !w.is_empty())
+        .filter(|w| w.len() >= 2)
+        .filter(|w| !stop_set.contains(&w.to_lowercase().as_str()))
+        .collect();
+
+    if keywords.is_empty() {
+        description.to_string()
+    } else {
+        keywords.join(" ")
+    }
+}
 /// Maximum depth for dependency expansion
 const MAX_DEPENDENCY_DEPTH: u32 = 2;
 /// Threshold for high risk (dependents count)
@@ -252,32 +576,36 @@ impl ImplementationPlanner {
     /// If the entry point looks like a file path (contains `/` or `.`), resolve via
     /// `get_file_symbol_names`. Otherwise treat it as a symbol name and use
     /// `find_symbol_references` to locate the file.
+    ///
+    /// Relative file paths are resolved to absolute using the project `root_path`.
     async fn resolve_explicit_entries(
         &self,
         entry_points: &[String],
         project_id: Uuid,
+        root_path: Option<&str>,
     ) -> Result<Vec<RelevantZone>> {
         let mut zones = Vec::new();
         for entry in entry_points {
             if entry.contains('/') || entry.contains('.') {
-                // File path — get symbols in this file
-                match self.neo4j.get_file_symbol_names(entry).await {
+                // File path — resolve to absolute, then get symbols
+                let resolved = resolve_path(root_path, entry);
+                match self.neo4j.get_file_symbol_names(&resolved).await {
                     Ok(symbols) => {
                         let mut functions = symbols.functions;
                         functions.extend(symbols.structs);
                         functions.extend(symbols.traits);
                         functions.extend(symbols.enums);
                         zones.push(RelevantZone {
-                            file_path: entry.clone(),
+                            file_path: resolved,
                             functions,
                             relevance_score: 1.0,
                             source: ZoneSource::ExplicitEntry,
                         });
                     }
                     Err(_) => {
-                        // File not in graph — still add it with no symbols
+                        // File not in graph — still add it with resolved path
                         zones.push(RelevantZone {
-                            file_path: entry.clone(),
+                            file_path: resolved,
                             functions: vec![],
                             relevance_score: 1.0,
                             source: ZoneSource::ExplicitEntry,
@@ -305,14 +633,24 @@ impl ImplementationPlanner {
 
     /// Fallback: search for relevant zones via semantic code search + note search.
     /// Uses `tokio::join!` to parallelize the two independent queries.
+    ///
+    /// The description is pre-processed with `extract_search_keywords` to strip
+    /// natural-language stop words (FR/EN) that would dilute Meilisearch matching.
     async fn search_semantic_zones(
         &self,
         description: &str,
         project_slug: Option<&str>,
     ) -> Result<Vec<RelevantZone>> {
+        let keywords = extract_search_keywords(description);
+        tracing::debug!(
+            "Planner: semantic search — raw={:?}, keywords={:?}",
+            description,
+            keywords
+        );
+
         let (code_results, note_results) = tokio::join!(
             self.meili
-                .search_code_with_scores(description, 10, None, project_slug, None),
+                .search_code_with_scores(&keywords, 10, None, project_slug, None),
             self.meili
                 .search_notes_with_filters(description, 10, project_slug, None, None, None),
         );
@@ -320,31 +658,41 @@ impl ImplementationPlanner {
         let mut zones = Vec::new();
 
         // Code search results
-        if let Ok(hits) = code_results {
-            for hit in hits {
-                zones.push(RelevantZone {
-                    file_path: hit.document.path.clone(),
-                    functions: hit.document.symbols.clone(),
-                    relevance_score: hit.score.min(1.0),
-                    source: ZoneSource::SemanticSearch,
-                });
+        match code_results {
+            Ok(hits) => {
+                for hit in hits {
+                    zones.push(RelevantZone {
+                        file_path: hit.document.path.clone(),
+                        functions: hit.document.symbols.clone(),
+                        relevance_score: hit.score.min(1.0),
+                        source: ZoneSource::SemanticSearch,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Planner: semantic code search failed: {}", e);
             }
         }
 
         // Note search results — extract file paths from anchor entities
-        if let Ok(notes) = note_results {
-            for note in notes {
-                for anchor in &note.anchor_entities {
-                    // Anchor entities that look like file paths
-                    if anchor.contains('/') || anchor.contains('.') {
-                        zones.push(RelevantZone {
-                            file_path: anchor.clone(),
-                            functions: vec![],
-                            relevance_score: 0.5, // Lower score for note-sourced zones
-                            source: ZoneSource::NoteReference,
-                        });
+        match note_results {
+            Ok(notes) => {
+                for note in notes {
+                    for anchor in &note.anchor_entities {
+                        // Anchor entities that look like file paths
+                        if anchor.contains('/') || anchor.contains('.') {
+                            zones.push(RelevantZone {
+                                file_path: anchor.clone(),
+                                functions: vec![],
+                                relevance_score: 0.5, // Lower score for note-sourced zones
+                                source: ZoneSource::NoteReference,
+                            });
+                        }
                     }
                 }
+            }
+            Err(e) => {
+                tracing::warn!("Planner: note search failed: {}", e);
             }
         }
 
@@ -355,9 +703,10 @@ impl ImplementationPlanner {
     /// otherwise fall back to semantic search. Dedup by file_path (keep best score),
     /// sort by score descending, limit to MAX_ZONES.
     async fn identify_zones(&self, request: &PlanRequest) -> Result<Vec<RelevantZone>> {
+        let root_path = request.root_path.as_deref();
         let zones = if let Some(ref entries) = request.entry_points {
             if !entries.is_empty() {
-                self.resolve_explicit_entries(entries, request.project_id)
+                self.resolve_explicit_entries(entries, request.project_id, root_path)
                     .await?
             } else {
                 self.search_semantic_zones(&request.description, request.project_slug.as_deref())
@@ -367,6 +716,17 @@ impl ImplementationPlanner {
             self.search_semantic_zones(&request.description, request.project_slug.as_deref())
                 .await?
         };
+
+        // Normalize all zone file paths to absolute using project root_path.
+        // This ensures dedup works correctly even when Meilisearch returns
+        // both relative and absolute paths for the same file.
+        let zones: Vec<RelevantZone> = zones
+            .into_iter()
+            .map(|mut zone| {
+                zone.file_path = resolve_path(root_path, &zone.file_path);
+                zone
+            })
+            .collect();
 
         // Dedup by file_path — keep the highest relevance_score
         let mut best: HashMap<String, RelevantZone> = HashMap::new();
@@ -391,8 +751,9 @@ impl ImplementationPlanner {
     // Phase 2 — DAG construction (Task 3)
     // ========================================================================
 
-    /// Expand dependencies for each zone: find dependent files (files that import
-    /// this zone's file) and direct imports. Returns (dependents_map, imports_map).
+    /// Expand dependencies for each zone: find impacted files (files that import
+    /// OR call functions from this zone's file) and direct imports.
+    /// Returns (dependents_map, imports_map).
     async fn expand_dependencies(
         &self,
         zones: &[RelevantZone],
@@ -403,7 +764,7 @@ impl ImplementationPlanner {
 
         for zone in zones {
             let (dependents, imports) = tokio::join!(
-                self.neo4j.find_dependent_files(
+                self.neo4j.find_impacted_files(
                     &zone.file_path,
                     MAX_DEPENDENCY_DEPTH,
                     Some(project_id)
@@ -1085,6 +1446,7 @@ mod tests {
             entry_points: Some(vec!["src/chat/mod.rs".to_string()]),
             scope: Some(PlanScope::Module),
             auto_create_plan: Some(false),
+            root_path: Some("~/.openclaw/workspace/my-project".to_string()),
         };
         let json = serde_json::to_string(&request).unwrap();
         let parsed: PlanRequest = serde_json::from_str(&json).unwrap();
@@ -1273,7 +1635,7 @@ mod tests {
         let (planner, pid) = setup_planner_with_data().await;
 
         let zones = planner
-            .resolve_explicit_entries(&["src/models.rs".to_string()], pid)
+            .resolve_explicit_entries(&["src/models.rs".to_string()], pid, None)
             .await
             .unwrap();
 
@@ -1290,7 +1652,7 @@ mod tests {
         let (planner, pid) = setup_planner_with_data().await;
 
         let zones = planner
-            .resolve_explicit_entries(&["src/unknown.rs".to_string()], pid)
+            .resolve_explicit_entries(&["src/unknown.rs".to_string()], pid, None)
             .await
             .unwrap();
 
@@ -1314,6 +1676,7 @@ mod tests {
             ]),
             scope: None,
             auto_create_plan: None,
+            root_path: None,
         };
 
         let zones = planner.identify_zones(&request).await.unwrap();
@@ -1338,6 +1701,7 @@ mod tests {
             ]),
             scope: None,
             auto_create_plan: None,
+            root_path: None,
         };
 
         let zones = planner.identify_zones(&request).await.unwrap();
@@ -1356,6 +1720,7 @@ mod tests {
             entry_points: None,
             scope: None,
             auto_create_plan: None,
+            root_path: None,
         };
 
         // With empty mocks, should return empty (no semantic matches)
@@ -1891,6 +2256,7 @@ mod tests {
             ]),
             scope: Some(PlanScope::Module),
             auto_create_plan: None,
+            root_path: None,
         };
 
         let plan = planner.plan_implementation(request).await.unwrap();
@@ -1918,6 +2284,7 @@ mod tests {
             entry_points: None, // No explicit entries, semantic search won't match
             scope: None,
             auto_create_plan: None,
+            root_path: None,
         };
 
         let plan = planner.plan_implementation(request).await.unwrap();
@@ -1939,6 +2306,7 @@ mod tests {
             ]),
             scope: None,
             auto_create_plan: Some(true),
+            root_path: None,
         };
 
         let plan = planner.plan_implementation(request).await.unwrap();
@@ -1948,5 +2316,44 @@ mod tests {
         assert!(!plan_id_str.is_empty());
         // Verify it's a valid UUID
         Uuid::parse_str(&plan_id_str).unwrap();
+    }
+
+    #[test]
+    fn test_extract_search_keywords_french() {
+        let result = extract_search_keywords("ajouter un endpoint REST pour les releases");
+        assert_eq!(result, "endpoint REST releases");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_english() {
+        let result = extract_search_keywords("add a new REST endpoint for releases");
+        assert_eq!(result, "REST endpoint releases");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_technical() {
+        // Technical terms should be preserved
+        let result = extract_search_keywords("implement WebSocket streaming for chat sessions");
+        assert_eq!(result, "WebSocket streaming chat sessions");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_code_terms_only() {
+        let result = extract_search_keywords("get_release create_milestone");
+        assert_eq!(result, "get_release create_milestone");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_all_stopwords_fallback() {
+        // If all words are stop words, fall back to original
+        let result = extract_search_keywords("un de la");
+        assert_eq!(result, "un de la");
+    }
+
+    #[test]
+    fn test_extract_search_keywords_mixed_punctuation() {
+        let result = extract_search_keywords("ajouter l'endpoint /api/releases/:id");
+        assert!(result.contains("endpoint"));
+        assert!(result.contains("/api/releases/:id"));
     }
 }

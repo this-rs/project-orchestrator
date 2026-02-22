@@ -200,6 +200,18 @@ impl Neo4jClient {
             "CREATE CONSTRAINT workspace_milestone_id IF NOT EXISTS FOR (wm:WorkspaceMilestone) REQUIRE wm.id IS UNIQUE",
             "CREATE CONSTRAINT resource_id IF NOT EXISTS FOR (r:Resource) REQUIRE r.id IS UNIQUE",
             "CREATE CONSTRAINT component_id IF NOT EXISTS FOR (c:Component) REQUIRE c.id IS UNIQUE",
+            // Chat constraints
+            "CREATE CONSTRAINT chat_session_id IF NOT EXISTS FOR (s:ChatSession) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT chat_event_id IF NOT EXISTS FOR (e:ChatEvent) REQUIRE e.id IS UNIQUE",
+            // Milestone & Release constraints
+            "CREATE CONSTRAINT milestone_id IF NOT EXISTS FOR (m:Milestone) REQUIRE m.id IS UNIQUE",
+            "CREATE CONSTRAINT release_id IF NOT EXISTS FOR (r:Release) REQUIRE r.id IS UNIQUE",
+            // FeatureGraph constraint
+            "CREATE CONSTRAINT feature_graph_id IF NOT EXISTS FOR (fg:FeatureGraph) REQUIRE fg.id IS UNIQUE",
+            // User constraint
+            "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
+            // RefreshToken constraint
+            "CREATE CONSTRAINT refresh_token_hash IF NOT EXISTS FOR (rt:RefreshToken) REQUIRE rt.token_hash IS UNIQUE",
         ];
 
         let indexes = vec![
@@ -232,6 +244,27 @@ impl Neo4jClient {
             "CREATE INDEX resource_type IF NOT EXISTS FOR (r:Resource) ON (r.resource_type)",
             "CREATE INDEX component_workspace IF NOT EXISTS FOR (c:Component) ON (c.workspace_id)",
             "CREATE INDEX component_type IF NOT EXISTS FOR (c:Component) ON (c.component_type)",
+            // ChatEvent indexes — critical for performance (120K+ nodes)
+            "CREATE INDEX chat_event_session IF NOT EXISTS FOR (e:ChatEvent) ON (e.session_id)",
+            "CREATE INDEX chat_event_type IF NOT EXISTS FOR (e:ChatEvent) ON (e.event_type)",
+            "CREATE INDEX chat_event_seq IF NOT EXISTS FOR (e:ChatEvent) ON (e.seq)",
+            // ChatSession indexes — queried by project_slug, workspace_slug, cli_session_id
+            "CREATE INDEX chat_session_project IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug)",
+            "CREATE INDEX chat_session_workspace IF NOT EXISTS FOR (s:ChatSession) ON (s.workspace_slug)",
+            "CREATE INDEX chat_session_cli IF NOT EXISTS FOR (s:ChatSession) ON (s.cli_session_id)",
+            // FeatureGraph indexes
+            "CREATE INDEX feature_graph_project IF NOT EXISTS FOR (fg:FeatureGraph) ON (fg.project_id)",
+            // User indexes — queried by email, external_id, auth_provider
+            "CREATE INDEX user_email IF NOT EXISTS FOR (u:User) ON (u.email)",
+            "CREATE INDEX user_external IF NOT EXISTS FOR (u:User) ON (u.external_id)",
+            "CREATE INDEX user_auth_provider IF NOT EXISTS FOR (u:User) ON (u.auth_provider)",
+            // RefreshToken indexes — queried by user_id
+            "CREATE INDEX refresh_token_user IF NOT EXISTS FOR (rt:RefreshToken) ON (rt.user_id)",
+            // Milestone indexes
+            "CREATE INDEX milestone_project IF NOT EXISTS FOR (m:Milestone) ON (m.project_id)",
+            // Release indexes
+            "CREATE INDEX release_project IF NOT EXISTS FOR (r:Release) ON (r.project_id)",
+            "CREATE INDEX release_version IF NOT EXISTS FOR (r:Release) ON (r.version)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)
@@ -291,6 +324,13 @@ impl Neo4jClient {
             "workspace_milestone_id",
             "resource_id",
             "component_id",
+            "chat_session_id",
+            "chat_event_id",
+            "milestone_id",
+            "release_id",
+            "feature_graph_id",
+            "user_id",
+            "refresh_token_hash",
         ];
         match self
             .graph
@@ -5842,6 +5882,72 @@ impl Neo4jClient {
                 r#"
                 MATCH (f:File {{path: $path}})<-[:IMPORTS*1..{}]-(dependent:File)
                 RETURN DISTINCT dependent.path AS path
+                "#,
+                depth
+            ))
+            .param("path", file_path),
+        };
+
+        let mut result = self.graph.execute(q).await?;
+        let mut paths = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            paths.push(row.get("path")?);
+        }
+
+        Ok(paths)
+    }
+
+    /// Find all files impacted by a change to a given file.
+    ///
+    /// Combines two traversal axes:
+    /// 1. **IMPORTS** — files that import (directly or transitively) the target file
+    /// 2. **CALLS**  — files whose functions call functions defined in the target file
+    ///
+    /// Returns a deduplicated list of file paths (excluding the target itself).
+    pub async fn find_impacted_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
+        let q = match project_id {
+            Some(pid) => query(&format!(
+                r#"
+                MATCH (f:File {{path: $path}})<-[:CONTAINS]-(p:Project {{id: $project_id}})
+                // Axis 1: files that import the target (transitively)
+                OPTIONAL MATCH (f)<-[:IMPORTS*1..{}]-(imp:File)
+                WHERE imp IS NULL OR EXISTS {{ MATCH (imp)<-[:CONTAINS]-(p) }}
+                // Axis 2: files whose functions call functions in the target
+                WITH f, p, COLLECT(DISTINCT imp.path) AS import_paths
+                OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)<-[:CALLS]-(caller:Function)<-[:CONTAINS]-(caller_file:File)
+                WHERE caller_file <> f AND EXISTS {{ MATCH (caller_file)<-[:CONTAINS]-(p) }}
+                WITH import_paths, COLLECT(DISTINCT caller_file.path) AS call_paths
+                // Merge both axes
+                WITH import_paths + call_paths AS all_paths
+                UNWIND all_paths AS path
+                WITH path WHERE path IS NOT NULL
+                RETURN DISTINCT path
+                "#,
+                depth
+            ))
+            .param("path", file_path)
+            .param("project_id", pid.to_string()),
+            None => query(&format!(
+                r#"
+                MATCH (f:File {{path: $path}})
+                // Axis 1: files that import the target (transitively)
+                OPTIONAL MATCH (f)<-[:IMPORTS*1..{}]-(imp:File)
+                // Axis 2: files whose functions call functions in the target
+                WITH f, COLLECT(DISTINCT imp.path) AS import_paths
+                OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)<-[:CALLS]-(caller:Function)<-[:CONTAINS]-(caller_file:File)
+                WHERE caller_file <> f
+                WITH import_paths, COLLECT(DISTINCT caller_file.path) AS call_paths
+                // Merge both axes
+                WITH import_paths + call_paths AS all_paths
+                UNWIND all_paths AS path
+                WITH path WHERE path IS NOT NULL
+                RETURN DISTINCT path
                 "#,
                 depth
             ))

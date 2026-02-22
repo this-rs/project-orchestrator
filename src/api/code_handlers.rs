@@ -456,46 +456,72 @@ pub async fn analyze_impact(
 ) -> Result<Json<ImpactAnalysis>, AppError> {
     let target_type = query.target_type.as_deref().unwrap_or("file");
 
-    let project_id = if let Some(ref slug) = query.project_slug {
-        Some(
-            state
-                .orchestrator
-                .neo4j()
-                .get_project_by_slug(slug)
-                .await?
-                .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?
-                .id,
-        )
+    let (project_id, project_root) = if let Some(ref slug) = query.project_slug {
+        let project = state
+            .orchestrator
+            .neo4j()
+            .get_project_by_slug(slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+        (Some(project.id), Some(project.root_path))
     } else {
-        None
+        (None, None)
     };
 
-    let (directly_affected, transitively_affected, caller_count) = if target_type == "file" {
+    // Resolve relative file paths to absolute using project root_path
+    let target = if target_type == "file" && !query.target.starts_with('/') {
+        if let Some(ref root) = project_root {
+            let expanded = crate::expand_tilde(root);
+            format!("{}/{}", expanded.trim_end_matches('/'), &query.target)
+        } else {
+            query.target.clone()
+        }
+    } else {
+        query.target.clone()
+    };
+
+    let (directly_affected, transitively_affected, caller_count, target) = if target_type == "file"
+    {
         let direct = state
             .orchestrator
             .neo4j()
-            .find_dependent_files(&query.target, 1, project_id)
+            .find_impacted_files(&target, 1, project_id)
             .await?;
+        // Fallback: if resolved path found nothing, retry with the raw input
+        let (direct, effective) = if direct.is_empty() && target != query.target {
+            let fallback = state
+                .orchestrator
+                .neo4j()
+                .find_impacted_files(&query.target, 1, project_id)
+                .await?;
+            if !fallback.is_empty() {
+                (fallback, query.target.clone())
+            } else {
+                (direct, target)
+            }
+        } else {
+            (direct, target)
+        };
         let transitive = state
             .orchestrator
             .neo4j()
-            .find_dependent_files(&query.target, 3, project_id)
+            .find_impacted_files(&effective, 3, project_id)
             .await?;
         let count = direct.len() as i64;
-        (direct, transitive, count)
+        (direct, transitive, count, effective)
     } else {
         let callers = state
             .orchestrator
             .neo4j()
-            .find_callers(&query.target, project_id)
+            .find_callers(&target, project_id)
             .await?;
         let direct: Vec<String> = callers.iter().map(|f| f.file_path.clone()).collect();
         let count = state
             .orchestrator
             .neo4j()
-            .get_function_caller_count(&query.target, project_id)
+            .get_function_caller_count(&target, project_id)
             .await?;
-        (direct.clone(), direct, count)
+        (direct.clone(), direct, count, target)
     };
 
     let test_files: Vec<String> = transitively_affected
@@ -505,12 +531,25 @@ pub async fn analyze_impact(
         .collect();
 
     // Fetch GDS analytics for the target node (best-effort: None if not computed)
-    let node_analytics = state
-        .orchestrator
-        .neo4j()
-        .get_node_analytics(&query.target, target_type)
-        .await
-        .unwrap_or(None);
+    // Try resolved path first, fall back to raw input if analytics not found
+    let node_analytics = {
+        let analytics = state
+            .orchestrator
+            .neo4j()
+            .get_node_analytics(&target, target_type)
+            .await
+            .unwrap_or(None);
+        match analytics {
+            Some(a) => Some(a),
+            None if target != query.target => state
+                .orchestrator
+                .neo4j()
+                .get_node_analytics(&query.target, target_type)
+                .await
+                .unwrap_or(None),
+            None => None,
+        }
+    };
 
     // Collect all affected file paths for community analysis
     let all_affected: Vec<String> = directly_affected
@@ -600,7 +639,7 @@ pub async fn analyze_impact(
     );
 
     Ok(Json(ImpactAnalysis {
-        target: query.target,
+        target,
         directly_affected,
         transitively_affected,
         test_files_affected: test_files,
@@ -1388,6 +1427,7 @@ pub async fn plan_implementation(
         entry_points: body.entry_points,
         scope,
         auto_create_plan: body.auto_create_plan,
+        root_path: Some(project.root_path),
     };
 
     let plan = state

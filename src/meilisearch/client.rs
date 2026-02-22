@@ -279,6 +279,15 @@ impl MeiliClient {
         Ok(())
     }
 
+    /// Delete ALL code documents from the index (used by cleanup_sync_data)
+    pub async fn delete_all_code(&self) -> Result<()> {
+        let index = self.client.index(index_names::CODE);
+        let task = index.delete_all_documents().await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(60)))
+            .await?;
+        Ok(())
+    }
+
     /// Get statistics for the code index
     pub async fn get_code_stats(&self) -> Result<IndexStats> {
         let index = self.client.index(index_names::CODE);

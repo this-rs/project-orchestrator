@@ -1139,13 +1139,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 continue;
             }
 
-            // Skip node_modules, target, etc.
+            // Skip ignored directories (shared constant with watcher.rs)
             let path_str = path.to_string_lossy();
-            if path_str.contains("node_modules")
-                || path_str.contains("/target/")
-                || path_str.contains("/.git/")
-                || path_str.contains("__pycache__")
-            {
+            if super::should_ignore_path(&path_str) {
                 continue;
             }
 

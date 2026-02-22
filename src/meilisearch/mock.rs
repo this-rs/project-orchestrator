@@ -212,6 +212,12 @@ impl SearchStore for MockSearchStore {
         Ok(())
     }
 
+    async fn delete_all_code(&self) -> Result<()> {
+        let mut docs = self.code_documents.write().await;
+        docs.clear();
+        Ok(())
+    }
+
     async fn get_code_stats(&self) -> Result<IndexStats> {
         let docs = self.code_documents.read().await;
         Ok(IndexStats {

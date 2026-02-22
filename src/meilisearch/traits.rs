@@ -57,6 +57,9 @@ pub trait SearchStore: Send + Sync {
     /// Delete orphan code documents (documents without project_id or with empty project_id)
     async fn delete_orphan_code_documents(&self) -> Result<()>;
 
+    /// Delete ALL code documents from the index (used by cleanup_sync_data)
+    async fn delete_all_code(&self) -> Result<()>;
+
     /// Get statistics for the code index
     async fn get_code_stats(&self) -> Result<IndexStats>;
 

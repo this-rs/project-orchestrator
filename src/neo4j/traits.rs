@@ -716,9 +716,20 @@ pub trait GraphStore: Send + Sync {
     // Dependency analysis
     // ========================================================================
 
-    /// Find all files that depend on a given file.
+    /// Find all files that depend on a given file (IMPORTS-only traversal).
     /// When project_id is provided, only return dependents from the same project.
     async fn find_dependent_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Find all files impacted by a change to a given file.
+    /// Combines IMPORTS traversal (file→file) and CALLS traversal
+    /// (functions in target ← called by functions in other files).
+    /// When project_id is provided, only return files from the same project.
+    async fn find_impacted_files(
         &self,
         file_path: &str,
         depth: u32,

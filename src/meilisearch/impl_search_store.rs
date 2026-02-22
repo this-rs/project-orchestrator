@@ -68,6 +68,10 @@ impl SearchStore for MeiliClient {
         self.delete_orphan_code_documents().await
     }
 
+    async fn delete_all_code(&self) -> Result<()> {
+        self.delete_all_code().await
+    }
+
     async fn get_code_stats(&self) -> Result<IndexStats> {
         self.get_code_stats().await
     }
