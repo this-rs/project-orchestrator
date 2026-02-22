@@ -116,6 +116,7 @@ pub(crate) struct RuntimeEnvConfig {
     pub process_path: Option<String>,
     pub claude_cli_path: Option<String>,
     pub auto_update_cli: bool,
+    pub auto_update_app: bool,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -222,6 +223,7 @@ impl ChatManager {
             process_path: config.process_path.clone(),
             claude_cli_path: config.claude_cli_path.clone(),
             auto_update_cli: config.auto_update_cli,
+            auto_update_app: config.auto_update_app,
         }));
         Self {
             graph,
@@ -267,6 +269,7 @@ impl ChatManager {
             process_path: config.process_path.clone(),
             claude_cli_path: config.claude_cli_path.clone(),
             auto_update_cli: config.auto_update_cli,
+            auto_update_app: config.auto_update_app,
         }));
         Self {
             graph,
@@ -451,14 +454,20 @@ impl ChatManager {
         self.env_config.write().await.auto_update_cli = enabled;
     }
 
-    /// Persist environment config (process_path, claude_cli_path, auto_update_cli) to config.yaml.
+    /// Update the auto-update app toggle.
+    pub async fn update_auto_update_app(&self, enabled: bool) {
+        self.env_config.write().await.auto_update_app = enabled;
+    }
+
+    /// Persist environment config (process_path, claude_cli_path, auto_update_cli, auto_update_app) to config.yaml.
     ///
     /// Uses the same surgical YAML modification pattern as `persist_permission_to_yaml`:
     /// read existing YAML, update only the relevant fields, write back atomically.
     pub async fn persist_chat_config_to_yaml(&self) -> Result<()> {
-        let yaml_path = self.config_yaml_path.as_ref().ok_or_else(|| {
-            anyhow!("No config.yaml path configured — cannot persist")
-        })?;
+        let yaml_path = self
+            .config_yaml_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("No config.yaml path configured — cannot persist"))?;
 
         let env = self.env_config.read().await.clone();
         Self::persist_env_config_to_yaml(yaml_path, &env)
@@ -525,6 +534,13 @@ impl ChatManager {
             chat_section.insert(auto_key, serde_yaml::Value::Bool(true));
         } else {
             chat_section.remove(&auto_key);
+        }
+        // Only write auto_update_app when false (default is true, so omit when true to keep YAML clean)
+        let auto_app_key = serde_yaml::Value::String("auto_update_app".into());
+        if !env.auto_update_app {
+            chat_section.insert(auto_app_key, serde_yaml::Value::Bool(false));
+        } else {
+            chat_section.remove(&auto_app_key);
         }
 
         // 5. Serialize the full document back to YAML string
@@ -4429,6 +4445,7 @@ mod tests {
             process_path: None,
             claude_cli_path: None,
             auto_update_cli: false,
+            auto_update_app: true,
         }
     }
 
@@ -8033,7 +8050,15 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         let options = manager
-            .build_options("/tmp", "claude-sonnet-4-6", "test prompt", None, None, None, &[])
+            .build_options(
+                "/tmp",
+                "claude-sonnet-4-6",
+                "test prompt",
+                None,
+                None,
+                None,
+                &[],
+            )
             .await;
 
         // Verify PATH was injected into the env HashMap
@@ -8044,7 +8069,10 @@ mod tests {
         );
         // Verify cli_path was set
         assert_eq!(
-            options.cli_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            options
+                .cli_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             Some("/test/claude".to_string()),
             "claude_cli_path should be set on options"
         );
@@ -8057,7 +8085,15 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         let options = manager
-            .build_options("/tmp", "claude-sonnet-4-6", "test prompt", None, None, None, &[])
+            .build_options(
+                "/tmp",
+                "claude-sonnet-4-6",
+                "test prompt",
+                None,
+                None,
+                None,
+                &[],
+            )
             .await;
 
         // PATH should NOT be in env when process_path is None
@@ -8142,7 +8178,10 @@ mod tests {
             Some("/runtime/path:/usr/bin")
         );
         assert_eq!(
-            options.cli_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            options
+                .cli_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             Some("/runtime/claude".to_string())
         );
     }
@@ -8156,6 +8195,7 @@ mod tests {
             process_path: Some("/custom/path:/usr/bin".into()),
             claude_cli_path: Some("/opt/claude".into()),
             auto_update_cli: true,
+            auto_update_app: true,
         };
 
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env).unwrap();
@@ -8175,11 +8215,9 @@ mod tests {
                 .unwrap(),
             "/opt/claude"
         );
-        assert!(
-            chat[&serde_yaml::Value::String("auto_update_cli".into())]
-                .as_bool()
-                .unwrap()
-        );
+        assert!(chat[&serde_yaml::Value::String("auto_update_cli".into())]
+            .as_bool()
+            .unwrap());
     }
 
     #[test]
@@ -8198,6 +8236,7 @@ mod tests {
             process_path: Some("/my/path".into()),
             claude_cli_path: None,
             auto_update_cli: false,
+            auto_update_app: true,
         };
 
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env).unwrap();
@@ -8213,7 +8252,10 @@ mod tests {
             "claude-sonnet-4-6"
         );
         // chat.permissions preserved
-        assert_eq!(doc["chat"]["permissions"]["mode"].as_str().unwrap(), "default");
+        assert_eq!(
+            doc["chat"]["permissions"]["mode"].as_str().unwrap(),
+            "default"
+        );
         // process_path set
         assert_eq!(doc["chat"]["process_path"].as_str().unwrap(), "/my/path");
         // claude_cli_path removed (None)
@@ -8232,6 +8274,7 @@ mod tests {
             process_path: Some("/my/path".into()),
             claude_cli_path: Some("/my/claude".into()),
             auto_update_cli: true,
+            auto_update_app: true,
         };
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env1).unwrap();
 
@@ -8240,6 +8283,7 @@ mod tests {
             process_path: None,
             claude_cli_path: None,
             auto_update_cli: false,
+            auto_update_app: true,
         };
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env2).unwrap();
 
@@ -8248,8 +8292,8 @@ mod tests {
 
         // All fields should be removed
         let chat = doc["chat"].as_mapping().unwrap();
-        assert!(!chat.contains_key(&serde_yaml::Value::String("process_path".into())));
-        assert!(!chat.contains_key(&serde_yaml::Value::String("claude_cli_path".into())));
-        assert!(!chat.contains_key(&serde_yaml::Value::String("auto_update_cli".into())));
+        assert!(!chat.contains_key(serde_yaml::Value::String("process_path".into())));
+        assert!(!chat.contains_key(serde_yaml::Value::String("claude_cli_path".into())));
+        assert!(!chat.contains_key(serde_yaml::Value::String("auto_update_cli".into())));
     }
 }

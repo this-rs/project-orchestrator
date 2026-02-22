@@ -178,6 +178,8 @@ pub struct ChatConfig {
     pub claude_cli_path: Option<String>,
     /// Enable automatic CLI version updates on startup (default: false).
     pub auto_update_cli: bool,
+    /// Enable automatic Tauri application updates on startup (default: true).
+    pub auto_update_app: bool,
 }
 
 impl ChatConfig {
@@ -248,6 +250,9 @@ impl ChatConfig {
             auto_update_cli: std::env::var("CHAT_AUTO_UPDATE_CLI")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            auto_update_app: std::env::var("CHAT_AUTO_UPDATE_APP")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(true),
         }
     }
 
@@ -328,6 +333,7 @@ mod tests {
             process_path: None,
             claude_cli_path: None,
             auto_update_cli: false,
+            auto_update_app: true,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -378,7 +384,10 @@ mod tests {
             "Bash(git *),Read,mcp__project-orchestrator__*",
         );
         std::env::set_var("CHAT_DISALLOWED_TOOLS", "Bash(rm -rf *), Bash(sudo *)");
-        std::env::set_var("CHAT_PROCESS_PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+        std::env::set_var(
+            "CHAT_PROCESS_PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        );
         std::env::set_var("CLAUDE_CLI_PATH", "/opt/homebrew/bin/claude");
         std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
 
@@ -478,6 +487,7 @@ mod tests {
             process_path: None,
             claude_cli_path: None,
             auto_update_cli: false,
+            auto_update_app: true,
         };
 
         let json = config.mcp_server_config();
@@ -509,6 +519,7 @@ mod tests {
             process_path: None,
             claude_cli_path: None,
             auto_update_cli: false,
+            auto_update_app: true,
         };
 
         let json = config.mcp_server_config();

@@ -143,6 +143,7 @@ fn main() {
             setup::generate_config,
             setup::read_config,
             setup::detect_claude_code,
+            setup::detect_shell_path,
             setup::setup_claude_code,
             setup::verify_oidc_discovery,
             // Docker management commands
@@ -168,8 +169,21 @@ fn main() {
             }
             // Set up minimize-to-tray behavior
             tray::setup_minimize_to_tray(app.handle());
-            // Check for updates in background
-            updater::check_for_updates(app.handle().clone());
+            // Check for updates in background (unless disabled in config.yaml)
+            let auto_update_app = std::fs::read_to_string(setup::config_path())
+                .ok()
+                .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+                .and_then(|v| {
+                    v.get("chat")
+                        .and_then(|c| c.get("auto_update_app"))
+                        .and_then(|v| v.as_bool())
+                })
+                .unwrap_or(true); // default: true
+            if auto_update_app {
+                updater::check_for_updates(app.handle().clone());
+            } else {
+                tracing::info!("Auto-update disabled in config — skipping startup update check");
+            }
 
             // Resolve absolute paths to bundled resources so the backend can find them.
             if let Ok(resource_dir) = app.path().resource_dir() {

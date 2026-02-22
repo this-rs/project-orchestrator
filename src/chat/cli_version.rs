@@ -213,9 +213,7 @@ mod tests {
             "/usr/local/bin/claude should not be local"
         );
         assert!(
-            !is_local_build(Path::new(
-                "/usr/local/lib/node_modules/.bin/claude"
-            )),
+            !is_local_build(Path::new("/usr/local/lib/node_modules/.bin/claude")),
             "npm global .bin should not be local"
         );
         assert!(
@@ -228,15 +226,11 @@ mod tests {
     fn test_is_local_build_cc_sdk_cache() {
         // cc-sdk cache path is NOT a local build
         assert!(
-            !is_local_build(Path::new(
-                "/Users/me/Library/Caches/cc-sdk/cli/claude"
-            )),
+            !is_local_build(Path::new("/Users/me/Library/Caches/cc-sdk/cli/claude")),
             "cc-sdk cache should not be local"
         );
         assert!(
-            !is_local_build(Path::new(
-                "/home/me/.cache/cc-sdk/cli/claude"
-            )),
+            !is_local_build(Path::new("/home/me/.cache/cc-sdk/cli/claude")),
             "Linux cc-sdk cache should not be local"
         );
     }
@@ -245,7 +239,9 @@ mod tests {
     fn test_is_local_build_custom_paths() {
         // Custom paths ARE local builds
         assert!(
-            is_local_build(Path::new("/home/me/projects/claude-dev/target/release/claude")),
+            is_local_build(Path::new(
+                "/home/me/projects/claude-dev/target/release/claude"
+            )),
             "Custom project build should be local"
         );
         assert!(

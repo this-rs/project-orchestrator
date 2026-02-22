@@ -169,6 +169,8 @@ pub struct ChatYamlConfig {
     pub claude_cli_path: Option<String>,
     /// Enable automatic CLI version updates on startup (default: false).
     pub auto_update_cli: Option<bool>,
+    /// Enable automatic Tauri application updates on startup (default: true).
+    pub auto_update_app: Option<bool>,
 }
 
 /// Authentication configuration — flexible multi-provider auth.
@@ -443,6 +445,9 @@ pub struct Config {
     /// Enable automatic CLI version updates on startup.
     /// Priority: env var (CHAT_AUTO_UPDATE_CLI) > YAML (chat.auto_update_cli) > None (false).
     pub chat_auto_update_cli: Option<bool>,
+    /// Enable automatic Tauri application updates on startup.
+    /// Priority: env var (CHAT_AUTO_UPDATE_APP) > YAML (chat.auto_update_app) > None (true).
+    pub chat_auto_update_app: Option<bool>,
     /// Resolved path to the config.yaml file that was loaded (if any).
     /// Used for persisting runtime changes back to disk.
     pub config_yaml_path: Option<std::path::PathBuf>,
@@ -501,6 +506,10 @@ impl Config {
                 .ok()
                 .map(|v| v == "true" || v == "1")
                 .or(yaml.chat.auto_update_cli),
+            chat_auto_update_app: std::env::var("CHAT_AUTO_UPDATE_APP")
+                .ok()
+                .map(|v| v == "true" || v == "1")
+                .or(yaml.chat.auto_update_app),
             config_yaml_path: resolved_path,
         })
     }
@@ -840,6 +849,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         }
         if let Some(auto_update) = config.chat_auto_update_cli {
             chat_config.auto_update_cli = auto_update;
+        }
+        if let Some(auto_update_app) = config.chat_auto_update_app {
+            chat_config.auto_update_app = auto_update_app;
         }
         let mut cm = chat::ChatManager::new(
             orchestrator.neo4j_arc(),
@@ -1658,7 +1670,10 @@ chat:
         assert!(config.chat.process_path.is_none());
         assert!(config.chat.claude_cli_path.is_none());
         assert!(config.chat.auto_update_cli.is_none());
-        assert_eq!(config.chat.default_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            config.chat.default_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
     }
 
     #[test]

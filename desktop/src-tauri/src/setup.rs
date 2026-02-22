@@ -667,6 +667,16 @@ pub fn detect_claude_code() -> Result<bool, String> {
     Ok(project_orchestrator::setup_claude::detect_claude_cli().is_some())
 }
 
+/// Detect the user's full PATH by sourcing their login shell.
+///
+/// More reliable than the REST endpoint when called from Tauri (desktop app)
+/// because it runs directly in the desktop process — no backend required.
+/// This is critical for the setup wizard, which runs BEFORE the backend starts.
+#[tauri::command]
+pub async fn detect_shell_path() -> Result<Option<String>, String> {
+    Ok(project_orchestrator::chat::path_detect::detect_user_path().await)
+}
+
 /// Result of the Claude Code MCP setup, sent to the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -35,6 +35,7 @@ fn test_config() -> Config {
         chat_process_path: None,
         chat_claude_cli_path: None,
         chat_auto_update_cli: None,
+        chat_auto_update_app: None,
         config_yaml_path: None,
     }
 }

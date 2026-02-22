@@ -413,6 +413,7 @@ pub struct ChatConfigResponse {
     pub process_path: Option<String>,
     pub claude_cli_path: Option<String>,
     pub auto_update_cli: bool,
+    pub auto_update_app: bool,
 }
 
 /// GET /api/chat/config — Return full chat configuration
@@ -435,6 +436,7 @@ pub async fn get_chat_config(
         process_path: env.process_path,
         claude_cli_path: env.claude_cli_path,
         auto_update_cli: env.auto_update_cli,
+        auto_update_app: env.auto_update_app,
     }))
 }
 
@@ -453,6 +455,8 @@ pub struct UpdateChatConfigRequest {
     pub claude_cli_path: Option<String>,
     /// Auto-update CLI toggle
     pub auto_update_cli: Option<bool>,
+    /// Auto-update application toggle
+    pub auto_update_app: Option<bool>,
 }
 
 /// PATCH /api/chat/config — Update chat configuration (partial merge).
@@ -509,6 +513,9 @@ pub async fn update_chat_config(
     if let Some(auto_update) = body.auto_update_cli {
         chat_manager.update_auto_update_cli(auto_update).await;
     }
+    if let Some(auto_update_app) = body.auto_update_app {
+        chat_manager.update_auto_update_app(auto_update_app).await;
+    }
 
     // Persist to config.yaml if path is known
     chat_manager
@@ -530,6 +537,7 @@ pub async fn update_chat_config(
         process_path: env.process_path,
         claude_cli_path: env.claude_cli_path,
         auto_update_cli: env.auto_update_cli,
+        auto_update_app: env.auto_update_app,
     }))
 }
 
@@ -572,9 +580,7 @@ pub struct InstallCliRequest {
 pub async fn install_cli(
     Json(body): Json<InstallCliRequest>,
 ) -> Json<crate::chat::cli_version::CliInstallResult> {
-    Json(
-        crate::chat::cli_version::install_or_upgrade_cli(body.version.as_deref()).await,
-    )
+    Json(crate::chat::cli_version::install_or_upgrade_cli(body.version.as_deref()).await)
 }
 
 #[cfg(test)]
