@@ -411,6 +411,56 @@
     }
 
     // ========================================================================
+    // Claude CLI install helpers
+    // ========================================================================
+
+    let cliInstallInProgress = false;
+    let cliInstalled = false;
+
+    async function installClaudeCli() {
+      if (cliInstallInProgress) return;
+      cliInstallInProgress = true;
+
+      setCheck('check-claude', '', 'Installing Claude Code CLI...');
+      setStatus('Installing Claude Code CLI via official installer...');
+
+      try {
+        const result = await invoke('install_cli', { version: null });
+        if (result.success) {
+          cliInstalled = true;
+          setCheck('check-claude', 'success', 'Installed: ' + (result.version || 'latest'));
+          setStatus('Claude Code CLI installed successfully');
+        } else {
+          setCheck('check-claude', 'error', result.message || 'Installation failed',
+            `<button class="check-action" onclick="installClaudeCli()">Retry</button>`);
+          setStatus('CLI installation failed — click Retry');
+        }
+      } catch (err) {
+        console.error('install_cli error:', err);
+        setCheck('check-claude', 'error', 'Install error: ' + err,
+          `<button class="check-action" onclick="installClaudeCli()">Retry</button>`);
+        setStatus('CLI installation failed — click Retry');
+      } finally {
+        cliInstallInProgress = false;
+      }
+    }
+
+    async function waitForCliInstall() {
+      // Wait until CLI is installed (either via install button or manually)
+      while (!cliInstalled && !isGlobalTimeout()) {
+        await sleep(1000);
+        // Also poll in case user installed it manually outside the app
+        try {
+          const deps = await invoke('check_dependencies');
+          if (deps.claudeCodeAvailable) {
+            cliInstalled = true;
+            return;
+          }
+        } catch (_) { /* continue polling */ }
+      }
+    }
+
+    // ========================================================================
     // Main flow
     // ========================================================================
 
@@ -429,12 +479,16 @@
           setCheck('check-config', 'warning', 'Will be created by setup wizard');
         }
 
-        // -- Claude Code CLI --
+        // -- Claude Code CLI (BLOCKING — must be installed to proceed) --
         if (deps.claudeCodeAvailable) {
           setCheck('check-claude', 'success');
         } else {
-          setCheck('check-claude', 'warning', 'Chat features require Claude Code CLI',
-            `<button class="check-action" onclick="openUrl('https://docs.anthropic.com/en/docs/claude-code/overview')">Install</button>`);
+          setCheck('check-claude', 'error', 'Claude Code CLI is required',
+            `<button class="check-action" onclick="installClaudeCli()">Install</button>`);
+          // Block here — wait for CLI to be installed before continuing
+          setStatus('Claude Code CLI is required to continue');
+          await waitForCliInstall();
+          setCheck('check-claude', 'success');
         }
 
         // -- NATS visibility --

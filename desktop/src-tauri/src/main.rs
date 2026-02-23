@@ -432,6 +432,30 @@ fn main() {
                     });
                 }
 
+                // Wait for Claude CLI to be installed before transitioning.
+                // The splash screen shows an "Install" button — we block here until
+                // the CLI is detected (either via the splash install button or manual install).
+                // Skip this check if setup is not yet completed (the setup wizard handles CLI).
+                if is_configured {
+                    let cli_timeout = std::time::Duration::from_secs(300); // 5 min max wait
+                    let cli_start = std::time::Instant::now();
+                    loop {
+                        if project_orchestrator::setup_claude::detect_claude_cli().is_some() {
+                            tracing::info!("Claude CLI detected — proceeding to main window");
+                            break;
+                        }
+                        if cli_start.elapsed() > cli_timeout {
+                            tracing::warn!(
+                                "Claude CLI not detected after {:?} — proceeding anyway",
+                                cli_timeout
+                            );
+                            break;
+                        }
+                        tracing::debug!("Waiting for Claude CLI to be installed...");
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
+
                 // Transition: close splash → show main window
                 // The frontend will check /api/setup-status and redirect to /setup if needed
                 show_main_window(&handle);
