@@ -1085,10 +1085,7 @@ async fn start_setup_server(port: u16) -> Result<()> {
     let frontend_path = std::env::var("FRONTEND_PATH").unwrap_or_else(|_| "./dist".to_string());
 
     let app = if serve_frontend && std::path::Path::new(&frontend_path).exists() {
-        tracing::info!(
-            "Setup server: serving frontend SPA from {}",
-            frontend_path
-        );
+        tracing::info!("Setup server: serving frontend SPA from {}", frontend_path);
         let index_path = format!("{}/index.html", frontend_path);
         let serve_dir = ServeDir::new(&frontend_path).fallback(ServeFile::new(index_path));
         app.fallback_service(serve_dir)
