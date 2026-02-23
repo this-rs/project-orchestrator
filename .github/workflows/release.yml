@@ -83,14 +83,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS Apple Silicon
+          # macOS Apple Silicon (native — ort-sys has prebuilt static ONNX Runtime)
           - target: aarch64-apple-darwin
             runner: macos-14
             os: macos
             arch: arm64
             use_cross: false
 
-          # macOS Intel (macos-14 is ARM64 but can cross-compile x86_64)
+          # macOS Intel (cross-compiled on Apple Silicon runner)
+          # ort-sys has NO prebuilt ONNX Runtime for this target. We download
+          # the official Microsoft release and use dynamic linking via
+          # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK (see step below).
+          # The resulting binaries need libonnxruntime.dylib at runtime.
           - target: x86_64-apple-darwin
             runner: macos-14
             os: macos
@@ -149,6 +153,25 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      # x86_64-apple-darwin: ort-sys has no prebuilt static ONNX Runtime for
+      # macOS Intel. We download the official Microsoft dynamic library and
+      # set ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys links
+      # dynamically instead of trying (and failing) to download from pyke.io.
+      # The dylib is bundled alongside binaries in the packaging steps below.
+      - name: Download ONNX Runtime for macOS x86_64
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          ORT_VERSION="1.23.2"
+          echo "Downloading ONNX Runtime ${ORT_VERSION} for macOS x86_64..."
+          curl -fsSL -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          mkdir -p "$RUNNER_TEMP/onnxruntime"
+          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
+          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "=== ONNX Runtime ${ORT_VERSION} for macOS x86_64 ==="
+          ls -la "$RUNNER_TEMP/onnxruntime/lib/"
+
       # --- Light variant (no embedded frontend) ---
 
       - name: Build light variant (native)
@@ -170,6 +193,17 @@ jobs:
           done
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
+          fi
+          # Bundle ONNX Runtime dylib for targets using dynamic linking (macOS x86_64).
+          # Two rpaths: @executable_path (dylib next to binary, e.g. tarball)
+          # and @executable_path/../lib (Homebrew layout: bin/ + lib/ siblings).
+          if [ -n "${ORT_LIB_LOCATION:-}" ]; then
+            echo "Bundling ONNX Runtime dylib from $ORT_LIB_LOCATION"
+            cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "staging/${ARCHIVE_NAME}/"
+            for bin in orchestrator orch mcp_server; do
+              install_name_tool -add_rpath @executable_path "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+              install_name_tool -add_rpath @executable_path/../lib "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+            done
           fi
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
@@ -227,6 +261,15 @@ jobs:
           done
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
+          fi
+          # Bundle ONNX Runtime dylib for targets using dynamic linking (macOS x86_64)
+          if [ -n "${ORT_LIB_LOCATION:-}" ]; then
+            echo "Bundling ONNX Runtime dylib from $ORT_LIB_LOCATION"
+            cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "staging/${ARCHIVE_NAME}/"
+            for bin in orchestrator orch mcp_server; do
+              install_name_tool -add_rpath @executable_path "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+              install_name_tool -add_rpath @executable_path/../lib "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+            done
           fi
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
@@ -548,6 +591,21 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2"
 
+      # x86_64-apple-darwin: provide ONNX Runtime for dynamic linking
+      # (same rationale as build-backend — ort-sys has no prebuilt for macOS Intel)
+      - name: Download ONNX Runtime for macOS x86_64
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          ORT_VERSION="1.23.2"
+          echo "Downloading ONNX Runtime ${ORT_VERSION} for macOS x86_64..."
+          curl -fsSL -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          mkdir -p "$RUNNER_TEMP/onnxruntime"
+          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
+          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          ls -la "$RUNNER_TEMP/onnxruntime/lib/"
+
       # Reuse the mcp_server binary already compiled by build-backend
       # (same code, same target, same release profile — no need to compile again)
       - name: Download pre-built mcp_server
@@ -647,6 +705,41 @@ jobs:
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: cargo tauri build --target ${{ matrix.tauri_target }}
+
+      # x86_64-apple-darwin: bundle ONNX Runtime dylib inside the .app so the
+      # main binary and mcp_server can find libonnxruntime at runtime.
+      # We place it in Contents/Frameworks/ (standard macOS location) and add
+      # the matching rpath. The re-sign step below will codesign the dylib.
+      - name: Bundle ONNX Runtime in Tauri app (macOS x86_64)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::warning::No .app bundle found — skipping ONNX Runtime bundling"
+            exit 0
+          fi
+
+          # Copy ONNX Runtime dylib to Frameworks/
+          FRAMEWORKS_DIR="$APP_PATH/Contents/Frameworks"
+          mkdir -p "$FRAMEWORKS_DIR"
+          cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "$FRAMEWORKS_DIR/"
+          chmod +x "$FRAMEWORKS_DIR"/libonnxruntime*.dylib
+
+          # Add rpath so the main executable finds the dylib in ../Frameworks/
+          APP_NAME="$(basename "${APP_PATH%.app}")"
+          install_name_tool -add_rpath @executable_path/../Frameworks \
+            "$APP_PATH/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+
+          # Add rpath to bundled mcp_server (resource binary, also dynamically linked)
+          MCP_SERVER="$APP_PATH/Contents/Resources/mcp_server"
+          if [ -f "$MCP_SERVER" ]; then
+            install_name_tool -add_rpath @executable_path/../Frameworks \
+              "$MCP_SERVER" 2>/dev/null || true
+          fi
+
+          echo "✅ ONNX Runtime dylib bundled in Frameworks/"
+          ls -la "$FRAMEWORKS_DIR/"
 
       # Verify the built bundle contains the correct frontend.
       # This catches any issue where Tauri silently bundles stale frontend files.

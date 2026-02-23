@@ -1,0 +1,11 @@
+# Cross-compilation configuration for cross-rs
+# https://github.com/cross-rs/cross
+#
+# Required because fastembed → ort-sys → ureq → native-tls → openssl-sys
+# needs OpenSSL development headers to download ONNX Runtime prebuilt binaries.
+
+[target.x86_64-unknown-linux-gnu]
+pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config"]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = ["dpkg --add-architecture arm64 && apt-get update && apt-get install -y libssl-dev:arm64 pkg-config"]
