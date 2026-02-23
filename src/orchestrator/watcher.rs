@@ -17,7 +17,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::Instant;
 use uuid::Uuid;
+
+/// Number of files above which we switch to a full project sync
+/// instead of syncing files individually. Full sync is more efficient
+/// for bulk changes (e.g., git checkout) because it uses WalkDir +
+/// batch UNWIND in a single pass instead of N individual sync_file calls.
+const BULK_SYNC_THRESHOLD: usize = 50;
+
+/// Quiet period (in seconds) before flushing collected file events.
+/// After the last file event, we wait this long before syncing.
+/// This allows bulk operations (git checkout, git pull, branch switch)
+/// to complete before we start syncing.
+const SYNC_DEBOUNCE_SECS: u64 = 3;
 
 use super::Orchestrator;
 use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType};
@@ -190,9 +203,16 @@ impl FileWatcher {
     /// 1. Creates a `notify::RecommendedWatcher` for filesystem events
     /// 2. Watches all currently registered paths recursively
     /// 3. Listens for dynamically added paths via `add_path_rx`
-    /// 4. On file change, resolves the project via `resolve_project`
-    /// 5. Calls `sync_file_for_project` with the resolved project context
-    /// 6. Triggers the analytics debouncer for the affected project
+    /// 4. **Collects** file change events per project in a debounce window
+    /// 5. After a quiet period (`SYNC_DEBOUNCE_SECS`), flushes collected events:
+    ///    - If < `BULK_SYNC_THRESHOLD` files → sync each file individually
+    ///    - If >= `BULK_SYNC_THRESHOLD` files → full project sync (more efficient)
+    /// 6. Triggers the analytics debouncer once per project per flush
+    ///
+    /// This **project-level debounce** is critical for bulk operations like
+    /// `git checkout` where 100+ files change simultaneously. Instead of
+    /// 100 sequential sync_file calls (each with Neo4j writes), we collect
+    /// all changes and sync them in one batch.
     ///
     /// Safe to call with 0 registered projects — the watcher will be ready
     /// to accept new paths dynamically via `register_project()`.
@@ -202,7 +222,7 @@ impl FileWatcher {
         }
 
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        let (event_tx, mut event_rx) = mpsc::channel::<PathBuf>(100);
+        let (event_tx, mut event_rx) = mpsc::channel::<PathBuf>(500);
         let (add_path_tx, mut add_path_rx) = mpsc::channel::<PathBuf>(32);
 
         self.stop_tx = Some(stop_tx);
@@ -243,13 +263,41 @@ impl FileWatcher {
             }
             drop(paths);
 
+            // ── Project-level sync debounce ──────────────────────────────
+            //
+            // Instead of syncing each file immediately (old: 500ms sleep +
+            // sync_file per event), we collect events per project and flush
+            // after a quiet period. This transforms 100 sequential syncs
+            // into 1 batch sync for bulk operations like git checkout.
+            //
+            // pending_files: project_id → (project_context, set of changed file paths)
+            let mut pending_files: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> =
+                HashMap::new();
+            // Files with no project association
+            let mut pending_orphans: HashSet<PathBuf> = HashSet::new();
+            let mut has_pending = false;
+
+            // Flush timer — starts far in the future, reset on each event
+            let flush_sleep = tokio::time::sleep_until(Instant::now() + Duration::from_secs(86400));
+            tokio::pin!(flush_sleep);
+
             // Keep watcher alive until stop signal
             loop {
                 tokio::select! {
                     _ = stop_rx.recv() => {
                         tracing::info!("File watcher stopping");
+                        // Flush any remaining pending files before stopping
+                        if has_pending {
+                            flush_pending_files(
+                                &mut pending_files,
+                                &mut pending_orphans,
+                                &orchestrator,
+                                &project_map,
+                            ).await;
+                        }
                         break;
                     }
+
                     // Dynamically add a new path to the notify watcher
                     Some(new_path) = add_path_rx.recv() => {
                         match watcher.watch(&new_path, RecursiveMode::Recursive) {
@@ -268,53 +316,42 @@ impl FileWatcher {
                             }
                         }
                     }
+
+                    // ── Collect file events into pending map ─────────────
                     Some(path) = event_rx.recv() => {
-                        // Check if file should be synced
-                        if should_sync_file(&path) {
-                            tracing::debug!("File changed: {}", path.display());
-
-                            // Debounce: wait a bit before syncing
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-
-                            if path.exists() {
-                                // Resolve which project this file belongs to
-                                let resolved = resolve_project(&path, &project_map).await;
-                                let (pid, pslug) = match &resolved {
-                                    Some(ctx) => (Some(ctx.project_id), Some(ctx.project_slug.as_str())),
-                                    None => (None, None),
-                                };
-
-                                match orchestrator
-                                    .sync_file_for_project(&path, pid, pslug)
-                                    .await
-                                {
-                                    Ok(true) => {
-                                        if let Some(ctx) = &resolved {
-                                            tracing::info!(
-                                                "Auto-synced: {} (project: {})",
-                                                path.display(),
-                                                ctx.project_slug
-                                            );
-                                        } else {
-                                            tracing::info!("Auto-synced: {} (no project)", path.display());
-                                        }
-                                        // Trigger debounced analytics for the resolved project
-                                        if let Some(ctx) = &resolved {
-                                            orchestrator
-                                                .analytics_debouncer()
-                                                .trigger(ctx.project_id);
-                                        }
-                                    }
-                                    Ok(false) => {
-                                        // File unchanged (hash match), skip
-                                        tracing::debug!("File unchanged, skipped: {}", path.display());
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Failed to sync {}: {}", path.display(), e);
-                                    }
-                                }
+                        if should_sync_file(&path) && path.exists() {
+                            // Resolve which project this file belongs to
+                            if let Some(ctx) = resolve_project(&path, &project_map).await {
+                                pending_files
+                                    .entry(ctx.project_id)
+                                    .or_insert_with(|| (ctx, HashSet::new()))
+                                    .1
+                                    .insert(path);
+                            } else {
+                                pending_orphans.insert(path);
                             }
+
+                            // Reset the debounce timer
+                            has_pending = true;
+                            flush_sleep.as_mut().reset(
+                                Instant::now() + Duration::from_secs(SYNC_DEBOUNCE_SECS)
+                            );
                         }
+                    }
+
+                    // ── Flush after quiet period ─────────────────────────
+                    _ = &mut flush_sleep, if has_pending => {
+                        flush_pending_files(
+                            &mut pending_files,
+                            &mut pending_orphans,
+                            &orchestrator,
+                            &project_map,
+                        ).await;
+                        has_pending = false;
+                        // Reset timer far in the future
+                        flush_sleep.as_mut().reset(
+                            Instant::now() + Duration::from_secs(86400)
+                        );
                     }
                 }
             }
@@ -323,9 +360,11 @@ impl FileWatcher {
         let paths = self.watched_paths.read().await;
         let projects = self.project_map.read().await;
         tracing::info!(
-            "File watcher started ({} paths, {} projects)",
+            "File watcher started ({} paths, {} projects, debounce={}s, bulk_threshold={})",
             paths.len(),
-            projects.len()
+            projects.len(),
+            SYNC_DEBOUNCE_SECS,
+            BULK_SYNC_THRESHOLD,
         );
         Ok(())
     }
@@ -355,6 +394,136 @@ impl FileWatcher {
             .iter()
             .map(|(path, ctx)| (ctx.project_id, ctx.project_slug.clone(), path.clone()))
             .collect()
+    }
+}
+
+/// Flush all pending file events collected during the debounce window.
+///
+/// For each project with pending files:
+/// - If >= `BULK_SYNC_THRESHOLD` files → run a full `sync_directory_for_project`
+///   (more efficient: single WalkDir + batch UNWIND, plus stale file cleanup)
+/// - If < threshold → sync each file individually
+/// - Trigger the analytics debouncer once per project
+///
+/// Orphan files (no project association) are synced individually.
+async fn flush_pending_files(
+    pending_files: &mut HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)>,
+    pending_orphans: &mut HashSet<PathBuf>,
+    orchestrator: &Arc<super::Orchestrator>,
+    project_map: &Arc<RwLock<HashMap<PathBuf, ProjectContext>>>,
+) {
+    let batch = std::mem::take(pending_files);
+    let orphans = std::mem::take(pending_orphans);
+
+    let total_files: usize = batch.values().map(|(_, files)| files.len()).sum();
+    let total_projects = batch.len();
+
+    if total_files > 0 {
+        tracing::info!(
+            "Sync debounce: flushing {} files across {} project(s)",
+            total_files,
+            total_projects,
+        );
+    }
+
+    for (pid, (ctx, files)) in batch {
+        let file_count = files.len();
+
+        if file_count >= BULK_SYNC_THRESHOLD {
+            // ── Bulk change detected → full project sync ─────────
+            tracing::info!(
+                "Bulk change detected ({} files) for project '{}' — switching to full project sync",
+                file_count,
+                ctx.project_slug,
+            );
+
+            // Find the project root_path from the project_map
+            let root_path = {
+                let pm = project_map.read().await;
+                pm.iter()
+                    .find(|(_, c)| c.project_id == pid)
+                    .map(|(path, _)| path.clone())
+            };
+
+            if let Some(root) = root_path {
+                match orchestrator
+                    .sync_directory_for_project(&root, Some(pid), Some(&ctx.project_slug))
+                    .await
+                {
+                    Ok(result) => {
+                        tracing::info!(
+                            "Bulk sync complete for '{}': {} synced, {} skipped, {} deleted, {} errors",
+                            ctx.project_slug,
+                            result.files_synced,
+                            result.files_skipped,
+                            result.files_deleted,
+                            result.errors,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Bulk sync failed for project '{}': {}",
+                            ctx.project_slug,
+                            e
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Cannot run bulk sync for project '{}' — root_path not found in project_map",
+                    ctx.project_slug,
+                );
+            }
+        } else {
+            // ── Incremental sync → sync each changed file ────────
+            tracing::info!(
+                "Syncing {} changed file(s) for project '{}'",
+                file_count,
+                ctx.project_slug,
+            );
+
+            let mut synced = 0usize;
+            let mut skipped = 0usize;
+            let mut errors = 0usize;
+
+            for path in &files {
+                match orchestrator
+                    .sync_file_for_project(path, Some(pid), Some(&ctx.project_slug))
+                    .await
+                {
+                    Ok(true) => synced += 1,
+                    Ok(false) => skipped += 1,
+                    Err(e) => {
+                        tracing::warn!("Failed to sync {}: {}", path.display(), e);
+                        errors += 1;
+                    }
+                }
+            }
+
+            if synced > 0 || errors > 0 {
+                tracing::info!(
+                    "Incremental sync for '{}': {} synced, {} unchanged, {} errors",
+                    ctx.project_slug,
+                    synced,
+                    skipped,
+                    errors,
+                );
+            }
+        }
+
+        // Trigger analytics debouncer once per project (will be further
+        // debounced by the AnalyticsDebouncer's own quiet period)
+        orchestrator.analytics_debouncer().trigger(pid);
+    }
+
+    // Sync orphan files (no project association) individually
+    if !orphans.is_empty() {
+        tracing::debug!("Syncing {} orphan file(s) (no project)", orphans.len());
+        for path in &orphans {
+            if let Err(e) = orchestrator.sync_file_for_project(path, None, None).await {
+                tracing::warn!("Failed to sync orphan {}: {}", path.display(), e);
+            }
+        }
     }
 }
 
