@@ -36,6 +36,13 @@ fn test_config() -> Config {
         chat_claude_cli_path: None,
         chat_auto_update_cli: None,
         chat_auto_update_app: None,
+        embedding_provider: None,
+        embedding_fastembed_model: None,
+        embedding_fastembed_cache_dir: None,
+        embedding_url: None,
+        embedding_model: None,
+        embedding_api_key: None,
+        embedding_dimensions: None,
         config_yaml_path: None,
     }
 }

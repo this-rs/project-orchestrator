@@ -72,6 +72,52 @@ pub struct SetupConfig {
     /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions"
     #[serde(default = "default_permission_mode")]
     pub chat_permission_mode: String,
+
+    // Desktop-only settings (PATH, CLI, auto-update)
+    /// PATH to inject into the Claude Code subprocess.
+    #[serde(default)]
+    pub chat_process_path: String,
+    /// Explicit path to the Claude CLI binary (optional, auto-detected by default).
+    #[serde(default)]
+    pub chat_claude_cli_path: String,
+    /// Enable automatic CLI version updates on startup (default: false).
+    #[serde(default)]
+    pub chat_auto_update_cli: bool,
+    /// Enable automatic Tauri application updates on startup (default: true).
+    #[serde(default = "default_true")]
+    pub chat_auto_update_app: bool,
+
+    // Embeddings
+    /// Embedding provider: "local", "http", or "disabled" (default: "local")
+    #[serde(default = "default_embedding_provider")]
+    pub embedding_provider: String,
+    /// Model name for local fastembed provider (default: "multilingual-e5-base")
+    #[serde(default = "default_fastembed_model")]
+    pub embedding_fastembed_model: String,
+    /// URL for HTTP embedding provider
+    #[serde(default)]
+    pub embedding_url: String,
+    /// Model name for HTTP embedding provider
+    #[serde(default)]
+    pub embedding_model: String,
+    /// API key for HTTP embedding provider
+    #[serde(default)]
+    pub embedding_api_key: String,
+    /// Expected embedding dimensions for HTTP provider (default: 768)
+    #[serde(default = "default_embedding_dimensions")]
+    pub embedding_dimensions: u32,
+}
+
+fn default_embedding_provider() -> String {
+    "local".into()
+}
+
+fn default_fastembed_model() -> String {
+    "multilingual-e5-base".into()
+}
+
+fn default_embedding_dimensions() -> u32 {
+    768
 }
 
 fn default_max_turns() -> u32 {
@@ -122,6 +168,8 @@ struct YamlOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     chat: Option<ChatSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    embeddings: Option<EmbeddingsSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     auth: Option<AuthSection>,
 }
 
@@ -161,11 +209,34 @@ struct ChatSection {
     max_turns: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     permissions: Option<ChatPermissionsSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_cli_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_update_cli: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_update_app: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatPermissionsSection {
     mode: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingsSection {
+    provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fastembed_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -629,7 +700,58 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             } else {
                 None
             },
+            process_path: if config.chat_process_path.trim().is_empty() {
+                None
+            } else {
+                Some(config.chat_process_path.trim().to_string())
+            },
+            claude_cli_path: if config.chat_claude_cli_path.trim().is_empty() {
+                None
+            } else {
+                Some(config.chat_claude_cli_path.trim().to_string())
+            },
+            auto_update_cli: Some(config.chat_auto_update_cli),
+            auto_update_app: Some(config.chat_auto_update_app),
         }),
+        embeddings: {
+            // Preserve existing API key when the frontend sends it empty (redacted)
+            let existing_embedding_api_key = existing
+                .as_ref()
+                .and_then(|old| old.embeddings.api_key.clone())
+                .filter(|s| !s.is_empty());
+
+            let api_key = if !config.embedding_api_key.is_empty() {
+                Some(config.embedding_api_key.clone())
+            } else {
+                existing_embedding_api_key
+            };
+
+            let provider = config.embedding_provider.trim().to_lowercase();
+            Some(EmbeddingsSection {
+                provider: provider.clone(),
+                fastembed_model: if provider == "local" && !config.embedding_fastembed_model.trim().is_empty() {
+                    Some(config.embedding_fastembed_model.trim().to_string())
+                } else {
+                    None
+                },
+                url: if provider == "http" && !config.embedding_url.trim().is_empty() {
+                    Some(config.embedding_url.trim().to_string())
+                } else {
+                    None
+                },
+                model: if provider == "http" && !config.embedding_model.trim().is_empty() {
+                    Some(config.embedding_model.trim().to_string())
+                } else {
+                    None
+                },
+                api_key: if provider == "http" { api_key } else { None },
+                dimensions: if provider == "http" && config.embedding_dimensions != 768 {
+                    Some(config.embedding_dimensions)
+                } else {
+                    None
+                },
+            })
+        },
         auth,
     };
 
@@ -675,6 +797,24 @@ pub fn detect_claude_code() -> Result<bool, String> {
 #[tauri::command]
 pub async fn detect_shell_path() -> Result<Option<String>, String> {
     Ok(project_orchestrator::chat::path_detect::detect_user_path().await)
+}
+
+/// Check CLI version status directly via Tauri (no backend/auth required).
+///
+/// This is used by the setup wizard which runs BEFORE the backend is available.
+/// Calls `check_cli_status()` from the shared `cli_version` module.
+#[tauri::command]
+pub async fn check_cli_status() -> Result<project_orchestrator::chat::cli_version::CliVersionStatus, String> {
+    Ok(project_orchestrator::chat::cli_version::check_cli_status().await)
+}
+
+/// Install or upgrade the Claude CLI directly via Tauri (no backend/auth required).
+///
+/// Same rationale as `check_cli_status` — the setup wizard needs this before
+/// the API server is running.
+#[tauri::command]
+pub async fn install_cli(version: Option<String>) -> Result<project_orchestrator::chat::cli_version::CliInstallResult, String> {
+    Ok(project_orchestrator::chat::cli_version::install_or_upgrade_cli(version.as_deref()).await)
 }
 
 /// Result of the Claude Code MCP setup, sent to the frontend.
@@ -883,6 +1023,18 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         chat_permission_mode: yaml.chat.permissions
             .map(|p| p.mode)
             .unwrap_or_else(|| "default".into()),
+        chat_process_path: yaml.chat.process_path.unwrap_or_default(),
+        chat_claude_cli_path: yaml.chat.claude_cli_path.unwrap_or_default(),
+        chat_auto_update_cli: yaml.chat.auto_update_cli.unwrap_or(false),
+        chat_auto_update_app: yaml.chat.auto_update_app.unwrap_or(true),
+        // Embedding settings
+        embedding_provider: yaml.embeddings.provider.clone().unwrap_or_else(|| "local".into()),
+        embedding_fastembed_model: yaml.embeddings.fastembed_model.clone().unwrap_or_else(|| "multilingual-e5-base".into()),
+        embedding_url: yaml.embeddings.url.clone().unwrap_or_default(),
+        embedding_model: yaml.embeddings.model.clone().unwrap_or_default(),
+        embedding_api_key: String::new(), // redacted
+        embedding_dimensions: yaml.embeddings.dimensions.unwrap_or(768) as u32,
+        has_embedding_api_key: yaml.embeddings.api_key.as_ref().is_some_and(|k| !k.is_empty()),
         has_oidc_secret,
         has_neo4j_password,
         has_meilisearch_key,
@@ -929,10 +1081,23 @@ pub struct ReadConfigResponse {
     pub chat_max_sessions: u32,
     pub chat_max_turns: u32,
     pub chat_permission_mode: String,
+    // Desktop-only settings
+    pub chat_process_path: String,
+    pub chat_claude_cli_path: String,
+    pub chat_auto_update_cli: bool,
+    pub chat_auto_update_app: bool,
+    // Embedding settings
+    pub embedding_provider: String,
+    pub embedding_fastembed_model: String,
+    pub embedding_url: String,
+    pub embedding_model: String,
+    pub embedding_api_key: String, // redacted
+    pub embedding_dimensions: u32,
     // Indicators for existing secrets (reconfigure mode)
     pub has_oidc_secret: bool,
     pub has_neo4j_password: bool,
     pub has_meilisearch_key: bool,
+    pub has_embedding_api_key: bool,
 }
 
 /// Generate a minimal config.yaml for first-launch (setup_completed = false).
@@ -964,6 +1129,7 @@ pub fn generate_default_config() -> Result<PathBuf, String> {
         },
         nats: None,
         chat: None,
+        embeddings: None,
         auth: None, // no-auth mode — wizard can load freely
     };
 

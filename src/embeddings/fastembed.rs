@@ -23,7 +23,10 @@ use tokio::sync::Mutex;
 ///
 /// Uses short lowercase identifiers matching common naming conventions.
 /// Falls back to `MultilingualE5Base` for unknown names.
-fn parse_model_name(name: &str) -> EmbeddingModel {
+///
+/// Public so that `runner.rs` can resolve model names from config without
+/// going through `from_env()`.
+pub fn parse_model_name_pub(name: &str) -> EmbeddingModel {
     match name.to_lowercase().as_str() {
         // Multilingual (recommended for FR/EN)
         "multilingual-e5-base" | "intfloat/multilingual-e5-base" => {
@@ -140,7 +143,7 @@ impl FastEmbedProvider {
     /// Returns an error if the model cannot be loaded.
     pub fn from_env() -> Result<Self> {
         let model_variant = std::env::var("FASTEMBED_MODEL")
-            .map(|m| parse_model_name(&m))
+            .map(|m| parse_model_name_pub(&m))
             .unwrap_or(EmbeddingModel::MultilingualE5Base);
 
         let cache_dir = std::env::var("FASTEMBED_CACHE_DIR")
@@ -205,16 +208,16 @@ mod tests {
     #[test]
     fn test_parse_model_name_known() {
         assert_eq!(
-            parse_model_name("multilingual-e5-base"),
+            parse_model_name_pub("multilingual-e5-base"),
             EmbeddingModel::MultilingualE5Base
         );
-        assert_eq!(parse_model_name("bge-m3"), EmbeddingModel::BGEM3);
+        assert_eq!(parse_model_name_pub("bge-m3"), EmbeddingModel::BGEM3);
         assert_eq!(
-            parse_model_name("nomic-embed-text-v1.5"),
+            parse_model_name_pub("nomic-embed-text-v1.5"),
             EmbeddingModel::NomicEmbedTextV15
         );
         assert_eq!(
-            parse_model_name("MULTILINGUAL-E5-BASE"),
+            parse_model_name_pub("MULTILINGUAL-E5-BASE"),
             EmbeddingModel::MultilingualE5Base,
             "case-insensitive"
         );
@@ -223,7 +226,7 @@ mod tests {
     #[test]
     fn test_parse_model_name_unknown_fallback() {
         assert_eq!(
-            parse_model_name("totally-unknown-model"),
+            parse_model_name_pub("totally-unknown-model"),
             EmbeddingModel::MultilingualE5Base
         );
     }
