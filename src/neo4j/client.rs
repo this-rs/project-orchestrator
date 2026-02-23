@@ -226,6 +226,11 @@ impl Neo4jClient {
             "CREATE INDEX struct_name IF NOT EXISTS FOR (s:Struct) ON (s.name)",
             "CREATE INDEX trait_name IF NOT EXISTS FOR (t:Trait) ON (t.name)",
             "CREATE INDEX enum_name IF NOT EXISTS FOR (e:Enum) ON (e.name)",
+            // Denormalized project_id on symbols — enables direct seek without graph traversal
+            "CREATE INDEX function_project_id IF NOT EXISTS FOR (f:Function) ON (f.project_id)",
+            "CREATE INDEX struct_project_id IF NOT EXISTS FOR (s:Struct) ON (s.project_id)",
+            "CREATE INDEX trait_project_id IF NOT EXISTS FOR (t:Trait) ON (t.project_id)",
+            "CREATE INDEX enum_project_id IF NOT EXISTS FOR (e:Enum) ON (e.project_id)",
             "CREATE INDEX impl_for_type IF NOT EXISTS FOR (i:Impl) ON (i.for_type)",
             "CREATE INDEX task_status IF NOT EXISTS FOR (t:Task) ON (t.status)",
             "CREATE INDEX task_priority IF NOT EXISTS FOR (t:Task) ON (t.priority)",
@@ -2344,6 +2349,28 @@ impl Neo4jClient {
         }
     }
 
+    /// Backfill project_id on existing symbol nodes (Function, Struct, Enum, Trait)
+    /// that were created before the denormalization was added.
+    /// Inherits project_id from the parent File node via CONTAINS relationships.
+    pub async fn backfill_symbol_project_ids(&self) -> Result<i64> {
+        let mut total = 0i64;
+        for label in &["Function", "Struct", "Enum", "Trait"] {
+            let cypher = format!(
+                "MATCH (p:Project)-[:CONTAINS]->(f:File)-[:CONTAINS]->(n:{}) \
+                 WHERE n.project_id IS NULL \
+                 SET n.project_id = p.id \
+                 RETURN count(n) AS cnt",
+                label
+            );
+            let q = query(&cypher);
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+        Ok(total)
+    }
+
     // ========================================================================
     // Function operations
     // ========================================================================
@@ -3034,6 +3061,7 @@ impl Neo4jClient {
             WITH f, func
             MATCH (file:File {path: func.file_path})
             MERGE (file)-[:CONTAINS]->(f)
+            SET f.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -3081,6 +3109,7 @@ impl Neo4jClient {
             WITH st, s
             MATCH (file:File {path: s.file_path})
             MERGE (file)-[:CONTAINS]->(st)
+            SET st.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -3128,6 +3157,7 @@ impl Neo4jClient {
             WITH tr, t
             MATCH (file:File {path: t.file_path})
             MERGE (file)-[:CONTAINS]->(tr)
+            SET tr.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -3175,6 +3205,7 @@ impl Neo4jClient {
             WITH en, e
             MATCH (file:File {path: e.file_path})
             MERGE (file)-[:CONTAINS]->(en)
+            SET en.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -3517,9 +3548,8 @@ impl Neo4jClient {
                     CALL {
                         WITH rel
                         MATCH (i:Import {id: rel.import_id})
-                        MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)-[:CONTAINS]->(symbol)
-                        WHERE symbol.name = rel.symbol_name
-                          AND (symbol:Struct OR symbol:Enum OR symbol:Trait)
+                        MATCH (symbol {name: rel.symbol_name, project_id: $project_id})
+                        WHERE symbol:Struct OR symbol:Enum OR symbol:Trait
                         WITH i, symbol LIMIT 1
                         MERGE (i)-[:IMPORTS_SYMBOL]->(symbol)
                     }
@@ -3650,7 +3680,7 @@ impl Neo4jClient {
                     CALL {
                         WITH call
                         MATCH (caller:Function {id: call.caller_id})
-                        MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)-[:CONTAINS]->(callee:Function {name: call.callee_name})
+                        MATCH (callee:Function {name: call.callee_name, project_id: $project_id})
                         WHERE callee.id <> call.caller_id
                         WITH caller, callee LIMIT 1
                         MERGE (caller)-[:CALLS]->(callee)
