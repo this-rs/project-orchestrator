@@ -3502,14 +3502,11 @@ impl Neo4jClient {
                     CALL {
                         WITH rel
                         MATCH (i:Import {id: rel.import_id})
-                        MATCH (i)<-[:HAS_IMPORT]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
-                        OPTIONAL MATCH (s:Struct {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
-                        OPTIONAL MATCH (e:Enum {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
-                        OPTIONAL MATCH (t:Trait {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
-                        WITH i, COALESCE(s, e, t) AS target
-                        WHERE target IS NOT NULL
-                        WITH i, target LIMIT 1
-                        MERGE (i)-[:IMPORTS_SYMBOL]->(target)
+                        MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)-[:CONTAINS]->(symbol)
+                        WHERE symbol.name = rel.symbol_name
+                          AND (symbol:Struct OR symbol:Enum OR symbol:Trait)
+                        WITH i, symbol LIMIT 1
+                        MERGE (i)-[:IMPORTS_SYMBOL]->(symbol)
                     }
                     "#,
                 )
@@ -3537,13 +3534,11 @@ impl Neo4jClient {
                 CALL {
                     WITH rel
                     MATCH (i:Import {id: rel.import_id})
-                    OPTIONAL MATCH (s:Struct {name: rel.symbol_name})
-                    OPTIONAL MATCH (e:Enum {name: rel.symbol_name})
-                    OPTIONAL MATCH (t:Trait {name: rel.symbol_name})
-                    WITH i, COALESCE(s, e, t) AS target
-                    WHERE target IS NOT NULL
-                    WITH i, target LIMIT 1
-                    MERGE (i)-[:IMPORTS_SYMBOL]->(target)
+                    MATCH (symbol)
+                    WHERE symbol.name = rel.symbol_name
+                      AND (symbol:Struct OR symbol:Enum OR symbol:Trait)
+                    WITH i, symbol LIMIT 1
+                    MERGE (i)-[:IMPORTS_SYMBOL]->(symbol)
                 }
                 "#,
             )
