@@ -11,9 +11,15 @@
 pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config"]
 
 [target.aarch64-unknown-linux-gnu]
-# Vendored OpenSSL builds from source — no system libssl-dev needed.
-# perl + make are required by openssl-src (OpenSSL's build system).
-pre-build = ["apt-get update && apt-get install -y pkg-config perl make"]
+# Two OpenSSL strategies coexist here:
+# - HOST build scripts: use system libssl-dev (x86_64) — needed because
+#   Cargo resolver v2 does NOT unify features between build-deps and normal deps,
+#   so the vendored feature only applies to TARGET, not HOST.
+# - TARGET binary: uses vendored OpenSSL (--features vendored-openssl) built
+#   from source via openssl-src — avoids needing libssl-dev:arm64 which would
+#   put arm64 .so in the HOST linker path and cause arch conflicts.
+# perl + make are required by openssl-src for the vendored TARGET build.
+pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config perl make"]
 
 [target.aarch64-unknown-linux-gnu.env]
 # Pass through ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys uses
