@@ -3640,7 +3640,7 @@ impl Neo4jClient {
                     CALL {
                         WITH call
                         MATCH (caller:Function {id: call.caller_id})
-                        MATCH (callee:Function {name: call.callee_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                        MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)-[:CONTAINS]->(callee:Function {name: call.callee_name})
                         WHERE callee.id <> call.caller_id
                         WITH caller, callee LIMIT 1
                         MERGE (caller)-[:CALLS]->(callee)
