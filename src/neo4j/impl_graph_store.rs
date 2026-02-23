@@ -1180,7 +1180,10 @@ impl GraphStore for Neo4jClient {
         self.get_milestone_details(milestone_id).await
     }
 
-    async fn get_milestone_progress(&self, milestone_id: Uuid) -> anyhow::Result<(u32, u32, u32, u32)> {
+    async fn get_milestone_progress(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<(u32, u32, u32, u32)> {
         self.get_milestone_progress(milestone_id).await
     }
 

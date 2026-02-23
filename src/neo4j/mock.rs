@@ -3735,7 +3735,10 @@ impl GraphStore for MockGraphStore {
         Ok((total, completed, in_progress, pending))
     }
 
-    async fn get_milestone_tasks_with_plans(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>> {
+    async fn get_milestone_tasks_with_plans(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Vec<TaskWithPlan>> {
         let task_ids = self
             .milestone_tasks
             .read()

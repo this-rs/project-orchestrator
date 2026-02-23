@@ -909,7 +909,8 @@ pub trait GraphStore: Send + Sync {
     async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)>;
 
     /// Get tasks linked to a project milestone (with plan info)
-    async fn get_milestone_tasks_with_plans(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>>;
+    async fn get_milestone_tasks_with_plans(&self, milestone_id: Uuid)
+        -> Result<Vec<TaskWithPlan>>;
 
     /// Get all steps for all tasks linked to a project milestone (batch)
     async fn get_milestone_steps_batch(
