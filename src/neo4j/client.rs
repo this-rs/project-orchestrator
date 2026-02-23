@@ -11714,43 +11714,54 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        // Build UNWIND list directly in Cypher (internal computed data, no injection risk)
-        let entries: Vec<String> = updates
-            .iter()
-            .map(|u| {
-                format!(
-                    "{{path: '{}', pagerank: {}, betweenness: {}, community_id: {}, community_label: '{}', clustering_coefficient: {}, component_id: {}}}",
-                    u.path.replace('\'', "\\'"),
-                    u.pagerank,
-                    u.betweenness,
-                    u.community_id,
-                    u.community_label.replace('\'', "\\'"),
-                    u.clustering_coefficient,
-                    u.component_id
-                )
-            })
-            .collect();
+        // Chunk to avoid overloading Neo4j heap (tx_state = ON_HEAP)
+        const CHUNK_SIZE: usize = 1000;
 
-        let cypher = format!(
-            r#"
-            UNWIND [{}] AS u
-            MATCH (f:File {{path: u.path}})
-            SET f.pagerank = u.pagerank,
-                f.betweenness = u.betweenness,
-                f.community_id = u.community_id,
-                f.community_label = u.community_label,
-                f.clustering_coefficient = u.clustering_coefficient,
-                f.component_id = u.component_id,
-                f.analytics_updated_at = datetime()
-            "#,
-            entries.join(", ")
-        );
+        for chunk in updates.chunks(CHUNK_SIZE) {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
+                .iter()
+                .map(|u| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("path".into(), u.path.clone().into());
+                    m.insert("pagerank".into(), u.pagerank.into());
+                    m.insert("betweenness".into(), u.betweenness.into());
+                    m.insert("community_id".into(), (u.community_id as i64).into());
+                    m.insert("community_label".into(), u.community_label.clone().into());
+                    m.insert(
+                        "clustering_coefficient".into(),
+                        u.clustering_coefficient.into(),
+                    );
+                    m.insert("component_id".into(), (u.component_id as i64).into());
+                    m
+                })
+                .collect();
 
-        self.execute(&cypher).await?;
+            let q = query(
+                r#"
+                UNWIND $items AS u
+                MATCH (f:File {path: u.path})
+                SET f.pagerank = u.pagerank,
+                    f.betweenness = u.betweenness,
+                    f.community_id = u.community_id,
+                    f.community_label = u.community_label,
+                    f.clustering_coefficient = u.clustering_coefficient,
+                    f.component_id = u.component_id,
+                    f.analytics_updated_at = datetime()
+                "#,
+            )
+            .param("items", items);
+
+            self.graph.run(q).await?;
+        }
+
         Ok(())
     }
 
-    /// Batch-update analytics scores on Function nodes via UNWIND.
+    /// Batch-update analytics scores on Function nodes via parameterized UNWIND.
+    ///
+    /// Uses chunking (1000 items max per transaction) to avoid heap pressure
+    /// and GC death spirals. The query plan is cached by Neo4j since the
+    /// Cypher string is constant (parameterized via $items).
     pub async fn batch_update_function_analytics(
         &self,
         updates: &[crate::graph::models::FunctionAnalyticsUpdate],
@@ -11759,36 +11770,43 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        let entries: Vec<String> = updates
-            .iter()
-            .map(|u| {
-                format!(
-                    "{{id: '{}', pagerank: {}, betweenness: {}, community_id: {}, clustering_coefficient: {}, component_id: {}}}",
-                    u.id.replace('\'', "\\'"),
-                    u.pagerank,
-                    u.betweenness,
-                    u.community_id,
-                    u.clustering_coefficient,
-                    u.component_id
-                )
-            })
-            .collect();
+        const CHUNK_SIZE: usize = 1000;
 
-        let cypher = format!(
-            r#"
-            UNWIND [{}] AS u
-            MATCH (f:Function {{id: u.id}})
-            SET f.pagerank = u.pagerank,
-                f.betweenness = u.betweenness,
-                f.community_id = u.community_id,
-                f.clustering_coefficient = u.clustering_coefficient,
-                f.component_id = u.component_id,
-                f.analytics_updated_at = datetime()
-            "#,
-            entries.join(", ")
-        );
+        for chunk in updates.chunks(CHUNK_SIZE) {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
+                .iter()
+                .map(|u| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("id".into(), u.id.clone().into());
+                    m.insert("pagerank".into(), u.pagerank.into());
+                    m.insert("betweenness".into(), u.betweenness.into());
+                    m.insert("community_id".into(), (u.community_id as i64).into());
+                    m.insert(
+                        "clustering_coefficient".into(),
+                        u.clustering_coefficient.into(),
+                    );
+                    m.insert("component_id".into(), (u.component_id as i64).into());
+                    m
+                })
+                .collect();
 
-        self.execute(&cypher).await?;
+            let q = query(
+                r#"
+                UNWIND $items AS u
+                MATCH (f:Function {id: u.id})
+                SET f.pagerank = u.pagerank,
+                    f.betweenness = u.betweenness,
+                    f.community_id = u.community_id,
+                    f.clustering_coefficient = u.clustering_coefficient,
+                    f.component_id = u.component_id,
+                    f.analytics_updated_at = datetime()
+                "#,
+            )
+            .param("items", items);
+
+            self.graph.run(q).await?;
+        }
+
         Ok(())
     }
 
