@@ -216,7 +216,7 @@ jobs:
 
       - name: Build light variant (cross)
         if: matrix.use_cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --features vendored-openssl --target ${{ matrix.target }}
 
       - name: Package light (Unix)
         if: matrix.os != 'windows'
@@ -286,7 +286,7 @@ jobs:
 
       - name: Build full variant (cross)
         if: matrix.use_cross
-        run: cross build --release --features embedded-frontend --target ${{ matrix.target }}
+        run: cross build --release --features embedded-frontend,vendored-openssl --target ${{ matrix.target }}
 
       - name: Package full (Unix)
         if: matrix.os != 'windows'

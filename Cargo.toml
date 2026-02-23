@@ -102,9 +102,16 @@ rand = "0.10.0"
 # Local embeddings via ONNX Runtime (default provider — zero external dependency)
 fastembed = "5.11"
 
+# openssl-sys is a transitive dep (via ort-sys build script → ureq → native-tls,
+# and neo4rs → native-tls). The "vendored" feature builds OpenSSL from source,
+# avoiding cross-compilation conflicts between host and target libssl-dev packages.
+# Only activated for cross-compiled builds (e.g. aarch64-unknown-linux-gnu).
+openssl-sys = { version = "0.9", optional = true, features = ["vendored"] }
+
 [features]
 default = []
 embedded-frontend = ["dep:rust-embed", "dep:mime_guess"]
+vendored-openssl = ["dep:openssl-sys"]
 
 [dev-dependencies]
 tokio-test = "0.4"
