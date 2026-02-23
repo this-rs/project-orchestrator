@@ -40,7 +40,10 @@ RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
 # =============================================================================
 # Stage 2: Build the backend (Rust)
 # =============================================================================
-FROM rust:1.93-bookworm AS builder
+# Trixie (Debian 13) provides glibc 2.40, required because ort-sys prebuilt
+# ONNX Runtime binaries reference __isoc23_* symbols (glibc ≥ 2.38).
+# Bookworm (glibc 2.36) fails with "undefined symbol: __isoc23_strtoll".
+FROM rust:1.93-trixie AS builder
 
 WORKDIR /app
 
@@ -100,7 +103,9 @@ RUN cargo build --release
 # =============================================================================
 # Stage 3: Runtime image
 # =============================================================================
-FROM debian:bookworm-slim AS runtime
+# Must match builder glibc version (Trixie = glibc 2.40) so dynamically-linked
+# symbols like __isoc23_strtoll resolve correctly at runtime.
+FROM debian:trixie-slim AS runtime
 
 # OCI labels
 LABEL org.opencontainers.image.source="https://github.com/this-rs/project-orchestrator"
