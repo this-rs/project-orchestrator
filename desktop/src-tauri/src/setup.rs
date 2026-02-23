@@ -1375,16 +1375,33 @@ pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus,
     let cache_dir = fastembed_cache_dir();
 
     if let Ok(info) = model_info {
-        // fastembed stores models under {cache_dir}/{model_code} with the HF repo path
+        // fastembed uses HuggingFace Hub cache layout:
+        //   {cache_dir}/models--{org}--{name}/snapshots/{sha}/onnx/model.onnx
         // The model_code is like "intfloat/multilingual-e5-base"
-        // fastembed converts this to a directory path
-        let model_dir = cache_dir.join(&info.model_code.replace('/', "--"));
-        let onnx_exists = model_dir.exists() && model_dir.join("model_optimized.onnx").exists();
+        let model_dir = cache_dir.join(format!("models--{}", &info.model_code.replace('/', "--")));
 
-        // Also check the alternative name (some models use model.onnx)
-        let alt_onnx = model_dir.exists() && model_dir.join("model.onnx").exists();
-
-        let available = onnx_exists || alt_onnx;
+        // Search for ONNX files inside snapshots subdirectories
+        let available = if model_dir.exists() {
+            // Check all snapshot dirs for model.onnx or model_optimized.onnx
+            let snapshots_dir = model_dir.join("snapshots");
+            if snapshots_dir.exists() {
+                std::fs::read_dir(&snapshots_dir)
+                    .map(|entries| {
+                        entries.filter_map(|e| e.ok()).any(|entry| {
+                            let onnx_dir = entry.path().join("onnx");
+                            onnx_dir.join("model.onnx").exists()
+                                || onnx_dir.join("model_optimized.onnx").exists()
+                        })
+                    })
+                    .unwrap_or(false)
+            } else {
+                // Fallback: check root of model_dir (older cache formats)
+                model_dir.join("model.onnx").exists()
+                    || model_dir.join("model_optimized.onnx").exists()
+            }
+        } else {
+            false
+        };
 
         tracing::info!(
             model = %model_name,
