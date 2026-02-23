@@ -9,7 +9,8 @@
 //! 1. `trigger(project_id)` sends a non-blocking message
 //! 2. Background task waits for the first trigger, then keeps consuming
 //!    triggers until `debounce_ms` of silence (no new triggers)
-//! 3. After the quiet period, runs `analyze_project` synchronously
+//! 3. After the quiet period, runs `analyze_project` **sequentially** for
+//!    each unique project collected during the debounce window
 //! 4. The loop is sequential — no concurrent analytics computations
 //!
 //! ## Usage
@@ -19,6 +20,7 @@
 //! debouncer.trigger(project_id); // non-blocking
 //! ```
 
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -65,6 +67,11 @@ impl AnalyticsDebouncer {
     }
 
     /// Background loop: debounce triggers and compute analytics.
+    ///
+    /// Collects ALL unique project IDs during the debounce window, then
+    /// processes them **sequentially** (one at a time). This ensures:
+    /// - No concurrent analytics computations (avoids 2× heap pressure)
+    /// - All triggered projects are processed (not just the last one)
     async fn run_loop(
         analytics: Arc<dyn AnalyticsEngine>,
         mut rx: mpsc::Receiver<Uuid>,
@@ -79,43 +86,61 @@ impl AnalyticsDebouncer {
                 Some(pid) => pid,
                 None => break, // channel closed, debouncer dropped
             };
-            let mut last_pid = pid;
+
+            // Collect all unique project IDs during debounce window
+            let mut pending_projects = HashSet::new();
+            pending_projects.insert(pid);
 
             // Debounce: keep consuming triggers until quiet period
             loop {
                 match tokio::time::timeout(debounce, rx.recv()).await {
                     Ok(Some(pid)) => {
-                        last_pid = pid; // new trigger arrived, reset timer
+                        pending_projects.insert(pid); // collect all unique projects
                     }
                     Ok(None) => return, // channel closed
                     Err(_) => break,    // timeout = quiet period elapsed
                 }
             }
 
-            // Compute analytics (sequential — no concurrent computation)
-            let start = std::time::Instant::now();
-            match analytics.analyze_project(last_pid).await {
-                Ok(result) => {
-                    tracing::info!(
-                        "Debounced analytics computed for project {} in {:?} (files: {} nodes, functions: {} nodes)",
-                        last_pid,
-                        start.elapsed(),
-                        result.file_analytics.node_count,
-                        result.function_analytics.node_count,
-                    );
-                    // Update analytics_computed_at timestamp on the project
-                    if let Some(ref store) = graph_store {
-                        if let Err(e) = store.update_project_analytics_timestamp(last_pid).await {
-                            tracing::warn!(
-                                "Failed to update analytics_computed_at for project {}: {}",
-                                last_pid,
-                                e
-                            );
+            // Process each project sequentially (no concurrent computation)
+            if pending_projects.len() > 1 {
+                tracing::info!(
+                    "Debounced analytics: processing {} projects sequentially",
+                    pending_projects.len()
+                );
+            }
+
+            for project_id in &pending_projects {
+                let start = std::time::Instant::now();
+                match analytics.analyze_project(*project_id).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            "Debounced analytics computed for project {} in {:?} (files: {} nodes, functions: {} nodes)",
+                            project_id,
+                            start.elapsed(),
+                            result.file_analytics.node_count,
+                            result.function_analytics.node_count,
+                        );
+                        // Update analytics_computed_at timestamp on the project
+                        if let Some(ref store) = graph_store {
+                            if let Err(e) =
+                                store.update_project_analytics_timestamp(*project_id).await
+                            {
+                                tracing::warn!(
+                                    "Failed to update analytics_computed_at for project {}: {}",
+                                    project_id,
+                                    e
+                                );
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Debounced analytics failed for project {}: {}", last_pid, e);
+                    Err(e) => {
+                        tracing::warn!(
+                            "Debounced analytics failed for project {}: {}",
+                            project_id,
+                            e
+                        );
+                    }
                 }
             }
         }
