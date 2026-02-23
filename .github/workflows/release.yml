@@ -166,7 +166,7 @@ jobs:
           curl -fsSL -o /tmp/onnxruntime.tgz \
             "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
           mkdir -p "$RUNNER_TEMP/onnxruntime"
-          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
+          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=2
           echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           echo "=== ONNX Runtime ${ORT_VERSION} for macOS x86_64 ==="
@@ -601,7 +601,7 @@ jobs:
           curl -fsSL -o /tmp/onnxruntime.tgz \
             "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
           mkdir -p "$RUNNER_TEMP/onnxruntime"
-          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
+          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=2
           echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           ls -la "$RUNNER_TEMP/onnxruntime/lib/"
