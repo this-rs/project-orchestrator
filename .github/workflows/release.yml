@@ -767,20 +767,31 @@ jobs:
           cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "$FRAMEWORKS_DIR/"
           chmod +x "$FRAMEWORKS_DIR"/libonnxruntime*.dylib
 
-          # Add rpath so the main executable finds the dylib in ../Frameworks/
-          APP_NAME="$(basename "${APP_PATH%.app}")"
-          install_name_tool -add_rpath @executable_path/../Frameworks \
-            "$APP_PATH/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+          # Add rpath so all executables find the dylib in ../Frameworks/
+          # NOTE: The .app folder uses productName ("Project Orchestrator") but the
+          # binary inside Contents/MacOS/ uses the Cargo package name
+          # ("project-orchestrator-desktop"). We must iterate over actual files.
+          echo "Adding @executable_path/../Frameworks rpath to all executables..."
+          for binary in "$APP_PATH/Contents/MacOS/"*; do
+            if [ -f "$binary" ] && [ -x "$binary" ]; then
+              echo "  rpath → $(basename "$binary")"
+              install_name_tool -add_rpath @executable_path/../Frameworks "$binary"
+            fi
+          done
 
           # Add rpath to bundled mcp_server (resource binary, also dynamically linked)
           MCP_SERVER="$APP_PATH/Contents/Resources/mcp_server"
           if [ -f "$MCP_SERVER" ]; then
-            install_name_tool -add_rpath @executable_path/../Frameworks \
-              "$MCP_SERVER" 2>/dev/null || true
+            echo "  rpath → mcp_server (resource)"
+            install_name_tool -add_rpath @executable_path/../Frameworks "$MCP_SERVER"
           fi
 
           echo "✅ ONNX Runtime dylib bundled in Frameworks/"
           ls -la "$FRAMEWORKS_DIR/"
+          echo "Executables with rpath:"
+          for binary in "$APP_PATH/Contents/MacOS/"*; do
+            [ -f "$binary" ] && otool -l "$binary" | grep -A2 LC_RPATH || true
+          done
 
       # Verify the built bundle contains the correct frontend.
       # This catches any issue where Tauri silently bundles stale frontend files.
@@ -1018,6 +1029,33 @@ jobs:
             fi
           fi
 
+      # Rename macOS updater bundles to include architecture.
+      # Tauri produces "Product Name.app.tar.gz" (no arch) for both aarch64 and x86_64.
+      # Without renaming, the flatten step in the release job overwrites one with the other,
+      # causing both darwin platforms in latest.json to point to the same binary.
+      - name: Rename macOS updater bundles with arch suffix
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+          ARCH="${{ matrix.artifact_arch }}"
+
+          for f in "$BUNDLE_DIR"/*.app.tar.gz; do
+            [ -f "$f" ] || continue
+            [[ "$f" == *.sig ]] && continue
+            BASE=$(basename "$f" .app.tar.gz)
+            DIR=$(dirname "$f")
+            NEW="${DIR}/${BASE}_${ARCH}.app.tar.gz"
+            mv "$f" "$NEW"
+            echo "Renamed: $(basename "$f") → $(basename "$NEW")"
+            if [ -f "${f}.sig" ]; then
+              mv "${f}.sig" "${NEW}.sig"
+              echo "Renamed: $(basename "${f}.sig") → $(basename "${NEW}.sig")"
+            fi
+          done
+          echo "Updater bundles after rename:"
+          ls -la "$BUNDLE_DIR"/*.app.tar.gz* 2>/dev/null || echo "  (none)"
+
       - name: Upload Tauri artifacts (macOS)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
@@ -1116,9 +1154,14 @@ jobs:
           ls -la release-files/ || echo "No release files found"
           echo ""
           echo "=== Updater-relevant files ==="
-          ls release-files/*.app.tar.gz release-files/*.app.tar.gz.sig 2>/dev/null || echo "  No macOS updater bundles"
-          ls release-files/*.AppImage.tar.gz release-files/*.AppImage.tar.gz.sig 2>/dev/null || echo "  No Linux updater bundles"
-          ls release-files/*.nsis.zip release-files/*.nsis.zip.sig 2>/dev/null || echo "  No Windows updater bundles"
+          echo "macOS arm64:"
+          ls release-files/*_arm64.app.tar.gz release-files/*_arm64.app.tar.gz.sig 2>/dev/null || echo "  (none)"
+          echo "macOS x86_64:"
+          ls release-files/*_x86_64.app.tar.gz release-files/*_x86_64.app.tar.gz.sig 2>/dev/null || echo "  (none)"
+          echo "Linux:"
+          ls release-files/*.AppImage.tar.gz release-files/*.AppImage.tar.gz.sig 2>/dev/null || echo "  (none)"
+          echo "Windows:"
+          ls release-files/*.nsis.zip release-files/*.nsis.zip.sig 2>/dev/null || echo "  (none)"
 
       - name: Generate Tauri updater latest.json
         shell: bash
@@ -1128,23 +1171,43 @@ jobs:
           BASE_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          # --- macOS ---
-          # Tauri produces "Product.Name.app.tar.gz" without arch in the filename.
-          # Both aarch64 and x86_64 builds produce the same name — after flatten,
-          # only one survives. Both darwin platforms use the same URL.
           # Helper: GitHub Releases replaces spaces with dots in asset names.
-          # e.g. "Project Orchestrator.app.tar.gz" → "Project.Orchestrator.app.tar.gz"
-          # We must apply the same transform when building download URLs.
+          # e.g. "Project Orchestrator_arm64.app.tar.gz" → "Project.Orchestrator_arm64.app.tar.gz"
           gh_asset_name() { basename "$1" | tr ' ' '.'; }
 
-          MACOS_URL=""
-          MACOS_SIG=""
-          for f in release-files/*.app.tar.gz; do
-            [ -f "$f" ] && [[ "$f" != *.sig ]] && MACOS_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          # --- macOS ---
+          # Updater bundles are renamed to include arch suffix in the build-tauri job:
+          #   "Product Name_arm64.app.tar.gz" and "Product Name_x86_64.app.tar.gz"
+          # This prevents collision when both builds produce identically named files.
+          MACOS_ARM64_URL=""
+          MACOS_ARM64_SIG=""
+          MACOS_X86_64_URL=""
+          MACOS_X86_64_SIG=""
+
+          for f in release-files/*_arm64.app.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && MACOS_ARM64_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
           done
-          for f in release-files/*.app.tar.gz.sig; do
-            [ -f "$f" ] && MACOS_SIG=$(cat "$f") && break
+          for f in release-files/*_arm64.app.tar.gz.sig; do
+            [ -f "$f" ] && MACOS_ARM64_SIG=$(cat "$f") && break
           done
+          for f in release-files/*_x86_64.app.tar.gz; do
+            [ -f "$f" ] && [[ "$f" != *.sig ]] && MACOS_X86_64_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          done
+          for f in release-files/*_x86_64.app.tar.gz.sig; do
+            [ -f "$f" ] && MACOS_X86_64_SIG=$(cat "$f") && break
+          done
+
+          # Fallback: if only one macOS arch built, use it for both
+          if [ -z "$MACOS_ARM64_URL" ] && [ -n "$MACOS_X86_64_URL" ]; then
+            echo "::warning::macOS arm64 updater bundle missing — using x86_64 for both darwin platforms"
+            MACOS_ARM64_URL="$MACOS_X86_64_URL"
+            MACOS_ARM64_SIG="$MACOS_X86_64_SIG"
+          fi
+          if [ -z "$MACOS_X86_64_URL" ] && [ -n "$MACOS_ARM64_URL" ]; then
+            echo "::warning::macOS x86_64 updater bundle missing — using arm64 for both darwin platforms"
+            MACOS_X86_64_URL="$MACOS_ARM64_URL"
+            MACOS_X86_64_SIG="$MACOS_ARM64_SIG"
+          fi
 
           # --- Linux ---
           # Tauri produces "Product.Name_version_amd64.AppImage.tar.gz"
@@ -1169,7 +1232,12 @@ jobs:
           done
 
           # --- Validation ---
-          if [ -z "$MACOS_URL" ] && [ -z "$LINUX_X86_64_URL" ] && [ -z "$WINDOWS_X86_64_URL" ]; then
+          [ -z "$MACOS_ARM64_URL" ] && echo "::warning::darwin-aarch64 updater URL is empty"
+          [ -z "$MACOS_X86_64_URL" ] && echo "::warning::darwin-x86_64 updater URL is empty"
+          [ -z "$LINUX_X86_64_URL" ] && echo "::warning::linux-x86_64 updater URL is empty"
+          [ -z "$WINDOWS_X86_64_URL" ] && echo "::warning::windows-x86_64 updater URL is empty"
+
+          if [ -z "$MACOS_ARM64_URL" ] && [ -z "$MACOS_X86_64_URL" ] && [ -z "$LINUX_X86_64_URL" ] && [ -z "$WINDOWS_X86_64_URL" ]; then
             echo "::warning::All updater URLs are empty — latest.json will not enable auto-updates. Check that TAURI_SIGNING_PRIVATE_KEY is set and updater bundles were generated."
           fi
 
@@ -1178,8 +1246,10 @@ jobs:
             --arg version "$VERSION" \
             --arg notes "See full release notes on GitHub" \
             --arg pub_date "$PUB_DATE" \
-            --arg macos_url "$MACOS_URL" \
-            --arg macos_sig "$MACOS_SIG" \
+            --arg macos_arm64_url "$MACOS_ARM64_URL" \
+            --arg macos_arm64_sig "$MACOS_ARM64_SIG" \
+            --arg macos_x86_64_url "$MACOS_X86_64_URL" \
+            --arg macos_x86_64_sig "$MACOS_X86_64_SIG" \
             --arg linux_x86_64_url "$LINUX_X86_64_URL" \
             --arg linux_x86_64_sig "$LINUX_X86_64_SIG" \
             --arg windows_x86_64_url "$WINDOWS_X86_64_URL" \
@@ -1189,8 +1259,8 @@ jobs:
               notes: $notes,
               pub_date: $pub_date,
               platforms: {
-                "darwin-aarch64": { url: $macos_url, signature: $macos_sig },
-                "darwin-x86_64": { url: $macos_url, signature: $macos_sig },
+                "darwin-aarch64": { url: $macos_arm64_url, signature: $macos_arm64_sig },
+                "darwin-x86_64": { url: $macos_x86_64_url, signature: $macos_x86_64_sig },
                 "linux-x86_64": { url: $linux_x86_64_url, signature: $linux_x86_64_sig },
                 "windows-x86_64": { url: $windows_x86_64_url, signature: $windows_x86_64_sig }
               }
