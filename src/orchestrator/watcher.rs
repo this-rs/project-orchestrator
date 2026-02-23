@@ -1348,4 +1348,175 @@ mod tests {
             assert!(watched.contains(p));
         }
     }
+
+    // ── constants and config tests ───────────────────────────────────
+
+    // Compile-time validation of constants — these fail compilation if violated
+    const _: () = assert!(BULK_SYNC_THRESHOLD > 0);
+    const _: () = assert!(BULK_SYNC_THRESHOLD <= 200); // Would never trigger bulk sync if too high
+    const _: () = assert!(SYNC_DEBOUNCE_SECS >= 1); // Too short won't absorb bulk ops
+    const _: () = assert!(SYNC_DEBOUNCE_SECS <= 10); // Too long means slow feedback loop
+
+    #[test]
+    fn test_bulk_sync_threshold_value() {
+        // Current value is 50 — enough to trigger on git checkout (~100+ files)
+        // but not so low that normal edits trigger bulk sync
+        assert_eq!(BULK_SYNC_THRESHOLD, 50);
+    }
+
+    #[test]
+    fn test_sync_debounce_secs_value() {
+        // Current value is 3 — absorbs git checkout while staying responsive
+        assert_eq!(SYNC_DEBOUNCE_SECS, 3);
+    }
+
+    // ── flush_pending_files logic tests ──────────────────────────────
+    //
+    // flush_pending_files requires an Arc<Orchestrator> which needs
+    // Neo4j/Meilisearch. Instead we test the data structures it consumes.
+
+    #[test]
+    fn test_pending_files_collection_below_threshold() {
+        // Simulate collecting files below BULK_SYNC_THRESHOLD
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "test-proj".to_string(),
+        };
+
+        let mut pending: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> = HashMap::new();
+
+        // Add 10 files (below threshold of 50)
+        let entry = pending.entry(pid).or_insert_with(|| (ctx, HashSet::new()));
+        for i in 0..10 {
+            entry
+                .1
+                .insert(PathBuf::from(format!("/tmp/src/file_{}.rs", i)));
+        }
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[&pid].1.len(), 10);
+        assert!(
+            pending[&pid].1.len() < BULK_SYNC_THRESHOLD,
+            "Should be below threshold — incremental sync path"
+        );
+    }
+
+    #[test]
+    fn test_pending_files_collection_above_threshold() {
+        // Simulate collecting files above BULK_SYNC_THRESHOLD (git checkout)
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "big-proj".to_string(),
+        };
+
+        let mut pending: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> = HashMap::new();
+
+        let entry = pending.entry(pid).or_insert_with(|| (ctx, HashSet::new()));
+        for i in 0..100 {
+            entry
+                .1
+                .insert(PathBuf::from(format!("/tmp/src/file_{}.rs", i)));
+        }
+
+        assert_eq!(pending[&pid].1.len(), 100);
+        assert!(
+            pending[&pid].1.len() >= BULK_SYNC_THRESHOLD,
+            "Should be above threshold — bulk sync path"
+        );
+    }
+
+    #[test]
+    fn test_pending_files_multi_project_collection() {
+        // Simulate collecting files from multiple projects during debounce window
+        let pid_a = Uuid::new_v4();
+        let pid_b = Uuid::new_v4();
+        let ctx_a = ProjectContext {
+            project_id: pid_a,
+            project_slug: "proj-a".to_string(),
+        };
+        let ctx_b = ProjectContext {
+            project_id: pid_b,
+            project_slug: "proj-b".to_string(),
+        };
+
+        let mut pending: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> = HashMap::new();
+
+        // 3 files in proj-a
+        let entry_a = pending
+            .entry(pid_a)
+            .or_insert_with(|| (ctx_a, HashSet::new()));
+        for i in 0..3 {
+            entry_a
+                .1
+                .insert(PathBuf::from(format!("/tmp/a/file_{}.rs", i)));
+        }
+
+        // 2 files in proj-b
+        let entry_b = pending
+            .entry(pid_b)
+            .or_insert_with(|| (ctx_b, HashSet::new()));
+        for i in 0..2 {
+            entry_b
+                .1
+                .insert(PathBuf::from(format!("/tmp/b/file_{}.rs", i)));
+        }
+
+        assert_eq!(pending.len(), 2, "Should have 2 distinct projects");
+        assert_eq!(pending[&pid_a].1.len(), 3);
+        assert_eq!(pending[&pid_b].1.len(), 2);
+
+        // Total files
+        let total: usize = pending.values().map(|(_, files)| files.len()).sum();
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn test_pending_files_dedup_same_path() {
+        // Same file path inserted multiple times → HashSet deduplicates
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "dup-proj".to_string(),
+        };
+
+        let mut pending: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> = HashMap::new();
+        let entry = pending.entry(pid).or_insert_with(|| (ctx, HashSet::new()));
+
+        let path = PathBuf::from("/tmp/src/main.rs");
+        entry.1.insert(path.clone());
+        entry.1.insert(path.clone());
+        entry.1.insert(path.clone());
+
+        assert_eq!(entry.1.len(), 1, "Same path should be deduped by HashSet");
+    }
+
+    #[test]
+    fn test_pending_orphans_collection() {
+        // Files with no project association go to orphans set
+        let mut orphans: HashSet<PathBuf> = HashSet::new();
+
+        orphans.insert(PathBuf::from("/tmp/untracked/file1.rs"));
+        orphans.insert(PathBuf::from("/tmp/untracked/file2.rs"));
+        orphans.insert(PathBuf::from("/tmp/untracked/file1.rs")); // dupe
+
+        assert_eq!(orphans.len(), 2, "Orphans should be deduped");
+    }
+
+    #[test]
+    fn test_mem_take_clears_pending() {
+        // Verifies that std::mem::take (used in flush_pending_files) clears the map
+        let mut pending: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> = HashMap::new();
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "test".to_string(),
+        };
+        pending.insert(pid, (ctx, HashSet::from([PathBuf::from("/a.rs")])));
+
+        let batch = std::mem::take(&mut pending);
+        assert!(pending.is_empty(), "Original should be empty after take");
+        assert_eq!(batch.len(), 1, "Taken batch should contain the data");
+    }
 }
