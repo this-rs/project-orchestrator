@@ -219,6 +219,10 @@ impl Neo4jClient {
             "CREATE INDEX file_language IF NOT EXISTS FOR (f:File) ON (f.language)",
             "CREATE INDEX file_project IF NOT EXISTS FOR (f:File) ON (f.project_id)",
             "CREATE INDEX function_name IF NOT EXISTS FOR (f:Function) ON (f.name)",
+            // Function.file_path — enables index seek in batch_create_call_relationships Phase 1
+            "CREATE INDEX function_file_path IF NOT EXISTS FOR (f:Function) ON (f.file_path)",
+            // Composite (name, file_path) — enables direct seek for same-file call resolution
+            "CREATE INDEX function_name_file_path IF NOT EXISTS FOR (f:Function) ON (f.name, f.file_path)",
             "CREATE INDEX struct_name IF NOT EXISTS FOR (s:Struct) ON (s.name)",
             "CREATE INDEX trait_name IF NOT EXISTS FOR (t:Trait) ON (t.name)",
             "CREATE INDEX enum_name IF NOT EXISTS FOR (e:Enum) ON (e.name)",
