@@ -1669,7 +1669,13 @@ pub async fn download_embedding_model(
         EmbeddingDownloadProgress {
             downloaded_bytes: if result.success { total_bytes } else { final_downloaded },
             total_bytes,
-            percentage: if result.success { 100.0 } else { (final_downloaded as f64 / total_bytes as f64 * 100.0) as f32 },
+            percentage: if result.success {
+                100.0
+            } else if total_bytes > 0 {
+                (final_downloaded as f64 / total_bytes as f64 * 100.0) as f32
+            } else {
+                0.0
+            },
             status: final_status.to_string(),
         },
     );
