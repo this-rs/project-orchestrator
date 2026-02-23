@@ -101,12 +101,13 @@ jobs:
             arch: x86_64
             use_cross: false
 
-          # Linux x86_64
+          # Linux x86_64 (native build — no need for cross since host == target)
+          # ort-sys downloads prebuilt ONNX Runtime from pyke.io and statically links.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             os: linux
             arch: x86_64
-            use_cross: true
+            use_cross: false
 
           # Linux ARM64
           - target: aarch64-unknown-linux-gnu
@@ -153,11 +154,25 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      # x86_64-apple-darwin: ort-sys has no prebuilt static ONNX Runtime for
-      # macOS Intel. We download the official Microsoft dynamic library and
-      # set ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys links
-      # dynamically instead of trying (and failing) to download from pyke.io.
-      # The dylib is bundled alongside binaries in the packaging steps below.
+      # Install build dependencies for native Linux builds.
+      # ort-sys build script needs openssl-sys (via ureq → native-tls) to compile.
+      - name: Install build dependencies (Linux native)
+        if: matrix.os == 'linux' && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      # -----------------------------------------------------------------------
+      # ONNX Runtime pre-download for targets where ort-sys cannot self-serve:
+      #
+      # - macOS x86_64: pyke.io has NO prebuilt for this target
+      # - Linux aarch64 (cross): pyke.io download fails silently inside cross
+      #   Docker containers (likely network/cache isolation issue)
+      #
+      # We download the official Microsoft ONNX Runtime release and set
+      # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys links dynamically
+      # instead of trying to download from pyke.io.
+      # The .so/.dylib files are bundled alongside binaries in packaging steps.
+      # -----------------------------------------------------------------------
+
       - name: Download ONNX Runtime for macOS x86_64
         if: matrix.target == 'x86_64-apple-darwin'
         run: |
@@ -171,6 +186,27 @@ jobs:
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           echo "=== ONNX Runtime ${ORT_VERSION} for macOS x86_64 ==="
           ls -la "$RUNNER_TEMP/onnxruntime/lib/"
+
+      - name: Download ONNX Runtime for Linux aarch64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          ORT_VERSION="1.23.2"
+          echo "Downloading ONNX Runtime ${ORT_VERSION} for Linux aarch64..."
+          curl -fsSL -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-aarch64-${ORT_VERSION}.tgz"
+          mkdir -p "$RUNNER_TEMP/onnxruntime"
+          # GNU tar: --strip-components=1 strips the top-level versioned directory
+          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
+          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          # Mount ORT dir at same absolute path inside cross container
+          echo "CROSS_CONTAINER_OPTS=-v $RUNNER_TEMP/onnxruntime:$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
+          echo "=== ONNX Runtime ${ORT_VERSION} for Linux aarch64 ==="
+          ls -la "$RUNNER_TEMP/onnxruntime/lib/"
+
+      - name: Install patchelf (for Linux dynamic ORT bundling)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y patchelf
 
       # --- Light variant (no embedded frontend) ---
 
@@ -194,15 +230,17 @@ jobs:
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
-          # Bundle ONNX Runtime dylib for targets using dynamic linking (macOS x86_64).
-          # Two rpaths: @executable_path (dylib next to binary, e.g. tarball)
-          # and @executable_path/../lib (Homebrew layout: bin/ + lib/ siblings).
+          # Bundle ONNX Runtime dylib for targets using dynamic linking
+          # (macOS x86_64, Linux aarch64).
           if [ -n "${ORT_LIB_LOCATION:-}" ]; then
             echo "Bundling ONNX Runtime dylib from $ORT_LIB_LOCATION"
             cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "staging/${ARCHIVE_NAME}/"
             for bin in orchestrator orch mcp_server; do
+              # macOS: @executable_path rpath (dylib next to binary + Homebrew layout)
               install_name_tool -add_rpath @executable_path "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
               install_name_tool -add_rpath @executable_path/../lib "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+              # Linux: $ORIGIN rpath so binary finds .so in same directory
+              patchelf --set-rpath '$ORIGIN' "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
             done
           fi
           cd staging
@@ -262,13 +300,16 @@ jobs:
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
-          # Bundle ONNX Runtime dylib for targets using dynamic linking (macOS x86_64)
+          # Bundle ONNX Runtime dylib for targets using dynamic linking
           if [ -n "${ORT_LIB_LOCATION:-}" ]; then
             echo "Bundling ONNX Runtime dylib from $ORT_LIB_LOCATION"
             cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "staging/${ARCHIVE_NAME}/"
             for bin in orchestrator orch mcp_server; do
+              # macOS: @executable_path rpath
               install_name_tool -add_rpath @executable_path "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
               install_name_tool -add_rpath @executable_path/../lib "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
+              # Linux: $ORIGIN rpath
+              patchelf --set-rpath '$ORIGIN' "staging/${ARCHIVE_NAME}/${bin}" 2>/dev/null || true
             done
           fi
           cd staging
