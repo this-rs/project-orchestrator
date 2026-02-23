@@ -41,6 +41,11 @@ class ProjectOrchestrator < Formula
     bin.install "orchestrator"
     bin.install "orch"
     bin.install "mcp_server"
+
+    # ONNX Runtime dylib — present only in macOS x86_64 builds (dynamic linking
+    # because ort-sys has no prebuilt static library for macOS Intel).
+    # Binaries have @executable_path/../lib in their rpath for this layout.
+    lib.install Dir["libonnxruntime*"] unless Dir["libonnxruntime*"].empty?
   end
 
   def caveats
