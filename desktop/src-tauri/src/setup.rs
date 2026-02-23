@@ -1435,36 +1435,217 @@ pub struct EmbeddingDownloadResult {
     pub error: Option<String>,
 }
 
+/// Progress event payload emitted during embedding model download.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingDownloadProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub percentage: f32,
+    /// "downloading", "complete", or "error"
+    pub status: String,
+}
+
+/// Recursively compute the total size of a directory in bytes.
+fn get_dir_size(path: &std::path::Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += get_dir_size(&p);
+            } else if let Ok(meta) = p.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Fetch real total size of model files from the HuggingFace Hub API.
+///
+/// Queries `/api/models/{repo_id}/tree/main` (and subdirectories) to get
+/// individual file sizes. Returns the sum of all files that fastembed would
+/// download (config, tokenizer, onnx model files — excluding pytorch/tf/openvino).
+///
+/// Falls back to `estimated_model_size()` if the API is unreachable.
+async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
+    /// Fetch file entries from one HF tree path (non-recursive).
+    async fn fetch_tree(client: &reqwest::Client, repo: &str, path: &str) -> Vec<(String, u64, String)> {
+        // type, size, path
+        let url = if path.is_empty() {
+            format!("https://huggingface.co/api/models/{}/tree/main", repo)
+        } else {
+            format!("https://huggingface.co/api/models/{}/tree/main/{}", repo, path)
+        };
+
+        let resp = match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return vec![],
+        };
+
+        let json: Vec<serde_json::Value> = match resp.json().await {
+            Ok(j) => j,
+            Err(_) => return vec![],
+        };
+
+        json.iter()
+            .filter_map(|entry| {
+                let entry_type = entry.get("type")?.as_str()?.to_string();
+                let entry_path = entry.get("path")?.as_str()?.to_string();
+                let size = entry.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                Some((entry_type, size, entry_path))
+            })
+            .collect()
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return estimated_model_size(fallback_name) as u64 * 1_000_000,
+    };
+
+    let mut total: u64 = 0;
+    let mut dirs_to_visit = vec![String::new()];
+
+    // Files/directories to exclude (not downloaded by fastembed)
+    let excluded_prefixes = [
+        "openvino/", "flax_model", "tf_model", "pytorch_model",
+        "rust_model", "model.safetensors", ".gitattributes",
+    ];
+
+    while let Some(dir) = dirs_to_visit.pop() {
+        let entries = fetch_tree(&client, model_code, &dir).await;
+        for (entry_type, size, path) in entries {
+            // Skip excluded files
+            let basename = path.rsplit('/').next().unwrap_or(&path);
+            if excluded_prefixes.iter().any(|prefix| basename.starts_with(prefix) || path.starts_with(prefix)) {
+                continue;
+            }
+
+            match entry_type.as_str() {
+                "file" => total += size,
+                "directory" => dirs_to_visit.push(path),
+                _ => {}
+            }
+        }
+    }
+
+    if total == 0 {
+        // API returned nothing useful — fallback
+        tracing::warn!(model_code, "HF API returned 0 bytes — using estimated size");
+        estimated_model_size(fallback_name) as u64 * 1_000_000
+    } else {
+        tracing::info!(model_code, total_bytes = total, "Fetched real model size from HF API");
+        total
+    }
+}
+
 /// Download a local ONNX embedding model via fastembed.
 ///
 /// This triggers the fastembed model download (HuggingFace Hub → ONNX files).
-/// The download shows progress in the terminal. This is a blocking async command
-/// that returns when the download is complete.
+/// Emits `embedding-download-progress` events to the frontend with real-time
+/// progress based on filesystem monitoring.
 #[tauri::command]
-pub async fn download_embedding_model(model_name: String) -> Result<EmbeddingDownloadResult, String> {
+pub async fn download_embedding_model(
+    app_handle: tauri::AppHandle,
+    model_name: String,
+) -> Result<EmbeddingDownloadResult, String> {
     use fastembed::{TextEmbedding, TextInitOptions};
+    use tauri::Emitter;
 
     let model_variant = project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);
     let cache_dir = fastembed_cache_dir();
 
-    tracing::info!(model = %model_name, cache_dir = %cache_dir.display(), "Downloading embedding model...");
+    // Get model_code for HF API + cache directory monitoring
+    let model_info = TextEmbedding::get_model_info(&model_variant);
+    let model_code = model_info
+        .as_ref()
+        .map(|info| info.model_code.clone())
+        .ok()
+        .unwrap_or_default();
 
-    // Run in a blocking thread since fastembed download is synchronous
+    // Build the model-specific cache directory path (HF Hub layout)
+    let model_cache_dir = if !model_code.is_empty() {
+        cache_dir.join(format!("models--{}", model_code.replace('/', "--")))
+    } else {
+        cache_dir.clone()
+    };
+
+    // Measure existing cache size (in case of partial previous download)
+    let initial_size = get_dir_size(&model_cache_dir);
+
+    tracing::info!(
+        model = %model_name,
+        model_code = %model_code,
+        cache_dir = %cache_dir.display(),
+        model_cache_dir = %model_cache_dir.display(),
+        initial_size,
+        "Downloading embedding model..."
+    );
+
+    // Fetch real total size from HuggingFace API
+    let total_bytes = fetch_model_total_size(&model_code, &model_name).await;
+    tracing::info!(total_bytes, "Expected model download size");
+
+    // Shared stop signal for the monitoring task
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    // Spawn a monitoring task that polls directory size every 500ms
+    let monitor_app = app_handle.clone();
+    let monitor_dir = model_cache_dir.clone();
+    let monitor = tokio::spawn(async move {
+        loop {
+            if stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+
+            let current_size = get_dir_size(&monitor_dir);
+            let downloaded = current_size.saturating_sub(initial_size);
+            let percentage = if total_bytes > 0 {
+                (downloaded as f64 / total_bytes as f64 * 100.0).min(99.0) as f32
+            } else {
+                0.0
+            };
+
+            let _ = monitor_app.emit(
+                "embedding-download-progress",
+                EmbeddingDownloadProgress {
+                    downloaded_bytes: downloaded,
+                    total_bytes,
+                    percentage,
+                    status: "downloading".to_string(),
+                },
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+
+    // Run the actual download in a blocking thread
+    let download_cache_dir = cache_dir.clone();
+    let download_model_name = model_name.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut options = TextInitOptions::new(model_variant).with_show_download_progress(true);
-        options = options.with_cache_dir(cache_dir.clone());
+        options = options.with_cache_dir(download_cache_dir.clone());
 
         match TextEmbedding::try_new(options) {
             Ok(_embedding) => {
-                tracing::info!(model = %model_name, "Embedding model downloaded successfully");
+                tracing::info!(model = %download_model_name, "Embedding model downloaded successfully");
                 EmbeddingDownloadResult {
                     success: true,
-                    model_path: cache_dir.display().to_string(),
+                    model_path: download_cache_dir.display().to_string(),
                     error: None,
                 }
             }
             Err(e) => {
-                tracing::error!(model = %model_name, error = %e, "Failed to download embedding model");
+                tracing::error!(model = %download_model_name, error = %e, "Failed to download embedding model");
                 EmbeddingDownloadResult {
                     success: false,
                     model_path: String::new(),
@@ -1475,6 +1656,23 @@ pub async fn download_embedding_model(model_name: String) -> Result<EmbeddingDow
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
+
+    // Stop the monitoring task
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = monitor.await;
+
+    // Emit final progress event
+    let final_status = if result.success { "complete" } else { "error" };
+    let final_downloaded = get_dir_size(&model_cache_dir).saturating_sub(initial_size);
+    let _ = app_handle.emit(
+        "embedding-download-progress",
+        EmbeddingDownloadProgress {
+            downloaded_bytes: if result.success { total_bytes } else { final_downloaded },
+            total_bytes,
+            percentage: if result.success { 100.0 } else { (final_downloaded as f64 / total_bytes as f64 * 100.0) as f32 },
+            status: final_status.to_string(),
+        },
+    );
 
     Ok(result)
 }
