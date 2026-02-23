@@ -18,11 +18,28 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 static BACKEND_PORT: std::sync::atomic::AtomicU16 =
     std::sync::atomic::AtomicU16::new(setup::DEFAULT_DESKTOP_PORT);
 
+/// Flag set by the splash screen's `proceed_to_main` Tauri command to signal
+/// that the splash has finished all its checks and is ready to transition.
+/// The backend thread polls this flag before calling `show_main_window()`.
+static SPLASH_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Tauri command: get the server port for the frontend to connect to.
 /// Returns the real port from config.yaml (not necessarily 6600).
 #[tauri::command]
 fn get_server_port() -> u16 {
     BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tauri command: called by the splash screen when all checks are done
+/// and it's ready to transition to the main window.
+///
+/// This removes the need for the Rust thread to duplicate Docker/CLI checks —
+/// the splash screen drives the transition by calling this when ready.
+#[tauri::command]
+fn proceed_to_main() {
+    tracing::info!("Splash screen signaled ready — will transition to main window");
+    SPLASH_READY.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Tauri command: check backend health and return the full `/health` response.
@@ -130,6 +147,7 @@ fn main() {
         .manage(docker_manager)
         .invoke_handler(tauri::generate_handler![
             get_server_port,
+            proceed_to_main,
             check_health,
             open_url,
             pick_directory,
@@ -148,6 +166,10 @@ fn main() {
             setup::install_cli,
             setup::setup_claude_code,
             setup::verify_oidc_discovery,
+            // Embedding model commands (setup wizard blocking validation)
+            setup::check_embedding_model,
+            setup::download_embedding_model,
+            setup::test_embedding_endpoint,
             // Docker management commands
             docker::check_docker,
             docker::open_docker_desktop,
@@ -296,7 +318,7 @@ fn main() {
 
             // Start backend server and manage splash → main window transition
             let handle = app.handle().clone();
-            let docker_for_transition = docker_for_setup.clone();
+            let _docker_for_transition = docker_for_setup.clone();
             std::thread::spawn(move || {
                 // Ensure a config.yaml exists — generate a default one if missing
                 let config_path = setup::config_path();
@@ -329,13 +351,6 @@ fn main() {
                     .and_then(|contents| serde_yaml::from_str::<serde_yaml::Value>(&contents).ok())
                     .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
                     .unwrap_or_else(|| "docker".to_string());
-
-                // Read nats_enabled from the YAML config
-                let nats_enabled = std::fs::read_to_string(&config_path)
-                    .ok()
-                    .and_then(|contents| serde_yaml::from_str::<serde_yaml::Value>(&contents).ok())
-                    .map(|v| v.get("nats").and_then(|n| n.get("url")).is_some())
-                    .unwrap_or(false);
 
                 // Always start the backend server (even in unconfigured mode)
                 // In unconfigured mode it runs no-auth so the setup wizard can load
@@ -371,7 +386,6 @@ fn main() {
                 );
                 let health_url = format!("http://localhost:{}/health", port);
                 let start = std::time::Instant::now();
-                let global_timeout = std::time::Duration::from_secs(120);
 
                 loop {
                     if start.elapsed() > std::time::Duration::from_secs(30) {
@@ -392,68 +406,30 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
 
-                // After backend HTTP is up, wait for Docker services if applicable.
-                // In setup mode or external mode, skip this — go straight to main window.
-                if is_configured && infra_mode != "external" {
-                    tracing::info!("Waiting for Docker services to become healthy...");
-                    let rt = tokio::runtime::Runtime::new()
-                        .expect("Failed to create tokio runtime for Docker health check");
-                    rt.block_on(async {
-                        let services_start = std::time::Instant::now();
-                        loop {
-                            if services_start.elapsed() > global_timeout {
-                                tracing::warn!(
-                                    "Docker services did not become healthy within {:?} — proceeding anyway",
-                                    global_timeout
-                                );
-                                break;
-                            }
+                // ─────────────────────────────────────────────────────────────
+                // Wait for the splash screen to signal readiness.
+                //
+                // The splash screen drives the transition: it checks Docker,
+                // Claude CLI, starts services, and polls backend health.
+                // When everything is ready, the splash JS calls
+                // invoke('proceed_to_main') which sets SPLASH_READY = true.
+                //
+                // This removes the duplicate Docker health + CLI detection
+                // loops that were in the Rust thread — single source of truth.
+                // ─────────────────────────────────────────────────────────────
+                let splash_timeout = std::time::Duration::from_secs(600); // 10 min max
+                let splash_start = std::time::Instant::now();
 
-                            let mgr = docker_for_transition.read().await;
-                            let health = mgr.check_health(nats_enabled).await;
-                            drop(mgr); // release lock quickly
-
-                            let neo4j_ok = health.neo4j == docker::ServiceStatus::Healthy;
-                            let meili_ok = health.meilisearch == docker::ServiceStatus::Healthy;
-                            let nats_ok = !nats_enabled
-                                || health.nats == docker::ServiceStatus::Healthy
-                                || health.nats == docker::ServiceStatus::Disabled;
-
-                            if neo4j_ok && meili_ok && nats_ok {
-                                tracing::info!(
-                                    "All Docker services healthy in {:?}",
-                                    services_start.elapsed()
-                                );
-                                break;
-                            }
-
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        }
-                    });
-                }
-
-                // Wait for Claude CLI to be installed before transitioning.
-                // The splash screen shows an "Install" button — we block here until
-                // the CLI is detected (either via the splash install button or manual install).
-                // Skip this check if setup is not yet completed (the setup wizard handles CLI).
-                if is_configured {
-                    let cli_timeout = std::time::Duration::from_secs(300); // 5 min max wait
-                    let cli_start = std::time::Instant::now();
-                    loop {
-                        if project_orchestrator::setup_claude::detect_claude_cli().is_some() {
-                            tracing::info!("Claude CLI detected — proceeding to main window");
-                            break;
-                        }
-                        if cli_start.elapsed() > cli_timeout {
-                            tracing::warn!(
-                                "Claude CLI not detected after {:?} — proceeding anyway",
-                                cli_timeout
-                            );
-                            break;
-                        }
-                        tracing::debug!("Waiting for Claude CLI to be installed...");
-                        std::thread::sleep(std::time::Duration::from_secs(2));
+                tracing::info!("Waiting for splash screen to signal readiness...");
+                while !SPLASH_READY.load(std::sync::atomic::Ordering::SeqCst) {
+                    if splash_start.elapsed() > splash_timeout {
+                        tracing::warn!(
+                            "Splash screen did not signal readiness after {:?} — proceeding anyway",
+                            splash_timeout
+                        );
+                        break;
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
 
                 // Transition: close splash → show main window

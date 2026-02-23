@@ -1012,14 +1012,20 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
 /// Start a minimal server for the setup wizard.
 ///
-/// Only serves `/health`, `/api/setup-status`, and `/auth/providers`.
+/// Serves `/health`, `/api/setup-status`, `/auth/providers`, and optionally
+/// the frontend SPA (when `SERVE_FRONTEND=true` and `FRONTEND_PATH` are set).
 /// No database connections are required — it's a lightweight Axum server
 /// that lets the Tauri frontend display the setup wizard.
+///
+/// Without frontend serving, `http://localhost:{port}/` returns 404 (white page).
+/// The Tauri desktop app sets `SERVE_FRONTEND=true` + `FRONTEND_PATH` in the
+/// `setup` callback, so the SPA loads and the React `SetupGuard` redirects to `/setup`.
 async fn start_setup_server(port: u16) -> Result<()> {
     use axum::routing::get;
     use serde::Serialize;
     use std::net::SocketAddr;
     use tower_http::cors::{Any, CorsLayer};
+    use tower_http::services::{ServeDir, ServeFile};
 
     #[derive(Serialize)]
     struct HealthResp {
@@ -1068,6 +1074,33 @@ async fn start_setup_server(port: u16) -> Result<()> {
         .route("/api/setup-status", get(setup_status))
         .route("/auth/providers", get(auth_providers))
         .layer(cors);
+
+    // Serve frontend SPA if enabled (Tauri desktop sets SERVE_FRONTEND=true).
+    // This is critical: without it, http://localhost:{port}/ returns 404 → white page.
+    // With it, the React app loads, SetupGuard checks /api/setup-status, and
+    // redirects to /setup (the setup wizard).
+    let serve_frontend = std::env::var("SERVE_FRONTEND")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let frontend_path = std::env::var("FRONTEND_PATH").unwrap_or_else(|_| "./dist".to_string());
+
+    let app = if serve_frontend && std::path::Path::new(&frontend_path).exists() {
+        tracing::info!(
+            "Setup server: serving frontend SPA from {}",
+            frontend_path
+        );
+        let index_path = format!("{}/index.html", frontend_path);
+        let serve_dir = ServeDir::new(&frontend_path).fallback(ServeFile::new(index_path));
+        app.fallback_service(serve_dir)
+    } else {
+        if serve_frontend {
+            tracing::warn!(
+                "SERVE_FRONTEND=true but frontend path does not exist: {}",
+                frontend_path
+            );
+        }
+        app
+    };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Setup-only server listening on {}", addr);

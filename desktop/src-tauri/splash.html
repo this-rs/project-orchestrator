@@ -411,53 +411,20 @@
     }
 
     // ========================================================================
-    // Claude CLI install helpers
+    // Docker install helpers
     // ========================================================================
 
-    let cliInstallInProgress = false;
-    let cliInstalled = false;
+    async function installDocker() {
+      setCheck('check-docker', '', 'Opening Docker Desktop download...');
+      setStatus('Please install Docker Desktop from the download page');
 
-    async function installClaudeCli() {
-      if (cliInstallInProgress) return;
-      cliInstallInProgress = true;
+      // Open the download page for the user's platform
+      const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
+      openUrl(url);
 
-      setCheck('check-claude', '', 'Installing Claude Code CLI...');
-      setStatus('Installing Claude Code CLI via official installer...');
-
-      try {
-        const result = await invoke('install_cli', { version: null });
-        if (result.success) {
-          cliInstalled = true;
-          setCheck('check-claude', 'success', 'Installed: ' + (result.version || 'latest'));
-          setStatus('Claude Code CLI installed successfully');
-        } else {
-          setCheck('check-claude', 'error', result.message || 'Installation failed',
-            `<button class="check-action" onclick="installClaudeCli()">Retry</button>`);
-          setStatus('CLI installation failed — click Retry');
-        }
-      } catch (err) {
-        console.error('install_cli error:', err);
-        setCheck('check-claude', 'error', 'Install error: ' + err,
-          `<button class="check-action" onclick="installClaudeCli()">Retry</button>`);
-        setStatus('CLI installation failed — click Retry');
-      } finally {
-        cliInstallInProgress = false;
-      }
-    }
-
-    async function waitForCliInstall() {
-      // Wait until CLI is installed (either via install button or manually)
-      while (!cliInstalled && !isGlobalTimeout()) {
-        await sleep(1000);
-        // Also poll in case user installed it manually outside the app
-        try {
-          const deps = await invoke('check_dependencies');
-          if (deps.claudeCodeAvailable) {
-            cliInstalled = true;
-            return;
-          }
-        } catch (_) { /* continue polling */ }
-      }
+      // Update UI to show we're waiting for Docker
+      setCheck('check-docker', 'warning', 'Waiting for Docker to be installed...',
+        `<button class="check-action" onclick="openUrl('${url}')">Open page again</button>`);
     }
 
     // ========================================================================
@@ -479,16 +446,11 @@
           setCheck('check-config', 'warning', 'Will be created by setup wizard');
         }
 
-        // -- Claude Code CLI (BLOCKING — must be installed to proceed) --
+        // -- Claude Code CLI (informational — setup wizard handles blocking) --
         if (deps.claudeCodeAvailable) {
           setCheck('check-claude', 'success');
         } else {
-          setCheck('check-claude', 'error', 'Claude Code CLI is required',
-            `<button class="check-action" onclick="installClaudeCli()">Install</button>`);
-          // Block here — wait for CLI to be installed before continuing
-          setStatus('Claude Code CLI is required to continue');
-          await waitForCliInstall();
-          setCheck('check-claude', 'success');
+          setCheck('check-claude', 'warning', 'Not detected — install via setup wizard');
         }
 
         // -- NATS visibility --
@@ -569,9 +531,8 @@
 
       } else {
         // Docker not installed
-        const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
         setCheck('check-docker', 'error', 'Docker is required to run services',
-          `<button class="check-action" onclick="openUrl('${url}')">Install</button>`);
+          `<button class="check-action" onclick="installDocker()">Install</button>`);
         setCheck('check-neo4j', 'error', 'Requires Docker');
         setCheck('check-meilisearch', 'error', 'Requires Docker');
         if (deps.natsEnabled) {
@@ -833,10 +794,16 @@
     // Transition & utility
     // ========================================================================
 
-    function transitionToMain() {
-      // The backend thread in main.rs handles the actual window transition
-      // via show_main_window(). This function is intentionally a no-op.
-      // The Rust side drives the transition (decision 0218a69c).
+    async function transitionToMain() {
+      // Signal the Rust backend thread to close the splash and show the main window.
+      // The Rust thread waits for this signal (SPLASH_READY flag) before calling
+      // show_main_window(). This makes the splash screen the single source of truth
+      // for when the transition should happen.
+      try {
+        await invoke('proceed_to_main');
+      } catch (err) {
+        console.error('proceed_to_main failed:', err);
+      }
     }
 
     function continueAnyway() {
