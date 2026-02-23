@@ -2,13 +2,24 @@
 # https://github.com/cross-rs/cross
 #
 # Required because fastembed → ort-sys → ureq → native-tls → openssl-sys
-# needs OpenSSL development headers to download ONNX Runtime prebuilt binaries.
+# needs OpenSSL development headers in the build script.
+#
+# IMPORTANT: Our binary uses rustls (not native-tls), so only the HOST-arch
+# libssl-dev is needed (for compiling build scripts). No TARGET-arch
+# libssl-dev is required — installing it causes linker conflicts where the
+# HOST linker finds incompatible TARGET .so files.
 
 [target.x86_64-unknown-linux-gnu]
 pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config"]
 
 [target.aarch64-unknown-linux-gnu]
-# Both libssl-dev (host x86_64) AND libssl-dev:arm64 (target) are needed:
-# openssl-sys build.rs compiles expando.c with the HOST compiler (x86_64),
-# so it needs the host-arch headers. The target-arch headers are for linking.
-pre-build = ["dpkg --add-architecture arm64 && apt-get update && apt-get install -y libssl-dev libssl-dev:arm64 pkg-config"]
+# Only HOST-arch (x86_64) libssl-dev — build scripts compile for HOST.
+# DO NOT add libssl-dev:arm64 — it puts arm64 .so in linker search path,
+# causing "incompatible with elf64-x86-64" errors when linking HOST binaries.
+pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config"]
+
+[target.aarch64-unknown-linux-gnu.env]
+# Pass through ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys uses
+# the pre-downloaded Microsoft ONNX Runtime instead of downloading from pyke.io
+# (which fails silently inside cross containers).
+passthrough = ["ORT_LIB_LOCATION", "ORT_PREFER_DYNAMIC_LINK"]
