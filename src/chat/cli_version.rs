@@ -180,7 +180,33 @@ pub async fn install_or_upgrade_cli(target_version: Option<&str>) -> CliInstallR
             }
         }
         Err(e) => {
-            warn!(error = %e, "CLI install/upgrade failed");
+            warn!(error = %e, "CLI install/upgrade failed — checking if CLI was installed anyway");
+
+            // Safety net: the official install script may have succeeded but the SDK's
+            // post-install checks failed (e.g. ~/.local/bin not in process PATH).
+            // Use detect_claude_cli() which checks well-known locations directly.
+            if let Some(found_path) = crate::setup_claude::detect_claude_cli() {
+                let path = std::path::PathBuf::from(&found_path);
+                let version = get_cli_version_robust(&path).await;
+                let version_str = version.as_ref().map(|v| v.to_string());
+
+                warn!(
+                    path = %found_path,
+                    version = ?version_str,
+                    "CLI install reported failure but binary found via detect_claude_cli"
+                );
+
+                return CliInstallResult {
+                    success: true,
+                    version: version_str,
+                    message: format!(
+                        "Claude CLI detected at {} (install script succeeded but post-install check failed)",
+                        found_path
+                    ),
+                    cli_path: Some(found_path),
+                };
+            }
+
             CliInstallResult {
                 success: false,
                 version: None,
