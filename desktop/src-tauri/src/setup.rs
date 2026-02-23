@@ -1395,17 +1395,24 @@ pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus,
         // The model_code is like "intfloat/multilingual-e5-base"
         let model_dir = cache_dir.join(format!("models--{}", &info.model_code.replace('/', "--")));
 
-        // Search for ONNX files inside snapshots subdirectories
+        // Search for ONNX files inside snapshots subdirectories.
+        // Two cache layouts exist depending on the HF repo structure:
+        //   - intfloat models: snapshots/{sha}/onnx/model.onnx  (subfolder)
+        //   - Qdrant models:   snapshots/{sha}/model.onnx       (root)
         let available = if model_dir.exists() {
-            // Check all snapshot dirs for model.onnx or model_optimized.onnx
             let snapshots_dir = model_dir.join("snapshots");
             if snapshots_dir.exists() {
                 std::fs::read_dir(&snapshots_dir)
                     .map(|entries| {
                         entries.filter_map(|e| e.ok()).any(|entry| {
-                            let onnx_dir = entry.path().join("onnx");
+                            let snap = entry.path();
+                            // Layout 1: onnx/ subfolder (intfloat repos)
+                            let onnx_dir = snap.join("onnx");
+                            // Layout 2: model at snapshot root (Qdrant ONNX repos)
                             onnx_dir.join("model.onnx").exists()
                                 || onnx_dir.join("model_optimized.onnx").exists()
+                                || snap.join("model.onnx").exists()
+                                || snap.join("model_optimized.onnx").exists()
                         })
                     })
                     .unwrap_or(false)
