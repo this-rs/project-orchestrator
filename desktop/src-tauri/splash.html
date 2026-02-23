@@ -748,13 +748,15 @@
               setCheck('check-meilisearch',
                 health.services.meilisearch === 'connected' ? 'success' : 'error',
                 health.services.meilisearch === 'connected' ? 'Connected' : 'Unreachable');
-              // NATS status from /health if available, otherwise mark as checked
-              if (health.services.nats) {
-                setCheck('check-nats',
-                  health.services.nats === 'connected' ? 'success' : 'error',
-                  health.services.nats === 'connected' ? 'Connected' : 'Unreachable');
+              // NATS status from /health
+              if (health.services.nats === 'connected') {
+                setCheck('check-nats', 'success', 'Connected');
+              } else if (health.services.nats === 'disabled') {
+                setCheck('check-nats', 'skipped', 'Disabled');
+              } else if (health.services.nats === 'disconnected') {
+                setCheck('check-nats', 'error', 'Unreachable');
               } else {
-                setCheck('check-nats', 'skipped', 'Not in health response');
+                setCheck('check-nats', 'skipped', 'Disabled');
               }
             } else {
               // Fallback for old /health format (no services field)
