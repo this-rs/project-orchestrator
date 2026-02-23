@@ -1,22 +1,19 @@
 # Cross-compilation configuration for cross-rs
 # https://github.com/cross-rs/cross
 #
-# Required because fastembed → ort-sys → ureq → native-tls → openssl-sys
-# needs OpenSSL development headers in the build script.
-#
-# IMPORTANT: Our binary uses rustls (not native-tls), so only the HOST-arch
-# libssl-dev is needed (for compiling build scripts). No TARGET-arch
-# libssl-dev is required — installing it causes linker conflicts where the
-# HOST linker finds incompatible TARGET .so files.
+# For cross-compiled targets, we use vendored OpenSSL (built from source)
+# to avoid conflicts between host and target libssl-dev packages.
+# See Cargo.toml `vendored-openssl` feature.
 
 [target.x86_64-unknown-linux-gnu]
+# x86_64 is now built natively (use_cross: false) — this section is kept
+# as fallback in case cross is ever re-enabled.
 pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config"]
 
 [target.aarch64-unknown-linux-gnu]
-# Only HOST-arch (x86_64) libssl-dev — build scripts compile for HOST.
-# DO NOT add libssl-dev:arm64 — it puts arm64 .so in linker search path,
-# causing "incompatible with elf64-x86-64" errors when linking HOST binaries.
-pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config"]
+# Vendored OpenSSL builds from source — no system libssl-dev needed.
+# perl + make are required by openssl-src (OpenSSL's build system).
+pre-build = ["apt-get update && apt-get install -y pkg-config perl make"]
 
 [target.aarch64-unknown-linux-gnu.env]
 # Pass through ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys uses
