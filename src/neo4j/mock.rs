@@ -1208,6 +1208,11 @@ impl GraphStore for MockGraphStore {
         Ok(paths.iter().filter_map(|p| files.get(p).cloned()).collect())
     }
 
+    async fn count_project_files(&self, project_id: Uuid) -> Result<i64> {
+        let pf = self.project_files.read().await;
+        Ok(pf.get(&project_id).map(|p| p.len() as i64).unwrap_or(0))
+    }
+
     // ========================================================================
     // Symbol operations
     // ========================================================================
@@ -2603,6 +2608,23 @@ impl GraphStore for MockGraphStore {
                 )
             })
             .collect())
+    }
+
+    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64> {
+        let pp = self.project_plans.read().await;
+        let plans = self.plans.read().await;
+        let ids = pp.get(&project_id).cloned().unwrap_or_default();
+        let count = ids
+            .iter()
+            .filter_map(|id| plans.get(id))
+            .filter(|p| {
+                matches!(
+                    p.status,
+                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
+                )
+            })
+            .count();
+        Ok(count as i64)
     }
 
     async fn list_plans_for_project(

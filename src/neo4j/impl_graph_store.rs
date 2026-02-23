@@ -422,6 +422,10 @@ impl GraphStore for Neo4jClient {
         self.list_project_files(project_id).await
     }
 
+    async fn count_project_files(&self, project_id: Uuid) -> anyhow::Result<i64> {
+        self.count_project_files(project_id).await
+    }
+
     // ========================================================================
     // Symbol operations
     // ========================================================================
@@ -773,6 +777,10 @@ impl GraphStore for Neo4jClient {
 
     async fn list_project_plans(&self, project_id: Uuid) -> anyhow::Result<Vec<PlanNode>> {
         self.list_project_plans(project_id).await
+    }
+
+    async fn count_project_plans(&self, project_id: Uuid) -> anyhow::Result<i64> {
+        self.count_project_plans(project_id).await
     }
 
     async fn list_plans_for_project(

@@ -2329,6 +2329,21 @@ impl Neo4jClient {
         Ok(files)
     }
 
+    /// Count files for a project (lightweight COUNT query, no data transfer).
+    pub async fn count_project_files(&self, project_id: Uuid) -> Result<i64> {
+        let q = query(
+            "MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File) RETURN count(f) AS cnt",
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("cnt")?)
+        } else {
+            Ok(0)
+        }
+    }
+
     // ========================================================================
     // Function operations
     // ========================================================================
@@ -5269,6 +5284,21 @@ impl Neo4jClient {
         }
 
         Ok(plans)
+    }
+
+    /// Count plans for a project (lightweight COUNT query, no data transfer).
+    pub async fn count_project_plans(&self, project_id: Uuid) -> Result<i64> {
+        let q = query(
+            "MATCH (project:Project {id: $project_id})-[:HAS_PLAN]->(p:Plan) WHERE p.status IN ['Draft', 'Approved', 'InProgress'] RETURN count(p) AS cnt",
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("cnt")?)
+        } else {
+            Ok(0)
+        }
     }
 
     /// List plans for a project with filters

@@ -325,6 +325,9 @@ pub trait GraphStore: Send + Sync {
     /// List files for a project
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>>;
 
+    /// Count files for a project (lightweight, no data transfer)
+    async fn count_project_files(&self, project_id: Uuid) -> Result<i64>;
+
     // ========================================================================
     // Symbol operations
     // ========================================================================
@@ -602,6 +605,9 @@ pub trait GraphStore: Send + Sync {
 
     /// List active plans for a specific project
     async fn list_project_plans(&self, project_id: Uuid) -> Result<Vec<PlanNode>>;
+
+    /// Count plans for a project (lightweight, no data transfer)
+    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64>;
 
     /// List plans for a project with filters
     async fn list_plans_for_project(

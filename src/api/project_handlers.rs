@@ -79,18 +79,18 @@ pub async fn list_projects(
 
     let mut responses = Vec::new();
     for project in &projects {
-        let files = state
+        let file_count = state
             .orchestrator
             .neo4j()
-            .list_project_files(project.id)
+            .count_project_files(project.id)
             .await
-            .unwrap_or_default();
-        let plans = state
+            .unwrap_or(0);
+        let plan_count = state
             .orchestrator
             .neo4j()
-            .list_project_plans(project.id)
+            .count_project_plans(project.id)
             .await
-            .unwrap_or_default();
+            .unwrap_or(0);
 
         responses.push(ProjectResponse {
             id: project.id.to_string(),
@@ -100,8 +100,8 @@ pub async fn list_projects(
             description: project.description.clone(),
             created_at: project.created_at.to_rfc3339(),
             last_synced: project.last_synced.map(|dt| dt.to_rfc3339()),
-            file_count: files.len(),
-            plan_count: plans.len(),
+            file_count: file_count as usize,
+            plan_count: plan_count as usize,
         });
     }
 
@@ -175,18 +175,18 @@ pub async fn get_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    let files = state
+    let file_count = state
         .orchestrator
         .neo4j()
-        .list_project_files(project.id)
+        .count_project_files(project.id)
         .await
-        .unwrap_or_default();
-    let plans = state
+        .unwrap_or(0);
+    let plan_count = state
         .orchestrator
         .neo4j()
-        .list_project_plans(project.id)
+        .count_project_plans(project.id)
         .await
-        .unwrap_or_default();
+        .unwrap_or(0);
 
     Ok(Json(ProjectResponse {
         id: project.id.to_string(),
@@ -196,8 +196,8 @@ pub async fn get_project(
         description: project.description,
         created_at: project.created_at.to_rfc3339(),
         last_synced: project.last_synced.map(|dt| dt.to_rfc3339()),
-        file_count: files.len(),
-        plan_count: plans.len(),
+        file_count: file_count as usize,
+        plan_count: plan_count as usize,
     }))
 }
 
