@@ -8,4 +8,7 @@
 pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config"]
 
 [target.aarch64-unknown-linux-gnu]
-pre-build = ["dpkg --add-architecture arm64 && apt-get update && apt-get install -y libssl-dev:arm64 pkg-config"]
+# Both libssl-dev (host x86_64) AND libssl-dev:arm64 (target) are needed:
+# openssl-sys build.rs compiles expando.c with the HOST compiler (x86_64),
+# so it needs the host-arch headers. The target-arch headers are for linking.
+pre-build = ["dpkg --add-architecture arm64 && apt-get update && apt-get install -y libssl-dev libssl-dev:arm64 pkg-config"]
