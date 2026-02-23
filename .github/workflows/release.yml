@@ -686,6 +686,11 @@ jobs:
       # Tauri's built-in codesign does NOT pass --timestamp to codesign (bug in
       # tauri-macos-sign). Apple requires a secure timestamp for notarization.
       # We re-sign everything after the Tauri build with --timestamp added.
+      #
+      # IMPORTANT: The main executable and .app bundle MUST be re-signed with
+      # --entitlements to preserve the entitlements from tauri.conf.json.
+      # Without this, --force strips the original entitlements, and with
+      # hardened runtime (--options runtime), the app loses network permissions.
       - name: Re-sign macOS bundle with timestamp
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
         env:
@@ -693,6 +698,7 @@ jobs:
         run: |
           BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
           APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          ENTITLEMENTS="desktop/src-tauri/entitlements.plist"
 
           if [ -z "$APP_PATH" ]; then
             echo "::warning::No .app bundle found — skipping re-sign"
@@ -700,9 +706,10 @@ jobs:
           fi
 
           echo "Re-signing $APP_PATH with --timestamp..."
+          echo "  Entitlements: $ENTITLEMENTS"
 
           # Sign deepest binaries first (inside-out order required by codesign)
-          # 1. Sign all nested frameworks and dylibs
+          # 1. Sign all nested frameworks and dylibs (no entitlements needed)
           find "$APP_PATH/Contents/Frameworks" -type f -perm +111 2>/dev/null | while read binary; do
             echo "  Signing framework: $(basename "$binary")"
             codesign --force --timestamp --options runtime \
@@ -710,9 +717,12 @@ jobs:
           done
 
           # 2. Sign resource binaries (e.g. mcp_server bundled as Tauri resource)
+          #    These are helper binaries — they inherit the app's sandbox but
+          #    need their own hardened runtime signature.
           find "$APP_PATH/Contents/Resources" -type f -perm +111 2>/dev/null | while read binary; do
             echo "  Signing resource: $(basename "$binary")"
             codesign --force --timestamp --options runtime \
+              --entitlements "$ENTITLEMENTS" \
               --sign "$APPLE_SIGNING_IDENTITY" "$binary"
           done
 
@@ -720,22 +730,34 @@ jobs:
           find "$APP_PATH/Contents/MacOS" -type f -perm +111 | while read binary; do
             echo "  Signing executable: $(basename "$binary")"
             codesign --force --timestamp --options runtime \
+              --entitlements "$ENTITLEMENTS" \
               --sign "$APPLE_SIGNING_IDENTITY" "$binary"
           done
 
           # 4. Sign the .app bundle itself (must be last)
           codesign --force --timestamp --options runtime \
+            --entitlements "$ENTITLEMENTS" \
             --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
 
-          # 4. Verify the signature
+          # 5. Verify the signature and entitlements
           echo "Verifying signature..."
           codesign --verify --deep --strict "$APP_PATH"
-          echo "✅ Re-sign with timestamp successful"
+          echo "Verifying entitlements..."
+          codesign -d --entitlements - "$APP_PATH" 2>&1 | head -20
+          echo "✅ Re-sign with timestamp + entitlements successful"
 
       # --- macOS: Recreate DMG with re-signed .app ---
       # The DMG created by Tauri contains a snapshot of the .app BEFORE re-sign.
       # We must recreate the DMG so it contains the re-signed .app (with timestamps).
       # Then sign the DMG itself with a timestamp.
+      #
+      # IMPORTANT: Tauri's original DMG (via bundle_dmg.sh) includes:
+      #   - The .app bundle
+      #   - An "Applications" symlink → /Applications (drag-to-install UX)
+      #   - A .VolumeIcon.icns (custom DMG icon in Finder)
+      #   - A .DS_Store (icon positions in the Finder window)
+      # A bare `hdiutil create -srcfolder <app>` loses all of these.
+      # We stage a directory that replicates the Tauri DMG structure.
       - name: Recreate and sign macOS DMG
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
         env:
@@ -759,19 +781,40 @@ jobs:
           echo "  App: $APP_PATH"
           echo "  DMG: $DMG_PATH"
 
-          # Remove old DMG
-          rm -f "$DMG_PATH"
+          # --- Stage the DMG contents (replicate Tauri's bundle_dmg.sh layout) ---
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
 
-          # Create new DMG from re-signed .app
+          # 1. Copy the re-signed .app
+          cp -R "$APP_PATH" "$STAGING/"
+
+          # 2. Add "Applications" symlink (drag-to-install shortcut)
+          ln -s /Applications "$STAGING/Applications"
+
+          # 3. Add volume icon from the .app's icon.icns
+          ICNS_FILE="$APP_PATH/Contents/Resources/icon.icns"
+          if [ -f "$ICNS_FILE" ]; then
+            cp "$ICNS_FILE" "$STAGING/.VolumeIcon.icns"
+          fi
+
+          echo "  Staging contents:"
+          ls -la "$STAGING/"
+
+          # --- Create the DMG from the staged directory ---
+          rm -f "$DMG_PATH"
           hdiutil create -volname "$VOLUME_NAME" \
-            -srcfolder "$APP_PATH" \
+            -srcfolder "$STAGING" \
             -ov -format UDZO \
             "$DMG_PATH"
+
+          # Cleanup staging
+          rm -rf "$STAGING"
 
           # Sign the DMG itself
           codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
           codesign --verify --deep --strict "$DMG_PATH"
-          echo "✅ DMG recreated and signed with re-signed app"
+          echo "✅ DMG recreated and signed with re-signed app (includes Applications shortcut)"
 
       # --- macOS: Rebuild updater bundles (.app.tar.gz + .sig) ---
       # The .app.tar.gz and .sig generated by Tauri are stale after re-sign.
