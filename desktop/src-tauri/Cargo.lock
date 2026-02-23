@@ -5050,6 +5050,7 @@ dependencies = [
  "bollard",
  "cocoa",
  "dirs 5.0.1",
+ "fastembed",
  "futures-util",
  "objc",
  "project-orchestrator",

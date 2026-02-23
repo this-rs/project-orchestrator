@@ -31,6 +31,10 @@ ignore:
   - "src/neo4j/client.rs"
   # Pure trait→client delegation — untestable without Neo4j, zero logic.
   - "src/neo4j/impl_graph_store.rs"
+  # Server bootstrap — start_server / start_setup_server bind Axum servers,
+  # read env vars, and configure middleware. Pure infrastructure, not unit-testable.
+  # Covered by integration/API tests (ci.yml jobs).
+  - "src/lib.rs"
   # Main entry points
   - "src/main.rs"
   - "src/bin/**"

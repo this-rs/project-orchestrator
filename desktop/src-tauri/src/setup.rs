@@ -1313,6 +1313,262 @@ fn resolve_oidc_endpoints(discovery_url: &str) -> (String, String, String, Strin
     }
 }
 
+// ============================================================================
+// Embedding model commands (setup wizard — blocking validation)
+// ============================================================================
+
+/// Status of a local ONNX embedding model in the fastembed cache.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingModelStatus {
+    pub available: bool,
+    pub cache_path: Option<String>,
+    pub estimated_size_mb: u32,
+}
+
+/// Map model name to estimated download size in MB.
+fn estimated_model_size(model_name: &str) -> u32 {
+    match model_name.to_lowercase().as_str() {
+        "multilingual-e5-small" | "intfloat/multilingual-e5-small" => 120,
+        "multilingual-e5-base" | "intfloat/multilingual-e5-base" => 400,
+        "multilingual-e5-large" | "intfloat/multilingual-e5-large" => 1100,
+        "bge-small-en-v1.5" => 80,
+        "bge-base-en-v1.5" => 250,
+        "bge-large-en-v1.5" => 650,
+        "bge-m3" => 1100,
+        "all-minilm-l6-v2" | "all-minilm-l12-v2" => 80,
+        "nomic-embed-text-v1" | "nomic-embed-text-v1.5" => 250,
+        "gte-base-en-v1.5" => 250,
+        "gte-large-en-v1.5" => 650,
+        "snowflake-arctic-embed-m" => 400,
+        "snowflake-arctic-embed-l" => 650,
+        _ => 400, // default estimate
+    }
+}
+
+/// Get the fastembed cache directory.
+fn fastembed_cache_dir() -> PathBuf {
+    std::env::var("FASTEMBED_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".fastembed_cache")
+        })
+}
+
+/// Check if a local ONNX embedding model is already downloaded in the cache.
+///
+/// Looks for the model directory in the fastembed cache and checks if the
+/// ONNX model file exists. Returns availability status and estimated size.
+#[tauri::command]
+pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus, String> {
+    use fastembed::{TextEmbedding, EmbeddingModel};
+
+    let model_variant = project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);
+    let estimated_size_mb = estimated_model_size(&model_name);
+
+    // Get model info to find the cache path
+    let model_info = TextEmbedding::get_model_info(&model_variant);
+    let cache_dir = fastembed_cache_dir();
+
+    if let Ok(info) = model_info {
+        // fastembed uses HuggingFace Hub cache layout:
+        //   {cache_dir}/models--{org}--{name}/snapshots/{sha}/onnx/model.onnx
+        // The model_code is like "intfloat/multilingual-e5-base"
+        let model_dir = cache_dir.join(format!("models--{}", &info.model_code.replace('/', "--")));
+
+        // Search for ONNX files inside snapshots subdirectories
+        let available = if model_dir.exists() {
+            // Check all snapshot dirs for model.onnx or model_optimized.onnx
+            let snapshots_dir = model_dir.join("snapshots");
+            if snapshots_dir.exists() {
+                std::fs::read_dir(&snapshots_dir)
+                    .map(|entries| {
+                        entries.filter_map(|e| e.ok()).any(|entry| {
+                            let onnx_dir = entry.path().join("onnx");
+                            onnx_dir.join("model.onnx").exists()
+                                || onnx_dir.join("model_optimized.onnx").exists()
+                        })
+                    })
+                    .unwrap_or(false)
+            } else {
+                // Fallback: check root of model_dir (older cache formats)
+                model_dir.join("model.onnx").exists()
+                    || model_dir.join("model_optimized.onnx").exists()
+            }
+        } else {
+            false
+        };
+
+        tracing::info!(
+            model = %model_name,
+            model_code = %info.model_code,
+            model_dir = %model_dir.display(),
+            available,
+            "Checking embedding model cache"
+        );
+
+        Ok(EmbeddingModelStatus {
+            available,
+            cache_path: if available { Some(model_dir.display().to_string()) } else { None },
+            estimated_size_mb,
+        })
+    } else {
+        // Unknown model — report as unavailable
+        Ok(EmbeddingModelStatus {
+            available: false,
+            cache_path: None,
+            estimated_size_mb,
+        })
+    }
+}
+
+/// Result of downloading an embedding model.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingDownloadResult {
+    pub success: bool,
+    pub model_path: String,
+    pub error: Option<String>,
+}
+
+/// Download a local ONNX embedding model via fastembed.
+///
+/// This triggers the fastembed model download (HuggingFace Hub → ONNX files).
+/// The download shows progress in the terminal. This is a blocking async command
+/// that returns when the download is complete.
+#[tauri::command]
+pub async fn download_embedding_model(model_name: String) -> Result<EmbeddingDownloadResult, String> {
+    use fastembed::{TextEmbedding, TextInitOptions};
+
+    let model_variant = project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);
+    let cache_dir = fastembed_cache_dir();
+
+    tracing::info!(model = %model_name, cache_dir = %cache_dir.display(), "Downloading embedding model...");
+
+    // Run in a blocking thread since fastembed download is synchronous
+    let result = tokio::task::spawn_blocking(move || {
+        let mut options = TextInitOptions::new(model_variant).with_show_download_progress(true);
+        options = options.with_cache_dir(cache_dir.clone());
+
+        match TextEmbedding::try_new(options) {
+            Ok(_embedding) => {
+                tracing::info!(model = %model_name, "Embedding model downloaded successfully");
+                EmbeddingDownloadResult {
+                    success: true,
+                    model_path: cache_dir.display().to_string(),
+                    error: None,
+                }
+            }
+            Err(e) => {
+                tracing::error!(model = %model_name, error = %e, "Failed to download embedding model");
+                EmbeddingDownloadResult {
+                    success: false,
+                    model_path: String::new(),
+                    error: Some(format!("{}", e)),
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    Ok(result)
+}
+
+/// Result of testing an HTTP embedding endpoint.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingTestResult {
+    pub success: bool,
+    pub dimensions: Option<u32>,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Test an HTTP embedding endpoint by sending a test request.
+///
+/// Sends an OpenAI-compatible embeddings request with input "hello test"
+/// and returns the response dimensions and latency.
+#[tauri::command]
+pub async fn test_embedding_endpoint(
+    url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<EmbeddingTestResult, String> {
+    let start = std::time::Instant::now();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    // Build OpenAI-compatible request
+    let body = serde_json::json!({
+        "input": "hello test",
+        "model": model,
+    });
+
+    let mut request = client.post(&url).json(&body);
+    if let Some(ref key) = api_key {
+        if !key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", key));
+        }
+    }
+
+    let resp = request.send().await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    match resp {
+        Ok(response) => {
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Ok(EmbeddingTestResult {
+                    success: false,
+                    dimensions: None,
+                    latency_ms,
+                    error: Some(format!("HTTP {}: {}", status, body.chars().take(200).collect::<String>())),
+                });
+            }
+
+            // Parse response to extract dimensions
+            match response.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    // OpenAI format: { data: [{ embedding: [0.1, 0.2, ...] }] }
+                    let dimensions = json["data"]
+                        .as_array()
+                        .and_then(|arr| arr.first())
+                        .and_then(|item| item["embedding"].as_array())
+                        .map(|emb| emb.len() as u32);
+
+                    Ok(EmbeddingTestResult {
+                        success: true,
+                        dimensions,
+                        latency_ms,
+                        error: None,
+                    })
+                }
+                Err(e) => Ok(EmbeddingTestResult {
+                    success: false,
+                    dimensions: None,
+                    latency_ms,
+                    error: Some(format!("Invalid JSON response: {}", e)),
+                }),
+            }
+        }
+        Err(e) => Ok(EmbeddingTestResult {
+            success: false,
+            dimensions: None,
+            latency_ms,
+            error: Some(format!("Connection failed: {}", e)),
+        }),
+    }
+}
+
 /// Simple timestamp without pulling in chrono.
 fn chrono_now() -> String {
     // Use std::time for a basic ISO-ish timestamp

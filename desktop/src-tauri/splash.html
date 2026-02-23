@@ -277,7 +277,7 @@
         <span class="check-label">Meilisearch</span>
       </div>
     </div>
-    <div class="check-item hidden" id="check-nats">
+    <div class="check-item" id="check-nats">
       <div class="check-icon"><div class="spinner"></div></div>
       <div class="check-content">
         <span class="check-label">NATS</span>
@@ -411,6 +411,23 @@
     }
 
     // ========================================================================
+    // Docker install helpers
+    // ========================================================================
+
+    async function installDocker() {
+      setCheck('check-docker', '', 'Opening Docker Desktop download...');
+      setStatus('Please install Docker Desktop from the download page');
+
+      // Open the download page for the user's platform
+      const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
+      openUrl(url);
+
+      // Update UI to show we're waiting for Docker
+      setCheck('check-docker', 'warning', 'Waiting for Docker to be installed...',
+        `<button class="check-action" onclick="openUrl('${url}')">Open page again</button>`);
+    }
+
+    // ========================================================================
     // Main flow
     // ========================================================================
 
@@ -429,19 +446,11 @@
           setCheck('check-config', 'warning', 'Will be created by setup wizard');
         }
 
-        // -- Claude Code CLI --
+        // -- Claude Code CLI (informational — setup wizard handles blocking) --
         if (deps.claudeCodeAvailable) {
           setCheck('check-claude', 'success');
         } else {
-          setCheck('check-claude', 'warning', 'Chat features require Claude Code CLI',
-            `<button class="check-action" onclick="openUrl('https://docs.anthropic.com/en/docs/claude-code/overview')">Install</button>`);
-        }
-
-        // -- NATS visibility --
-        if (deps.natsEnabled) {
-          showItem('check-nats');
-        } else {
-          hideItem('check-nats');
+          setCheck('check-claude', 'warning', 'Not detected — install via setup wizard');
         }
 
         // -- Route based on infra_mode --
@@ -450,11 +459,9 @@
           setCheck('check-docker', 'skipped', 'External mode');
           setCheck('check-neo4j', '', 'Checking connectivity...');
           setCheck('check-meilisearch', '', 'Checking connectivity...');
-          if (deps.natsEnabled) {
-            setCheck('check-nats', '', 'Checking connectivity...');
-          }
+          setCheck('check-nats', '', 'Checking connectivity...');
           setStatus('Checking services...');
-          await pollBackendHealthWithServices(deps.natsEnabled);
+          await pollBackendHealthWithServices();
           return;
         }
 
@@ -464,9 +471,7 @@
           setCheck('check-docker', 'skipped', 'Setup pending');
           setCheck('check-neo4j', 'skipped', 'Setup pending');
           setCheck('check-meilisearch', 'skipped', 'Setup pending');
-          if (deps.natsEnabled) {
-            setCheck('check-nats', 'skipped', 'Setup pending');
-          }
+          setCheck('check-nats', 'skipped', 'Setup pending');
           setStatus('Starting backend (setup mode)...');
           await pollBackendHealth();
           return;
@@ -483,6 +488,7 @@
         setCheck('check-docker', 'warning', 'Could not check');
         setCheck('check-neo4j', 'warning');
         setCheck('check-meilisearch', 'warning');
+        setCheck('check-nats', 'warning');
         setStatus('Starting backend...');
         await pollBackendHealth();
       }
@@ -505,9 +511,7 @@
           `<button class="check-action" onclick="invoke('open_docker_desktop').catch(()=>{})">Open</button>`);
         setCheck('check-neo4j', '', 'Waiting for Docker...');
         setCheck('check-meilisearch', '', 'Waiting for Docker...');
-        if (deps.natsEnabled) {
-          setCheck('check-nats', '', 'Waiting for Docker...');
-        }
+        setCheck('check-nats', '', 'Waiting for Docker...');
         setStatus('Please start Docker Desktop');
 
         // Poll until Docker daemon comes up
@@ -515,14 +519,11 @@
 
       } else {
         // Docker not installed
-        const url = DOCKER_URLS[platformOs] || DOCKER_URLS['macos'];
         setCheck('check-docker', 'error', 'Docker is required to run services',
-          `<button class="check-action" onclick="openUrl('${url}')">Install</button>`);
+          `<button class="check-action" onclick="installDocker()">Install</button>`);
         setCheck('check-neo4j', 'error', 'Requires Docker');
         setCheck('check-meilisearch', 'error', 'Requires Docker');
-        if (deps.natsEnabled) {
-          setCheck('check-nats', 'error', 'Requires Docker');
-        }
+        setCheck('check-nats', 'error', 'Requires Docker');
         setStatus('Docker is required');
         document.getElementById('btn-continue').classList.add('visible');
 
@@ -586,16 +587,14 @@
     async function startServices(deps) {
       setCheck('check-neo4j', '', 'Starting...');
       setCheck('check-meilisearch', '', 'Starting...');
-      if (deps.natsEnabled) {
-        setCheck('check-nats', '', 'Starting...');
-      }
+      setCheck('check-nats', '', 'Starting...');
       setStatus('Starting services...');
 
       // Build config for start_docker_services
       const config = {
         neo4jPassword: deps.neo4jPassword || '',
         meilisearchKey: deps.meilisearchKey || '',
-        natsEnabled: deps.natsEnabled,
+        natsEnabled: true,
       };
 
       try {
@@ -609,25 +608,25 @@
       }
 
       // Poll individual service health
-      await pollServicesHealth(deps.natsEnabled);
+      await pollServicesHealth();
     }
 
     // ========================================================================
     // Poll individual services health
     // ========================================================================
 
-    async function pollServicesHealth(natsEnabled) {
+    async function pollServicesHealth() {
       setStatus('Waiting for services...');
       const serviceStartTime = Date.now();
       const SERVICE_TIMEOUT = 60000; // 60s per-service warning
 
       let neo4jReady = false;
       let meiliReady = false;
-      let natsReady = !natsEnabled; // skip if disabled
+      let natsReady = false;
 
       while (!isGlobalTimeout()) {
         try {
-          const health = await invoke('check_services_health', { natsEnabled });
+          const health = await invoke('check_services_health', { natsEnabled: true });
 
           // -- Neo4j --
           if (!neo4jReady) {
@@ -664,7 +663,7 @@
           }
 
           // -- NATS --
-          if (natsEnabled && !natsReady) {
+          if (!natsReady) {
             if (health.nats === 'healthy') {
               setCheck('check-nats', 'success');
               natsReady = true;
@@ -732,7 +731,7 @@
     }
 
     // External mode: poll /health and update service check-items from the response
-    async function pollBackendHealthWithServices(natsEnabled) {
+    async function pollBackendHealthWithServices() {
       setCheck('check-backend', '', 'Starting...');
 
       const port = await invoke('get_server_port').catch(() => 6600);
@@ -749,14 +748,19 @@
               setCheck('check-meilisearch',
                 health.services.meilisearch === 'connected' ? 'success' : 'error',
                 health.services.meilisearch === 'connected' ? 'Connected' : 'Unreachable');
-              if (natsEnabled) {
-                // NATS status is not in /health yet — mark as skipped for now
-                setCheck('check-nats', 'skipped', 'Not checked');
+              // NATS status from /health if available, otherwise mark as checked
+              if (health.services.nats) {
+                setCheck('check-nats',
+                  health.services.nats === 'connected' ? 'success' : 'error',
+                  health.services.nats === 'connected' ? 'Connected' : 'Unreachable');
+              } else {
+                setCheck('check-nats', 'skipped', 'Not in health response');
               }
             } else {
               // Fallback for old /health format (no services field)
               setCheck('check-neo4j', 'skipped', 'Status unavailable');
               setCheck('check-meilisearch', 'skipped', 'Status unavailable');
+              setCheck('check-nats', 'skipped', 'Status unavailable');
             }
 
             setCheck('check-backend', 'success');
@@ -779,10 +783,16 @@
     // Transition & utility
     // ========================================================================
 
-    function transitionToMain() {
-      // The backend thread in main.rs handles the actual window transition
-      // via show_main_window(). This function is intentionally a no-op.
-      // The Rust side drives the transition (decision 0218a69c).
+    async function transitionToMain() {
+      // Signal the Rust backend thread to close the splash and show the main window.
+      // The Rust thread waits for this signal (SPLASH_READY flag) before calling
+      // show_main_window(). This makes the splash screen the single source of truth
+      // for when the transition should happen.
+      try {
+        await invoke('proceed_to_main');
+      } catch (err) {
+        console.error('proceed_to_main failed:', err);
+      }
     }
 
     function continueAnyway() {
