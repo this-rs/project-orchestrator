@@ -206,7 +206,9 @@ fn init_local_embedding_provider(config: &crate::Config) -> Option<Arc<dyn Embed
 
 /// Initialize the HTTP-based embedding provider (Ollama, OpenAI, etc.)
 fn init_http_embedding_provider(config: &crate::Config) -> Option<Arc<dyn EmbeddingProvider>> {
-    let url = config.embedding_url.clone()
+    let url = config
+        .embedding_url
+        .clone()
         .unwrap_or_else(|| "http://localhost:11434/v1/embeddings".to_string());
 
     // Allow explicit opt-out
@@ -215,11 +217,12 @@ fn init_http_embedding_provider(config: &crate::Config) -> Option<Arc<dyn Embedd
         return None;
     }
 
-    let model = config.embedding_model.clone()
+    let model = config
+        .embedding_model
+        .clone()
         .unwrap_or_else(|| "nomic-embed-text".to_string());
 
-    let api_key = config.embedding_api_key.clone()
-        .filter(|k| !k.is_empty());
+    let api_key = config.embedding_api_key.clone().filter(|k| !k.is_empty());
 
     let dimensions = config.embedding_dimensions.unwrap_or(768);
 

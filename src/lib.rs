@@ -575,9 +575,7 @@ impl Config {
             embedding_fastembed_cache_dir: std::env::var("FASTEMBED_CACHE_DIR")
                 .ok()
                 .or(yaml.embeddings.fastembed_cache_dir),
-            embedding_url: std::env::var("EMBEDDING_URL")
-                .ok()
-                .or(yaml.embeddings.url),
+            embedding_url: std::env::var("EMBEDDING_URL").ok().or(yaml.embeddings.url),
             embedding_model: std::env::var("EMBEDDING_MODEL")
                 .ok()
                 .or(yaml.embeddings.model),
