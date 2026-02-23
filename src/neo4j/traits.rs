@@ -905,8 +905,17 @@ pub trait GraphStore: Send + Sync {
         milestone_id: Uuid,
     ) -> Result<Option<(MilestoneNode, Vec<TaskNode>)>>;
 
-    /// Get milestone progress (completed tasks / total tasks)
-    async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32)>;
+    /// Get milestone progress (total, completed, in_progress, pending)
+    async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)>;
+
+    /// Get tasks linked to a project milestone (with plan info)
+    async fn get_milestone_tasks_with_plans(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>>;
+
+    /// Get all steps for all tasks linked to a project milestone (batch)
+    async fn get_milestone_steps_batch(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
 
     /// Delete a milestone
     async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()>;

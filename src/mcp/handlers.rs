@@ -1429,7 +1429,8 @@ impl ToolHandler {
     async fn get_milestone_progress(&self, args: Value) -> Result<Value> {
         let milestone_id = parse_uuid(&args, "milestone_id")?;
 
-        let (completed, total) = self.neo4j().get_milestone_progress(milestone_id).await?;
+        let (total, completed, in_progress, pending) =
+            self.neo4j().get_milestone_progress(milestone_id).await?;
         let percentage = if total > 0 {
             (completed as f64 / total as f64) * 100.0
         } else {
@@ -1437,8 +1438,10 @@ impl ToolHandler {
         };
 
         Ok(json!({
-            "completed": completed,
             "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending,
             "percentage": percentage
         }))
     }

@@ -7538,13 +7538,16 @@ impl Neo4jClient {
         }
     }
 
-    /// Get milestone progress (completed tasks / total tasks)
-    pub async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32)> {
+    /// Get milestone progress (total, completed, in_progress, pending)
+    pub async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)> {
         let q = query(
             r#"
             MATCH (m:Milestone {id: $id})-[:INCLUDES_TASK]->(t:Task)
-            RETURN count(t) AS total,
-                   sum(CASE WHEN t.status = 'Completed' THEN 1 ELSE 0 END) AS completed
+            RETURN
+                count(t) AS total,
+                sum(CASE WHEN t.status = 'Completed' THEN 1 ELSE 0 END) AS completed,
+                sum(CASE WHEN t.status = 'InProgress' THEN 1 ELSE 0 END) AS in_progress,
+                sum(CASE WHEN t.status = 'Pending' THEN 1 ELSE 0 END) AS pending
             "#,
         )
         .param("id", milestone_id.to_string());
@@ -7553,10 +7556,109 @@ impl Neo4jClient {
         if let Some(row) = result.next().await? {
             let total: i64 = row.get("total").unwrap_or(0);
             let completed: i64 = row.get("completed").unwrap_or(0);
-            Ok((completed as u32, total as u32))
+            let in_progress: i64 = row.get("in_progress").unwrap_or(0);
+            let pending: i64 = row.get("pending").unwrap_or(0);
+            Ok((
+                total as u32,
+                completed as u32,
+                in_progress as u32,
+                pending as u32,
+            ))
         } else {
-            Ok((0, 0))
+            Ok((0, 0, 0, 0))
         }
+    }
+
+    /// Get tasks linked to a project milestone (with plan info)
+    pub async fn get_milestone_tasks_with_plans(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Vec<TaskWithPlan>> {
+        let q = query(
+            r#"
+            MATCH (m:Milestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)
+            OPTIONAL MATCH (p:Plan)-[:HAS_TASK]->(t)
+            RETURN t, p.id AS plan_id, COALESCE(p.title, '') AS plan_title,
+                   COALESCE(p.status, '') AS plan_status
+            ORDER BY t.priority DESC, t.created_at
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tasks = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            let plan_id_str: String = row.get("plan_id").unwrap_or_default();
+            let plan_title: String = row.get("plan_title").unwrap_or_default();
+            let plan_status: String = row.get("plan_status").unwrap_or_default();
+            tasks.push(TaskWithPlan {
+                task: self.node_to_task(&node)?,
+                plan_id: plan_id_str.parse().unwrap_or_default(),
+                plan_title,
+                plan_status: if plan_status.is_empty() {
+                    None
+                } else {
+                    Some(pascal_to_snake_case(&plan_status))
+                },
+            });
+        }
+        Ok(tasks)
+    }
+
+    /// Get all steps for all tasks linked to a project milestone (batch query)
+    pub async fn get_milestone_steps_batch(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        let q = query(
+            r#"
+            MATCH (m:Milestone {id: $milestone_id})-[:INCLUDES_TASK]->(t:Task)-[:HAS_STEP]->(s:Step)
+            RETURN t.id AS task_id, s
+            ORDER BY t.id, s.order
+            "#,
+        )
+        .param("milestone_id", milestone_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut steps_map: std::collections::HashMap<Uuid, Vec<StepNode>> =
+            std::collections::HashMap::new();
+
+        while let Some(row) = result.next().await? {
+            let task_id_str: String = row.get("task_id")?;
+            let task_id: Uuid = task_id_str.parse()?;
+            let node: neo4rs::Node = row.get("s")?;
+            let step = StepNode {
+                id: node.get::<String>("id")?.parse()?,
+                order: node.get::<i64>("order")? as u32,
+                description: node.get("description")?,
+                status: serde_json::from_str(&format!(
+                    "\"{}\"",
+                    pascal_to_snake_case(&node.get::<String>("status")?)
+                ))
+                .unwrap_or(StepStatus::Pending),
+                verification: node
+                    .get::<String>("verification")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                created_at: node
+                    .get::<String>("created_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+                updated_at: node
+                    .get::<String>("updated_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                completed_at: node
+                    .get::<String>("completed_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+            };
+            steps_map.entry(task_id).or_default().push(step);
+        }
+
+        Ok(steps_map)
     }
 
     /// Delete a milestone

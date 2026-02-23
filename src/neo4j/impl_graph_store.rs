@@ -1180,8 +1180,22 @@ impl GraphStore for Neo4jClient {
         self.get_milestone_details(milestone_id).await
     }
 
-    async fn get_milestone_progress(&self, milestone_id: Uuid) -> anyhow::Result<(u32, u32)> {
+    async fn get_milestone_progress(&self, milestone_id: Uuid) -> anyhow::Result<(u32, u32, u32, u32)> {
         self.get_milestone_progress(milestone_id).await
+    }
+
+    async fn get_milestone_tasks_with_plans(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<Vec<TaskWithPlan>> {
+        self.get_milestone_tasks_with_plans(milestone_id).await
+    }
+
+    async fn get_milestone_steps_batch(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        self.get_milestone_steps_batch(milestone_id).await
     }
 
     async fn delete_milestone(&self, milestone_id: Uuid) -> anyhow::Result<()> {
