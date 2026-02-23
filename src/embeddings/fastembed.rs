@@ -242,7 +242,7 @@ mod tests {
     // These download the model on first run (~400MB) so they are slow.
     // Run explicitly: cargo test -- fastembed --ignored
     #[tokio::test]
-    #[ignore = "requires ONNX model download (~400MB)"]
+    #[ignore = "requires ONNX model download (~1.1GB)"]
     async fn test_embed_text_dimensions() {
         let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
             .expect("Failed to init FastEmbed");
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires ONNX model download (~400MB)"]
+    #[ignore = "requires ONNX model download (~1.1GB)"]
     async fn test_embed_batch_consistency() {
         let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
             .expect("Failed to init FastEmbed");
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires ONNX model download (~400MB)"]
+    #[ignore = "requires ONNX model download (~1.1GB)"]
     async fn test_embed_empty_batch() {
         let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
             .expect("Failed to init FastEmbed");
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires ONNX model download (~400MB)"]
+    #[ignore = "requires ONNX model download (~1.1GB)"]
     async fn test_model_name_accessor() {
         let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
             .expect("Failed to init FastEmbed");
