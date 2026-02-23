@@ -187,9 +187,7 @@ fn init_local_embedding_provider(config: &crate::Config) -> Option<Arc<dyn Embed
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            dirs::home_dir().map(|h| h.join(".fastembed_cache"))
-        });
+        .or_else(|| dirs::home_dir().map(|h| h.join(".fastembed_cache")));
 
     match FastEmbedProvider::new(model_variant, cache_dir) {
         Ok(provider) => {
