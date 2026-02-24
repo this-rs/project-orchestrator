@@ -680,15 +680,18 @@ jobs:
           Copy-Item "target/release/mcp_server.exe" "target/release/mcp_server"
           Write-Host "✅ mcp_server extracted to target/release/"
 
-      # --- Windows: Bundle MSVC Runtime DLLs + VC++ Redistributable ---
-      # ort-sys (ONNX Runtime) is compiled with dynamic CRT (/MD) and requires
-      # msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll at runtime.
+      # --- Windows: Bundle ALL MSVC Runtime DLLs + VC++ Redistributable ---
+      # ort-sys (ONNX Runtime) is compiled with dynamic CRT (/MD).
+      # Rather than guessing which DLLs are needed, we bundle ALL DLLs from the
+      # VC++ CRT directory (~12 files, ~4MB total). This covers direct deps
+      # (msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll) AND transitive deps
+      # (msvcp140_1.dll, msvcp140_2.dll, concrt140.dll, etc.).
       #
       # Strategy (belt-and-suspenders):
-      # 1. Bundle the 3 DLLs directly — the NSIS hook copies them next to the exe
+      # 1. Bundle ALL CRT DLLs — the NSIS hook copies them next to the exe
       #    as a guaranteed fallback (no admin needed, no external installer)
-      # 2. Also bundle vc_redist.x64.exe — the NSIS hook tries a system-wide
-      #    install first (cleaner long-term, benefits other apps too)
+      # 2. Also bundle vc_redist.x64.exe — the NSIS hook ALWAYS runs it
+      #    (idempotent, cleaner long-term, benefits other apps too)
       #
       # See: https://github.com/tauri-apps/tauri/discussions/2662
       - name: Bundle MSVC Runtime DLLs and VC++ Redistributable
@@ -698,23 +701,19 @@ jobs:
           $resourcesDir = "desktop/src-tauri/resources"
           New-Item -ItemType Directory -Force -Path $resourcesDir
 
-          # --- 1. Copy MSVC runtime DLLs from the Visual Studio installation ---
+          # --- 1. Copy ALL MSVC runtime DLLs from the Visual Studio installation ---
           # GitHub Actions Windows runners have VS 2022 Enterprise with MSVC tools.
-          # We find the latest VC redist directory and copy the 3 required DLLs.
+          # We find the latest VC redist directory and copy ALL .dll files.
           $vcRedistDirs = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue
           if ($vcRedistDirs) {
             $crtDir = ($vcRedistDirs | Sort-Object Name | Select-Object -Last 1).FullName
             Write-Host "Found MSVC CRT directory: $crtDir"
-            $dlls = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
-            foreach ($dll in $dlls) {
-              $src = Join-Path $crtDir $dll
-              if (Test-Path $src) {
-                Copy-Item $src "$resourcesDir/$dll"
-                $size = [math]::Round((Get-Item "$resourcesDir/$dll").Length / 1KB, 1)
-                Write-Host "  Copied $dll (${size} KB)"
-              } else {
-                Write-Host "  WARNING: $dll not found in $crtDir"
-              }
+            $dllFiles = Get-ChildItem "$crtDir\*.dll"
+            Write-Host "Found $($dllFiles.Count) DLLs to bundle:"
+            foreach ($dll in $dllFiles) {
+              Copy-Item $dll.FullName "$resourcesDir/$($dll.Name)"
+              $size = [math]::Round($dll.Length / 1KB, 1)
+              Write-Host "  $($dll.Name) (${size} KB)"
             }
           } else {
             Write-Host "WARNING: Could not find MSVC CRT directory — DLL fallback will not be available"
@@ -726,16 +725,18 @@ jobs:
           $size = [math]::Round((Get-Item "$resourcesDir/vc_redist.x64.exe").Length / 1MB, 1)
           Write-Host "Downloaded vc_redist.x64.exe (${size} MB)"
 
-          # --- 3. Inject all into tauri.conf.json resources ---
+          # --- 3. Dynamically inject all resources into tauri.conf.json ---
           $configPath = "desktop/src-tauri/tauri.conf.json"
           $config = Get-Content $configPath -Raw | ConvertFrom-Json
-          # DLLs and vc_redist go to $INSTDIR/resources/ in the NSIS bundle
+          # vc_redist goes to $INSTDIR/resources/ in the NSIS bundle
           $config.bundle.resources | Add-Member -NotePropertyName "resources/vc_redist.x64.exe" -NotePropertyValue "vc_redist.x64.exe"
-          $config.bundle.resources | Add-Member -NotePropertyName "resources/msvcp140.dll" -NotePropertyValue "msvcp140.dll"
-          $config.bundle.resources | Add-Member -NotePropertyName "resources/vcruntime140.dll" -NotePropertyValue "vcruntime140.dll"
-          $config.bundle.resources | Add-Member -NotePropertyName "resources/vcruntime140_1.dll" -NotePropertyValue "vcruntime140_1.dll"
+          # Add ALL DLLs found in the resources directory
+          $resourceDlls = Get-ChildItem "$resourcesDir\*.dll"
+          foreach ($dll in $resourceDlls) {
+            $config.bundle.resources | Add-Member -NotePropertyName "resources/$($dll.Name)" -NotePropertyValue "$($dll.Name)"
+          }
           $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
-          Write-Host "✅ MSVC DLLs + vc_redist.x64.exe added to Tauri resources"
+          Write-Host "✅ $($resourceDlls.Count) MSVC DLLs + vc_redist.x64.exe added to Tauri resources"
           Write-Host "Resources dir contents:"
           Get-ChildItem $resourcesDir | Format-Table Name, Length
 
