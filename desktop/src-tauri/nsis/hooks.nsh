@@ -4,8 +4,12 @@
 ;
 ; The vc_redist.x64.exe is bundled as a Tauri resource by the CI workflow,
 ; so no internet access is needed at install time.
+;
+; IMPORTANT: We use POSTINSTALL (not PREINSTALL) because the resource files
+; are only extracted to $INSTDIR AFTER the install phase. At PREINSTALL time,
+; $INSTDIR/resources/vc_redist.x64.exe does not exist yet.
 
-!macro NSIS_HOOK_PREINSTALL
+!macro NSIS_HOOK_POSTINSTALL
   ; Check if VC++ 2015-2022 Redistributable (x64) is already installed
   ; Registry key exists when any version of the 14.x runtime is present
   ReadRegDWORD $0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64" "Installed"

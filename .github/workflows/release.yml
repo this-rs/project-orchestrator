@@ -1292,6 +1292,14 @@ jobs:
           echo "=== Tauri updater latest.json ==="
           cat release-files/latest.json
 
+      # Delete any existing release for this tag before creating a fresh one.
+      # softprops/action-gh-release with generate_release_notes APPENDS notes
+      # when updating an existing release — causing duplicate changelogs on re-runs.
+      - name: Delete existing release (if any)
+        run: gh release delete "${{ env.RELEASE_TAG }}" --yes --cleanup-tag=false 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
