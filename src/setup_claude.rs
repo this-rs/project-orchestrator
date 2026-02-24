@@ -167,17 +167,15 @@ pub fn detect_claude_cli() -> Option<String> {
             );
         }
         // npm global (AppData\Roaming\npm\claude.cmd)
+        // dirs::config_dir() already returns AppData\Roaming on Windows
         if let Some(config_dir) = dirs::config_dir() {
-            if let Some(roaming) = config_dir.parent() {
-                paths.push(
-                    roaming
-                        .join("Roaming")
-                        .join("npm")
-                        .join("claude.cmd")
-                        .to_string_lossy()
-                        .to_string(),
-                );
-            }
+            paths.push(
+                config_dir
+                    .join("npm")
+                    .join("claude.cmd")
+                    .to_string_lossy()
+                    .to_string(),
+            );
         }
         // Compat: ~/.local/bin/claude.exe
         if let Some(home) = dirs::home_dir() {
