@@ -4893,13 +4893,35 @@ impl GraphStore for MockGraphStore {
         offset: usize,
     ) -> Result<(Vec<ChatSessionNode>, usize)> {
         let sessions = self.chat_sessions.read().await;
+        // Collect workspace project slugs for membership check
+        let ws_project_slugs: Vec<String> = if let Some(ws) = workspace_slug {
+            let workspaces = self.workspaces.read().await;
+            if let Some(w) = workspaces.values().find(|w| w.slug == ws) {
+                let wp = self.workspace_projects.read().await;
+                let projects = self.projects.read().await;
+                wp.get(&w.id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|pid| projects.get(pid).map(|p| p.slug.clone()))
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
         let mut filtered: Vec<_> = sessions
             .values()
             .filter(|s| {
                 if let Some(slug) = project_slug {
                     s.project_slug.as_deref() == Some(slug)
                 } else if let Some(ws) = workspace_slug {
+                    // Match workspace_slug OR project_slug membership
                     s.workspace_slug.as_deref() == Some(ws)
+                        || s.project_slug.as_deref().map_or(false, |ps| {
+                            ws_project_slugs.iter().any(|wps| wps == ps)
+                        })
                 } else {
                     true
                 }

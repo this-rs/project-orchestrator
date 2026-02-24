@@ -9867,10 +9867,16 @@ impl Neo4jClient {
                     .param("slug", slug.to_string()),
             )
         } else if let Some(ws) = workspace_slug {
+            // Match sessions directly tagged with workspace_slug
+            // OR sessions whose project_slug belongs to a project in this workspace
             (
                 query(
                     r#"
-                    MATCH (s:ChatSession {workspace_slug: $ws})
+                    OPTIONAL MATCH (w:Workspace {slug: $ws})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)
+                    WITH collect(proj.slug) AS ws_project_slugs
+                    MATCH (s:ChatSession)
+                    WHERE s.workspace_slug = $ws
+                       OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)
                     RETURN s ORDER BY s.updated_at DESC
                     SKIP $offset LIMIT $limit
                     "#,
@@ -9878,7 +9884,16 @@ impl Neo4jClient {
                 .param("ws", ws.to_string())
                 .param("offset", offset as i64)
                 .param("limit", limit as i64),
-                query("MATCH (s:ChatSession {workspace_slug: $ws}) RETURN count(s) AS total")
+                query(
+                    r#"
+                    OPTIONAL MATCH (w:Workspace {slug: $ws})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)
+                    WITH collect(proj.slug) AS ws_project_slugs
+                    MATCH (s:ChatSession)
+                    WHERE s.workspace_slug = $ws
+                       OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)
+                    RETURN count(s) AS total
+                    "#,
+                )
                     .param("ws", ws.to_string()),
             )
         } else {
