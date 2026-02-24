@@ -135,24 +135,70 @@ pub fn detect_claude_cli() -> Option<String> {
     }
 
     // Fallback: check well-known paths (macOS .app bundles have a minimal PATH)
-    let candidates = [
-        // npm global (macOS/Linux)
-        "/usr/local/bin/claude",
-        // Homebrew (Apple Silicon)
-        "/opt/homebrew/bin/claude",
-        // Homebrew (Intel)
-        "/usr/local/bin/claude",
-        // User-local npm global
-        &format!(
-            "{}/.npm-global/bin/claude",
-            std::env::var("HOME").unwrap_or_default()
-        ),
-        // nvm / fnm / volta managed
-        &format!(
-            "{}/.local/bin/claude",
-            std::env::var("HOME").unwrap_or_default()
-        ),
-    ];
+    #[cfg(unix)]
+    let candidates: Vec<String> = {
+        let home = dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_default();
+        vec![
+            // npm global (macOS/Linux)
+            "/usr/local/bin/claude".to_string(),
+            // Homebrew (Apple Silicon)
+            "/opt/homebrew/bin/claude".to_string(),
+            // User-local npm global
+            format!("{}/.npm-global/bin/claude", home),
+            // nvm / fnm / volta managed
+            format!("{}/.local/bin/claude", home),
+        ]
+    };
+
+    #[cfg(windows)]
+    let candidates: Vec<String> = {
+        let mut paths = Vec::new();
+        // Anthropic installer (AppData\Local\Programs\claude\claude.exe)
+        if let Some(local_data) = dirs::data_local_dir() {
+            paths.push(
+                local_data
+                    .join("Programs")
+                    .join("claude")
+                    .join("claude.exe")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+        // npm global (AppData\Roaming\npm\claude.cmd)
+        if let Some(config_dir) = dirs::config_dir() {
+            if let Some(roaming) = config_dir.parent() {
+                paths.push(
+                    roaming
+                        .join("Roaming")
+                        .join("npm")
+                        .join("claude.cmd")
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+        // Compat: ~/.local/bin/claude.exe
+        if let Some(home) = dirs::home_dir() {
+            paths.push(
+                home.join(".local")
+                    .join("bin")
+                    .join("claude.exe")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            // ~/.claude/local/claude.exe
+            paths.push(
+                home.join(".claude")
+                    .join("local")
+                    .join("claude.exe")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+        paths
+    };
 
     for candidate in &candidates {
         if std::path::Path::new(candidate).exists() {

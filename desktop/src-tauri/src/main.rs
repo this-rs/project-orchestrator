@@ -226,7 +226,8 @@ fn main() {
                 }
 
                 // MCP server binary for chat sessions (InteractiveClient / Claude Code CLI)
-                let mcp_path = resource_dir.join("mcp_server");
+                let mcp_name = format!("mcp_server{}", std::env::consts::EXE_SUFFIX);
+                let mcp_path = resource_dir.join(&mcp_name);
                 if mcp_path.exists() {
                     tracing::info!("MCP server path: {}", mcp_path.display());
                     std::env::set_var("MCP_SERVER_PATH", mcp_path.to_str().unwrap_or("mcp_server"));

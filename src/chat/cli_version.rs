@@ -247,6 +247,15 @@ fn is_local_build(cli_path: &Path) -> bool {
         // Installs to ~/.local/share/claude/versions/<ver>/ with symlink at ~/.local/bin/claude
         ".local/bin/claude",
         ".local/share/claude/",
+        // Windows: npm global (backslash and forward slash variants)
+        "AppData\\Roaming\\npm",
+        "AppData/Roaming/npm",
+        // Windows: Nexus SDK cache (backslash and forward slash variants)
+        "AppData\\Local\\cc-sdk",
+        "AppData/Local/cc-sdk",
+        // Windows: Anthropic installer (backslash and forward slash variants)
+        "AppData\\Local\\Programs\\claude",
+        "AppData/Local/Programs/claude",
     ];
 
     // Also check if it's the cc-sdk cached path specifically
@@ -397,6 +406,42 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"success\":true"));
         assert!(json.contains("\"version\":\"2.6.0\""));
+    }
+
+    #[test]
+    fn test_is_local_build_windows_paths() {
+        // Windows npm global installs are NOT local builds
+        assert!(
+            !is_local_build(Path::new(
+                "C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd"
+            )),
+            "Windows npm global should not be local"
+        );
+        assert!(
+            !is_local_build(Path::new(
+                "C:/Users/me/AppData/Roaming/npm/claude.cmd"
+            )),
+            "Windows npm global (forward slash) should not be local"
+        );
+        // Windows cc-sdk cache is NOT a local build
+        assert!(
+            !is_local_build(Path::new(
+                "C:\\Users\\me\\AppData\\Local\\cc-sdk\\cli\\claude.exe"
+            )),
+            "Windows cc-sdk cache should not be local"
+        );
+        // Windows Anthropic installer is NOT a local build
+        assert!(
+            !is_local_build(Path::new(
+                "C:\\Users\\me\\AppData\\Local\\Programs\\claude\\claude.exe"
+            )),
+            "Windows Anthropic installer should not be local"
+        );
+        // Custom Windows path IS a local build
+        assert!(
+            is_local_build(Path::new("C:\\dev\\claude.exe")),
+            "Custom Windows path should be local"
+        );
     }
 
     /// Integration test: check_cli_status returns a valid struct.

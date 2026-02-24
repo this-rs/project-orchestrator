@@ -39,9 +39,12 @@ pub const IGNORED_PATH_SEGMENTS: &[&str] = &[
 ///
 /// Returns `true` if the path contains any of the [`IGNORED_PATH_SEGMENTS`].
 pub fn should_ignore_path(path_str: &str) -> bool {
+    // Normalize Windows backslashes to forward slashes for consistent matching.
+    // This is a no-op on Unix where paths already use '/'.
+    let normalized = path_str.replace('\\', "/");
     IGNORED_PATH_SEGMENTS
         .iter()
-        .any(|seg| path_str.contains(seg))
+        .any(|seg| normalized.contains(seg))
 }
 
 #[cfg(test)]
@@ -77,5 +80,35 @@ mod tests {
         assert!(!should_ignore_path("/project/src/distribution.rs"));
         // "rebuild" should NOT be caught by "/build/"
         assert!(!should_ignore_path("/project/src/rebuild.rs"));
+    }
+
+    #[test]
+    fn test_should_ignore_windows_paths() {
+        // Windows-style paths with backslashes should be correctly matched
+        assert!(
+            should_ignore_path("C:\\project\\target\\debug\\file.rs"),
+            "Windows target path should be ignored"
+        );
+        assert!(
+            should_ignore_path("C:\\repo\\.git\\config"),
+            "Windows .git path should be ignored"
+        );
+        assert!(
+            should_ignore_path("D:\\app\\node_modules\\pkg\\index.js"),
+            "Windows node_modules path should be ignored"
+        );
+        assert!(
+            should_ignore_path("C:\\project\\dist\\bundle.js"),
+            "Windows dist path should be ignored"
+        );
+        // Normal Windows paths should NOT be ignored
+        assert!(
+            !should_ignore_path("C:\\project\\src\\main.rs"),
+            "Windows src path should not be ignored"
+        );
+        assert!(
+            !should_ignore_path("D:\\workspace\\lib\\utils.ts"),
+            "Windows lib path should not be ignored"
+        );
     }
 }

@@ -6,13 +6,17 @@
 
 use tracing::{debug, warn};
 
-/// Detect the user's full PATH by spawning a login shell.
+/// Detect the user's full PATH by spawning a login shell (Unix) or reading
+/// the environment variable directly (Windows).
 ///
-/// Launches the user's `$SHELL` (or falls back to `/bin/zsh` → `/bin/bash` → `/bin/sh`)
+/// On Unix, launches the user's `$SHELL` (or falls back to `/bin/zsh` → `/bin/bash` → `/bin/sh`)
 /// in login mode (`-l`) and reads the `PATH` environment variable.
+///
+/// On Windows, simply reads `%PATH%` from the environment (always fully populated).
 ///
 /// Returns `None` on error, timeout (5s), or empty/invalid result.
 /// Never panics.
+#[cfg(unix)]
 pub async fn detect_user_path() -> Option<String> {
     let shell = find_shell();
     debug!(shell = %shell, "Detecting user PATH via login shell");
@@ -68,7 +72,29 @@ pub async fn detect_user_path() -> Option<String> {
     Some(path)
 }
 
+/// Detect the user's full PATH from the environment (Windows).
+///
+/// On Windows the inherited `%PATH%` is always fully populated (no login-shell
+/// dance required). Returns `None` only if `%PATH%` is unset or empty.
+#[cfg(windows)]
+pub async fn detect_user_path() -> Option<String> {
+    let path = std::env::var("PATH").ok().filter(|p| !p.is_empty())?;
+
+    // Basic validation: a valid Windows PATH should contain `\` or `:` (drive letters)
+    if !path.contains('\\') && !path.contains(':') {
+        warn!(
+            value = %path,
+            "PATH doesn't look like a Windows PATH (no '\\' or ':' found)"
+        );
+        return None;
+    }
+
+    debug!(path = %path, "Detected user PATH from environment");
+    Some(path)
+}
+
 /// Find the user's shell, with fallbacks.
+#[cfg(unix)]
 fn find_shell() -> String {
     if let Ok(shell) = std::env::var("SHELL") {
         if !shell.is_empty() && std::path::Path::new(&shell).exists() {
@@ -91,6 +117,7 @@ fn find_shell() -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn test_find_shell_returns_existing_path() {
         let shell = find_shell();
@@ -135,6 +162,22 @@ mod tests {
         assert!(
             empty_segments.is_empty(),
             "PATH should not have empty segments (::), got: {}",
+            path
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_detect_user_path_windows() {
+        let path = detect_user_path().await;
+        assert!(
+            path.is_some(),
+            "detect_user_path() should return Some on Windows"
+        );
+        let path = path.unwrap();
+        assert!(
+            path.contains("Windows") || path.contains("System32") || path.contains("\\"),
+            "PATH should contain Windows paths, got: {}",
             path
         );
     }
