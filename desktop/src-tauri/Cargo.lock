@@ -2995,6 +2995,7 @@ checksum = "bd070e393353796e801d209ad339e89596eb4c8d430d18ede6a1cced8fafbd99"
 dependencies = [
  "autocfg",
  "hashbrown 0.12.3",
+ "rayon",
  "serde",
 ]
 
@@ -3006,7 +3007,6 @@ checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
 dependencies = [
  "equivalent",
  "hashbrown 0.16.1",
- "rayon",
  "serde",
  "serde_core",
 ]
@@ -3857,7 +3857,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 [[package]]
 name = "nexus-claude"
 version = "0.5.0"
-source = "git+https://github.com/this-rs/nexus.git?rev=572cf37#572cf37e1b36e6502d17ac39e52d9772654fdf38"
+source = "git+https://github.com/this-rs/nexus.git?rev=f5ff63f#f5ff63fb0c28f4c7babe8cca25ac7fe74b22d320"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4451,7 +4451,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -5876,7 +5876,7 @@ dependencies = [
  "ahash",
  "fixedbitset",
  "hashbrown 0.15.5",
- "indexmap 2.13.0",
+ "indexmap 1.9.3",
  "ndarray 0.16.1",
  "num-traits",
  "petgraph",
