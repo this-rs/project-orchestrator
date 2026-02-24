@@ -770,6 +770,30 @@ jobs:
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: cargo tauri build --target ${{ matrix.tauri_target }}
 
+      # Free disk space after Tauri build completes.
+      # The cargo build output (deps/, build/, .fingerprint/, incremental/) can
+      # consume 5-10 GB on macOS runners. We only need the bundle/ directory
+      # for the remaining steps (re-sign, DMG, notarize, upload).
+      # Without this cleanup, macOS runners (14 GB disk) run out of space
+      # during hdiutil create (DMG recreation).
+      - name: Free disk space (remove build intermediates)
+        shell: bash
+        run: |
+          TARGET_DIR="desktop/src-tauri/target/${{ matrix.tauri_target }}/release"
+          if [ -d "$TARGET_DIR" ]; then
+            echo "=== Disk usage before cleanup ==="
+            df -h . | tail -1
+            echo "Target dir size: $(du -sh "$TARGET_DIR" | cut -f1)"
+            echo "Bundle dir size: $(du -sh "$TARGET_DIR/bundle" 2>/dev/null | cut -f1 || echo 'N/A')"
+
+            # Remove everything in release/ except the bundle/ directory
+            find "$TARGET_DIR" -maxdepth 1 -not -name bundle -not -path "$TARGET_DIR" -exec rm -rf {} +
+
+            echo "=== Disk usage after cleanup ==="
+            df -h . | tail -1
+            echo "Target dir size: $(du -sh "$TARGET_DIR" | cut -f1)"
+          fi
+
       # x86_64-apple-darwin: bundle ONNX Runtime dylib inside the .app so the
       # main binary and mcp_server can find libonnxruntime at runtime.
       # We place it in Contents/Frameworks/ (standard macOS location) and add
