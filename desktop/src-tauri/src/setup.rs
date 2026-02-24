@@ -229,6 +229,10 @@ struct EmbeddingsSection {
     provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     fastembed_model: Option<String>,
+    /// Explicit cache directory so the backend always finds the model
+    /// downloaded by the setup wizard (default: ~/.fastembed_cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fastembed_cache_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -731,6 +735,13 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
                 provider: provider.clone(),
                 fastembed_model: if provider == "local" && !config.embedding_fastembed_model.trim().is_empty() {
                     Some(config.embedding_fastembed_model.trim().to_string())
+                } else {
+                    None
+                },
+                fastembed_cache_dir: if provider == "local" {
+                    // Always persist the cache dir so the backend finds the model
+                    // downloaded by the setup wizard — prevents re-download on every launch.
+                    Some(fastembed_cache_dir().display().to_string())
                 } else {
                     None
                 },
@@ -1327,22 +1338,26 @@ pub struct EmbeddingModelStatus {
 }
 
 /// Map model name to estimated download size in MB.
+///
+/// Sizes queried from HuggingFace API on 2026-02-24:
+/// model.onnx (+ model.onnx_data for large models) + tokenizer + config files.
 fn estimated_model_size(model_name: &str) -> u32 {
     match model_name.to_lowercase().as_str() {
-        "multilingual-e5-small" | "intfloat/multilingual-e5-small" => 120,
-        "multilingual-e5-base" | "intfloat/multilingual-e5-base" => 400,
-        "multilingual-e5-large" | "intfloat/multilingual-e5-large" => 1100,
-        "bge-small-en-v1.5" => 80,
-        "bge-base-en-v1.5" => 250,
-        "bge-large-en-v1.5" => 650,
-        "bge-m3" => 1100,
-        "all-minilm-l6-v2" | "all-minilm-l12-v2" => 80,
-        "nomic-embed-text-v1" | "nomic-embed-text-v1.5" => 250,
-        "gte-base-en-v1.5" => 250,
-        "gte-large-en-v1.5" => 650,
-        "snowflake-arctic-embed-m" => 400,
-        "snowflake-arctic-embed-l" => 650,
-        _ => 400, // default estimate
+        "multilingual-e5-small" | "intfloat/multilingual-e5-small" => 500,
+        "multilingual-e5-base" | "intfloat/multilingual-e5-base" => 1150,
+        "multilingual-e5-large" | "intfloat/multilingual-e5-large" => 2300,
+        "bge-small-en-v1.5" => 150,
+        "bge-base-en-v1.5" => 450,
+        "bge-large-en-v1.5" => 1350,
+        "bge-m3" => 2300,
+        "all-minilm-l6-v2" => 100,
+        "all-minilm-l12-v2" => 150,
+        "nomic-embed-text-v1" | "nomic-embed-text-v1.5" => 550,
+        "gte-base-en-v1.5" => 550,
+        "gte-large-en-v1.5" => 1750,
+        "snowflake-arctic-embed-m" => 450,
+        "snowflake-arctic-embed-l" => 1350,
+        _ => 500, // default estimate
     }
 }
 
@@ -1380,17 +1395,24 @@ pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus,
         // The model_code is like "intfloat/multilingual-e5-base"
         let model_dir = cache_dir.join(format!("models--{}", &info.model_code.replace('/', "--")));
 
-        // Search for ONNX files inside snapshots subdirectories
+        // Search for ONNX files inside snapshots subdirectories.
+        // Two cache layouts exist depending on the HF repo structure:
+        //   - intfloat models: snapshots/{sha}/onnx/model.onnx  (subfolder)
+        //   - Qdrant models:   snapshots/{sha}/model.onnx       (root)
         let available = if model_dir.exists() {
-            // Check all snapshot dirs for model.onnx or model_optimized.onnx
             let snapshots_dir = model_dir.join("snapshots");
             if snapshots_dir.exists() {
                 std::fs::read_dir(&snapshots_dir)
                     .map(|entries| {
                         entries.filter_map(|e| e.ok()).any(|entry| {
-                            let onnx_dir = entry.path().join("onnx");
+                            let snap = entry.path();
+                            // Layout 1: onnx/ subfolder (intfloat repos)
+                            let onnx_dir = snap.join("onnx");
+                            // Layout 2: model at snapshot root (Qdrant ONNX repos)
                             onnx_dir.join("model.onnx").exists()
                                 || onnx_dir.join("model_optimized.onnx").exists()
+                                || snap.join("model.onnx").exists()
+                                || snap.join("model_optimized.onnx").exists()
                         })
                     })
                     .unwrap_or(false)
@@ -1467,15 +1489,17 @@ fn get_dir_size(path: &std::path::Path) -> u64 {
 
 /// Fetch real total size of model files from the HuggingFace Hub API.
 ///
-/// Queries `/api/models/{repo_id}/tree/main` (and subdirectories) to get
-/// individual file sizes. Returns the sum of all files that fastembed would
-/// download (config, tokenizer, onnx model files — excluding pytorch/tf/openvino).
+/// Counts only the files that fastembed actually downloads:
+/// - Root-level: config.json, tokenizer.json, tokenizer_config.json,
+///   special_tokens_map.json, sentencepiece.bpe.model, vocab.txt
+/// - onnx/: model.onnx + model.onnx_data only (NOT _O4, _qint8 variants)
 ///
 /// Falls back to `estimated_model_size()` if the API is unreachable.
 async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
     /// Fetch file entries from one HF tree path (non-recursive).
+    /// Returns (type, size, lfs_size, path) tuples. Uses lfs.size when available
+    /// since the top-level `size` for LFS pointers reflects the pointer, not the blob.
     async fn fetch_tree(client: &reqwest::Client, repo: &str, path: &str) -> Vec<(String, u64, String)> {
-        // type, size, path
         let url = if path.is_empty() {
             format!("https://huggingface.co/api/models/{}/tree/main", repo)
         } else {
@@ -1496,11 +1520,22 @@ async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
             .filter_map(|entry| {
                 let entry_type = entry.get("type")?.as_str()?.to_string();
                 let entry_path = entry.get("path")?.as_str()?.to_string();
-                let size = entry.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                // Prefer lfs.size (real blob size) over top-level size (may be pointer size)
+                let size = entry.get("lfs")
+                    .and_then(|lfs| lfs.get("size"))
+                    .and_then(|s| s.as_u64())
+                    .or_else(|| entry.get("size").and_then(|s| s.as_u64()))
+                    .unwrap_or(0);
                 Some((entry_type, size, entry_path))
             })
             .collect()
     }
+
+    /// Files that fastembed downloads from root and onnx/ directories.
+    const TOKENIZER_CONFIG_FILES: &[&str] = &[
+        "config.json", "tokenizer.json", "tokenizer_config.json",
+        "special_tokens_map.json", "sentencepiece.bpe.model", "vocab.txt",
+    ];
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -1511,27 +1546,26 @@ async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
     };
 
     let mut total: u64 = 0;
-    let mut dirs_to_visit = vec![String::new()];
 
-    // Files/directories to exclude (not downloaded by fastembed)
-    let excluded_prefixes = [
-        "openvino/", "flax_model", "tf_model", "pytorch_model",
-        "rust_model", "model.safetensors", ".gitattributes",
-    ];
-
-    while let Some(dir) = dirs_to_visit.pop() {
-        let entries = fetch_tree(&client, model_code, &dir).await;
-        for (entry_type, size, path) in entries {
-            // Skip excluded files
+    // 1. Root-level tokenizer/config files
+    for (entry_type, size, path) in fetch_tree(&client, model_code, "").await {
+        if entry_type == "file" {
             let basename = path.rsplit('/').next().unwrap_or(&path);
-            if excluded_prefixes.iter().any(|prefix| basename.starts_with(prefix) || path.starts_with(prefix)) {
-                continue;
+            if TOKENIZER_CONFIG_FILES.contains(&basename) {
+                total += size;
             }
+        }
+    }
 
-            match entry_type.as_str() {
-                "file" => total += size,
-                "directory" => dirs_to_visit.push(path),
-                _ => {}
+    // 2. onnx/ directory — ONLY model.onnx + model.onnx_data + tokenizer/config
+    //    (skip optimized variants: model_O4.onnx, model_qint8_*.onnx, etc.)
+    for (entry_type, size, path) in fetch_tree(&client, model_code, "onnx").await {
+        if entry_type == "file" {
+            let basename = path.rsplit('/').next().unwrap_or(&path);
+            if basename == "model.onnx" || basename == "model.onnx_data"
+                || TOKENIZER_CONFIG_FILES.contains(&basename)
+            {
+                total += size;
             }
         }
     }

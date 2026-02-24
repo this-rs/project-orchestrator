@@ -178,11 +178,16 @@ fn init_local_embedding_provider(config: &crate::Config) -> Option<Arc<dyn Embed
         .map(crate::embeddings::fastembed::parse_model_name_pub)
         .unwrap_or(EmbeddingModel::MultilingualE5Base);
 
-    let cache_dir = config
+    // Cache dir priority: config (env/YAML) > default (~/.fastembed_cache).
+    // MUST match the desktop setup wizard's `fastembed_cache_dir()` which uses
+    // `~/.fastembed_cache` — otherwise the backend won't find the model that
+    // the wizard already downloaded, causing a re-download on every launch.
+    let cache_dir: Option<PathBuf> = config
         .embedding_fastembed_cache_dir
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".fastembed_cache")));
 
     match FastEmbedProvider::new(model_variant, cache_dir) {
         Ok(provider) => {

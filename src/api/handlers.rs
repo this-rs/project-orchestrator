@@ -144,6 +144,8 @@ impl ServerState {
 pub struct ServiceHealthStatus {
     pub neo4j: String,
     pub meilisearch: String,
+    /// NATS connection status: "connected", "disconnected", or "disabled".
+    pub nats: String,
 }
 
 /// Health check response
@@ -155,7 +157,7 @@ pub struct HealthResponse {
     pub services: Option<ServiceHealthStatus>,
 }
 
-/// Health check handler — verifies actual connectivity to Neo4j and Meilisearch.
+/// Health check handler — verifies actual connectivity to Neo4j, Meilisearch, and NATS.
 ///
 /// Returns:
 /// - 200 + `"ok"` if both Neo4j and Meilisearch are connected
@@ -174,6 +176,19 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
         .health_check()
         .await
         .unwrap_or(false);
+
+    // NATS: check connection state if configured, otherwise "disabled"
+    let nats_status = match &state.nats_emitter {
+        Some(emitter) => {
+            let conn_state = emitter.client().connection_state();
+            if conn_state == async_nats::connection::State::Connected {
+                "connected"
+            } else {
+                "disconnected"
+            }
+        }
+        None => "disabled",
+    };
 
     let status = if neo4j_ok && meili_ok {
         "ok"
@@ -205,6 +220,7 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
                 } else {
                     "disconnected".to_string()
                 },
+                nats: nats_status.to_string(),
             }),
         }),
     )
