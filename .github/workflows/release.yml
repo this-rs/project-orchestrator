@@ -540,8 +540,6 @@ jobs:
             tauri_target: x86_64-pc-windows-msvc
             artifact_os: windows
             artifact_arch: x86_64
-            # Static CRT: eliminates MSVCP140.dll / VCRUNTIME140.dll dependency
-            rustflags: "-C target-feature=+crt-static"
 
     steps:
       - uses: actions/checkout@v4
@@ -682,6 +680,29 @@ jobs:
           Copy-Item "target/release/mcp_server.exe" "target/release/mcp_server"
           Write-Host "✅ mcp_server extracted to target/release/"
 
+      # --- Windows: Bundle VC++ Redistributable in NSIS installer ---
+      # ort-sys (ONNX Runtime) is compiled with dynamic CRT and requires
+      # MSVCP140.dll / VCRUNTIME140.dll. The NSIS installer hook (hooks.nsh)
+      # checks if the runtime is installed and runs vc_redist.x64.exe silently.
+      - name: Download and bundle VC++ Redistributable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Download vc_redist.x64.exe into Tauri resources
+          $vcRedistUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          $resourcesDir = "desktop/src-tauri/resources"
+          New-Item -ItemType Directory -Force -Path $resourcesDir
+          Invoke-WebRequest -Uri $vcRedistUrl -OutFile "$resourcesDir/vc_redist.x64.exe" -UseBasicParsing
+          $size = [math]::Round((Get-Item "$resourcesDir/vc_redist.x64.exe").Length / 1MB, 1)
+          Write-Host "Downloaded vc_redist.x64.exe (${size} MB)"
+
+          # Inject into tauri.conf.json resources so it gets bundled in $INSTDIR/resources/
+          $configPath = "desktop/src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $config.bundle.resources | Add-Member -NotePropertyName "resources/vc_redist.x64.exe" -NotePropertyValue "vc_redist.x64.exe"
+          $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
+          Write-Host "✅ vc_redist.x64.exe added to Tauri resources"
+
       # --- macOS Code Signing: import certificate into a persistent keychain ---
       # We manage our own keychain so the certificate stays available for BOTH
       # the Tauri build step AND the post-build re-sign step (which adds --timestamp).
@@ -740,7 +761,6 @@ jobs:
       - name: Build Tauri bundle
         working-directory: desktop/src-tauri
         env:
-          RUSTFLAGS: ${{ matrix.rustflags || '' }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # macOS — identity only, certificate is in our persistent keychain

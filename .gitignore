@@ -26,6 +26,7 @@ tarpaulin-report.json
 # Desktop (Tauri)
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
+desktop/src-tauri/resources/vc_redist*.exe
 desktop/dist/
 
 

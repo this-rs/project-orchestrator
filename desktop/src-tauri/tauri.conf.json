@@ -64,7 +64,8 @@
         "displayLanguageSelector": false,
         "languages": ["English"],
         "headerImage": null,
-        "sidebarImage": null
+        "sidebarImage": null,
+        "installerHooks": "nsis/hooks.nsh"
       },
       "wix": {
         "language": ["en-US"]
