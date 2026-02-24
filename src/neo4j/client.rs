@@ -9894,7 +9894,7 @@ impl Neo4jClient {
                     RETURN count(s) AS total
                     "#,
                 )
-                    .param("ws", ws.to_string()),
+                .param("ws", ws.to_string()),
             )
         } else {
             (

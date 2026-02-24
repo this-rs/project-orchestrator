@@ -4919,9 +4919,9 @@ impl GraphStore for MockGraphStore {
                 } else if let Some(ws) = workspace_slug {
                     // Match workspace_slug OR project_slug membership
                     s.workspace_slug.as_deref() == Some(ws)
-                        || s.project_slug.as_deref().map_or(false, |ps| {
-                            ws_project_slugs.iter().any(|wps| wps == ps)
-                        })
+                        || s.project_slug
+                            .as_deref()
+                            .map_or(false, |ps| ws_project_slugs.iter().any(|wps| wps == ps))
                 } else {
                     true
                 }
