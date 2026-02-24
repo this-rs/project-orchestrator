@@ -680,10 +680,6 @@ jobs:
           Copy-Item "target/release/mcp_server.exe" "target/release/mcp_server"
           Write-Host "✅ mcp_server extracted to target/release/"
 
-      # --- Windows: Bundle VC++ Redistributable in NSIS installer ---
-      # ort-sys (ONNX Runtime) is compiled with dynamic CRT and requires
-      # MSVCP140.dll / VCRUNTIME140.dll. The NSIS installer hook (hooks.nsh)
-      # checks if the runtime is installed and runs vc_redist.x64.exe silently.
       # --- Windows: Bundle MSVC Runtime DLLs + VC++ Redistributable ---
       # ort-sys (ONNX Runtime) is compiled with dynamic CRT (/MD) and requires
       # msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll at runtime.
@@ -1033,15 +1029,41 @@ jobs:
           echo "  Staging contents:"
           ls -la "$STAGING/"
 
-          # --- Create the DMG from the staged directory ---
+          # --- Create the DMG via explicit-size writable image ---
+          # hdiutil create -srcfolder -format UDZO auto-calculates the intermediate
+          # image size, but DOESN'T account for code signature extended attributes
+          # (xattr from codesign --timestamp). This causes "No space left on device"
+          # on the MOUNTED IMAGE (not the real disk) for aarch64 builds.
+          # Fix: create a writable image with 2x headroom, copy, then convert.
           rm -f "$DMG_PATH"
-          hdiutil create -volname "$VOLUME_NAME" \
-            -srcfolder "$STAGING" \
-            -ov -format UDZO \
-            "$DMG_PATH"
 
-          # Cleanup staging
+          # Calculate staging size and add generous padding
+          STAGING_SIZE_MB=$(du -sm "$STAGING" | cut -f1)
+          IMAGE_SIZE_MB=$((STAGING_SIZE_MB * 2 + 100))
+          echo "  Staging: ${STAGING_SIZE_MB}MB → Image: ${IMAGE_SIZE_MB}MB"
+
+          # Detach any stale volume from previous failed attempts
+          hdiutil detach "/Volumes/$VOLUME_NAME" 2>/dev/null || true
+
+          # Step 1: Create writable HFS+ image with explicit size
+          TEMP_DMG="$RUNNER_TEMP/temp-writable.dmg"
+          hdiutil create -size "${IMAGE_SIZE_MB}m" -fs HFS+ -volname "$VOLUME_NAME" "$TEMP_DMG"
+
+          # Step 2: Mount, copy contents, unmount
+          MOUNT_POINT="$RUNNER_TEMP/dmg-mount"
+          mkdir -p "$MOUNT_POINT"
+          hdiutil attach "$TEMP_DMG" -mountpoint "$MOUNT_POINT" -nobrowse
+          cp -R "$STAGING/"* "$MOUNT_POINT/"
+          # Set volume icon flag (makes Finder show .VolumeIcon.icns)
+          SetFile -a C "$MOUNT_POINT" 2>/dev/null || true
+          hdiutil detach "$MOUNT_POINT"
+
+          # Cleanup staging before conversion (free disk space)
           rm -rf "$STAGING"
+
+          # Step 3: Convert to compressed read-only UDZO
+          hdiutil convert "$TEMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG_PATH"
+          rm -f "$TEMP_DMG"
 
           # Sign the DMG itself
           codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
