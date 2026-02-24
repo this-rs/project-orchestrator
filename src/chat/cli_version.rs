@@ -418,9 +418,7 @@ mod tests {
             "Windows npm global should not be local"
         );
         assert!(
-            !is_local_build(Path::new(
-                "C:/Users/me/AppData/Roaming/npm/claude.cmd"
-            )),
+            !is_local_build(Path::new("C:/Users/me/AppData/Roaming/npm/claude.cmd")),
             "Windows npm global (forward slash) should not be local"
         );
         // Windows cc-sdk cache is NOT a local build
