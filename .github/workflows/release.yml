@@ -684,24 +684,64 @@ jobs:
       # ort-sys (ONNX Runtime) is compiled with dynamic CRT and requires
       # MSVCP140.dll / VCRUNTIME140.dll. The NSIS installer hook (hooks.nsh)
       # checks if the runtime is installed and runs vc_redist.x64.exe silently.
-      - name: Download and bundle VC++ Redistributable
+      # --- Windows: Bundle MSVC Runtime DLLs + VC++ Redistributable ---
+      # ort-sys (ONNX Runtime) is compiled with dynamic CRT (/MD) and requires
+      # msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll at runtime.
+      #
+      # Strategy (belt-and-suspenders):
+      # 1. Bundle the 3 DLLs directly — the NSIS hook copies them next to the exe
+      #    as a guaranteed fallback (no admin needed, no external installer)
+      # 2. Also bundle vc_redist.x64.exe — the NSIS hook tries a system-wide
+      #    install first (cleaner long-term, benefits other apps too)
+      #
+      # See: https://github.com/tauri-apps/tauri/discussions/2662
+      - name: Bundle MSVC Runtime DLLs and VC++ Redistributable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Download vc_redist.x64.exe into Tauri resources
-          $vcRedistUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
           $resourcesDir = "desktop/src-tauri/resources"
           New-Item -ItemType Directory -Force -Path $resourcesDir
+
+          # --- 1. Copy MSVC runtime DLLs from the Visual Studio installation ---
+          # GitHub Actions Windows runners have VS 2022 Enterprise with MSVC tools.
+          # We find the latest VC redist directory and copy the 3 required DLLs.
+          $vcRedistDirs = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue
+          if ($vcRedistDirs) {
+            $crtDir = ($vcRedistDirs | Sort-Object Name | Select-Object -Last 1).FullName
+            Write-Host "Found MSVC CRT directory: $crtDir"
+            $dlls = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+            foreach ($dll in $dlls) {
+              $src = Join-Path $crtDir $dll
+              if (Test-Path $src) {
+                Copy-Item $src "$resourcesDir/$dll"
+                $size = [math]::Round((Get-Item "$resourcesDir/$dll").Length / 1KB, 1)
+                Write-Host "  Copied $dll (${size} KB)"
+              } else {
+                Write-Host "  WARNING: $dll not found in $crtDir"
+              }
+            }
+          } else {
+            Write-Host "WARNING: Could not find MSVC CRT directory — DLL fallback will not be available"
+          }
+
+          # --- 2. Download vc_redist.x64.exe (system-wide installer) ---
+          $vcRedistUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
           Invoke-WebRequest -Uri $vcRedistUrl -OutFile "$resourcesDir/vc_redist.x64.exe" -UseBasicParsing
           $size = [math]::Round((Get-Item "$resourcesDir/vc_redist.x64.exe").Length / 1MB, 1)
           Write-Host "Downloaded vc_redist.x64.exe (${size} MB)"
 
-          # Inject into tauri.conf.json resources so it gets bundled in $INSTDIR/resources/
+          # --- 3. Inject all into tauri.conf.json resources ---
           $configPath = "desktop/src-tauri/tauri.conf.json"
           $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          # DLLs and vc_redist go to $INSTDIR/resources/ in the NSIS bundle
           $config.bundle.resources | Add-Member -NotePropertyName "resources/vc_redist.x64.exe" -NotePropertyValue "vc_redist.x64.exe"
+          $config.bundle.resources | Add-Member -NotePropertyName "resources/msvcp140.dll" -NotePropertyValue "msvcp140.dll"
+          $config.bundle.resources | Add-Member -NotePropertyName "resources/vcruntime140.dll" -NotePropertyValue "vcruntime140.dll"
+          $config.bundle.resources | Add-Member -NotePropertyName "resources/vcruntime140_1.dll" -NotePropertyValue "vcruntime140_1.dll"
           $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
-          Write-Host "✅ vc_redist.x64.exe added to Tauri resources"
+          Write-Host "✅ MSVC DLLs + vc_redist.x64.exe added to Tauri resources"
+          Write-Host "Resources dir contents:"
+          Get-ChildItem $resourcesDir | Format-Table Name, Length
 
       # --- macOS Code Signing: import certificate into a persistent keychain ---
       # We manage our own keychain so the certificate stays available for BOTH
@@ -769,6 +809,30 @@ jobs:
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: cargo tauri build --target ${{ matrix.tauri_target }}
+
+      # Free disk space after Tauri build completes.
+      # The cargo build output (deps/, build/, .fingerprint/, incremental/) can
+      # consume 5-10 GB on macOS runners. We only need the bundle/ directory
+      # for the remaining steps (re-sign, DMG, notarize, upload).
+      # Without this cleanup, macOS runners (14 GB disk) run out of space
+      # during hdiutil create (DMG recreation).
+      - name: Free disk space (remove build intermediates)
+        shell: bash
+        run: |
+          TARGET_DIR="desktop/src-tauri/target/${{ matrix.tauri_target }}/release"
+          if [ -d "$TARGET_DIR" ]; then
+            echo "=== Disk usage before cleanup ==="
+            df -h . | tail -1
+            echo "Target dir size: $(du -sh "$TARGET_DIR" | cut -f1)"
+            echo "Bundle dir size: $(du -sh "$TARGET_DIR/bundle" 2>/dev/null | cut -f1 || echo 'N/A')"
+
+            # Remove everything in release/ except the bundle/ directory
+            find "$TARGET_DIR" -maxdepth 1 -not -name bundle -not -path "$TARGET_DIR" -exec rm -rf {} +
+
+            echo "=== Disk usage after cleanup ==="
+            df -h . | tail -1
+            echo "Target dir size: $(du -sh "$TARGET_DIR" | cut -f1)"
+          fi
 
       # x86_64-apple-darwin: bundle ONNX Runtime dylib inside the .app so the
       # main binary and mcp_server can find libonnxruntime at runtime.
