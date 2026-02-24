@@ -60,7 +60,7 @@
         "type": "downloadBootstrapper"
       },
       "nsis": {
-        "installMode": "both",
+        "installMode": "perMachine",
         "displayLanguageSelector": false,
         "languages": ["English"],
         "headerImage": null,
