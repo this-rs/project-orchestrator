@@ -4921,7 +4921,7 @@ impl GraphStore for MockGraphStore {
                     s.workspace_slug.as_deref() == Some(ws)
                         || s.project_slug
                             .as_deref()
-                            .map_or(false, |ps| ws_project_slugs.iter().any(|wps| wps == ps))
+                            .is_some_and(|ps| ws_project_slugs.iter().any(|wps| wps == ps))
                 } else {
                     true
                 }
