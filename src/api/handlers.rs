@@ -1132,6 +1132,37 @@ pub async fn get_meilisearch_stats(
     }))
 }
 
+/// POST /api/admin/cleanup-cross-project-calls — Remove spurious CALLS relationships between different projects
+pub async fn cleanup_cross_project_calls(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let deleted = state
+        .orchestrator
+        .neo4j()
+        .cleanup_cross_project_calls()
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted_count": deleted })))
+}
+
+/// POST /api/admin/cleanup-sync-data — Delete all sync data (File/Function/Struct nodes) and Meilisearch code index
+pub async fn cleanup_sync_data(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let deleted = state
+        .orchestrator
+        .neo4j()
+        .cleanup_sync_data()
+        .await?;
+    // Also clean ALL Meilisearch code documents to avoid stale/duplicate entries
+    if let Err(e) = state.orchestrator.meili().delete_all_code().await {
+        tracing::warn!("Failed to clean Meilisearch code index: {}", e);
+    }
+    Ok(Json(serde_json::json!({
+        "deleted_count": deleted,
+        "message": "Sync data and Meilisearch code index cleaned. Run sync_project to rebuild."
+    })))
+}
+
 // ============================================================================
 // Commits
 // ============================================================================

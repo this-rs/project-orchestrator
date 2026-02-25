@@ -2012,7 +2012,57 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
-            // ── Not yet migrated ────────────────────────────────────────
+            // ── P11: Admin & Sync (6 tools) ─────────────────────────────
+
+            // --- Sync (1) ---
+
+            "sync_directory" => {
+                let mut body = serde_json::Map::new();
+                body.insert("path".to_string(), json!(extract_string(args, "path")?));
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), json!(v));
+                }
+                let result = http.post("/api/sync", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            // --- Watch (3) ---
+
+            "start_watch" => {
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("path").and_then(|v| v.as_str()) {
+                    body.insert("path".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), json!(v));
+                }
+                let result = http.post("/api/watch", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "stop_watch" => {
+                let result = http.delete("/api/watch").await?;
+                Ok(Some(result))
+            }
+
+            "watch_status" => {
+                let result = http.get("/api/watch").await?;
+                Ok(Some(result))
+            }
+
+            // --- Admin Cleanup (2) ---
+
+            "cleanup_cross_project_calls" => {
+                let result = http.post("/api/admin/cleanup-cross-project-calls", &json!({})).await?;
+                Ok(Some(result))
+            }
+
+            "cleanup_sync_data" => {
+                let result = http.post("/api/admin/cleanup-sync-data", &json!({})).await?;
+                Ok(Some(result))
+            }
+
+            // ── All tools migrated ──────────────────────────────────────
             _ => Ok(None),
         }
     }
