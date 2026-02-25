@@ -105,7 +105,7 @@ fn write_array(out: &mut String, arr: &[Value], indent: usize, inline: bool) {
     }
 
     // Complex array: each item on its own line with `- ` prefix
-    let item_indent = if inline { indent } else { indent };
+    let item_indent = indent;
 
     for (i, v) in arr.iter().enumerate() {
         if i > 0 || !inline {
@@ -213,7 +213,7 @@ mod tests {
     fn test_simple_scalars() {
         assert_eq!(json_to_compact(&json!(42)), "42");
         assert_eq!(json_to_compact(&json!(true)), "true");
-        assert_eq!(json_to_compact(&json!(3.14)), "3.14");
+        assert_eq!(json_to_compact(&json!(2.71)), "2.71");
         assert_eq!(json_to_compact(&json!("hello")), "hello");
     }
 
