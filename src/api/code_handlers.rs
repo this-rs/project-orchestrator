@@ -2786,4 +2786,686 @@ mod tests {
         // Legacy risk level still works
         assert!(["low", "medium", "high"].contains(&json["risk_level"].as_str().unwrap()));
     }
+
+    // ====================================================================
+    // GET /api/code/symbols/{file_path} — get_file_symbols
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_file_symbols_not_found() {
+        // File not in graph → 404
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/symbols/nonexistent.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_symbols_empty_file() {
+        // File exists in graph but has no functions or structs
+        let app = test_app_with_code().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/symbols/src/main.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["path"], "src/main.rs");
+        assert_eq!(json["language"], "rust");
+        assert!(json["functions"].as_array().unwrap().is_empty());
+        assert!(json["structs"].as_array().unwrap().is_empty());
+        assert!(json["imports"].as_array().unwrap().is_empty());
+    }
+
+    /// Build a test router with a file that has functions, structs, and imports
+    async fn test_app_with_symbols() -> axum::Router {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{FunctionNode, ImportNode, Parameter, StructNode, Visibility};
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+
+        // Seed file
+        let file = FileNode {
+            path: "src/handler.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "abc".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: None,
+        };
+        graph.upsert_file(&file).await.unwrap();
+
+        // Seed a function
+        let func = FunctionNode {
+            name: "handle_request".to_string(),
+            visibility: Visibility::Public,
+            params: vec![Parameter {
+                name: "req".to_string(),
+                type_name: Some("Request".to_string()),
+            }],
+            return_type: Some("Response".to_string()),
+            generics: vec![],
+            is_async: true,
+            is_unsafe: false,
+            complexity: 3,
+            file_path: "src/handler.rs".to_string(),
+            line_start: 10,
+            line_end: 30,
+            docstring: Some("Handle incoming request".to_string()),
+        };
+        graph.upsert_function(&func).await.unwrap();
+
+        // Seed a struct
+        let s = StructNode {
+            name: "Config".to_string(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: "src/handler.rs".to_string(),
+            line_start: 5,
+            line_end: 8,
+            docstring: Some("App config".to_string()),
+        };
+        graph.upsert_struct(&s).await.unwrap();
+
+        // Seed an import
+        let imp = ImportNode {
+            path: "std::io".to_string(),
+            alias: None,
+            items: vec![],
+            file_path: "src/handler.rs".to_string(),
+            line: 1,
+        };
+        graph.upsert_import(&imp).await.unwrap();
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        create_router(state)
+    }
+
+    #[tokio::test]
+    async fn test_get_file_symbols_with_data() {
+        let app = test_app_with_symbols().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/symbols/src/handler.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["path"], "src/handler.rs");
+        assert_eq!(json["language"], "rust");
+
+        // Check function
+        let functions = json["functions"].as_array().unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0]["name"], "handle_request");
+        assert!(functions[0]["is_async"].as_bool().unwrap());
+        assert!(functions[0]["is_public"].as_bool().unwrap());
+        assert_eq!(functions[0]["line"], 10);
+        assert_eq!(functions[0]["complexity"], 3);
+        assert_eq!(functions[0]["docstring"], "Handle incoming request");
+        let sig = functions[0]["signature"].as_str().unwrap();
+        assert!(sig.contains("handle_request"), "signature: {}", sig);
+        assert!(sig.contains("req: Request"), "signature: {}", sig);
+        assert!(sig.contains("-> Response"), "signature: {}", sig);
+
+        // Check struct
+        let structs = json["structs"].as_array().unwrap();
+        assert_eq!(structs.len(), 1);
+        assert_eq!(structs[0]["name"], "Config");
+        assert!(structs[0]["is_public"].as_bool().unwrap());
+        assert_eq!(structs[0]["line"], 5);
+
+        // Check imports
+        let imports = json["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0], "std::io");
+    }
+
+    // ====================================================================
+    // GET /api/code/references — find_references
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_find_references_empty() {
+        // No references for a symbol that doesn't exist
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/references?symbol=nonexistent_function"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_references_with_callers() {
+        // Seed call relationships: caller_fn calls "target_fn"
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{FunctionNode, Visibility};
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+
+        // Seed a caller function
+        let caller = FunctionNode {
+            name: "caller_fn".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/caller.rs".to_string(),
+            line_start: 5,
+            line_end: 15,
+            docstring: None,
+        };
+        graph.upsert_function(&caller).await.unwrap();
+
+        // Seed the call relationship: caller_fn calls target_fn
+        graph.call_relationships.write().await.insert(
+            "src/caller.rs::caller_fn".to_string(),
+            vec!["target_fn".to_string()],
+        );
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get("/api/code/references?symbol=target_fn"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let refs = json.as_array().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0]["file_path"], "src/caller.rs");
+        assert_eq!(refs[0]["reference_type"], "call");
+        assert_eq!(refs[0]["line"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_find_references_missing_symbol_param() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/references?limit=5"))
+            .await
+            .unwrap();
+
+        // Missing required 'symbol' param → 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/code/dependencies/{file_path} — get_file_dependencies
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_file_dependencies_empty() {
+        // File with no import relationships → empty lists
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/dependencies/src/orphan.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["imports"].as_array().unwrap().is_empty());
+        assert!(json["imported_by"].as_array().unwrap().is_empty());
+        assert!(json["impact_radius"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_file_dependencies_with_imports() {
+        // Use the existing test_app_with_imports() which has import relationships seeded
+        let app = test_app_with_imports().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/dependencies/src/handler.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // handler.rs imports lib.rs
+        let imports = json["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0]["path"], "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn test_get_file_dependencies_imported_by() {
+        // lib.rs is imported by handler.rs, utils.rs, test_lib.rs
+        let app = test_app_with_imports().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/dependencies/src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // lib.rs is depended on by 3 files
+        let imported_by = json["imported_by"].as_array().unwrap();
+        assert_eq!(imported_by.len(), 3);
+        let impact_radius = json["impact_radius"].as_array().unwrap();
+        assert_eq!(impact_radius.len(), 3);
+    }
+
+    // ====================================================================
+    // GET /api/code/callgraph — get_call_graph
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_call_graph_empty() {
+        // Function not in graph → returns empty callers/callees
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/callgraph?function=nonexistent_fn"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["name"], "nonexistent_fn");
+        assert!(json["callers"].as_array().unwrap().is_empty());
+        assert!(json["callees"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_call_graph_with_relationships() {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{FunctionNode, Visibility};
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+
+        // Seed functions
+        let caller = FunctionNode {
+            name: "caller".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/a.rs".to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        };
+        graph.upsert_function(&caller).await.unwrap();
+
+        let target = FunctionNode {
+            name: "target".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/b.rs".to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        };
+        graph.upsert_function(&target).await.unwrap();
+
+        // caller calls target; target calls "downstream"
+        {
+            let mut cr = graph.call_relationships.write().await;
+            cr.insert("src/a.rs::caller".to_string(), vec!["target".to_string()]);
+            cr.insert(
+                "src/b.rs::target".to_string(),
+                vec!["downstream".to_string()],
+            );
+        }
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        // Test direction=both (default)
+        let resp = app
+            .oneshot(auth_get("/api/code/callgraph?function=target"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["name"], "target");
+        // "caller" calls "target"
+        let callers = json["callers"].as_array().unwrap();
+        assert_eq!(callers.len(), 1, "callers: {:?}", callers);
+        // "target" calls "downstream"
+        let callees = json["callees"].as_array().unwrap();
+        assert_eq!(callees.len(), 1, "callees: {:?}", callees);
+        assert_eq!(callees[0], "downstream");
+    }
+
+    #[tokio::test]
+    async fn test_get_call_graph_callers_only() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/callgraph?function=some_fn&direction=callers",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // With direction=callers, callees should be empty
+        assert!(json["callees"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_call_graph_missing_function_param() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/callgraph?depth=2"))
+            .await
+            .unwrap();
+
+        // Missing required 'function' param → 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/code/impact — analyze_impact additional coverage
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_analyze_impact_file_not_in_graph() {
+        // analyze_impact for a file with no relationships → empty lists, low risk
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/unknown.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["target"], "src/unknown.rs");
+        assert!(json["directly_affected"].as_array().unwrap().is_empty());
+        assert!(json["transitively_affected"].as_array().unwrap().is_empty());
+        assert!(json["test_files_affected"].as_array().unwrap().is_empty());
+        assert_eq!(json["caller_count"], 0);
+        assert_eq!(json["risk_level"], "low");
+    }
+
+    #[tokio::test]
+    async fn test_analyze_impact_function_mode() {
+        // analyze_impact with target_type=function should use callers path
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{FunctionNode, Visibility};
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with;
+
+        let graph = MockGraphStore::new();
+
+        // Seed a target function
+        let target_fn = FunctionNode {
+            name: "do_work".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 2,
+            file_path: "src/worker.rs".to_string(),
+            line_start: 10,
+            line_end: 20,
+            docstring: None,
+        };
+        graph.upsert_function(&target_fn).await.unwrap();
+
+        // Seed a caller function
+        let caller_fn = FunctionNode {
+            name: "main".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 5,
+            docstring: None,
+        };
+        graph.upsert_function(&caller_fn).await.unwrap();
+
+        // main calls do_work
+        graph
+            .call_relationships
+            .write()
+            .await
+            .insert("src/main.rs::main".to_string(), vec!["do_work".to_string()]);
+
+        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=do_work&target_type=function",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["target"], "do_work");
+        // caller_count comes from get_function_caller_count
+        let caller_count = json["caller_count"].as_i64().unwrap();
+        assert_eq!(caller_count, 1);
+        // directly_affected should contain files of callers
+        let direct = json["directly_affected"].as_array().unwrap();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0], "src/main.rs");
+    }
+
+    // ====================================================================
+    // POST /api/code/similar — find_similar_code
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_find_similar_code_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/code/similar")
+                    .header("authorization", test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"snippet": "fn main()"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_similar_code_with_results() {
+        let app = test_app_with_code().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/code/similar")
+                    .header("authorization", test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"snippet": "main entry point", "limit": 5}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let results = json.as_array().unwrap();
+        assert!(!results.is_empty());
+        // Verify SimilarCode shape
+        assert!(results[0]["path"].is_string());
+        assert!(results[0]["similarity"].is_number());
+        assert!(results[0]["snippet"].is_string());
+    }
 }

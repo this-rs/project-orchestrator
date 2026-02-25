@@ -1027,6 +1027,32 @@ mod tests {
     }
 
     #[test]
+    fn test_entity_type_plan_era_variants() {
+        // Display
+        let variants = vec![
+            (EntityType::Step, "step"),
+            (EntityType::Constraint, "constraint"),
+            (EntityType::Milestone, "milestone"),
+            (EntityType::Release, "release"),
+        ];
+        for (variant, expected) in &variants {
+            assert_eq!(variant.to_string(), *expected);
+        }
+
+        // FromStr
+        for (variant, s) in &variants {
+            assert_eq!(&EntityType::from_str(s).unwrap(), variant);
+        }
+
+        // Serde roundtrip
+        for (variant, _) in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            let deserialized: EntityType = serde_json::from_str(&json).unwrap();
+            assert_eq!(&deserialized, variant);
+        }
+    }
+
+    #[test]
     fn test_note_scope_workspace_specificity() {
         // Workspace is the broadest scope (specificity -1)
         assert_eq!(NoteScope::Workspace.specificity(), -1);

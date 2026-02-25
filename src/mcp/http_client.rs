@@ -302,4 +302,167 @@ mod tests {
         let client = McpHttpClient::new("http://localhost:8080".to_string(), None);
         assert_eq!(client.base_url, "http://localhost:8080");
     }
+
+    // ── extract_optional_bool ────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_optional_bool_true() {
+        let args = json!({"flag": true});
+        assert_eq!(extract_optional_bool(&args, "flag"), Some(true));
+    }
+
+    #[test]
+    fn test_extract_optional_bool_false() {
+        let args = json!({"flag": false});
+        assert_eq!(extract_optional_bool(&args, "flag"), Some(false));
+    }
+
+    #[test]
+    fn test_extract_optional_bool_missing() {
+        let args = json!({"other": 42});
+        assert_eq!(extract_optional_bool(&args, "flag"), None);
+    }
+
+    #[test]
+    fn test_extract_optional_bool_wrong_type() {
+        let args = json!({"flag": "yes"});
+        assert_eq!(extract_optional_bool(&args, "flag"), None);
+    }
+
+    // ── handle_response (mock axum server) ───────────────────────────────
+
+    use axum::{
+        body::Body, extract::Request, http::StatusCode as AxumStatusCode, routing::get, Router,
+    };
+    use tokio::net::TcpListener;
+
+    /// Helper: spin up a one-route axum server and return an McpHttpClient pointed at it.
+    async fn make_test_server(handler: axum::routing::MethodRouter) -> McpHttpClient {
+        let app = Router::new().route("/test", handler);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        McpHttpClient::new(base_url, Some("test-token".to_string()))
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_200_valid_json() {
+        let client = make_test_server(get(|| async {
+            (
+                AxumStatusCode::OK,
+                axum::Json(json!({"id": 1, "name": "ok"})),
+            )
+        }))
+        .await;
+
+        let result = client.get("/test").await.unwrap();
+        assert_eq!(result["id"], 1);
+        assert_eq!(result["name"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_204_no_content() {
+        let client = make_test_server(get(|| async { (AxumStatusCode::NO_CONTENT, "") })).await;
+
+        let result = client.get("/test").await.unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_200_empty_body() {
+        let client = make_test_server(get(|| async { (AxumStatusCode::OK, "") })).await;
+
+        let result = client.get("/test").await.unwrap();
+        assert_eq!(result, json!({"success": true}));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_error() {
+        let client = make_test_server(get(|| async {
+            (AxumStatusCode::BAD_REQUEST, "missing required field")
+        }))
+        .await;
+
+        let err = client.get("/test").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("400"), "expected status 400 in: {msg}");
+        assert!(
+            msg.contains("missing required field"),
+            "expected body excerpt in: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_200_invalid_json() {
+        let client = make_test_server(get(|| async { (AxumStatusCode::OK, "not json {{{") })).await;
+
+        let err = client.get("/test").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to parse JSON response"),
+            "expected JSON parse error in: {msg}"
+        );
+    }
+
+    // ── inject_auth ──────────────────────────────────────────────────────
+
+    /// Verify Bearer token is sent when auth_token is Some.
+    #[tokio::test]
+    async fn test_inject_auth_sends_bearer() {
+        let app = Router::new().route(
+            "/auth-check",
+            get(|req: Request<Body>| async move {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                (AxumStatusCode::OK, axum::Json(json!({"auth": auth})))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let client = McpHttpClient::new(base_url, Some("my-secret-jwt".to_string()));
+        let result = client.get("/auth-check").await.unwrap();
+        assert_eq!(result["auth"], "Bearer my-secret-jwt");
+    }
+
+    /// Verify no Authorization header is sent when auth_token is None.
+    #[tokio::test]
+    async fn test_inject_auth_none_sends_no_header() {
+        let app = Router::new().route(
+            "/auth-check",
+            get(|req: Request<Body>| async move {
+                let has_auth = req.headers().contains_key("authorization");
+                (
+                    AxumStatusCode::OK,
+                    axum::Json(json!({"has_auth": has_auth})),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let client = McpHttpClient::new(base_url, None);
+        let result = client.get("/auth-check").await.unwrap();
+        assert_eq!(result["has_auth"], false);
+    }
 }
