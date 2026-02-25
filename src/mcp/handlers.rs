@@ -976,6 +976,60 @@ impl ToolHandler {
                 Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
             }
 
+            // ── P6: Commits (5 tools) ───────────────────────────────────
+
+            "create_commit" => {
+                // Map MCP field names to REST field names: sha→hash
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("sha") {
+                    body.insert("hash".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("message") {
+                    body.insert("message".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("author") {
+                    body.insert("author".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("files_changed") {
+                    body.insert("files_changed".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("project_id") {
+                    body.insert("project_id".to_string(), v.clone());
+                }
+                let result = http.post("/api/commits", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "link_commit_to_task" => {
+                let task_id = extract_id(args, "task_id")?;
+                let commit_sha = extract_string(args, "commit_sha")?;
+                // REST expects "commit_hash" field name
+                let body = json!({"commit_hash": commit_sha});
+                let result = http.post(&format!("/api/tasks/{}/commits", task_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+            }
+
+            "link_commit_to_plan" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let commit_sha = extract_string(args, "commit_sha")?;
+                // REST expects "commit_hash" field name
+                let body = json!({"commit_hash": commit_sha});
+                let result = http.post(&format!("/api/plans/{}/commits", plan_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+            }
+
+            "get_task_commits" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.get(&format!("/api/tasks/{}/commits", task_id)).await?;
+                Ok(Some(result))
+            }
+
+            "get_plan_commits" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.get(&format!("/api/plans/{}/commits", plan_id)).await?;
+                Ok(Some(result))
+            }
+
             // ── Not yet migrated ────────────────────────────────────────
             _ => Ok(None),
         }

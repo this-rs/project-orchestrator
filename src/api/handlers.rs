@@ -1143,13 +1143,30 @@ pub struct CreateCommitRequest {
     pub message: String,
     pub author: String,
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    /// Files changed in this commit (enables incremental sync)
+    pub files_changed: Option<Vec<String>>,
+    /// Project UUID (enables incremental sync + analytics)
+    pub project_id: Option<String>,
+}
+
+/// Response for create_commit
+#[derive(Serialize)]
+pub struct CreateCommitResponse {
+    #[serde(flatten)]
+    pub commit: CommitNode,
+    pub sync_triggered: bool,
 }
 
 /// Create a new commit
+///
+/// Side-effects (when `files_changed` + `project_id` are provided):
+/// 1. Incremental sync of changed files (background)
+/// 2. Analytics debounce trigger (background)
+/// 3. Hebbian energy boost on notes linked to committed files (background)
 pub async fn create_commit(
     State(state): State<OrchestratorState>,
     Json(req): Json<CreateCommitRequest>,
-) -> Result<Json<CommitNode>, AppError> {
+) -> Result<Json<CreateCommitResponse>, AppError> {
     let commit = CommitNode {
         hash: req.hash,
         message: req.message,
@@ -1158,7 +1175,87 @@ pub async fn create_commit(
     };
 
     state.orchestrator.create_commit(&commit).await?;
-    Ok(Json(commit))
+
+    let files_changed = req.files_changed.unwrap_or_default();
+    let project_id = req
+        .project_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    let sync_triggered = !files_changed.is_empty() && project_id.is_some();
+
+    if sync_triggered {
+        let pid = project_id.unwrap();
+        let orchestrator = state.orchestrator.clone();
+        let files_for_boost = files_changed.clone();
+
+        // Resolve project slug for MeiliSearch indexing
+        let project_slug = orchestrator
+            .neo4j()
+            .get_project(pid)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.slug);
+
+        // Side-effect 1 & 2: Incremental sync + analytics debounce
+        let orch2 = orchestrator.clone();
+        tokio::spawn(async move {
+            for file_path in &files_changed {
+                let path = std::path::Path::new(file_path);
+                if path.exists() {
+                    if let Err(e) = orch2
+                        .sync_file_for_project(path, Some(pid), project_slug.as_deref())
+                        .await
+                    {
+                        tracing::warn!("Incremental sync failed for {}: {}", file_path, e);
+                    }
+                }
+            }
+            if let Err(e) = orch2.neo4j().update_project_synced(pid).await {
+                tracing::warn!("Failed to update last_synced: {}", e);
+            }
+            orch2.analytics_debouncer().trigger(pid);
+        });
+
+        // Side-effect 3: Hebbian energy boost on notes linked to committed files
+        let ar_config = orchestrator.auto_reinforcement_config().clone();
+        if ar_config.enabled && !files_for_boost.is_empty() {
+            let neo4j = orchestrator.neo4j_arc();
+            tokio::spawn(async move {
+                for file_path in &files_for_boost {
+                    match neo4j
+                        .get_notes_for_entity(&crate::notes::EntityType::File, file_path)
+                        .await
+                    {
+                        Ok(notes) => {
+                            for note in &notes {
+                                if let Err(e) =
+                                    neo4j.boost_energy(note.id, ar_config.commit_energy_boost).await
+                                {
+                                    tracing::warn!(
+                                        note_id = %note.id, error = %e,
+                                        "Auto-reinforce commit: energy boost failed"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                file = %file_path, error = %e,
+                                "Auto-reinforce commit: get_entity_notes failed"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    Ok(Json(CreateCommitResponse {
+        commit,
+        sync_triggered,
+    }))
 }
 
 /// Request to link a commit to a task
