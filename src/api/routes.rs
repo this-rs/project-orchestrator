@@ -400,14 +400,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route("/api/code/search", get(code_handlers::search_code))
         // Get symbols in a file (Neo4j)
         .route(
-            "/api/code/symbols/{file_path}",
+            "/api/code/symbols/{*file_path}",
             get(code_handlers::get_file_symbols),
         )
         // Find all references to a symbol
         .route("/api/code/references", get(code_handlers::find_references))
         // Get file dependencies (imports + dependents)
         .route(
-            "/api/code/dependencies/{file_path}",
+            "/api/code/dependencies/{*file_path}",
             get(code_handlers::get_file_dependencies),
         )
         // Get call graph for a function
