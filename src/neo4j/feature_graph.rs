@@ -1152,7 +1152,6 @@ impl Neo4jClient {
         Ok(functions)
     }
 
-
     fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {
         Ok(FeatureGraphNode {
             id: node.get::<String>("id")?.parse()?,
@@ -1183,4 +1182,3 @@ impl Neo4jClient {
         })
     }
 }
-

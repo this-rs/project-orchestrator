@@ -687,7 +687,11 @@ pub async fn search_decisions(
     let decisions = state
         .orchestrator
         .plan_manager()
-        .search_decisions(&query.q, query.limit.unwrap_or(10), query.project_slug.as_deref())
+        .search_decisions(
+            &query.q,
+            query.limit.unwrap_or(10),
+            query.project_slug.as_deref(),
+        )
         .await?;
     Ok(Json(decisions))
 }
@@ -1148,11 +1152,7 @@ pub async fn cleanup_cross_project_calls(
 pub async fn cleanup_sync_data(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let deleted = state
-        .orchestrator
-        .neo4j()
-        .cleanup_sync_data()
-        .await?;
+    let deleted = state.orchestrator.neo4j().cleanup_sync_data().await?;
     // Also clean ALL Meilisearch code documents to avoid stale/duplicate entries
     if let Err(e) = state.orchestrator.meili().delete_all_code().await {
         tracing::warn!("Failed to clean Meilisearch code index: {}", e);
@@ -1261,8 +1261,9 @@ pub async fn create_commit(
                     {
                         Ok(notes) => {
                             for note in &notes {
-                                if let Err(e) =
-                                    neo4j.boost_energy(note.id, ar_config.commit_energy_boost).await
+                                if let Err(e) = neo4j
+                                    .boost_energy(note.id, ar_config.commit_energy_boost)
+                                    .await
                                 {
                                     tracing::warn!(
                                         note_id = %note.id, error = %e,

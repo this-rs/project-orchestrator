@@ -166,10 +166,7 @@ impl McpHttpClient {
                 return Ok(Value::Null);
             }
 
-            let body = resp
-                .text()
-                .await
-                .context("Failed to read response body")?;
+            let body = resp.text().await.context("Failed to read response body")?;
 
             // Empty body → return a generic success
             if body.is_empty() {
@@ -213,7 +210,9 @@ pub fn extract_string(args: &Value, field: &str) -> Result<String> {
 
 /// Extract an optional string field from tool arguments.
 pub fn extract_optional_string(args: &Value, field: &str) -> Option<String> {
-    args.get(field).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract a required UUID string field from tool arguments.
@@ -258,7 +257,10 @@ mod tests {
     #[test]
     fn test_extract_optional_string() {
         let args = json!({"name": "test"});
-        assert_eq!(extract_optional_string(&args, "name"), Some("test".to_string()));
+        assert_eq!(
+            extract_optional_string(&args, "name"),
+            Some("test".to_string())
+        );
         assert_eq!(extract_optional_string(&args, "missing"), None);
     }
 

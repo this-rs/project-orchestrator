@@ -319,8 +319,16 @@ impl PlanManager {
     }
 
     /// Search for related decisions
-    pub async fn search_decisions(&self, query: &str, limit: usize, project_slug: Option<&str>) -> Result<Vec<DecisionNode>> {
-        let docs = self.meili.search_decisions_in_project(query, limit, project_slug).await?;
+    pub async fn search_decisions(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slug: Option<&str>,
+    ) -> Result<Vec<DecisionNode>> {
+        let docs = self
+            .meili
+            .search_decisions_in_project(query, limit, project_slug)
+            .await?;
 
         // Convert documents to nodes
         let decisions = docs
@@ -1218,7 +1226,10 @@ mod tests {
         .unwrap();
 
         // Search for "microservices" should find first decision
-        let results = pm.search_decisions("microservices", 10, None).await.unwrap();
+        let results = pm
+            .search_decisions("microservices", 10, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].description, "Adopt microservices architecture");
 

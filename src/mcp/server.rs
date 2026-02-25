@@ -39,8 +39,7 @@ impl McpServer {
         orchestrator: Arc<Orchestrator>,
         chat_manager: Arc<ChatManager>,
     ) -> Self {
-        let tool_handler =
-            ToolHandler::new(orchestrator).with_chat_manager(Some(chat_manager));
+        let tool_handler = ToolHandler::new(orchestrator).with_chat_manager(Some(chat_manager));
         Self {
             tool_handler,
             initialized: false,

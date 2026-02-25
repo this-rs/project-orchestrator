@@ -2486,7 +2486,6 @@ impl Neo4jClient {
         Ok(files)
     }
 
-
     /// Get aggregated symbol names for a file (functions, structs, traits, enums)
     pub async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
         let q = query(
@@ -2682,7 +2681,6 @@ impl Neo4jClient {
 
         Ok(blocks)
     }
-
 
     // ========================================================================
     // Impact analysis

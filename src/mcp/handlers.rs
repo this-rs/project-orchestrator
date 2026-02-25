@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use super::http_client::{extract_id, extract_optional_string, extract_string, McpHttpClient};
 use crate::expand_tilde;
-use super::http_client::{McpHttpClient, extract_string, extract_id, extract_optional_string};
 
 /// Backend for tool execution — either direct Orchestrator access or HTTP proxy.
 pub enum ToolBackend {
@@ -104,10 +104,24 @@ impl ToolHandler {
         // release, milestone, commit, note, workspace, workspace_milestone,
         // resource, component, chat, feature_graph, code, admin
         let mega_tools: &[&str] = &[
-            "project", "plan", "task", "step", "decision", "constraint",
-            "release", "milestone", "commit", "note", "workspace",
-            "workspace_milestone", "resource", "component", "chat",
-            "feature_graph", "code", "admin",
+            "project",
+            "plan",
+            "task",
+            "step",
+            "decision",
+            "constraint",
+            "release",
+            "milestone",
+            "commit",
+            "note",
+            "workspace",
+            "workspace_milestone",
+            "resource",
+            "component",
+            "chat",
+            "feature_graph",
+            "code",
+            "admin",
         ];
 
         if !mega_tools.contains(&name) {
@@ -327,7 +341,13 @@ impl ToolHandler {
             ("admin", "decay_synapses") => "decay_synapses",
             ("admin", "backfill_synapses") => "backfill_synapses",
 
-            _ => return Err(anyhow!("Unknown action '{}' for mega-tool '{}'", action, tool)),
+            _ => {
+                return Err(anyhow!(
+                    "Unknown action '{}' for mega-tool '{}'",
+                    action,
+                    tool
+                ))
+            }
         };
         Ok(name.to_string())
     }
@@ -579,7 +599,6 @@ impl ToolHandler {
 
         match name {
             // ── P2: Projects (8 tools) ──────────────────────────────────
-
             "list_projects" => {
                 let mut query = Vec::new();
                 if let Some(s) = args.get("search").and_then(|v| v.as_str()) {
@@ -629,7 +648,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("root_path") {
                     body.insert("root_path".to_string(), v.clone());
                 }
-                let result = http.patch(&format!("/api/projects/{}", slug), &Value::Object(body)).await?;
+                let result = http
+                    .patch(&format!("/api/projects/{}", slug), &Value::Object(body))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -648,7 +669,8 @@ impl ToolHandler {
                     }
                 }
                 let result = if query.is_empty() {
-                    http.post(&format!("/api/projects/{}/sync", slug), &json!({})).await?
+                    http.post(&format!("/api/projects/{}/sync", slug), &json!({}))
+                        .await?
                 } else {
                     // POST with query params — use get_with_query pattern but POST
                     let url = format!("/api/projects/{}/sync?force=true", slug);
@@ -659,7 +681,9 @@ impl ToolHandler {
 
             "get_project_roadmap" => {
                 let project_id = extract_id(args, "project_id")?;
-                let result = http.get(&format!("/api/projects/{}/roadmap", project_id)).await?;
+                let result = http
+                    .get(&format!("/api/projects/{}/roadmap", project_id))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -678,13 +702,13 @@ impl ToolHandler {
                 let result = if query.is_empty() {
                     http.get(&format!("/api/projects/{}/plans", slug)).await?
                 } else {
-                    http.get_with_query(&format!("/api/projects/{}/plans", slug), &query).await?
+                    http.get_with_query(&format!("/api/projects/{}/plans", slug), &query)
+                        .await?
                 };
                 Ok(Some(result))
             }
 
             // ── P3: Plans (9 tools) ──────────────────────────────────────
-
             "list_plans" => {
                 let mut query = Vec::new();
                 if let Some(s) = args.get("project_id").and_then(|v| v.as_str()) {
@@ -737,60 +761,91 @@ impl ToolHandler {
                 let plan_id = extract_id(args, "plan_id")?;
                 let status = extract_string(args, "status")?;
                 let body = json!({"status": status});
-                let result = http.patch(&format!("/api/plans/{}", plan_id), &body).await?;
+                let result = http
+                    .patch(&format!("/api/plans/{}", plan_id), &body)
+                    .await?;
                 // REST returns 204 → null, normalize to {"updated": true}
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_plan" => {
                 let plan_id = extract_id(args, "plan_id")?;
                 let result = http.delete(&format!("/api/plans/{}", plan_id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "link_plan_to_project" => {
                 let plan_id = extract_id(args, "plan_id")?;
                 let project_id = extract_id(args, "project_id")?;
                 let body = json!({"project_id": project_id});
-                let result = http.put(&format!("/api/plans/{}/project", plan_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+                let result = http
+                    .put(&format!("/api/plans/{}/project", plan_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"linked": true})
+                } else {
+                    result
+                }))
             }
 
             "unlink_plan_from_project" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.delete(&format!("/api/plans/{}/project", plan_id)).await?;
-                Ok(Some(if result.is_null() { json!({"unlinked": true}) } else { result }))
+                let result = http
+                    .delete(&format!("/api/plans/{}/project", plan_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"unlinked": true})
+                } else {
+                    result
+                }))
             }
 
             "get_dependency_graph" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.get(&format!("/api/plans/{}/dependency-graph", plan_id)).await?;
+                let result = http
+                    .get(&format!("/api/plans/{}/dependency-graph", plan_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             "get_critical_path" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.get(&format!("/api/plans/{}/critical-path", plan_id)).await?;
+                let result = http
+                    .get(&format!("/api/plans/{}/critical-path", plan_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             // ── P3: Constraints (5 tools) ───────────────────────────────────
-
             "list_constraints" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.get(&format!("/api/plans/{}/constraints", plan_id)).await?;
+                let result = http
+                    .get(&format!("/api/plans/{}/constraints", plan_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             "add_constraint" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.post(&format!("/api/plans/{}/constraints", plan_id), args).await?;
+                let result = http
+                    .post(&format!("/api/plans/{}/constraints", plan_id), args)
+                    .await?;
                 Ok(Some(result))
             }
 
             "get_constraint" => {
                 let constraint_id = extract_id(args, "constraint_id")?;
-                let result = http.get(&format!("/api/constraints/{}", constraint_id)).await?;
+                let result = http
+                    .get(&format!("/api/constraints/{}", constraint_id))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -806,18 +861,32 @@ impl ToolHandler {
                 if let Some(v) = args.get("enforced_by") {
                     body.insert("enforced_by".to_string(), v.clone());
                 }
-                let result = http.patch(&format!("/api/constraints/{}", constraint_id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                let result = http
+                    .patch(
+                        &format!("/api/constraints/{}", constraint_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_constraint" => {
                 let constraint_id = extract_id(args, "constraint_id")?;
-                let result = http.delete(&format!("/api/constraints/{}", constraint_id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                let result = http
+                    .delete(&format!("/api/constraints/{}", constraint_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             // ── P4: Tasks (13 tools) ────────────────────────────────────
-
             "list_tasks" => {
                 let mut query = Vec::new();
                 if let Some(s) = args.get("plan_id").and_then(|v| v.as_str()) {
@@ -866,7 +935,9 @@ impl ToolHandler {
 
             "create_task" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.post(&format!("/api/plans/{}/tasks", plan_id), args).await?;
+                let result = http
+                    .post(&format!("/api/plans/{}/tasks", plan_id), args)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -897,74 +968,108 @@ impl ToolHandler {
                 if let Some(v) = args.get("description") {
                     body.insert("description".to_string(), v.clone());
                 }
-                let result = http.patch(&format!("/api/tasks/{}", task_id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                let result = http
+                    .patch(&format!("/api/tasks/{}", task_id), &Value::Object(body))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_task" => {
                 let task_id = extract_id(args, "task_id")?;
                 let result = http.delete(&format!("/api/tasks/{}", task_id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "get_next_task" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.get(&format!("/api/plans/{}/next-task", plan_id)).await?;
+                let result = http
+                    .get(&format!("/api/plans/{}/next-task", plan_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             "add_task_dependencies" => {
                 let task_id = extract_id(args, "task_id")?;
                 // REST expects { "depends_on": [...] }, MCP sends { "dependency_ids": [...] }
-                let dep_ids = args.get("dependency_ids")
-                    .cloned()
-                    .unwrap_or(json!([]));
+                let dep_ids = args.get("dependency_ids").cloned().unwrap_or(json!([]));
                 let body = json!({"depends_on": dep_ids});
-                let result = http.post(&format!("/api/tasks/{}/dependencies", task_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/tasks/{}/dependencies", task_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
             }
 
             "remove_task_dependency" => {
                 let task_id = extract_id(args, "task_id")?;
                 let dependency_id = extract_id(args, "dependency_id")?;
-                let result = http.delete(&format!("/api/tasks/{}/dependencies/{}", task_id, dependency_id)).await?;
-                Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
+                let result = http
+                    .delete(&format!(
+                        "/api/tasks/{}/dependencies/{}",
+                        task_id, dependency_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
             }
 
             "get_task_blockers" => {
                 let task_id = extract_id(args, "task_id")?;
-                let result = http.get(&format!("/api/tasks/{}/blockers", task_id)).await?;
+                let result = http
+                    .get(&format!("/api/tasks/{}/blockers", task_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             "get_tasks_blocked_by" => {
                 let task_id = extract_id(args, "task_id")?;
-                let result = http.get(&format!("/api/tasks/{}/blocking", task_id)).await?;
+                let result = http
+                    .get(&format!("/api/tasks/{}/blocking", task_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             "get_task_context" => {
                 let plan_id = extract_id(args, "plan_id")?;
                 let task_id = extract_id(args, "task_id")?;
-                let result = http.get(&format!("/api/plans/{}/tasks/{}/context", plan_id, task_id)).await?;
+                let result = http
+                    .get(&format!("/api/plans/{}/tasks/{}/context", plan_id, task_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             "get_task_prompt" => {
                 let plan_id = extract_id(args, "plan_id")?;
                 let task_id = extract_id(args, "task_id")?;
-                let result = http.get(&format!("/api/plans/{}/tasks/{}/prompt", plan_id, task_id)).await?;
+                let result = http
+                    .get(&format!("/api/plans/{}/tasks/{}/prompt", plan_id, task_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             "add_decision" => {
                 let task_id = extract_id(args, "task_id")?;
-                let result = http.post(&format!("/api/tasks/{}/decisions", task_id), args).await?;
+                let result = http
+                    .post(&format!("/api/tasks/{}/decisions", task_id), args)
+                    .await?;
                 Ok(Some(result))
             }
 
             // ── P4: Steps (6 tools) ────────────────────────────────────
-
             "list_steps" => {
                 let task_id = extract_id(args, "task_id")?;
                 let result = http.get(&format!("/api/tasks/{}/steps", task_id)).await?;
@@ -973,7 +1078,9 @@ impl ToolHandler {
 
             "create_step" => {
                 let task_id = extract_id(args, "task_id")?;
-                let result = http.post(&format!("/api/tasks/{}/steps", task_id), args).await?;
+                let result = http
+                    .post(&format!("/api/tasks/{}/steps", task_id), args)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -989,24 +1096,35 @@ impl ToolHandler {
                 if let Some(v) = args.get("status") {
                     body.insert("status".to_string(), v.clone());
                 }
-                let result = http.patch(&format!("/api/steps/{}", step_id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                let result = http
+                    .patch(&format!("/api/steps/{}", step_id), &Value::Object(body))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_step" => {
                 let step_id = extract_id(args, "step_id")?;
                 let result = http.delete(&format!("/api/steps/{}", step_id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "get_step_progress" => {
                 let task_id = extract_id(args, "task_id")?;
-                let result = http.get(&format!("/api/tasks/{}/steps/progress", task_id)).await?;
+                let result = http
+                    .get(&format!("/api/tasks/{}/steps/progress", task_id))
+                    .await?;
                 Ok(Some(result))
             }
 
             // ── P4: Decisions (4 tools) ────────────────────────────────
-
             "get_decision" => {
                 let decision_id = extract_id(args, "decision_id")?;
                 let result = http.get(&format!("/api/decisions/{}", decision_id)).await?;
@@ -1025,14 +1143,29 @@ impl ToolHandler {
                 if let Some(v) = args.get("chosen_option") {
                     body.insert("chosen_option".to_string(), v.clone());
                 }
-                let result = http.patch(&format!("/api/decisions/{}", decision_id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                let result = http
+                    .patch(
+                        &format!("/api/decisions/{}", decision_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_decision" => {
                 let decision_id = extract_id(args, "decision_id")?;
-                let result = http.delete(&format!("/api/decisions/{}", decision_id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                let result = http
+                    .delete(&format!("/api/decisions/{}", decision_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "search_decisions" => {
@@ -1049,7 +1182,6 @@ impl ToolHandler {
             }
 
             // ── P5: Milestones (9 tools) ────────────────────────────────
-
             "list_milestones" => {
                 let project_id = extract_id(args, "project_id")?;
                 let mut query = Vec::new();
@@ -1073,13 +1205,17 @@ impl ToolHandler {
 
             "create_milestone" => {
                 let project_id = extract_id(args, "project_id")?;
-                let result = http.post(&format!("/api/projects/{}/milestones", project_id), args).await?;
+                let result = http
+                    .post(&format!("/api/projects/{}/milestones", project_id), args)
+                    .await?;
                 Ok(Some(result))
             }
 
             "get_milestone" => {
                 let milestone_id = extract_id(args, "milestone_id")?;
-                let result = http.get(&format!("/api/milestones/{}", milestone_id)).await?;
+                let result = http
+                    .get(&format!("/api/milestones/{}", milestone_id))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1101,19 +1237,36 @@ impl ToolHandler {
                 if let Some(v) = args.get("closed_at") {
                     body.insert("closed_at".to_string(), v.clone());
                 }
-                let result = http.patch(&format!("/api/milestones/{}", milestone_id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                let result = http
+                    .patch(
+                        &format!("/api/milestones/{}", milestone_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_milestone" => {
                 let milestone_id = extract_id(args, "milestone_id")?;
-                let result = http.delete(&format!("/api/milestones/{}", milestone_id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                let result = http
+                    .delete(&format!("/api/milestones/{}", milestone_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "get_milestone_progress" => {
                 let milestone_id = extract_id(args, "milestone_id")?;
-                let result = http.get(&format!("/api/milestones/{}/progress", milestone_id)).await?;
+                let result = http
+                    .get(&format!("/api/milestones/{}/progress", milestone_id))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1121,27 +1274,47 @@ impl ToolHandler {
                 let milestone_id = extract_id(args, "milestone_id")?;
                 let task_id = extract_id(args, "task_id")?;
                 let body = json!({"task_id": task_id});
-                let result = http.post(&format!("/api/milestones/{}/tasks", milestone_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/milestones/{}/tasks", milestone_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
             }
 
             "link_plan_to_milestone" => {
                 let milestone_id = extract_id(args, "milestone_id")?;
                 let plan_id = extract_id(args, "plan_id")?;
                 let body = json!({"plan_id": plan_id});
-                let result = http.post(&format!("/api/milestones/{}/plans", milestone_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/milestones/{}/plans", milestone_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"linked": true})
+                } else {
+                    result
+                }))
             }
 
             "unlink_plan_from_milestone" => {
                 let milestone_id = extract_id(args, "milestone_id")?;
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.delete(&format!("/api/milestones/{}/plans/{}", milestone_id, plan_id)).await?;
-                Ok(Some(if result.is_null() { json!({"unlinked": true}) } else { result }))
+                let result = http
+                    .delete(&format!(
+                        "/api/milestones/{}/plans/{}",
+                        milestone_id, plan_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"unlinked": true})
+                } else {
+                    result
+                }))
             }
 
             // ── P5: Releases (8 tools) ─────────────────────────────────
-
             "list_releases" => {
                 let project_id = extract_id(args, "project_id")?;
                 let mut query = Vec::new();
@@ -1165,7 +1338,9 @@ impl ToolHandler {
 
             "create_release" => {
                 let project_id = extract_id(args, "project_id")?;
-                let result = http.post(&format!("/api/projects/{}/releases", project_id), args).await?;
+                let result = http
+                    .post(&format!("/api/projects/{}/releases", project_id), args)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1193,22 +1368,43 @@ impl ToolHandler {
                 if let Some(v) = args.get("released_at") {
                     body.insert("released_at".to_string(), v.clone());
                 }
-                let result = http.patch(&format!("/api/releases/{}", release_id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                let result = http
+                    .patch(
+                        &format!("/api/releases/{}", release_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_release" => {
                 let release_id = extract_id(args, "release_id")?;
-                let result = http.delete(&format!("/api/releases/{}", release_id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                let result = http
+                    .delete(&format!("/api/releases/{}", release_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "add_task_to_release" => {
                 let release_id = extract_id(args, "release_id")?;
                 let task_id = extract_id(args, "task_id")?;
                 let body = json!({"task_id": task_id});
-                let result = http.post(&format!("/api/releases/{}/tasks", release_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/releases/{}/tasks", release_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
             }
 
             "add_commit_to_release" => {
@@ -1216,19 +1412,33 @@ impl ToolHandler {
                 let commit_sha = extract_string(args, "commit_sha")?;
                 // REST expects "commit_hash" field name
                 let body = json!({"commit_hash": commit_sha});
-                let result = http.post(&format!("/api/releases/{}/commits", release_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/releases/{}/commits", release_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
             }
 
             "remove_commit_from_release" => {
                 let release_id = extract_id(args, "release_id")?;
                 let commit_sha = extract_string(args, "commit_sha")?;
-                let result = http.delete(&format!("/api/releases/{}/commits/{}", release_id, commit_sha)).await?;
-                Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
+                let result = http
+                    .delete(&format!(
+                        "/api/releases/{}/commits/{}",
+                        release_id, commit_sha
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
             }
 
             // ── P6: Commits (5 tools) ───────────────────────────────────
-
             "create_commit" => {
                 // Map MCP field names to REST field names: sha→hash
                 let mut body = serde_json::Map::new();
@@ -1256,8 +1466,14 @@ impl ToolHandler {
                 let commit_sha = extract_string(args, "commit_sha")?;
                 // REST expects "commit_hash" field name
                 let body = json!({"commit_hash": commit_sha});
-                let result = http.post(&format!("/api/tasks/{}/commits", task_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/tasks/{}/commits", task_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"linked": true})
+                } else {
+                    result
+                }))
             }
 
             "link_commit_to_plan" => {
@@ -1265,8 +1481,14 @@ impl ToolHandler {
                 let commit_sha = extract_string(args, "commit_sha")?;
                 // REST expects "commit_hash" field name
                 let body = json!({"commit_hash": commit_sha});
-                let result = http.post(&format!("/api/plans/{}/commits", plan_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/plans/{}/commits", plan_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"linked": true})
+                } else {
+                    result
+                }))
             }
 
             "get_task_commits" => {
@@ -1284,7 +1506,6 @@ impl ToolHandler {
             // ── P7: Notes & Knowledge (23 tools) ──────────────────────────
 
             // --- CRUD (5) ---
-
             "list_notes" => {
                 let mut query = Vec::new();
                 if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
@@ -1343,22 +1564,39 @@ impl ToolHandler {
             "update_note" => {
                 let note_id = extract_id(args, "note_id")?;
                 let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("content") { body.insert("content".to_string(), v.clone()); }
-                if let Some(v) = args.get("importance") { body.insert("importance".to_string(), v.clone()); }
-                if let Some(v) = args.get("status") { body.insert("status".to_string(), v.clone()); }
-                if let Some(v) = args.get("tags") { body.insert("tags".to_string(), v.clone()); }
-                let result = http.patch(&format!("/api/notes/{}", note_id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                if let Some(v) = args.get("content") {
+                    body.insert("content".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("importance") {
+                    body.insert("importance".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("status") {
+                    body.insert("status".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("tags") {
+                    body.insert("tags".to_string(), v.clone());
+                }
+                let result = http
+                    .patch(&format!("/api/notes/{}", note_id), &Value::Object(body))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_note" => {
                 let note_id = extract_id(args, "note_id")?;
                 let result = http.delete(&format!("/api/notes/{}", note_id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             // --- Search (3) ---
-
             "search_notes" => {
                 // MCP param "query" → REST param "q"
                 let query_str = extract_string(args, "query")?;
@@ -1394,7 +1632,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
                     query.push(("limit".to_string(), v.to_string()));
                 }
-                let result = http.get_with_query("/api/notes/search-semantic", &query).await?;
+                let result = http
+                    .get_with_query("/api/notes/search-semantic", &query)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1413,15 +1653,18 @@ impl ToolHandler {
                 if let Some(v) = args.get("min_score").and_then(|v| v.as_f64()) {
                     query.push(("min_score".to_string(), v.to_string()));
                 }
-                let result = http.get_with_query("/api/notes/neurons/search", &query).await?;
+                let result = http
+                    .get_with_query("/api/notes/neurons/search", &query)
+                    .await?;
                 Ok(Some(result))
             }
 
             // --- Lifecycle (3) ---
-
             "confirm_note" => {
                 let note_id = extract_id(args, "note_id")?;
-                let result = http.post(&format!("/api/notes/{}/confirm", note_id), &json!({})).await?;
+                let result = http
+                    .post(&format!("/api/notes/{}/confirm", note_id), &json!({}))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1429,38 +1672,55 @@ impl ToolHandler {
                 let note_id = extract_id(args, "note_id")?;
                 let reason = extract_string(args, "reason")?;
                 let body = json!({"reason": reason});
-                let result = http.post(&format!("/api/notes/{}/invalidate", note_id), &body).await?;
+                let result = http
+                    .post(&format!("/api/notes/{}/invalidate", note_id), &body)
+                    .await?;
                 Ok(Some(result))
             }
 
             "supersede_note" => {
                 let old_note_id = extract_id(args, "old_note_id")?;
                 // Forward remaining args as body (old_note_id extracted for URL path)
-                let result = http.post(&format!("/api/notes/{}/supersede", old_note_id), args).await?;
+                let result = http
+                    .post(&format!("/api/notes/{}/supersede", old_note_id), args)
+                    .await?;
                 Ok(Some(result))
             }
 
             // --- Linking (2) ---
-
             "link_note_to_entity" => {
                 let note_id = extract_id(args, "note_id")?;
                 let entity_type = extract_string(args, "entity_type")?;
                 let entity_id = extract_string(args, "entity_id")?;
                 let body = json!({"entity_type": entity_type, "entity_id": entity_id});
-                let result = http.post(&format!("/api/notes/{}/links", note_id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/notes/{}/links", note_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"linked": true})
+                } else {
+                    result
+                }))
             }
 
             "unlink_note_from_entity" => {
                 let note_id = extract_id(args, "note_id")?;
                 let entity_type = extract_string(args, "entity_type")?;
                 let entity_id = extract_string(args, "entity_id")?;
-                let result = http.delete(&format!("/api/notes/{}/links/{}/{}", note_id, entity_type, entity_id)).await?;
-                Ok(Some(if result.is_null() { json!({"unlinked": true}) } else { result }))
+                let result = http
+                    .delete(&format!(
+                        "/api/notes/{}/links/{}/{}",
+                        note_id, entity_type, entity_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"unlinked": true})
+                } else {
+                    result
+                }))
             }
 
             // --- Retrieval (5) ---
-
             "get_context_notes" => {
                 let entity_type = extract_string(args, "entity_type")?;
                 let entity_id = extract_string(args, "entity_id")?;
@@ -1486,7 +1746,8 @@ impl ToolHandler {
                 let result = if query.is_empty() {
                     http.get("/api/notes/needs-review").await?
                 } else {
-                    http.get_with_query("/api/notes/needs-review", &query).await?
+                    http.get_with_query("/api/notes/needs-review", &query)
+                        .await?
                 };
                 Ok(Some(result))
             }
@@ -1511,7 +1772,12 @@ impl ToolHandler {
             "get_entity_notes" => {
                 let entity_type = extract_string(args, "entity_type")?;
                 let entity_id = extract_string(args, "entity_id")?;
-                let result = http.get(&format!("/api/entities/{}/{}/notes", entity_type, entity_id)).await?;
+                let result = http
+                    .get(&format!(
+                        "/api/entities/{}/{}/notes",
+                        entity_type, entity_id
+                    ))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1525,15 +1791,16 @@ impl ToolHandler {
                     query.push(("offset".to_string(), v.to_string()));
                 }
                 let result = if query.is_empty() {
-                    http.get(&format!("/api/projects/{}/notes", project_id)).await?
+                    http.get(&format!("/api/projects/{}/notes", project_id))
+                        .await?
                 } else {
-                    http.get_with_query(&format!("/api/projects/{}/notes", project_id), &query).await?
+                    http.get_with_query(&format!("/api/projects/{}/notes", project_id), &query)
+                        .await?
                 };
                 Ok(Some(result))
             }
 
             // --- Admin (5) ---
-
             "update_staleness_scores" => {
                 let result = http.post("/api/notes/update-staleness", &json!({})).await?;
                 Ok(Some(result))
@@ -1541,8 +1808,12 @@ impl ToolHandler {
 
             "update_energy_scores" => {
                 let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("half_life") { body.insert("half_life".to_string(), v.clone()); }
-                let result = http.post("/api/notes/update-energy", &Value::Object(body)).await?;
+                if let Some(v) = args.get("half_life") {
+                    body.insert("half_life".to_string(), v.clone());
+                }
+                let result = http
+                    .post("/api/notes/update-energy", &Value::Object(body))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1562,17 +1833,24 @@ impl ToolHandler {
                 // REST runs async (202 Accepted), MCP Direct was sync.
                 // We forward to the async endpoint and return the 202 response.
                 let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("batch_size") { body.insert("batch_size".to_string(), v.clone()); }
-                if let Some(v) = args.get("min_similarity") { body.insert("min_similarity".to_string(), v.clone()); }
-                if let Some(v) = args.get("max_neighbors") { body.insert("max_neighbors".to_string(), v.clone()); }
-                let result = http.post("/api/admin/backfill-synapses", &Value::Object(body)).await?;
+                if let Some(v) = args.get("batch_size") {
+                    body.insert("batch_size".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("min_similarity") {
+                    body.insert("min_similarity".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("max_neighbors") {
+                    body.insert("max_neighbors".to_string(), v.clone());
+                }
+                let result = http
+                    .post("/api/admin/backfill-synapses", &Value::Object(body))
+                    .await?;
                 Ok(Some(result))
             }
 
             // ── P8: Workspaces (34 tools) ──────────────────────────────────
 
             // --- Workspace CRUD (5) ---
-
             "list_workspaces" => {
                 let mut query = Vec::new();
                 if let Some(v) = args.get("search").and_then(|v| v.as_str()) {
@@ -1606,30 +1884,49 @@ impl ToolHandler {
             "update_workspace" => {
                 let slug = extract_string(args, "slug")?;
                 let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("name") { body.insert("name".to_string(), v.clone()); }
-                if let Some(v) = args.get("description") { body.insert("description".to_string(), v.clone()); }
-                if let Some(v) = args.get("metadata") { body.insert("metadata".to_string(), v.clone()); }
-                let result = http.patch(&format!("/api/workspaces/{}", slug), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                if let Some(v) = args.get("name") {
+                    body.insert("name".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("metadata") {
+                    body.insert("metadata".to_string(), v.clone());
+                }
+                let result = http
+                    .patch(&format!("/api/workspaces/{}", slug), &Value::Object(body))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_workspace" => {
                 let slug = extract_string(args, "slug")?;
                 let result = http.delete(&format!("/api/workspaces/{}", slug)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             // --- Workspace Overview & Projects (4) ---
-
             "get_workspace_overview" => {
                 let slug = extract_string(args, "slug")?;
-                let result = http.get(&format!("/api/workspaces/{}/overview", slug)).await?;
+                let result = http
+                    .get(&format!("/api/workspaces/{}/overview", slug))
+                    .await?;
                 Ok(Some(result))
             }
 
             "list_workspace_projects" => {
                 let slug = extract_string(args, "slug")?;
-                let result = http.get(&format!("/api/workspaces/{}/projects", slug)).await?;
+                let result = http
+                    .get(&format!("/api/workspaces/{}/projects", slug))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1637,27 +1934,39 @@ impl ToolHandler {
                 let slug = extract_string(args, "slug")?;
                 let project_id = extract_id(args, "project_id")?;
                 let body = json!({"project_id": project_id});
-                let result = http.post(&format!("/api/workspaces/{}/projects", slug), &body).await?;
-                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/workspaces/{}/projects", slug), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
             }
 
             "remove_project_from_workspace" => {
                 let slug = extract_string(args, "slug")?;
                 let project_id = extract_id(args, "project_id")?;
-                let result = http.delete(&format!("/api/workspaces/{}/projects/{}", slug, project_id)).await?;
-                Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
+                let result = http
+                    .delete(&format!("/api/workspaces/{}/projects/{}", slug, project_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
             }
 
             // --- Workspace Topology (1) ---
-
             "get_workspace_topology" => {
                 let slug = extract_string(args, "slug")?;
-                let result = http.get(&format!("/api/workspaces/{}/topology", slug)).await?;
+                let result = http
+                    .get(&format!("/api/workspaces/{}/topology", slug))
+                    .await?;
                 Ok(Some(result))
             }
 
             // --- Workspace Milestones (10) ---
-
             "list_all_workspace_milestones" => {
                 let mut query = Vec::new();
                 if let Some(v) = args.get("workspace_id").and_then(|v| v.as_str()) {
@@ -1675,7 +1984,8 @@ impl ToolHandler {
                 let result = if query.is_empty() {
                     http.get("/api/workspace-milestones").await?
                 } else {
-                    http.get_with_query("/api/workspace-milestones", &query).await?
+                    http.get_with_query("/api/workspace-milestones", &query)
+                        .await?
                 };
                 Ok(Some(result))
             }
@@ -1703,64 +2013,113 @@ impl ToolHandler {
 
             "create_workspace_milestone" => {
                 let slug = extract_string(args, "slug")?;
-                let result = http.post(&format!("/api/workspaces/{}/milestones", slug), args).await?;
+                let result = http
+                    .post(&format!("/api/workspaces/{}/milestones", slug), args)
+                    .await?;
                 Ok(Some(result))
             }
 
             "get_workspace_milestone" => {
                 let id = extract_id(args, "id")?;
-                let result = http.get(&format!("/api/workspace-milestones/{}", id)).await?;
+                let result = http
+                    .get(&format!("/api/workspace-milestones/{}", id))
+                    .await?;
                 Ok(Some(result))
             }
 
             "update_workspace_milestone" => {
                 let id = extract_id(args, "id")?;
                 let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("title") { body.insert("title".to_string(), v.clone()); }
-                if let Some(v) = args.get("description") { body.insert("description".to_string(), v.clone()); }
-                if let Some(v) = args.get("status") { body.insert("status".to_string(), v.clone()); }
-                if let Some(v) = args.get("target_date") { body.insert("target_date".to_string(), v.clone()); }
-                let result = http.patch(&format!("/api/workspace-milestones/{}", id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                if let Some(v) = args.get("title") {
+                    body.insert("title".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("status") {
+                    body.insert("status".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("target_date") {
+                    body.insert("target_date".to_string(), v.clone());
+                }
+                let result = http
+                    .patch(
+                        &format!("/api/workspace-milestones/{}", id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_workspace_milestone" => {
                 let id = extract_id(args, "id")?;
-                let result = http.delete(&format!("/api/workspace-milestones/{}", id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                let result = http
+                    .delete(&format!("/api/workspace-milestones/{}", id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "add_task_to_workspace_milestone" => {
                 let id = extract_id(args, "id")?;
                 let task_id = extract_id(args, "task_id")?;
                 let body = json!({"task_id": task_id});
-                let result = http.post(&format!("/api/workspace-milestones/{}/tasks", id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/workspace-milestones/{}/tasks", id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
             }
 
             "link_plan_to_workspace_milestone" => {
                 let id = extract_id(args, "id")?;
                 let plan_id = extract_id(args, "plan_id")?;
                 let body = json!({"plan_id": plan_id});
-                let result = http.post(&format!("/api/workspace-milestones/{}/plans", id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/workspace-milestones/{}/plans", id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"linked": true})
+                } else {
+                    result
+                }))
             }
 
             "unlink_plan_from_workspace_milestone" => {
                 let id = extract_id(args, "id")?;
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http.delete(&format!("/api/workspace-milestones/{}/plans/{}", id, plan_id)).await?;
-                Ok(Some(if result.is_null() { json!({"unlinked": true}) } else { result }))
+                let result = http
+                    .delete(&format!(
+                        "/api/workspace-milestones/{}/plans/{}",
+                        id, plan_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"unlinked": true})
+                } else {
+                    result
+                }))
             }
 
             "get_workspace_milestone_progress" => {
                 let id = extract_id(args, "id")?;
-                let result = http.get(&format!("/api/workspace-milestones/{}/progress", id)).await?;
+                let result = http
+                    .get(&format!("/api/workspace-milestones/{}/progress", id))
+                    .await?;
                 Ok(Some(result))
             }
 
             // --- Resources (6) ---
-
             "list_resources" => {
                 let slug = extract_string(args, "slug")?;
                 let mut query = Vec::new();
@@ -1784,7 +2143,9 @@ impl ToolHandler {
 
             "create_resource" => {
                 let slug = extract_string(args, "slug")?;
-                let result = http.post(&format!("/api/workspaces/{}/resources", slug), args).await?;
+                let result = http
+                    .post(&format!("/api/workspaces/{}/resources", slug), args)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1797,19 +2158,39 @@ impl ToolHandler {
             "update_resource" => {
                 let id = extract_id(args, "id")?;
                 let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("name") { body.insert("name".to_string(), v.clone()); }
-                if let Some(v) = args.get("file_path") { body.insert("file_path".to_string(), v.clone()); }
-                if let Some(v) = args.get("url") { body.insert("url".to_string(), v.clone()); }
-                if let Some(v) = args.get("version") { body.insert("version".to_string(), v.clone()); }
-                if let Some(v) = args.get("description") { body.insert("description".to_string(), v.clone()); }
-                let result = http.patch(&format!("/api/resources/{}", id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                if let Some(v) = args.get("name") {
+                    body.insert("name".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("file_path") {
+                    body.insert("file_path".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("url") {
+                    body.insert("url".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("version") {
+                    body.insert("version".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                let result = http
+                    .patch(&format!("/api/resources/{}", id), &Value::Object(body))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_resource" => {
                 let id = extract_id(args, "id")?;
                 let result = http.delete(&format!("/api/resources/{}", id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "link_resource_to_project" => {
@@ -1817,12 +2198,17 @@ impl ToolHandler {
                 let project_id = extract_id(args, "project_id")?;
                 let link_type = extract_string(args, "link_type")?;
                 let body = json!({"project_id": project_id, "link_type": link_type});
-                let result = http.post(&format!("/api/resources/{}/projects", id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+                let result = http
+                    .post(&format!("/api/resources/{}/projects", id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"linked": true})
+                } else {
+                    result
+                }))
             }
 
             // --- Components (8) ---
-
             "list_components" => {
                 let slug = extract_string(args, "slug")?;
                 let mut query = Vec::new();
@@ -1846,7 +2232,9 @@ impl ToolHandler {
 
             "create_component" => {
                 let slug = extract_string(args, "slug")?;
-                let result = http.post(&format!("/api/workspaces/{}/components", slug), args).await?;
+                let result = http
+                    .post(&format!("/api/workspaces/{}/components", slug), args)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1859,50 +2247,91 @@ impl ToolHandler {
             "update_component" => {
                 let id = extract_id(args, "id")?;
                 let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("name") { body.insert("name".to_string(), v.clone()); }
-                if let Some(v) = args.get("description") { body.insert("description".to_string(), v.clone()); }
-                if let Some(v) = args.get("runtime") { body.insert("runtime".to_string(), v.clone()); }
-                if let Some(v) = args.get("config") { body.insert("config".to_string(), v.clone()); }
-                if let Some(v) = args.get("tags") { body.insert("tags".to_string(), v.clone()); }
-                let result = http.patch(&format!("/api/components/{}", id), &Value::Object(body)).await?;
-                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+                if let Some(v) = args.get("name") {
+                    body.insert("name".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("runtime") {
+                    body.insert("runtime".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("config") {
+                    body.insert("config".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("tags") {
+                    body.insert("tags".to_string(), v.clone());
+                }
+                let result = http
+                    .patch(&format!("/api/components/{}", id), &Value::Object(body))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
             }
 
             "delete_component" => {
                 let id = extract_id(args, "id")?;
                 let result = http.delete(&format!("/api/components/{}", id)).await?;
-                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             "add_component_dependency" => {
                 let id = extract_id(args, "id")?;
                 let depends_on_id = extract_id(args, "depends_on_id")?;
                 let mut body = json!({"depends_on_id": depends_on_id});
-                if let Some(v) = args.get("protocol") { body["protocol"] = v.clone(); }
-                if let Some(v) = args.get("required") { body["required"] = v.clone(); }
-                let result = http.post(&format!("/api/components/{}/dependencies", id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+                if let Some(v) = args.get("protocol") {
+                    body["protocol"] = v.clone();
+                }
+                if let Some(v) = args.get("required") {
+                    body["required"] = v.clone();
+                }
+                let result = http
+                    .post(&format!("/api/components/{}/dependencies", id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
             }
 
             "remove_component_dependency" => {
                 let id = extract_id(args, "id")?;
                 let dep_id = extract_id(args, "dep_id")?;
-                let result = http.delete(&format!("/api/components/{}/dependencies/{}", id, dep_id)).await?;
-                Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
+                let result = http
+                    .delete(&format!("/api/components/{}/dependencies/{}", id, dep_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
             }
 
             "map_component_to_project" => {
                 let id = extract_id(args, "id")?;
                 let project_id = extract_id(args, "project_id")?;
                 let body = json!({"project_id": project_id});
-                let result = http.put(&format!("/api/components/{}/project", id), &body).await?;
-                Ok(Some(if result.is_null() { json!({"mapped": true}) } else { result }))
+                let result = http
+                    .put(&format!("/api/components/{}/project", id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"mapped": true})
+                } else {
+                    result
+                }))
             }
 
             // ── P9: Code Exploration & Analytics (16 tools) ────────────────
 
             // --- Search (3) ---
-
             "search_code" => {
                 let query_str = extract_string(args, "query")?;
                 let mut query = vec![("query".to_string(), query_str)];
@@ -1935,10 +2364,12 @@ impl ToolHandler {
                 if let Some(v) = args.get("path_prefix").and_then(|v| v.as_str()) {
                     query.push(("path_prefix".to_string(), v.to_string()));
                 }
-                let result = http.get_with_query(
-                    &format!("/api/projects/{}/code/search", project_slug),
-                    &query,
-                ).await?;
+                let result = http
+                    .get_with_query(
+                        &format!("/api/projects/{}/code/search", project_slug),
+                        &query,
+                    )
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1964,10 +2395,11 @@ impl ToolHandler {
             }
 
             // --- Graph Traversal (4) ---
-
             "get_file_symbols" => {
                 let file_path = extract_string(args, "file_path")?;
-                let result = http.get(&format!("/api/code/symbols/{}", file_path)).await?;
+                let result = http
+                    .get(&format!("/api/code/symbols/{}", file_path))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1986,7 +2418,9 @@ impl ToolHandler {
 
             "get_file_dependencies" => {
                 let file_path = extract_string(args, "file_path")?;
-                let result = http.get(&format!("/api/code/dependencies/{}", file_path)).await?;
+                let result = http
+                    .get(&format!("/api/code/dependencies/{}", file_path))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -2004,7 +2438,6 @@ impl ToolHandler {
             }
 
             // --- Analysis (3) ---
-
             "analyze_impact" => {
                 let target = extract_string(args, "target")?;
                 let mut query = vec![("target".to_string(), target)];
@@ -2026,7 +2459,8 @@ impl ToolHandler {
                 let result = if query.is_empty() {
                     http.get("/api/code/architecture").await?
                 } else {
-                    http.get_with_query("/api/code/architecture", &query).await?
+                    http.get_with_query("/api/code/architecture", &query)
+                        .await?
                 };
                 Ok(Some(result))
             }
@@ -2038,7 +2472,6 @@ impl ToolHandler {
             }
 
             // --- Types (3) ---
-
             "find_trait_implementations" => {
                 let trait_name = extract_string(args, "trait_name")?;
                 let query = vec![("trait_name".to_string(), trait_name)];
@@ -2061,7 +2494,6 @@ impl ToolHandler {
             }
 
             // --- Analytics GDS (3) ---
-
             "get_code_communities" => {
                 let project_slug = extract_string(args, "project_slug")?;
                 let mut query = vec![("project_slug".to_string(), project_slug)];
@@ -2092,14 +2524,15 @@ impl ToolHandler {
                 if let Some(v) = args.get("node_type").and_then(|v| v.as_str()) {
                     query.push(("node_type".to_string(), v.to_string()));
                 }
-                let result = http.get_with_query("/api/code/node-importance", &query).await?;
+                let result = http
+                    .get_with_query("/api/code/node-importance", &query)
+                    .await?;
                 Ok(Some(result))
             }
 
             // ── P10: Chat, Feature Graphs & Misc (14 tools) ─────────────
 
             // --- Chat CRUD (5) ---
-
             "list_chat_sessions" => {
                 let mut query = Vec::new();
                 if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
@@ -2130,7 +2563,10 @@ impl ToolHandler {
             "chat_send_message" => {
                 // REST POST /api/chat/sessions creates a session + sends the first message
                 let mut body = serde_json::Map::new();
-                body.insert("message".to_string(), json!(extract_string(args, "message")?));
+                body.insert(
+                    "message".to_string(),
+                    json!(extract_string(args, "message")?),
+                );
                 body.insert("cwd".to_string(), json!(extract_string(args, "cwd")?));
                 if let Some(v) = args.get("session_id").and_then(|v| v.as_str()) {
                     body.insert("session_id".to_string(), json!(v));
@@ -2150,7 +2586,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("add_dirs") {
                     body.insert("add_dirs".to_string(), v.clone());
                 }
-                let result = http.post("/api/chat/sessions", &Value::Object(body)).await?;
+                let result = http
+                    .post("/api/chat/sessions", &Value::Object(body))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -2163,20 +2601,26 @@ impl ToolHandler {
                 if let Some(v) = args.get("offset").and_then(|v| v.as_u64()) {
                     query.push(("offset".to_string(), v.to_string()));
                 }
-                let result = http.get_with_query(&format!("/api/chat/sessions/{}/messages", id), &query).await?;
+                let result = http
+                    .get_with_query(&format!("/api/chat/sessions/{}/messages", id), &query)
+                    .await?;
                 Ok(Some(result))
             }
 
             // --- Feature Graphs (6) ---
-
             "create_feature_graph" => {
                 let mut body = serde_json::Map::new();
                 body.insert("name".to_string(), json!(extract_string(args, "name")?));
-                body.insert("project_id".to_string(), json!(extract_id(args, "project_id")?));
+                body.insert(
+                    "project_id".to_string(),
+                    json!(extract_id(args, "project_id")?),
+                );
                 if let Some(v) = args.get("description").and_then(|v| v.as_str()) {
                     body.insert("description".to_string(), json!(v));
                 }
-                let result = http.post("/api/feature-graphs", &Value::Object(body)).await?;
+                let result = http
+                    .post("/api/feature-graphs", &Value::Object(body))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -2204,20 +2648,37 @@ impl ToolHandler {
             "add_to_feature_graph" => {
                 let id = extract_id(args, "feature_graph_id")?;
                 let mut body = serde_json::Map::new();
-                body.insert("entity_type".to_string(), json!(extract_string(args, "entity_type")?));
-                body.insert("entity_id".to_string(), json!(extract_string(args, "entity_id")?));
+                body.insert(
+                    "entity_type".to_string(),
+                    json!(extract_string(args, "entity_type")?),
+                );
+                body.insert(
+                    "entity_id".to_string(),
+                    json!(extract_string(args, "entity_id")?),
+                );
                 if let Some(v) = args.get("role").and_then(|v| v.as_str()) {
                     body.insert("role".to_string(), json!(v));
                 }
-                let result = http.post(&format!("/api/feature-graphs/{}/entities", id), &Value::Object(body)).await?;
+                let result = http
+                    .post(
+                        &format!("/api/feature-graphs/{}/entities", id),
+                        &Value::Object(body),
+                    )
+                    .await?;
                 Ok(Some(result))
             }
 
             "auto_build_feature_graph" => {
                 let mut body = serde_json::Map::new();
                 body.insert("name".to_string(), json!(extract_string(args, "name")?));
-                body.insert("project_id".to_string(), json!(extract_id(args, "project_id")?));
-                body.insert("entry_function".to_string(), json!(extract_string(args, "entry_function")?));
+                body.insert(
+                    "project_id".to_string(),
+                    json!(extract_id(args, "project_id")?),
+                );
+                body.insert(
+                    "entry_function".to_string(),
+                    json!(extract_string(args, "entry_function")?),
+                );
                 if let Some(v) = args.get("description").and_then(|v| v.as_str()) {
                     body.insert("description".to_string(), json!(v));
                 }
@@ -2230,16 +2691,23 @@ impl ToolHandler {
                 if let Some(v) = args.get("filter_community").and_then(|v| v.as_bool()) {
                     body.insert("filter_community".to_string(), json!(v));
                 }
-                let result = http.post("/api/feature-graphs/auto-build", &Value::Object(body)).await?;
+                let result = http
+                    .post("/api/feature-graphs/auto-build", &Value::Object(body))
+                    .await?;
                 Ok(Some(result))
             }
 
             // --- Misc (3) ---
-
             "plan_implementation" => {
                 let mut body = serde_json::Map::new();
-                body.insert("project_slug".to_string(), json!(extract_string(args, "project_slug")?));
-                body.insert("description".to_string(), json!(extract_string(args, "description")?));
+                body.insert(
+                    "project_slug".to_string(),
+                    json!(extract_string(args, "project_slug")?),
+                );
+                body.insert(
+                    "description".to_string(),
+                    json!(extract_string(args, "description")?),
+                );
                 if let Some(v) = args.get("entry_points") {
                     body.insert("entry_points".to_string(), v.clone());
                 }
@@ -2249,7 +2717,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("auto_create_plan").and_then(|v| v.as_bool()) {
                     body.insert("auto_create_plan".to_string(), json!(v));
                 }
-                let result = http.post("/api/code/plan-implementation", &Value::Object(body)).await?;
+                let result = http
+                    .post("/api/code/plan-implementation", &Value::Object(body))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -2266,7 +2736,6 @@ impl ToolHandler {
             // ── P11: Admin & Sync (6 tools) ─────────────────────────────
 
             // --- Sync (1) ---
-
             "sync_directory" => {
                 let mut body = serde_json::Map::new();
                 body.insert("path".to_string(), json!(extract_string(args, "path")?));
@@ -2278,7 +2747,6 @@ impl ToolHandler {
             }
 
             // --- Watch (3) ---
-
             "start_watch" => {
                 let mut body = serde_json::Map::new();
                 if let Some(v) = args.get("path").and_then(|v| v.as_str()) {
@@ -2302,14 +2770,17 @@ impl ToolHandler {
             }
 
             // --- Admin Cleanup (2) ---
-
             "cleanup_cross_project_calls" => {
-                let result = http.post("/api/admin/cleanup-cross-project-calls", &json!({})).await?;
+                let result = http
+                    .post("/api/admin/cleanup-cross-project-calls", &json!({}))
+                    .await?;
                 Ok(Some(result))
             }
 
             "cleanup_sync_data" => {
-                let result = http.post("/api/admin/cleanup-sync-data", &json!({})).await?;
+                let result = http
+                    .post("/api/admin/cleanup-sync-data", &json!({}))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -2662,7 +3133,9 @@ impl ToolHandler {
     async fn unlink_plan_from_project(&self, args: Value) -> Result<Value> {
         let plan_id = parse_uuid(&args, "plan_id")?;
 
-        self.orchestrator().unlink_plan_from_project(plan_id).await?;
+        self.orchestrator()
+            .unlink_plan_from_project(plan_id)
+            .await?;
         Ok(json!({"unlinked": true}))
     }
 

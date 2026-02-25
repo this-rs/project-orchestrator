@@ -285,12 +285,7 @@ pub async fn sync_project(
     let path = std::path::Path::new(&expanded);
     let result = state
         .orchestrator
-        .sync_directory_for_project_with_options(
-            path,
-            Some(project.id),
-            Some(&project.slug),
-            force,
-        )
+        .sync_directory_for_project_with_options(path, Some(project.id), Some(&project.slug), force)
         .await?;
 
     // Update last_synced timestamp

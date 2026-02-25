@@ -401,6 +401,4 @@ impl Neo4jClient {
         }
         Ok(rows)
     }
-
 }
-

@@ -1466,15 +1466,16 @@ pub async fn get_node_importance(
     let pagerank = metrics.pagerank.unwrap_or(0.0);
     let betweenness = metrics.betweenness.unwrap_or(0.0);
 
-    let risk_level = if pagerank > percentiles.pagerank_p95 && betweenness > percentiles.betweenness_p95 {
-        "critical"
-    } else if pagerank > percentiles.pagerank_p95 || betweenness > percentiles.betweenness_p95 {
-        "high"
-    } else if pagerank > percentiles.pagerank_p80 || betweenness > percentiles.betweenness_p80 {
-        "medium"
-    } else {
-        "low"
-    };
+    let risk_level =
+        if pagerank > percentiles.pagerank_p95 && betweenness > percentiles.betweenness_p95 {
+            "critical"
+        } else if pagerank > percentiles.pagerank_p95 || betweenness > percentiles.betweenness_p95 {
+            "high"
+        } else if pagerank > percentiles.pagerank_p80 || betweenness > percentiles.betweenness_p80 {
+            "medium"
+        } else {
+            "low"
+        };
 
     let summary = match risk_level {
         "critical" => format!("{} has very high PageRank and betweenness — modifying it has significant regression risk", params.node_path),

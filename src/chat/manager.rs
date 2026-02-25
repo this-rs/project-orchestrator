@@ -1379,7 +1379,10 @@ impl ChatManager {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to generate MCP session token: {} — MCP will run without auth", e);
+                    tracing::warn!(
+                        "Failed to generate MCP session token: {} — MCP will run without auth",
+                        e
+                    );
                 }
             }
         }
@@ -4586,7 +4589,16 @@ mod tests {
 
         // Without override, falls back to global (Default)
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[], None)
+            .build_options(
+                "/tmp",
+                "claude-opus-4-6",
+                "prompt",
+                None,
+                None,
+                None,
+                &[],
+                None,
+            )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
     }
@@ -4646,7 +4658,16 @@ mod tests {
 
         // Initially Default (safe-by-default)
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[], None)
+            .build_options(
+                "/tmp",
+                "claude-opus-4-6",
+                "prompt",
+                None,
+                None,
+                None,
+                &[],
+                None,
+            )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
 
@@ -4662,7 +4683,16 @@ mod tests {
 
         // New build_options should reflect the update
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[], None)
+            .build_options(
+                "/tmp",
+                "claude-opus-4-6",
+                "prompt",
+                None,
+                None,
+                None,
+                &[],
+                None,
+            )
             .await;
         assert!(matches!(
             opts.permission_mode,
@@ -4801,7 +4831,16 @@ mod tests {
         );
 
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, Some(hooks), &[], None)
+            .build_options(
+                "/tmp",
+                "model",
+                "prompt",
+                None,
+                None,
+                Some(hooks),
+                &[],
+                None,
+            )
             .await;
 
         // Hooks should be configured
@@ -8205,7 +8244,16 @@ mod tests {
 
         // Initially no PATH injection
         let options = manager
-            .build_options("/tmp", "claude-sonnet-4-6", "test", None, None, None, &[], None)
+            .build_options(
+                "/tmp",
+                "claude-sonnet-4-6",
+                "test",
+                None,
+                None,
+                None,
+                &[],
+                None,
+            )
             .await;
         assert!(!options.env.contains_key("PATH"));
 
@@ -8219,7 +8267,16 @@ mod tests {
 
         // Now build_options should pick up the runtime values
         let options = manager
-            .build_options("/tmp", "claude-sonnet-4-6", "test", None, None, None, &[], None)
+            .build_options(
+                "/tmp",
+                "claude-sonnet-4-6",
+                "test",
+                None,
+                None,
+                None,
+                &[],
+                None,
+            )
             .await;
         assert_eq!(
             options.env.get("PATH").map(|s| s.as_str()),

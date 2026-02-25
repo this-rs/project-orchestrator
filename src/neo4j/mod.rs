@@ -1,8 +1,8 @@
 //! Neo4j client and models for the knowledge graph
 
-pub mod client;
 mod analytics;
 mod chat;
+pub mod client;
 mod code;
 mod commit;
 mod constraint;

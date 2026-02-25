@@ -198,8 +198,7 @@ mod tests {
             exp: chrono::Utc::now().timestamp() + 900, // original 15min token
         };
 
-        let token =
-            generate_session_token(&original, TEST_SECRET, 14400).expect("should succeed");
+        let token = generate_session_token(&original, TEST_SECRET, 14400).expect("should succeed");
         let decoded = decode_jwt(&token, TEST_SECRET).expect("should decode");
 
         assert_eq!(decoded.sub, original.sub);
@@ -222,7 +221,10 @@ mod tests {
         let token = generate_session_token(&claims, TEST_SECRET, 3600).expect("should succeed");
         // Same decode function used by require_auth middleware
         let result = decode_jwt(&token, TEST_SECRET);
-        assert!(result.is_ok(), "session token should be valid for require_auth");
+        assert!(
+            result.is_ok(),
+            "session token should be valid for require_auth"
+        );
     }
 
     #[test]

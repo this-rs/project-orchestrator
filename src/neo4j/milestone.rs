@@ -472,9 +472,7 @@ impl Neo4jClient {
             if where_clause.is_empty() { "" } else { &where_clause }
         );
         let count_result = self
-            .execute_with_params(
-                query(&count_cypher).param("project_id", project_id.to_string()),
-            )
+            .execute_with_params(query(&count_cypher).param("project_id", project_id.to_string()))
             .await?;
         let total: i64 = count_result
             .first()
