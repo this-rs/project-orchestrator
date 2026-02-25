@@ -797,6 +797,185 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── P5: Milestones (9 tools) ────────────────────────────────
+
+            "list_milestones" => {
+                let project_id = extract_id(args, "project_id")?;
+                let mut query = Vec::new();
+                if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let path = format!("/api/projects/{}/milestones", project_id);
+                let result = if query.is_empty() {
+                    http.get(&path).await?
+                } else {
+                    http.get_with_query(&path, &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_milestone" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http.post(&format!("/api/projects/{}/milestones", project_id), args).await?;
+                Ok(Some(result))
+            }
+
+            "get_milestone" => {
+                let milestone_id = extract_id(args, "milestone_id")?;
+                let result = http.get(&format!("/api/milestones/{}", milestone_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_milestone" => {
+                let milestone_id = extract_id(args, "milestone_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("status") {
+                    body.insert("status".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("title") {
+                    body.insert("title".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("target_date") {
+                    body.insert("target_date".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("closed_at") {
+                    body.insert("closed_at".to_string(), v.clone());
+                }
+                let result = http.patch(&format!("/api/milestones/{}", milestone_id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_milestone" => {
+                let milestone_id = extract_id(args, "milestone_id")?;
+                let result = http.delete(&format!("/api/milestones/{}", milestone_id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "get_milestone_progress" => {
+                let milestone_id = extract_id(args, "milestone_id")?;
+                let result = http.get(&format!("/api/milestones/{}/progress", milestone_id)).await?;
+                Ok(Some(result))
+            }
+
+            "add_task_to_milestone" => {
+                let milestone_id = extract_id(args, "milestone_id")?;
+                let task_id = extract_id(args, "task_id")?;
+                let body = json!({"task_id": task_id});
+                let result = http.post(&format!("/api/milestones/{}/tasks", milestone_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+            }
+
+            "link_plan_to_milestone" => {
+                let milestone_id = extract_id(args, "milestone_id")?;
+                let plan_id = extract_id(args, "plan_id")?;
+                let body = json!({"plan_id": plan_id});
+                let result = http.post(&format!("/api/milestones/{}/plans", milestone_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+            }
+
+            "unlink_plan_from_milestone" => {
+                let milestone_id = extract_id(args, "milestone_id")?;
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.delete(&format!("/api/milestones/{}/plans/{}", milestone_id, plan_id)).await?;
+                Ok(Some(if result.is_null() { json!({"unlinked": true}) } else { result }))
+            }
+
+            // ── P5: Releases (8 tools) ─────────────────────────────────
+
+            "list_releases" => {
+                let project_id = extract_id(args, "project_id")?;
+                let mut query = Vec::new();
+                if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let path = format!("/api/projects/{}/releases", project_id);
+                let result = if query.is_empty() {
+                    http.get(&path).await?
+                } else {
+                    http.get_with_query(&path, &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_release" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http.post(&format!("/api/projects/{}/releases", project_id), args).await?;
+                Ok(Some(result))
+            }
+
+            "get_release" => {
+                let release_id = extract_id(args, "release_id")?;
+                let result = http.get(&format!("/api/releases/{}", release_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_release" => {
+                let release_id = extract_id(args, "release_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("status") {
+                    body.insert("status".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("title") {
+                    body.insert("title".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("target_date") {
+                    body.insert("target_date".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("released_at") {
+                    body.insert("released_at".to_string(), v.clone());
+                }
+                let result = http.patch(&format!("/api/releases/{}", release_id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_release" => {
+                let release_id = extract_id(args, "release_id")?;
+                let result = http.delete(&format!("/api/releases/{}", release_id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "add_task_to_release" => {
+                let release_id = extract_id(args, "release_id")?;
+                let task_id = extract_id(args, "task_id")?;
+                let body = json!({"task_id": task_id});
+                let result = http.post(&format!("/api/releases/{}/tasks", release_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+            }
+
+            "add_commit_to_release" => {
+                let release_id = extract_id(args, "release_id")?;
+                let commit_sha = extract_string(args, "commit_sha")?;
+                // REST expects "commit_hash" field name
+                let body = json!({"commit_hash": commit_sha});
+                let result = http.post(&format!("/api/releases/{}/commits", release_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+            }
+
+            "remove_commit_from_release" => {
+                let release_id = extract_id(args, "release_id")?;
+                let commit_sha = extract_string(args, "commit_sha")?;
+                let result = http.delete(&format!("/api/releases/{}/commits/{}", release_id, commit_sha)).await?;
+                Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
+            }
+
             // ── Not yet migrated ────────────────────────────────────────
             _ => Ok(None),
         }
