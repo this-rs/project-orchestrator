@@ -6,12 +6,9 @@ use super::handlers::ToolHandler;
 use super::http_client::McpHttpClient;
 use super::protocol::*;
 use super::tools::all_tools;
-use crate::chat::ChatManager;
-use crate::orchestrator::Orchestrator;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -25,33 +22,9 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    /// Create a new MCP server with the given orchestrator (Direct mode)
-    pub fn new(orchestrator: Arc<Orchestrator>) -> Self {
-        let tool_handler = ToolHandler::new(orchestrator);
-        Self {
-            tool_handler,
-            initialized: false,
-        }
-    }
-
-    /// Create a new MCP server with chat support (Direct mode)
-    pub fn with_chat_manager(
-        orchestrator: Arc<Orchestrator>,
-        chat_manager: Arc<ChatManager>,
-    ) -> Self {
-        let tool_handler = ToolHandler::new(orchestrator).with_chat_manager(Some(chat_manager));
-        Self {
-            tool_handler,
-            initialized: false,
-        }
-    }
-
-    /// Create a new MCP server in HTTP proxy mode.
-    ///
-    /// All migrated tools will proxy to the REST API via `McpHttpClient`.
-    /// Non-migrated tools will return an error.
-    pub fn new_http(http_client: McpHttpClient) -> Self {
-        let tool_handler = ToolHandler::new_http(http_client);
+    /// Create a new MCP server that proxies all tool calls to the REST API.
+    pub fn new(http_client: McpHttpClient) -> Self {
+        let tool_handler = ToolHandler::new(http_client);
         Self {
             tool_handler,
             initialized: false,

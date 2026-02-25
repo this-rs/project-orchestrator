@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         std::env::var("PO_AUTH_TOKEN").is_ok()
     );
 
-    let mut server = McpServer::new_http(http_client);
+    let mut server = McpServer::new(http_client);
 
     if let Err(e) = server.run().await {
         error!("MCP server error: {}", e);
