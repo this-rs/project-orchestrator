@@ -129,7 +129,12 @@ fn write_array(out: &mut String, arr: &[Value], indent: usize, inline: bool) {
 
 /// Write an object value.
 /// `inline` means the first key should be written on the current line.
-fn write_object(out: &mut String, map: &serde_json::Map<String, Value>, indent: usize, inline: bool) {
+fn write_object(
+    out: &mut String,
+    map: &serde_json::Map<String, Value>,
+    indent: usize,
+    inline: bool,
+) {
     if map.is_empty() {
         out.push_str("{}");
         return;
