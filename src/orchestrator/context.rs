@@ -65,7 +65,7 @@ impl ContextBuilder {
         // Search for related decisions
         let related_decisions = self
             .plan_manager
-            .search_decisions(&task_details.task.description, 5)
+            .search_decisions(&task_details.task.description, 5, None)
             .await?;
 
         // Get notes for the task

@@ -677,6 +677,7 @@ pub async fn delete_decision(
 pub struct SearchQuery {
     pub q: String,
     pub limit: Option<usize>,
+    pub project_slug: Option<String>,
 }
 
 pub async fn search_decisions(
@@ -686,7 +687,7 @@ pub async fn search_decisions(
     let decisions = state
         .orchestrator
         .plan_manager()
-        .search_decisions(&query.q, query.limit.unwrap_or(10))
+        .search_decisions(&query.q, query.limit.unwrap_or(10), query.project_slug.as_deref())
         .await?;
     Ok(Json(decisions))
 }

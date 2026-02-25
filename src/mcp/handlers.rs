@@ -18,7 +18,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::expand_tilde;
-use super::http_client::{McpHttpClient, extract_string, extract_id};
+use super::http_client::{McpHttpClient, extract_string, extract_id, extract_optional_string};
 
 /// Backend for tool execution — either direct Orchestrator access or HTTP proxy.
 pub enum ToolBackend {
@@ -563,6 +563,238 @@ impl ToolHandler {
                 let constraint_id = extract_id(args, "constraint_id")?;
                 let result = http.delete(&format!("/api/constraints/{}", constraint_id)).await?;
                 Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            // ── P4: Tasks (13 tools) ────────────────────────────────────
+
+            "list_tasks" => {
+                let mut query = Vec::new();
+                if let Some(s) = args.get("plan_id").and_then(|v| v.as_str()) {
+                    query.push(("plan_id".to_string(), s.to_string()));
+                }
+                if let Some(s) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), s.to_string()));
+                }
+                if let Some(s) = args.get("workspace_slug").and_then(|v| v.as_str()) {
+                    query.push(("workspace_slug".to_string(), s.to_string()));
+                }
+                if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), s.to_string()));
+                }
+                if let Some(v) = args.get("priority_min").and_then(|v| v.as_i64()) {
+                    query.push(("priority_min".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("priority_max").and_then(|v| v.as_i64()) {
+                    query.push(("priority_max".to_string(), v.to_string()));
+                }
+                if let Some(s) = args.get("tags").and_then(|v| v.as_str()) {
+                    query.push(("tags".to_string(), s.to_string()));
+                }
+                if let Some(s) = args.get("assigned_to").and_then(|v| v.as_str()) {
+                    query.push(("assigned_to".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                if let Some(sb) = args.get("sort_by").and_then(|v| v.as_str()) {
+                    query.push(("sort_by".to_string(), sb.to_string()));
+                }
+                if let Some(so) = args.get("sort_order").and_then(|v| v.as_str()) {
+                    query.push(("sort_order".to_string(), so.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/tasks").await?
+                } else {
+                    http.get_with_query("/api/tasks", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_task" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.post(&format!("/api/plans/{}/tasks", plan_id), args).await?;
+                Ok(Some(result))
+            }
+
+            "get_task" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.get(&format!("/api/tasks/{}", task_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_task" => {
+                let task_id = extract_id(args, "task_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("status") {
+                    body.insert("status".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("assigned_to") {
+                    body.insert("assigned_to".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("priority") {
+                    body.insert("priority".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("tags") {
+                    body.insert("tags".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("title") {
+                    body.insert("title".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                let result = http.patch(&format!("/api/tasks/{}", task_id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_task" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.delete(&format!("/api/tasks/{}", task_id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "get_next_task" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.get(&format!("/api/plans/{}/next-task", plan_id)).await?;
+                Ok(Some(result))
+            }
+
+            "add_task_dependencies" => {
+                let task_id = extract_id(args, "task_id")?;
+                // REST expects { "depends_on": [...] }, MCP sends { "dependency_ids": [...] }
+                let dep_ids = args.get("dependency_ids")
+                    .cloned()
+                    .unwrap_or(json!([]));
+                let body = json!({"depends_on": dep_ids});
+                let result = http.post(&format!("/api/tasks/{}/dependencies", task_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+            }
+
+            "remove_task_dependency" => {
+                let task_id = extract_id(args, "task_id")?;
+                let dependency_id = extract_id(args, "dependency_id")?;
+                let result = http.delete(&format!("/api/tasks/{}/dependencies/{}", task_id, dependency_id)).await?;
+                Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
+            }
+
+            "get_task_blockers" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.get(&format!("/api/tasks/{}/blockers", task_id)).await?;
+                Ok(Some(result))
+            }
+
+            "get_tasks_blocked_by" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.get(&format!("/api/tasks/{}/blocking", task_id)).await?;
+                Ok(Some(result))
+            }
+
+            "get_task_context" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.get(&format!("/api/plans/{}/tasks/{}/context", plan_id, task_id)).await?;
+                Ok(Some(result))
+            }
+
+            "get_task_prompt" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.get(&format!("/api/plans/{}/tasks/{}/prompt", plan_id, task_id)).await?;
+                Ok(Some(result))
+            }
+
+            "add_decision" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.post(&format!("/api/tasks/{}/decisions", task_id), args).await?;
+                Ok(Some(result))
+            }
+
+            // ── P4: Steps (6 tools) ────────────────────────────────────
+
+            "list_steps" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.get(&format!("/api/tasks/{}/steps", task_id)).await?;
+                Ok(Some(result))
+            }
+
+            "create_step" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.post(&format!("/api/tasks/{}/steps", task_id), args).await?;
+                Ok(Some(result))
+            }
+
+            "get_step" => {
+                let step_id = extract_id(args, "step_id")?;
+                let result = http.get(&format!("/api/steps/{}", step_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_step" => {
+                let step_id = extract_id(args, "step_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("status") {
+                    body.insert("status".to_string(), v.clone());
+                }
+                let result = http.patch(&format!("/api/steps/{}", step_id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_step" => {
+                let step_id = extract_id(args, "step_id")?;
+                let result = http.delete(&format!("/api/steps/{}", step_id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "get_step_progress" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http.get(&format!("/api/tasks/{}/steps/progress", task_id)).await?;
+                Ok(Some(result))
+            }
+
+            // ── P4: Decisions (4 tools) ────────────────────────────────
+
+            "get_decision" => {
+                let decision_id = extract_id(args, "decision_id")?;
+                let result = http.get(&format!("/api/decisions/{}", decision_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_decision" => {
+                let decision_id = extract_id(args, "decision_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("rationale") {
+                    body.insert("rationale".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("chosen_option") {
+                    body.insert("chosen_option".to_string(), v.clone());
+                }
+                let result = http.patch(&format!("/api/decisions/{}", decision_id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_decision" => {
+                let decision_id = extract_id(args, "decision_id")?;
+                let result = http.delete(&format!("/api/decisions/{}", decision_id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "search_decisions" => {
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![("q".to_string(), query_str)];
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(s) = extract_optional_string(args, "project_slug") {
+                    query.push(("project_slug".to_string(), s));
+                }
+                let result = http.get_with_query("/api/decisions/search", &query).await?;
+                Ok(Some(result))
             }
 
             // ── Not yet migrated ────────────────────────────────────────
