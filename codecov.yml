@@ -25,6 +25,11 @@ ignore:
   - "src/api/ws_chat_handler.rs"
   - "src/api/chat_handlers.rs"
   - "src/chat/**"
+  # MCP handlers — try_handle_http() is pure HTTP delegation to REST API,
+  # untestable without a running server (same pattern as neo4j/client.rs).
+  # Mega-tool resolution logic is tested via unit tests in this file.
+  # HTTP routing is covered by API tests (ci.yml: api-tests job).
+  - "src/mcp/handlers.rs"
   # Neo4j client — all methods require a running Neo4j instance.
   # Tested by integration tests (ci.yml: integration-tests, api-tests jobs).
   # Unit tests use MockGraphStore (mock.rs) which is fully covered.
