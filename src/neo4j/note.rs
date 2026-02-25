@@ -340,6 +340,10 @@ impl Neo4jClient {
             EntityType::WorkspaceMilestone => "WorkspaceMilestone",
             EntityType::Resource => "Resource",
             EntityType::Component => "Component",
+            EntityType::Step => "Step",
+            EntityType::Constraint => "Constraint",
+            EntityType::Milestone => "Milestone",
+            EntityType::Release => "Release",
         };
 
         // Determine the match field based on entity type
@@ -395,6 +399,10 @@ impl Neo4jClient {
             EntityType::WorkspaceMilestone => "WorkspaceMilestone",
             EntityType::Resource => "Resource",
             EntityType::Component => "Component",
+            EntityType::Step => "Step",
+            EntityType::Constraint => "Constraint",
+            EntityType::Milestone => "Milestone",
+            EntityType::Release => "Release",
         };
 
         let (match_field, match_value) = match entity_type {
@@ -442,6 +450,10 @@ impl Neo4jClient {
             EntityType::WorkspaceMilestone => "WorkspaceMilestone",
             EntityType::Resource => "Resource",
             EntityType::Component => "Component",
+            EntityType::Step => "Step",
+            EntityType::Constraint => "Constraint",
+            EntityType::Milestone => "Milestone",
+            EntityType::Release => "Release",
         };
 
         let (match_field, match_value) = match entity_type {
@@ -498,6 +510,10 @@ impl Neo4jClient {
             EntityType::WorkspaceMilestone => "WorkspaceMilestone",
             EntityType::Resource => "Resource",
             EntityType::Component => "Component",
+            EntityType::Step => "Step",
+            EntityType::Constraint => "Constraint",
+            EntityType::Milestone => "Milestone",
+            EntityType::Release => "Release",
         };
 
         let (match_field, match_value) = match entity_type {
