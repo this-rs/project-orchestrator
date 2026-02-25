@@ -3,6 +3,7 @@
 //! This module provides an MCP server that exposes the orchestrator API
 //! as tools for Claude Code and other MCP clients.
 
+pub mod formatter;
 pub mod handlers;
 pub mod http_client;
 pub mod protocol;

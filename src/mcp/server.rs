@@ -2,6 +2,7 @@
 //!
 //! Implements the MCP server that communicates over stdio using JSON-RPC 2.0.
 
+use super::formatter::json_to_compact;
 use super::handlers::ToolHandler;
 use super::http_client::McpHttpClient;
 use super::protocol::*;
@@ -208,9 +209,7 @@ impl McpServer {
             .await;
 
         let tool_result = match result {
-            Ok(value) => {
-                ToolCallResult::success(serde_json::to_string_pretty(&value).unwrap_or_default())
-            }
+            Ok(value) => ToolCallResult::success(json_to_compact(&value)),
             Err(e) => {
                 error!("Tool error: {}", e);
                 ToolCallResult::error(e.to_string())
