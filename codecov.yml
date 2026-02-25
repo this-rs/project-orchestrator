@@ -28,9 +28,25 @@ ignore:
   # Neo4j client — all methods require a running Neo4j instance.
   # Tested by integration tests (ci.yml: integration-tests, api-tests jobs).
   # Unit tests use MockGraphStore (mock.rs) which is fully covered.
+  # Note: client.rs was decomposed into domain files — all need live Neo4j.
   - "src/neo4j/client.rs"
-  # Pure trait→client delegation — untestable without Neo4j, zero logic.
   - "src/neo4j/impl_graph_store.rs"
+  - "src/neo4j/analytics.rs"
+  - "src/neo4j/chat.rs"
+  - "src/neo4j/code.rs"
+  - "src/neo4j/commit.rs"
+  - "src/neo4j/constraint.rs"
+  - "src/neo4j/decision.rs"
+  - "src/neo4j/feature_graph.rs"
+  - "src/neo4j/milestone.rs"
+  - "src/neo4j/note.rs"
+  - "src/neo4j/plan.rs"
+  - "src/neo4j/project.rs"
+  - "src/neo4j/release.rs"
+  - "src/neo4j/step.rs"
+  - "src/neo4j/task.rs"
+  - "src/neo4j/user.rs"
+  - "src/neo4j/workspace.rs"
   # Server bootstrap — start_server / start_setup_server bind Axum servers,
   # read env vars, and configure middleware. Pure infrastructure, not unit-testable.
   # Covered by integration/API tests (ci.yml jobs).
