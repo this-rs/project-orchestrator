@@ -3,6 +3,7 @@
 //! Implements the MCP server that communicates over stdio using JSON-RPC 2.0.
 
 use super::handlers::ToolHandler;
+use super::http_client::McpHttpClient;
 use super::protocol::*;
 use super::tools::all_tools;
 use crate::chat::ChatManager;
@@ -19,32 +20,40 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// MCP Server that handles JSON-RPC 2.0 requests over stdio
 pub struct McpServer {
-    #[allow(dead_code)]
-    orchestrator: Arc<Orchestrator>,
     tool_handler: ToolHandler,
     initialized: bool,
 }
 
 impl McpServer {
-    /// Create a new MCP server with the given orchestrator
+    /// Create a new MCP server with the given orchestrator (Direct mode)
     pub fn new(orchestrator: Arc<Orchestrator>) -> Self {
-        let tool_handler = ToolHandler::new(orchestrator.clone());
+        let tool_handler = ToolHandler::new(orchestrator);
         Self {
-            orchestrator,
             tool_handler,
             initialized: false,
         }
     }
 
-    /// Create a new MCP server with chat support
+    /// Create a new MCP server with chat support (Direct mode)
     pub fn with_chat_manager(
         orchestrator: Arc<Orchestrator>,
         chat_manager: Arc<ChatManager>,
     ) -> Self {
         let tool_handler =
-            ToolHandler::new(orchestrator.clone()).with_chat_manager(Some(chat_manager));
+            ToolHandler::new(orchestrator).with_chat_manager(Some(chat_manager));
         Self {
-            orchestrator,
+            tool_handler,
+            initialized: false,
+        }
+    }
+
+    /// Create a new MCP server in HTTP proxy mode.
+    ///
+    /// All migrated tools will proxy to the REST API via `McpHttpClient`.
+    /// Non-migrated tools will return an error.
+    pub fn new_http(http_client: McpHttpClient) -> Self {
+        let tool_handler = ToolHandler::new_http(http_client);
+        Self {
             tool_handler,
             initialized: false,
         }

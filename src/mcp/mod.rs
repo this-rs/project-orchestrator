@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod server;
 pub mod tools;
 
+pub use handlers::ToolBackend;
 pub use http_client::McpHttpClient;
 pub use protocol::*;
 pub use server::McpServer;

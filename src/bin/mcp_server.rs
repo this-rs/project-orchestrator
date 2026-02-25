@@ -3,17 +3,21 @@
 //! This binary runs the project-orchestrator as an MCP server,
 //! communicating over stdio for integration with Claude Code.
 //!
-//! # Usage
+//! # Dual Mode
 //!
+//! The server supports two operational modes:
+//!
+//! ## Direct mode (default)
+//! Connects directly to Neo4j, Meilisearch, etc. All tools work.
 //! ```bash
-//! # Run directly
-//! ./mcp_server
-//!
-//! # With environment variables
 //! NEO4J_URI=bolt://localhost:7687 ./mcp_server
+//! ```
 //!
-//! # With debug logging
-//! RUST_LOG=debug ./mcp_server
+//! ## HTTP proxy mode
+//! Proxies tool calls to the REST API. Only migrated tools work.
+//! Activated when `PO_SERVER_URL` is set (injected by the backend at session spawn).
+//! ```bash
+//! PO_SERVER_URL=http://127.0.0.1:8080 PO_AUTH_TOKEN=<jwt> ./mcp_server
 //! ```
 //!
 //! # Claude Code Integration
@@ -43,7 +47,7 @@ use clap::Parser;
 use project_orchestrator::chat::{ChatConfig, ChatManager};
 #[allow(deprecated)] // EventNotifier kept for legacy MCP_HTTP_URL fallback
 use project_orchestrator::events::{connect_nats, EventNotifier, NatsEmitter};
-use project_orchestrator::mcp::McpServer;
+use project_orchestrator::mcp::{McpHttpClient, McpServer};
 use project_orchestrator::orchestrator::Orchestrator;
 use project_orchestrator::{AppState, Config};
 use std::sync::Arc;
@@ -100,9 +104,52 @@ async fn main() -> Result<()> {
         .with(EnvFilter::from_default_env().add_directive("project_orchestrator=info".parse()?))
         .init();
 
+    info!("Starting MCP server for project-orchestrator");
+
+    // ── Dual mode detection ──────────────────────────────────────────────
+    //
+    // If PO_SERVER_URL is set, the MCP server operates as a thin HTTP proxy
+    // that delegates tool calls to the REST API. This is the target architecture
+    // (injected by the backend at session spawn).
+    //
+    // If PO_SERVER_URL is NOT set, the server operates in legacy Direct mode
+    // with full Orchestrator/Neo4j/Meilisearch access.
+    if let Some(http_client) = McpHttpClient::from_env() {
+        return run_http_mode(http_client).await;
+    }
+
+    // ── Direct mode (legacy) ─────────────────────────────────────────────
+    run_direct_mode().await
+}
+
+/// Run the MCP server in HTTP proxy mode.
+///
+/// Lightweight: no Neo4j, no Meilisearch, no Orchestrator.
+/// Only requires the REST API to be running.
+async fn run_http_mode(http_client: McpHttpClient) -> Result<()> {
+    info!("MCP server starting in HTTP proxy mode");
+    info!(
+        "Proxying tool calls to REST API (PO_SERVER_URL set, auth={})",
+        std::env::var("PO_AUTH_TOKEN").is_ok()
+    );
+
+    let mut server = McpServer::new_http(http_client);
+
+    if let Err(e) = server.run().await {
+        error!("MCP server error: {}", e);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// Run the MCP server in Direct mode (legacy).
+///
+/// Full access to Neo4j, Meilisearch, Orchestrator, ChatManager.
+async fn run_direct_mode() -> Result<()> {
     let args = Args::parse();
 
-    info!("Starting MCP server for project-orchestrator");
+    info!("MCP server starting in Direct mode (legacy)");
 
     // Deprecation warning for MCP_HTTP_URL
     if args.http_url.is_some() {

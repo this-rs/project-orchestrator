@@ -1,6 +1,10 @@
 //! MCP Tool handlers
 //!
 //! Implements the actual logic for each MCP tool.
+//!
+//! Supports two backends:
+//! - **Direct** mode: tools call the Orchestrator directly (legacy, full access to Neo4j/Meili)
+//! - **Http** mode: tools proxy calls to the REST API via McpHttpClient (target architecture)
 
 use crate::chat::ChatManager;
 use crate::meilisearch::SearchStore;
@@ -14,37 +18,95 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::expand_tilde;
+use super::http_client::McpHttpClient;
+
+/// Backend for tool execution — either direct Orchestrator access or HTTP proxy.
+pub enum ToolBackend {
+    /// Direct access to Orchestrator + optional ChatManager (legacy mode).
+    /// Used when PO_SERVER_URL is NOT set.
+    Direct(Arc<Orchestrator>, Option<Arc<ChatManager>>),
+
+    /// HTTP proxy to REST API via McpHttpClient (target architecture).
+    /// Used when PO_SERVER_URL IS set.
+    Http(McpHttpClient),
+}
 
 /// Handles MCP tool calls
 pub struct ToolHandler {
-    orchestrator: Arc<Orchestrator>,
-    chat_manager: Option<Arc<ChatManager>>,
+    backend: ToolBackend,
 }
 
 impl ToolHandler {
+    /// Create a new ToolHandler with direct Orchestrator access (legacy mode).
     pub fn new(orchestrator: Arc<Orchestrator>) -> Self {
         Self {
-            orchestrator,
-            chat_manager: None,
+            backend: ToolBackend::Direct(orchestrator, None),
         }
     }
 
+    /// Create a new ToolHandler with HTTP proxy backend.
+    pub fn new_http(http_client: McpHttpClient) -> Self {
+        Self {
+            backend: ToolBackend::Http(http_client),
+        }
+    }
+
+    /// Add a ChatManager to a Direct-mode ToolHandler.
     pub fn with_chat_manager(mut self, chat_manager: Option<Arc<ChatManager>>) -> Self {
-        self.chat_manager = chat_manager;
+        if let ToolBackend::Direct(_, ref mut cm) = self.backend {
+            *cm = chat_manager;
+        }
         self
     }
 
+    /// Returns true if the handler is in HTTP proxy mode.
+    pub fn is_http_mode(&self) -> bool {
+        matches!(self.backend, ToolBackend::Http(_))
+    }
+
+    /// Get the HTTP client (panics if not in Http mode).
+    fn http(&self) -> &McpHttpClient {
+        match &self.backend {
+            ToolBackend::Http(client) => client,
+            ToolBackend::Direct(..) => panic!("http() called on Direct backend"),
+        }
+    }
+
+    /// Get the Orchestrator (panics if not in Direct mode).
+    fn orchestrator(&self) -> &Arc<Orchestrator> {
+        match &self.backend {
+            ToolBackend::Direct(orch, _) => orch,
+            ToolBackend::Http(_) => panic!("orchestrator() called on Http backend"),
+        }
+    }
+
     fn neo4j(&self) -> &dyn GraphStore {
-        self.orchestrator.neo4j()
+        self.orchestrator().neo4j()
     }
 
     fn meili(&self) -> &dyn SearchStore {
-        self.orchestrator.meili()
+        self.orchestrator().meili()
     }
 
     /// Handle a tool call and return the result as JSON
     pub async fn handle(&self, name: &str, args: Option<Value>) -> Result<Value> {
         let args = args.unwrap_or(json!({}));
+
+        // ── HTTP-mode routing (smoke test: list_projects only) ──────────
+        // In HTTP mode, route migrated tools through the REST API.
+        // All other tools fall through to Direct mode (which will panic
+        // if the backend is Http — this is intentional during migration).
+        if self.is_http_mode() {
+            if let Some(result) = self.try_handle_http(name, &args).await? {
+                return Ok(result);
+            }
+            // Not yet migrated — error out in Http mode
+            return Err(anyhow!(
+                "Tool '{}' is not yet migrated to HTTP mode. \
+                 This tool requires Direct mode (PO_SERVER_URL must not be set).",
+                name
+            ));
+        }
 
         match name {
             // Projects
@@ -257,6 +319,48 @@ impl ToolHandler {
     }
 
     // ========================================================================
+    // HTTP-mode routing (migrated tools)
+    // ========================================================================
+
+    /// Try to handle a tool call via HTTP proxy.
+    /// Returns `Ok(Some(value))` if the tool is migrated, `Ok(None)` if not yet migrated.
+    async fn try_handle_http(&self, name: &str, args: &Value) -> Result<Option<Value>> {
+        let http = self.http();
+
+        match name {
+            // ── Smoke test: list_projects only ──────────────────────────
+            "list_projects" => {
+                let mut query = Vec::new();
+                if let Some(s) = args.get("search").and_then(|v| v.as_str()) {
+                    query.push(("search".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                if let Some(sb) = args.get("sort_by").and_then(|v| v.as_str()) {
+                    query.push(("sort_by".to_string(), sb.to_string()));
+                }
+                if let Some(so) = args.get("sort_order").and_then(|v| v.as_str()) {
+                    query.push(("sort_order".to_string(), so.to_string()));
+                }
+
+                let result = if query.is_empty() {
+                    http.get("/api/projects").await?
+                } else {
+                    http.get_with_query("/api/projects", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            // ── Not yet migrated ────────────────────────────────────────
+            _ => Ok(None),
+        }
+    }
+
+    // ========================================================================
     // Project Handlers
     // ========================================================================
 
@@ -310,7 +414,7 @@ impl ToolHandler {
             analytics_computed_at: None,
         };
 
-        self.orchestrator.create_project(&project).await?;
+        self.orchestrator().create_project(&project).await?;
         Ok(serde_json::to_value(project)?)
     }
 
@@ -353,7 +457,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(expand_tilde);
 
-        self.orchestrator
+        self.orchestrator()
             .update_project(project.id, name, description, root_path)
             .await?;
         Ok(json!({"updated": true}))
@@ -371,7 +475,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Project not found: {}", slug))?;
 
-        self.orchestrator.delete_project(project.id).await?;
+        self.orchestrator().delete_project(project.id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -392,7 +496,7 @@ impl ToolHandler {
         let expanded = expand_tilde(&project.root_path);
         let path = std::path::Path::new(&expanded);
         let result = self
-            .orchestrator
+            .orchestrator()
             .sync_directory_for_project_with_options(
                 path,
                 Some(project.id),
@@ -404,10 +508,10 @@ impl ToolHandler {
         self.neo4j().update_project_synced(project.id).await?;
 
         // Compute graph analytics (PageRank, communities, etc.) — best-effort, background
-        self.orchestrator.spawn_analyze_project(project.id);
+        self.orchestrator().spawn_analyze_project(project.id);
 
         // Refresh auto-built feature graphs in background (best-effort)
-        self.orchestrator.spawn_refresh_feature_graphs(project.id);
+        self.orchestrator().spawn_refresh_feature_graphs(project.id);
 
         Ok(json!({
             "files_synced": result.files_synced,
@@ -551,7 +655,7 @@ impl ToolHandler {
         };
 
         let plan = self
-            .orchestrator
+            .orchestrator()
             .plan_manager()
             .create_plan(req, "mcp")
             .await?;
@@ -562,7 +666,7 @@ impl ToolHandler {
         let plan_id = parse_uuid(&args, "plan_id")?;
 
         let details = self
-            .orchestrator
+            .orchestrator()
             .plan_manager()
             .get_plan_details(plan_id)
             .await?
@@ -579,7 +683,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("status is required"))?;
 
         let status: PlanStatus = serde_json::from_str(&format!("\"{}\"", status_str))?;
-        self.orchestrator
+        self.orchestrator()
             .plan_manager()
             .update_plan_status(plan_id, status)
             .await?;
@@ -591,7 +695,7 @@ impl ToolHandler {
         let plan_id = parse_uuid(&args, "plan_id")?;
         let project_id = parse_uuid(&args, "project_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .link_plan_to_project(plan_id, project_id)
             .await?;
         Ok(json!({"linked": true}))
@@ -600,14 +704,14 @@ impl ToolHandler {
     async fn unlink_plan_from_project(&self, args: Value) -> Result<Value> {
         let plan_id = parse_uuid(&args, "plan_id")?;
 
-        self.orchestrator.unlink_plan_from_project(plan_id).await?;
+        self.orchestrator().unlink_plan_from_project(plan_id).await?;
         Ok(json!({"unlinked": true}))
     }
 
     async fn delete_plan(&self, args: Value) -> Result<Value> {
         let plan_id = parse_uuid(&args, "plan_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .plan_manager()
             .delete_plan(plan_id)
             .await?;
@@ -619,7 +723,7 @@ impl ToolHandler {
 
         // Get all tasks for the plan with their dependencies
         let details = self
-            .orchestrator
+            .orchestrator()
             .plan_manager()
             .get_plan_details(plan_id)
             .await?
@@ -666,7 +770,7 @@ impl ToolHandler {
 
         // Get all tasks for the plan
         let details = self
-            .orchestrator
+            .orchestrator()
             .plan_manager()
             .get_plan_details(plan_id)
             .await?
@@ -850,7 +954,7 @@ impl ToolHandler {
         };
 
         let task = self
-            .orchestrator
+            .orchestrator()
             .plan_manager()
             .add_task(plan_id, req)
             .await?;
@@ -861,7 +965,7 @@ impl ToolHandler {
         let task_id = parse_uuid(&args, "task_id")?;
 
         let details = self
-            .orchestrator
+            .orchestrator()
             .plan_manager()
             .get_task_details(task_id)
             .await?
@@ -872,7 +976,7 @@ impl ToolHandler {
 
     async fn delete_task(&self, args: Value) -> Result<Value> {
         let task_id = parse_uuid(&args, "task_id")?;
-        self.orchestrator
+        self.orchestrator()
             .plan_manager()
             .delete_task(task_id)
             .await?;
@@ -914,7 +1018,7 @@ impl ToolHandler {
             ..Default::default()
         };
 
-        self.orchestrator
+        self.orchestrator()
             .plan_manager()
             .update_task(task_id, req)
             .await?;
@@ -925,7 +1029,7 @@ impl ToolHandler {
         let plan_id = parse_uuid(&args, "plan_id")?;
 
         let task = self
-            .orchestrator
+            .orchestrator()
             .plan_manager()
             .get_next_available_task(plan_id)
             .await?;
@@ -945,7 +1049,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("dependency_ids is required"))?;
 
         for dep_id in dependency_ids {
-            self.orchestrator
+            self.orchestrator()
                 .add_task_dependency(task_id, dep_id)
                 .await?;
         }
@@ -956,7 +1060,7 @@ impl ToolHandler {
         let task_id = parse_uuid(&args, "task_id")?;
         let dependency_id = parse_uuid(&args, "dependency_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .remove_task_dependency(task_id, dependency_id)
             .await?;
         Ok(json!({"removed": true}))
@@ -981,7 +1085,7 @@ impl ToolHandler {
         let task_id = parse_uuid(&args, "task_id")?;
 
         let context = self
-            .orchestrator
+            .orchestrator()
             .context_builder()
             .build_context(task_id, plan_id)
             .await?;
@@ -993,12 +1097,12 @@ impl ToolHandler {
         let task_id = parse_uuid(&args, "task_id")?;
 
         let context = self
-            .orchestrator
+            .orchestrator()
             .context_builder()
             .build_context(task_id, plan_id)
             .await?;
         let prompt = self
-            .orchestrator
+            .orchestrator()
             .context_builder()
             .generate_prompt(&context);
 
@@ -1036,7 +1140,7 @@ impl ToolHandler {
         };
 
         let decision = self
-            .orchestrator
+            .orchestrator()
             .plan_manager()
             .add_decision(task_id, req, "mcp")
             .await?;
@@ -1070,7 +1174,7 @@ impl ToolHandler {
         let order = steps.len() as u32;
 
         let step = StepNode::new(order, description.to_string(), verification);
-        self.orchestrator
+        self.orchestrator()
             .plan_manager()
             .add_step(task_id, &step)
             .await?;
@@ -1085,7 +1189,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("status is required"))?;
 
         let status: StepStatus = serde_json::from_str(&format!("\"{}\"", status_str))?;
-        self.orchestrator
+        self.orchestrator()
             .plan_manager()
             .update_step_status(step_id, status)
             .await?;
@@ -1138,7 +1242,7 @@ impl ToolHandler {
             None,
         );
 
-        self.orchestrator
+        self.orchestrator()
             .plan_manager()
             .add_constraint(plan_id, &constraint)
             .await?;
@@ -1148,7 +1252,7 @@ impl ToolHandler {
     async fn delete_constraint(&self, args: Value) -> Result<Value> {
         let constraint_id = parse_uuid(&args, "constraint_id")?;
 
-        self.orchestrator.delete_constraint(constraint_id).await?;
+        self.orchestrator().delete_constraint(constraint_id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -1210,7 +1314,7 @@ impl ToolHandler {
             project_id,
         };
 
-        self.orchestrator.create_release(&release).await?;
+        self.orchestrator().create_release(&release).await?;
         Ok(serde_json::to_value(release)?)
     }
 
@@ -1262,7 +1366,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.orchestrator
+        self.orchestrator()
             .update_release(
                 release_id,
                 status,
@@ -1279,7 +1383,7 @@ impl ToolHandler {
         let release_id = parse_uuid(&args, "release_id")?;
         let task_id = parse_uuid(&args, "task_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .add_task_to_release(release_id, task_id)
             .await?;
         Ok(json!({"added": true}))
@@ -1292,7 +1396,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("commit_sha is required"))?;
 
-        self.orchestrator
+        self.orchestrator()
             .add_commit_to_release(release_id, commit_sha)
             .await?;
         Ok(json!({"added": true}))
@@ -1305,7 +1409,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("commit_sha is required"))?;
 
-        self.orchestrator
+        self.orchestrator()
             .remove_commit_from_release(release_id, commit_sha)
             .await?;
         Ok(json!({"removed": true}))
@@ -1364,7 +1468,7 @@ impl ToolHandler {
             project_id,
         };
 
-        self.orchestrator.create_milestone(&milestone).await?;
+        self.orchestrator().create_milestone(&milestone).await?;
         Ok(serde_json::to_value(milestone)?)
     }
 
@@ -1413,7 +1517,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.orchestrator
+        self.orchestrator()
             .update_milestone(
                 milestone_id,
                 status,
@@ -1450,7 +1554,7 @@ impl ToolHandler {
         let milestone_id = parse_uuid(&args, "milestone_id")?;
         let task_id = parse_uuid(&args, "task_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .add_task_to_milestone(milestone_id, task_id)
             .await?;
         Ok(json!({"added": true}))
@@ -1460,7 +1564,7 @@ impl ToolHandler {
         let plan_id = parse_uuid(&args, "plan_id")?;
         let milestone_id = parse_uuid(&args, "milestone_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .link_plan_to_milestone(plan_id, milestone_id)
             .await?;
         Ok(json!({"linked": true}))
@@ -1470,7 +1574,7 @@ impl ToolHandler {
         let plan_id = parse_uuid(&args, "plan_id")?;
         let milestone_id = parse_uuid(&args, "milestone_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .unlink_plan_from_milestone(plan_id, milestone_id)
             .await?;
         Ok(json!({"unlinked": true}))
@@ -1514,7 +1618,7 @@ impl ToolHandler {
             timestamp: chrono::Utc::now(),
         };
 
-        self.orchestrator.create_commit(&commit).await?;
+        self.orchestrator().create_commit(&commit).await?;
 
         // Clone files list before it's moved into the sync spawn
         let ar_files_for_hook = files_changed.clone();
@@ -1523,7 +1627,7 @@ impl ToolHandler {
         let sync_triggered = !files_changed.is_empty() && project_id.is_some();
         if sync_triggered {
             let project_id = project_id.unwrap();
-            let orchestrator = self.orchestrator.clone();
+            let orchestrator = self.orchestrator().clone();
 
             // Resolve project slug for MeiliSearch indexing
             let project_slug = self.neo4j().get_project(project_id).await?.map(|p| p.slug);
@@ -1550,9 +1654,9 @@ impl ToolHandler {
         }
 
         // Hook Niveau 2: boost energy of notes linked to committed files
-        let ar_config = self.orchestrator.auto_reinforcement_config().clone();
+        let ar_config = self.orchestrator().auto_reinforcement_config().clone();
         if ar_config.enabled && !ar_files_for_hook.is_empty() {
-            let neo4j = self.orchestrator.neo4j_arc();
+            let neo4j = self.orchestrator().neo4j_arc();
             let files = ar_files_for_hook;
             tokio::spawn(async move {
                 for file_path in &files {
@@ -1608,7 +1712,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("commit_sha is required"))?;
 
-        self.orchestrator
+        self.orchestrator()
             .link_commit_to_task(commit_sha, task_id)
             .await?;
         Ok(json!({"linked": true}))
@@ -1621,7 +1725,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("commit_sha is required"))?;
 
-        self.orchestrator
+        self.orchestrator()
             .link_commit_to_plan(commit_sha, plan_id)
             .await?;
         Ok(json!({"linked": true}))
@@ -2112,7 +2216,7 @@ impl ToolHandler {
         let expanded = expand_tilde(path_str);
         let path = std::path::Path::new(&expanded);
         let result = self
-            .orchestrator
+            .orchestrator()
             .sync_directory_for_project(path, project_id, project_slug.as_deref())
             .await?;
 
@@ -2120,9 +2224,9 @@ impl ToolHandler {
         if let Some(pid) = project_id {
             self.neo4j().update_project_synced(pid).await?;
             // Compute graph analytics (PageRank, communities, etc.) — best-effort, background
-            self.orchestrator.spawn_analyze_project(pid);
+            self.orchestrator().spawn_analyze_project(pid);
             // Refresh auto-built feature graphs in background (best-effort)
-            self.orchestrator.spawn_refresh_feature_graphs(pid);
+            self.orchestrator().spawn_refresh_feature_graphs(pid);
         }
 
         Ok(json!({
@@ -2232,7 +2336,7 @@ impl ToolHandler {
         };
 
         let (notes, total) = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .list_notes(project_id, None, &filters)
             .await?;
@@ -2284,7 +2388,7 @@ impl ToolHandler {
         };
 
         let note = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .create_note(request, "mcp")
             .await?;
@@ -2296,7 +2400,7 @@ impl ToolHandler {
         let note_id = parse_uuid(&args, "note_id")?;
 
         let note = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .get_note(note_id)
             .await?
@@ -2333,7 +2437,7 @@ impl ToolHandler {
         };
 
         let note = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .update_note(note_id, request)
             .await?
@@ -2346,7 +2450,7 @@ impl ToolHandler {
         let note_id = parse_uuid(&args, "note_id")?;
 
         let deleted = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .delete_note(note_id)
             .await?;
@@ -2387,7 +2491,7 @@ impl ToolHandler {
         };
 
         let hits = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .search_notes(query, &filters)
             .await?;
@@ -2421,7 +2525,7 @@ impl ToolHandler {
             .map(|v| v as usize);
 
         let hits = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .semantic_search_notes(query, project_id, workspace_slug, limit)
             .await?;
@@ -2433,7 +2537,7 @@ impl ToolHandler {
         let note_id = parse_uuid(&args, "note_id")?;
 
         let note = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .confirm_note(note_id, "mcp")
             .await?
@@ -2450,7 +2554,7 @@ impl ToolHandler {
             .ok_or_else(|| anyhow!("reason is required"))?;
 
         let note = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .invalidate_note(note_id, reason, "mcp")
             .await?
@@ -2499,7 +2603,7 @@ impl ToolHandler {
         };
 
         let new_note = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .supersede_note(old_note_id, request, "mcp")
             .await?;
@@ -2528,7 +2632,7 @@ impl ToolHandler {
             entity_id,
         };
 
-        self.orchestrator
+        self.orchestrator()
             .note_manager()
             .link_note_to_entity(note_id, &request)
             .await?;
@@ -2551,7 +2655,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("entity_id is required"))?;
 
-        self.orchestrator
+        self.orchestrator()
             .note_manager()
             .unlink_note_from_entity(note_id, &entity_type, entity_id)
             .await?;
@@ -2579,7 +2683,7 @@ impl ToolHandler {
             .unwrap_or(0.1);
 
         let response = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .get_context_notes(&entity_type, entity_id, max_depth, min_score)
             .await?;
@@ -2594,7 +2698,7 @@ impl ToolHandler {
             .and_then(|s| Uuid::parse_str(s).ok());
 
         let notes = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .get_notes_needing_review(project_id)
             .await?;
@@ -2604,7 +2708,7 @@ impl ToolHandler {
 
     async fn update_staleness_scores(&self, _args: Value) -> Result<Value> {
         let count = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .update_staleness_scores()
             .await?;
@@ -2619,7 +2723,7 @@ impl ToolHandler {
             .unwrap_or(90.0);
 
         let count = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .update_energy_scores(half_life)
             .await?;
@@ -2633,7 +2737,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("query is required"))?;
 
-        let engine = self.orchestrator.activation_engine().ok_or_else(|| {
+        let engine = self.orchestrator().activation_engine().ok_or_else(|| {
             anyhow!(
                 "Spreading activation unavailable: no embedding provider configured. \
                      Set EMBEDDING_PROVIDER=local or EMBEDDING_PROVIDER=http to enable."
@@ -2698,10 +2802,10 @@ impl ToolHandler {
             .collect();
 
         // Hook Niveau 1: auto-reinforce co-activated notes (fire-and-forget)
-        let ar_config = self.orchestrator.auto_reinforcement_config().clone();
+        let ar_config = self.orchestrator().auto_reinforcement_config().clone();
         if ar_config.enabled && !results.is_empty() {
             let note_ids: Vec<Uuid> = results.iter().map(|r| r.note.id).collect();
-            let neo4j = self.orchestrator.neo4j_arc();
+            let neo4j = self.orchestrator().neo4j_arc();
             tokio::spawn(async move {
                 // Boost energy for each activated note
                 for id in &note_ids {
@@ -2823,7 +2927,7 @@ impl ToolHandler {
 
         let start = std::time::Instant::now();
         let progress = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .backfill_synapses(batch_size, min_similarity, max_neighbors, None)
             .await?;
@@ -2852,7 +2956,7 @@ impl ToolHandler {
         };
 
         let (notes, total) = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .list_project_notes(project_id, &filters)
             .await?;
@@ -2885,7 +2989,7 @@ impl ToolHandler {
             .map_err(|_| anyhow!("Invalid entity type: {}", entity_type_str))?;
 
         let notes = self
-            .orchestrator
+            .orchestrator()
             .note_manager()
             .get_propagated_notes(&entity_type, entity_id, max_depth, min_score)
             .await?;
@@ -2908,7 +3012,7 @@ impl ToolHandler {
             .map_err(|_| anyhow!("Invalid entity type: {}", entity_type_str))?;
 
         let notes = self
-            .orchestrator
+            .orchestrator()
             .neo4j()
             .get_notes_for_entity(&entity_type, entity_id)
             .await?;
@@ -2982,7 +3086,7 @@ impl ToolHandler {
             metadata,
         };
 
-        self.orchestrator.create_workspace(&workspace).await?;
+        self.orchestrator().create_workspace(&workspace).await?;
         Ok(serde_json::to_value(workspace)?)
     }
 
@@ -3023,7 +3127,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        self.orchestrator
+        self.orchestrator()
             .update_workspace(workspace.id, name, description, metadata)
             .await?;
 
@@ -3050,7 +3154,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        self.orchestrator.delete_workspace(workspace.id).await?;
+        self.orchestrator().delete_workspace(workspace.id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3123,7 +3227,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        self.orchestrator
+        self.orchestrator()
             .add_project_to_workspace(workspace.id, project_id)
             .await?;
 
@@ -3143,7 +3247,7 @@ impl ToolHandler {
             .await?
             .ok_or_else(|| anyhow!("Workspace not found"))?;
 
-        self.orchestrator
+        self.orchestrator()
             .remove_project_from_workspace(workspace.id, project_id)
             .await?;
 
@@ -3267,7 +3371,7 @@ impl ToolHandler {
             tags,
         };
 
-        self.orchestrator
+        self.orchestrator()
             .create_workspace_milestone(&milestone)
             .await?;
         Ok(serde_json::to_value(milestone)?)
@@ -3314,7 +3418,7 @@ impl ToolHandler {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
 
-        self.orchestrator
+        self.orchestrator()
             .update_workspace_milestone(id, title, description, status, target_date)
             .await?;
 
@@ -3330,7 +3434,7 @@ impl ToolHandler {
     async fn delete_workspace_milestone(&self, args: Value) -> Result<Value> {
         let id = parse_uuid(&args, "id")?;
 
-        self.orchestrator.delete_workspace_milestone(id).await?;
+        self.orchestrator().delete_workspace_milestone(id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3338,7 +3442,7 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let task_id = parse_uuid(&args, "task_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .add_task_to_workspace_milestone(id, task_id)
             .await?;
 
@@ -3349,7 +3453,7 @@ impl ToolHandler {
         let plan_id = parse_uuid(&args, "plan_id")?;
         let id = parse_uuid(&args, "id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .link_plan_to_workspace_milestone(plan_id, id)
             .await?;
 
@@ -3360,7 +3464,7 @@ impl ToolHandler {
         let plan_id = parse_uuid(&args, "plan_id")?;
         let id = parse_uuid(&args, "id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .unlink_plan_from_workspace_milestone(plan_id, id)
             .await?;
 
@@ -3487,7 +3591,7 @@ impl ToolHandler {
             metadata,
         };
 
-        self.orchestrator.create_resource(&resource).await?;
+        self.orchestrator().create_resource(&resource).await?;
         Ok(serde_json::to_value(resource)?)
     }
 
@@ -3506,7 +3610,7 @@ impl ToolHandler {
     async fn delete_resource(&self, args: Value) -> Result<Value> {
         let id = parse_uuid(&args, "id")?;
 
-        self.orchestrator.delete_resource(id).await?;
+        self.orchestrator().delete_resource(id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3520,12 +3624,12 @@ impl ToolHandler {
 
         match link_type.to_lowercase().as_str() {
             "implements" => {
-                self.orchestrator
+                self.orchestrator()
                     .link_project_implements_resource(project_id, id)
                     .await?;
             }
             "uses" => {
-                self.orchestrator
+                self.orchestrator()
                     .link_project_uses_resource(project_id, id)
                     .await?;
             }
@@ -3633,7 +3737,7 @@ impl ToolHandler {
             tags,
         };
 
-        self.orchestrator.create_component(&component).await?;
+        self.orchestrator().create_component(&component).await?;
         Ok(serde_json::to_value(component)?)
     }
 
@@ -3652,7 +3756,7 @@ impl ToolHandler {
     async fn delete_component(&self, args: Value) -> Result<Value> {
         let id = parse_uuid(&args, "id")?;
 
-        self.orchestrator.delete_component(id).await?;
+        self.orchestrator().delete_component(id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3668,7 +3772,7 @@ impl ToolHandler {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        self.orchestrator
+        self.orchestrator()
             .add_component_dependency(id, depends_on_id, protocol, required)
             .await?;
 
@@ -3679,7 +3783,7 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let dep_id = parse_uuid(&args, "dep_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .remove_component_dependency(id, dep_id)
             .await?;
 
@@ -3690,7 +3794,7 @@ impl ToolHandler {
         let id = parse_uuid(&args, "id")?;
         let project_id = parse_uuid(&args, "project_id")?;
 
-        self.orchestrator
+        self.orchestrator()
             .map_component_to_project(id, project_id)
             .await?;
 
@@ -3730,7 +3834,7 @@ impl ToolHandler {
 
     async fn delete_step_handler(&self, args: Value) -> Result<Value> {
         let step_id = parse_uuid(&args, "step_id")?;
-        self.orchestrator.delete_step(step_id).await?;
+        self.orchestrator().delete_step(step_id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3766,7 +3870,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.orchestrator
+        self.orchestrator()
             .update_constraint(constraint_id, description, constraint_type, enforced_by)
             .await?;
         Ok(json!({"updated": true}))
@@ -3774,13 +3878,13 @@ impl ToolHandler {
 
     async fn delete_release(&self, args: Value) -> Result<Value> {
         let release_id = parse_uuid(&args, "release_id")?;
-        self.orchestrator.delete_release(release_id).await?;
+        self.orchestrator().delete_release(release_id).await?;
         Ok(json!({"deleted": true}))
     }
 
     async fn delete_milestone(&self, args: Value) -> Result<Value> {
         let milestone_id = parse_uuid(&args, "milestone_id")?;
-        self.orchestrator.delete_milestone(milestone_id).await?;
+        self.orchestrator().delete_milestone(milestone_id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3809,7 +3913,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.orchestrator
+        self.orchestrator()
             .update_decision(decision_id, description, rationale, chosen_option)
             .await?;
         Ok(json!({"updated": true}))
@@ -3817,7 +3921,7 @@ impl ToolHandler {
 
     async fn delete_decision(&self, args: Value) -> Result<Value> {
         let decision_id = parse_uuid(&args, "decision_id")?;
-        self.orchestrator.delete_decision(decision_id).await?;
+        self.orchestrator().delete_decision(decision_id).await?;
         Ok(json!({"deleted": true}))
     }
 
@@ -3844,7 +3948,7 @@ impl ToolHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        self.orchestrator
+        self.orchestrator()
             .update_resource(id, name, file_path, url, version, description)
             .await?;
         Ok(json!({"updated": true}))
@@ -3871,7 +3975,7 @@ impl ToolHandler {
                 .collect()
         });
 
-        self.orchestrator
+        self.orchestrator()
             .update_component(id, name, description, runtime, config, tags)
             .await?;
         Ok(json!({"updated": true}))
@@ -3914,7 +4018,7 @@ impl ToolHandler {
         let session_id = parse_uuid(&args, "session_id")?;
 
         // Close active session if chat manager is available
-        if let Some(cm) = &self.chat_manager {
+        if let ToolBackend::Direct(_, Some(cm)) = &self.backend {
             let _ = cm.close_session(&session_id.to_string()).await;
         }
 
@@ -3928,10 +4032,10 @@ impl ToolHandler {
     }
 
     async fn chat_send_message(&self, args: Value) -> Result<Value> {
-        let cm = self
-            .chat_manager
-            .as_ref()
-            .ok_or_else(|| anyhow!("Chat manager not initialized"))?;
+        let cm = match &self.backend {
+            ToolBackend::Direct(_, Some(cm)) => cm,
+            _ => return Err(anyhow!("Chat manager not initialized")),
+        };
 
         let message = args
             .get("message")
@@ -4022,10 +4126,10 @@ impl ToolHandler {
     }
 
     async fn list_chat_messages(&self, args: Value) -> Result<Value> {
-        let cm = self
-            .chat_manager
-            .as_ref()
-            .ok_or_else(|| anyhow!("Chat manager not initialized"))?;
+        let cm = match &self.backend {
+            ToolBackend::Direct(_, Some(cm)) => cm,
+            _ => return Err(anyhow!("Chat manager not initialized")),
+        };
 
         let session_id = args
             .get("session_id")
@@ -4569,7 +4673,7 @@ impl ToolHandler {
         };
 
         let plan = self
-            .orchestrator
+            .orchestrator()
             .planner()
             .plan_implementation(request)
             .await?;
