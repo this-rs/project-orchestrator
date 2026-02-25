@@ -458,6 +458,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(code_handlers::get_code_communities),
         )
         .route("/api/code/health", get(code_handlers::get_code_health))
+        .route(
+            "/api/code/node-importance",
+            get(code_handlers::get_node_importance),
+        )
         // ================================================================
         // Implementation Planner
         // ================================================================

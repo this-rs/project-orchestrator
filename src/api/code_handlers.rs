@@ -1400,6 +1400,112 @@ pub async fn get_code_health(
 }
 
 // ============================================================================
+// Node Importance (GDS Analytics)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct NodeImportanceQuery {
+    pub project_slug: String,
+    pub node_path: String,
+    pub node_type: Option<String>,
+}
+
+/// GET /api/code/node-importance — Get GDS metrics for a specific node
+pub async fn get_node_importance(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<NodeImportanceQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let node_type = params.node_type.as_deref().unwrap_or("file");
+
+    let metrics = state
+        .orchestrator
+        .neo4j()
+        .get_node_gds_metrics(&params.node_path, node_type, project.id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let metrics = match metrics {
+        Some(m) => m,
+        None => {
+            return Err(AppError::NotFound(format!(
+                "Node not found: '{}' (type: {})",
+                params.node_path, node_type
+            )));
+        }
+    };
+
+    if metrics.pagerank.is_none() {
+        return Ok(Json(serde_json::json!({
+            "node": params.node_path,
+            "node_type": node_type,
+            "message": "No structural analytics available for this node. Run sync_project first, then wait for analytics computation.",
+            "metrics": {
+                "in_degree": metrics.in_degree,
+                "out_degree": metrics.out_degree,
+            }
+        })));
+    }
+
+    let percentiles = state
+        .orchestrator
+        .neo4j()
+        .get_project_percentiles(project.id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // Calculate risk level based on PageRank + betweenness
+    let pagerank = metrics.pagerank.unwrap_or(0.0);
+    let betweenness = metrics.betweenness.unwrap_or(0.0);
+
+    let risk_level = if pagerank > percentiles.pagerank_p95 && betweenness > percentiles.betweenness_p95 {
+        "critical"
+    } else if pagerank > percentiles.pagerank_p95 || betweenness > percentiles.betweenness_p95 {
+        "high"
+    } else if pagerank > percentiles.pagerank_p80 || betweenness > percentiles.betweenness_p80 {
+        "medium"
+    } else {
+        "low"
+    };
+
+    let summary = match risk_level {
+        "critical" => format!("{} has very high PageRank and betweenness — modifying it has significant regression risk", params.node_path),
+        "high" => format!("{} has high centrality — changes may have wide impact", params.node_path),
+        "medium" => format!("{} has moderate importance — standard review recommended", params.node_path),
+        _ => format!("{} has low centrality — changes are relatively safe", params.node_path),
+    };
+
+    Ok(Json(serde_json::json!({
+        "node": params.node_path,
+        "node_type": node_type,
+        "risk_level": risk_level,
+        "summary": summary,
+        "metrics": {
+            "pagerank": pagerank,
+            "betweenness": betweenness,
+            "clustering_coefficient": metrics.clustering_coefficient,
+            "community_id": metrics.community_id,
+            "in_degree": metrics.in_degree,
+            "out_degree": metrics.out_degree,
+        },
+        "percentiles": {
+            "pagerank_p80": percentiles.pagerank_p80,
+            "pagerank_p95": percentiles.pagerank_p95,
+            "betweenness_p80": percentiles.betweenness_p80,
+            "betweenness_p95": percentiles.betweenness_p95,
+        }
+    })))
+}
+
+// ============================================================================
 // Implementation Planner
 // ============================================================================
 

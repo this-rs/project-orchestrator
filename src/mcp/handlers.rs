@@ -1648,6 +1648,203 @@ impl ToolHandler {
                 Ok(Some(if result.is_null() { json!({"mapped": true}) } else { result }))
             }
 
+            // ── P9: Code Exploration & Analytics (16 tools) ────────────────
+
+            // --- Search (3) ---
+
+            "search_code" => {
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![("query".to_string(), query_str)];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("language").and_then(|v| v.as_str()) {
+                    query.push(("language".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("path_prefix").and_then(|v| v.as_str()) {
+                    query.push(("path_prefix".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/search", &query).await?;
+                Ok(Some(result))
+            }
+
+            "search_project_code" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![("query".to_string(), query_str)];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("language").and_then(|v| v.as_str()) {
+                    query.push(("language".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("path_prefix").and_then(|v| v.as_str()) {
+                    query.push(("path_prefix".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query(
+                    &format!("/api/projects/{}/code/search", project_slug),
+                    &query,
+                ).await?;
+                Ok(Some(result))
+            }
+
+            "search_workspace_code" => {
+                // REST search_code supports workspace_slug as query param
+                let workspace_slug = extract_string(args, "workspace_slug")?;
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![
+                    ("query".to_string(), query_str),
+                    ("workspace_slug".to_string(), workspace_slug),
+                ];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("language").and_then(|v| v.as_str()) {
+                    query.push(("language".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("path_prefix").and_then(|v| v.as_str()) {
+                    query.push(("path_prefix".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/search", &query).await?;
+                Ok(Some(result))
+            }
+
+            // --- Graph Traversal (4) ---
+
+            "get_file_symbols" => {
+                let file_path = extract_string(args, "file_path")?;
+                let result = http.get(&format!("/api/code/symbols/{}", file_path)).await?;
+                Ok(Some(result))
+            }
+
+            "find_references" => {
+                let symbol = extract_string(args, "symbol")?;
+                let mut query = vec![("symbol".to_string(), symbol)];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/references", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_file_dependencies" => {
+                let file_path = extract_string(args, "file_path")?;
+                let result = http.get(&format!("/api/code/dependencies/{}", file_path)).await?;
+                Ok(Some(result))
+            }
+
+            "get_call_graph" => {
+                let function = extract_string(args, "function")?;
+                let mut query = vec![("function".to_string(), function)];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("depth".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/callgraph", &query).await?;
+                Ok(Some(result))
+            }
+
+            // --- Analysis (3) ---
+
+            "analyze_impact" => {
+                let target = extract_string(args, "target")?;
+                let mut query = vec![("target".to_string(), target)];
+                if let Some(v) = args.get("target_type").and_then(|v| v.as_str()) {
+                    query.push(("target_type".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/impact", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_architecture" => {
+                let mut query = Vec::new();
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/code/architecture").await?
+                } else {
+                    http.get_with_query("/api/code/architecture", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "find_similar_code" => {
+                // POST because of body (code_snippet)
+                let result = http.post("/api/code/similar", args).await?;
+                Ok(Some(result))
+            }
+
+            // --- Types (3) ---
+
+            "find_trait_implementations" => {
+                let trait_name = extract_string(args, "trait_name")?;
+                let query = vec![("trait_name".to_string(), trait_name)];
+                let result = http.get_with_query("/api/code/trait-impls", &query).await?;
+                Ok(Some(result))
+            }
+
+            "find_type_traits" => {
+                let type_name = extract_string(args, "type_name")?;
+                let query = vec![("type_name".to_string(), type_name)];
+                let result = http.get_with_query("/api/code/type-traits", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_impl_blocks" => {
+                let type_name = extract_string(args, "type_name")?;
+                let query = vec![("type_name".to_string(), type_name)];
+                let result = http.get_with_query("/api/code/impl-blocks", &query).await?;
+                Ok(Some(result))
+            }
+
+            // --- Analytics GDS (3) ---
+
+            "get_code_communities" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("min_size").and_then(|v| v.as_i64()) {
+                    query.push(("min_size".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/communities", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_code_health" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("god_function_threshold").and_then(|v| v.as_i64()) {
+                    query.push(("god_function_threshold".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/health", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_node_importance" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let node_path = extract_string(args, "node_path")?;
+                let mut query = vec![
+                    ("project_slug".to_string(), project_slug),
+                    ("node_path".to_string(), node_path),
+                ];
+                if let Some(v) = args.get("node_type").and_then(|v| v.as_str()) {
+                    query.push(("node_type".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/node-importance", &query).await?;
+                Ok(Some(result))
+            }
+
             // ── Not yet migrated ────────────────────────────────────────
             _ => Ok(None),
         }
