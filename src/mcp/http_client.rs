@@ -98,6 +98,18 @@ impl McpHttpClient {
         self.handle_response(resp, "POST", &url).await
     }
 
+    /// PUT request with JSON body.
+    pub async fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        let url = format!("{}{}", self.base_url, path);
+        debug!("PUT {}", url);
+
+        let mut req = self.client.put(&url).json(body);
+        req = self.inject_auth(req);
+
+        let resp = req.send().await.context("HTTP PUT failed")?;
+        self.handle_response(resp, "PUT", &url).await
+    }
+
     /// PATCH request with JSON body.
     pub async fn patch(&self, path: &str, body: &Value) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);

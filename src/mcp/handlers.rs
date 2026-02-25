@@ -432,6 +432,139 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── P3: Plans (9 tools) ──────────────────────────────────────
+
+            "list_plans" => {
+                let mut query = Vec::new();
+                if let Some(s) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), s.to_string()));
+                }
+                if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), s.to_string()));
+                }
+                if let Some(v) = args.get("priority_min").and_then(|v| v.as_i64()) {
+                    query.push(("priority_min".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("priority_max").and_then(|v| v.as_i64()) {
+                    query.push(("priority_max".to_string(), v.to_string()));
+                }
+                if let Some(s) = args.get("search").and_then(|v| v.as_str()) {
+                    query.push(("search".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                if let Some(sb) = args.get("sort_by").and_then(|v| v.as_str()) {
+                    query.push(("sort_by".to_string(), sb.to_string()));
+                }
+                if let Some(so) = args.get("sort_order").and_then(|v| v.as_str()) {
+                    query.push(("sort_order".to_string(), so.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/plans").await?
+                } else {
+                    http.get_with_query("/api/plans", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_plan" => {
+                let result = http.post("/api/plans", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_plan" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.get(&format!("/api/plans/{}", plan_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_plan_status" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let status = extract_string(args, "status")?;
+                let body = json!({"status": status});
+                let result = http.patch(&format!("/api/plans/{}", plan_id), &body).await?;
+                // REST returns 204 → null, normalize to {"updated": true}
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_plan" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.delete(&format!("/api/plans/{}", plan_id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "link_plan_to_project" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let project_id = extract_id(args, "project_id")?;
+                let body = json!({"project_id": project_id});
+                let result = http.put(&format!("/api/plans/{}/project", plan_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+            }
+
+            "unlink_plan_from_project" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.delete(&format!("/api/plans/{}/project", plan_id)).await?;
+                Ok(Some(if result.is_null() { json!({"unlinked": true}) } else { result }))
+            }
+
+            "get_dependency_graph" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.get(&format!("/api/plans/{}/dependency-graph", plan_id)).await?;
+                Ok(Some(result))
+            }
+
+            "get_critical_path" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.get(&format!("/api/plans/{}/critical-path", plan_id)).await?;
+                Ok(Some(result))
+            }
+
+            // ── P3: Constraints (5 tools) ───────────────────────────────────
+
+            "list_constraints" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.get(&format!("/api/plans/{}/constraints", plan_id)).await?;
+                Ok(Some(result))
+            }
+
+            "add_constraint" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.post(&format!("/api/plans/{}/constraints", plan_id), args).await?;
+                Ok(Some(result))
+            }
+
+            "get_constraint" => {
+                let constraint_id = extract_id(args, "constraint_id")?;
+                let result = http.get(&format!("/api/constraints/{}", constraint_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_constraint" => {
+                let constraint_id = extract_id(args, "constraint_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("constraint_type") {
+                    body.insert("constraint_type".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("enforced_by") {
+                    body.insert("enforced_by".to_string(), v.clone());
+                }
+                let result = http.patch(&format!("/api/constraints/{}", constraint_id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_constraint" => {
+                let constraint_id = extract_id(args, "constraint_id")?;
+                let result = http.delete(&format!("/api/constraints/{}", constraint_id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
             // ── Not yet migrated ────────────────────────────────────────
             _ => Ok(None),
         }
