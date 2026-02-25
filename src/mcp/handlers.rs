@@ -88,13 +88,264 @@ impl ToolHandler {
         self.orchestrator().meili()
     }
 
+    /// Resolve mega-tool names to legacy names for backward-compatible routing.
+    ///
+    /// If `name` is a mega-tool (e.g. "project"), extracts the `action` param and
+    /// maps to the legacy tool name (e.g. "list_projects"). Legacy names pass through.
+    fn resolve_mega_tool(&self, name: &str, args: &Value) -> Result<(String, Value)> {
+        use super::tools::resolve_legacy_alias;
+
+        // Check if already a legacy name → pass through
+        if resolve_legacy_alias(name).is_some() {
+            return Ok((name.to_string(), args.clone()));
+        }
+
+        // Mega-tool names: project, plan, task, step, decision, constraint,
+        // release, milestone, commit, note, workspace, workspace_milestone,
+        // resource, component, chat, feature_graph, code, admin
+        let mega_tools: &[&str] = &[
+            "project", "plan", "task", "step", "decision", "constraint",
+            "release", "milestone", "commit", "note", "workspace",
+            "workspace_milestone", "resource", "component", "chat",
+            "feature_graph", "code", "admin",
+        ];
+
+        if !mega_tools.contains(&name) {
+            // Unknown tool — return as-is, let downstream handle the error
+            return Ok((name.to_string(), args.clone()));
+        }
+
+        // Extract action parameter
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("Mega-tool '{}' requires an 'action' parameter", name))?;
+
+        // Build the legacy tool name from (mega_tool, action)
+        let legacy_name = self.mega_tool_to_legacy(name, action)?;
+
+        // Return resolved name + original args (action param is ignored by handlers)
+        Ok((legacy_name, args.clone()))
+    }
+
+    /// Map (mega_tool, action) → legacy tool name
+    fn mega_tool_to_legacy(&self, tool: &str, action: &str) -> Result<String> {
+        let name = match (tool, action) {
+            // Project
+            ("project", "list") => "list_projects",
+            ("project", "create") => "create_project",
+            ("project", "get") => "get_project",
+            ("project", "update") => "update_project",
+            ("project", "delete") => "delete_project",
+            ("project", "sync") => "sync_project",
+            ("project", "get_roadmap") => "get_project_roadmap",
+            ("project", "list_plans") => "list_project_plans",
+
+            // Plan
+            ("plan", "list") => "list_plans",
+            ("plan", "create") => "create_plan",
+            ("plan", "get") => "get_plan",
+            ("plan", "update_status") => "update_plan_status",
+            ("plan", "delete") => "delete_plan",
+            ("plan", "link_to_project") => "link_plan_to_project",
+            ("plan", "unlink_from_project") => "unlink_plan_from_project",
+            ("plan", "get_dependency_graph") => "get_dependency_graph",
+            ("plan", "get_critical_path") => "get_critical_path",
+
+            // Task
+            ("task", "list") => "list_tasks",
+            ("task", "create") => "create_task",
+            ("task", "get") => "get_task",
+            ("task", "update") => "update_task",
+            ("task", "delete") => "delete_task",
+            ("task", "get_next") => "get_next_task",
+            ("task", "add_dependencies") => "add_task_dependencies",
+            ("task", "remove_dependency") => "remove_task_dependency",
+            ("task", "get_blockers") => "get_task_blockers",
+            ("task", "get_blocked_by") => "get_tasks_blocked_by",
+            ("task", "get_context") => "get_task_context",
+            ("task", "get_prompt") => "get_task_prompt",
+
+            // Step
+            ("step", "list") => "list_steps",
+            ("step", "create") => "create_step",
+            ("step", "update") => "update_step",
+            ("step", "get") => "get_step",
+            ("step", "delete") => "delete_step",
+            ("step", "get_progress") => "get_step_progress",
+
+            // Decision
+            ("decision", "add") => "add_decision",
+            ("decision", "get") => "get_decision",
+            ("decision", "update") => "update_decision",
+            ("decision", "delete") => "delete_decision",
+            ("decision", "search") => "search_decisions",
+
+            // Constraint
+            ("constraint", "list") => "list_constraints",
+            ("constraint", "add") => "add_constraint",
+            ("constraint", "get") => "get_constraint",
+            ("constraint", "update") => "update_constraint",
+            ("constraint", "delete") => "delete_constraint",
+
+            // Release
+            ("release", "list") => "list_releases",
+            ("release", "create") => "create_release",
+            ("release", "get") => "get_release",
+            ("release", "update") => "update_release",
+            ("release", "delete") => "delete_release",
+            ("release", "add_task") => "add_task_to_release",
+            ("release", "add_commit") => "add_commit_to_release",
+            ("release", "remove_commit") => "remove_commit_from_release",
+
+            // Milestone
+            ("milestone", "list") => "list_milestones",
+            ("milestone", "create") => "create_milestone",
+            ("milestone", "get") => "get_milestone",
+            ("milestone", "update") => "update_milestone",
+            ("milestone", "delete") => "delete_milestone",
+            ("milestone", "get_progress") => "get_milestone_progress",
+            ("milestone", "add_task") => "add_task_to_milestone",
+            ("milestone", "link_plan") => "link_plan_to_milestone",
+            ("milestone", "unlink_plan") => "unlink_plan_from_milestone",
+
+            // Commit
+            ("commit", "create") => "create_commit",
+            ("commit", "link_to_task") => "link_commit_to_task",
+            ("commit", "link_to_plan") => "link_commit_to_plan",
+            ("commit", "get_task_commits") => "get_task_commits",
+            ("commit", "get_plan_commits") => "get_plan_commits",
+
+            // Note
+            ("note", "list") => "list_notes",
+            ("note", "create") => "create_note",
+            ("note", "get") => "get_note",
+            ("note", "update") => "update_note",
+            ("note", "delete") => "delete_note",
+            ("note", "search") => "search_notes",
+            ("note", "search_semantic") => "search_notes_semantic",
+            ("note", "confirm") => "confirm_note",
+            ("note", "invalidate") => "invalidate_note",
+            ("note", "supersede") => "supersede_note",
+            ("note", "link_to_entity") => "link_note_to_entity",
+            ("note", "unlink_from_entity") => "unlink_note_from_entity",
+            ("note", "get_context") => "get_context_notes",
+            ("note", "get_needing_review") => "get_notes_needing_review",
+            ("note", "list_project") => "list_project_notes",
+            ("note", "get_propagated") => "get_propagated_notes",
+            ("note", "get_entity") => "get_entity_notes",
+
+            // Workspace
+            ("workspace", "list") => "list_workspaces",
+            ("workspace", "create") => "create_workspace",
+            ("workspace", "get") => "get_workspace",
+            ("workspace", "update") => "update_workspace",
+            ("workspace", "delete") => "delete_workspace",
+            ("workspace", "get_overview") => "get_workspace_overview",
+            ("workspace", "list_projects") => "list_workspace_projects",
+            ("workspace", "add_project") => "add_project_to_workspace",
+            ("workspace", "remove_project") => "remove_project_from_workspace",
+            ("workspace", "get_topology") => "get_workspace_topology",
+
+            // Workspace Milestone
+            ("workspace_milestone", "list_all") => "list_all_workspace_milestones",
+            ("workspace_milestone", "list") => "list_workspace_milestones",
+            ("workspace_milestone", "create") => "create_workspace_milestone",
+            ("workspace_milestone", "get") => "get_workspace_milestone",
+            ("workspace_milestone", "update") => "update_workspace_milestone",
+            ("workspace_milestone", "delete") => "delete_workspace_milestone",
+            ("workspace_milestone", "add_task") => "add_task_to_workspace_milestone",
+            ("workspace_milestone", "link_plan") => "link_plan_to_workspace_milestone",
+            ("workspace_milestone", "unlink_plan") => "unlink_plan_from_workspace_milestone",
+            ("workspace_milestone", "get_progress") => "get_workspace_milestone_progress",
+
+            // Resource
+            ("resource", "list") => "list_resources",
+            ("resource", "create") => "create_resource",
+            ("resource", "get") => "get_resource",
+            ("resource", "update") => "update_resource",
+            ("resource", "delete") => "delete_resource",
+            ("resource", "link_to_project") => "link_resource_to_project",
+
+            // Component
+            ("component", "list") => "list_components",
+            ("component", "create") => "create_component",
+            ("component", "get") => "get_component",
+            ("component", "update") => "update_component",
+            ("component", "delete") => "delete_component",
+            ("component", "add_dependency") => "add_component_dependency",
+            ("component", "remove_dependency") => "remove_component_dependency",
+            ("component", "map_to_project") => "map_component_to_project",
+
+            // Chat
+            ("chat", "list_sessions") => "list_chat_sessions",
+            ("chat", "get_session") => "get_chat_session",
+            ("chat", "delete_session") => "delete_chat_session",
+            ("chat", "send_message") => "chat_send_message",
+            ("chat", "list_messages") => "list_chat_messages",
+
+            // Feature Graph
+            ("feature_graph", "create") => "create_feature_graph",
+            ("feature_graph", "get") => "get_feature_graph",
+            ("feature_graph", "list") => "list_feature_graphs",
+            ("feature_graph", "add_entity") => "add_to_feature_graph",
+            ("feature_graph", "auto_build") => "auto_build_feature_graph",
+            ("feature_graph", "delete") => "delete_feature_graph",
+
+            // Code
+            ("code", "search") => "search_code",
+            ("code", "search_project") => "search_project_code",
+            ("code", "search_workspace") => "search_workspace_code",
+            ("code", "get_file_symbols") => "get_file_symbols",
+            ("code", "find_references") => "find_references",
+            ("code", "get_file_dependencies") => "get_file_dependencies",
+            ("code", "get_call_graph") => "get_call_graph",
+            ("code", "analyze_impact") => "analyze_impact",
+            ("code", "get_architecture") => "get_architecture",
+            ("code", "find_similar") => "find_similar_code",
+            ("code", "find_trait_implementations") => "find_trait_implementations",
+            ("code", "find_type_traits") => "find_type_traits",
+            ("code", "get_impl_blocks") => "get_impl_blocks",
+            ("code", "get_communities") => "get_code_communities",
+            ("code", "get_health") => "get_code_health",
+            ("code", "get_node_importance") => "get_node_importance",
+            ("code", "plan_implementation") => "plan_implementation",
+
+            // Admin
+            ("admin", "sync_directory") => "sync_directory",
+            ("admin", "start_watch") => "start_watch",
+            ("admin", "stop_watch") => "stop_watch",
+            ("admin", "watch_status") => "watch_status",
+            ("admin", "meilisearch_stats") => "get_meilisearch_stats",
+            ("admin", "delete_meilisearch_orphans") => "delete_meilisearch_orphans",
+            ("admin", "cleanup_cross_project_calls") => "cleanup_cross_project_calls",
+            ("admin", "cleanup_sync_data") => "cleanup_sync_data",
+            ("admin", "update_staleness_scores") => "update_staleness_scores",
+            ("admin", "update_energy_scores") => "update_energy_scores",
+            ("admin", "search_neurons") => "search_neurons",
+            ("admin", "reinforce_neurons") => "reinforce_neurons",
+            ("admin", "decay_synapses") => "decay_synapses",
+            ("admin", "backfill_synapses") => "backfill_synapses",
+
+            _ => return Err(anyhow!("Unknown action '{}' for mega-tool '{}'", action, tool)),
+        };
+        Ok(name.to_string())
+    }
+
     /// Handle a tool call and return the result as JSON
     pub async fn handle(&self, name: &str, args: Option<Value>) -> Result<Value> {
         let args = args.unwrap_or(json!({}));
 
-        // ── HTTP-mode routing (P2: all 8 project tools) ─────────────────
-        // In HTTP mode, route migrated tools through the REST API.
-        // Non-migrated tools return an error (Direct mode required).
+        // ── Mega-tool resolution ────────────────────────────────────────
+        // If the caller uses a mega-tool name (e.g. "project"), extract the
+        // "action" parameter and resolve to the legacy tool name for routing.
+        // If the caller uses a legacy name (e.g. "list_projects"), pass through.
+        let (resolved_name, resolved_args) = self.resolve_mega_tool(name, &args)?;
+        let name = resolved_name.as_str();
+        let args = resolved_args;
+
+        // ── HTTP-mode routing ───────────────────────────────────────────
+        // In HTTP mode, route all tools through the REST API.
         if self.is_http_mode() {
             if let Some(result) = self.try_handle_http(name, &args).await? {
                 return Ok(result);
