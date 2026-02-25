@@ -1845,6 +1845,173 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── P10: Chat, Feature Graphs & Misc (14 tools) ─────────────
+
+            // --- Chat CRUD (5) ---
+
+            "list_chat_sessions" => {
+                let mut query = Vec::new();
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/chat/sessions", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_chat_session" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http.get(&format!("/api/chat/sessions/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "delete_chat_session" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http.delete(&format!("/api/chat/sessions/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "chat_send_message" => {
+                // REST POST /api/chat/sessions creates a session + sends the first message
+                let mut body = serde_json::Map::new();
+                body.insert("message".to_string(), json!(extract_string(args, "message")?));
+                body.insert("cwd".to_string(), json!(extract_string(args, "cwd")?));
+                if let Some(v) = args.get("session_id").and_then(|v| v.as_str()) {
+                    body.insert("session_id".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    body.insert("project_slug".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("model").and_then(|v| v.as_str()) {
+                    body.insert("model".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("permission_mode").and_then(|v| v.as_str()) {
+                    body.insert("permission_mode".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("workspace_slug").and_then(|v| v.as_str()) {
+                    body.insert("workspace_slug".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("add_dirs") {
+                    body.insert("add_dirs".to_string(), v.clone());
+                }
+                let result = http.post("/api/chat/sessions", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "list_chat_messages" => {
+                let id = extract_id(args, "session_id")?;
+                let mut query = Vec::new();
+                if let Some(v) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query(&format!("/api/chat/sessions/{}/messages", id), &query).await?;
+                Ok(Some(result))
+            }
+
+            // --- Feature Graphs (6) ---
+
+            "create_feature_graph" => {
+                let mut body = serde_json::Map::new();
+                body.insert("name".to_string(), json!(extract_string(args, "name")?));
+                body.insert("project_id".to_string(), json!(extract_id(args, "project_id")?));
+                if let Some(v) = args.get("description").and_then(|v| v.as_str()) {
+                    body.insert("description".to_string(), json!(v));
+                }
+                let result = http.post("/api/feature-graphs", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "list_feature_graphs" => {
+                let mut query = Vec::new();
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/feature-graphs", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_feature_graph" => {
+                let id = extract_id(args, "id")?;
+                let result = http.get(&format!("/api/feature-graphs/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "delete_feature_graph" => {
+                let id = extract_id(args, "id")?;
+                let result = http.delete(&format!("/api/feature-graphs/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "add_to_feature_graph" => {
+                let id = extract_id(args, "feature_graph_id")?;
+                let mut body = serde_json::Map::new();
+                body.insert("entity_type".to_string(), json!(extract_string(args, "entity_type")?));
+                body.insert("entity_id".to_string(), json!(extract_string(args, "entity_id")?));
+                if let Some(v) = args.get("role").and_then(|v| v.as_str()) {
+                    body.insert("role".to_string(), json!(v));
+                }
+                let result = http.post(&format!("/api/feature-graphs/{}/entities", id), &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "auto_build_feature_graph" => {
+                let mut body = serde_json::Map::new();
+                body.insert("name".to_string(), json!(extract_string(args, "name")?));
+                body.insert("project_id".to_string(), json!(extract_id(args, "project_id")?));
+                body.insert("entry_function".to_string(), json!(extract_string(args, "entry_function")?));
+                if let Some(v) = args.get("description").and_then(|v| v.as_str()) {
+                    body.insert("description".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("depth").and_then(|v| v.as_u64()) {
+                    body.insert("depth".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("include_relations") {
+                    body.insert("include_relations".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("filter_community").and_then(|v| v.as_bool()) {
+                    body.insert("filter_community".to_string(), json!(v));
+                }
+                let result = http.post("/api/feature-graphs/auto-build", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            // --- Misc (3) ---
+
+            "plan_implementation" => {
+                let mut body = serde_json::Map::new();
+                body.insert("project_slug".to_string(), json!(extract_string(args, "project_slug")?));
+                body.insert("description".to_string(), json!(extract_string(args, "description")?));
+                if let Some(v) = args.get("entry_points") {
+                    body.insert("entry_points".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("scope").and_then(|v| v.as_str()) {
+                    body.insert("scope".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("auto_create_plan").and_then(|v| v.as_bool()) {
+                    body.insert("auto_create_plan".to_string(), json!(v));
+                }
+                let result = http.post("/api/code/plan-implementation", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "get_meilisearch_stats" => {
+                let result = http.get("/api/meilisearch/stats").await?;
+                Ok(Some(result))
+            }
+
+            "delete_meilisearch_orphans" => {
+                let result = http.delete("/api/meilisearch/orphans").await?;
+                Ok(Some(result))
+            }
+
             // ── Not yet migrated ────────────────────────────────────────
             _ => Ok(None),
         }
