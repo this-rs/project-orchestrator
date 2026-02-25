@@ -1030,6 +1030,294 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── P7: Notes & Knowledge (23 tools) ──────────────────────────
+
+            // --- CRUD (5) ---
+
+            "list_notes" => {
+                let mut query = Vec::new();
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("note_type").and_then(|v| v.as_str()) {
+                    query.push(("note_type".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("importance").and_then(|v| v.as_str()) {
+                    query.push(("importance".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("min_staleness").and_then(|v| v.as_f64()) {
+                    query.push(("min_staleness".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("max_staleness").and_then(|v| v.as_f64()) {
+                    query.push(("max_staleness".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("tags").and_then(|v| v.as_str()) {
+                    query.push(("tags".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("search").and_then(|v| v.as_str()) {
+                    query.push(("search".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("global_only").and_then(|v| v.as_bool()) {
+                    query.push(("global_only".to_string(), v.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/notes").await?
+                } else {
+                    http.get_with_query("/api/notes", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_note" => {
+                // Forward full args as body (REST ignores unknown fields via serde)
+                let result = http.post("/api/notes", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_note" => {
+                let note_id = extract_id(args, "note_id")?;
+                let result = http.get(&format!("/api/notes/{}", note_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_note" => {
+                let note_id = extract_id(args, "note_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("content") { body.insert("content".to_string(), v.clone()); }
+                if let Some(v) = args.get("importance") { body.insert("importance".to_string(), v.clone()); }
+                if let Some(v) = args.get("status") { body.insert("status".to_string(), v.clone()); }
+                if let Some(v) = args.get("tags") { body.insert("tags".to_string(), v.clone()); }
+                let result = http.patch(&format!("/api/notes/{}", note_id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_note" => {
+                let note_id = extract_id(args, "note_id")?;
+                let result = http.delete(&format!("/api/notes/{}", note_id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            // --- Search (3) ---
+
+            "search_notes" => {
+                // MCP param "query" → REST param "q"
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![("q".to_string(), query_str)];
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("note_type").and_then(|v| v.as_str()) {
+                    query.push(("note_type".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("importance").and_then(|v| v.as_str()) {
+                    query.push(("importance".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/notes/search", &query).await?;
+                Ok(Some(result))
+            }
+
+            "search_notes_semantic" => {
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![("query".to_string(), query_str)];
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("workspace_slug").and_then(|v| v.as_str()) {
+                    query.push(("workspace_slug".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/notes/search-semantic", &query).await?;
+                Ok(Some(result))
+            }
+
+            "search_neurons" => {
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![("query".to_string(), query_str)];
+                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                    query.push(("project_slug".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("max_results").and_then(|v| v.as_i64()) {
+                    query.push(("max_results".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("max_hops").and_then(|v| v.as_i64()) {
+                    query.push(("max_hops".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("min_score").and_then(|v| v.as_f64()) {
+                    query.push(("min_score".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/notes/neurons/search", &query).await?;
+                Ok(Some(result))
+            }
+
+            // --- Lifecycle (3) ---
+
+            "confirm_note" => {
+                let note_id = extract_id(args, "note_id")?;
+                let result = http.post(&format!("/api/notes/{}/confirm", note_id), &json!({})).await?;
+                Ok(Some(result))
+            }
+
+            "invalidate_note" => {
+                let note_id = extract_id(args, "note_id")?;
+                let reason = extract_string(args, "reason")?;
+                let body = json!({"reason": reason});
+                let result = http.post(&format!("/api/notes/{}/invalidate", note_id), &body).await?;
+                Ok(Some(result))
+            }
+
+            "supersede_note" => {
+                let old_note_id = extract_id(args, "old_note_id")?;
+                // Forward remaining args as body (old_note_id extracted for URL path)
+                let result = http.post(&format!("/api/notes/{}/supersede", old_note_id), args).await?;
+                Ok(Some(result))
+            }
+
+            // --- Linking (2) ---
+
+            "link_note_to_entity" => {
+                let note_id = extract_id(args, "note_id")?;
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let body = json!({"entity_type": entity_type, "entity_id": entity_id});
+                let result = http.post(&format!("/api/notes/{}/links", note_id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+            }
+
+            "unlink_note_from_entity" => {
+                let note_id = extract_id(args, "note_id")?;
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let result = http.delete(&format!("/api/notes/{}/links/{}/{}", note_id, entity_type, entity_id)).await?;
+                Ok(Some(if result.is_null() { json!({"unlinked": true}) } else { result }))
+            }
+
+            // --- Retrieval (5) ---
+
+            "get_context_notes" => {
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let mut query = vec![
+                    ("entity_type".to_string(), entity_type),
+                    ("entity_id".to_string(), entity_id),
+                ];
+                if let Some(v) = args.get("max_depth").and_then(|v| v.as_i64()) {
+                    query.push(("max_depth".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("min_score").and_then(|v| v.as_f64()) {
+                    query.push(("min_score".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/notes/context", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_notes_needing_review" => {
+                let mut query = Vec::new();
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/notes/needs-review").await?
+                } else {
+                    http.get_with_query("/api/notes/needs-review", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "get_propagated_notes" => {
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let mut query = vec![
+                    ("entity_type".to_string(), entity_type),
+                    ("entity_id".to_string(), entity_id),
+                ];
+                if let Some(v) = args.get("max_depth").and_then(|v| v.as_i64()) {
+                    query.push(("max_depth".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("min_score").and_then(|v| v.as_f64()) {
+                    query.push(("min_score".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/notes/propagated", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_entity_notes" => {
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let result = http.get(&format!("/api/entities/{}/{}/notes", entity_type, entity_id)).await?;
+                Ok(Some(result))
+            }
+
+            "list_project_notes" => {
+                let project_id = extract_id(args, "project_id")?;
+                let mut query = Vec::new();
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get(&format!("/api/projects/{}/notes", project_id)).await?
+                } else {
+                    http.get_with_query(&format!("/api/projects/{}/notes", project_id), &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            // --- Admin (5) ---
+
+            "update_staleness_scores" => {
+                let result = http.post("/api/notes/update-staleness", &json!({})).await?;
+                Ok(Some(result))
+            }
+
+            "update_energy_scores" => {
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("half_life") { body.insert("half_life".to_string(), v.clone()); }
+                let result = http.post("/api/notes/update-energy", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "reinforce_neurons" => {
+                // Forward full args as body (note_ids, energy_boost, synapse_boost)
+                let result = http.post("/api/notes/neurons/reinforce", args).await?;
+                Ok(Some(result))
+            }
+
+            "decay_synapses" => {
+                // Forward full args as body (decay_amount, prune_threshold)
+                let result = http.post("/api/notes/neurons/decay", args).await?;
+                Ok(Some(result))
+            }
+
+            "backfill_synapses" => {
+                // REST runs async (202 Accepted), MCP Direct was sync.
+                // We forward to the async endpoint and return the 202 response.
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("batch_size") { body.insert("batch_size".to_string(), v.clone()); }
+                if let Some(v) = args.get("min_similarity") { body.insert("min_similarity".to_string(), v.clone()); }
+                if let Some(v) = args.get("max_neighbors") { body.insert("max_neighbors".to_string(), v.clone()); }
+                let result = http.post("/api/admin/backfill-synapses", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
             // ── Not yet migrated ────────────────────────────────────────
             _ => Ok(None),
         }

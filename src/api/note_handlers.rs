@@ -923,3 +923,150 @@ pub async fn cancel_backfill_synapses(
         "message": "Cancellation requested. The job will stop after the current note."
     })))
 }
+
+// ============================================================================
+// Additional endpoints for MCP HTTP proxy parity
+// ============================================================================
+
+/// Query params for semantic note search
+#[derive(Debug, Deserialize)]
+pub struct SemanticSearchQuery {
+    pub query: String,
+    pub project_slug: Option<String>,
+    pub workspace_slug: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// GET /api/notes/search-semantic — Vector-based semantic search
+pub async fn search_notes_semantic(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<SemanticSearchQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = if let Some(ref slug) = query.project_slug {
+        let project = state
+            .orchestrator
+            .neo4j()
+            .get_project_by_slug(slug)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+        Some(project.id)
+    } else {
+        None
+    };
+
+    let hits = state
+        .orchestrator
+        .note_manager()
+        .semantic_search_notes(
+            &query.query,
+            project_id,
+            query.workspace_slug.as_deref(),
+            query.limit,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(hits).unwrap_or_default()))
+}
+
+/// Request body for update_energy_scores
+#[derive(Debug, Deserialize)]
+pub struct UpdateEnergyBody {
+    pub half_life: Option<f64>,
+}
+
+/// POST /api/notes/update-energy — Decay energy scores based on half-life
+pub async fn update_energy_scores(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<UpdateEnergyBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let half_life = body.half_life.unwrap_or(90.0);
+    let count = state
+        .orchestrator
+        .note_manager()
+        .update_energy_scores(half_life)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "notes_updated": count,
+        "half_life_days": half_life
+    })))
+}
+
+/// Request body for reinforce_neurons
+#[derive(Debug, Deserialize)]
+pub struct ReinforceNeuronsBody {
+    pub note_ids: Vec<Uuid>,
+    pub energy_boost: Option<f64>,
+    pub synapse_boost: Option<f64>,
+}
+
+/// POST /api/notes/neurons/reinforce — Boost energy + reinforce synapses
+pub async fn reinforce_neurons(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<ReinforceNeuronsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if body.note_ids.len() < 2 {
+        return Err(AppError::BadRequest(format!(
+            "note_ids must contain at least 2 UUIDs (got {})",
+            body.note_ids.len()
+        )));
+    }
+
+    let energy_boost = body.energy_boost.unwrap_or(0.2);
+    let synapse_boost = body.synapse_boost.unwrap_or(0.05);
+
+    let neo4j = state.orchestrator.neo4j();
+    let mut neurons_boosted = 0u64;
+    for note_id in &body.note_ids {
+        neo4j
+            .boost_energy(*note_id, energy_boost)
+            .await
+            .map_err(AppError::Internal)?;
+        neurons_boosted += 1;
+    }
+
+    let synapses_reinforced = neo4j
+        .reinforce_synapses(&body.note_ids, synapse_boost)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "neurons_boosted": neurons_boosted,
+        "synapses_reinforced": synapses_reinforced,
+        "energy_boost": energy_boost,
+        "synapse_boost": synapse_boost,
+    })))
+}
+
+/// Request body for decay_synapses
+#[derive(Debug, Deserialize)]
+pub struct DecaySynapsesBody {
+    pub decay_amount: Option<f64>,
+    pub prune_threshold: Option<f64>,
+}
+
+/// POST /api/notes/neurons/decay — Decay synapses and prune weak ones
+pub async fn decay_synapses(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<DecaySynapsesBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let decay_amount = body.decay_amount.unwrap_or(0.01);
+    let prune_threshold = body.prune_threshold.unwrap_or(0.1);
+
+    let (decayed, pruned) = state
+        .orchestrator
+        .neo4j()
+        .decay_synapses(decay_amount, prune_threshold)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "synapses_decayed": decayed,
+        "synapses_pruned": pruned,
+        "decay_amount": decay_amount,
+        "prune_threshold": prune_threshold,
+    })))
+}

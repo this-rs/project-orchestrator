@@ -482,8 +482,20 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Notes search
         .route("/api/notes/search", get(note_handlers::search_notes))
         .route(
+            "/api/notes/search-semantic",
+            get(note_handlers::search_notes_semantic),
+        )
+        .route(
             "/api/notes/neurons/search",
             get(note_handlers::search_neurons),
+        )
+        .route(
+            "/api/notes/neurons/reinforce",
+            post(note_handlers::reinforce_neurons),
+        )
+        .route(
+            "/api/notes/neurons/decay",
+            post(note_handlers::decay_synapses),
         )
         // Notes needing review
         .route(
@@ -494,6 +506,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/notes/update-staleness",
             post(note_handlers::update_staleness_scores),
+        )
+        // Update energy scores (Hebbian decay)
+        .route(
+            "/api/notes/update-energy",
+            post(note_handlers::update_energy_scores),
         )
         // Notes for a project
         .route(
