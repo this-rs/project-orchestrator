@@ -704,14 +704,12 @@ impl Neo4jClient {
             MATCH (wm:WorkspaceMilestone {id: $milestone_id})
             OPTIONAL MATCH (wm)-[:INCLUDES_TASK]->(t1:Task)
             OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(wm), (p)-[:HAS_TASK]->(t2:Task)
-            WITH collect(DISTINCT t1) + collect(DISTINCT t2) AS all_tasks
-            UNWIND all_tasks AS t
-            WITH DISTINCT t
+            WITH [x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL] AS tasks
             RETURN
-                count(t) AS total,
-                sum(CASE WHEN t.status = 'Completed' THEN 1 ELSE 0 END) AS completed,
-                sum(CASE WHEN t.status = 'InProgress' THEN 1 ELSE 0 END) AS in_progress,
-                sum(CASE WHEN t.status = 'Pending' THEN 1 ELSE 0 END) AS pending
+                size(tasks) AS total,
+                size([t IN tasks WHERE t.status = 'Completed']) AS completed,
+                size([t IN tasks WHERE t.status = 'InProgress']) AS in_progress,
+                size([t IN tasks WHERE t.status = 'Pending']) AS pending
             "#,
         )
         .param("milestone_id", milestone_id.to_string());
@@ -744,17 +742,13 @@ impl Neo4jClient {
             r#"
             MATCH (wm:WorkspaceMilestone {id: $milestone_id})
             OPTIONAL MATCH (wm)-[:INCLUDES_TASK]->(t1:Task)
-            OPTIONAL MATCH (p1:Plan)-[:HAS_TASK]->(t1)
-            WITH wm, collect(DISTINCT {task: t1, plan: p1}) AS direct_tasks
-            OPTIONAL MATCH (p2:Plan)-[:TARGETS_MILESTONE]->(wm), (p2)-[:HAS_TASK]->(t2:Task)
-            WITH direct_tasks + collect(DISTINCT {task: t2, plan: p2}) AS all_entries
-            UNWIND all_entries AS entry
-            WITH entry.task AS t, entry.plan AS p
-            WHERE t IS NOT NULL
-            WITH DISTINCT t, p
-            RETURN t, COALESCE(p.id, '') AS plan_id,
-                   COALESCE(p.title, '') AS plan_title,
-                   COALESCE(p.status, '') AS plan_status
+            OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(wm), (p)-[:HAS_TASK]->(t2:Task)
+            WITH [x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL] AS tasks
+            UNWIND tasks AS t
+            OPTIONAL MATCH (pl:Plan)-[:HAS_TASK]->(t)
+            RETURN t, COALESCE(pl.id, '') AS plan_id,
+                   COALESCE(pl.title, '') AS plan_title,
+                   COALESCE(pl.status, '') AS plan_status
             ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
             "#,
         )
@@ -793,10 +787,8 @@ impl Neo4jClient {
             MATCH (wm:WorkspaceMilestone {id: $milestone_id})
             OPTIONAL MATCH (wm)-[:INCLUDES_TASK]->(t1:Task)
             OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(wm), (p)-[:HAS_TASK]->(t2:Task)
-            WITH collect(DISTINCT t1) + collect(DISTINCT t2) AS all_tasks
-            UNWIND all_tasks AS t
-            WITH DISTINCT t
-            WHERE t IS NOT NULL
+            WITH [x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL] AS tasks
+            UNWIND tasks AS t
             MATCH (t)-[:HAS_STEP]->(s:Step)
             RETURN t.id AS task_id, s
             ORDER BY t.id, s.order
