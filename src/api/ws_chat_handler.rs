@@ -730,7 +730,7 @@ async fn handle_ws_chat_loop(
                                             Ok(())
                                         } else {
                                             // No instance owns the session — resume locally (spawns new CLI)
-                                            chat_manager.resume_session(&session_id, &content).await
+                                            chat_manager.resume_session(&session_id, &content, Some(&claims)).await
                                         };
 
                                         match result {

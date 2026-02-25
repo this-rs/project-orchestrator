@@ -1335,12 +1335,15 @@ impl ChatManager {
         permission_mode_override: Option<&str>,
         hooks: Option<std::collections::HashMap<String, Vec<nexus_claude::HookMatcher>>>,
         add_dirs: &[String],
+        user_claims: Option<&crate::auth::jwt::Claims>,
     ) -> ClaudeCodeOptions {
         // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
         let cwd = expand_tilde(cwd);
         let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
 
         let mut env = HashMap::new();
+        // Neo4j/MeiliSearch env vars — kept for non-CRUD processes that still
+        // call the database directly (e.g., sync, code parsing, analytics).
         env.insert("NEO4J_URI".into(), self.config.neo4j_uri.clone());
         env.insert("NEO4J_USER".into(), self.config.neo4j_user.clone());
         env.insert("NEO4J_PASSWORD".into(), self.config.neo4j_password.clone());
@@ -1352,6 +1355,34 @@ impl ChatManager {
             "MEILISEARCH_KEY".into(),
             self.config.meilisearch_key.clone(),
         );
+
+        // Inject session token + server URL for MCP HTTP wrapper mode.
+        // Only when auth is enabled (jwt_secret present) AND user claims are available.
+        // PO_SERVER_URL is ALWAYS 127.0.0.1:{port} — the MCP server is a local subprocess.
+        if let (Some(ref secret), Some(claims)) = (&self.config.jwt_secret, user_claims) {
+            match crate::auth::jwt::generate_session_token(
+                claims,
+                secret,
+                self.config.session_token_expiry_secs,
+            ) {
+                Ok(token) => {
+                    env.insert("PO_AUTH_TOKEN".into(), token);
+                    env.insert(
+                        "PO_SERVER_URL".into(),
+                        format!("http://127.0.0.1:{}", self.config.server_port),
+                    );
+                    tracing::debug!(
+                        user = %claims.email,
+                        expiry_secs = self.config.session_token_expiry_secs,
+                        server_port = self.config.server_port,
+                        "Injected PO_AUTH_TOKEN + PO_SERVER_URL into MCP env"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to generate MCP session token: {} — MCP will run without auth", e);
+                }
+            }
+        }
 
         let mcp_config = McpServerConfig::Stdio {
             command: mcp_path,
@@ -1719,6 +1750,7 @@ impl ChatManager {
                 request.permission_mode.as_deref(),
                 Some(compaction_hooks),
                 &resolved_add_dirs,
+                request.user_claims.as_ref(),
             )
             .await;
         let mut client = InteractiveClient::new(options)
@@ -3600,7 +3632,12 @@ impl ChatManager {
     ///
     /// If the session has a `cli_session_id`, resumes with `--resume`.
     /// If not (first message or previous spawn failed), starts fresh without `--resume`.
-    pub async fn resume_session(&self, session_id: &str, message: &str) -> Result<()> {
+    pub async fn resume_session(
+        &self,
+        session_id: &str,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+    ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
         // Load session from Neo4j
@@ -3658,6 +3695,7 @@ impl ChatManager {
                 session_node.permission_mode.as_deref(),
                 Some(compaction_hooks),
                 &resume_add_dirs,
+                user_claims,
             )
             .await;
 
@@ -4446,6 +4484,9 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: true,
+            jwt_secret: None,
+            server_port: 8080,
+            session_token_expiry_secs: 14400,
         }
     }
 
@@ -4484,6 +4525,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
@@ -4511,6 +4553,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
@@ -4533,6 +4576,7 @@ mod tests {
                 Some("bypassPermissions"),
                 None,
                 &[],
+                None,
             )
             .await;
         assert!(matches!(
@@ -4542,7 +4586,7 @@ mod tests {
 
         // Without override, falls back to global (Default)
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[])
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[], None)
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
     }
@@ -4602,7 +4646,7 @@ mod tests {
 
         // Initially Default (safe-by-default)
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[])
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[], None)
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
 
@@ -4618,7 +4662,7 @@ mod tests {
 
         // New build_options should reflect the update
         let opts = manager
-            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[])
+            .build_options("/tmp", "claude-opus-4-6", "prompt", None, None, None, &[], None)
             .await;
         assert!(matches!(
             opts.permission_mode,
@@ -4683,6 +4727,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .await;
 
@@ -4706,6 +4751,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .await;
 
@@ -4719,7 +4765,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         let options = manager
-            .build_options("/tmp", "model", "prompt", None, None, None, &[])
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
             .await;
 
         let mcp = options.mcp_servers.get("project-orchestrator").unwrap();
@@ -4755,7 +4801,7 @@ mod tests {
         );
 
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, Some(hooks), &[])
+            .build_options("/tmp", "model", "prompt", None, None, Some(hooks), &[], None)
             .await;
 
         // Hooks should be configured
@@ -4772,7 +4818,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, None, &[])
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
             .await;
 
         // No hooks configured
@@ -4871,7 +4917,7 @@ mod tests {
 
         let dirs = ["/extra/dir1".to_string(), "/extra/dir2".to_string()];
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, None, &dirs)
+            .build_options("/tmp", "model", "prompt", None, None, None, &dirs, None)
             .await;
 
         assert_eq!(opts.add_dirs.len(), 2);
@@ -4889,7 +4935,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, None, &[])
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
             .await;
 
         assert!(opts.add_dirs.is_empty());
@@ -5498,7 +5544,7 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let result = manager.resume_session("not-a-uuid", "hello").await;
+        let result = manager.resume_session("not-a-uuid", "hello", None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -5512,7 +5558,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let id = Uuid::new_v4().to_string();
-        let result = manager.resume_session(&id, "hello").await;
+        let result = manager.resume_session(&id, "hello", None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -5533,7 +5579,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let result = manager
-            .resume_session(&session.id.to_string(), "hello")
+            .resume_session(&session.id.to_string(), "hello", None)
             .await;
         // Should fail (CLI not available in test), but NOT with "no CLI session ID"
         assert!(result.is_err());
@@ -8058,6 +8104,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .await;
 
@@ -8093,6 +8140,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .await;
 
@@ -8157,7 +8205,7 @@ mod tests {
 
         // Initially no PATH injection
         let options = manager
-            .build_options("/tmp", "claude-sonnet-4-6", "test", None, None, None, &[])
+            .build_options("/tmp", "claude-sonnet-4-6", "test", None, None, None, &[], None)
             .await;
         assert!(!options.env.contains_key("PATH"));
 
@@ -8171,7 +8219,7 @@ mod tests {
 
         // Now build_options should pick up the runtime values
         let options = manager
-            .build_options("/tmp", "claude-sonnet-4-6", "test", None, None, None, &[])
+            .build_options("/tmp", "claude-sonnet-4-6", "test", None, None, None, &[], None)
             .await;
         assert_eq!(
             options.env.get("PATH").map(|s| s.as_str()),

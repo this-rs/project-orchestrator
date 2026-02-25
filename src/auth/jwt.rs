@@ -72,6 +72,32 @@ pub fn encode_jwt(
     .context("Failed to encode JWT")
 }
 
+/// Generate a session token for MCP subprocess authentication.
+///
+/// Creates a JWT with the user's identity (sub, email, name) and a custom
+/// expiration duration. Used by ChatManager to inject `PO_AUTH_TOKEN` into
+/// the MCP server's env vars.
+///
+/// The token is validated by the same `require_auth` middleware — no new
+/// auth mechanism needed.
+pub fn generate_session_token(claims: &Claims, secret: &str, expiry_secs: u64) -> Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    let session_claims = Claims {
+        sub: claims.sub.clone(),
+        email: claims.email.clone(),
+        name: claims.name.clone(),
+        iat: now,
+        exp: now + expiry_secs as i64,
+    };
+
+    encode(
+        &Header::default(),
+        &session_claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .context("Failed to encode session token")
+}
+
 /// Decode and validate a JWT token.
 ///
 /// Returns the claims if the token is valid, not expired, and
@@ -160,6 +186,43 @@ mod tests {
 
         let result = decode_jwt("just-random-text", TEST_SECRET);
         assert!(result.is_err(), "random text should be rejected");
+    }
+
+    #[test]
+    fn test_generate_session_token_4h() {
+        let original = Claims {
+            sub: Uuid::new_v4().to_string(),
+            email: "alice@ffs.holdings".to_string(),
+            name: "Alice".to_string(),
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 900, // original 15min token
+        };
+
+        let token =
+            generate_session_token(&original, TEST_SECRET, 14400).expect("should succeed");
+        let decoded = decode_jwt(&token, TEST_SECRET).expect("should decode");
+
+        assert_eq!(decoded.sub, original.sub);
+        assert_eq!(decoded.email, original.email);
+        assert_eq!(decoded.name, original.name);
+        // Session token should have 4h expiry, not the original 15min
+        assert_eq!(decoded.exp - decoded.iat, 14400);
+    }
+
+    #[test]
+    fn test_generate_session_token_validated_by_decode() {
+        let claims = Claims {
+            sub: Uuid::new_v4().to_string(),
+            email: "bob@ffs.holdings".to_string(),
+            name: "Bob".to_string(),
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 900,
+        };
+
+        let token = generate_session_token(&claims, TEST_SECRET, 3600).expect("should succeed");
+        // Same decode function used by require_auth middleware
+        let result = decode_jwt(&token, TEST_SECRET);
+        assert!(result.is_ok(), "session token should be valid for require_auth");
     }
 
     #[test]

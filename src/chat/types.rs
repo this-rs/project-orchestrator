@@ -29,6 +29,10 @@ pub struct ChatRequest {
     /// as add_dirs automatically (mutually exclusive with explicit add_dirs)
     #[serde(default)]
     pub workspace_slug: Option<String>,
+    /// Authenticated user claims — injected by the server (not from JSON body).
+    /// Used to generate the MCP session token (PO_AUTH_TOKEN).
+    #[serde(skip)]
+    pub user_claims: Option<crate::auth::jwt::Claims>,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)

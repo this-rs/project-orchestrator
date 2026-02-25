@@ -929,6 +929,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(auto_update_app) = config.chat_auto_update_app {
             chat_config.auto_update_app = auto_update_app;
         }
+        // Inject auth context for MCP session token generation.
+        // When auth is enabled, build_options() will generate a JWT session token
+        // and inject PO_AUTH_TOKEN + PO_SERVER_URL into the MCP server env vars.
+        chat_config.server_port = config.server_port;
+        if let Some(ref auth) = config.auth_config {
+            chat_config.jwt_secret = Some(auth.jwt_secret.clone());
+        }
         let mut cm = chat::ChatManager::new(
             orchestrator.neo4j_arc(),
             orchestrator.meili_arc(),

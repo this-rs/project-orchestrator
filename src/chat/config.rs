@@ -180,6 +180,14 @@ pub struct ChatConfig {
     pub auto_update_cli: bool,
     /// Enable automatic Tauri application updates on startup (default: true).
     pub auto_update_app: bool,
+    /// JWT secret for generating session tokens (MCP auth).
+    /// When Some (auth enabled), build_options() generates a session JWT
+    /// and injects PO_AUTH_TOKEN + PO_SERVER_URL into the MCP server env.
+    pub jwt_secret: Option<String>,
+    /// Server port for PO_SERVER_URL derivation (always 127.0.0.1:{port}).
+    pub server_port: u16,
+    /// Expiration duration for MCP session tokens in seconds (default: 4h = 14400s).
+    pub session_token_expiry_secs: u64,
 }
 
 impl ChatConfig {
@@ -253,6 +261,15 @@ impl ChatConfig {
             auto_update_app: std::env::var("CHAT_AUTO_UPDATE_APP")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(true),
+            jwt_secret: None, // Injected from Config.auth_config in lib.rs
+            server_port: std::env::var("SERVER_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080),
+            session_token_expiry_secs: std::env::var("CHAT_SESSION_TOKEN_EXPIRY_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(14400), // 4 hours
         }
     }
 
@@ -334,6 +351,9 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: true,
+            jwt_secret: None,
+            server_port: 8080,
+            session_token_expiry_secs: 14400,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -488,6 +508,9 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: true,
+            jwt_secret: None,
+            server_port: 8080,
+            session_token_expiry_secs: 14400,
         };
 
         let json = config.mcp_server_config();
@@ -520,6 +543,9 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: true,
+            jwt_secret: None,
+            server_port: 8080,
+            session_token_expiry_secs: 14400,
         };
 
         let json = config.mcp_server_config();

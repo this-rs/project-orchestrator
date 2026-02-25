@@ -18,8 +18,15 @@ use uuid::Uuid;
 /// POST /api/chat/sessions — Create a new chat session and send the first message
 pub async fn create_session(
     State(state): State<OrchestratorState>,
-    Json(request): Json<ChatRequest>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    Json(mut request): Json<ChatRequest>,
 ) -> Result<Json<CreateSessionResponse>, AppError> {
+    // Inject authenticated user claims into the request so ChatManager
+    // can generate a session token for the MCP subprocess.
+    if let Some(axum::Extension(c)) = claims {
+        request.user_claims = Some(c);
+    }
+
     let chat_manager = state
         .chat_manager
         .as_ref()

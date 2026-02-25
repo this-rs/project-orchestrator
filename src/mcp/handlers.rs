@@ -3974,6 +3974,7 @@ impl ToolHandler {
             permission_mode,
             add_dirs,
             workspace_slug,
+            user_claims: None, // MCP direct mode — no user claims available
         };
 
         // Create session and wait for it to complete (non-streaming for MCP)
