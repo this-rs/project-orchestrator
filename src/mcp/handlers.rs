@@ -1318,6 +1318,336 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── P8: Workspaces (34 tools) ──────────────────────────────────
+
+            // --- Workspace CRUD (5) ---
+
+            "list_workspaces" => {
+                let mut query = Vec::new();
+                if let Some(v) = args.get("search").and_then(|v| v.as_str()) {
+                    query.push(("search".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/workspaces").await?
+                } else {
+                    http.get_with_query("/api/workspaces", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_workspace" => {
+                let result = http.post("/api/workspaces", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_workspace" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.get(&format!("/api/workspaces/{}", slug)).await?;
+                Ok(Some(result))
+            }
+
+            "update_workspace" => {
+                let slug = extract_string(args, "slug")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("name") { body.insert("name".to_string(), v.clone()); }
+                if let Some(v) = args.get("description") { body.insert("description".to_string(), v.clone()); }
+                if let Some(v) = args.get("metadata") { body.insert("metadata".to_string(), v.clone()); }
+                let result = http.patch(&format!("/api/workspaces/{}", slug), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_workspace" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.delete(&format!("/api/workspaces/{}", slug)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            // --- Workspace Overview & Projects (4) ---
+
+            "get_workspace_overview" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.get(&format!("/api/workspaces/{}/overview", slug)).await?;
+                Ok(Some(result))
+            }
+
+            "list_workspace_projects" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.get(&format!("/api/workspaces/{}/projects", slug)).await?;
+                Ok(Some(result))
+            }
+
+            "add_project_to_workspace" => {
+                let slug = extract_string(args, "slug")?;
+                let project_id = extract_id(args, "project_id")?;
+                let body = json!({"project_id": project_id});
+                let result = http.post(&format!("/api/workspaces/{}/projects", slug), &body).await?;
+                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+            }
+
+            "remove_project_from_workspace" => {
+                let slug = extract_string(args, "slug")?;
+                let project_id = extract_id(args, "project_id")?;
+                let result = http.delete(&format!("/api/workspaces/{}/projects/{}", slug, project_id)).await?;
+                Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
+            }
+
+            // --- Workspace Topology (1) ---
+
+            "get_workspace_topology" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.get(&format!("/api/workspaces/{}/topology", slug)).await?;
+                Ok(Some(result))
+            }
+
+            // --- Workspace Milestones (10) ---
+
+            "list_all_workspace_milestones" => {
+                let mut query = Vec::new();
+                if let Some(v) = args.get("workspace_id").and_then(|v| v.as_str()) {
+                    query.push(("workspace_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/workspace-milestones").await?
+                } else {
+                    http.get_with_query("/api/workspace-milestones", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "list_workspace_milestones" => {
+                let slug = extract_string(args, "slug")?;
+                let mut query = Vec::new();
+                if let Some(v) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let path = format!("/api/workspaces/{}/milestones", slug);
+                let result = if query.is_empty() {
+                    http.get(&path).await?
+                } else {
+                    http.get_with_query(&path, &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_workspace_milestone" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.post(&format!("/api/workspaces/{}/milestones", slug), args).await?;
+                Ok(Some(result))
+            }
+
+            "get_workspace_milestone" => {
+                let id = extract_id(args, "id")?;
+                let result = http.get(&format!("/api/workspace-milestones/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_workspace_milestone" => {
+                let id = extract_id(args, "id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("title") { body.insert("title".to_string(), v.clone()); }
+                if let Some(v) = args.get("description") { body.insert("description".to_string(), v.clone()); }
+                if let Some(v) = args.get("status") { body.insert("status".to_string(), v.clone()); }
+                if let Some(v) = args.get("target_date") { body.insert("target_date".to_string(), v.clone()); }
+                let result = http.patch(&format!("/api/workspace-milestones/{}", id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_workspace_milestone" => {
+                let id = extract_id(args, "id")?;
+                let result = http.delete(&format!("/api/workspace-milestones/{}", id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "add_task_to_workspace_milestone" => {
+                let id = extract_id(args, "id")?;
+                let task_id = extract_id(args, "task_id")?;
+                let body = json!({"task_id": task_id});
+                let result = http.post(&format!("/api/workspace-milestones/{}/tasks", id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+            }
+
+            "link_plan_to_workspace_milestone" => {
+                let id = extract_id(args, "id")?;
+                let plan_id = extract_id(args, "plan_id")?;
+                let body = json!({"plan_id": plan_id});
+                let result = http.post(&format!("/api/workspace-milestones/{}/plans", id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+            }
+
+            "unlink_plan_from_workspace_milestone" => {
+                let id = extract_id(args, "id")?;
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.delete(&format!("/api/workspace-milestones/{}/plans/{}", id, plan_id)).await?;
+                Ok(Some(if result.is_null() { json!({"unlinked": true}) } else { result }))
+            }
+
+            "get_workspace_milestone_progress" => {
+                let id = extract_id(args, "id")?;
+                let result = http.get(&format!("/api/workspace-milestones/{}/progress", id)).await?;
+                Ok(Some(result))
+            }
+
+            // --- Resources (6) ---
+
+            "list_resources" => {
+                let slug = extract_string(args, "slug")?;
+                let mut query = Vec::new();
+                if let Some(v) = args.get("resource_type").and_then(|v| v.as_str()) {
+                    query.push(("resource_type".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let path = format!("/api/workspaces/{}/resources", slug);
+                let result = if query.is_empty() {
+                    http.get(&path).await?
+                } else {
+                    http.get_with_query(&path, &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_resource" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.post(&format!("/api/workspaces/{}/resources", slug), args).await?;
+                Ok(Some(result))
+            }
+
+            "get_resource" => {
+                let id = extract_id(args, "id")?;
+                let result = http.get(&format!("/api/resources/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_resource" => {
+                let id = extract_id(args, "id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("name") { body.insert("name".to_string(), v.clone()); }
+                if let Some(v) = args.get("file_path") { body.insert("file_path".to_string(), v.clone()); }
+                if let Some(v) = args.get("url") { body.insert("url".to_string(), v.clone()); }
+                if let Some(v) = args.get("version") { body.insert("version".to_string(), v.clone()); }
+                if let Some(v) = args.get("description") { body.insert("description".to_string(), v.clone()); }
+                let result = http.patch(&format!("/api/resources/{}", id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_resource" => {
+                let id = extract_id(args, "id")?;
+                let result = http.delete(&format!("/api/resources/{}", id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "link_resource_to_project" => {
+                let id = extract_id(args, "id")?;
+                let project_id = extract_id(args, "project_id")?;
+                let link_type = extract_string(args, "link_type")?;
+                let body = json!({"project_id": project_id, "link_type": link_type});
+                let result = http.post(&format!("/api/resources/{}/projects", id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"linked": true}) } else { result }))
+            }
+
+            // --- Components (8) ---
+
+            "list_components" => {
+                let slug = extract_string(args, "slug")?;
+                let mut query = Vec::new();
+                if let Some(v) = args.get("component_type").and_then(|v| v.as_str()) {
+                    query.push(("component_type".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let path = format!("/api/workspaces/{}/components", slug);
+                let result = if query.is_empty() {
+                    http.get(&path).await?
+                } else {
+                    http.get_with_query(&path, &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_component" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.post(&format!("/api/workspaces/{}/components", slug), args).await?;
+                Ok(Some(result))
+            }
+
+            "get_component" => {
+                let id = extract_id(args, "id")?;
+                let result = http.get(&format!("/api/components/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_component" => {
+                let id = extract_id(args, "id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("name") { body.insert("name".to_string(), v.clone()); }
+                if let Some(v) = args.get("description") { body.insert("description".to_string(), v.clone()); }
+                if let Some(v) = args.get("runtime") { body.insert("runtime".to_string(), v.clone()); }
+                if let Some(v) = args.get("config") { body.insert("config".to_string(), v.clone()); }
+                if let Some(v) = args.get("tags") { body.insert("tags".to_string(), v.clone()); }
+                let result = http.patch(&format!("/api/components/{}", id), &Value::Object(body)).await?;
+                Ok(Some(if result.is_null() { json!({"updated": true}) } else { result }))
+            }
+
+            "delete_component" => {
+                let id = extract_id(args, "id")?;
+                let result = http.delete(&format!("/api/components/{}", id)).await?;
+                Ok(Some(if result.is_null() { json!({"deleted": true}) } else { result }))
+            }
+
+            "add_component_dependency" => {
+                let id = extract_id(args, "id")?;
+                let depends_on_id = extract_id(args, "depends_on_id")?;
+                let mut body = json!({"depends_on_id": depends_on_id});
+                if let Some(v) = args.get("protocol") { body["protocol"] = v.clone(); }
+                if let Some(v) = args.get("required") { body["required"] = v.clone(); }
+                let result = http.post(&format!("/api/components/{}/dependencies", id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"added": true}) } else { result }))
+            }
+
+            "remove_component_dependency" => {
+                let id = extract_id(args, "id")?;
+                let dep_id = extract_id(args, "dep_id")?;
+                let result = http.delete(&format!("/api/components/{}/dependencies/{}", id, dep_id)).await?;
+                Ok(Some(if result.is_null() { json!({"removed": true}) } else { result }))
+            }
+
+            "map_component_to_project" => {
+                let id = extract_id(args, "id")?;
+                let project_id = extract_id(args, "project_id")?;
+                let body = json!({"project_id": project_id});
+                let result = http.put(&format!("/api/components/{}/project", id), &body).await?;
+                Ok(Some(if result.is_null() { json!({"mapped": true}) } else { result }))
+            }
+
             // ── Not yet migrated ────────────────────────────────────────
             _ => Ok(None),
         }
