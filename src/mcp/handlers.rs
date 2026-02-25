@@ -2725,4 +2725,442 @@ mod tests {
             );
         }
     }
+
+    // ========================================================================
+    // HTTP routing tests (mock axum server)
+    // ========================================================================
+
+    use axum::{
+        body::Body, extract::Request, http::StatusCode, response::IntoResponse, routing::any,
+        Router,
+    };
+    use tokio::net::TcpListener;
+
+    /// Echo handler: returns {method, path, query, body} for every request.
+    async fn echo_handler(req: Request<Body>) -> impl IntoResponse {
+        let method = req.method().to_string();
+        let path = req.uri().path().to_string();
+        let query = req.uri().query().unwrap_or("").to_string();
+        let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+        let body_json: Value = serde_json::from_str(&body_str).unwrap_or(Value::Null);
+
+        (
+            StatusCode::OK,
+            axum::Json(json!({
+                "_echo": true,
+                "method": method,
+                "path": path,
+                "query": query,
+                "body": body_json,
+            })),
+        )
+    }
+
+    /// Spin up a temporary axum server and return a ToolHandler connected to it.
+    async fn make_http_handler() -> (ToolHandler, String) {
+        let app = Router::new().fallback(any(echo_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let client = McpHttpClient::new(base_url.clone(), Some("test-token".to_string()));
+        (ToolHandler::new(client), base_url)
+    }
+
+    // -- Projects ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_projects() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_projects", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/projects");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_projects_with_query() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_projects",
+                Some(json!({"search": "test", "limit": 10})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/projects");
+        let query = result["query"].as_str().unwrap();
+        assert!(
+            query.contains("search=test"),
+            "query should contain search=test, got: {}",
+            query
+        );
+        assert!(
+            query.contains("limit=10"),
+            "query should contain limit=10, got: {}",
+            query
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_create_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_project",
+                Some(json!({"name": "My Project", "root_path": "/tmp/proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/projects");
+        assert_eq!(result["body"]["name"], "My Project");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_project", Some(json!({"slug": "my-project"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/projects/my-project");
+    }
+
+    #[tokio::test]
+    async fn test_http_update_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_project",
+                Some(json!({"slug": "my-proj", "name": "New Name"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert_eq!(result["path"], "/api/projects/my-proj");
+        assert_eq!(result["body"]["name"], "New Name");
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_project", Some(json!({"slug": "old-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], "/api/projects/old-proj");
+    }
+
+    // -- Plans -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_create_plan() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_plan",
+                Some(json!({"title": "Test Plan", "description": "A plan"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/plans");
+        assert_eq!(result["body"]["title"], "Test Plan");
+    }
+
+    #[tokio::test]
+    async fn test_http_update_plan_status() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_plan_status",
+                Some(json!({
+                    "plan_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "status": "in_progress"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("550e8400-e29b-41d4-a716-446655440000"));
+        assert_eq!(result["body"]["status"], "in_progress");
+    }
+
+    #[tokio::test]
+    async fn test_http_link_plan_to_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "link_plan_to_project",
+                Some(json!({
+                    "plan_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "project_id": "660e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PUT");
+        assert!(result["path"].as_str().unwrap().ends_with("/project"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_plan() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "delete_plan",
+                Some(json!({"plan_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/plans/"));
+    }
+
+    // -- Tasks -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_tasks_with_filters() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_tasks",
+                Some(json!({
+                    "plan_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "status": "pending",
+                    "limit": 20
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/tasks");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("plan_id="));
+        assert!(query.contains("status=pending"));
+    }
+
+    #[tokio::test]
+    async fn test_http_create_task() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_task",
+                Some(json!({
+                    "plan_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "title": "Test Task"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/tasks"));
+        assert_eq!(result["body"]["title"], "Test Task");
+    }
+
+    // -- Steps -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_create_step() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_step",
+                Some(json!({
+                    "task_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "description": "Do something"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().contains("/steps"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_step() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_step",
+                Some(json!({
+                    "step_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "status": "completed"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"].as_str().unwrap().contains("/steps/"));
+    }
+
+    // -- Notes -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_create_note() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_note",
+                Some(json!({
+                    "content": "Important note",
+                    "note_type": "guideline",
+                    "importance": "high"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/notes");
+    }
+
+    #[tokio::test]
+    async fn test_http_search_notes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("search_notes", Some(json!({"query": "architecture"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/search");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("q=architecture"));
+    }
+
+    // -- Commits -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_create_commit() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_commit",
+                Some(json!({
+                    "sha": "abc1234",
+                    "message": "feat: something",
+                    "author": "test"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/commits");
+        // MCP field "sha" maps to REST "hash"
+        assert_eq!(result["body"]["hash"], "abc1234");
+    }
+
+    // -- Code --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_search_code() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("search_code", Some(json!({"query": "ToolHandler"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/search");
+        let query = result["query"].as_str().unwrap();
+        assert!(
+            query.contains("query=ToolHandler"),
+            "query should contain query=ToolHandler, got: {}",
+            query
+        );
+    }
+
+    // -- Workspaces --------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_create_workspace() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_workspace",
+                Some(json!({"name": "Test WS", "slug": "test-ws"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/workspaces");
+    }
+
+    // -- Mega-tool → HTTP integration -------------------------------------
+
+    #[tokio::test]
+    async fn test_mega_tool_project_routes_to_http() {
+        let (handler, _) = make_http_handler().await;
+        // Calling mega-tool "project" with action "list" should resolve and route via HTTP
+        let result = handler
+            .handle("project", Some(json!({"action": "list"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/projects");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_plan_create_routes_to_http() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "plan",
+                Some(json!({"action": "create", "title": "New Plan"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/plans");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_note_search_semantic() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "note",
+                Some(json!({"action": "search_semantic", "query": "how to"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/search-semantic");
+    }
+
+    // -- Error paths -------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_unknown_tool_returns_error() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler.handle("totally_unknown_tool", None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_missing_required_arg() {
+        let (handler, _) = make_http_handler().await;
+        // get_project requires "slug" — call without it
+        let result = handler.handle("get_project", Some(json!({}))).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("slug"));
+    }
 }
