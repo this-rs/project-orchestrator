@@ -262,9 +262,16 @@ pub struct SyncProjectResponse {
     pub errors: usize,
 }
 
+/// Query parameters for sync_project
+#[derive(Debug, Deserialize, Default)]
+pub struct SyncProjectQuery {
+    pub force: Option<bool>,
+}
+
 pub async fn sync_project(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
+    Query(query): Query<SyncProjectQuery>,
 ) -> Result<Json<SyncProjectResponse>, AppError> {
     let project = state
         .orchestrator
@@ -273,11 +280,17 @@ pub async fn sync_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
+    let force = query.force.unwrap_or(false);
     let expanded = expand_tilde(&project.root_path);
     let path = std::path::Path::new(&expanded);
     let result = state
         .orchestrator
-        .sync_directory_for_project(path, Some(project.id), Some(&project.slug))
+        .sync_directory_for_project_with_options(
+            path,
+            Some(project.id),
+            Some(&project.slug),
+            force,
+        )
         .await?;
 
     // Update last_synced timestamp
@@ -302,11 +315,20 @@ pub async fn sync_project(
     }))
 }
 
-/// List plans for a project
+/// Query parameters for list_project_plans
+#[derive(Debug, Deserialize, Default)]
+pub struct ProjectPlansQuery {
+    pub status: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// List plans for a project with optional status filter and pagination
 pub async fn list_project_plans(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
-) -> Result<Json<Vec<crate::neo4j::models::PlanNode>>, AppError> {
+    Query(query): Query<ProjectPlansQuery>,
+) -> Result<Json<PaginatedResponse<crate::neo4j::models::PlanNode>>, AppError> {
     let project = state
         .orchestrator
         .neo4j()
@@ -314,13 +336,19 @@ pub async fn list_project_plans(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    let plans = state
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+    let status_filter: Option<Vec<String>> = query
+        .status
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
+
+    let (plans, total) = state
         .orchestrator
         .neo4j()
-        .list_project_plans(project.id)
+        .list_plans_for_project(project.id, status_filter, limit, offset)
         .await?;
 
-    Ok(Json(plans))
+    Ok(Json(PaginatedResponse::new(plans, total, limit, offset)))
 }
 
 /// Search code in a project

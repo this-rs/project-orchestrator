@@ -18,7 +18,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::expand_tilde;
-use super::http_client::McpHttpClient;
+use super::http_client::{McpHttpClient, extract_string, extract_id};
 
 /// Backend for tool execution — either direct Orchestrator access or HTTP proxy.
 pub enum ToolBackend {
@@ -92,10 +92,9 @@ impl ToolHandler {
     pub async fn handle(&self, name: &str, args: Option<Value>) -> Result<Value> {
         let args = args.unwrap_or(json!({}));
 
-        // ── HTTP-mode routing (smoke test: list_projects only) ──────────
+        // ── HTTP-mode routing (P2: all 8 project tools) ─────────────────
         // In HTTP mode, route migrated tools through the REST API.
-        // All other tools fall through to Direct mode (which will panic
-        // if the backend is Http — this is intentional during migration).
+        // Non-migrated tools return an error (Direct mode required).
         if self.is_http_mode() {
             if let Some(result) = self.try_handle_http(name, &args).await? {
                 return Ok(result);
@@ -328,7 +327,8 @@ impl ToolHandler {
         let http = self.http();
 
         match name {
-            // ── Smoke test: list_projects only ──────────────────────────
+            // ── P2: Projects (8 tools) ──────────────────────────────────
+
             "list_projects" => {
                 let mut query = Vec::new();
                 if let Some(s) = args.get("search").and_then(|v| v.as_str()) {
@@ -346,11 +346,88 @@ impl ToolHandler {
                 if let Some(so) = args.get("sort_order").and_then(|v| v.as_str()) {
                     query.push(("sort_order".to_string(), so.to_string()));
                 }
-
                 let result = if query.is_empty() {
                     http.get("/api/projects").await?
                 } else {
                     http.get_with_query("/api/projects", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_project" => {
+                let result = http.post("/api/projects", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_project" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.get(&format!("/api/projects/{}", slug)).await?;
+                Ok(Some(result))
+            }
+
+            "update_project" => {
+                let slug = extract_string(args, "slug")?;
+                // Build PATCH body — only include fields that are present
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("name") {
+                    body.insert("name".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("root_path") {
+                    body.insert("root_path".to_string(), v.clone());
+                }
+                let result = http.patch(&format!("/api/projects/{}", slug), &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "delete_project" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http.delete(&format!("/api/projects/{}", slug)).await?;
+                Ok(Some(result))
+            }
+
+            "sync_project" => {
+                let slug = extract_string(args, "slug")?;
+                let mut query = Vec::new();
+                if let Some(force) = args.get("force").and_then(|v| v.as_bool()) {
+                    if force {
+                        query.push(("force".to_string(), "true".to_string()));
+                    }
+                }
+                let result = if query.is_empty() {
+                    http.post(&format!("/api/projects/{}/sync", slug), &json!({})).await?
+                } else {
+                    // POST with query params — use get_with_query pattern but POST
+                    let url = format!("/api/projects/{}/sync?force=true", slug);
+                    http.post(&url, &json!({})).await?
+                };
+                Ok(Some(result))
+            }
+
+            "get_project_roadmap" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http.get(&format!("/api/projects/{}/roadmap", project_id)).await?;
+                Ok(Some(result))
+            }
+
+            "list_project_plans" => {
+                let slug = extract_string(args, "project_slug")?;
+                let mut query = Vec::new();
+                if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get(&format!("/api/projects/{}/plans", slug)).await?
+                } else {
+                    http.get_with_query(&format!("/api/projects/{}/plans", slug), &query).await?
                 };
                 Ok(Some(result))
             }
