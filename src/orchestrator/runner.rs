@@ -1431,73 +1431,82 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ) -> Result<SyncResult> {
         let project_slug = project_slug.map(|s| s.to_string());
         let mut result = SyncResult::default();
-        let mut synced_paths: HashSet<String> = HashSet::new();
 
-        // All supported languages - must match SupportedLanguage::from_extension()
-        let extensions = [
-            "rs", // Rust
-            "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
-            "py",   // Python
-            "go",   // Go
-            "java", // Java
-            "c", "h", // C
-            "cpp", "cc", "cxx", "hpp", "hxx", // C++
-            "rb",  // Ruby
-            "php", // PHP
-            "kt", "kts",   // Kotlin
-            "swift", // Swift
-            "sh", "bash", // Bash
-        ];
+        // ── Phase 1: Scan ──────────────────────────────────────────
+        let entries = scan_files(dir_path);
 
-        for entry in WalkDir::new(dir_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let path = entry.path();
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default();
+        // Track all scanned paths for stale-file cleanup
+        let synced_paths: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
 
-            if !extensions.contains(&ext) {
-                continue;
-            }
+        // ── Phase 2: Read ───────────────────────────────────────────
+        let file_contents = read_files(entries).await;
 
-            // Skip ignored directories (shared constant with watcher.rs)
-            let path_str = path.to_string_lossy();
-            if super::should_ignore_path(&path_str) {
-                continue;
-            }
-
-            // Track the path for cleanup
-            synced_paths.insert(path_str.to_string());
-
-            match self
-                .sync_file_for_project_with_options(
-                    path,
-                    project_id,
-                    project_slug.as_deref(),
-                    force,
-                )
-                .await
-            {
-                Ok(synced) => {
-                    if synced {
-                        result.files_synced += 1;
-                    } else {
+        // ── Hash check: skip unchanged files ───────────────────────
+        let mut to_parse = Vec::with_capacity(file_contents.len());
+        for fc in file_contents {
+            if !force {
+                if let Ok(Some(existing)) = self.state.neo4j.get_file(&fc.path).await {
+                    if existing.hash == fc.hash {
                         result.files_skipped += 1;
+                        continue;
                     }
                 }
+            }
+            to_parse.push(fc);
+        }
+
+        // ── Phase 3: Parse ─────────────────────────────────────────
+        let parsed_files = parse_files(to_parse, &self.parser).await;
+        let parse_count = parsed_files.len();
+
+        // ── Store: Neo4j + MeiliSearch ─────────────────────────────
+        for parsed in &parsed_files {
+            match self.store_parsed_file_for_project(parsed, project_id).await {
+                Ok(()) => {
+                    // Index in Meilisearch only if project context is available
+                    if let (Some(pid), Some(slug)) = (project_id, project_slug.as_deref()) {
+                        let doc = CodeParser::to_code_document(parsed, &pid.to_string(), slug);
+                        if let Err(e) = self.state.meili.index_code(&doc).await {
+                            tracing::warn!(
+                                "Failed to index {} in Meilisearch: {}",
+                                parsed.path,
+                                e
+                            );
+                        }
+                    }
+
+                    // Verify notes attached to this file
+                    if let Ok(content) = tokio::fs::read_to_string(&parsed.path).await {
+                        if let Err(e) = self
+                            .verify_notes_for_file(&parsed.path, parsed, &content)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to verify notes for {}: {}",
+                                parsed.path,
+                                e
+                            );
+                        }
+                    }
+
+                    result.files_synced += 1;
+                }
                 Err(e) => {
-                    tracing::warn!("Failed to sync {}: {}", path.display(), e);
+                    tracing::warn!("Failed to store {}: {}", parsed.path, e);
                     result.errors += 1;
                 }
             }
         }
 
-        // Clean up stale files if we have a project_id
+        tracing::info!(
+            "sync pipeline: scanned {} → read {} → parsed {} → stored {}",
+            synced_paths.len(),
+            synced_paths.len(),
+            parse_count,
+            result.files_synced,
+        );
+
+        // ── Cleanup: remove stale files ────────────────────────────
         if let Some(pid) = project_id {
             let valid_paths: Vec<String> = synced_paths.into_iter().collect();
             match self.neo4j().delete_stale_files(pid, &valid_paths).await {
@@ -3975,6 +3984,184 @@ pub struct GitFileChange {
     pub deletions: Option<i64>,
 }
 
+// ── Pipeline functions ──────────────────────────────────────────────
+// 3-phase sync pipeline: scan → read → parse
+
+/// Phase 1: Scan a directory and return all eligible files.
+///
+/// Walks the directory tree, applies gitignore-like filtering via
+/// [`super::should_ignore_path`], and detects language from extension.
+/// Returns only files whose extension maps to a [`SupportedLanguage`].
+///
+/// This is a pure I/O-free metadata scan — no file content is loaded.
+pub fn scan_files(root: &Path) -> Vec<FileEntry> {
+    use crate::parser::SupportedLanguage;
+
+    let start = std::time::Instant::now();
+    let mut entries = Vec::new();
+
+    for entry in WalkDir::new(root)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+
+        // Only keep files whose extension maps to a supported language
+        let language = match SupportedLanguage::from_extension(ext) {
+            Some(lang) => lang,
+            None => continue,
+        };
+
+        // Skip ignored directories (shared constant with watcher.rs)
+        let path_str = path.to_string_lossy();
+        if super::should_ignore_path(&path_str) {
+            continue;
+        }
+
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let normalized = normalize_path(&path_str);
+
+        entries.push(FileEntry {
+            path: normalized,
+            size,
+            language,
+        });
+    }
+
+    let elapsed = start.elapsed();
+    tracing::info!(
+        "scan_files: found {} eligible files in {:?}",
+        entries.len(),
+        elapsed
+    );
+
+    entries
+}
+
+/// Phase 3: Parse files with tree-sitter.
+///
+/// Parses each file's content using the appropriate tree-sitter grammar
+/// based on the detected language. Files that fail to parse are logged and skipped.
+///
+/// Returns only successfully parsed files.
+pub async fn parse_files(
+    files: Vec<FileContent>,
+    parser: &Arc<RwLock<CodeParser>>,
+) -> Vec<ParsedFile> {
+    let start = std::time::Instant::now();
+    let mut parsed = Vec::with_capacity(files.len());
+    let mut parse_errors = 0usize;
+
+    for file in &files {
+        let file_path = std::path::Path::new(&file.path);
+        match {
+            let mut p = parser.write().await;
+            p.parse_file(file_path, &file.content)
+        } {
+            Ok(pf) => {
+                parsed.push(pf);
+            }
+            Err(e) => {
+                tracing::warn!("parse_files: failed to parse {}: {}", file.path, e);
+                parse_errors += 1;
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    tracing::info!(
+        "parse_files: parsed {} files ({} errors) in {:?}",
+        parsed.len(),
+        parse_errors,
+        elapsed
+    );
+
+    parsed
+}
+
+/// Phase 2: Read file contents from disk.
+///
+/// Loads each file's content and computes a SHA-256 hash.
+/// Files that fail to read (permission errors, etc.) are logged and skipped.
+///
+/// Returns only successfully read files.
+pub async fn read_files(entries: Vec<FileEntry>) -> Vec<FileContent> {
+    use sha2::{Digest, Sha256};
+
+    let start = std::time::Instant::now();
+    let mut files = Vec::with_capacity(entries.len());
+    let mut read_errors = 0usize;
+
+    for entry in entries {
+        match tokio::fs::read_to_string(&entry.path).await {
+            Ok(content) => {
+                let mut hasher = Sha256::new();
+                hasher.update(content.as_bytes());
+                let hash = hex::encode(hasher.finalize());
+
+                files.push(FileContent {
+                    path: entry.path,
+                    content,
+                    size: entry.size,
+                    language: entry.language,
+                    hash,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("read_files: failed to read {}: {}", entry.path, e);
+                read_errors += 1;
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    tracing::info!(
+        "read_files: loaded {} files ({} errors) in {:?}",
+        files.len(),
+        read_errors,
+        elapsed
+    );
+
+    files
+}
+
+// ── Pipeline types ──────────────────────────────────────────────────
+// Used by the 3-phase sync pipeline: scan → read → parse
+
+/// A file discovered during the scan phase.
+///
+/// Contains only metadata — no content loaded yet.
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    /// Normalized absolute path
+    pub path: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Detected language from extension
+    pub language: crate::parser::SupportedLanguage,
+}
+
+/// A file whose content has been loaded from disk (read phase).
+#[derive(Debug, Clone)]
+pub struct FileContent {
+    /// Normalized absolute path
+    pub path: String,
+    /// Raw source content
+    pub content: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Detected language
+    pub language: crate::parser::SupportedLanguage,
+    /// SHA-256 hash of content
+    pub hash: String,
+}
+
 /// Result of a sync operation
 #[derive(Debug, Default)]
 pub struct SyncResult {
@@ -6258,6 +6445,289 @@ mod tests {
             source.contains("run_unwind_in_chunks"),
             "Batch helper reference must exist in runner.rs"
         );
+    }
+
+    // ── T4.1: Pipeline phase separation tests ─────────────────────
+
+    #[test]
+    fn test_scan_files_finds_supported_extensions() {
+        // Create a temp directory with various file types
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Supported files
+        std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("app.ts"), "export {}").unwrap();
+        std::fs::write(root.join("lib.py"), "pass").unwrap();
+        std::fs::write(root.join("main.go"), "package main").unwrap();
+
+        // Unsupported files — should be excluded
+        std::fs::write(root.join("readme.md"), "# Hello").unwrap();
+        std::fs::write(root.join("data.json"), "{}").unwrap();
+        std::fs::write(root.join("style.css"), "body {}").unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 4, "should find exactly 4 supported files");
+
+        // Verify all entries have a language
+        for entry in &entries {
+            assert!(!entry.path.is_empty());
+            assert!(entry.size > 0);
+        }
+
+        // Verify specific languages are detected
+        let languages: Vec<String> = entries.iter().map(|e| {
+            e.language.as_str().to_string()
+        }).collect();
+        assert!(languages.contains(&"rust".to_string()));
+        assert!(languages.contains(&"typescript".to_string()));
+        assert!(languages.contains(&"python".to_string()));
+        assert!(languages.contains(&"go".to_string()));
+    }
+
+    #[test]
+    fn test_scan_files_respects_ignore_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Normal file
+        std::fs::write(root.join("src.rs"), "fn f() {}").unwrap();
+
+        // Files in ignored directories
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "module.exports = {}").unwrap();
+
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join(".git/objects/hook.sh"), "#!/bin/bash").unwrap();
+
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/build.rs"), "fn main() {}").unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 1, "should only find the root src.rs");
+        assert!(entries[0].path.ends_with("src.rs"));
+    }
+
+    #[test]
+    fn test_scan_files_empty_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = scan_files(tmp.path());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_scan_files_paths_are_normalized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("test.rs"), "fn x() {}").unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 1);
+        // Normalized paths should be absolute
+        assert!(
+            std::path::Path::new(&entries[0].path).is_absolute(),
+            "scan_files should return absolute paths"
+        );
+    }
+
+    #[test]
+    fn test_scan_files_all_language_extensions() {
+        // Verify that scan_files uses SupportedLanguage::from_extension
+        // which covers more extensions than the old hardcoded list
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Extensions that from_extension supports but old list missed
+        std::fs::write(root.join("lib.mjs"), "export default {}").unwrap();
+        std::fs::write(root.join("types.pyi"), "x: int").unwrap();
+        std::fs::write(root.join("Rakefile.rake"), "task :default").unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 3, "from_extension should match mjs, pyi, rake");
+    }
+
+    #[tokio::test]
+    async fn test_read_files_loads_content_and_hash() {
+        use crate::parser::SupportedLanguage;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let content = "fn hello() {}";
+        std::fs::write(root.join("hello.rs"), content).unwrap();
+
+        let entries = vec![FileEntry {
+            path: root.join("hello.rs").to_string_lossy().to_string(),
+            size: content.len() as u64,
+            language: SupportedLanguage::Rust,
+        }];
+
+        let files = read_files(entries).await;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content, content);
+        assert!(!files[0].hash.is_empty());
+        assert_eq!(files[0].size, content.len() as u64);
+
+        // Verify hash is deterministic
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::write(tmp2.path().join("hello.rs"), content).unwrap();
+        let entries2 = vec![FileEntry {
+            path: tmp2.path().join("hello.rs").to_string_lossy().to_string(),
+            size: content.len() as u64,
+            language: SupportedLanguage::Rust,
+        }];
+        let files2 = read_files(entries2).await;
+        assert_eq!(files[0].hash, files2[0].hash, "same content = same hash");
+    }
+
+    #[tokio::test]
+    async fn test_read_files_skips_unreadable() {
+        use crate::parser::SupportedLanguage;
+
+        // File that doesn't exist → should be skipped, not error
+        let entries = vec![FileEntry {
+            path: "/nonexistent/path/ghost.rs".to_string(),
+            size: 0,
+            language: SupportedLanguage::Rust,
+        }];
+
+        let files = read_files(entries).await;
+        assert!(files.is_empty(), "unreadable file should be skipped");
+    }
+
+    #[tokio::test]
+    async fn test_read_files_preserves_language() {
+        use crate::parser::SupportedLanguage;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("app.py"), "pass").unwrap();
+
+        let entries = vec![FileEntry {
+            path: tmp.path().join("app.py").to_string_lossy().to_string(),
+            size: 4,
+            language: SupportedLanguage::Python,
+        }];
+
+        let files = read_files(entries).await;
+        assert_eq!(files.len(), 1);
+        assert!(matches!(files[0].language, SupportedLanguage::Python));
+    }
+
+    #[test]
+    fn test_file_entry_has_correct_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let content = "fn hello_world() { println!(\"hello\"); }";
+        std::fs::write(root.join("sized.rs"), content).unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, content.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_extracts_symbols() {
+        use crate::parser::SupportedLanguage;
+
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let files = vec![FileContent {
+            path: "/tmp/test_parse.rs".to_string(),
+            content: r#"
+                pub fn greet(name: &str) -> String {
+                    format!("Hello, {}!", name)
+                }
+
+                pub struct User {
+                    pub name: String,
+                }
+            "#.to_string(),
+            size: 100,
+            language: SupportedLanguage::Rust,
+            hash: "abc123".to_string(),
+        }];
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "/tmp/test_parse.rs");
+
+        // Should extract function 'greet' and struct 'User'
+        assert!(
+            parsed[0].functions.iter().any(|f| f.name == "greet"),
+            "should find function 'greet'"
+        );
+        assert!(
+            parsed[0].structs.iter().any(|s| s.name == "User"),
+            "should find struct 'User'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_handles_multiple_languages() {
+        use crate::parser::SupportedLanguage;
+
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let files = vec![
+            FileContent {
+                path: "/tmp/lib.rs".to_string(),
+                content: "pub fn add(a: i32, b: i32) -> i32 { a + b }".to_string(),
+                size: 44,
+                language: SupportedLanguage::Rust,
+                hash: "h1".to_string(),
+            },
+            FileContent {
+                path: "/tmp/app.py".to_string(),
+                content: "def hello():\n    pass\n".to_string(),
+                size: 21,
+                language: SupportedLanguage::Python,
+                hash: "h2".to_string(),
+            },
+        ];
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].functions.iter().any(|f| f.name == "add"));
+        assert!(parsed[1].functions.iter().any(|f| f.name == "hello"));
+    }
+
+    #[tokio::test]
+    async fn test_full_pipeline_scan_read_parse() {
+        // End-to-end test: scan → read → parse on real temp files
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::write(
+            root.join("math.rs"),
+            "pub fn multiply(a: i32, b: i32) -> i32 { a * b }",
+        ).unwrap();
+        std::fs::write(
+            root.join("utils.py"),
+            "def square(x):\n    return x * x\n",
+        ).unwrap();
+        std::fs::write(root.join("readme.md"), "# Skip me").unwrap();
+
+        // Phase 1: Scan
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 2, "scan should find .rs and .py");
+
+        // Phase 2: Read
+        let file_contents = read_files(entries).await;
+        assert_eq!(file_contents.len(), 2, "read should load both files");
+        for fc in &file_contents {
+            assert!(!fc.content.is_empty());
+            assert!(!fc.hash.is_empty());
+        }
+
+        // Phase 3: Parse
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let parsed = parse_files(file_contents, &parser).await;
+        assert_eq!(parsed.len(), 2, "parse should handle both files");
+
+        // Verify Rust file parsed correctly
+        let rs = parsed.iter().find(|p| p.path.ends_with("math.rs")).unwrap();
+        assert!(rs.functions.iter().any(|f| f.name == "multiply"));
+
+        // Verify Python file parsed correctly
+        let py = parsed.iter().find(|p| p.path.ends_with("utils.py")).unwrap();
+        assert!(py.functions.iter().any(|f| f.name == "square"));
     }
 
     // ── T8.6: Sync consistency integration tests ──────────────────
