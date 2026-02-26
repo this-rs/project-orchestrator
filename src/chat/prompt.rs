@@ -373,7 +373,26 @@ Le Knowledge Fabric connecte toutes les entités du graphe via des relations sé
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use uuid::Uuid;
+
+// ============================================================================
+// Fabric metrics TTL cache — avoids N Neo4j queries per conversation
+// ============================================================================
+
+/// Cached fabric metrics with TTL expiry.
+struct CachedFabricMetrics {
+    project_id: Uuid,
+    metrics: FabricPromptMetrics,
+    fetched_at: std::time::Instant,
+}
+
+/// Global TTL cache for fabric metrics (30s expiry).
+/// Shared across all calls to `fetch_project_context` within the process.
+static FABRIC_CACHE: std::sync::LazyLock<RwLock<Option<CachedFabricMetrics>>> =
+    std::sync::LazyLock::new(|| RwLock::new(None));
+
+const FABRIC_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ============================================================================
 // Tool catalog — static grouping of MCP tools for meta-prompting
@@ -847,8 +866,54 @@ pub async fn fetch_project_context(
 }
 
 /// Build lightweight Knowledge Fabric metrics for the system prompt.
+/// Uses a 30s TTL cache to avoid repeated Neo4j queries within a conversation.
 /// Returns None if no fabric data exists (graceful degradation).
 async fn build_fabric_metrics(
+    graph: &Arc<dyn GraphStore>,
+    project_id: Uuid,
+) -> Option<FabricPromptMetrics> {
+    // Check TTL cache first
+    {
+        let cache = FABRIC_CACHE.read().await;
+        if let Some(ref cached) = *cache {
+            if cached.project_id == project_id && cached.fetched_at.elapsed() < FABRIC_CACHE_TTL {
+                return Some(FabricPromptMetrics {
+                    touches_count: cached.metrics.touches_count,
+                    co_changed_count: cached.metrics.co_changed_count,
+                    synapse_count: cached.metrics.synapse_count,
+                    avg_energy: cached.metrics.avg_energy,
+                    top_hotspots: cached.metrics.top_hotspots.clone(),
+                    critical_risk_files: cached.metrics.critical_risk_files.clone(),
+                });
+            }
+        }
+    }
+
+    // Cache miss or expired — fetch from Neo4j
+    let metrics = fetch_fabric_metrics_from_neo4j(graph, project_id).await;
+
+    // Update cache
+    if let Some(ref m) = metrics {
+        let mut cache = FABRIC_CACHE.write().await;
+        *cache = Some(CachedFabricMetrics {
+            project_id,
+            metrics: FabricPromptMetrics {
+                touches_count: m.touches_count,
+                co_changed_count: m.co_changed_count,
+                synapse_count: m.synapse_count,
+                avg_energy: m.avg_energy,
+                top_hotspots: m.top_hotspots.clone(),
+                critical_risk_files: m.critical_risk_files.clone(),
+            },
+            fetched_at: std::time::Instant::now(),
+        });
+    }
+
+    metrics
+}
+
+/// Actually fetch fabric metrics from Neo4j (called on cache miss).
+async fn fetch_fabric_metrics_from_neo4j(
     graph: &Arc<dyn GraphStore>,
     project_id: Uuid,
 ) -> Option<FabricPromptMetrics> {
@@ -891,7 +956,7 @@ async fn build_fabric_metrics(
     };
 
     Some(FabricPromptMetrics {
-        touches_count: 0, // Enriched when count queries are available
+        touches_count: 0,
         co_changed_count: 0,
         synapse_count: neural.as_ref().map(|n| n.active_synapses).unwrap_or(0),
         avg_energy: neural.as_ref().map(|n| n.avg_energy).unwrap_or(0.0),

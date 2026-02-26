@@ -811,11 +811,12 @@ impl Neo4jClient {
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
             OPTIONAL MATCH (n:Note)-[:LINKED_TO]->(f)
             WHERE n.status <> 'obsolete'
-            WITH f, count(DISTINCT n) AS note_count
+            WITH f, count(DISTINCT n) AS note_count,
+                 sum(COALESCE(n.energy, 0.5)) AS energy_sum
             OPTIONAL MATCH (d:Decision)-[:AFFECTS]->(f)
-            WITH f, note_count, count(DISTINCT d) AS decision_count
+            WITH f, note_count, count(DISTINCT d) AS decision_count, energy_sum
             WITH f, note_count, decision_count,
-                 note_count + decision_count * 2 AS raw_density
+                 toInteger(energy_sum + decision_count * 2) AS raw_density
             RETURN f.path AS path, note_count, decision_count, raw_density
             ORDER BY raw_density DESC
             "#,

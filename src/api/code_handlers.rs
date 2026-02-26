@@ -1447,6 +1447,22 @@ pub async fn get_code_health(
         .await
         .unwrap_or(serde_json::json!(null));
 
+    // Neural metrics (SYNAPSE layer health)
+    let neural_metrics = match state
+        .orchestrator
+        .neo4j()
+        .get_neural_metrics(project.id)
+        .await
+    {
+        Ok(nm) => serde_json::json!({
+            "active_synapses": nm.active_synapses,
+            "avg_energy": nm.avg_energy,
+            "weak_synapses_ratio": nm.weak_synapses_ratio,
+            "dead_notes_count": nm.dead_notes_count,
+        }),
+        Err(_) => serde_json::json!(null),
+    };
+
     Ok(Json(serde_json::json!({
         "god_functions": god_functions_json,
         "god_function_count": god_functions_json.len(),
@@ -1459,6 +1475,7 @@ pub async fn get_code_health(
         "hotspots": hotspots,
         "knowledge_gaps": knowledge_gaps,
         "risk_assessment": risk_assessment,
+        "neural_metrics": neural_metrics,
     })))
 }
 

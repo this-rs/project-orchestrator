@@ -1666,28 +1666,68 @@ pub async fn update_fabric_scores(
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
 
     let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(120);
 
-    // Compute fabric graph analytics (IMPORTS + CO_CHANGED + SYNAPSE layers)
+    // Compute fabric graph analytics with timeout (IMPORTS + CO_CHANGED + SYNAPSE layers)
     let weights = crate::graph::models::FabricWeights::default();
-    let analytics = state
-        .orchestrator
-        .analytics()
-        .analyze_fabric_graph(project_id, &weights)
-        .await
-        .map_err(AppError::Internal)?;
+    let analytics = tokio::time::timeout(timeout, async {
+        state
+            .orchestrator
+            .analytics()
+            .analyze_fabric_graph(project_id, &weights)
+            .await
+    })
+    .await
+    .map_err(|_| {
+        AppError::Internal(anyhow::anyhow!(
+            "Fabric scores computation timed out after 120s"
+        ))
+    })?
+    .map_err(AppError::Internal)?;
 
     let computation_ms = start.elapsed().as_millis() as u64;
 
-    // Stub calls for future T5.5-T5.7 metrics (churn, knowledge_density, risk)
-    // These will be wired when both agents finish their respective tasks.
-    // For now, return the fabric scores result.
+    if computation_ms > 10_000 {
+        tracing::warn!(
+            project_id = %project_id,
+            nodes = analytics.metrics.len(),
+            elapsed_ms = computation_ms,
+            "Large graph: fabric scores computation took >10s"
+        );
+    }
+
+    // Also compute churn, knowledge_density, and risk scores
+    let neo = state.orchestrator.neo4j();
+    let churn = neo
+        .compute_churn_scores(project_id)
+        .await
+        .unwrap_or_default();
+    let churn_count = churn.len();
+    let _ = neo.batch_update_churn_scores(&churn).await;
+
+    let density = neo
+        .compute_knowledge_density(project_id)
+        .await
+        .unwrap_or_default();
+    let density_count = density.len();
+    let _ = neo.batch_update_knowledge_density(&density).await;
+
+    let risk = neo
+        .compute_risk_scores(project_id)
+        .await
+        .unwrap_or_default();
+    let risk_count = risk.len();
+    let _ = neo.batch_update_risk_scores(&risk).await;
 
     Ok(Json(serde_json::json!({
         "nodes_updated": analytics.metrics.len(),
-        "computation_ms": computation_ms,
+        "computation_ms": start.elapsed().as_millis() as u64,
         "fabric_scores_computed": true,
         "communities": analytics.communities.len(),
         "components": analytics.components.len(),
+        "churn_scores_computed": churn_count,
+        "knowledge_density_computed": density_count,
+        "risk_scores_computed": risk_count,
     })))
 }
 
@@ -1768,21 +1808,47 @@ pub async fn bootstrap_knowledge_fabric(
 
     // Step 4: Update fabric scores (the final analytics computation)
     let weights = crate::graph::models::FabricWeights::default();
-    match state
-        .orchestrator
-        .analytics()
-        .analyze_fabric_graph(project_id, &weights)
-        .await
+    let timeout = std::time::Duration::from_secs(120);
+    match tokio::time::timeout(
+        timeout,
+        state
+            .orchestrator
+            .analytics()
+            .analyze_fabric_graph(project_id, &weights),
+    )
+    .await
     {
-        Ok(analytics) => completed.push(serde_json::json!({
+        Ok(Ok(analytics)) => completed.push(serde_json::json!({
             "step": "update_fabric_scores",
             "nodes_updated": analytics.metrics.len(),
             "communities": analytics.communities.len(),
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Ok(Err(e)) => failed.push(serde_json::json!({
             "step": "update_fabric_scores",
             "error": e.to_string(),
         })),
+        Err(_) => failed.push(serde_json::json!({
+            "step": "update_fabric_scores",
+            "error": "Timed out after 120s",
+        })),
+    }
+
+    // Step 5: Compute churn, knowledge density, and risk scores
+    let neo = state.orchestrator.neo4j();
+    if let Ok(churn) = neo.compute_churn_scores(project_id).await {
+        let count = churn.len();
+        let _ = neo.batch_update_churn_scores(&churn).await;
+        completed.push(serde_json::json!({"step": "churn_scores", "files_scored": count}));
+    }
+    if let Ok(density) = neo.compute_knowledge_density(project_id).await {
+        let count = density.len();
+        let _ = neo.batch_update_knowledge_density(&density).await;
+        completed.push(serde_json::json!({"step": "knowledge_density", "files_scored": count}));
+    }
+    if let Ok(risk) = neo.compute_risk_scores(project_id).await {
+        let count = risk.len();
+        let _ = neo.batch_update_risk_scores(&risk).await;
+        completed.push(serde_json::json!({"step": "risk_scores", "files_scored": count}));
     }
 
     let total_time_ms = start.elapsed().as_millis() as u64;
