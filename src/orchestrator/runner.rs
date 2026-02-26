@@ -2910,6 +2910,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         ctx.go_module_path.as_deref(),
                         &ctx.suffix_index,
                     ),
+                    "java" => Self::resolve_java_import_indexed(
+                        &import.path,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3160,6 +3164,59 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .filter(|f| !f.ends_with("_test.go"))
             .map(|f| f.to_string())
             .collect()
+    }
+
+    /// Resolve Java import using SuffixIndex.
+    ///
+    /// Handles 3 cases:
+    /// 1. Standard: `import com.example.Foo` → look for `com/example/Foo.java`
+    /// 2. Wildcard: `import com.example.*` → all `.java` files in `com/example/`
+    /// 3. Static: `import static com.example.Foo.BAR` → strip member, resolve to `Foo.java`
+    fn resolve_java_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+
+        // Strip "static " prefix for static imports
+        let (is_static, path) = if path.starts_with("static ") {
+            (true, path.strip_prefix("static ").unwrap_or(path).trim())
+        } else {
+            (false, path)
+        };
+
+        // Check for wildcard imports (com.example.*)
+        if path.ends_with(".*") {
+            let package = &path[..path.len() - 2]; // strip ".*"
+            let dir = package.replace('.', "/");
+            return index
+                .get_files_in_dir(&dir, "java")
+                .into_iter()
+                .map(|f| f.to_string())
+                .collect();
+        }
+
+        // Convert dots to path separators
+        let parts: Vec<&str> = path.split('.').collect();
+
+        if is_static && parts.len() >= 2 {
+            // Static import: strip last segment (member name), resolve the class
+            // import static com.example.Foo.BAR → com/example/Foo.java
+            let class_parts = &parts[..parts.len() - 1];
+            let suffix = format!("{}.java", class_parts.join("/"));
+            if let Some(resolved) = index.get(&suffix) {
+                return vec![resolved.to_string()];
+            }
+            return Vec::new();
+        }
+
+        // Standard import: com.example.Foo → com/example/Foo.java
+        let suffix = format!("{}.java", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
     }
 
     /// Resolve Python import using SuffixIndex.
@@ -6717,6 +6774,70 @@ mod tests {
             &index,
         );
         assert!(result.is_empty(), "stdlib imports should be skipped");
+    }
+
+    #[test]
+    fn test_resolve_java_import_indexed_standard() {
+        let paths = vec![
+            "com/example/models/User.java".to_string(),
+            "com/example/models/Order.java".to_string(),
+            "com/example/utils/StringHelper.java".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Standard import: com.example.models.User → com/example/models/User.java
+        let result = Orchestrator::resolve_java_import_indexed(
+            "com.example.models.User",
+            &index,
+        );
+        assert_eq!(result, vec!["com/example/models/User.java"]);
+    }
+
+    #[test]
+    fn test_resolve_java_import_indexed_wildcard() {
+        let paths = vec![
+            "com/example/models/User.java".to_string(),
+            "com/example/models/Order.java".to_string(),
+            "com/example/utils/StringHelper.java".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Wildcard import: com.example.models.* → all .java in com/example/models/
+        let result = Orchestrator::resolve_java_import_indexed(
+            "com.example.models.*",
+            &index,
+        );
+        assert_eq!(result.len(), 2, "should find 2 .java files in models/");
+        assert!(result.contains(&"com/example/models/User.java".to_string()));
+        assert!(result.contains(&"com/example/models/Order.java".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_java_import_indexed_static() {
+        let paths = vec![
+            "com/example/Utils.java".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Static import: static com.example.Utils.MAX_VALUE → com/example/Utils.java
+        let result = Orchestrator::resolve_java_import_indexed(
+            "static com.example.Utils.MAX_VALUE",
+            &index,
+        );
+        assert_eq!(result, vec!["com/example/Utils.java"]);
+    }
+
+    #[test]
+    fn test_resolve_java_import_indexed_nonexistent() {
+        let paths = vec!["com/example/Foo.java".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Package that doesn't exist
+        let result = Orchestrator::resolve_java_import_indexed(
+            "org.missing.Bar",
+            &index,
+        );
+        assert!(result.is_empty());
     }
 
     #[test]
