@@ -28,6 +28,8 @@ pub struct ImportResolutionContext {
     pub resolve_cache: ResolveCache,
     /// Go module path from go.mod (e.g. "github.com/user/project"), lazy-loaded
     pub go_module_path: Option<String>,
+    /// PHP PSR-4 mappings from composer.json (namespace prefix → directory), lazy-loaded
+    pub psr4_mappings: std::collections::HashMap<String, String>,
 }
 
 impl ImportResolutionContext {
@@ -41,6 +43,7 @@ impl ImportResolutionContext {
             symbol_table: SymbolTable::new(),
             resolve_cache: ResolveCache::new(),
             go_module_path: None,
+            psr4_mappings: std::collections::HashMap::new(),
         }
     }
 
@@ -53,6 +56,17 @@ impl ImportResolutionContext {
             return; // Already loaded
         }
         self.go_module_path = parse_go_mod_module(project_root);
+    }
+
+    /// Load PHP PSR-4 autoload mappings from composer.json.
+    ///
+    /// Parses `composer.json` in the project root and extracts
+    /// `autoload.psr-4` namespace-to-directory mappings.
+    pub fn load_composer_psr4(&mut self, project_root: &str) {
+        if !self.psr4_mappings.is_empty() {
+            return; // Already loaded
+        }
+        self.psr4_mappings = parse_composer_psr4(project_root);
     }
 
     /// Populate the symbol table from parsed files.
@@ -100,6 +114,53 @@ pub fn parse_go_mod_module(project_root: &str) -> Option<String> {
     None
 }
 
+/// Parse `composer.json` to extract PSR-4 autoload mappings.
+///
+/// Looks for `autoload.psr-4` and returns a map of namespace prefix → directory.
+/// Namespace prefixes are normalized: trailing `\\` is preserved for matching.
+/// Returns an empty map if composer.json doesn't exist or has no PSR-4 config.
+pub fn parse_composer_psr4(project_root: &str) -> std::collections::HashMap<String, String> {
+    let composer_path = std::path::Path::new(project_root).join("composer.json");
+    let content = match std::fs::read_to_string(&composer_path) {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    let mut mappings = std::collections::HashMap::new();
+
+    if let Some(psr4) = json
+        .get("autoload")
+        .and_then(|a| a.get("psr-4"))
+        .and_then(|p| p.as_object())
+    {
+        for (namespace, dir_val) in psr4 {
+            if let Some(dir) = dir_val.as_str() {
+                mappings.insert(namespace.clone(), dir.to_string());
+            }
+        }
+    }
+
+    // Also check autoload-dev for test namespaces
+    if let Some(psr4) = json
+        .get("autoload-dev")
+        .and_then(|a| a.get("psr-4"))
+        .and_then(|p| p.as_object())
+    {
+        for (namespace, dir_val) in psr4 {
+            if let Some(dir) = dir_val.as_str() {
+                mappings.insert(namespace.clone(), dir.to_string());
+            }
+        }
+    }
+
+    mappings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +205,58 @@ mod tests {
 
         let result = parse_go_mod_module(dir.path().to_str().unwrap());
         assert_eq!(result, Some("example.com/foo/bar".to_string()));
+    }
+
+    #[test]
+    fn test_parse_composer_psr4_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"autoload":{"psr-4":{"App\\":"src/","Domain\\":"lib/domain/"}}}"#,
+        )
+        .unwrap();
+
+        let result = parse_composer_psr4(dir.path().to_str().unwrap());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("App\\").unwrap(), "src/");
+        assert_eq!(result.get("Domain\\").unwrap(), "lib/domain/");
+    }
+
+    #[test]
+    fn test_parse_composer_psr4_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = parse_composer_psr4(dir.path().to_str().unwrap());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_composer_psr4_no_autoload() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"name":"vendor/pkg","require":{"php":">=8.1"}}"#,
+        )
+        .unwrap();
+
+        let result = parse_composer_psr4(dir.path().to_str().unwrap());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_composer_psr4_with_dev() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{
+                "autoload": {"psr-4": {"App\\": "src/"}},
+                "autoload-dev": {"psr-4": {"Tests\\": "tests/"}}
+            }"#,
+        )
+        .unwrap();
+
+        let result = parse_composer_psr4(dir.path().to_str().unwrap());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("App\\").unwrap(), "src/");
+        assert_eq!(result.get("Tests\\").unwrap(), "tests/");
     }
 }

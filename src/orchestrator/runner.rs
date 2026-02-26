@@ -1488,6 +1488,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Load language-specific config files (lazy, only when needed)
         import_ctx.load_go_module_path(dir_path.to_str().unwrap_or(""));
+        import_ctx.load_composer_psr4(dir_path.to_str().unwrap_or(""));
 
         import_ctx.log_stats();
 
@@ -2914,6 +2915,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         &import.path,
                         &ctx.suffix_index,
                     ),
+                    "php" => Self::resolve_php_import_indexed(
+                        &import.path,
+                        &ctx.psr4_mappings,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3212,6 +3218,58 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Standard import: com.example.Foo → com/example/Foo.java
         let suffix = format!("{}.java", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve PHP import using PSR-4 mappings from composer.json.
+    ///
+    /// PSR-4 resolution: find the longest matching namespace prefix,
+    /// replace it with the directory prefix, convert `\` to `/`, append `.php`.
+    /// Falls back to direct SuffixIndex lookup if no PSR-4 mapping matches.
+    fn resolve_php_import_indexed(
+        import_path: &str,
+        psr4_mappings: &std::collections::HashMap<String, String>,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        // Strip leading backslash (fully-qualified namespace)
+        let path = path.strip_prefix('\\').unwrap_or(path);
+
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // PSR-4: find longest matching namespace prefix
+        let mut best_prefix = "";
+        let mut best_dir = "";
+        for (ns_prefix, dir) in psr4_mappings {
+            if path.starts_with(ns_prefix.as_str()) && ns_prefix.len() > best_prefix.len() {
+                best_prefix = ns_prefix;
+                best_dir = dir;
+            }
+        }
+
+        if !best_prefix.is_empty() {
+            // Strip namespace prefix, convert \ to /, prepend directory, append .php
+            let relative = &path[best_prefix.len()..];
+            let file_path = format!(
+                "{}{}.php",
+                best_dir,
+                relative.replace('\\', "/")
+            );
+            if let Some(resolved) = index.get(&file_path) {
+                return vec![resolved.to_string()];
+            }
+            // PSR-4 matched but file not found — don't fallback (the mapping is authoritative)
+            return Vec::new();
+        }
+
+        // No PSR-4 mapping matched — fallback: convert namespace to path directly
+        let suffix = format!("{}.php", path.replace('\\', "/"));
         if let Some(resolved) = index.get(&suffix) {
             return vec![resolved.to_string()];
         }
@@ -6835,6 +6893,114 @@ mod tests {
         // Package that doesn't exist
         let result = Orchestrator::resolve_java_import_indexed(
             "org.missing.Bar",
+            &index,
+        );
+        assert!(result.is_empty());
+    }
+
+    // ── PHP PSR-4 resolver tests ──────────────────────────────────
+
+    #[test]
+    fn test_resolve_php_import_psr4_simple() {
+        let paths = vec!["src/Models/User.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+
+        // App\Models\User → src/Models/User.php
+        let result = Orchestrator::resolve_php_import_indexed(
+            "App\\Models\\User",
+            &psr4,
+            &index,
+        );
+        assert_eq!(result, vec!["src/Models/User.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_psr4_multi_mapping() {
+        let paths = vec![
+            "src/Controllers/HomeController.php".to_string(),
+            "lib/domain/Entity/Product.php".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+        psr4.insert("Domain\\".to_string(), "lib/domain/".to_string());
+
+        let result = Orchestrator::resolve_php_import_indexed(
+            "Domain\\Entity\\Product",
+            &psr4,
+            &index,
+        );
+        assert_eq!(result, vec!["lib/domain/Entity/Product.php"]);
+
+        let result = Orchestrator::resolve_php_import_indexed(
+            "App\\Controllers\\HomeController",
+            &psr4,
+            &index,
+        );
+        assert_eq!(result, vec!["src/Controllers/HomeController.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_psr4_longest_prefix_wins() {
+        let paths = vec!["src/Sub/Deep/Thing.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+        psr4.insert("App\\Sub\\".to_string(), "src/Sub/".to_string());
+
+        // "App\Sub\Deep\Thing" matches both "App\" and "App\Sub\",
+        // longest prefix "App\Sub\" wins → src/Sub/ + Deep/Thing.php
+        let result = Orchestrator::resolve_php_import_indexed(
+            "App\\Sub\\Deep\\Thing",
+            &psr4,
+            &index,
+        );
+        assert_eq!(result, vec!["src/Sub/Deep/Thing.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_no_composer() {
+        let paths = vec!["Models/User.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let psr4 = std::collections::HashMap::new(); // empty = no composer.json
+
+        // Fallback: direct namespace→path conversion
+        let result = Orchestrator::resolve_php_import_indexed(
+            "Models\\User",
+            &psr4,
+            &index,
+        );
+        assert_eq!(result, vec!["Models/User.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_fully_qualified() {
+        let paths = vec!["src/Models/User.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+
+        // Leading backslash (fully qualified) should be stripped
+        let result = Orchestrator::resolve_php_import_indexed(
+            "\\App\\Models\\User",
+            &psr4,
+            &index,
+        );
+        assert_eq!(result, vec!["src/Models/User.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_nonexistent() {
+        let paths = vec!["src/Models/User.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+
+        let result = Orchestrator::resolve_php_import_indexed(
+            "App\\Missing\\Class",
+            &psr4,
             &index,
         );
         assert!(result.is_empty());
