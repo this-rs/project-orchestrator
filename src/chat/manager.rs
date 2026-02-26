@@ -843,15 +843,14 @@ impl ChatManager {
                     "NATS RPC send request received"
                 );
 
-                // Get session state — check if still active locally
+                // Get session state — check if still active locally.
+                // DON'T touch interrupt_flag or interrupt_token here — stream_response
+                // owns their lifecycle (T1 fix for Gaps 1, 2, 4, 7, 10).
                 let session_state = {
                     let mut sessions = active_sessions.write().await;
                     match sessions.get_mut(&session_id) {
                         Some(session) => {
                             session.last_activity = Instant::now();
-                            session.interrupt_flag.store(false, Ordering::SeqCst);
-                            // Reset interrupt_token (CancellationToken is not resettable — create a new one)
-                            session.interrupt_token = CancellationToken::new();
                             Some((
                                 session.client.clone(),
                                 session.events_tx.clone(),
@@ -863,8 +862,9 @@ impl ChatManager {
                                 session.streaming_text.clone(),
                                 session.streaming_events.clone(),
                                 session.sdk_control_rx.clone(),
-                                session.interrupt_token.clone(),
                                 session.auto_continue.clone(),
+                                session.stdin_tx.clone(),
+                                session.interrupt_token.clone(),
                             ))
                         }
                         None => None,
@@ -900,8 +900,9 @@ impl ChatManager {
                         streaming_text,
                         streaming_events,
                         sdk_control_rx,
-                        interrupt_token,
                         auto_continue,
+                        stdin_tx,
+                        interrupt_token,
                     )) => {
                         let message = &request.message;
 
@@ -972,13 +973,24 @@ impl ChatManager {
                                 error: None,
                             }
                         } else if is_streaming.load(Ordering::SeqCst) {
-                            // If streaming → queue the message (will be drained by stream_response)
+                            // If streaming → queue the message and interrupt so it's processed sooner (T4, Gap 8)
                             info!(
-                                "Stream in progress for session {} (via NATS RPC), queuing message",
+                                "Stream in progress for session {} (via NATS RPC), queuing message and interrupting",
                                 session_id
                             );
                             let mut queue = pending_messages.lock().await;
                             queue.push_back(message.clone());
+
+                            // Interrupt the stream so the message is processed sooner
+                            interrupt_flag.store(true, Ordering::SeqCst);
+                            interrupt_token.cancel();
+
+                            // Send interrupt to CLI immediately via stdin_tx (lock-free)
+                            if let Some(ref tx) = stdin_tx {
+                                let json = InteractiveClient::build_interrupt_json();
+                                let _ = tx.try_send(json);
+                            }
+
                             crate::events::ChatRpcResponse {
                                 success: true,
                                 error: None,
@@ -1052,7 +1064,6 @@ impl ChatManager {
                                     event_emitter_clone,
                                     nats_clone,
                                     sdk_control_rx,
-                                    interrupt_token,
                                     auto_continue,
                                     retry_config_clone,
                                 )
@@ -1997,7 +2008,6 @@ impl ChatManager {
                 event_emitter,
                 nats,
                 sdk_control_rx,
-                interrupt_token,
                 auto_continue,
                 retry_config,
             )
@@ -2032,7 +2042,6 @@ impl ChatManager {
         shared_sdk_control_rx: Arc<
             tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
         >,
-        interrupt_token: CancellationToken,
         auto_continue: Arc<AtomicBool>,
         retry_config: super::config::RetryConfig,
     ) {
@@ -2044,6 +2053,25 @@ impl ChatManager {
             let _ = tx.send(event.clone());
             if let Some(ref nats) = nats {
                 nats.publish_chat_event(sid, event);
+            }
+        };
+
+        // Create a NEW CancellationToken and store it in ActiveSession BEFORE
+        // setting is_streaming=true. This ensures the token always matches
+        // what interrupt() will cancel (fixes Gaps 1, 2, 4, 7, 10).
+        let interrupt_token = {
+            let mut sessions = active_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                let token = CancellationToken::new();
+                session.interrupt_token = token.clone();
+                session.interrupt_flag.store(false, Ordering::SeqCst);
+                token
+            } else {
+                warn!(
+                    "Session {} no longer in active_sessions at stream start",
+                    session_id
+                );
+                return;
             }
         };
 
@@ -2788,6 +2816,20 @@ impl ChatManager {
             *shared_sdk_control_rx.lock().await = sdk_control_rx;
         }
 
+        // Lock-free interrupt: send the CLI interrupt signal IMMEDIATELY via stdin_tx
+        // BEFORE the Neo4j persistence and memory manager ops (T2 fix for Gaps 3, 6).
+        // This avoids taking the client Mutex lock which could be contended.
+        if interrupt_flag.load(Ordering::SeqCst) {
+            if let Some(ref tx) = stdin_tx_for_auto_allow {
+                let json = InteractiveClient::build_interrupt_json();
+                if let Err(e) = tx.try_send(json) {
+                    warn!("Failed to send lock-free interrupt to CLI: {}", e);
+                } else {
+                    debug!("Lock-free interrupt sent to CLI for session {}", session_id);
+                }
+            }
+        }
+
         // Batch-persist all collected events to Neo4j
         if let Some(uuid) = session_uuid {
             if !events_to_persist.is_empty() {
@@ -2825,18 +2867,10 @@ impl ChatManager {
             }
         }
 
-        // If interrupted, send the interrupt signal to the CLI and emit ToolCancelled
-        // for any tools that were still running (ToolUse without ToolResult).
+        // If interrupted, emit ToolCancelled for any tools that were still running
+        // (ToolUse without ToolResult). The actual CLI interrupt was already sent
+        // lock-free via stdin_tx above.
         if interrupt_flag.load(Ordering::SeqCst) {
-            debug!("Sending interrupt signal to CLI for session {}", session_id);
-            let mut c = client.lock().await;
-            if let Err(e) = c.interrupt().await {
-                warn!(
-                    "Failed to send interrupt signal to CLI for session {}: {}",
-                    session_id, e
-                );
-            }
-
             // Emit ToolCancelled for each pending tool (ToolUse without ToolResult)
             if !pending_tool_calls.is_empty() {
                 info!(
@@ -2877,29 +2911,6 @@ impl ChatManager {
                 }
             }
         }
-
-        is_streaming.store(false, Ordering::SeqCst);
-        // Broadcast streaming_status=false to all connected clients (multi-tab support)
-        emit_chat(
-            ChatEvent::StreamingStatus {
-                is_streaming: false,
-            },
-            &events_tx,
-            &nats,
-            &session_id,
-        );
-        // Emit CRUD event for session list live refresh
-        if let Some(ref emitter) = event_emitter {
-            emitter.emit_updated(
-                crate::events::EntityType::ChatSession,
-                &session_id,
-                serde_json::json!({ "is_streaming": false }),
-                None,
-            );
-        }
-        streaming_text.lock().await.clear();
-        streaming_events.lock().await.clear();
-        debug!("Stream completed for session {}", session_id);
 
         // Auto-continue: if error_max_turns was hit and auto_continue is enabled,
         // emit an AutoContinue event, wait 500ms (interruptible), then enqueue "Continue"
@@ -2959,6 +2970,36 @@ impl ChatManager {
             }
         }
 
+        // T5 race protection (Gap 11): check pending_messages BEFORE setting
+        // is_streaming=false. If there are pending messages, keep is_streaming=true
+        // so concurrent send_message() calls still queue instead of racing.
+        let has_pending = !pending_messages.lock().await.is_empty();
+
+        if !has_pending {
+            is_streaming.store(false, Ordering::SeqCst);
+            // Broadcast streaming_status=false to all connected clients (multi-tab support)
+            emit_chat(
+                ChatEvent::StreamingStatus {
+                    is_streaming: false,
+                },
+                &events_tx,
+                &nats,
+                &session_id,
+            );
+            // Emit CRUD event for session list live refresh
+            if let Some(ref emitter) = event_emitter {
+                emitter.emit_updated(
+                    crate::events::EntityType::ChatSession,
+                    &session_id,
+                    serde_json::json!({ "is_streaming": false }),
+                    None,
+                );
+            }
+            streaming_text.lock().await.clear();
+            streaming_events.lock().await.clear();
+            debug!("Stream completed for session {}", session_id);
+        }
+
         // Check pending_messages queue — if there are queued messages, process the next one
         let next_message = {
             let mut queue = pending_messages.lock().await;
@@ -3014,8 +3055,7 @@ impl ChatManager {
 
             // Recursive call to process the queued message
             // Use Box::pin to handle recursive async
-            // Create a fresh interrupt_token for the new stream (the old one may be cancelled)
-            let fresh_interrupt_token = CancellationToken::new();
+            // stream_response will create its own fresh interrupt_token internally
             Box::pin(Self::stream_response(
                 client,
                 events_tx,
@@ -3034,11 +3074,36 @@ impl ChatManager {
                 event_emitter,
                 nats,
                 shared_sdk_control_rx,
-                fresh_interrupt_token,
                 auto_continue,
                 retry_config,
             ))
             .await;
+        } else if has_pending {
+            // Race: has_pending was true but pop_front returned None.
+            // Set is_streaming=false now since there's nothing to process.
+            is_streaming.store(false, Ordering::SeqCst);
+            emit_chat(
+                ChatEvent::StreamingStatus {
+                    is_streaming: false,
+                },
+                &events_tx,
+                &nats,
+                &session_id,
+            );
+            if let Some(ref emitter) = event_emitter {
+                emitter.emit_updated(
+                    crate::events::EntityType::ChatSession,
+                    &session_id,
+                    serde_json::json!({ "is_streaming": false }),
+                    None,
+                );
+            }
+            streaming_text.lock().await.clear();
+            streaming_events.lock().await.clear();
+            debug!(
+                "Stream completed for session {} (pending race resolved)",
+                session_id
+            );
         }
     }
 
@@ -3102,7 +3167,39 @@ impl ChatManager {
 
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
-        // Get session state — NO broadcast replacement, the same channel is reused
+        // Check is_streaming with read lock first — if streaming, queue the message
+        // AND trigger an interrupt so the stream breaks and processes it sooner (T4 fix, Gap 8).
+        {
+            let sessions = self.active_sessions.read().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+
+            if session.is_streaming.load(Ordering::SeqCst) {
+                info!(
+                    "Stream in progress for session {}, queuing message and interrupting",
+                    session_id
+                );
+                // Queue the message
+                let mut queue = session.pending_messages.lock().await;
+                queue.push_back(message.to_string());
+
+                // Interrupt the stream so the message is processed sooner
+                session.interrupt_flag.store(true, Ordering::SeqCst);
+                session.interrupt_token.cancel();
+
+                // Send interrupt to CLI immediately via stdin_tx (lock-free)
+                if let Some(ref tx) = session.stdin_tx {
+                    let json = InteractiveClient::build_interrupt_json();
+                    let _ = tx.try_send(json);
+                }
+
+                return Ok(());
+            }
+        }
+
+        // Not streaming — get session state for persist + stream.
+        // DON'T create new interrupt_token here — stream_response will do it.
         let (
             client,
             events_tx,
@@ -3114,7 +3211,6 @@ impl ChatManager {
             streaming_text,
             streaming_events,
             sdk_control_rx,
-            interrupt_token,
             auto_continue,
         ) = {
             let mut sessions = self.active_sessions.write().await;
@@ -3122,10 +3218,6 @@ impl ChatManager {
                 .get_mut(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
 
-            // Reset interrupt flag for new message
-            session.interrupt_flag.store(false, Ordering::SeqCst);
-            // Reset interrupt_token (CancellationToken is not resettable — create a new one)
-            session.interrupt_token = CancellationToken::new();
             session.last_activity = Instant::now();
 
             (
@@ -3139,23 +3231,9 @@ impl ChatManager {
                 session.streaming_text.clone(),
                 session.streaming_events.clone(),
                 session.sdk_control_rx.clone(),
-                session.interrupt_token.clone(),
                 session.auto_continue.clone(),
             )
         };
-
-        // If a stream is in progress, queue the message for later processing.
-        // Do NOT persist or broadcast yet — the dequeue in stream_response() handles that,
-        // ensuring the user_message seq comes AFTER the current stream's events.
-        if is_streaming.load(Ordering::SeqCst) {
-            info!(
-                "Stream in progress for session {}, queuing message",
-                session_id
-            );
-            let mut queue = pending_messages.lock().await;
-            queue.push_back(message.to_string());
-            return Ok(());
-        }
 
         // No stream in progress — persist and broadcast immediately
 
@@ -3231,7 +3309,6 @@ impl ChatManager {
                 event_emitter,
                 nats,
                 sdk_control_rx,
-                interrupt_token,
                 auto_continue,
                 retry_config,
             )
@@ -3895,7 +3972,6 @@ impl ChatManager {
                 event_emitter,
                 nats,
                 sdk_control_rx,
-                interrupt_token,
                 auto_continue,
                 retry_config,
             )
@@ -4308,8 +4384,20 @@ impl ChatManager {
         Ok(())
     }
 
-    /// Close an active session: disconnect client, remove from active map
+    /// Close an active session: interrupt first, then disconnect and remove.
+    ///
+    /// T3 fix (Gap 5): call interrupt() BEFORE removing the session from
+    /// active_sessions so the stream loop can observe the flag/token. Then
+    /// disconnect with a 5s timeout — if the CLI hangs, drop the client to
+    /// trigger SIGKILL via the Drop impl.
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
+        // 1. Interrupt first (session still in map so interrupt() can find it)
+        self.interrupt(session_id).await.ok();
+
+        // 2. Brief wait for stream loop to break
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 3. Remove session from active map
         let client = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
@@ -4318,12 +4406,29 @@ impl ChatManager {
             session.client
         };
 
-        let mut c = client.lock().await;
-        if let Err(e) = c.disconnect().await {
-            warn!("Error disconnecting session {}: {}", session_id, e);
+        // 4. Disconnect with 5s timeout — if it hangs, drop(client) triggers SIGKILL via Drop
+        let disconnect_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut c = client.lock().await;
+            c.disconnect().await
+        })
+        .await;
+
+        match disconnect_result {
+            Ok(Ok(())) => {
+                info!("Closed session {}", session_id);
+            }
+            Ok(Err(e)) => {
+                warn!("Error disconnecting session {}: {}", session_id, e);
+            }
+            Err(_elapsed) => {
+                warn!(
+                    "Disconnect timed out for session {} (5s) — dropping client to force SIGKILL",
+                    session_id
+                );
+                drop(client);
+            }
         }
 
-        info!("Closed session {}", session_id);
         Ok(())
     }
 
