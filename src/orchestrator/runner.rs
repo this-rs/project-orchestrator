@@ -2681,13 +2681,14 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Emit event with slug in payload for subscribers (watcher bridge, etc.)
         let mut payload = serde_json::Map::new();
-        payload.insert(
-            "slug".to_string(),
-            serde_json::Value::String(project.slug),
-        );
+        payload.insert("slug".to_string(), serde_json::Value::String(project.slug));
         self.emit(
-            CrudEvent::new(EventEntityType::Project, CrudAction::Deleted, id.to_string())
-                .with_payload(serde_json::Value::Object(payload)),
+            CrudEvent::new(
+                EventEntityType::Project,
+                CrudAction::Deleted,
+                id.to_string(),
+            )
+            .with_payload(serde_json::Value::Object(payload)),
         );
         Ok(())
     }
@@ -3650,7 +3651,10 @@ mod tests {
     async fn test_delete_project_fails_if_not_found() {
         let (orch, _rx) = orch_with_bus().await;
         let result = orch.delete_project(Uuid::new_v4()).await;
-        assert!(result.is_err(), "delete_project should fail if project doesn't exist");
+        assert!(
+            result.is_err(),
+            "delete_project should fail if project doesn't exist"
+        );
     }
 
     #[tokio::test]
@@ -3698,18 +3702,34 @@ mod tests {
         orch.neo4j().create_release(&release).await.unwrap();
 
         // Verify they exist
-        let milestones = orch.neo4j().list_project_milestones(project.id).await.unwrap();
+        let milestones = orch
+            .neo4j()
+            .list_project_milestones(project.id)
+            .await
+            .unwrap();
         assert_eq!(milestones.len(), 1);
-        let releases = orch.neo4j().list_project_releases(project.id).await.unwrap();
+        let releases = orch
+            .neo4j()
+            .list_project_releases(project.id)
+            .await
+            .unwrap();
         assert_eq!(releases.len(), 1);
 
         // Delete project
         orch.delete_project(project.id).await.unwrap();
 
         // Verify cascade
-        let milestones = orch.neo4j().list_project_milestones(project.id).await.unwrap();
+        let milestones = orch
+            .neo4j()
+            .list_project_milestones(project.id)
+            .await
+            .unwrap();
         assert_eq!(milestones.len(), 0, "Milestones should be cascade-deleted");
-        let releases = orch.neo4j().list_project_releases(project.id).await.unwrap();
+        let releases = orch
+            .neo4j()
+            .list_project_releases(project.id)
+            .await
+            .unwrap();
         assert_eq!(releases.len(), 0, "Releases should be cascade-deleted");
     }
 

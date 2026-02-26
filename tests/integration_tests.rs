@@ -442,5 +442,9 @@ async fn test_neo4j_stale_file_cleanup() {
     );
 
     // Cleanup: delete the test project
-    state.neo4j.delete_project(project_id, "test-project").await.unwrap();
+    state
+        .neo4j
+        .delete_project(project_id, "test-project")
+        .await
+        .unwrap();
 }
