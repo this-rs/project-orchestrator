@@ -418,10 +418,16 @@ impl GraphStore for MockGraphStore {
         // Cascade: remove project files
         self.project_files.write().await.remove(&id);
         // Cascade: remove project plans and their children
-        if let Some(plan_ids) = self.project_plans.write().await.remove(&id) {
-            for plan_id in plan_ids {
-                self.delete_plan(plan_id).await?;
-            }
+        // Note: collect plan_ids first and drop the lock before calling delete_plan
+        // to avoid deadlock (delete_plan also acquires project_plans lock)
+        let plan_ids = self
+            .project_plans
+            .write()
+            .await
+            .remove(&id)
+            .unwrap_or_default();
+        for plan_id in plan_ids {
+            self.delete_plan(plan_id).await?;
         }
         self.project_releases.write().await.remove(&id);
         self.project_milestones.write().await.remove(&id);

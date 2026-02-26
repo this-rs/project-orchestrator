@@ -216,12 +216,12 @@ impl Neo4jClient {
         // Archive decisions: detach from tasks + files, set status=archived
         let q = query(
             r#"
-            MATCH (p:Project {id: $id})-[:HAS_PLAN]->(plan:Plan)-[:HAS_TASK]->(task:Task)-[inf:INFORMED_BY]->(d:Decision)
+            MATCH (p:Project {id: $id})-[:HAS_PLAN]->(plan:Plan)-[:HAS_TASK]->(task:Task)-[r_inf:INFORMED_BY]->(d:Decision)
             // Remove AFFECTS relationships to files of THIS project
             OPTIONAL MATCH (d)-[aff:AFFECTS]->(target)
                 WHERE (target:File OR target:Function OR target:Struct)
                 AND EXISTS { MATCH (target)<-[:CONTAINS*1..2]-(p) }
-            DELETE aff, inf
+            DELETE aff, r_inf
             SET d.status = 'archived',
                 d.archived_from_project = $project_name,
                 d.archived_at = datetime()

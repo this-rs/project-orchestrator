@@ -3572,6 +3572,147 @@ mod tests {
         assert_eq!(ev.action, CrudAction::Deleted);
     }
 
+    #[tokio::test]
+    async fn test_delete_project_emits_slug_in_payload() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+        orch.delete_project(project.id).await.unwrap();
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.action, CrudAction::Deleted);
+        // Verify slug is included in event payload
+        let slug = ev
+            .payload
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .expect("event payload should contain slug");
+        assert_eq!(slug, project.slug);
+    }
+
+    #[tokio::test]
+    async fn test_delete_project_cleans_meilisearch() {
+        use crate::meilisearch::indexes::CodeDocument;
+
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+
+        // Seed a project + code documents
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+
+        // Add some code documents to MeiliSearch for this project
+        orch.meili()
+            .index_code(&CodeDocument {
+                id: "file1".to_string(),
+                path: "/tmp/test/main.rs".to_string(),
+                language: "rust".to_string(),
+                symbols: vec!["main".to_string()],
+                docstrings: String::new(),
+                signatures: vec!["fn main()".to_string()],
+                imports: vec![],
+                project_id: project.id.to_string(),
+                project_slug: project.slug.clone(),
+            })
+            .await
+            .unwrap();
+
+        let stats = orch.meili().get_code_stats().await.unwrap();
+        assert_eq!(stats.total_documents, 1);
+
+        // Delete project
+        orch.delete_project(project.id).await.unwrap();
+
+        // Verify MeiliSearch was cleaned up
+        let stats = orch.meili().get_code_stats().await.unwrap();
+        assert_eq!(
+            stats.total_documents, 0,
+            "MeiliSearch code documents should be deleted on project removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_project_removes_project_from_neo4j() {
+        let (orch, _rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+
+        // Verify project exists
+        let found = orch.neo4j().get_project(project.id).await.unwrap();
+        assert!(found.is_some());
+
+        orch.delete_project(project.id).await.unwrap();
+
+        // Verify project is gone
+        let found = orch.neo4j().get_project(project.id).await.unwrap();
+        assert!(found.is_none(), "Project should be deleted from Neo4j");
+    }
+
+    #[tokio::test]
+    async fn test_delete_project_fails_if_not_found() {
+        let (orch, _rx) = orch_with_bus().await;
+        let result = orch.delete_project(Uuid::new_v4()).await;
+        assert!(result.is_err(), "delete_project should fail if project doesn't exist");
+    }
+
+    #[tokio::test]
+    async fn test_delete_project_cascades_plans_tasks_steps() {
+        let (orch, _rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+
+        // Create plan → task → step
+        let plan = test_plan_for_project(project.id);
+        orch.neo4j().create_plan(&plan).await.unwrap();
+        orch.neo4j()
+            .link_plan_to_project(plan.id, project.id)
+            .await
+            .unwrap();
+
+        let task = test_task();
+        orch.neo4j().create_task(plan.id, &task).await.unwrap();
+
+        let step = test_step(0, "Do something");
+        orch.neo4j().create_step(task.id, &step).await.unwrap();
+
+        // Verify they exist
+        let steps = orch.neo4j().get_task_steps(task.id).await.unwrap();
+        assert_eq!(steps.len(), 1);
+
+        // Delete project
+        orch.delete_project(project.id).await.unwrap();
+
+        // Verify cascade — steps should be gone
+        let steps = orch.neo4j().get_task_steps(task.id).await.unwrap();
+        assert_eq!(steps.len(), 0, "Steps should be cascade-deleted");
+    }
+
+    #[tokio::test]
+    async fn test_delete_project_cascades_milestones_releases() {
+        let (orch, _rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+
+        let milestone = test_milestone(project.id, "v1.0 Milestone");
+        orch.neo4j().create_milestone(&milestone).await.unwrap();
+
+        let release = test_release(project.id, "1.0.0");
+        orch.neo4j().create_release(&release).await.unwrap();
+
+        // Verify they exist
+        let milestones = orch.neo4j().list_project_milestones(project.id).await.unwrap();
+        assert_eq!(milestones.len(), 1);
+        let releases = orch.neo4j().list_project_releases(project.id).await.unwrap();
+        assert_eq!(releases.len(), 1);
+
+        // Delete project
+        orch.delete_project(project.id).await.unwrap();
+
+        // Verify cascade
+        let milestones = orch.neo4j().list_project_milestones(project.id).await.unwrap();
+        assert_eq!(milestones.len(), 0, "Milestones should be cascade-deleted");
+        let releases = orch.neo4j().list_project_releases(project.id).await.unwrap();
+        assert_eq!(releases.len(), 0, "Releases should be cascade-deleted");
+    }
+
     // ── Plan link/unlink ─────────────────────────────────────────────
 
     #[tokio::test]

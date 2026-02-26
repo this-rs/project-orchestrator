@@ -228,7 +228,7 @@ async fn test_workspace_project_association() {
     assert!(projects.is_empty());
 
     // Cleanup
-    state.neo4j.delete_project(project.id).await.unwrap();
+    state.neo4j.delete_project(project.id, &project.name).await.unwrap();
     state.neo4j.delete_workspace(workspace.id).await.unwrap();
 }
 
@@ -487,10 +487,10 @@ async fn test_resource_project_links() {
 
     // Cleanup
     state.neo4j.delete_resource(resource.id).await.unwrap();
-    state.neo4j.delete_project(api_project.id).await.unwrap();
+    state.neo4j.delete_project(api_project.id, &api_project.name).await.unwrap();
     state
         .neo4j
-        .delete_project(frontend_project.id)
+        .delete_project(frontend_project.id, &frontend_project.name)
         .await
         .unwrap();
     state.neo4j.delete_workspace(workspace.id).await.unwrap();
@@ -706,7 +706,7 @@ async fn test_component_project_mapping() {
 
     // Cleanup
     state.neo4j.delete_component(component.id).await.unwrap();
-    state.neo4j.delete_project(project.id).await.unwrap();
+    state.neo4j.delete_project(project.id, &project.name).await.unwrap();
     state.neo4j.delete_workspace(workspace.id).await.unwrap();
 }
 
@@ -1091,7 +1091,7 @@ async fn test_multiple_projects_in_workspace() {
 
     // Cleanup
     for id in project_ids {
-        state.neo4j.delete_project(id).await.unwrap();
+        state.neo4j.delete_project(id, "test-project").await.unwrap();
     }
     state.neo4j.delete_workspace(workspace.id).await.unwrap();
 }
