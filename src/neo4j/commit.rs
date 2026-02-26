@@ -291,9 +291,7 @@ impl Neo4jClient {
         min_count: i64,
         max_relations: i64,
     ) -> Result<i64> {
-        let since_str = since
-            .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH)
-            .to_rfc3339();
+        let since_str = since.unwrap_or(chrono::DateTime::UNIX_EPOCH).to_rfc3339();
 
         // Phase 1: Compute co-changed pairs from TOUCHES and MERGE into CO_CHANGED
         let q = query(
