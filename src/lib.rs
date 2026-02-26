@@ -978,7 +978,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     orchestrator::spawn_project_watcher_bridge(
         watcher.clone(),
         event_bus.subscribe(),
-        orchestrator.neo4j_arc(),
+        orchestrator.clone(),
     );
 
     // Create server state

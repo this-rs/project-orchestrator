@@ -601,7 +601,7 @@ fn should_sync_file(path: &Path) -> bool {
 pub fn spawn_project_watcher_bridge(
     watcher: Arc<RwLock<FileWatcher>>,
     mut event_rx: tokio::sync::broadcast::Receiver<CrudEvent>,
-    neo4j: Arc<dyn crate::neo4j::GraphStore>,
+    orchestrator: Arc<super::Orchestrator>,
 ) {
     tokio::spawn(async move {
         tracing::info!("Project watcher bridge started — listening for project CRUD events");
@@ -614,13 +614,13 @@ pub fn spawn_project_watcher_bridge(
                     }
                     match event.action {
                         CrudAction::Created => {
-                            handle_project_created(&watcher, &event).await;
+                            handle_project_created(&watcher, &orchestrator, &event).await;
                         }
                         CrudAction::Deleted => {
                             handle_project_deleted(&watcher, &event).await;
                         }
                         CrudAction::Updated => {
-                            handle_project_updated(&watcher, &event, &neo4j).await;
+                            handle_project_updated(&watcher, &event, &orchestrator).await;
                         }
                         _ => {} // Linked/Unlinked — not relevant for watcher
                     }
@@ -641,8 +641,13 @@ pub fn spawn_project_watcher_bridge(
     });
 }
 
-/// Handle a Project::Created event — register on the watcher if root_path exists.
-async fn handle_project_created(watcher: &Arc<RwLock<FileWatcher>>, event: &CrudEvent) {
+/// Handle a Project::Created event — register on the watcher if root_path exists,
+/// then spawn an initial sync in background.
+async fn handle_project_created(
+    watcher: &Arc<RwLock<FileWatcher>>,
+    orchestrator: &Arc<super::Orchestrator>,
+    event: &CrudEvent,
+) {
     let root_path = match event.payload.get("root_path").and_then(|v| v.as_str()) {
         Some(rp) => rp.to_string(),
         None => {
@@ -687,6 +692,57 @@ async fn handle_project_created(watcher: &Arc<RwLock<FileWatcher>>, event: &Crud
     match w.register_project(path, project_id, slug.clone()).await {
         Ok(_) => {
             tracing::info!("Watcher bridge: auto-registered project '{}'", slug);
+
+            // Spawn initial sync in background — same pipeline as sync_project handler
+            // (sync tree-sitter → update last_synced → analytics → feature graphs)
+            let orch = orchestrator.clone();
+            let sync_path = expanded.clone();
+            let sync_slug = slug.clone();
+            tracing::info!(
+                "Watcher bridge: spawning initial sync for project '{}'",
+                sync_slug
+            );
+            tokio::spawn(async move {
+                let path = std::path::Path::new(&sync_path);
+                match orch
+                    .sync_directory_for_project_with_options(
+                        path,
+                        Some(project_id),
+                        Some(&sync_slug),
+                        false,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        tracing::info!(
+                            "Watcher bridge: initial sync completed for '{}' — {} files synced, {} skipped, {} errors",
+                            sync_slug,
+                            result.files_synced,
+                            result.files_skipped,
+                            result.errors,
+                        );
+                        // Update last_synced timestamp
+                        if let Err(e) = orch.neo4j().update_project_synced(project_id).await {
+                            tracing::warn!(
+                                "Watcher bridge: failed to update last_synced for '{}': {}",
+                                sync_slug,
+                                e
+                            );
+                        }
+                        // Compute graph analytics (PageRank, communities, etc.)
+                        orch.spawn_analyze_project(project_id);
+                        // Refresh auto-built feature graphs
+                        orch.spawn_refresh_feature_graphs(project_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Watcher bridge: initial sync failed for '{}': {}",
+                            sync_slug,
+                            e
+                        );
+                    }
+                }
+            });
         }
         Err(e) => {
             tracing::warn!(
@@ -723,7 +779,7 @@ async fn handle_project_deleted(watcher: &Arc<RwLock<FileWatcher>>, event: &Crud
 async fn handle_project_updated(
     watcher: &Arc<RwLock<FileWatcher>>,
     event: &CrudEvent,
-    neo4j: &Arc<dyn crate::neo4j::GraphStore>,
+    orchestrator: &Arc<super::Orchestrator>,
 ) {
     // Only react if root_path was part of the update
     let new_root_path = match event.payload.get("root_path").and_then(|v| v.as_str()) {
@@ -737,6 +793,7 @@ async fn handle_project_updated(
     };
 
     // Look up the project to get current slug
+    let neo4j = orchestrator.neo4j_arc();
     let project = match neo4j.get_project(project_id).await {
         Ok(Some(p)) => p,
         Ok(None) => {
