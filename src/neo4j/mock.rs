@@ -413,7 +413,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn delete_project(&self, id: Uuid) -> Result<()> {
+    async fn delete_project(&self, id: Uuid, _project_name: &str) -> Result<()> {
         self.projects.write().await.remove(&id);
         // Cascade: remove project files
         self.project_files.write().await.remove(&id);

@@ -54,8 +54,9 @@ pub trait GraphStore: Send + Sync {
     /// Update project analytics_computed_at timestamp
     async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()>;
 
-    /// Delete a project and all its data
-    async fn delete_project(&self, id: Uuid) -> Result<()>;
+    /// Delete a project and all its data.
+    /// `project_name` is used to tag archived notes/decisions with the source project.
+    async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()>;
 
     // ========================================================================
     // Workspace operations

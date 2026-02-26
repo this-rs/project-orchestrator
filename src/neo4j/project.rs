@@ -189,8 +189,127 @@ impl Neo4jClient {
     }
 
     /// Delete a project and all its data
-    pub async fn delete_project(&self, id: Uuid) -> Result<()> {
-        // Delete all files belonging to the project
+    pub async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()> {
+        // ================================================================
+        // Phase 1: Archive knowledge (Notes + Decisions) — preserve, don't delete
+        // ================================================================
+
+        // Archive notes: detach from project + files, set status=archived
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[r:HAS_NOTE]->(n:Note)
+            // Remove LINKED_TO relationships to files/symbols of THIS project
+            OPTIONAL MATCH (n)-[lt:LINKED_TO]->(target)
+                WHERE (target:File OR target:Function OR target:Struct OR target:Trait OR target:Enum)
+                AND EXISTS { MATCH (target)<-[:CONTAINS*1..2]-(p) }
+            DELETE lt, r
+            SET n.status = 'archived',
+                n.project_id = null,
+                n.archived_from_project = $project_name,
+                n.archived_at = datetime()
+            "#,
+        )
+        .param("id", id.to_string())
+        .param("project_name", project_name);
+        self.graph.run(q).await?;
+
+        // Archive decisions: detach from tasks + files, set status=archived
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[:HAS_PLAN]->(plan:Plan)-[:HAS_TASK]->(task:Task)-[inf:INFORMED_BY]->(d:Decision)
+            // Remove AFFECTS relationships to files of THIS project
+            OPTIONAL MATCH (d)-[aff:AFFECTS]->(target)
+                WHERE (target:File OR target:Function OR target:Struct)
+                AND EXISTS { MATCH (target)<-[:CONTAINS*1..2]-(p) }
+            DELETE aff, inf
+            SET d.status = 'archived',
+                d.archived_from_project = $project_name,
+                d.archived_at = datetime()
+            "#,
+        )
+        .param("id", id.to_string())
+        .param("project_name", project_name);
+        self.graph.run(q).await?;
+
+        // ================================================================
+        // Phase 2: Cascade delete structural entities (leaf-first order)
+        // ================================================================
+
+        // Delete steps (must come before tasks)
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[:HAS_PLAN]->(plan:Plan)-[:HAS_TASK]->(task:Task)-[:HAS_STEP]->(s:Step)
+            DETACH DELETE s
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete constraints (must come before plans)
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[:HAS_PLAN]->(plan:Plan)-[:CONSTRAINED_BY]->(c:Constraint)
+            DETACH DELETE c
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete plans + tasks (decisions already detached in phase 1)
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[:HAS_PLAN]->(plan:Plan)
+            OPTIONAL MATCH (plan)-[:HAS_TASK]->(task:Task)
+            DETACH DELETE task, plan
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete milestones
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[:HAS_MILESTONE]->(m:Milestone)
+            DETACH DELETE m
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete releases
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[:HAS_RELEASE]->(r:Release)
+            DETACH DELETE r
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete feature graphs
+        let q = query(
+            r#"
+            MATCH (fg:FeatureGraph {project_id: $id})
+            DETACH DELETE fg
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // Delete commits linked to this project's plans/tasks
+        let q = query(
+            r#"
+            MATCH (c:Commit {project_id: $id})
+            DETACH DELETE c
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
+        // ================================================================
+        // Phase 3: Delete code structure (files + symbols)
+        // ================================================================
+
         let q = query(
             r#"
             MATCH (p:Project {id: $id})
@@ -202,20 +321,10 @@ impl Neo4jClient {
         .param("id", id.to_string());
         self.graph.run(q).await?;
 
-        // Delete all plans belonging to the project
-        let q = query(
-            r#"
-            MATCH (p:Project {id: $id})
-            OPTIONAL MATCH (p)-[:HAS_PLAN]->(plan:Plan)
-            OPTIONAL MATCH (plan)-[:HAS_TASK]->(task:Task)
-            OPTIONAL MATCH (task)-[:INFORMED_BY]->(decision:Decision)
-            DETACH DELETE decision, task, plan
-            "#,
-        )
-        .param("id", id.to_string());
-        self.graph.run(q).await?;
+        // ================================================================
+        // Phase 4: Delete the project node itself
+        // ================================================================
 
-        // Delete the project itself
         let q = query(
             r#"
             MATCH (p:Project {id: $id})

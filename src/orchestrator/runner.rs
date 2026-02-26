@@ -2652,14 +2652,43 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         Ok(())
     }
 
-    /// Delete a project and emit event
+    /// Delete a project and emit event.
+    ///
+    /// Cleanup order:
+    /// 1. Lookup project (get name + slug before deletion)
+    /// 2. MeiliSearch: delete code documents (best-effort)
+    /// 3. Neo4j: archive notes/decisions, cascade delete structural entities
+    /// 4. Emit CrudEvent with slug in payload
     pub async fn delete_project(&self, id: Uuid) -> Result<()> {
-        self.neo4j().delete_project(id).await?;
-        self.emit(CrudEvent::new(
-            EventEntityType::Project,
-            CrudAction::Deleted,
-            id.to_string(),
-        ));
+        // Lookup project before deleting — we need the name and slug
+        let project = self
+            .neo4j()
+            .get_project(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Project {} not found", id))?;
+
+        // MeiliSearch cleanup — best-effort, don't block deletion on failure
+        if let Err(e) = self.meili().delete_code_for_project(&project.slug).await {
+            tracing::warn!(
+                "Failed to delete MeiliSearch code documents for project '{}': {}",
+                project.slug,
+                e
+            );
+        }
+
+        // Neo4j cascade delete (archives notes/decisions, deletes everything else)
+        self.neo4j().delete_project(id, &project.name).await?;
+
+        // Emit event with slug in payload for subscribers (watcher bridge, etc.)
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "slug".to_string(),
+            serde_json::Value::String(project.slug),
+        );
+        self.emit(
+            CrudEvent::new(EventEntityType::Project, CrudAction::Deleted, id.to_string())
+                .with_payload(serde_json::Value::Object(payload)),
+        );
         Ok(())
     }
 
