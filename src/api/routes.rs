@@ -679,6 +679,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::cleanup_cross_project_calls),
         )
         .route(
+            "/api/admin/cleanup-builtin-calls",
+            post(handlers::cleanup_builtin_calls),
+        )
+        .route(
             "/api/admin/cleanup-sync-data",
             post(handlers::cleanup_sync_data),
         )

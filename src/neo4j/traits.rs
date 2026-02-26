@@ -427,6 +427,10 @@ pub trait GraphStore: Send + Sync {
     /// Returns the number of deleted relationships.
     async fn cleanup_cross_project_calls(&self) -> Result<i64>;
 
+    /// Delete all CALLS relationships where the callee function name is a known built-in.
+    /// Returns the number of deleted relationships.
+    async fn cleanup_builtin_calls(&self) -> Result<i64>;
+
     /// Clean up ALL sync-generated data (File, Function, Struct, Trait, Enum, Impl, Import, FeatureGraph).
     /// Returns the total number of deleted entities/relationships.
     async fn cleanup_sync_data(&self) -> Result<i64>;

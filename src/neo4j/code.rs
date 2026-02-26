@@ -774,6 +774,12 @@ impl Neo4jClient {
         callee_name: &str,
         project_id: Option<Uuid>,
     ) -> Result<()> {
+        // Double protection: filter out built-in calls at insertion level
+        use crate::parser::noise_filter;
+        if noise_filter::is_builtin_call(callee_name) {
+            return Ok(());
+        }
+
         // Phase 1: Try same-file match (most common case, O(1) via index)
         // Extract file_path from caller_id (format: "file_path:func_name:line_start")
         let caller_file_path = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
@@ -1495,8 +1501,13 @@ impl Neo4jClient {
             return Ok(());
         }
 
+        // Double protection: filter out built-in calls at insertion level
+        // (primary filter is in the parser, this catches any remaining)
+        use crate::parser::noise_filter;
+
         let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = calls
             .iter()
+            .filter(|call| !noise_filter::is_builtin_call(&call.callee_name))
             .map(|call| {
                 let caller_file_path = call
                     .caller_id
@@ -1748,6 +1759,64 @@ impl Neo4jClient {
         } else {
             Ok(0)
         }
+    }
+
+    /// Delete all CALLS relationships where the callee function name matches a known built-in.
+    /// Uses the noise_filter::BUILT_IN_NAMES list. Batched to handle large graphs.
+    /// Returns the number of deleted relationships.
+    pub async fn cleanup_builtin_calls(&self) -> Result<i64> {
+        use crate::parser::noise_filter;
+
+        let builtins: Vec<String> = noise_filter::builtin_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let batch_size = 10_000;
+        let mut total_deleted: i64 = 0;
+
+        loop {
+            let q = query(
+                r#"
+                MATCH (caller:Function)-[r:CALLS]->(callee:Function)
+                WHERE callee.name IN $builtins
+                WITH r LIMIT $batch_size
+                DELETE r
+                RETURN count(r) AS cnt
+                "#,
+            )
+            .param("builtins", builtins.clone())
+            .param("batch_size", batch_size as i64);
+
+            match self.graph.execute(q).await {
+                Ok(mut result) => {
+                    if let Ok(Some(row)) = result.next().await {
+                        let cnt: i64 = row.get("cnt").unwrap_or(0);
+                        if cnt == 0 {
+                            break;
+                        }
+                        total_deleted += cnt;
+                        tracing::info!(
+                            "cleanup_builtin_calls: deleted batch of {} CALLS rels (total: {})",
+                            cnt,
+                            total_deleted
+                        );
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("cleanup_builtin_calls query failed: {}", e);
+                    break;
+                }
+            }
+        }
+
+        tracing::info!(
+            "cleanup_builtin_calls: deleted {} built-in CALLS relationships total",
+            total_deleted
+        );
+        Ok(total_deleted)
     }
 
     /// Get all functions called by a function

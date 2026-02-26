@@ -544,6 +544,10 @@ impl GraphStore for Neo4jClient {
         self.cleanup_cross_project_calls().await
     }
 
+    async fn cleanup_builtin_calls(&self) -> anyhow::Result<i64> {
+        self.cleanup_builtin_calls().await
+    }
+
     async fn cleanup_sync_data(&self) -> anyhow::Result<i64> {
         self.cleanup_sync_data().await
     }

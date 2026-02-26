@@ -1506,6 +1506,22 @@ impl GraphStore for MockGraphStore {
         Ok(deleted)
     }
 
+    async fn cleanup_builtin_calls(&self) -> Result<i64> {
+        use crate::parser::noise_filter;
+
+        let builtins = noise_filter::builtin_names();
+        let mut cr = self.call_relationships.write().await;
+        let mut deleted = 0i64;
+
+        for (_caller_id, callees) in cr.iter_mut() {
+            let before = callees.len();
+            callees.retain(|callee_name| !builtins.contains(callee_name.as_str()));
+            deleted += (before - callees.len()) as i64;
+        }
+
+        Ok(deleted)
+    }
+
     async fn cleanup_sync_data(&self) -> Result<i64> {
         let mut total = 0i64;
         total += self.functions.write().await.drain().count() as i64;
@@ -9346,6 +9362,96 @@ mod tests {
         assert_eq!(
             count, 2,
             "Should count Draft + InProgress, exclude Completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_builtin_calls() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // Create caller and callee functions
+        let caller = FunctionNode {
+            name: "process".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        };
+        store.upsert_function(&caller).await.unwrap();
+
+        let real_callee = FunctionNode {
+            name: "transform_data".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 12,
+            line_end: 20,
+            docstring: None,
+        };
+        store.upsert_function(&real_callee).await.unwrap();
+
+        let builtin_callee = FunctionNode {
+            name: "println".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 22,
+            line_end: 24,
+            docstring: None,
+        };
+        store.upsert_function(&builtin_callee).await.unwrap();
+
+        // Create CALLS: process -> transform_data (real) and process -> println (built-in)
+        // Use None for project_id to skip project-file scoping in mock
+        store
+            .create_call_relationship("src/main.rs::process", "transform_data", None)
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("src/main.rs::process", "println", None)
+            .await
+            .unwrap();
+
+        // Verify both calls exist
+        let cr = store.call_relationships.read().await;
+        let calls = cr.get("src/main.rs::process").unwrap();
+        assert_eq!(calls.len(), 2, "Should have 2 calls before cleanup");
+        drop(cr);
+
+        // Run cleanup
+        let deleted = store.cleanup_builtin_calls().await.unwrap();
+        assert_eq!(deleted, 1, "Should delete 1 built-in call (println)");
+
+        // Verify only real call remains
+        let cr = store.call_relationships.read().await;
+        let calls = cr.get("src/main.rs::process").unwrap();
+        assert_eq!(calls.len(), 1, "Should have 1 call after cleanup");
+        assert!(
+            calls.contains(&"transform_data".to_string()),
+            "Should keep real call 'transform_data'"
+        );
+        assert!(
+            !calls.contains(&"println".to_string()),
+            "Should remove built-in call 'println'"
         );
     }
 }

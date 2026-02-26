@@ -872,6 +872,11 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s
 });
 
+/// Get a reference to the full set of built-in names (for Neo4j cleanup queries).
+pub fn builtin_names() -> &'static HashSet<&'static str> {
+    &BUILT_IN_NAMES
+}
+
 /// Check if a function call name is a built-in/noise that should be filtered.
 ///
 /// Returns `true` if the name should be excluded from the call graph.

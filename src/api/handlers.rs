@@ -1322,6 +1322,18 @@ pub async fn cleanup_cross_project_calls(
     Ok(Json(serde_json::json!({ "deleted_count": deleted })))
 }
 
+/// POST /api/admin/cleanup-builtin-calls — Delete CALLS relationships targeting built-in functions
+pub async fn cleanup_builtin_calls(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let deleted = state
+        .orchestrator
+        .neo4j()
+        .cleanup_builtin_calls()
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted_count": deleted })))
+}
+
 /// POST /api/admin/cleanup-sync-data — Delete all sync data (File/Function/Struct nodes) and Meilisearch code index
 pub async fn cleanup_sync_data(
     State(state): State<OrchestratorState>,
