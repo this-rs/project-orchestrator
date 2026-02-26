@@ -413,13 +413,14 @@ async fn test_neo4j_stale_file_cleanup() {
 
     // Now simulate a sync where only file1 and file2 exist (file3 was deleted)
     let valid_paths = vec![file1_path.clone(), file2_path.clone()];
-    let (files_deleted, _symbols_deleted) = state
+    let (files_deleted, _symbols_deleted, deleted_paths) = state
         .neo4j
         .delete_stale_files(project_id, &valid_paths)
         .await
         .unwrap();
 
     assert_eq!(files_deleted, 1, "Should delete 1 stale file");
+    assert_eq!(deleted_paths.len(), 1, "Should return 1 deleted path");
 
     // Verify only 2 files remain
     let paths_after = state

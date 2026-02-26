@@ -1643,13 +1643,22 @@ impl Neo4jClient {
 
         // Delete code relationships first (batched to avoid massive transactions)
         // CALLS alone can be 300k+ rels — unbatched DELETE causes OOM/timeout
+        //
+        // NOTE: Types not yet in use (EXTENDS, IMPLEMENTS, STEP_IN_PROCESS)
+        // are forward-compatible no-ops — the batched loop simply returns 0.
         let rel_types = vec![
             "CALLS",
             "IMPORTS",
+            "IMPORTS_SYMBOL",
+            "USES_TYPE",
             "IMPLEMENTS_FOR",
             "IMPLEMENTS_TRAIT",
             "HAS_IMPORT",
             "INCLUDES_ENTITY",
+            // Forward-compatible: Plans 5 & 6
+            "EXTENDS",
+            "IMPLEMENTS",
+            "STEP_IN_PROCESS",
         ];
 
         for rel_type in &rel_types {
@@ -1698,6 +1707,10 @@ impl Neo4jClient {
         }
 
         // Delete code entity nodes (batched DETACH DELETE removes remaining CONTAINS edges)
+        //
+        // NOTE: Process is forward-compatible for Plan 6 (Process Detection).
+        // Class/Interface are NOT added — Struct and Trait cover these concepts
+        // in the current model (Rust-centric). If needed later, add here.
         let node_labels = vec![
             "Function",
             "Struct",
@@ -1707,6 +1720,8 @@ impl Neo4jClient {
             "Import",
             "File",
             "FeatureGraph",
+            // Forward-compatible: Plan 6
+            "Process",
         ];
 
         for label in &node_labels {
