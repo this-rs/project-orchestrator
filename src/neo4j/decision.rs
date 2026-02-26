@@ -134,4 +134,72 @@ impl Neo4jClient {
         self.graph.run(q).await?;
         Ok(())
     }
+
+    /// Get decisions related to an entity.
+    ///
+    /// Finds decisions connected via:
+    /// 1. Direct (Decision)-[:AFFECTS]->(entity) — if AFFECTS relations exist (P3)
+    /// 2. Indirect via task linkage — (Task)-[:INFORMED_BY]->(Decision)
+    ///    where the task's affected_files mention the entity path
+    ///
+    /// Returns up to `limit` decisions ordered by decided_at DESC.
+    pub async fn get_decisions_for_entity(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DecisionNode>> {
+        // Try both direct AFFECTS and indirect via task affected_files
+        let cypher = format!(
+            r#"
+            // Path 1: Direct AFFECTS relation (P3 — may not exist yet)
+            OPTIONAL MATCH (d1:Decision)-[:AFFECTS]->(target:{} {{{}: $entity_id}})
+            WITH collect(DISTINCT d1) AS direct_decisions
+
+            // Path 2: Indirect via Task affected_files containing entity_id
+            OPTIONAL MATCH (t:Task)-[:INFORMED_BY]->(d2:Decision)
+            WHERE $entity_id IN t.affected_files
+            WITH direct_decisions, collect(DISTINCT d2) AS indirect_decisions
+
+            // Merge and deduplicate
+            WITH [d IN direct_decisions + indirect_decisions WHERE d IS NOT NULL] AS all_decisions
+            UNWIND all_decisions AS d
+            WITH DISTINCT d
+            RETURN d
+            ORDER BY d.decided_at DESC
+            LIMIT $limit
+            "#,
+            entity_type,
+            if entity_type == "File" { "path" } else { "id" },
+        );
+
+        let q = query(&cypher)
+            .param("entity_id", entity_id.to_string())
+            .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut decisions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            decisions.push(DecisionNode {
+                id: node.get::<String>("id")?.parse()?,
+                description: node.get("description")?,
+                rationale: node.get("rationale")?,
+                alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
+                chosen_option: node
+                    .get::<String>("chosen_option")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
+                decided_at: node
+                    .get::<String>("decided_at")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+            });
+        }
+
+        Ok(decisions)
+    }
 }

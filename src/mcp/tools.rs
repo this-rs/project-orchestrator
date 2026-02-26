@@ -143,6 +143,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "get_notes_needing_review" => Some(("note", "get_needing_review")),
         "list_project_notes" => Some(("note", "list_project")),
         "get_propagated_notes" => Some(("note", "get_propagated")),
+        "get_propagated_knowledge" => Some(("note", "get_propagated_knowledge")),
         "get_entity_notes" => Some(("note", "get_entity")),
 
         // Workspace
@@ -495,13 +496,13 @@ fn commit_tool() -> ToolDefinition {
 fn note_tool() -> ToolDefinition {
     ToolDefinition {
         name: "note".to_string(),
-        description: "Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity".to_string(),
+        description: "Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity, get_context_knowledge, get_propagated_knowledge".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "search", "search_semantic", "confirm", "invalidate", "supersede", "link_to_entity", "unlink_from_entity", "get_context", "get_needing_review", "list_project", "get_propagated", "get_entity"],
+                    "enum": ["list", "create", "get", "update", "delete", "search", "search_semantic", "confirm", "invalidate", "supersede", "link_to_entity", "unlink_from_entity", "get_context", "get_needing_review", "list_project", "get_propagated", "get_entity", "get_context_knowledge", "get_propagated_knowledge"],
                     "description": "Operation to perform"
                 },
                 "note_id": {"type": "string", "description": "Note UUID"},

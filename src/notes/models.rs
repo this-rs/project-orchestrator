@@ -703,6 +703,39 @@ impl Note {
 // Propagated Note (for context retrieval)
 // ============================================================================
 
+/// A single hop in a propagation path, distinguishing structural and neural relations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationHop {
+    /// Relation type (e.g. "IMPORTS", "CALLS", "SYNAPSE")
+    #[serde(rename = "type")]
+    pub rel_type: String,
+    /// Source of the relation: "structural" for code graph, "neural" for Hebbian synapses
+    pub source: String,
+    /// Synapse weight (only present for SYNAPSE relations)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+impl RelationHop {
+    /// Create a structural hop (code graph relation)
+    pub fn structural(rel_type: impl Into<String>) -> Self {
+        Self {
+            rel_type: rel_type.into(),
+            source: "structural".to_string(),
+            weight: None,
+        }
+    }
+
+    /// Create a neural hop (Hebbian synapse)
+    pub fn neural(weight: f64) -> Self {
+        Self {
+            rel_type: "SYNAPSE".to_string(),
+            source: "neural".to_string(),
+            weight: Some(weight),
+        }
+    }
+}
+
 /// A note with propagation information for context retrieval
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropagatedNote {
@@ -720,6 +753,13 @@ pub struct PropagatedNote {
     /// Higher values mean the note was propagated through structurally important hubs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_pagerank: Option<f64>,
+    /// Relation hops traversed on the propagation path, with source info (structural/neural).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub relation_path: Vec<RelationHop>,
+    /// Combined weight of all relations on the path (product of individual weights).
+    /// Higher = stronger structural connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_rel_weight: Option<f64>,
 }
 
 // ============================================================================
@@ -811,6 +851,54 @@ pub struct NoteContextResponse {
     /// Propagated notes from related entities
     pub propagated_notes: Vec<PropagatedNote>,
     /// Total count of relevant notes
+    pub total_count: usize,
+}
+
+/// Unified context knowledge response combining notes, decisions, and recent commits.
+///
+/// Returned by `get_context_knowledge(entity_type, entity_id)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextKnowledge {
+    /// Direct notes attached to the entity
+    pub direct_notes: Vec<Note>,
+    /// Propagated notes from related entities
+    pub propagated_notes: Vec<PropagatedNote>,
+    /// Decisions related to this entity (via AFFECTS or task/plan linkage)
+    pub decisions: Vec<crate::neo4j::models::DecisionNode>,
+    /// Recent commits touching this entity (via TOUCHES)
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub recent_commits: Vec<crate::neo4j::models::FileHistoryEntry>,
+    /// Total count of all knowledge items
+    pub total_count: usize,
+}
+
+/// Statistics about relations traversed during propagation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationStats {
+    /// Relation type (e.g. "IMPORTS", "CALLS")
+    pub relation_type: String,
+    /// Number of notes propagated via this relation type
+    pub count: usize,
+    /// Average score of notes propagated via this relation
+    pub avg_score: f64,
+}
+
+/// Enriched propagation response with notes, decisions, and relation analytics.
+///
+/// Returned by `get_propagated_knowledge(entity_type, entity_id, ...)`.
+/// Combines `get_propagated_notes` + `get_decisions_for_entity` with
+/// per-relation statistics and score breakdowns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropagatedKnowledge {
+    /// Propagated notes with full score breakdown (distance, relation_weight, pagerank)
+    pub notes: Vec<PropagatedNote>,
+    /// Decisions propagated via task/plan linkage
+    pub decisions: Vec<crate::neo4j::models::DecisionNode>,
+    /// Total relations traversed across all propagation paths
+    pub total_relations_traversed: usize,
+    /// Per-relation-type statistics
+    pub relation_stats: Vec<RelationStats>,
+    /// Total count of knowledge items (notes + decisions)
     pub total_count: usize,
 }
 
@@ -1130,6 +1218,8 @@ mod tests {
             propagation_path: vec!["hub_file".to_string(), "target".to_string()],
             distance: 2,
             path_pagerank: Some(hub_pagerank),
+            relation_path: vec![RelationHop::structural("IMPORTS"), RelationHop::structural("CALLS")],
+            path_rel_weight: Some(0.9),
         };
         assert_eq!(pn.path_pagerank, Some(0.15));
         assert!(pn.relevance_score > 0.4);

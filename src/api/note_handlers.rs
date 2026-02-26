@@ -95,6 +95,10 @@ pub struct ContextNotesQuery {
     pub entity_id: String,
     pub max_depth: Option<u32>,
     pub min_score: Option<f64>,
+    /// Comma-separated list of relation types to traverse for propagation.
+    /// E.g. "CONTAINS,IMPORTS,CALLS,CO_CHANGED,IMPLEMENTS_TRAIT"
+    /// If absent, defaults to CONTAINS|IMPORTS|CALLS (backward compatible).
+    pub relation_types: Option<String>,
 }
 
 // ============================================================================
@@ -464,6 +468,14 @@ pub async fn get_propagated_notes(
         .parse::<EntityType>()
         .map_err(|_| AppError::BadRequest(format!("Invalid entity type: {}", query.entity_type)))?;
 
+    // Parse comma-separated relation_types into Vec<String>
+    let relation_types: Option<Vec<String>> = query.relation_types.as_ref().map(|s| {
+        s.split(',')
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
+    });
+
     let notes = state
         .orchestrator
         .note_manager()
@@ -472,10 +484,68 @@ pub async fn get_propagated_notes(
             &query.entity_id,
             query.max_depth.unwrap_or(3),
             query.min_score.unwrap_or(0.1),
+            relation_types.as_deref(),
         )
         .await?;
 
     Ok(Json(notes))
+}
+
+/// Get unified context knowledge for an entity (notes + decisions + commits)
+pub async fn get_context_knowledge(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ContextNotesQuery>,
+) -> Result<Json<crate::notes::ContextKnowledge>, AppError> {
+    let entity_type = query
+        .entity_type
+        .parse::<EntityType>()
+        .map_err(|_| AppError::BadRequest(format!("Invalid entity type: {}", query.entity_type)))?;
+
+    let result = state
+        .orchestrator
+        .note_manager()
+        .get_context_knowledge(
+            &entity_type,
+            &query.entity_id,
+            query.max_depth.unwrap_or(3),
+            query.min_score.unwrap_or(0.1),
+        )
+        .await?;
+
+    Ok(Json(result))
+}
+
+/// Get enriched propagated knowledge for an entity (notes + decisions + relation stats)
+pub async fn get_propagated_knowledge(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ContextNotesQuery>,
+) -> Result<Json<crate::notes::PropagatedKnowledge>, AppError> {
+    let entity_type = query
+        .entity_type
+        .parse::<EntityType>()
+        .map_err(|_| AppError::BadRequest(format!("Invalid entity type: {}", query.entity_type)))?;
+
+    // Parse comma-separated relation_types into Vec<String>
+    let relation_types: Option<Vec<String>> = query.relation_types.as_ref().map(|s| {
+        s.split(',')
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
+    });
+
+    let result = state
+        .orchestrator
+        .note_manager()
+        .get_propagated_knowledge(
+            &entity_type,
+            &query.entity_id,
+            query.max_depth.unwrap_or(3),
+            query.min_score.unwrap_or(0.1),
+            relation_types.as_deref(),
+        )
+        .await?;
+
+    Ok(Json(result))
 }
 
 /// Get notes attached to a specific entity

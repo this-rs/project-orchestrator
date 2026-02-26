@@ -188,6 +188,8 @@ impl ToolHandler {
             ("note", "get_needing_review") => "get_notes_needing_review",
             ("note", "list_project") => "list_project_notes",
             ("note", "get_propagated") => "get_propagated_notes",
+            ("note", "get_propagated_knowledge") => "get_propagated_knowledge",
+            ("note", "get_context_knowledge") => "get_context_knowledge",
             ("note", "get_entity") => "get_entity_notes",
 
             // Workspace
@@ -1517,7 +1519,52 @@ impl ToolHandler {
                 if let Some(v) = args.get("min_score").and_then(|v| v.as_f64()) {
                     query.push(("min_score".to_string(), v.to_string()));
                 }
+                // Forward relation_types as comma-separated string
+                if let Some(v) = args.get("relation_types").and_then(|v| v.as_str()) {
+                    query.push(("relation_types".to_string(), v.to_string()));
+                }
                 let result = http.get_with_query("/api/notes/propagated", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_context_knowledge" => {
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let mut query = vec![
+                    ("entity_type".to_string(), entity_type),
+                    ("entity_id".to_string(), entity_id),
+                ];
+                if let Some(v) = args.get("max_depth").and_then(|v| v.as_i64()) {
+                    query.push(("max_depth".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("min_score").and_then(|v| v.as_f64()) {
+                    query.push(("min_score".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/notes/context-knowledge", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_propagated_knowledge" => {
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let mut query = vec![
+                    ("entity_type".to_string(), entity_type),
+                    ("entity_id".to_string(), entity_id),
+                ];
+                if let Some(v) = args.get("max_depth").and_then(|v| v.as_i64()) {
+                    query.push(("max_depth".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("min_score").and_then(|v| v.as_f64()) {
+                    query.push(("min_score".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("relation_types").and_then(|v| v.as_str()) {
+                    query.push(("relation_types".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/notes/propagated-knowledge", &query)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -2688,6 +2735,8 @@ mod tests {
             ("search_semantic", "search_notes_semantic"),
             ("link_to_entity", "link_note_to_entity"),
             ("get_context", "get_context_notes"),
+            ("get_context_knowledge", "get_context_knowledge"),
+            ("get_propagated_knowledge", "get_propagated_knowledge"),
             ("confirm", "confirm_note"),
             ("invalidate", "invalidate_note"),
             ("supersede", "supersede_note"),

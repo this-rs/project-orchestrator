@@ -3282,6 +3282,16 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn get_decisions_for_entity(
+        &self,
+        _entity_type: &str,
+        _entity_id: &str,
+        _limit: u32,
+    ) -> Result<Vec<DecisionNode>> {
+        // Mock: return empty — decision entity traversal requires graph
+        Ok(vec![])
+    }
+
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -4414,6 +4424,7 @@ impl GraphStore for MockGraphStore {
         _entity_id: &str,
         _max_depth: u32,
         _min_score: f64,
+        _relation_types: Option<&[String]>,
     ) -> Result<Vec<PropagatedNote>> {
         // Simplified: propagation requires graph traversal; return empty
         Ok(vec![])
@@ -4439,6 +4450,8 @@ impl GraphStore for MockGraphStore {
                     distance: 1,
                     note: n,
                     path_pagerank: None,
+                    relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
+                    path_rel_weight: Some(1.0),
                 })
                 .collect())
         } else {

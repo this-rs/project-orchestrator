@@ -700,16 +700,20 @@ impl NoteManager {
         }
     }
 
-    /// Get propagated notes for an entity (via graph traversal)
+    /// Get propagated notes for an entity (via graph traversal).
+    ///
+    /// `relation_types` controls which graph relations to traverse.
+    /// `None` → default (CONTAINS|IMPORTS|CALLS).
     pub async fn get_propagated_notes(
         &self,
         entity_type: &EntityType,
         entity_id: &str,
         max_depth: u32,
         min_score: f64,
+        relation_types: Option<&[String]>,
     ) -> Result<Vec<PropagatedNote>> {
         self.neo4j
-            .get_propagated_notes(entity_type, entity_id, max_depth, min_score)
+            .get_propagated_notes(entity_type, entity_id, max_depth, min_score, relation_types)
             .await
     }
 
@@ -727,10 +731,10 @@ impl NoteManager {
             .get_notes_for_entity(entity_type, entity_id)
             .await?;
 
-        // Get propagated notes from graph traversal
+        // Get propagated notes from graph traversal (default relations)
         let mut propagated_notes = self
             .neo4j
-            .get_propagated_notes(entity_type, entity_id, max_depth, min_score)
+            .get_propagated_notes(entity_type, entity_id, max_depth, min_score, None)
             .await?;
 
         // If entity is a Project, also get workspace-level notes
@@ -764,6 +768,137 @@ impl NoteManager {
         Ok(NoteContextResponse {
             direct_notes,
             propagated_notes,
+            total_count,
+        })
+    }
+
+    /// Get unified context knowledge for an entity.
+    ///
+    /// Combines:
+    /// 1. Direct + propagated notes (same as `get_context_notes`)
+    /// 2. Decisions related to the entity (via AFFECTS or task linkage)
+    /// 3. Recent commits touching the entity (via TOUCHES, for File entities)
+    pub async fn get_context_knowledge(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        max_depth: u32,
+        min_score: f64,
+    ) -> Result<crate::notes::ContextKnowledge> {
+        // 1. Notes (reuse existing get_context_notes)
+        let notes = self
+            .get_context_notes(entity_type, entity_id, max_depth, min_score)
+            .await?;
+
+        // 2. Decisions related to this entity
+        let entity_label = match entity_type {
+            EntityType::File => "File",
+            EntityType::Function => "Function",
+            EntityType::Struct => "Struct",
+            EntityType::Trait => "Trait",
+            _ => "File", // fallback
+        };
+        let decisions = self
+            .neo4j
+            .get_decisions_for_entity(entity_label, entity_id, 10)
+            .await
+            .unwrap_or_default();
+
+        // 3. Recent commits (only for File entities, via TOUCHES)
+        let recent_commits = if *entity_type == EntityType::File {
+            self.neo4j
+                .get_file_history(entity_id, Some(10))
+                .await
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        let total_count =
+            notes.direct_notes.len() + notes.propagated_notes.len() + decisions.len() + recent_commits.len();
+
+        Ok(crate::notes::ContextKnowledge {
+            direct_notes: notes.direct_notes,
+            propagated_notes: notes.propagated_notes,
+            decisions,
+            recent_commits,
+            total_count,
+        })
+    }
+
+    /// Get enriched propagated knowledge for an entity.
+    ///
+    /// Unlike `get_context_notes` (direct + propagated notes only), this returns:
+    /// - Propagated notes with full score breakdown (distance, relation_weight, pagerank)
+    /// - Decisions propagated via task/plan linkage
+    /// - Per-relation-type statistics
+    ///
+    /// Accepts `relation_types` to control which relation types to traverse.
+    pub async fn get_propagated_knowledge(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        max_depth: u32,
+        min_score: f64,
+        relation_types: Option<&[String]>,
+    ) -> Result<crate::notes::PropagatedKnowledge> {
+        // Cap max_depth at 3 to prevent unbounded traversal
+        let capped_depth = max_depth.min(3);
+
+        // 1. Get propagated notes with full scoring
+        let propagated_notes = self
+            .get_propagated_notes(entity_type, entity_id, capped_depth, min_score, relation_types)
+            .await?;
+
+        // 2. Get decisions related to this entity
+        let entity_label = match entity_type {
+            EntityType::File => "File",
+            EntityType::Function => "Function",
+            EntityType::Struct => "Struct",
+            EntityType::Trait => "Trait",
+            _ => "File", // fallback
+        };
+        let decisions = self
+            .neo4j
+            .get_decisions_for_entity(entity_label, entity_id, 10)
+            .await
+            .unwrap_or_default();
+
+        // 3. Compute relation statistics from propagated notes
+        let mut rel_map: std::collections::HashMap<String, (usize, f64)> =
+            std::collections::HashMap::new();
+        let mut total_relations_traversed: usize = 0;
+
+        for note in &propagated_notes {
+            for hop in &note.relation_path {
+                total_relations_traversed += 1;
+                let entry = rel_map.entry(hop.rel_type.clone()).or_insert((0, 0.0));
+                entry.0 += 1;
+                entry.1 += note.relevance_score;
+            }
+        }
+
+        let mut relation_stats: Vec<crate::notes::RelationStats> = rel_map
+            .into_iter()
+            .map(|(relation_type, (count, total_score))| crate::notes::RelationStats {
+                relation_type,
+                count,
+                avg_score: if count > 0 {
+                    total_score / count as f64
+                } else {
+                    0.0
+                },
+            })
+            .collect();
+        relation_stats.sort_by(|a, b| b.count.cmp(&a.count));
+
+        let total_count = propagated_notes.len() + decisions.len();
+
+        Ok(crate::notes::PropagatedKnowledge {
+            notes: propagated_notes,
+            decisions,
+            total_relations_traversed,
+            relation_stats,
             total_count,
         })
     }

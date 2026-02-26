@@ -566,6 +566,16 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/notes/propagated",
             get(note_handlers::get_propagated_notes),
         )
+        // Unified context knowledge (notes + decisions + commits)
+        .route(
+            "/api/notes/context-knowledge",
+            get(note_handlers::get_context_knowledge),
+        )
+        // Enriched propagated knowledge (notes + decisions + relation stats)
+        .route(
+            "/api/notes/propagated-knowledge",
+            get(note_handlers::get_propagated_knowledge),
+        )
         // Entity notes (direct only)
         .route(
             "/api/entities/{entity_type}/{entity_id}/notes",

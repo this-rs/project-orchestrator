@@ -989,6 +989,16 @@ impl GraphStore for Neo4jClient {
         self.delete_decision(decision_id).await
     }
 
+    async fn get_decisions_for_entity(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<DecisionNode>> {
+        self.get_decisions_for_entity(entity_type, entity_id, limit)
+            .await
+    }
+
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -1472,8 +1482,9 @@ impl GraphStore for Neo4jClient {
         entity_id: &str,
         max_depth: u32,
         min_score: f64,
+        relation_types: Option<&[String]>,
     ) -> anyhow::Result<Vec<PropagatedNote>> {
-        self.get_propagated_notes(entity_type, entity_id, max_depth, min_score)
+        self.get_propagated_notes(entity_type, entity_id, max_depth, min_score, relation_types)
             .await
     }
 

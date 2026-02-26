@@ -760,6 +760,14 @@ pub trait GraphStore: Send + Sync {
     /// Delete a decision
     async fn delete_decision(&self, decision_id: Uuid) -> Result<()>;
 
+    /// Get decisions related to an entity (via AFFECTS or task linkage)
+    async fn get_decisions_for_entity(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DecisionNode>>;
+
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -1126,13 +1134,19 @@ pub trait GraphStore: Send + Sync {
         entity_id: &str,
     ) -> Result<Vec<Note>>;
 
-    /// Get propagated notes for an entity (traversing the graph)
+    /// Get propagated notes for an entity (traversing the graph).
+    ///
+    /// `relation_types` controls which graph relations to traverse.
+    /// - `None` → default (CONTAINS|IMPORTS|CALLS) — backward compatible
+    /// - `Some(&["CO_CHANGED", "IMPLEMENTS_TRAIT", ...])` → custom traversal
+    /// Only whitelisted relation types are accepted (see `ALLOWED_PROPAGATION_RELATIONS`).
     async fn get_propagated_notes(
         &self,
         entity_type: &EntityType,
         entity_id: &str,
         max_depth: u32,
         min_score: f64,
+        relation_types: Option<&[String]>,
     ) -> Result<Vec<PropagatedNote>>;
 
     /// Get workspace-level notes for a project (propagated from parent workspace)
