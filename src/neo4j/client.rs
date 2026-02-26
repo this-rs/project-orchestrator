@@ -278,6 +278,16 @@ impl Neo4jClient {
             "CREATE INDEX affects_rel_idx IF NOT EXISTS FOR ()-[r:AFFECTS]->() ON (r.created_at)",
             // Decision SUPERSEDES relationship index
             "CREATE INDEX supersedes_rel_idx IF NOT EXISTS FOR ()-[r:SUPERSEDES]->() ON (r.created_at)",
+            // IMPORTS_SYMBOL relationship index — enables fast symbol resolution lookups
+            "CREATE INDEX imports_symbol_resolved IF NOT EXISTS FOR ()-[r:IMPORTS_SYMBOL]->() ON (r.resolved)",
+            // Forward-compatible: Plan 5 (Heritage Relations)
+            "CREATE INDEX extends_rel_idx IF NOT EXISTS FOR ()-[r:EXTENDS]->() ON (r.created_at)",
+            "CREATE INDEX implements_rel_idx IF NOT EXISTS FOR ()-[r:IMPLEMENTS]->() ON (r.created_at)",
+            // Forward-compatible: Plan 6 (Process Detection)
+            "CREATE INDEX step_in_process_rel_idx IF NOT EXISTS FOR ()-[r:STEP_IN_PROCESS]->() ON (r.order)",
+            // Process node indexes (Plan 6)
+            "CREATE INDEX process_project_id IF NOT EXISTS FOR (p:Process) ON (p.project_id)",
+            "CREATE INDEX process_id IF NOT EXISTS FOR (p:Process) ON (p.id)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)
