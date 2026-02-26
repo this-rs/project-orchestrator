@@ -83,6 +83,11 @@ pub struct ActiveSession {
     /// entire duration of streaming — if `send_permission_response` tried to
     /// take the same lock, it would deadlock.
     pub stdin_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// PID of the CLI subprocess. Used to send SIGINT to the process group
+    /// during interrupt, which cascades to all child processes (find, sleep,
+    /// etc.) that would otherwise survive as orphans.
+    /// Captured once after `client.connect()` — stable for the session lifetime.
+    pub child_pid: Option<u32>,
     /// Cancellation token for NATS listener tasks spawned by this session.
     /// When the session is replaced (e.g., by `resume_session`), the old token
     /// is cancelled so that stale NATS listeners (interrupt, snapshot, RPC)
@@ -1827,9 +1832,16 @@ impl ChatManager {
         // (which is held by stream_response during streaming → deadlock).
         let stdin_tx = client.clone_stdin_sender().await;
 
+        // Capture the CLI subprocess PID for process group signaling.
+        // Used by interrupt() to send SIGINT to the entire process group,
+        // killing child processes (find, sleep, etc.) that survive the
+        // control_request interrupt.
+        let child_pid = client.child_pid().await;
+
         info!(
             session_id = %session_id,
             has_stdin_tx = stdin_tx.is_some(),
+            ?child_pid,
             "Created chat session with model {}",
             model
         );
@@ -1876,6 +1888,7 @@ impl ChatManager {
                     model: Some(model.clone()),
                     sdk_control_rx: sdk_control_rx.clone(),
                     stdin_tx,
+                    child_pid,
                     nats_cancel: nats_cancel.clone(),
                     interrupt_token: interrupt_token.clone(),
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
@@ -3806,6 +3819,9 @@ impl ChatManager {
         // Clone stdin sender for lock-free permission responses (see create_session).
         let stdin_tx = client.clone_stdin_sender().await;
 
+        // Capture CLI subprocess PID for process group signaling (see create_session).
+        let child_pid = client.child_pid().await;
+
         let client = Arc::new(Mutex::new(client));
 
         // Re-create ConversationMemoryManager for resumed session
@@ -3891,6 +3907,7 @@ impl ChatManager {
                     model: Some(session_node.model.clone()),
                     sdk_control_rx: sdk_control_rx.clone(),
                     stdin_tx,
+                    child_pid,
                     nats_cancel: nats_cancel.clone(),
                     interrupt_token: interrupt_token.clone(),
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
@@ -4342,14 +4359,16 @@ impl ChatManager {
     /// client lock. The stream loop then sends the actual interrupt signal to the CLI.
     /// This is instantaneous — no waiting for the Mutex.
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
-        let (interrupt_flag, interrupt_token) = {
+        let (interrupt_flag, interrupt_token, stdin_tx, child_pid) = {
             let sessions = self.active_sessions.read().await;
             match sessions.get(session_id) {
                 Some(s) => (
                     Some(s.interrupt_flag.clone()),
                     Some(s.interrupt_token.clone()),
+                    s.stdin_tx.clone(),
+                    s.child_pid,
                 ),
-                None => (None, None),
+                None => (None, None, None, None),
             }
         };
 
@@ -4360,9 +4379,40 @@ impl ChatManager {
             if let Some(token) = interrupt_token {
                 token.cancel();
             }
+
+            // Send the interrupt control_request to the CLI IMMEDIATELY via stdin_tx.
+            // Don't wait for stream_response post-loop — it may take time to break out.
+            if let Some(ref tx) = stdin_tx {
+                let json = InteractiveClient::build_interrupt_json();
+                if let Err(e) = tx.try_send(json) {
+                    warn!(
+                        session_id = %session_id,
+                        "Failed to send interrupt control_request via stdin_tx: {}",
+                        e
+                    );
+                }
+            }
+
+            // Send SIGINT to the CLI's process group to kill child processes
+            // (find, sleep, cargo, etc.) that survive the control_request interrupt.
+            // The CLI process (group leader) handles SIGINT gracefully.
+            // Child processes receive SIGINT and terminate immediately.
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                unsafe {
+                    let pgid = -(pid as i32);
+                    libc::kill(pgid, libc::SIGINT);
+                }
+                info!(
+                    session_id = %session_id,
+                    pid = pid,
+                    "Sent SIGINT to CLI process group"
+                );
+            }
+
             info!(
                 session_id = %session_id,
-                "Interrupt flag set and token cancelled locally"
+                "Interrupt: flag set, token cancelled, control_request sent, SIGINT sent"
             );
         } else {
             debug!(
@@ -6336,6 +6386,7 @@ mod tests {
             model: None,
             sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
             stdin_tx: None,
+            child_pid: None,
             nats_cancel: CancellationToken::new(),
             interrupt_token: CancellationToken::new(),
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
@@ -7220,6 +7271,7 @@ mod tests {
             model: None,
             sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
             stdin_tx: None,
+            child_pid: None,
             nats_cancel: CancellationToken::new(),
             interrupt_token: CancellationToken::new(),
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
