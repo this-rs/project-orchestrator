@@ -4489,7 +4489,7 @@ mod tests {
             auto_update_app: true,
             jwt_secret: None,
             server_port: 8080,
-            session_token_expiry_secs: 14400,
+            session_token_expiry_secs: 86400,
         }
     }
 

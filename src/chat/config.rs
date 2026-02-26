@@ -186,7 +186,7 @@ pub struct ChatConfig {
     pub jwt_secret: Option<String>,
     /// Server port for PO_SERVER_URL derivation (always 127.0.0.1:{port}).
     pub server_port: u16,
-    /// Expiration duration for MCP session tokens in seconds (default: 4h = 14400s).
+    /// Expiration duration for MCP session tokens in seconds (default: 24h = 86400s).
     pub session_token_expiry_secs: u64,
 }
 
@@ -269,7 +269,7 @@ impl ChatConfig {
             session_token_expiry_secs: std::env::var("CHAT_SESSION_TOKEN_EXPIRY_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(14400), // 4 hours
+                .unwrap_or(86400), // 24 hours
         }
     }
 
@@ -353,7 +353,7 @@ mod tests {
             auto_update_app: true,
             jwt_secret: None,
             server_port: 8080,
-            session_token_expiry_secs: 14400,
+            session_token_expiry_secs: 86400,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -510,7 +510,7 @@ mod tests {
             auto_update_app: true,
             jwt_secret: None,
             server_port: 8080,
-            session_token_expiry_secs: 14400,
+            session_token_expiry_secs: 86400,
         };
 
         let json = config.mcp_server_config();
@@ -545,7 +545,7 @@ mod tests {
             auto_update_app: true,
             jwt_secret: None,
             server_port: 8080,
-            session_token_expiry_secs: 14400,
+            session_token_expiry_secs: 86400,
         };
 
         let json = config.mcp_server_config();

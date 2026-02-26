@@ -198,14 +198,14 @@ mod tests {
             exp: chrono::Utc::now().timestamp() + 900, // original 15min token
         };
 
-        let token = generate_session_token(&original, TEST_SECRET, 14400).expect("should succeed");
+        let token = generate_session_token(&original, TEST_SECRET, 86400).expect("should succeed");
         let decoded = decode_jwt(&token, TEST_SECRET).expect("should decode");
 
         assert_eq!(decoded.sub, original.sub);
         assert_eq!(decoded.email, original.email);
         assert_eq!(decoded.name, original.name);
-        // Session token should have 4h expiry, not the original 15min
-        assert_eq!(decoded.exp - decoded.iat, 14400);
+        // Session token should have 24h expiry, not the original 15min
+        assert_eq!(decoded.exp - decoded.iat, 86400);
     }
 
     #[test]
