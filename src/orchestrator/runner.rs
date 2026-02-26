@@ -2927,6 +2927,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         &ctx.c_include_paths,
                         &ctx.suffix_index,
                     ),
+                    "csharp" => Self::resolve_csharp_import_indexed(
+                        &import.path,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3327,6 +3331,83 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // 3. Direct suffix lookup (handles flat includes like "utils.h")
         if let Some(resolved) = index.get(path) {
             return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve C# using directive to project files.
+    ///
+    /// Handles three patterns:
+    /// - `using Namespace.Sub;` → search Namespace/Sub/ directory for .cs files
+    /// - `using static Namespace.Class;` → resolve Class.cs
+    /// - `using Alias = Namespace.Type;` → resolve the aliased type
+    ///
+    /// System namespaces (System.*, Microsoft.*) are ignored.
+    fn resolve_csharp_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore system namespaces
+        if path.starts_with("System")
+            || path.starts_with("Microsoft")
+            || path.starts_with("global::")
+        {
+            return Vec::new();
+        }
+
+        // Handle "static Namespace.Class" or "static Namespace.Class.Member"
+        if path.starts_with("static ") {
+            let static_path = path.strip_prefix("static ").unwrap_or(path).trim();
+            let parts: Vec<&str> = static_path.split('.').collect();
+            if parts.len() >= 2 {
+                // Strip last segment (member name), resolve class file
+                let class_parts = &parts[..parts.len() - 1];
+                let suffix = format!("{}.cs", class_parts.join("/"));
+                if let Some(resolved) = index.get(&suffix) {
+                    return vec![resolved.to_string()];
+                }
+                // Try: last part is the class itself
+                let suffix = format!("{}.cs", parts.join("/"));
+                if let Some(resolved) = index.get(&suffix) {
+                    return vec![resolved.to_string()];
+                }
+            }
+            return Vec::new();
+        }
+
+        // Handle "Alias = Namespace.Type"
+        if let Some(eq_pos) = path.find('=') {
+            let type_path = path[eq_pos + 1..].trim();
+            if type_path.starts_with("System") || type_path.starts_with("Microsoft") {
+                return Vec::new();
+            }
+            let suffix = format!("{}.cs", type_path.replace('.', "/"));
+            if let Some(resolved) = index.get(&suffix) {
+                return vec![resolved.to_string()];
+            }
+            return Vec::new();
+        }
+
+        // Standard using: namespace→directory, try as class file first, then directory
+        let parts: Vec<&str> = path.split('.').collect();
+
+        // Try as direct class file: Namespace.Sub.Class → Namespace/Sub/Class.cs
+        let suffix = format!("{}.cs", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        // Try as directory (namespace import): get all .cs files in dir
+        let dir = parts.join("/");
+        let dir_files = index.get_files_in_dir(&dir, "cs");
+        if !dir_files.is_empty() {
+            return dir_files.into_iter().map(|f| f.to_string()).collect();
         }
 
         Vec::new()
@@ -7153,6 +7234,83 @@ mod tests {
             &index,
         );
         assert_eq!(result, vec!["vendor/lib/common.h"]);
+    }
+
+    // ── C# resolver tests ────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_csharp_using_standard() {
+        let paths = vec![
+            "Models/User.cs".to_string(),
+            "Models/Product.cs".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // using Models; → directory lookup
+        let result = Orchestrator::resolve_csharp_import_indexed("Models", &index);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"Models/User.cs".to_string()));
+        assert!(result.contains(&"Models/Product.cs".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_csharp_using_class() {
+        let paths = vec!["Services/Auth/TokenService.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // using Services.Auth.TokenService; → direct class file
+        let result = Orchestrator::resolve_csharp_import_indexed(
+            "Services.Auth.TokenService",
+            &index,
+        );
+        assert_eq!(result, vec!["Services/Auth/TokenService.cs"]);
+    }
+
+    #[test]
+    fn test_resolve_csharp_using_static() {
+        let paths = vec!["Utils/MathHelper.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // using static Utils.MathHelper.PI → strip member, resolve class
+        let result = Orchestrator::resolve_csharp_import_indexed(
+            "static Utils.MathHelper.PI",
+            &index,
+        );
+        assert_eq!(result, vec!["Utils/MathHelper.cs"]);
+    }
+
+    #[test]
+    fn test_resolve_csharp_using_alias() {
+        let paths = vec!["Data/Repositories/UserRepo.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // using Repo = Data.Repositories.UserRepo; → resolve aliased type
+        let result = Orchestrator::resolve_csharp_import_indexed(
+            "Repo = Data.Repositories.UserRepo",
+            &index,
+        );
+        assert_eq!(result, vec!["Data/Repositories/UserRepo.cs"]);
+    }
+
+    #[test]
+    fn test_resolve_csharp_system_namespace_ignored() {
+        let paths = vec!["System/Console.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_csharp_import_indexed("System.Collections.Generic", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_csharp_import_indexed("Microsoft.Extensions.DependencyInjection", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_csharp_nonexistent() {
+        let paths = vec!["Models/User.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_csharp_import_indexed("Missing.Namespace", &index);
+        assert!(result.is_empty());
     }
 
     #[test]

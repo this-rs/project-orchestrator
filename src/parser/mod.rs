@@ -30,6 +30,7 @@ pub enum SupportedLanguage {
     Kotlin,
     Swift,
     Bash,
+    CSharp,
 }
 
 impl SupportedLanguage {
@@ -49,6 +50,7 @@ impl SupportedLanguage {
             "kt" | "kts" => Some(Self::Kotlin),
             "swift" => Some(Self::Swift),
             "sh" | "bash" | "zsh" => Some(Self::Bash),
+            "cs" => Some(Self::CSharp),
             _ => None,
         }
     }
@@ -68,6 +70,7 @@ impl SupportedLanguage {
             Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
             Self::Swift => tree_sitter_swift::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         }
     }
 
@@ -86,6 +89,7 @@ impl SupportedLanguage {
             Self::Kotlin => "kotlin",
             Self::Swift => "swift",
             Self::Bash => "bash",
+            Self::CSharp => "csharp",
         }
     }
 
@@ -104,6 +108,7 @@ impl SupportedLanguage {
             Self::Kotlin,
             Self::Swift,
             Self::Bash,
+            Self::CSharp,
         ]
     }
 }
@@ -207,6 +212,9 @@ impl CodeParser {
             }
             SupportedLanguage::Bash => {
                 languages::bash::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::CSharp => {
+                languages::csharp::extract(&root, content, &path_str, &mut parsed)?;
             }
         }
 
@@ -550,12 +558,13 @@ mod tests {
         assert_eq!(SupportedLanguage::Kotlin.as_str(), "kotlin");
         assert_eq!(SupportedLanguage::Swift.as_str(), "swift");
         assert_eq!(SupportedLanguage::Bash.as_str(), "bash");
+        assert_eq!(SupportedLanguage::CSharp.as_str(), "csharp");
     }
 
     #[test]
     fn test_all_returns_12_languages() {
         let all = SupportedLanguage::all();
-        assert_eq!(all.len(), 12);
+        assert_eq!(all.len(), 13);
     }
 
     #[test]
@@ -573,6 +582,7 @@ mod tests {
         assert!(all.contains(&SupportedLanguage::Kotlin));
         assert!(all.contains(&SupportedLanguage::Swift));
         assert!(all.contains(&SupportedLanguage::Bash));
+        assert!(all.contains(&SupportedLanguage::CSharp));
     }
 
     // =========================================================================
@@ -762,6 +772,79 @@ public class Standalone {
         let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
         assert!(standalone.parent_class.is_none());
         assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_csharp_class_and_interface() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+using System;
+using Models.Data;
+
+namespace MyApp.Services
+{
+    public interface IUserService
+    {
+        User GetUser(int id);
+    }
+
+    public class UserService : BaseService, IUserService, IDisposable
+    {
+        public User GetUser(int id)
+        {
+            return new User();
+        }
+
+        private void Cleanup() { }
+    }
+
+    public enum UserRole
+    {
+        Admin,
+        User,
+        Guest
+    }
+
+    public struct Point
+    {
+        public int X;
+        public int Y;
+    }
+}
+"#;
+        let path = PathBuf::from("UserService.cs");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.language, "csharp");
+
+        // Imports
+        assert!(parsed.imports.len() >= 2, "expected at least 2 using directives, got {}", parsed.imports.len());
+
+        // Interface
+        let iface = parsed.traits.iter().find(|t| t.name == "IUserService");
+        assert!(iface.is_some(), "IUserService interface not found");
+
+        // Class with inheritance
+        let svc = parsed.structs.iter().find(|s| s.name == "UserService");
+        assert!(svc.is_some(), "UserService class not found");
+        let svc = svc.unwrap();
+        assert_eq!(svc.parent_class.as_deref(), Some("BaseService"));
+        assert!(svc.interfaces.contains(&"IUserService".to_string()));
+        assert!(svc.interfaces.contains(&"IDisposable".to_string()));
+
+        // Methods
+        assert!(parsed.functions.iter().any(|f| f.name == "GetUser"), "GetUser method not found");
+        assert!(parsed.functions.iter().any(|f| f.name == "Cleanup"), "Cleanup method not found");
+
+        // Enum
+        let e = parsed.enums.iter().find(|e| e.name == "UserRole");
+        assert!(e.is_some(), "UserRole enum not found");
+        let e = e.unwrap();
+        assert_eq!(e.variants.len(), 3);
+
+        // Struct
+        let point = parsed.structs.iter().find(|s| s.name == "Point");
+        assert!(point.is_some(), "Point struct not found");
     }
 
     #[test]
