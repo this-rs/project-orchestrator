@@ -1267,40 +1267,20 @@ pub async fn create_commit(
                 tracing::warn!("Failed to update last_synced: {}", e);
             }
             orch2.analytics_debouncer().trigger(pid);
+            orch2.co_change_debouncer().trigger(pid);
         });
 
-        // Side-effect 3: Hebbian energy boost on notes linked to committed files
-        let ar_config = orchestrator.auto_reinforcement_config().clone();
-        if ar_config.enabled && !paths_for_boost.is_empty() {
-            let neo4j = orchestrator.neo4j_arc();
-            tokio::spawn(async move {
-                for file_path in &paths_for_boost {
-                    match neo4j
-                        .get_notes_for_entity(&crate::notes::EntityType::File, file_path)
-                        .await
-                    {
-                        Ok(notes) => {
-                            for note in &notes {
-                                if let Err(e) = neo4j
-                                    .boost_energy(note.id, ar_config.commit_energy_boost)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        note_id = %note.id, error = %e,
-                                        "Auto-reinforce commit: energy boost failed"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                file = %file_path, error = %e,
-                                "Auto-reinforce commit: get_entity_notes failed"
-                            );
-                        }
-                    }
-                }
-            });
+        // Side-effect 3: Debounced Hebbian energy boost + synapse reinforcement.
+        // Instead of inline processing, delegate to the NeuralReinforcementDebouncer
+        // which batches file paths across rapid-fire commits (e.g., during git
+        // checkout/rebase) and performs a single pass after a 5s quiet period.
+        if orchestrator.auto_reinforcement_config().enabled && !paths_for_boost.is_empty() {
+            orchestrator
+                .neural_reinforcement_debouncer()
+                .trigger(crate::graph::ReinforcementPayload {
+                    project_id: pid,
+                    file_paths: paths_for_boost,
+                });
         }
     }
 
@@ -1395,6 +1375,70 @@ pub async fn get_file_history(
         .get_file_history(&query.path, query.limit)
         .await?;
     Ok(Json(history))
+}
+
+/// Query parameters for co-change graph
+#[derive(Deserialize)]
+pub struct CoChangeGraphQuery {
+    pub min_count: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+/// Get the co-change graph for a project
+pub async fn get_co_change_graph(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+    Query(query): Query<CoChangeGraphQuery>,
+) -> Result<Json<Vec<crate::neo4j::models::CoChangePair>>, AppError> {
+    let pairs = state
+        .orchestrator
+        .neo4j()
+        .get_co_change_graph(project_id, query.min_count.unwrap_or(3), query.limit.unwrap_or(100))
+        .await?;
+    Ok(Json(pairs))
+}
+
+/// Query parameters for file co-changers
+#[derive(Deserialize)]
+pub struct FileCoChangersQuery {
+    pub path: String,
+    pub min_count: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+/// Get files that co-change with a given file
+pub async fn get_file_co_changers(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<FileCoChangersQuery>,
+) -> Result<Json<Vec<crate::neo4j::models::CoChanger>>, AppError> {
+    let changers = state
+        .orchestrator
+        .neo4j()
+        .get_file_co_changers(&query.path, query.min_count.unwrap_or(3), query.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(changers))
+}
+
+/// Backfill TOUCHES relations from git history for a project
+pub async fn backfill_commit_touches(
+    State(state): State<OrchestratorState>,
+    Path(project_slug): Path<String>,
+) -> Result<Json<crate::orchestrator::BackfillResult>, AppError> {
+    // Resolve project
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_slug)))?;
+
+    let root_path = std::path::PathBuf::from(&project.root_path);
+    let result = state
+        .orchestrator
+        .backfill_commit_touches(project.id, &root_path)
+        .await?;
+
+    Ok(Json(result))
 }
 
 // ============================================================================

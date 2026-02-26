@@ -466,6 +466,23 @@ pub struct FileHistoryEntry {
     pub deletions: Option<i64>,
 }
 
+/// A pair of files that co-change (returned by get_co_change_graph)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoChangePair {
+    pub file_a: String,
+    pub file_b: String,
+    pub count: i64,
+    pub last_at: Option<String>,
+}
+
+/// A file that co-changes with a given file (returned by get_file_co_changers)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoChanger {
+    pub path: String,
+    pub count: i64,
+    pub last_at: Option<String>,
+}
+
 /// Deserializes a list of file changes that can be either strings or objects.
 /// This allows backward-compatible API: `["a.rs", "b.rs"]` or `[{"path": "a.rs", "additions": 10}]`
 pub fn deserialize_files_changed<'de, D>(

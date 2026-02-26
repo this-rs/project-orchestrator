@@ -1685,7 +1685,6 @@ mod tests {
                     last_synced: None,
                     analytics_computed_at: None,
                     last_co_change_computed_at: None,
-                last_co_change_computed_at: None,
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -1697,7 +1696,6 @@ mod tests {
                     last_synced: None,
                     analytics_computed_at: None,
                     last_co_change_computed_at: None,
-                last_co_change_computed_at: None,
                 },
             ],
             ..Default::default()
@@ -1748,7 +1746,6 @@ mod tests {
                     last_synced: None,
                     analytics_computed_at: None,
                     last_co_change_computed_at: None,
-                last_co_change_computed_at: None,
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -1760,7 +1757,6 @@ mod tests {
                     last_synced: None,
                     analytics_computed_at: None,
                     last_co_change_computed_at: None,
-                last_co_change_computed_at: None,
                 },
             ],
             ..Default::default()

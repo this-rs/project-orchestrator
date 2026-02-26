@@ -4,7 +4,10 @@ use crate::embeddings::{EmbeddingProvider, FastEmbedProvider, HttpEmbeddingProvi
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
-use crate::graph::{AnalyticsConfig, AnalyticsDebouncer, AnalyticsEngine, GraphAnalyticsEngine};
+use crate::graph::{
+    AnalyticsConfig, AnalyticsDebouncer, CoChangeDebouncer, NeuralReinforcementDebouncer,
+    AnalyticsEngine, GraphAnalyticsEngine,
+};
 use crate::neo4j::models::*;
 use crate::neurons::{AutoReinforcementConfig, SpreadingActivationEngine};
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
@@ -128,6 +131,8 @@ pub struct Orchestrator {
     planner: Arc<super::ImplementationPlanner>,
     analytics: Arc<dyn AnalyticsEngine>,
     analytics_debouncer: AnalyticsDebouncer,
+    co_change_debouncer: CoChangeDebouncer,
+    neural_reinforcement_debouncer: NeuralReinforcementDebouncer,
     activation_engine: Option<Arc<SpreadingActivationEngine>>,
     auto_reinforcement: AutoReinforcementConfig,
     event_bus: Option<Arc<HybridEmitter>>,
@@ -289,6 +294,13 @@ impl Orchestrator {
             2000,
             Some(state.neo4j.clone()),
         );
+        let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
+        let ar_config = AutoReinforcementConfig::default();
+        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
+            state.neo4j.clone(),
+            ar_config.clone(),
+            5_000,
+        );
 
         Ok(Self {
             state,
@@ -300,8 +312,10 @@ impl Orchestrator {
             planner,
             analytics,
             analytics_debouncer,
+            co_change_debouncer,
+            neural_reinforcement_debouncer,
             activation_engine,
-            auto_reinforcement: AutoReinforcementConfig::default(),
+            auto_reinforcement: ar_config,
             event_bus: None,
             event_emitter: None,
             embedding_provider: embedding_provider.clone(),
@@ -367,6 +381,13 @@ impl Orchestrator {
             2000,
             Some(state.neo4j.clone()),
         );
+        let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
+        let ar_config = AutoReinforcementConfig::default();
+        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
+            state.neo4j.clone(),
+            ar_config.clone(),
+            5_000,
+        );
 
         Ok(Self {
             state,
@@ -378,8 +399,10 @@ impl Orchestrator {
             planner,
             analytics,
             analytics_debouncer,
+            co_change_debouncer,
+            neural_reinforcement_debouncer,
             activation_engine,
-            auto_reinforcement: AutoReinforcementConfig::default(),
+            auto_reinforcement: ar_config,
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
@@ -447,6 +470,13 @@ impl Orchestrator {
             2000,
             Some(state.neo4j.clone()),
         );
+        let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
+        let ar_config = AutoReinforcementConfig::default();
+        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
+            state.neo4j.clone(),
+            ar_config.clone(),
+            5_000,
+        );
 
         Ok(Self {
             state,
@@ -458,8 +488,10 @@ impl Orchestrator {
             planner,
             analytics,
             analytics_debouncer,
+            co_change_debouncer,
+            neural_reinforcement_debouncer,
             activation_engine,
-            auto_reinforcement: AutoReinforcementConfig::default(),
+            auto_reinforcement: ar_config,
             event_bus: None,
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
@@ -1120,6 +1152,19 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         &self.analytics_debouncer
     }
 
+    /// Get the CO_CHANGED debouncer (for co-change computation triggers)
+    pub fn co_change_debouncer(&self) -> &CoChangeDebouncer {
+        &self.co_change_debouncer
+    }
+
+    /// Get the neural reinforcement debouncer (for commit Hebbian hooks).
+    ///
+    /// Debounces rapid-fire commits (e.g., during git checkout/rebase) to
+    /// prevent CPU spikes from hundreds of energy boost + synapse calls.
+    pub fn neural_reinforcement_debouncer(&self) -> &NeuralReinforcementDebouncer {
+        &self.neural_reinforcement_debouncer
+    }
+
     /// Get the spreading activation engine (if embedding provider is available).
     ///
     /// Returns `None` when `EMBEDDING_PROVIDER=disabled` or initialization failed.
@@ -1164,6 +1209,187 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         );
 
         Ok(count)
+    }
+
+    /// Backfill TOUCHES relations from git history for a project.
+    ///
+    /// Parses `git log --name-only` and creates TOUCHES relations for each commit.
+    /// Idempotent: commits that already have TOUCHES relations are skipped.
+    /// After backfilling, triggers a full CO_CHANGED computation.
+    pub async fn backfill_commit_touches(
+        &self,
+        project_id: uuid::Uuid,
+        root_path: &Path,
+    ) -> Result<BackfillResult> {
+        let start = std::time::Instant::now();
+
+        // Step 1: Parse git log
+        let git_commits = Self::git_log_touched_files(root_path, 1000)?;
+        let total_from_git = git_commits.len();
+
+        if git_commits.is_empty() {
+            return Ok(BackfillResult {
+                commits_parsed: 0,
+                commits_backfilled: 0,
+                touches_created: 0,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        // Step 2: Create Commit nodes + TOUCHES relations in batches
+        let mut commits_backfilled = 0u64;
+        let mut touches_created = 0u64;
+        let neo4j = self.neo4j();
+
+        for chunk in git_commits.chunks(100) {
+            for gc in chunk {
+                // Create commit node (MERGE = idempotent)
+                let commit = CommitNode {
+                    hash: gc.hash.clone(),
+                    message: gc.message.clone(),
+                    author: gc.author.clone(),
+                    timestamp: gc.timestamp,
+                };
+                neo4j.create_commit(&commit).await?;
+
+                // Create TOUCHES (MERGE = idempotent)
+                if !gc.files.is_empty() {
+                    let file_infos: Vec<crate::neo4j::models::FileChangedInfo> = gc
+                        .files
+                        .iter()
+                        .map(|f| crate::neo4j::models::FileChangedInfo::from(f.as_str()))
+                        .collect();
+                    neo4j
+                        .create_commit_touches(&gc.hash, &file_infos)
+                        .await?;
+                    touches_created += gc.files.len() as u64;
+                }
+                commits_backfilled += 1;
+            }
+        }
+
+        // Step 3: Trigger full CO_CHANGED computation (since=None for full recompute)
+        if let Err(e) = neo4j.compute_co_changed(project_id, None, 3, 500).await {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "CO_CHANGED computation after backfill failed"
+            );
+        }
+
+        let result = BackfillResult {
+            commits_parsed: total_from_git as u64,
+            commits_backfilled,
+            touches_created,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        };
+
+        tracing::info!(
+            project_id = %project_id,
+            commits_parsed = result.commits_parsed,
+            commits_backfilled = result.commits_backfilled,
+            touches_created = result.touches_created,
+            elapsed_ms = result.elapsed_ms,
+            "Backfill TOUCHES complete"
+        );
+
+        Ok(result)
+    }
+
+    /// Parse git log to extract commits and their touched files.
+    ///
+    /// Uses `git log --name-only --format=...` for efficient parsing.
+    /// Limited to `max_commits` most recent commits.
+    fn git_log_touched_files(
+        root_path: &Path,
+        max_commits: usize,
+    ) -> Result<Vec<GitCommitFiles>> {
+        use std::process::Command;
+
+        let output = Command::new("git")
+            .args([
+                "log",
+                "--name-only",
+                &format!("--max-count={}", max_commits),
+                "--format=COMMIT_START%n%H%n%s%n%an%n%aI",
+            ])
+            .current_dir(root_path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "git log failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut commits = Vec::new();
+        let mut current: Option<GitCommitFiles> = None;
+
+        for line in stdout.lines() {
+            if line == "COMMIT_START" {
+                if let Some(c) = current.take() {
+                    commits.push(c);
+                }
+                // Next 4 lines: hash, subject, author, date
+                continue;
+            }
+
+            if let Some(ref mut c) = current {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    c.files.push(trimmed.to_string());
+                }
+            } else {
+                // We're reading commit metadata lines
+                // After COMMIT_START: hash, subject, author, date (4 lines)
+                // We need to accumulate them
+            }
+        }
+        if let Some(c) = current.take() {
+            commits.push(c);
+        }
+
+        // Re-parse with a cleaner state machine
+        commits.clear();
+        let mut lines = stdout.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line == "COMMIT_START" {
+                let hash = lines.next().unwrap_or("").to_string();
+                let message = lines.next().unwrap_or("").to_string();
+                let author = lines.next().unwrap_or("").to_string();
+                let date_str = lines.next().unwrap_or("");
+                let timestamp = chrono::DateTime::parse_from_rfc3339(date_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+
+                let mut files = Vec::new();
+                // Read file lines until next COMMIT_START or EOF
+                while let Some(next) = lines.peek() {
+                    if *next == "COMMIT_START" || next.is_empty() {
+                        if next.is_empty() {
+                            lines.next(); // skip empty line
+                            continue;
+                        }
+                        break;
+                    }
+                    files.push(lines.next().unwrap().to_string());
+                }
+
+                if !hash.is_empty() {
+                    commits.push(GitCommitFiles {
+                        hash,
+                        message,
+                        author,
+                        timestamp,
+                        files,
+                    });
+                }
+            }
+        }
+
+        Ok(commits)
     }
 
     // ========================================================================
@@ -3211,6 +3437,25 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         );
         Ok(())
     }
+}
+
+/// Result of backfilling TOUCHES relations from git history
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackfillResult {
+    pub commits_parsed: u64,
+    pub commits_backfilled: u64,
+    pub touches_created: u64,
+    pub elapsed_ms: u64,
+}
+
+/// A commit with its touched files (parsed from git log)
+#[derive(Debug, Clone)]
+pub struct GitCommitFiles {
+    pub hash: String,
+    pub message: String,
+    pub author: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub files: Vec<String>,
 }
 
 /// Result of a sync operation

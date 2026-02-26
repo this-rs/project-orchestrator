@@ -368,6 +368,86 @@ impl Neo4jClient {
         Ok(total)
     }
 
+    // ========================================================================
+    // CO_CHANGED query operations
+    // ========================================================================
+
+    /// Get the co-change graph for a project: all CO_CHANGED pairs sorted by count desc.
+    pub async fn get_co_change_graph(
+        &self,
+        project_id: Uuid,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<CoChangePair>> {
+        let q = query(
+            r#"
+            MATCH (f1:File)-[r:CO_CHANGED]-(f2:File)
+            WHERE r.project_id = $project_id
+              AND r.count >= $min_count
+              AND f1.path < f2.path
+            RETURN f1.path AS file_a,
+                   f2.path AS file_b,
+                   r.count AS count,
+                   toString(r.last_at) AS last_at
+            ORDER BY r.count DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("min_count", min_count)
+        .param("limit", limit);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut pairs = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            pairs.push(CoChangePair {
+                file_a: row.get("file_a")?,
+                file_b: row.get("file_b")?,
+                count: row.get("count")?,
+                last_at: row.get::<String>("last_at").ok(),
+            });
+        }
+
+        Ok(pairs)
+    }
+
+    /// Get files that co-change with a given file (bidirectional).
+    pub async fn get_file_co_changers(
+        &self,
+        file_path: &str,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<CoChanger>> {
+        let q = query(
+            r#"
+            MATCH (f1:File {path: $path})-[r:CO_CHANGED]-(f2:File)
+            WHERE r.count >= $min_count
+            RETURN f2.path AS path,
+                   r.count AS count,
+                   toString(r.last_at) AS last_at
+            ORDER BY r.count DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("path", file_path)
+        .param("min_count", min_count)
+        .param("limit", limit);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut changers = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            changers.push(CoChanger {
+                path: row.get("path")?,
+                count: row.get("count")?,
+                last_at: row.get::<String>("last_at").ok(),
+            });
+        }
+
+        Ok(changers)
+    }
+
     /// Delete a commit
     pub async fn delete_commit(&self, hash: &str) -> Result<()> {
         let q = query(

@@ -388,6 +388,17 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(handlers::get_commit_files),
         )
         .route("/api/files/history", get(handlers::get_file_history))
+        // CO_CHANGED — File coupling queries
+        .route(
+            "/api/projects/{project_id}/co-changes",
+            get(handlers::get_co_change_graph),
+        )
+        .route("/api/files/co-changers", get(handlers::get_file_co_changers))
+        // Backfill TOUCHES from git history
+        .route(
+            "/api/projects/{project_slug}/backfill-touches",
+            post(handlers::backfill_commit_touches),
+        )
         // Webhooks (protected — /api prefix)
         .route("/api/wake", post(handlers::wake))
         // ================================================================

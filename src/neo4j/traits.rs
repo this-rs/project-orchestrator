@@ -863,6 +863,22 @@ pub trait GraphStore: Send + Sync {
     /// Update project last_co_change_computed_at timestamp
     async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()>;
 
+    /// Get the co-change graph for a project
+    async fn get_co_change_graph(
+        &self,
+        project_id: Uuid,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<CoChangePair>>;
+
+    /// Get files that co-change with a given file
+    async fn get_file_co_changers(
+        &self,
+        file_path: &str,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<CoChanger>>;
+
     // ========================================================================
     // Release operations
     // ========================================================================

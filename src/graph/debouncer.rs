@@ -147,6 +147,286 @@ impl AnalyticsDebouncer {
     }
 }
 
+// ============================================================================
+// CoChangeDebouncer — debounced CO_CHANGED recomputation
+// ============================================================================
+
+/// Debounced CO_CHANGED computation trigger.
+///
+/// Same pattern as `AnalyticsDebouncer` but with a longer debounce period (30s default)
+/// and calls `compute_co_changed` instead of `analyze_project`.
+///
+/// ## Usage
+///
+/// ```ignore
+/// let debouncer = CoChangeDebouncer::new(graph_store, 30_000);
+/// debouncer.trigger(project_id); // non-blocking
+/// ```
+pub struct CoChangeDebouncer {
+    trigger_tx: mpsc::Sender<Uuid>,
+}
+
+impl CoChangeDebouncer {
+    /// Create a new CO_CHANGED debouncer.
+    ///
+    /// `debounce_ms` is the quiet period before triggering computation (default: 30_000ms).
+    pub fn new(graph_store: Arc<dyn GraphStore>, debounce_ms: u64) -> Self {
+        let (tx, rx) = mpsc::channel::<Uuid>(64);
+        tokio::spawn(Self::run_loop(graph_store, rx, debounce_ms));
+        Self { trigger_tx: tx }
+    }
+
+    /// Trigger a CO_CHANGED recomputation for the given project.
+    ///
+    /// Non-blocking: returns immediately. If the channel is full, the trigger
+    /// is silently dropped (a pending trigger will still fire).
+    pub fn trigger(&self, project_id: Uuid) {
+        let _ = self.trigger_tx.try_send(project_id);
+    }
+
+    /// Background loop: debounce triggers and compute CO_CHANGED.
+    async fn run_loop(
+        graph_store: Arc<dyn GraphStore>,
+        mut rx: mpsc::Receiver<Uuid>,
+        debounce_ms: u64,
+    ) {
+        let debounce = Duration::from_millis(debounce_ms);
+
+        loop {
+            // Wait for the first trigger
+            let pid = match rx.recv().await {
+                Some(pid) => pid,
+                None => break, // channel closed
+            };
+
+            // Collect all unique project IDs during debounce window
+            let mut pending_projects = HashSet::new();
+            pending_projects.insert(pid);
+
+            // Debounce: keep consuming triggers until quiet period
+            loop {
+                match tokio::time::timeout(debounce, rx.recv()).await {
+                    Ok(Some(pid)) => {
+                        pending_projects.insert(pid);
+                    }
+                    Ok(None) => return, // channel closed
+                    Err(_) => break,    // timeout = quiet period elapsed
+                }
+            }
+
+            // Process each project sequentially
+            if pending_projects.len() > 1 {
+                tracing::info!(
+                    "Debounced CO_CHANGED: processing {} projects sequentially",
+                    pending_projects.len()
+                );
+            }
+
+            for project_id in &pending_projects {
+                let start = std::time::Instant::now();
+
+                // Read last_co_change_computed_at for incremental computation
+                let since = graph_store
+                    .get_project(*project_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.last_co_change_computed_at);
+
+                match graph_store
+                    .compute_co_changed(*project_id, since, 3, 500)
+                    .await
+                {
+                    Ok(count) => {
+                        tracing::info!(
+                            "Debounced CO_CHANGED computed for project {} in {:?} ({} relations)",
+                            project_id,
+                            start.elapsed(),
+                            count,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Debounced CO_CHANGED failed for project {}: {}",
+                            project_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// NeuralReinforcementDebouncer — debounced Hebbian reinforcement on commits
+// ============================================================================
+
+/// Payload for a neural reinforcement trigger.
+/// Groups file paths by project so we can batch energy boosts and synapse
+/// reinforcement across rapid-fire commits.
+#[derive(Debug, Clone)]
+pub struct ReinforcementPayload {
+    pub project_id: Uuid,
+    pub file_paths: Vec<String>,
+}
+
+/// Debounced neural reinforcement trigger for commit hooks.
+///
+/// Prevents CPU spikes during git checkout / rebase storms where hundreds of
+/// commits arrive in rapid succession. Collects all file paths from multiple
+/// commits during the debounce window, deduplicates them, then performs a
+/// single batch of energy boosts + synapse reinforcement.
+///
+/// ## Design
+///
+/// - **Debounce**: 5s quiet period (configurable) before processing
+/// - **Dedup**: file paths are deduplicated within the window (per project)
+/// - **Batch**: single `get_notes_for_entity` + `boost_energy` + `reinforce_synapses`
+///   pass instead of per-commit processing
+///
+/// ## Usage
+///
+/// ```ignore
+/// let debouncer = NeuralReinforcementDebouncer::new(graph_store, config, 5_000);
+/// debouncer.trigger(ReinforcementPayload {
+///     project_id: pid,
+///     file_paths: vec!["src/main.rs".into()],
+/// });
+/// ```
+pub struct NeuralReinforcementDebouncer {
+    trigger_tx: mpsc::Sender<ReinforcementPayload>,
+}
+
+impl NeuralReinforcementDebouncer {
+    /// Create a new neural reinforcement debouncer.
+    ///
+    /// `debounce_ms` is the quiet period before processing (default: 5_000ms).
+    pub fn new(
+        graph_store: Arc<dyn GraphStore>,
+        config: crate::neurons::AutoReinforcementConfig,
+        debounce_ms: u64,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<ReinforcementPayload>(128);
+        tokio::spawn(Self::run_loop(graph_store, config, rx, debounce_ms));
+        Self { trigger_tx: tx }
+    }
+
+    /// Trigger a neural reinforcement for files touched by a commit.
+    ///
+    /// Non-blocking: returns immediately. If the channel is full, the trigger
+    /// is silently dropped (a pending trigger will still fire).
+    pub fn trigger(&self, payload: ReinforcementPayload) {
+        let _ = self.trigger_tx.try_send(payload);
+    }
+
+    /// Background loop: debounce triggers and perform batch reinforcement.
+    async fn run_loop(
+        graph_store: Arc<dyn GraphStore>,
+        config: crate::neurons::AutoReinforcementConfig,
+        mut rx: mpsc::Receiver<ReinforcementPayload>,
+        debounce_ms: u64,
+    ) {
+        let debounce = Duration::from_millis(debounce_ms);
+
+        loop {
+            // Wait for the first trigger
+            let payload = match rx.recv().await {
+                Some(p) => p,
+                None => break, // channel closed
+            };
+
+            // Collect all payloads during debounce window, grouped by project
+            let mut pending: std::collections::HashMap<Uuid, HashSet<String>> =
+                std::collections::HashMap::new();
+            pending
+                .entry(payload.project_id)
+                .or_default()
+                .extend(payload.file_paths);
+
+            // Debounce: keep consuming triggers until quiet period
+            loop {
+                match tokio::time::timeout(debounce, rx.recv()).await {
+                    Ok(Some(p)) => {
+                        pending.entry(p.project_id).or_default().extend(p.file_paths);
+                    }
+                    Ok(None) => return, // channel closed
+                    Err(_) => break,    // timeout = quiet period elapsed
+                }
+            }
+
+            // Process each project's accumulated file paths
+            for (project_id, file_paths) in &pending {
+                let total_files = file_paths.len();
+                let mut all_note_ids: Vec<Uuid> = Vec::new();
+                let mut boost_count = 0u64;
+
+                for file_path in file_paths {
+                    match graph_store
+                        .get_notes_for_entity(
+                            &crate::notes::EntityType::File,
+                            file_path,
+                        )
+                        .await
+                    {
+                        Ok(notes) => {
+                            for note in &notes {
+                                if let Err(e) = graph_store
+                                    .boost_energy(note.id, config.commit_energy_boost)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        note_id = %note.id, error = %e,
+                                        "Neural reinforcement debouncer: energy boost failed"
+                                    );
+                                } else {
+                                    boost_count += 1;
+                                }
+                                all_note_ids.push(note.id);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                file = %file_path, error = %e,
+                                "Neural reinforcement debouncer: get_entity_notes failed"
+                            );
+                        }
+                    }
+                }
+
+                // Hebbian synapse reinforcement
+                let mut synapse_count = 0usize;
+                if all_note_ids.len() >= 2 {
+                    all_note_ids.sort();
+                    all_note_ids.dedup();
+                    if all_note_ids.len() >= 2 {
+                        match graph_store
+                            .reinforce_synapses(&all_note_ids, config.commit_synapse_boost)
+                            .await
+                        {
+                            Ok(count) => synapse_count = count,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Neural reinforcement debouncer: synapse reinforcement failed"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                tracing::info!(
+                    project_id = %project_id,
+                    files = total_files,
+                    notes_boosted = boost_count,
+                    synapses_reinforced = synapse_count,
+                    "Neural reinforcement debouncer: batch complete"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

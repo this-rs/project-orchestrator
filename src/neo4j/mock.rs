@@ -3529,6 +3529,24 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn get_co_change_graph(
+        &self,
+        _project_id: Uuid,
+        _min_count: i64,
+        _limit: i64,
+    ) -> Result<Vec<CoChangePair>> {
+        Ok(vec![])
+    }
+
+    async fn get_file_co_changers(
+        &self,
+        _file_path: &str,
+        _min_count: i64,
+        _limit: i64,
+    ) -> Result<Vec<CoChanger>> {
+        Ok(vec![])
+    }
+
     // ========================================================================
     // Release operations
     // ========================================================================

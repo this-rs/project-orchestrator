@@ -188,6 +188,7 @@ async fn test_workspace_project_association() {
         created_at: chrono::Utc::now(),
         last_synced: None,
         analytics_computed_at: None,
+        last_co_change_computed_at: None,
     };
     state.neo4j.create_project(&project).await.unwrap();
 
@@ -419,6 +420,7 @@ async fn test_resource_project_links() {
         created_at: chrono::Utc::now(),
         last_synced: None,
         analytics_computed_at: None,
+        last_co_change_computed_at: None,
     };
     state.neo4j.create_project(&api_project).await.unwrap();
 
@@ -431,6 +433,7 @@ async fn test_resource_project_links() {
         created_at: chrono::Utc::now(),
         last_synced: None,
         analytics_computed_at: None,
+        last_co_change_computed_at: None,
     };
     state.neo4j.create_project(&frontend_project).await.unwrap();
 
@@ -667,6 +670,7 @@ async fn test_component_project_mapping() {
         created_at: chrono::Utc::now(),
         last_synced: None,
         analytics_computed_at: None,
+        last_co_change_computed_at: None,
     };
     state.neo4j.create_project(&project).await.unwrap();
 
@@ -1052,6 +1056,7 @@ async fn test_multiple_projects_in_workspace() {
             created_at: chrono::Utc::now(),
             last_synced: None,
             analytics_computed_at: None,
+            last_co_change_computed_at: None,
         };
         state.neo4j.create_project(&project).await.unwrap();
         state

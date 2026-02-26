@@ -40,7 +40,9 @@ pub mod writer;
 pub mod mock;
 
 // Re-export primary types for convenience
-pub use debouncer::AnalyticsDebouncer;
+pub use debouncer::{
+    AnalyticsDebouncer, CoChangeDebouncer, NeuralReinforcementDebouncer, ReinforcementPayload,
+};
 pub use engine::{AnalyticsEngine, GraphAnalyticsEngine, ProjectAnalytics};
 pub use models::{
     AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeHealthReport, CodeNode, CodeNodeType,

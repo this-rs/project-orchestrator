@@ -1103,6 +1103,25 @@ impl GraphStore for Neo4jClient {
         self.update_project_co_change_timestamp(id).await
     }
 
+    async fn get_co_change_graph(
+        &self,
+        project_id: Uuid,
+        min_count: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<CoChangePair>> {
+        self.get_co_change_graph(project_id, min_count, limit).await
+    }
+
+    async fn get_file_co_changers(
+        &self,
+        file_path: &str,
+        min_count: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<CoChanger>> {
+        self.get_file_co_changers(file_path, min_count, limit)
+            .await
+    }
+
     // ========================================================================
     // Release operations
     // ========================================================================

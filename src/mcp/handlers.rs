@@ -265,6 +265,8 @@ impl ToolHandler {
             ("code", "get_health") => "get_code_health",
             ("code", "get_node_importance") => "get_node_importance",
             ("code", "plan_implementation") => "plan_implementation",
+            ("code", "get_co_change_graph") => "get_co_change_graph",
+            ("code", "get_file_co_changers") => "get_file_co_changers",
 
             // Admin
             ("admin", "sync_directory") => "sync_directory",
@@ -281,6 +283,7 @@ impl ToolHandler {
             ("admin", "reinforce_neurons") => "reinforce_neurons",
             ("admin", "decay_synapses") => "decay_synapses",
             ("admin", "backfill_synapses") => "backfill_synapses",
+            ("admin", "backfill_touches") => "backfill_touches",
 
             _ => {
                 return Err(anyhow!(
@@ -1597,6 +1600,18 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "backfill_touches" => {
+                let project_slug = extract_string(args, "project_slug")
+                    .or_else(|_| extract_string(args, "slug"))?;
+                let result = http
+                    .post(
+                        &format!("/api/projects/{}/backfill-touches", project_slug),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
             // ── P8: Workspaces (34 tools) ──────────────────────────────────
 
             // --- Workspace CRUD (5) ---
@@ -2468,6 +2483,48 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/code/plan-implementation", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_co_change_graph" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                // Resolve project UUID from slug
+                let project_info = http.get(&format!("/api/projects/{}", project_slug)).await?;
+                let project_id = project_info
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Project not found: {}", project_slug))?;
+                let mut query_params = Vec::new();
+                if let Some(v) = args.get("min_count").and_then(|v| v.as_i64()) {
+                    query_params.push(("min_count".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query_params.push(("limit".to_string(), v.to_string()));
+                }
+                let result = if query_params.is_empty() {
+                    http.get(&format!("/api/projects/{}/co-changes", project_id)).await?
+                } else {
+                    http.get_with_query(
+                        &format!("/api/projects/{}/co-changes", project_id),
+                        &query_params,
+                    )
+                    .await?
+                };
+                Ok(Some(result))
+            }
+
+            "get_file_co_changers" => {
+                let file_path = extract_string(args, "file_path")?;
+                let mut query_params = vec![("path".to_string(), file_path)];
+                if let Some(v) = args.get("min_count").and_then(|v| v.as_i64()) {
+                    query_params.push(("min_count".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query_params.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/files/co-changers", &query_params)
                     .await?;
                 Ok(Some(result))
             }
