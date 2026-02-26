@@ -34,6 +34,7 @@ pub mod debouncer;
 pub mod engine;
 pub mod extraction;
 pub mod models;
+pub mod process;
 pub mod writer;
 
 #[cfg(test)]
