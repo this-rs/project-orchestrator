@@ -974,10 +974,13 @@ impl ToolHandler {
                 let decision_id = extract_id(args, "decision_id")?;
                 let entity_type = extract_string(args, "entity_type")?;
                 let entity_id = extract_string(args, "entity_id")?;
+                // Use query-param variant to safely handle entity_ids with slashes (file paths)
+                let encoded_type = urlencoding::encode(&entity_type);
+                let encoded_id = urlencoding::encode(&entity_id);
                 let result = http
                     .delete(&format!(
-                        "/api/decisions/{}/affects/{}/{}",
-                        decision_id, entity_type, entity_id
+                        "/api/decisions/{}/affects?entity_type={}&entity_id={}",
+                        decision_id, encoded_type, encoded_id
                     ))
                     .await?;
                 Ok(Some(if result.is_null() {

@@ -779,7 +779,11 @@ pub async fn add_decision_affects(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Remove an AFFECTS relation from a decision to an entity
+/// Remove an AFFECTS relation from a decision to an entity.
+///
+/// Supports two URL formats:
+/// - `DELETE /api/decisions/{id}/affects/{entity_type}/{entity_id}` (simple entity_ids)
+/// - `DELETE /api/decisions/{id}/affects?entity_type=File&entity_id=/path/to/file.rs` (paths with slashes)
 pub async fn remove_decision_affects(
     State(state): State<OrchestratorState>,
     Path((decision_id, entity_type, entity_id)): Path<(Uuid, String, String)>,
@@ -788,6 +792,29 @@ pub async fn remove_decision_affects(
         .orchestrator
         .neo4j()
         .remove_decision_affects(decision_id, &entity_type, &entity_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Query params for the query-param variant of remove_decision_affects.
+#[derive(Deserialize)]
+pub struct RemoveAffectsQuery {
+    pub entity_type: String,
+    pub entity_id: String,
+}
+
+/// DELETE /api/decisions/{id}/affects?entity_type=...&entity_id=...
+///
+/// Alternative to the path-based route, for entity_ids that contain slashes (e.g. file paths).
+pub async fn remove_decision_affects_query(
+    State(state): State<OrchestratorState>,
+    Path(decision_id): Path<Uuid>,
+    Query(query): Query<RemoveAffectsQuery>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .remove_decision_affects(decision_id, &query.entity_type, &query.entity_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1367,6 +1394,38 @@ pub async fn create_commit(
 
     let sync_triggered = !files_changed.is_empty() && project_id.is_some();
 
+    // Resolve project to get root_path (for path resolution) and slug (for MeiliSearch).
+    // File nodes in Neo4j use absolute paths, so TOUCHES relations require absolute paths.
+    let project_info = if let Some(pid) = project_id {
+        state
+            .orchestrator
+            .neo4j()
+            .get_project(pid)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let project_root = project_info
+        .as_ref()
+        .map(|p| std::path::PathBuf::from(crate::expand_tilde(&p.root_path)));
+    let project_slug = project_info.as_ref().map(|p| p.slug.clone());
+
+    // Resolve relative paths to absolute using project root_path
+    let files_changed: Vec<crate::neo4j::models::FileChangedInfo> = files_changed
+        .into_iter()
+        .map(|mut f| {
+            if let Some(ref root) = project_root {
+                let p = std::path::Path::new(&f.path);
+                if p.is_relative() {
+                    f.path = root.join(p).to_string_lossy().to_string();
+                }
+            }
+            f
+        })
+        .collect();
+
     // Side-effect: Create TOUCHES relations (Commit→File) — synchronous for consistency
     if !files_changed.is_empty() {
         let commit_hash = commit.hash.clone();
@@ -1389,15 +1448,6 @@ pub async fn create_commit(
         // Extract file paths for sync and boost operations
         let file_paths: Vec<String> = files_changed.iter().map(|f| f.path.clone()).collect();
         let paths_for_boost = file_paths.clone();
-
-        // Resolve project slug for MeiliSearch indexing
-        let project_slug = orchestrator
-            .neo4j()
-            .get_project(pid)
-            .await
-            .ok()
-            .flatten()
-            .map(|p| p.slug);
 
         // Side-effect 1 & 2: Incremental sync + analytics debounce
         let orch2 = orchestrator.clone();
@@ -1590,7 +1640,7 @@ pub async fn backfill_commit_touches(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_slug)))?;
 
-    let root_path = std::path::PathBuf::from(&project.root_path);
+    let root_path = std::path::PathBuf::from(crate::expand_tilde(&project.root_path));
     let result = state
         .orchestrator
         .backfill_commit_touches(project.id, &root_path)
@@ -1756,7 +1806,7 @@ pub async fn bootstrap_knowledge_fabric(
     let mut failed = Vec::new();
 
     // Step 1: Backfill commit touches
-    let root_path = std::path::PathBuf::from(&project.root_path);
+    let root_path = std::path::PathBuf::from(crate::expand_tilde(&project.root_path));
     match state
         .orchestrator
         .backfill_commit_touches(project_id, &root_path)

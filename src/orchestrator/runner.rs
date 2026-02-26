@@ -1256,11 +1256,20 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 neo4j.create_commit(&commit).await?;
 
                 // Create TOUCHES (MERGE = idempotent)
+                // git log returns relative paths (e.g. "src/lib.rs") but File nodes
+                // in Neo4j use absolute paths — prefix with root_path to match.
                 if !gc.files.is_empty() {
                     let file_infos: Vec<crate::neo4j::models::FileChangedInfo> = gc
                         .files
                         .iter()
-                        .map(|f| crate::neo4j::models::FileChangedInfo::from(f.as_str()))
+                        .map(|f| {
+                            let abs_path = root_path.join(&f.path);
+                            crate::neo4j::models::FileChangedInfo {
+                                path: abs_path.to_string_lossy().to_string(),
+                                additions: f.additions,
+                                deletions: f.deletions,
+                            }
+                        })
                         .collect();
                     neo4j.create_commit_touches(&gc.hash, &file_infos).await?;
                     touches_created += gc.files.len() as u64;
@@ -1297,9 +1306,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         Ok(result)
     }
 
-    /// Parse git log to extract commits and their touched files.
+    /// Parse git log to extract commits and their touched files with stats.
     ///
-    /// Uses `git log --name-only --format=...` for efficient parsing.
+    /// Uses `git log --numstat --format=...` to get additions/deletions per file.
     /// Limited to `max_commits` most recent commits.
     fn git_log_touched_files(root_path: &Path, max_commits: usize) -> Result<Vec<GitCommitFiles>> {
         use std::process::Command;
@@ -1307,7 +1316,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let output = Command::new("git")
             .args([
                 "log",
-                "--name-only",
+                "--numstat",
                 &format!("--max-count={}", max_commits),
                 "--format=COMMIT_START%n%H%n%s%n%an%n%aI",
             ])
@@ -1323,35 +1332,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut commits = Vec::new();
-        let mut current: Option<GitCommitFiles> = None;
-
-        for line in stdout.lines() {
-            if line == "COMMIT_START" {
-                if let Some(c) = current.take() {
-                    commits.push(c);
-                }
-                // Next 4 lines: hash, subject, author, date
-                continue;
-            }
-
-            if let Some(ref mut c) = current {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    c.files.push(trimmed.to_string());
-                }
-            } else {
-                // We're reading commit metadata lines
-                // After COMMIT_START: hash, subject, author, date (4 lines)
-                // We need to accumulate them
-            }
-        }
-        if let Some(c) = current.take() {
-            commits.push(c);
-        }
-
-        // Re-parse with a cleaner state machine
-        commits.clear();
         let mut lines = stdout.lines().peekable();
+
         while let Some(line) = lines.next() {
             if line == "COMMIT_START" {
                 let hash = lines.next().unwrap_or("").to_string();
@@ -1363,16 +1345,27 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     .unwrap_or_else(|_| chrono::Utc::now());
 
                 let mut files = Vec::new();
-                // Read file lines until next COMMIT_START or EOF
+                // --numstat lines: "<additions>\t<deletions>\t<path>"
+                // Binary files show "-\t-\t<path>"
                 while let Some(next) = lines.peek() {
                     if *next == "COMMIT_START" || next.is_empty() {
                         if next.is_empty() {
-                            lines.next(); // skip empty line
+                            lines.next(); // skip empty separator line
                             continue;
                         }
                         break;
                     }
-                    files.push(lines.next().unwrap().to_string());
+                    let stat_line = lines.next().unwrap();
+                    let parts: Vec<&str> = stat_line.splitn(3, '\t').collect();
+                    if parts.len() == 3 {
+                        let additions = parts[0].parse::<i64>().ok(); // "-" for binary → None
+                        let deletions = parts[1].parse::<i64>().ok();
+                        files.push(GitFileChange {
+                            path: parts[2].to_string(),
+                            additions,
+                            deletions,
+                        });
+                    }
                 }
 
                 if !hash.is_empty() {
@@ -3454,7 +3447,15 @@ pub struct GitCommitFiles {
     pub message: String,
     pub author: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    pub files: Vec<String>,
+    pub files: Vec<GitFileChange>,
+}
+
+/// A file changed in a git commit (from --numstat output).
+#[derive(Debug, Clone)]
+pub struct GitFileChange {
+    pub path: String,
+    pub additions: Option<i64>,
+    pub deletions: Option<i64>,
 }
 
 /// Result of a sync operation

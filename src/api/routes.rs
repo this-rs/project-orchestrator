@@ -343,7 +343,9 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Decision Affects
         .route(
             "/api/decisions/{decision_id}/affects",
-            post(handlers::add_decision_affects).get(handlers::list_decision_affects),
+            post(handlers::add_decision_affects)
+                .get(handlers::list_decision_affects)
+                .delete(handlers::remove_decision_affects_query),
         )
         .route(
             "/api/decisions/{decision_id}/affects/{entity_type}/{entity_id}",
