@@ -1489,6 +1489,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Load language-specific config files (lazy, only when needed)
         import_ctx.load_go_module_path(dir_path.to_str().unwrap_or(""));
         import_ctx.load_composer_psr4(dir_path.to_str().unwrap_or(""));
+        import_ctx.load_cmake_include_paths(dir_path.to_str().unwrap_or(""));
 
         import_ctx.log_stats();
 
@@ -2920,6 +2921,12 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         &ctx.psr4_mappings,
                         &ctx.suffix_index,
                     ),
+                    "c" | "cpp" => Self::resolve_c_include_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.c_include_paths,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3271,6 +3278,54 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // No PSR-4 mapping matched — fallback: convert namespace to path directly
         let suffix = format!("{}.php", path.replace('\\', "/"));
         if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve C/C++ `#include` using relative path, include paths, and SuffixIndex.
+    ///
+    /// Resolution order:
+    /// 1. Relative to source file directory
+    /// 2. Each configured include path (from CMakeLists.txt)
+    /// 3. Direct SuffixIndex lookup (filename-based)
+    ///
+    /// System headers (not found in project) naturally return empty.
+    fn resolve_c_include_indexed(
+        include_path: &str,
+        source_file: &str,
+        include_paths: &[String],
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = include_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // 1. Try relative to source file directory
+        let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        if !source_dir.is_empty() {
+            let relative = format!("{}/{}", source_dir, path);
+            if let Some(resolved) = index.get(&relative) {
+                return vec![resolved.to_string()];
+            }
+        }
+
+        // 2. Try each include path
+        for inc_dir in include_paths {
+            let candidate = format!(
+                "{}/{}",
+                inc_dir.trim_end_matches('/'),
+                path
+            );
+            if let Some(resolved) = index.get(&candidate) {
+                return vec![resolved.to_string()];
+            }
+        }
+
+        // 3. Direct suffix lookup (handles flat includes like "utils.h")
+        if let Some(resolved) = index.get(path) {
             return vec![resolved.to_string()];
         }
 
@@ -7004,6 +7059,100 @@ mod tests {
             &index,
         );
         assert!(result.is_empty());
+    }
+
+    // ── C/C++ include resolver tests ──────────────────────────────
+
+    #[test]
+    fn test_resolve_c_include_relative() {
+        let paths = vec![
+            "src/main.c".to_string(),
+            "src/utils.h".to_string(),
+            "include/config.h".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // #include "utils.h" from src/main.c → relative: src/utils.h
+        let result = Orchestrator::resolve_c_include_indexed(
+            "utils.h",
+            "src/main.c",
+            &[],
+            &index,
+        );
+        assert_eq!(result, vec!["src/utils.h"]);
+    }
+
+    #[test]
+    fn test_resolve_c_include_with_path() {
+        let paths = vec![
+            "src/main.c".to_string(),
+            "src/lib/parser.h".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // #include "lib/parser.h" from src/main.c → src/lib/parser.h
+        let result = Orchestrator::resolve_c_include_indexed(
+            "lib/parser.h",
+            "src/main.c",
+            &[],
+            &index,
+        );
+        assert_eq!(result, vec!["src/lib/parser.h"]);
+    }
+
+    #[test]
+    fn test_resolve_c_include_via_include_path() {
+        let paths = vec![
+            "src/main.c".to_string(),
+            "include/config.h".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let include_paths = vec!["include".to_string()];
+
+        // #include "config.h" from src/main.c — not found relative,
+        // found via include path: include/config.h
+        let result = Orchestrator::resolve_c_include_indexed(
+            "config.h",
+            "src/main.c",
+            &include_paths,
+            &index,
+        );
+        assert_eq!(result, vec!["include/config.h"]);
+    }
+
+    #[test]
+    fn test_resolve_c_include_system_header_ignored() {
+        let paths = vec![
+            "src/main.c".to_string(),
+            "src/utils.h".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // System header like <stdio.h> — not in project index, returns empty
+        let result = Orchestrator::resolve_c_include_indexed(
+            "stdio.h",
+            "src/main.c",
+            &[],
+            &index,
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_c_include_suffix_fallback() {
+        let paths = vec![
+            "vendor/lib/common.h".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Not relative, not in include paths, but found via suffix index
+        let result = Orchestrator::resolve_c_include_indexed(
+            "vendor/lib/common.h",
+            "src/main.c",
+            &[],
+            &index,
+        );
+        assert_eq!(result, vec!["vendor/lib/common.h"]);
     }
 
     #[test]

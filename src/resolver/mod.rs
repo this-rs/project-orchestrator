@@ -30,6 +30,8 @@ pub struct ImportResolutionContext {
     pub go_module_path: Option<String>,
     /// PHP PSR-4 mappings from composer.json (namespace prefix → directory), lazy-loaded
     pub psr4_mappings: std::collections::HashMap<String, String>,
+    /// C/C++ include paths from CMakeLists.txt (best-effort), lazy-loaded
+    pub c_include_paths: Vec<String>,
 }
 
 impl ImportResolutionContext {
@@ -44,6 +46,7 @@ impl ImportResolutionContext {
             resolve_cache: ResolveCache::new(),
             go_module_path: None,
             psr4_mappings: std::collections::HashMap::new(),
+            c_include_paths: Vec::new(),
         }
     }
 
@@ -67,6 +70,17 @@ impl ImportResolutionContext {
             return; // Already loaded
         }
         self.psr4_mappings = parse_composer_psr4(project_root);
+    }
+
+    /// Load C/C++ include paths from CMakeLists.txt (best-effort).
+    ///
+    /// Extracts `include_directories(...)` and `target_include_directories(... PUBLIC|PRIVATE ...)`
+    /// directives from CMakeLists.txt in the project root.
+    pub fn load_cmake_include_paths(&mut self, project_root: &str) {
+        if !self.c_include_paths.is_empty() {
+            return; // Already loaded
+        }
+        self.c_include_paths = parse_cmake_include_paths(project_root);
     }
 
     /// Populate the symbol table from parsed files.
@@ -159,6 +173,79 @@ pub fn parse_composer_psr4(project_root: &str) -> std::collections::HashMap<Stri
     }
 
     mappings
+}
+
+/// Parse `CMakeLists.txt` to extract include directories (best-effort).
+///
+/// Extracts paths from `include_directories(...)` and
+/// `target_include_directories(... PUBLIC|PRIVATE|INTERFACE ...)` directives.
+/// Returns empty vec if CMakeLists.txt doesn't exist.
+pub fn parse_cmake_include_paths(project_root: &str) -> Vec<String> {
+    let cmake_path = std::path::Path::new(project_root).join("CMakeLists.txt");
+    let content = match std::fs::read_to_string(&cmake_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut paths = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // include_directories(include/ src/lib/)
+        if let Some(args) = extract_cmake_parens(trimmed, "include_directories") {
+            for arg in args.split_whitespace() {
+                let arg = arg.trim_matches('"');
+                if !arg.is_empty() && !arg.starts_with("${") {
+                    paths.push(arg.to_string());
+                }
+            }
+        }
+
+        // target_include_directories(mylib PUBLIC include/ PRIVATE src/)
+        if let Some(args) = extract_cmake_parens(trimmed, "target_include_directories") {
+            // Skip target name and visibility keywords, collect paths
+            for arg in args.split_whitespace() {
+                let arg = arg.trim_matches('"');
+                match arg {
+                    "PUBLIC" | "PRIVATE" | "INTERFACE" | "SYSTEM" | "BEFORE" | "AFTER" => continue,
+                    _ if arg.starts_with("${") => continue,
+                    _ if arg.is_empty() => continue,
+                    _ => {
+                        // Skip the first arg (target name) — heuristic: if it contains
+                        // a path separator or extension, treat as path
+                        if arg.contains('/') || arg.contains('.') {
+                            paths.push(arg.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Extract content inside parentheses for a CMake directive.
+/// Returns None if the line doesn't start with the directive.
+fn extract_cmake_parens<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
+    let lower = line.to_lowercase();
+    if !lower.starts_with(&directive.to_lowercase()) {
+        return None;
+    }
+    let rest = &line[directive.len()..].trim_start();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let inner = &rest[1..];
+    // Find matching closing paren
+    if let Some(end) = inner.find(')') {
+        Some(&inner[..end])
+    } else {
+        Some(inner) // unclosed paren, take rest
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +345,39 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.get("App\\").unwrap(), "src/");
         assert_eq!(result.get("Tests\\").unwrap(), "tests/");
+    }
+
+    #[test]
+    fn test_parse_cmake_include_paths_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.20)\nproject(mylib)\ninclude_directories(include/ src/lib/)\n",
+        )
+        .unwrap();
+
+        let result = parse_cmake_include_paths(dir.path().to_str().unwrap());
+        assert_eq!(result, vec!["include/", "src/lib/"]);
+    }
+
+    #[test]
+    fn test_parse_cmake_include_paths_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = parse_cmake_include_paths(dir.path().to_str().unwrap());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_cmake_include_paths_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "target_include_directories(mylib PUBLIC include/ PRIVATE src/internal/)\n",
+        )
+        .unwrap();
+
+        let result = parse_cmake_include_paths(dir.path().to_str().unwrap());
+        assert!(result.contains(&"include/".to_string()));
+        assert!(result.contains(&"src/internal/".to_string()));
     }
 }
