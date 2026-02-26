@@ -3165,6 +3165,8 @@ mod tests {
             line_start: 5,
             line_end: 8,
             docstring: Some("App config".to_string()),
+            parent_class: None,
+            interfaces: vec![],
         };
         graph.upsert_struct(&s).await.unwrap();
 

@@ -401,7 +401,9 @@ impl Neo4jClient {
                 s.file_path = $file_path,
                 s.line_start = $line_start,
                 s.line_end = $line_end,
-                s.docstring = $docstring
+                s.docstring = $docstring,
+                s.parent_class = $parent_class,
+                s.interfaces = $interfaces
             WITH s
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(s)
@@ -414,7 +416,9 @@ impl Neo4jClient {
         .param("file_path", s.file_path.clone())
         .param("line_start", s.line_start as i64)
         .param("line_end", s.line_end as i64)
-        .param("docstring", s.docstring.clone().unwrap_or_default());
+        .param("docstring", s.docstring.clone().unwrap_or_default())
+        .param("parent_class", s.parent_class.clone().unwrap_or_default())
+        .param("interfaces", s.interfaces.clone());
 
         self.graph.run(q).await?;
         Ok(())
@@ -1078,6 +1082,11 @@ impl Neo4jClient {
                     "docstring".into(),
                     s.docstring.clone().unwrap_or_default().into(),
                 );
+                m.insert(
+                    "parent_class".into(),
+                    s.parent_class.clone().unwrap_or_default().into(),
+                );
+                m.insert("interfaces".into(), s.interfaces.clone().into());
                 m
             })
             .collect();
@@ -1092,7 +1101,9 @@ impl Neo4jClient {
                 st.file_path = s.file_path,
                 st.line_start = s.line_start,
                 st.line_end = s.line_end,
-                st.docstring = s.docstring
+                st.docstring = s.docstring,
+                st.parent_class = s.parent_class,
+                st.interfaces = s.interfaces
             WITH st, s
             MATCH (file:File {path: s.file_path})
             MERGE (file)-[:CONTAINS]->(st)

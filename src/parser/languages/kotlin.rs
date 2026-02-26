@@ -139,6 +139,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        parent_class: None,
+        interfaces: vec![],
     })
 }
 
@@ -174,6 +176,8 @@ fn extract_object(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        parent_class: None,
+        interfaces: vec![],
     })
 }
 

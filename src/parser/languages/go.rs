@@ -190,6 +190,8 @@ fn extract_type_declaration(
                                 line_start: child.start_position().row as u32 + 1,
                                 line_end: child.end_position().row as u32 + 1,
                                 docstring,
+                                parent_class: None,
+                                interfaces: vec![],
                             });
                         }
                         "interface_type" => {
@@ -217,6 +219,8 @@ fn extract_type_declaration(
                                 line_start: child.start_position().row as u32 + 1,
                                 line_end: child.end_position().row as u32 + 1,
                                 docstring,
+                                parent_class: None,
+                                interfaces: vec![],
                             });
                         }
                     }

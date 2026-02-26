@@ -80,6 +80,10 @@ pub enum CodeEdgeType {
     Affects,
     /// Neural synapse — weighted connection between notes (Knowledge Fabric P3)
     Synapse,
+    /// Class inheritance — child class extends parent class (Heritage Plan 5)
+    Extends,
+    /// Interface implementation — class implements interface/protocol (Heritage Plan 5)
+    Implements,
 }
 
 impl std::fmt::Display for CodeEdgeType {
@@ -95,6 +99,8 @@ impl std::fmt::Display for CodeEdgeType {
             Self::Discussed => write!(f, "DISCUSSED"),
             Self::Affects => write!(f, "AFFECTS"),
             Self::Synapse => write!(f, "SYNAPSE"),
+            Self::Extends => write!(f, "EXTENDS"),
+            Self::Implements => write!(f, "IMPLEMENTS"),
         }
     }
 }
@@ -450,6 +456,10 @@ pub struct FabricWeights {
     pub synapse: f64,
     /// Weight for DEFINES/CONTAINS edges (structural, default: 1.0)
     pub defines: f64,
+    /// Weight for EXTENDS edges (class inheritance, default: 0.95)
+    pub extends: f64,
+    /// Weight for IMPLEMENTS edges (interface implementation, default: 0.85)
+    pub implements: f64,
     /// Minimum CO_CHANGED count to include an edge (filters noise)
     pub co_changed_min_count: i64,
 }
@@ -465,6 +475,8 @@ impl Default for FabricWeights {
             discussed: 0.3,
             synapse: 0.6,
             defines: 1.0,
+            extends: 0.95,
+            implements: 0.85,
             co_changed_min_count: 2,
         }
     }
@@ -554,6 +566,8 @@ mod tests {
         assert_eq!(CodeEdgeType::Discussed.to_string(), "DISCUSSED");
         assert_eq!(CodeEdgeType::Affects.to_string(), "AFFECTS");
         assert_eq!(CodeEdgeType::Synapse.to_string(), "SYNAPSE");
+        assert_eq!(CodeEdgeType::Extends.to_string(), "EXTENDS");
+        assert_eq!(CodeEdgeType::Implements.to_string(), "IMPLEMENTS");
     }
 
     #[test]
@@ -567,6 +581,8 @@ mod tests {
         assert!((w.discussed - 0.3).abs() < f64::EPSILON);
         assert!((w.synapse - 0.6).abs() < f64::EPSILON);
         assert!((w.defines - 1.0).abs() < f64::EPSILON);
+        assert!((w.extends - 0.95).abs() < f64::EPSILON);
+        assert!((w.implements - 0.85).abs() < f64::EPSILON);
         assert_eq!(w.co_changed_min_count, 2);
     }
 

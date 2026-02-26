@@ -7762,6 +7762,8 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            parent_class: None,
+            interfaces: vec![],
         }
     }
 
@@ -9115,6 +9117,8 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            parent_class: None,
+            interfaces: vec![],
         }
     }
 

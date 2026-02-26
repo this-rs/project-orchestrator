@@ -138,8 +138,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         Visibility::Public
     };
 
-    // Extract base classes as "generics" (representing inheritance)
-    let generics: Vec<String> = node
+    // Extract base classes — first is parent_class (single inheritance), rest are interfaces/mixins
+    let superclasses: Vec<String> = node
         .child_by_field_name("superclasses")
         .or_else(|| find_child_by_kind(node, "argument_list"))
         .map(|args| {
@@ -150,16 +150,21 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         })
         .unwrap_or_default();
 
+    let parent_class = superclasses.first().cloned();
+    let interfaces: Vec<String> = superclasses.into_iter().skip(1).collect();
+
     let docstring = get_py_docstring(node, source);
 
     Some(StructNode {
         name,
         visibility,
-        generics,
+        generics: vec![],
         file_path: file_path.to_string(),
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        parent_class,
+        interfaces,
     })
 }
 

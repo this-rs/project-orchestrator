@@ -269,6 +269,8 @@ mod tests {
                     line_start: *line,
                     line_end: line + 5,
                     docstring: None,
+                    parent_class: None,
+                    interfaces: vec![],
                 })
                 .collect(),
             traits: vec![],

@@ -117,6 +117,8 @@ fn extract_variable(node: &tree_sitter::Node, source: &str, file_path: &str) -> 
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        parent_class: None,
+        interfaces: vec![],
     })
 }
 
@@ -148,6 +150,8 @@ fn extract_declaration(
                     line_start: child.start_position().row as u32 + 1,
                     line_end: child.end_position().row as u32 + 1,
                     docstring: get_bash_doc(node, source),
+                    parent_class: None,
+                    interfaces: vec![],
                 });
             }
         }

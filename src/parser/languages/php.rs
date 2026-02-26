@@ -129,22 +129,53 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
     let docstring = get_php_doc(node, source);
     let visibility = get_php_visibility(node, source);
 
-    // Extract base class and interfaces as generics
-    let mut generics = Vec::new();
-    if let Some(base) = node.child_by_field_name("base_clause") {
-        if let Some(text) = get_text(&base, source) {
-            generics.push(text.trim_start_matches("extends").trim().to_string());
-        }
-    }
+    // Extract parent class from base_clause (extends)
+    // Try both field_name and kind-based lookup since tree-sitter-php may vary
+    let parent_class = node
+        .child_by_field_name("base_clause")
+        .or_else(|| {
+            node.children(&mut node.walk())
+                .find(|c| c.kind() == "base_clause")
+        })
+        .and_then(|base| {
+            // The base_clause contains a name/qualified_name child for the parent class
+            base.children(&mut base.walk())
+                .find(|c| c.kind() == "name" || c.kind() == "qualified_name")
+                .and_then(|c| get_text(&c, source).map(|s| s.to_string()))
+                .or_else(|| {
+                    // Fallback: get full text and strip "extends" keyword
+                    get_text(&base, source)
+                        .map(|s| s.trim_start_matches("extends").trim().to_string())
+                })
+        })
+        .filter(|s| !s.is_empty());
+
+    // Extract interfaces from class_interface_clause (implements)
+    let interfaces: Vec<String> = node
+        .child_by_field_name("class_interface_clause")
+        .or_else(|| {
+            node.children(&mut node.walk())
+                .find(|c| c.kind() == "class_interface_clause")
+        })
+        .map(|clause| {
+            clause
+                .children(&mut clause.walk())
+                .filter(|c| c.kind() == "name" || c.kind() == "qualified_name")
+                .filter_map(|c| get_text(&c, source).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     Some(StructNode {
         name,
         visibility,
-        generics,
+        generics: vec![],
         file_path: file_path.to_string(),
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        parent_class,
+        interfaces,
     })
 }
 

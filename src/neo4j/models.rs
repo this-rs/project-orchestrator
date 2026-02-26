@@ -165,6 +165,12 @@ pub struct StructNode {
     pub line_start: u32,
     pub line_end: u32,
     pub docstring: Option<String>,
+    /// Parent class name (single inheritance: Java, Python, PHP, Ruby, etc.)
+    #[serde(default)]
+    pub parent_class: Option<String>,
+    /// Implemented interfaces/protocols (Java implements, TS implements, Swift protocol conformance, etc.)
+    #[serde(default)]
+    pub interfaces: Vec<String>,
 }
 
 /// A trait/interface definition

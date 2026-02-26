@@ -629,6 +629,100 @@ class Config:
     }
 
     #[test]
+    fn test_parse_python_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal:
+    pass
+
+class Dog(Animal):
+    """A dog inherits from Animal"""
+    pass
+
+class GuideDog(Dog, Serializable, Loggable):
+    """Multiple inheritance: first is parent, rest are interfaces/mixins"""
+    pass
+
+class Standalone:
+    """No inheritance"""
+    pass
+"#;
+        let path = PathBuf::from("test_inheritance.py");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.structs.len(), 4);
+
+        // Animal — no parent
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+        assert!(animal.generics.is_empty(), "generics should be empty, heritage goes in parent_class/interfaces");
+
+        // Dog — inherits from Animal
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        // GuideDog — multiple inheritance
+        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert_eq!(guide.interfaces, vec!["Serializable", "Loggable"]);
+
+        // Standalone — no inheritance
+        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_php_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"<?php
+
+class Animal {
+    public $name;
+}
+
+class Dog extends Animal {
+    public $breed;
+}
+
+class GuideDog extends Dog implements Serializable, JsonSerializable {
+    public $handler;
+}
+
+class Standalone {
+    public $value;
+}
+"#;
+        let path = PathBuf::from("test_inheritance.php");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.structs.len(), 4);
+
+        // Animal — no parent
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+        assert!(animal.generics.is_empty(), "generics should be empty, heritage goes in parent_class/interfaces");
+
+        // Dog — extends Animal
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        // GuideDog — extends Dog, implements Serializable + JsonSerializable
+        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert_eq!(guide.interfaces, vec!["Serializable", "JsonSerializable"]);
+
+        // Standalone — no inheritance
+        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
     fn test_parse_typescript_file() {
         let mut parser = CodeParser::new().unwrap();
         let content = r#"
