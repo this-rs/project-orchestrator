@@ -2106,6 +2106,20 @@ impl GraphStore for Neo4jClient {
         self.get_project_call_edges(project_id).await
     }
 
+    async fn get_project_extends_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_project_extends_edges(project_id).await
+    }
+
+    async fn get_project_implements_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_project_implements_edges(project_id).await
+    }
+
     async fn batch_update_file_analytics(
         &self,
         updates: &[crate::graph::models::FileAnalyticsUpdate],

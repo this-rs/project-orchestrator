@@ -77,6 +77,36 @@ impl GraphExtractor {
             }
         }
 
+        // 3. Fetch EXTENDS edges (class inheritance)
+        let extends_edges = self.store.get_project_extends_edges(project_id).await?;
+        for (source, target) in &extends_edges {
+            if graph.get_index(source).is_some() && graph.get_index(target).is_some() {
+                graph.add_edge(
+                    source,
+                    target,
+                    CodeEdge {
+                        edge_type: CodeEdgeType::Extends,
+                        weight: 0.95,
+                    },
+                );
+            }
+        }
+
+        // 4. Fetch IMPLEMENTS edges (interface/protocol implementation)
+        let implements_edges = self.store.get_project_implements_edges(project_id).await?;
+        for (source, target) in &implements_edges {
+            if graph.get_index(source).is_some() && graph.get_index(target).is_some() {
+                graph.add_edge(
+                    source,
+                    target,
+                    CodeEdge {
+                        edge_type: CodeEdgeType::Implements,
+                        weight: 0.85,
+                    },
+                );
+            }
+        }
+
         Ok(graph)
     }
 
@@ -181,11 +211,55 @@ impl GraphExtractor {
             }
         }
 
+        // 4. Layer 3: EXTENDS (class inheritance, very strong coupling)
+        match self.store.get_project_extends_edges(project_id).await {
+            Ok(extends_edges) => {
+                for (source, target) in &extends_edges {
+                    if graph.get_index(source).is_some() && graph.get_index(target).is_some() {
+                        graph.add_edge(
+                            source,
+                            target,
+                            CodeEdge {
+                                edge_type: CodeEdgeType::Extends,
+                                weight: weights.extends,
+                            },
+                        );
+                    }
+                }
+                tracing::debug!(project_id = %project_id, extends_edges = extends_edges.len(), "Fabric extraction: EXTENDS layer added");
+            }
+            Err(e) => {
+                tracing::debug!(project_id = %project_id, error = %e, "Fabric extraction: EXTENDS layer unavailable (graceful degradation)");
+            }
+        }
+
+        // 5. Layer 4: IMPLEMENTS (interface implementation, strong coupling)
+        match self.store.get_project_implements_edges(project_id).await {
+            Ok(implements_edges) => {
+                for (source, target) in &implements_edges {
+                    if graph.get_index(source).is_some() && graph.get_index(target).is_some() {
+                        graph.add_edge(
+                            source,
+                            target,
+                            CodeEdge {
+                                edge_type: CodeEdgeType::Implements,
+                                weight: weights.implements,
+                            },
+                        );
+                    }
+                }
+                tracing::debug!(project_id = %project_id, implements_edges = implements_edges.len(), "Fabric extraction: IMPLEMENTS layer added");
+            }
+            Err(e) => {
+                tracing::debug!(project_id = %project_id, error = %e, "Fabric extraction: IMPLEMENTS layer unavailable (graceful degradation)");
+            }
+        }
+
         // Future layers (T5.5, T5.6):
         // - AFFECTS: Decision → File edges (requires get_project_affects_edges)
         // - DISCUSSED: Session → File edges (requires get_project_discussed_edges)
 
-        // 4. Layer 3: SYNAPSE (neural connections bridged through Note→File)
+        // 6. Layer 5: SYNAPSE (neural connections bridged through Note→File)
         match self.store.get_project_synapse_edges(project_id).await {
             Ok(synapse_pairs) => {
                 let mut added = 0;
@@ -457,6 +531,236 @@ mod tests {
         let func_graph = extractor.extract_function_graph(project.id).await.unwrap();
         assert_eq!(func_graph.node_count(), 0);
         assert_eq!(func_graph.edge_count(), 0);
+    }
+
+    /// Seed structs with heritage relationships into the mock store.
+    /// `extends` = vec of (child_name, child_file, parent_name, parent_file).
+    /// `implements` = vec of (struct_name, struct_file, trait_name, trait_file).
+    async fn seed_heritage(
+        store: &MockGraphStore,
+        project_id: Uuid,
+        extends: &[(&str, &str, &str, &str)],
+        implements: &[(&str, &str, &str, &str)],
+    ) {
+        use crate::neo4j::models::{StructNode, TraitNode, Visibility};
+
+        // Collect all structs (children + parents)
+        let mut seen_structs = std::collections::HashSet::new();
+        for (child_name, child_file, parent_name, parent_file) in extends {
+            for (name, file) in [(child_name, child_file), (parent_name, parent_file)] {
+                if seen_structs.insert((*name, *file)) {
+                    store
+                        .upsert_struct(&StructNode {
+                            name: name.to_string(),
+                            visibility: Visibility::Public,
+                            generics: vec![],
+                            file_path: file.to_string(),
+                            line_start: 1,
+                            line_end: 10,
+                            docstring: None,
+                            parent_class: None,
+                            interfaces: vec![],
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            // Seed the extends relationship
+            store
+                .call_relationships
+                .write()
+                .await
+                .entry(format!("extends:{}", child_name))
+                .or_default()
+                .push(parent_name.to_string());
+        }
+
+        // Collect all structs and traits from implements
+        for (struct_name, struct_file, trait_name, trait_file) in implements {
+            if seen_structs.insert((*struct_name, *struct_file)) {
+                store
+                    .upsert_struct(&StructNode {
+                        name: struct_name.to_string(),
+                        visibility: Visibility::Public,
+                        generics: vec![],
+                        file_path: struct_file.to_string(),
+                        line_start: 1,
+                        line_end: 10,
+                        docstring: None,
+                        parent_class: None,
+                        interfaces: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            store
+                .upsert_trait(&TraitNode {
+                    name: trait_name.to_string(),
+                    visibility: Visibility::Public,
+                    generics: vec![],
+                    file_path: trait_file.to_string(),
+                    line_start: 1,
+                    line_end: 10,
+                    docstring: None,
+                    is_external: false,
+                    source: None,
+                })
+                .await
+                .unwrap();
+            // Seed the implements relationship
+            store
+                .call_relationships
+                .write()
+                .await
+                .entry(format!("implements:{}", struct_name))
+                .or_default()
+                .push(trait_name.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_file_graph_with_heritage_edges() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // 4 files: models/animal.rs, models/dog.rs, traits/serializable.rs, traits/comparable.rs
+        let files = [
+            "src/models/animal.rs",
+            "src/models/dog.rs",
+            "src/traits/serializable.rs",
+            "src/traits/comparable.rs",
+        ];
+        // 1 import: dog.rs imports animal.rs
+        let imports = [("src/models/dog.rs", "src/models/animal.rs")];
+
+        seed_files_and_imports(&store, project.id, &files, &imports).await;
+
+        // Dog extends Animal (cross-file)
+        let extends = [("Dog", "src/models/dog.rs", "Animal", "src/models/animal.rs")];
+        // Dog implements Serializable and Comparable (cross-file)
+        let implements_rels = [
+            (
+                "Dog",
+                "src/models/dog.rs",
+                "Serializable",
+                "src/traits/serializable.rs",
+            ),
+            (
+                "Dog",
+                "src/models/dog.rs",
+                "Comparable",
+                "src/traits/comparable.rs",
+            ),
+        ];
+
+        seed_heritage(&store, project.id, &extends, &implements_rels).await;
+
+        let extractor = GraphExtractor::new(Arc::new(store));
+        let graph = extractor.extract_file_graph(project.id).await.unwrap();
+
+        assert_eq!(graph.node_count(), 4, "4 file nodes");
+        // 1 import + 1 extends + 2 implements = 4 edges
+        assert_eq!(graph.edge_count(), 4, "1 import + 1 extends + 2 implements");
+
+        // Verify edge types
+        let edge_types: Vec<CodeEdgeType> = graph
+            .graph
+            .edge_weights()
+            .map(|e| e.edge_type.clone())
+            .collect();
+        assert!(
+            edge_types.contains(&CodeEdgeType::Imports),
+            "has import edge"
+        );
+        assert!(
+            edge_types.contains(&CodeEdgeType::Extends),
+            "has extends edge"
+        );
+        assert!(
+            edge_types.contains(&CodeEdgeType::Implements),
+            "has implements edge"
+        );
+
+        // Verify weights
+        let extends_edge = graph
+            .graph
+            .edge_weights()
+            .find(|e| e.edge_type == CodeEdgeType::Extends)
+            .unwrap();
+        assert!(
+            (extends_edge.weight - 0.95).abs() < 0.001,
+            "extends weight = 0.95"
+        );
+
+        let implements_edge = graph
+            .graph
+            .edge_weights()
+            .find(|e| e.edge_type == CodeEdgeType::Implements)
+            .unwrap();
+        assert!(
+            (implements_edge.weight - 0.85).abs() < 0.001,
+            "implements weight = 0.85"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_fabric_graph_with_heritage_layers() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        let files = [
+            "src/base.rs",
+            "src/child.rs",
+            "src/iface.rs",
+        ];
+        let imports = [("src/child.rs", "src/base.rs")];
+
+        seed_files_and_imports(&store, project.id, &files, &imports).await;
+
+        // child extends base (cross-file)
+        let extends = [("Child", "src/child.rs", "Base", "src/base.rs")];
+        // child implements iface (cross-file)
+        let implements_rels = [("Child", "src/child.rs", "MyTrait", "src/iface.rs")];
+
+        seed_heritage(&store, project.id, &extends, &implements_rels).await;
+
+        let extractor = GraphExtractor::new(Arc::new(store));
+        let weights = FabricWeights::default();
+        let graph = extractor
+            .extract_fabric_graph(project.id, &weights)
+            .await
+            .unwrap();
+
+        assert_eq!(graph.node_count(), 3, "3 file nodes");
+        // 1 import (weight 0.8) + 1 extends (weight 0.95) + 1 implements (weight 0.85) = 3 edges
+        assert_eq!(
+            graph.edge_count(),
+            3,
+            "1 import + 1 extends + 1 implements"
+        );
+
+        // Verify fabric weights are applied (not hardcoded)
+        let extends_edge = graph
+            .graph
+            .edge_weights()
+            .find(|e| e.edge_type == CodeEdgeType::Extends)
+            .unwrap();
+        assert!(
+            (extends_edge.weight - weights.extends).abs() < 0.001,
+            "extends uses FabricWeights.extends"
+        );
+
+        let implements_edge = graph
+            .graph
+            .edge_weights()
+            .find(|e| e.edge_type == CodeEdgeType::Implements)
+            .unwrap();
+        assert!(
+            (implements_edge.weight - weights.implements).abs() < 0.001,
+            "implements uses FabricWeights.implements"
+        );
     }
 
     #[tokio::test]

@@ -6486,6 +6486,95 @@ impl GraphStore for MockGraphStore {
         Ok(edges)
     }
 
+    async fn get_project_extends_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let structs = self.structs_map.read().await;
+        let mut edges = Vec::new();
+
+        for (key, parents) in cr.iter() {
+            if let Some(child_name) = key.strip_prefix("extends:") {
+                // Find the child struct's file
+                if let Some(child_struct) = structs.values().find(|s| {
+                    s.name == child_name && project_paths.contains(&s.file_path)
+                }) {
+                    for parent_name in parents {
+                        // Find the parent struct's file
+                        if let Some(parent_struct) = structs.values().find(|s| {
+                            s.name == *parent_name && project_paths.contains(&s.file_path)
+                        }) {
+                            if child_struct.file_path != parent_struct.file_path {
+                                edges.push((
+                                    child_struct.file_path.clone(),
+                                    parent_struct.file_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn get_project_implements_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let structs = self.structs_map.read().await;
+        let traits = self.traits_map.read().await;
+        let mut edges = Vec::new();
+
+        for (key, ifaces) in cr.iter() {
+            if let Some(struct_name) = key.strip_prefix("implements:") {
+                // Find the struct's file
+                if let Some(struct_node) = structs.values().find(|s| {
+                    s.name == struct_name && project_paths.contains(&s.file_path)
+                }) {
+                    for iface_name in ifaces {
+                        // Find the trait's file
+                        if let Some(trait_node) = traits.values().find(|t| {
+                            t.name == *iface_name && project_paths.contains(&t.file_path)
+                        }) {
+                            if struct_node.file_path != trait_node.file_path {
+                                edges.push((
+                                    struct_node.file_path.clone(),
+                                    trait_node.file_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
     async fn batch_update_file_analytics(
         &self,
         updates: &[crate::graph::models::FileAnalyticsUpdate],

@@ -450,6 +450,64 @@ impl Neo4jClient {
         Ok(edges)
     }
 
+    /// Get all EXTENDS edges between structs/classes in a project as (child_file, parent_file) pairs.
+    /// Returns file-level edges so the graph analytics engine can weight inter-file coupling.
+    pub async fn get_project_extends_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)-[:CONTAINS]->(s1:Struct)-[:EXTENDS]->(s2:Struct)<-[:CONTAINS]-(f2:File)<-[:CONTAINS]-(p)
+            WHERE f1 <> f2
+            RETURN f1.path AS source, f2.path AS target
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(source), Ok(target)) =
+                (row.get::<String>("source"), row.get::<String>("target"))
+            {
+                edges.push((source, target));
+            }
+        }
+
+        Ok(edges)
+    }
+
+    /// Get all IMPLEMENTS edges between structs and traits in a project as (struct_file, trait_file) pairs.
+    /// Returns file-level edges so the graph analytics engine can weight inter-file coupling.
+    pub async fn get_project_implements_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)-[:CONTAINS]->(s:Struct)-[:IMPLEMENTS]->(t:Trait)<-[:CONTAINS]-(f2:File)<-[:CONTAINS]-(p)
+            WHERE f1 <> f2
+            RETURN f1.path AS source, f2.path AS target
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(source), Ok(target)) =
+                (row.get::<String>("source"), row.get::<String>("target"))
+            {
+                edges.push((source, target));
+            }
+        }
+
+        Ok(edges)
+    }
+
     /// Batch-update analytics scores on File nodes via UNWIND.
     pub async fn batch_update_file_analytics(
         &self,

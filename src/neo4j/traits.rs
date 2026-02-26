@@ -1723,6 +1723,17 @@ pub trait GraphStore: Send + Sync {
     /// Single bulk query — used by the graph analytics engine for extraction.
     async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
 
+    /// Get all EXTENDS edges between structs/classes in a project as (child_file, parent_file) pairs.
+    /// Returns file-level edges for the graph analytics engine.
+    async fn get_project_extends_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Get all IMPLEMENTS edges between structs and traits in a project as (struct_file, trait_file) pairs.
+    /// Returns file-level edges for the graph analytics engine.
+    async fn get_project_implements_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String)>>;
+
     /// Batch-update analytics scores on File nodes.
     /// Uses UNWIND for single-query efficiency.
     async fn batch_update_file_analytics(&self, updates: &[FileAnalyticsUpdate]) -> Result<()>;
