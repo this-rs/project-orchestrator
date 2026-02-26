@@ -140,6 +140,57 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
     }
 }
 
+/// Create a mock AppState with shared access to BOTH graph and search stores.
+///
+/// Returns (AppState, Arc<MockGraphStore>, Arc<MockSearchStore>) so tests can
+/// inspect both stores after operations.
+pub fn mock_app_state_with_stores() -> (
+    AppState,
+    Arc<MockGraphStore>,
+    Arc<MockSearchStore>,
+) {
+    let graph = Arc::new(MockGraphStore::new());
+    let meili = Arc::new(MockSearchStore::new());
+    let state = AppState {
+        neo4j: graph.clone(),
+        meili: meili.clone(),
+        parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
+        config: Arc::new(crate::Config {
+            setup_completed: true,
+            neo4j_uri: "bolt://mock:7687".to_string(),
+            neo4j_user: "neo4j".to_string(),
+            neo4j_password: "mock".to_string(),
+            meilisearch_url: "http://mock:7700".to_string(),
+            meilisearch_key: "mock-key".to_string(),
+            nats_url: None,
+            workspace_path: ".".to_string(),
+            server_port: 0,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            public_url: None,
+            chat_permissions: None,
+            chat_default_model: None,
+            chat_max_sessions: None,
+            chat_max_turns: None,
+            chat_session_timeout_secs: None,
+            chat_process_path: None,
+            chat_claude_cli_path: None,
+            chat_auto_update_cli: None,
+            chat_auto_update_app: None,
+            embedding_provider: None,
+            embedding_fastembed_model: None,
+            embedding_fastembed_cache_dir: None,
+            embedding_url: None,
+            embedding_model: None,
+            embedding_api_key: None,
+            embedding_dimensions: None,
+            config_yaml_path: None,
+        }),
+    };
+    (state, graph, meili)
+}
+
 /// Create a test AuthConfig suitable for integration tests.
 ///
 /// Uses a fixed JWT secret and disables domain restriction.

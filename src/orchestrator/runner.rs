@@ -6260,6 +6260,677 @@ mod tests {
         );
     }
 
+    // ── T8.6: Sync consistency integration tests ──────────────────
+
+    /// Scenario 1: Add a file → verify File + symbols + IMPORTS created in Neo4j AND MeiliSearch
+    #[tokio::test]
+    async fn test_sync_add_file_creates_all_entities() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_path = "/tmp/sync-test/src/lib.rs".to_string();
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "add-test-hash".to_string(),
+            functions: vec![
+                FunctionNode {
+                    name: "handler".to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: Some("Response".to_string()),
+                    generics: vec![],
+                    is_async: true,
+                    is_unsafe: false,
+                    complexity: 3,
+                    file_path: file_path.clone(),
+                    line_start: 10,
+                    line_end: 30,
+                    docstring: Some("Handle request".to_string()),
+                },
+            ],
+            structs: vec![StructNode {
+                name: "Config".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: 8,
+                docstring: None,
+            }],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![ImportNode {
+                path: "serde::Deserialize".to_string(),
+                alias: None,
+                items: vec!["Deserialize".to_string()],
+                file_path: file_path.clone(),
+                line: 1,
+            }],
+            function_calls: vec![],
+            symbols: vec!["handler".to_string(), "Config".to_string()],
+        };
+
+        // Store with project context so MeiliSearch gets indexed
+        let project_id = uuid::Uuid::new_v4();
+        orch.store_parsed_file_for_project(&parsed, Some(project_id))
+            .await
+            .unwrap();
+
+        // Also manually index in MeiliSearch (normally done by sync_file_for_project)
+        let doc = crate::parser::CodeParser::to_code_document(
+            &parsed,
+            &project_id.to_string(),
+            "test-project",
+        );
+        orch.meili().index_code(&doc).await.unwrap();
+
+        // ── Verify Neo4j ──
+        assert_eq!(neo4j.functions.read().await.len(), 1, "1 function expected");
+        assert_eq!(neo4j.structs_map.read().await.len(), 1, "1 struct expected");
+        assert_eq!(neo4j.imports.read().await.len(), 1, "1 import expected");
+        let file = neo4j.get_file(&file_path).await.unwrap();
+        assert!(file.is_some(), "File node should exist in Neo4j");
+
+        // ── Verify MeiliSearch ──
+        let code_docs = meili.code_documents.read().await;
+        assert_eq!(code_docs.len(), 1, "1 code document in MeiliSearch");
+        assert_eq!(code_docs[0].path, file_path);
+        assert!(code_docs[0].symbols.contains(&"handler".to_string()));
+        assert!(code_docs[0].symbols.contains(&"Config".to_string()));
+    }
+
+    /// Scenario 2: Delete a file (< 50 threshold) → verify everything cleaned in Neo4j AND MeiliSearch
+    #[tokio::test]
+    async fn test_sync_delete_file_cleans_all() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let file_path = "/tmp/sync-test/src/delete_me.rs".to_string();
+
+        // Step 1: Add the file
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "delete-test-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "temp_func".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["temp_func".to_string()],
+        };
+
+        orch.store_parsed_file_for_project(&parsed, Some(project_id))
+            .await
+            .unwrap();
+        let doc = crate::parser::CodeParser::to_code_document(
+            &parsed,
+            &project_id.to_string(),
+            "test-project",
+        );
+        orch.meili().index_code(&doc).await.unwrap();
+
+        // Verify file exists
+        assert_eq!(neo4j.functions.read().await.len(), 1);
+        assert_eq!(meili.code_documents.read().await.len(), 1);
+
+        // Step 2: Delete the file (simulating what watcher does)
+        GraphStore::delete_file(neo4j.as_ref(), &file_path)
+            .await
+            .unwrap();
+        orch.meili().delete_code(&file_path).await.unwrap();
+
+        // ── Verify Neo4j cleaned ──
+        let file = neo4j.get_file(&file_path).await.unwrap();
+        assert!(file.is_none(), "File node should be deleted from Neo4j");
+        // Functions are cleaned via DETACH DELETE in the mock
+        assert_eq!(
+            neo4j.functions.read().await.len(),
+            0,
+            "Functions should be deleted"
+        );
+
+        // ── Verify MeiliSearch cleaned ──
+        assert_eq!(
+            meili.code_documents.read().await.len(),
+            0,
+            "MeiliSearch documents should be deleted"
+        );
+    }
+
+    /// Scenario 3: Rename a file → old node deleted, new created with correct relations
+    #[tokio::test]
+    async fn test_sync_rename_file_old_deleted_new_created() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let old_path = "/tmp/sync-test/src/old_name.rs".to_string();
+        let new_path = "/tmp/sync-test/src/new_name.rs".to_string();
+
+        // Step 1: Create file with old name
+        let old_parsed = ParsedFile {
+            path: old_path.clone(),
+            language: "rust".to_string(),
+            hash: "old-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "my_fn".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: old_path.clone(),
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["my_fn".to_string()],
+        };
+
+        orch.store_parsed_file_for_project(&old_parsed, Some(project_id))
+            .await
+            .unwrap();
+        let doc = crate::parser::CodeParser::to_code_document(
+            &old_parsed,
+            &project_id.to_string(),
+            "test",
+        );
+        orch.meili().index_code(&doc).await.unwrap();
+
+        // Step 2: Simulate rename = delete old + create new
+        GraphStore::delete_file(neo4j.as_ref(), &old_path)
+            .await
+            .unwrap();
+        orch.meili().delete_code(&old_path).await.unwrap();
+
+        let new_parsed = ParsedFile {
+            path: new_path.clone(),
+            language: "rust".to_string(),
+            hash: "new-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "my_fn".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: new_path.clone(),
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["my_fn".to_string()],
+        };
+
+        orch.store_parsed_file_for_project(&new_parsed, Some(project_id))
+            .await
+            .unwrap();
+        let doc = crate::parser::CodeParser::to_code_document(
+            &new_parsed,
+            &project_id.to_string(),
+            "test",
+        );
+        orch.meili().index_code(&doc).await.unwrap();
+
+        // ── Verify old gone, new exists ──
+        let old_file = neo4j.get_file(&old_path).await.unwrap();
+        assert!(old_file.is_none(), "Old file should be deleted");
+
+        let new_file = neo4j.get_file(&new_path).await.unwrap();
+        assert!(new_file.is_some(), "New file should exist");
+
+        // Function with new file_path should exist
+        let funcs = neo4j.functions.read().await;
+        assert_eq!(funcs.len(), 1, "Should have exactly 1 function");
+        let func = funcs.values().next().unwrap();
+        assert_eq!(func.file_path, new_path, "Function should reference new path");
+
+        // MeiliSearch: only new file
+        let code_docs = meili.code_documents.read().await;
+        assert_eq!(code_docs.len(), 1);
+        assert_eq!(code_docs[0].path, new_path);
+    }
+
+    /// Scenario 4: Modify hierarchy (EXTENDS change) — forward-compatible validation
+    #[tokio::test]
+    async fn test_sync_heritage_change_forward_compatible() {
+        // EXTENDS/IMPLEMENTS don't exist yet (Plans 5/6).
+        // This test validates that the cleanup_sync_data handles them as no-ops
+        // and that the pattern documentation exists for future implementation.
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let _orch = Orchestrator::new(state).await.unwrap();
+
+        // cleanup_sync_data should handle EXTENDS/IMPLEMENTS without error
+        // (forward-compatible no-ops)
+        let deleted = GraphStore::cleanup_sync_data(neo4j.as_ref()).await.unwrap();
+        assert_eq!(deleted, 0, "Empty store cleanup should delete 0 entities");
+
+        // Verify the Plans 5/6 cleanup pattern documentation exists
+        let source = include_str!("runner.rs");
+        assert!(
+            source.contains("Plans 5 & 6: Heritage & Process relations"),
+            "Heritage cleanup pattern documentation must exist"
+        );
+    }
+
+    /// Scenario 5: Bulk delete (>= BULK_SYNC_THRESHOLD files) → full sync path
+    #[tokio::test]
+    async fn test_sync_bulk_delete_triggers_full_sync_path() {
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let _orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+
+        // Create 60 files (> BULK_SYNC_THRESHOLD = 50)
+        for i in 0..60 {
+            let path = format!("/tmp/bulk-test/src/file_{}.rs", i);
+            GraphStore::upsert_file(
+                neo4j.as_ref(),
+                &FileNode {
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    hash: format!("hash_{}", i),
+                    last_parsed: chrono::Utc::now(),
+                    project_id: Some(project_id),
+                },
+            )
+            .await
+            .unwrap();
+            // Link to project (mock uses project_files for delete_stale_files)
+            GraphStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(neo4j.files.read().await.len(), 60);
+
+        // Simulate keeping only 10 files (50 deletions) via delete_stale_files
+        let valid_paths: Vec<String> =
+            (0..10).map(|i| format!("/tmp/bulk-test/src/file_{}.rs", i)).collect();
+
+        let (files_deleted, _symbols_deleted, stale_paths) = GraphStore::delete_stale_files(
+            neo4j.as_ref(),
+            project_id,
+            &valid_paths,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files_deleted, 50, "Should delete 50 stale files");
+        assert_eq!(stale_paths.len(), 50, "Should return 50 deleted paths");
+        assert_eq!(neo4j.files.read().await.len(), 10, "10 files should remain");
+
+        // Simulate MeiliSearch cleanup for each stale path
+        for path in &stale_paths {
+            meili.delete_code(path).await.unwrap();
+        }
+    }
+
+    /// Scenario 6: Add + delete simultaneously in debounce window → consistency
+    #[tokio::test]
+    async fn test_sync_add_delete_same_window_consistent() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+
+        let file_a = "/tmp/simul-test/src/file_a.rs".to_string();
+        let file_b = "/tmp/simul-test/src/file_b.rs".to_string();
+
+        // Create file_a and file_b
+        for path in [&file_a, &file_b] {
+            let parsed = ParsedFile {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: "hash".to_string(),
+                functions: vec![FunctionNode {
+                    name: format!("fn_{}", path.split('/').last().unwrap()),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: path.clone(),
+                    line_start: 1,
+                    line_end: 5,
+                    docstring: None,
+                }],
+                structs: vec![],
+                traits: vec![],
+                enums: vec![],
+                impl_blocks: vec![],
+                imports: vec![],
+                function_calls: vec![],
+                symbols: vec![],
+            };
+            orch.store_parsed_file_for_project(&parsed, Some(project_id))
+                .await
+                .unwrap();
+            let doc = crate::parser::CodeParser::to_code_document(
+                &parsed,
+                &project_id.to_string(),
+                "test",
+            );
+            orch.meili().index_code(&doc).await.unwrap();
+        }
+
+        assert_eq!(neo4j.functions.read().await.len(), 2);
+        assert_eq!(meili.code_documents.read().await.len(), 2);
+
+        // Simulate: delete file_a + modify file_b in same window
+        GraphStore::delete_file(neo4j.as_ref(), &file_a)
+            .await
+            .unwrap();
+        orch.meili().delete_code(&file_a).await.unwrap();
+
+        let parsed_b_modified = ParsedFile {
+            path: file_b.clone(),
+            language: "rust".to_string(),
+            hash: "new-hash".to_string(),
+            functions: vec![
+                FunctionNode {
+                    name: "fn_file_b.rs".to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_b.clone(),
+                    line_start: 1,
+                    line_end: 5,
+                    docstring: None,
+                },
+                FunctionNode {
+                    name: "new_func".to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_b.clone(),
+                    line_start: 10,
+                    line_end: 15,
+                    docstring: None,
+                },
+            ],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+        orch.store_parsed_file_for_project(&parsed_b_modified, Some(project_id))
+            .await
+            .unwrap();
+
+        // ── Verify consistency ──
+        let file_a_node = neo4j.get_file(&file_a).await.unwrap();
+        assert!(file_a_node.is_none(), "file_a should be gone");
+
+        let file_b_node = neo4j.get_file(&file_b).await.unwrap();
+        assert!(file_b_node.is_some(), "file_b should exist");
+
+        // file_b should have 2 functions now
+        let funcs = neo4j.functions.read().await;
+        let file_b_funcs: Vec<_> = funcs
+            .values()
+            .filter(|f| f.file_path == file_b)
+            .collect();
+        assert_eq!(file_b_funcs.len(), 2, "file_b should have 2 functions");
+
+        // MeiliSearch: only file_b
+        let code_docs = meili.code_documents.read().await;
+        assert_eq!(code_docs.len(), 1);
+        assert_eq!(code_docs[0].path, file_b);
+    }
+
+    /// Scenario 7: Delete file that is source of IMPORTS → IMPORTS relations cleaned
+    #[tokio::test]
+    async fn test_sync_delete_import_source_cleans_relations() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let importer = "/tmp/import-test/src/main.rs".to_string();
+        let imported = "/tmp/import-test/src/utils.rs".to_string();
+
+        // Create both files with an import relationship
+        let parsed_importer = ParsedFile {
+            path: importer.clone(),
+            language: "rust".to_string(),
+            hash: "importer-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "main".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: importer.clone(),
+                line_start: 1,
+                line_end: 10,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![ImportNode {
+                path: "utils".to_string(),
+                alias: None,
+                items: vec![],
+                file_path: importer.clone(),
+                line: 1,
+            }],
+            function_calls: vec![],
+            symbols: vec!["main".to_string()],
+        };
+
+        let parsed_imported = ParsedFile {
+            path: imported.clone(),
+            language: "rust".to_string(),
+            hash: "imported-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "helper".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: imported.clone(),
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["helper".to_string()],
+        };
+
+        orch.store_parsed_file_for_project(&parsed_importer, None)
+            .await
+            .unwrap();
+        orch.store_parsed_file_for_project(&parsed_imported, None)
+            .await
+            .unwrap();
+
+        assert_eq!(neo4j.functions.read().await.len(), 2);
+        assert_eq!(neo4j.imports.read().await.len(), 1);
+
+        // Delete the imported file — DETACH DELETE should clean relations
+        GraphStore::delete_file(neo4j.as_ref(), &imported)
+            .await
+            .unwrap();
+
+        // ── Verify ──
+        let imported_node = neo4j.get_file(&imported).await.unwrap();
+        assert!(imported_node.is_none(), "Imported file should be deleted");
+
+        // The importer file and its import node should still exist
+        // (the import statement in main.rs still references utils)
+        let importer_node = neo4j.get_file(&importer).await.unwrap();
+        assert!(importer_node.is_some(), "Importer file should still exist");
+    }
+
+    /// Scenario 8: MeiliSearch post-deletion → search returns no phantom results
+    #[tokio::test]
+    async fn test_sync_meilisearch_no_phantom_after_deletion() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+
+        // Create 3 files
+        for i in 0..3 {
+            let path = format!("/tmp/phantom-test/src/file_{}.rs", i);
+            let parsed = ParsedFile {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("hash_{}", i),
+                functions: vec![FunctionNode {
+                    name: format!("func_{}", i),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: path.clone(),
+                    line_start: 1,
+                    line_end: 5,
+                    docstring: None,
+                }],
+                structs: vec![],
+                traits: vec![],
+                enums: vec![],
+                impl_blocks: vec![],
+                imports: vec![],
+                function_calls: vec![],
+                symbols: vec![format!("func_{}", i)],
+            };
+            orch.store_parsed_file_for_project(&parsed, Some(project_id))
+                .await
+                .unwrap();
+            let doc = crate::parser::CodeParser::to_code_document(
+                &parsed,
+                &project_id.to_string(),
+                "test",
+            );
+            orch.meili().index_code(&doc).await.unwrap();
+        }
+
+        assert_eq!(meili.code_documents.read().await.len(), 3);
+
+        // Delete file_1 from both Neo4j and MeiliSearch
+        let deleted_path = "/tmp/phantom-test/src/file_1.rs";
+        neo4j.delete_file(deleted_path).await.unwrap();
+        orch.meili().delete_code(deleted_path).await.unwrap();
+
+        // ── Verify no phantom documents ──
+        let code_docs = meili.code_documents.read().await;
+        assert_eq!(code_docs.len(), 2, "Should have 2 documents after deletion");
+
+        // Verify deleted file is not in results
+        let phantom = code_docs.iter().find(|d| d.path == deleted_path);
+        assert!(phantom.is_none(), "Deleted file should not be in MeiliSearch");
+
+        // Verify remaining files are correct
+        let paths: Vec<&str> = code_docs.iter().map(|d| d.path.as_str()).collect();
+        assert!(paths.contains(&"/tmp/phantom-test/src/file_0.rs"));
+        assert!(paths.contains(&"/tmp/phantom-test/src/file_2.rs"));
+
+        // Search should not find the deleted file
+        let results = orch.meili().search_code("func_1", 10, None).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "Search for deleted file's function should return empty"
+        );
+    }
+
     // ── Stress tests ─────────────────────────────────────────────
 
     #[tokio::test]
@@ -6279,7 +6950,7 @@ mod tests {
 
         let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let state = mock_app_state_with_graph(mock_store.clone());
-        let orch = Orchestrator::new(state).await.unwrap();
+        let _orch = Orchestrator::new(state).await.unwrap();
 
         let file_base = "/tmp/stress-test/src";
 

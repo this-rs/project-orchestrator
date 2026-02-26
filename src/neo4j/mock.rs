@@ -1150,9 +1150,44 @@ impl GraphStore for MockGraphStore {
         for paths in pf.values_mut() {
             paths.retain(|p| p != path);
         }
-        // Remove symbols linked to this file
+        // Remove symbols linked to this file (mirrors DETACH DELETE in Neo4j)
         self.file_symbols.write().await.remove(path);
         self.import_relationships.write().await.remove(path);
+        // Remove all entities whose file_path matches (DETACH DELETE cascade)
+        self.functions
+            .write()
+            .await
+            .retain(|_, f| f.file_path != path);
+        self.structs_map
+            .write()
+            .await
+            .retain(|_, s| s.file_path != path);
+        self.traits_map
+            .write()
+            .await
+            .retain(|_, t| t.file_path != path);
+        self.enums_map
+            .write()
+            .await
+            .retain(|_, e| e.file_path != path);
+        self.impls_map
+            .write()
+            .await
+            .retain(|_, i| i.file_path != path);
+        self.imports
+            .write()
+            .await
+            .retain(|_, i| i.file_path != path);
+        // Remove call relationships from deleted functions
+        {
+            let funcs = self.functions.read().await;
+            let valid_ids: std::collections::HashSet<&str> =
+                funcs.keys().map(|s| s.as_str()).collect();
+            self.call_relationships
+                .write()
+                .await
+                .retain(|caller, _| valid_ids.contains(caller.as_str()));
+        }
         Ok(())
     }
 

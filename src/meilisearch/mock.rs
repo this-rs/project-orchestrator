@@ -12,9 +12,9 @@ use tokio::sync::RwLock;
 /// simple substring matching; scores are 1.0 for exact matches and 0.5 for
 /// substring matches.
 pub struct MockSearchStore {
-    code_documents: RwLock<Vec<CodeDocument>>,
-    decision_documents: RwLock<Vec<DecisionDocument>>,
-    note_documents: RwLock<Vec<NoteDocument>>,
+    pub code_documents: RwLock<Vec<CodeDocument>>,
+    pub decision_documents: RwLock<Vec<DecisionDocument>>,
+    pub note_documents: RwLock<Vec<NoteDocument>>,
 }
 
 impl MockSearchStore {
