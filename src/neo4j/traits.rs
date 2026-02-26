@@ -1818,6 +1818,24 @@ pub trait GraphStore: Send + Sync {
     async fn get_risk_summary(&self, project_id: Uuid) -> Result<serde_json::Value>;
 
     // ========================================================================
+    // Process detection
+    // ========================================================================
+
+    /// Batch upsert Process nodes using UNWIND.
+    async fn batch_upsert_processes(&self, processes: &[ProcessNode]) -> Result<()>;
+
+    /// Batch create STEP_IN_PROCESS relationships.
+    /// Takes (process_id, function_id, step_number) tuples.
+    async fn batch_create_step_relationships(
+        &self,
+        steps: &[(String, String, u32)],
+    ) -> Result<()>;
+
+    /// Delete all Process nodes and their STEP_IN_PROCESS relationships for a project.
+    /// Returns the number of deleted entities.
+    async fn delete_project_processes(&self, project_id: Uuid) -> Result<u64>;
+
+    // ========================================================================
     // Health check
     // ========================================================================
 

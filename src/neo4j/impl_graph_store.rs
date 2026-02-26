@@ -2220,6 +2220,21 @@ impl GraphStore for Neo4jClient {
         self.get_risk_summary(project_id).await
     }
 
+    async fn batch_upsert_processes(&self, processes: &[ProcessNode]) -> anyhow::Result<()> {
+        self.batch_upsert_processes(processes).await
+    }
+
+    async fn batch_create_step_relationships(
+        &self,
+        steps: &[(String, String, u32)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_step_relationships(steps).await
+    }
+
+    async fn delete_project_processes(&self, project_id: Uuid) -> anyhow::Result<u64> {
+        self.delete_project_processes(project_id).await
+    }
+
     async fn health_check(&self) -> anyhow::Result<bool> {
         match self.execute("RETURN 1 AS ping").await {
             Ok(_) => Ok(true),

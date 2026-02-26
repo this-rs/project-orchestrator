@@ -3304,4 +3304,116 @@ impl Neo4jClient {
 
         Ok(functions)
     }
+
+    /// Batch upsert Process nodes using UNWIND + MERGE.
+    pub async fn batch_upsert_processes(
+        &self,
+        processes: &[crate::neo4j::models::ProcessNode],
+    ) -> Result<()> {
+        if processes.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = processes
+            .iter()
+            .map(|p| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), p.id.clone().into());
+                m.insert("label".into(), p.label.clone().into());
+                m.insert("process_type".into(), p.process_type.clone().into());
+                m.insert("step_count".into(), (p.step_count as i64).into());
+                m.insert("entry_point_id".into(), p.entry_point_id.clone().into());
+                m.insert("terminal_id".into(), p.terminal_id.clone().into());
+                m.insert(
+                    "communities".into(),
+                    p.communities
+                        .iter()
+                        .map(|c| *c as i64)
+                        .collect::<Vec<i64>>()
+                        .into(),
+                );
+                m.insert(
+                    "project_id".into(),
+                    p.project_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default()
+                        .into(),
+                );
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS proc
+            MERGE (p:Process {id: proc.id})
+            SET p.label = proc.label,
+                p.process_type = proc.process_type,
+                p.step_count = proc.step_count,
+                p.entry_point_id = proc.entry_point_id,
+                p.terminal_id = proc.terminal_id,
+                p.communities = proc.communities,
+                p.project_id = proc.project_id
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Batch create STEP_IN_PROCESS relationships.
+    pub async fn batch_create_step_relationships(
+        &self,
+        steps: &[(String, String, u32)],
+    ) -> Result<()> {
+        if steps.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = steps
+            .iter()
+            .map(|(process_id, function_id, step_number)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("process_id".into(), process_id.clone().into());
+                m.insert("function_id".into(), function_id.clone().into());
+                m.insert("step".into(), (*step_number as i64).into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS s
+            MATCH (p:Process {id: s.process_id})
+            MATCH (f:Function {id: s.function_id})
+            MERGE (p)-[r:STEP_IN_PROCESS]->(f)
+            SET r.step = s.step
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Delete all Process nodes and STEP_IN_PROCESS relationships for a project.
+    pub async fn delete_project_processes(&self, project_id: uuid::Uuid) -> Result<u64> {
+        let q = query(
+            r#"
+            MATCH (p:Process {project_id: $project_id})
+            DETACH DELETE p
+            RETURN count(p) AS deleted
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let deleted: i64 = row.get("deleted")?;
+            Ok(deleted as u64)
+        } else {
+            Ok(0)
+        }
+    }
 }

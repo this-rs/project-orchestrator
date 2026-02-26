@@ -6690,6 +6690,22 @@ impl GraphStore for MockGraphStore {
         Ok(serde_json::json!(null))
     }
 
+    async fn batch_upsert_processes(&self, _processes: &[ProcessNode]) -> anyhow::Result<()> {
+        // No-op in mock — process persistence is tested via integration tests
+        Ok(())
+    }
+
+    async fn batch_create_step_relationships(
+        &self,
+        _steps: &[(String, String, u32)],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_project_processes(&self, _project_id: Uuid) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
     async fn health_check(&self) -> anyhow::Result<bool> {
         Ok(true)
     }

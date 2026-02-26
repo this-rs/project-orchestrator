@@ -614,6 +614,22 @@ where
 // Release and Milestone Nodes
 // ============================================================================
 
+/// A detected business process (entry point → terminal through CALLS graph).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessNode {
+    pub id: String,
+    pub label: String,
+    /// "intra_community" or "cross_community"
+    pub process_type: String,
+    pub step_count: u32,
+    pub entry_point_id: String,
+    pub terminal_id: String,
+    pub communities: Vec<u32>,
+    pub project_id: Option<Uuid>,
+}
+
+// ============================================================================
+
 /// A release/version of the project
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseNode {
