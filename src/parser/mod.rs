@@ -4,6 +4,7 @@
 
 pub mod helpers;
 pub mod languages;
+pub mod noise_filter;
 
 use crate::meilisearch::indexes::CodeDocument;
 use crate::neo4j::models::*;

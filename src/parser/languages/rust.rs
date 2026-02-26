@@ -342,11 +342,13 @@ fn extract_calls_recursive(
                 };
 
                 if let Some(callee) = callee_name {
-                    calls.push(FunctionCall {
-                        caller_id: caller_id.to_string(),
-                        callee_name: callee,
-                        line: node.start_position().row as u32 + 1,
-                    });
+                    if !crate::parser::noise_filter::is_builtin_call(&callee) {
+                        calls.push(FunctionCall {
+                            caller_id: caller_id.to_string(),
+                            callee_name: callee,
+                            line: node.start_position().row as u32 + 1,
+                        });
+                    }
                 }
             }
         }

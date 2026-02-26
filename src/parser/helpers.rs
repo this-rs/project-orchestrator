@@ -183,13 +183,16 @@ fn extract_calls_recursive(
 
         // Handle different call expression types across languages
         match node.kind() {
-            "call_expression" | "call" | "function_call_expression" | "method_call_expression" => {
+            "call_expression" | "call" | "function_call_expression" | "method_call_expression"
+            | "method_invocation" => {
                 if let Some(callee_name) = extract_callee_name(&node, source) {
-                    calls.push(super::FunctionCall {
-                        caller_id: caller_id.to_string(),
-                        callee_name,
-                        line: node.start_position().row as u32 + 1,
-                    });
+                    if !super::noise_filter::is_builtin_call(&callee_name) {
+                        calls.push(super::FunctionCall {
+                            caller_id: caller_id.to_string(),
+                            callee_name,
+                            line: node.start_position().row as u32 + 1,
+                        });
+                    }
                 }
             }
             _ => {}
