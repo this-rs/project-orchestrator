@@ -1605,6 +1605,24 @@ pub async fn backfill_decision_embeddings(
     })))
 }
 
+/// POST /api/admin/backfill-discussed — Backfill DISCUSSED relations on existing sessions
+pub async fn backfill_discussed(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (sessions, entities, relations) = state
+        .orchestrator
+        .neo4j()
+        .backfill_discussed()
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "sessions_processed": sessions,
+        "entities_found": entities,
+        "relations_created": relations,
+    })))
+}
+
 // ============================================================================
 // Releases
 // ============================================================================

@@ -657,13 +657,13 @@ fn component_tool() -> ToolDefinition {
 fn chat_tool() -> ToolDefinition {
     ToolDefinition {
         name: "chat".to_string(),
-        description: "Manage chat sessions. Actions: list_sessions, get_session, delete_session, send_message, list_messages".to_string(),
+        description: "Manage chat sessions. Actions: list_sessions, get_session, delete_session, send_message, list_messages, add_discussed, get_session_entities".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list_sessions", "get_session", "delete_session", "send_message", "list_messages"],
+                    "enum": ["list_sessions", "get_session", "delete_session", "send_message", "list_messages", "add_discussed", "get_session_entities"],
                     "description": "Operation to perform"
                 },
                 "session_id": {"type": "string", "description": "Session UUID"},
@@ -674,6 +674,8 @@ fn chat_tool() -> ToolDefinition {
                 "permission_mode": {"type": "string", "description": "Permission mode (send_message)"},
                 "workspace_slug": {"type": "string", "description": "Workspace slug (send_message)"},
                 "add_dirs": {"type": "array", "items": {"type": "string"}, "description": "Additional directories (send_message)"},
+                "entities": {"type": "array", "items": {"type": "object"}, "description": "Entities to mark as discussed (add_discussed): [{entity_type, entity_id}]"},
+                "project_id": {"type": "string", "description": "Project UUID (get_session_entities — scoping filter)"},
                 "limit": {"type": "integer", "description": "Max items"},
                 "offset": {"type": "integer", "description": "Skip items"}
             })),
@@ -755,13 +757,13 @@ fn code_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, backfill_decision_embeddings, backfill_touches".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, backfill_decision_embeddings, backfill_touches, backfill_discussed".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},

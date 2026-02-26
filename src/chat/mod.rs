@@ -5,11 +5,16 @@
 
 pub mod cli_version;
 pub mod config;
+pub mod entity_extractor;
 pub mod manager;
 pub mod path_detect;
 pub mod prompt;
 pub mod types;
 
 pub use config::{ChatConfig, PermissionConfig};
+pub use entity_extractor::{
+    extract_entities, validate_entities, EntityType, ExtractedEntity, ExtractionSource,
+    ValidatedEntity,
+};
 pub use manager::ChatManager;
 pub use types::{ChatEvent, ChatRequest, ChatSession, ClientMessage};

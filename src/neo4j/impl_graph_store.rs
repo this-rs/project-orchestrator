@@ -1875,6 +1875,30 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Chat DISCUSSED relations
+    // ========================================================================
+
+    async fn add_discussed(
+        &self,
+        session_id: Uuid,
+        entities: &[(String, String)],
+    ) -> anyhow::Result<usize> {
+        self.add_discussed(session_id, entities).await
+    }
+
+    async fn get_session_entities(
+        &self,
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<DiscussedEntity>> {
+        self.get_session_entities(session_id, project_id).await
+    }
+
+    async fn backfill_discussed(&self) -> anyhow::Result<(usize, usize, usize)> {
+        self.backfill_discussed().await
+    }
+
+    // ========================================================================
     // User / Auth operations
     // ========================================================================
 

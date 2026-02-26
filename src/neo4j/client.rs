@@ -254,6 +254,8 @@ impl Neo4jClient {
             "CREATE INDEX chat_session_project IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug)",
             "CREATE INDEX chat_session_workspace IF NOT EXISTS FOR (s:ChatSession) ON (s.workspace_slug)",
             "CREATE INDEX chat_session_cli IF NOT EXISTS FOR (s:ChatSession) ON (s.cli_session_id)",
+            // ChatSession composite index for DISCUSSED relation queries
+            "CREATE INDEX chat_session_project_id IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug, s.id)",
             // FeatureGraph indexes
             "CREATE INDEX feature_graph_project IF NOT EXISTS FOR (fg:FeatureGraph) ON (fg.project_id)",
             // User indexes — queried by email, external_id, auth_provider

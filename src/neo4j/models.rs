@@ -116,6 +116,21 @@ pub struct ChatEventRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// An entity discussed in a chat session (via DISCUSSED relation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscussedEntity {
+    /// Entity type: "File", "Function", "Struct", "Trait", "Enum"
+    pub entity_type: String,
+    /// Entity identifier: file path (for File) or symbol name
+    pub entity_id: String,
+    /// Number of times the entity was mentioned in the session
+    pub mention_count: i64,
+    /// When the entity was last mentioned
+    pub last_mentioned_at: Option<String>,
+    /// Source file path (for symbols, not for File entities)
+    pub file_path: Option<String>,
+}
+
 // ============================================================================
 // Code Structure Nodes (from Tree-sitter)
 // ============================================================================

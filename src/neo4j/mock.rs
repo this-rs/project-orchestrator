@@ -5303,6 +5303,31 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
+    // Chat DISCUSSED relations
+    // ========================================================================
+
+    async fn add_discussed(
+        &self,
+        _session_id: Uuid,
+        entities: &[(String, String)],
+    ) -> Result<usize> {
+        // Mock: just return the number of entities as if all were created
+        Ok(entities.len())
+    }
+
+    async fn get_session_entities(
+        &self,
+        _session_id: Uuid,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<DiscussedEntity>> {
+        Ok(Vec::new())
+    }
+
+    async fn backfill_discussed(&self) -> Result<(usize, usize, usize)> {
+        Ok((0, 0, 0))
+    }
+
+    // ========================================================================
     // User / Auth operations
     // ========================================================================
 

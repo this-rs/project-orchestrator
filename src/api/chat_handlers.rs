@@ -37,6 +37,9 @@ pub async fn create_session(
         .await
         .map_err(AppError::Internal)?;
 
+    // T4.3: Extract code entities from the first message and create DISCUSSED relations (non-blocking)
+    super::ws_chat_handler::spawn_entity_extraction(&state, &response.session_id, &request.message);
+
     // Emit CRUD event for live refresh
     state.event_bus.emit(
         CrudEvent::new(
@@ -588,6 +591,78 @@ pub async fn install_cli(
     Json(body): Json<InstallCliRequest>,
 ) -> Json<crate::chat::cli_version::CliInstallResult> {
     Json(crate::chat::cli_version::install_or_upgrade_cli(body.version.as_deref()).await)
+}
+
+// ============================================================================
+// DISCUSSED relations (ChatSession → Entity)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct AddDiscussedRequest {
+    /// List of entities: each is `{ entity_type, entity_id }`
+    pub entities: Vec<DiscussedEntityInput>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiscussedEntityInput {
+    /// Entity type: "File", "Function", "Struct", "Trait", "Enum"
+    pub entity_type: String,
+    /// Entity identifier: file path (for File) or symbol name
+    pub entity_id: String,
+}
+
+/// POST /api/chat/sessions/{id}/discussed — Add DISCUSSED relations
+pub async fn add_discussed(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    Json(body): Json<AddDiscussedRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if body.entities.is_empty() {
+        return Ok(Json(serde_json::json!({ "created": 0 })));
+    }
+
+    let entities: Vec<(String, String)> = body
+        .entities
+        .into_iter()
+        .map(|e| (e.entity_type, e.entity_id))
+        .collect();
+
+    let created = state
+        .orchestrator
+        .neo4j()
+        .add_discussed(session_id, &entities)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({ "created": created })))
+}
+
+/// GET /api/chat/sessions/{id}/discussed — Get entities discussed in a session
+pub async fn get_session_entities(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    Query(params): Query<SessionEntitiesQuery>,
+) -> Result<Json<Vec<crate::neo4j::models::DiscussedEntity>>, AppError> {
+    let project_id = params
+        .project_id
+        .as_ref()
+        .and_then(|s| s.parse::<Uuid>().ok());
+
+    let entities = state
+        .orchestrator
+        .neo4j()
+        .get_session_entities(session_id, project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(entities))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionEntitiesQuery {
+    /// Optional project_id to scope results (security: no cross-project leaks)
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[cfg(test)]

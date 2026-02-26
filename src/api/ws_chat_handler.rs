@@ -708,6 +708,9 @@ async fn handle_ws_chat_loop(
                                     WsChatClientMessage::UserMessage { content } => {
                                         debug!(session_id = %session_id, "WS: Received user_message");
 
+                                        // T4.3: Extract code entities and create DISCUSSED relations (non-blocking)
+                                        spawn_entity_extraction(&state, &session_id, &content);
+
                                         // 3-branch routing: local → remote (NATS RPC) → fallback resume
                                         let result = if chat_manager.is_session_active(&session_id).await {
                                             // Session is local — send directly
@@ -972,4 +975,215 @@ async fn handle_ws_chat_loop(
     }
 
     info!(session_id = %session_id, "Chat WebSocket connection closed");
+}
+
+/// Rate-limiter for neural reinforcement via chat.
+/// Allows at most `MAX_BOOSTS_PER_MINUTE` reinforcement batches per minute
+/// to avoid runaway energy inflation during rapid conversations.
+mod chat_reinforcement_limiter {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// Maximum reinforcement batches per minute window.
+    const MAX_BOOSTS_PER_MINUTE: u32 = 5;
+
+    /// Epoch-minute of the current window.
+    static WINDOW_MINUTE: AtomicU64 = AtomicU64::new(0);
+    /// Number of boosts in the current window.
+    static WINDOW_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    /// Try to acquire a reinforcement slot. Returns `true` if allowed.
+    pub fn try_acquire() -> bool {
+        let now_minute = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 60;
+
+        let stored = WINDOW_MINUTE.load(Ordering::Relaxed);
+        if now_minute != stored {
+            // New minute window — reset counter
+            WINDOW_MINUTE.store(now_minute, Ordering::Relaxed);
+            WINDOW_COUNT.store(1, Ordering::Relaxed);
+            return true;
+        }
+
+        let prev = WINDOW_COUNT.fetch_add(1, Ordering::Relaxed);
+        if prev < MAX_BOOSTS_PER_MINUTE {
+            true
+        } else {
+            // Over limit — undo the increment (best-effort)
+            WINDOW_COUNT.fetch_sub(1, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+/// Spawn a background task to extract code entities from a chat message,
+/// create DISCUSSED relations, and perform neural reinforcement (Hebbian).
+///
+/// This is the integration point between:
+/// - T4.1 (entity_extractor) — regex-based entity extraction
+/// - T4.2 (DISCUSSED) — graph relations
+/// - T4.6 (neural reinforcement) — energy boost + synapse reinforcement
+///
+/// Non-blocking, fire-and-forget. Rate-limited to 5 reinforcement batches/minute.
+pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, message: &str) {
+    use crate::chat::entity_extractor;
+
+    // Quick check: skip empty or very short messages (not worth extracting)
+    if message.len() < 5 {
+        return;
+    }
+
+    // Extract entities synchronously (regex-based, fast — microseconds)
+    let entities = entity_extractor::extract_entities(message);
+    if entities.is_empty() {
+        return;
+    }
+
+    let entity_count = entities.len();
+    let session_uuid = match session_id.parse::<uuid::Uuid>() {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    // Convert to (entity_type, entity_id) tuples for add_discussed
+    // add_discussed expects Neo4j labels: "File", "Function", "Struct", "Trait", "Enum"
+    let discussed_entities: Vec<(String, String)> = entities
+        .into_iter()
+        .map(|e| {
+            let label = match e.entity_type {
+                entity_extractor::EntityType::File => "File",
+                entity_extractor::EntityType::Function => "Function",
+                entity_extractor::EntityType::Struct => "Struct",
+                entity_extractor::EntityType::Trait => "Trait",
+                entity_extractor::EntityType::Enum => "Enum",
+                entity_extractor::EntityType::Symbol => "Function", // best guess
+            };
+            (label.to_string(), e.identifier)
+        })
+        .collect();
+
+    let neo4j = state.orchestrator.neo4j_arc();
+
+    // Read reinforcement config before moving into async block
+    let ar_config = state.orchestrator.auto_reinforcement_config().clone();
+    let should_reinforce = ar_config.enabled && chat_reinforcement_limiter::try_acquire();
+
+    // Clone entity info for reinforcement phase (need it after discussed_entities is consumed)
+    let reinforcement_entities: Vec<(String, String)> = if should_reinforce {
+        discussed_entities.clone()
+    } else {
+        Vec::new()
+    };
+
+    // Fire-and-forget: create DISCUSSED relations + neural reinforcement
+    tokio::spawn(async move {
+        // Phase 1: Create DISCUSSED relations
+        match neo4j.add_discussed(session_uuid, &discussed_entities).await {
+            Ok(created) => {
+                if created > 0 {
+                    debug!(
+                        session_id = %session_uuid,
+                        extracted = entity_count,
+                        discussed = created,
+                        "Entity extraction: created DISCUSSED relations"
+                    );
+                }
+            }
+            Err(e) => {
+                debug!(
+                    session_id = %session_uuid,
+                    error = %e,
+                    "Entity extraction: failed to create DISCUSSED relations"
+                );
+            }
+        }
+
+        // Phase 2: Neural reinforcement (Hebbian learning via chat)
+        // Find notes linked to discussed entities, boost their energy,
+        // and reinforce synapses between co-activated notes.
+        if !should_reinforce || reinforcement_entities.is_empty() {
+            return;
+        }
+
+        let mut all_note_ids: Vec<uuid::Uuid> = Vec::new();
+        let mut boost_count = 0u64;
+
+        for (entity_type_str, entity_id) in &reinforcement_entities {
+            // Map Neo4j label to notes::EntityType
+            let entity_type = match entity_type_str.as_str() {
+                "File" => crate::notes::EntityType::File,
+                "Function" => crate::notes::EntityType::Function,
+                "Struct" => crate::notes::EntityType::Struct,
+                "Trait" => crate::notes::EntityType::Trait,
+                "Enum" => crate::notes::EntityType::Enum,
+                _ => continue,
+            };
+
+            match neo4j.get_notes_for_entity(&entity_type, entity_id).await {
+                Ok(notes) => {
+                    for note in &notes {
+                        // Boost energy for each note linked to a discussed entity
+                        if let Err(e) = neo4j
+                            .boost_energy(note.id, ar_config.chat_energy_boost)
+                            .await
+                        {
+                            debug!(
+                                note_id = %note.id,
+                                error = %e,
+                                "Chat neural reinforcement: energy boost failed"
+                            );
+                        } else {
+                            boost_count += 1;
+                        }
+                        all_note_ids.push(note.id);
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        entity_type = %entity_type_str,
+                        entity_id = %entity_id,
+                        error = %e,
+                        "Chat neural reinforcement: get_notes_for_entity failed"
+                    );
+                }
+            }
+        }
+
+        // Reinforce synapses between co-activated notes (Hebbian: "fire together, wire together")
+        if all_note_ids.len() >= 2 {
+            all_note_ids.sort();
+            all_note_ids.dedup();
+            if all_note_ids.len() >= 2 {
+                match neo4j
+                    .reinforce_synapses(&all_note_ids, ar_config.chat_synapse_boost)
+                    .await
+                {
+                    Ok(synapse_count) => {
+                        debug!(
+                            session_id = %session_uuid,
+                            energy_boosts = boost_count,
+                            synapses_reinforced = synapse_count,
+                            notes_activated = all_note_ids.len(),
+                            "Chat neural reinforcement complete"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            session_id = %session_uuid,
+                            error = %e,
+                            "Chat neural reinforcement: synapse reinforcement failed"
+                        );
+                    }
+                }
+            }
+        } else if boost_count > 0 {
+            debug!(
+                session_id = %session_uuid,
+                energy_boosts = boost_count,
+                "Chat neural reinforcement: energy only (< 2 notes for synapses)"
+            );
+        }
+    });
 }

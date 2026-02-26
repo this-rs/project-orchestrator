@@ -247,6 +247,8 @@ impl ToolHandler {
             ("chat", "delete_session") => "delete_chat_session",
             ("chat", "send_message") => "chat_send_message",
             ("chat", "list_messages") => "list_chat_messages",
+            ("chat", "add_discussed") => "add_discussed",
+            ("chat", "get_session_entities") => "get_session_entities",
 
             // Feature Graph
             ("feature_graph", "create") => "create_feature_graph",
@@ -294,6 +296,7 @@ impl ToolHandler {
             ("admin", "backfill_synapses") => "backfill_synapses",
             ("admin", "backfill_decision_embeddings") => "backfill_decision_embeddings",
             ("admin", "backfill_touches") => "backfill_touches",
+            ("admin", "backfill_discussed") => "backfill_discussed",
 
             _ => {
                 return Err(anyhow!(
@@ -1790,6 +1793,13 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "backfill_discussed" => {
+                let result = http
+                    .post("/api/admin/backfill-discussed", &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
             // ── P8: Workspaces (34 tools) ──────────────────────────────────
 
             // --- Workspace CRUD (5) ---
@@ -2545,6 +2555,31 @@ impl ToolHandler {
                 }
                 let result = http
                     .get_with_query(&format!("/api/chat/sessions/{}/messages", id), &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "add_discussed" => {
+                let id = extract_id(args, "session_id")?;
+                let entities = args
+                    .get("entities")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                let body = json!({ "entities": entities });
+                let result = http
+                    .post(&format!("/api/chat/sessions/{}/discussed", id), &body)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_session_entities" => {
+                let id = extract_id(args, "session_id")?;
+                let mut query = Vec::new();
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query(&format!("/api/chat/sessions/{}/discussed", id), &query)
                     .await?;
                 Ok(Some(result))
             }

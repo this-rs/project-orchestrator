@@ -605,4 +605,330 @@ impl Neo4jClient {
                 .unwrap_or_else(|_| chrono::Utc::now()),
         })
     }
+
+    // ========================================================================
+    // DISCUSSED relations (ChatSession → Entity)
+    // ========================================================================
+
+    /// Add DISCUSSED relations between a chat session and entities.
+    ///
+    /// Uses MERGE for idempotence: if the relation already exists, increments
+    /// `mention_count` and updates `last_mentioned_at`.
+    /// Uses per-type UNWIND batching (one query per entity type).
+    ///
+    /// Each entity is identified by `(entity_type, entity_id)` where:
+    /// - entity_type: "File", "Function", "Struct", "Trait", "Enum"
+    /// - entity_id: the path (for File) or name (for symbols)
+    pub async fn add_discussed(
+        &self,
+        session_id: Uuid,
+        entities: &[(String, String)], // Vec<(entity_type, entity_id)>
+    ) -> Result<usize> {
+        if entities.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0usize;
+
+        // Group entities by type for efficient per-type UNWIND queries
+        let mut files: Vec<String> = Vec::new();
+        let mut functions: Vec<String> = Vec::new();
+        let mut structs: Vec<String> = Vec::new();
+        let mut traits: Vec<String> = Vec::new();
+        let mut enums: Vec<String> = Vec::new();
+
+        for (etype, eid) in entities {
+            match etype.as_str() {
+                "File" => files.push(eid.clone()),
+                "Function" => functions.push(eid.clone()),
+                "Struct" => structs.push(eid.clone()),
+                "Trait" => traits.push(eid.clone()),
+                "Enum" => enums.push(eid.clone()),
+                _ => {} // skip unknown types
+            }
+        }
+
+        // Helper macro: run UNWIND MERGE for a given label and match property
+        // File nodes match on `path`, all others match on `name`
+        let sid = session_id.to_string();
+
+        if !files.is_empty() {
+            let q = query(
+                r#"
+                MATCH (s:ChatSession {id: $session_id})
+                UNWIND $ids AS file_path
+                MATCH (e:File {path: file_path})
+                MERGE (s)-[r:DISCUSSED]->(e)
+                ON CREATE SET r.mention_count = 1,
+                             r.first_mentioned_at = datetime(),
+                             r.last_mentioned_at = datetime()
+                ON MATCH SET r.mention_count = r.mention_count + 1,
+                            r.last_mentioned_at = datetime()
+                RETURN count(r) AS cnt
+                "#,
+            )
+            .param("session_id", sid.clone())
+            .param("ids", files);
+
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        // For symbol types (Function, Struct, Trait, Enum): match on name
+        let symbol_types: &[(&str, &str, Vec<String>)] = &[
+            ("Function", "name", functions),
+            ("Struct", "name", structs),
+            ("Trait", "name", traits),
+            ("Enum", "name", enums),
+        ];
+
+        for (label, _prop, ids) in symbol_types {
+            if ids.is_empty() {
+                continue;
+            }
+
+            // Dynamic label in Cypher via string formatting (label is a static &str, safe)
+            let cypher = format!(
+                r#"
+                MATCH (s:ChatSession {{id: $session_id}})
+                UNWIND $ids AS sym_name
+                MATCH (e:{} {{name: sym_name}})
+                WITH s, e
+                LIMIT 1
+                MERGE (s)-[r:DISCUSSED]->(e)
+                ON CREATE SET r.mention_count = 1,
+                             r.first_mentioned_at = datetime(),
+                             r.last_mentioned_at = datetime()
+                ON MATCH SET r.mention_count = r.mention_count + 1,
+                            r.last_mentioned_at = datetime()
+                RETURN count(r) AS cnt
+                "#,
+                label
+            );
+
+            let q = query(&cypher)
+                .param("session_id", sid.clone())
+                .param("ids", ids.clone());
+
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// Get all entities discussed in a chat session.
+    ///
+    /// Returns a list of `(entity_type, entity_id, mention_count, last_mentioned_at)`.
+    /// Scoped by project_id if provided (security: no cross-project leaks).
+    pub async fn get_session_entities(
+        &self,
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<DiscussedEntity>> {
+        let cypher = if project_id.is_some() {
+            r#"
+            MATCH (s:ChatSession {id: $session_id})-[r:DISCUSSED]->(e)
+            WHERE (e:File AND EXISTS { MATCH (e)<-[:CONTAINS]-(p:Project {id: $project_id}) })
+               OR (e:Function AND e.project_id = $project_id)
+               OR (e:Struct AND e.project_id = $project_id)
+               OR (e:Trait AND e.project_id = $project_id)
+               OR (e:Enum AND e.project_id = $project_id)
+            RETURN
+              CASE
+                WHEN e:File THEN 'File'
+                WHEN e:Function THEN 'Function'
+                WHEN e:Struct THEN 'Struct'
+                WHEN e:Trait THEN 'Trait'
+                WHEN e:Enum THEN 'Enum'
+                ELSE 'Unknown'
+              END AS entity_type,
+              CASE
+                WHEN e:File THEN e.path
+                ELSE e.name
+              END AS entity_id,
+              r.mention_count AS mention_count,
+              toString(r.last_mentioned_at) AS last_mentioned_at,
+              CASE WHEN e:Function THEN e.file_path
+                   WHEN e:Struct THEN e.file_path
+                   WHEN e:Trait THEN e.file_path
+                   WHEN e:Enum THEN e.file_path
+                   ELSE null
+              END AS file_path
+            ORDER BY r.mention_count DESC
+            "#
+        } else {
+            r#"
+            MATCH (s:ChatSession {id: $session_id})-[r:DISCUSSED]->(e)
+            RETURN
+              CASE
+                WHEN e:File THEN 'File'
+                WHEN e:Function THEN 'Function'
+                WHEN e:Struct THEN 'Struct'
+                WHEN e:Trait THEN 'Trait'
+                WHEN e:Enum THEN 'Enum'
+                ELSE 'Unknown'
+              END AS entity_type,
+              CASE
+                WHEN e:File THEN e.path
+                ELSE e.name
+              END AS entity_id,
+              r.mention_count AS mention_count,
+              toString(r.last_mentioned_at) AS last_mentioned_at,
+              CASE WHEN e:Function THEN e.file_path
+                   WHEN e:Struct THEN e.file_path
+                   WHEN e:Trait THEN e.file_path
+                   WHEN e:Enum THEN e.file_path
+                   ELSE null
+              END AS file_path
+            ORDER BY r.mention_count DESC
+            "#
+        };
+
+        let mut q = query(cypher).param("session_id", session_id.to_string());
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut entities = Vec::new();
+        while let Some(row) = result.next().await? {
+            entities.push(DiscussedEntity {
+                entity_type: row.get("entity_type").unwrap_or_default(),
+                entity_id: row.get("entity_id").unwrap_or_default(),
+                mention_count: row.get("mention_count").unwrap_or(1),
+                last_mentioned_at: row.get::<String>("last_mentioned_at").ok(),
+                file_path: row.get::<String>("file_path").ok(),
+            });
+        }
+        Ok(entities)
+    }
+
+    /// Backfill DISCUSSED relations on all existing chat sessions.
+    ///
+    /// Iterates all sessions in batches, extracts entities from user_message events
+    /// using the entity_extractor, and creates DISCUSSED relations via MERGE.
+    /// Idempotent — safe to run multiple times (MERGE prevents duplicates).
+    ///
+    /// Returns `(sessions_processed, entities_found, relations_created)`.
+    pub async fn backfill_discussed(&self) -> Result<(usize, usize, usize)> {
+        use crate::chat::entity_extractor;
+        use tracing::{debug, info};
+
+        const BATCH_SIZE: usize = 100;
+        let mut total_sessions = 0usize;
+        let mut total_entities = 0usize;
+        let mut total_relations = 0usize;
+        let mut offset = 0;
+
+        loop {
+            // Fetch a batch of sessions that have user_message events
+            let q = query(
+                r#"
+                MATCH (s:ChatSession)-[:HAS_EVENT]->(e:ChatEvent)
+                WHERE e.event_type IN ['user_message', 'assistant_text']
+                WITH s, collect(e.data) AS messages
+                RETURN s.id AS session_id, messages
+                ORDER BY s.created_at ASC
+                SKIP $offset
+                LIMIT $limit
+                "#,
+            )
+            .param("offset", offset as i64)
+            .param("limit", BATCH_SIZE as i64);
+
+            let mut result = self.graph.execute(q).await?;
+            let mut batch_count = 0;
+
+            while let Some(row) = result.next().await? {
+                let session_id_str: String = row.get("session_id")?;
+                let session_uuid: Uuid = match session_id_str.parse() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+
+                let messages: Vec<String> = row.get("messages").unwrap_or_default();
+
+                // Extract entities from all messages in this session
+                let mut all_entities: Vec<(String, String)> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+
+                for msg_data in &messages {
+                    // Parse message JSON to get content
+                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(msg_data) {
+                        let content = data
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+
+                        if content.len() < 5 {
+                            continue;
+                        }
+
+                        let entities = entity_extractor::extract_entities(content);
+                        for e in entities {
+                            let label = match e.entity_type {
+                                entity_extractor::EntityType::File => "File",
+                                entity_extractor::EntityType::Function => "Function",
+                                entity_extractor::EntityType::Struct => "Struct",
+                                entity_extractor::EntityType::Trait => "Trait",
+                                entity_extractor::EntityType::Enum => "Enum",
+                                entity_extractor::EntityType::Symbol => "Function",
+                            };
+                            let key = (label.to_string(), e.identifier.clone());
+                            if seen.insert(key.clone()) {
+                                all_entities.push(key);
+                            }
+                        }
+                    }
+                }
+
+                total_entities += all_entities.len();
+
+                if !all_entities.is_empty() {
+                    match self.add_discussed(session_uuid, &all_entities).await {
+                        Ok(created) => {
+                            total_relations += created;
+                        }
+                        Err(e) => {
+                            debug!(
+                                session_id = %session_uuid,
+                                error = %e,
+                                "Backfill: failed to create DISCUSSED for session"
+                            );
+                        }
+                    }
+                }
+
+                batch_count += 1;
+                total_sessions += 1;
+            }
+
+            info!(
+                batch = offset / BATCH_SIZE + 1,
+                sessions = total_sessions,
+                entities = total_entities,
+                relations = total_relations,
+                "Backfill DISCUSSED: batch processed"
+            );
+
+            if batch_count < BATCH_SIZE {
+                break; // Last batch
+            }
+            offset += BATCH_SIZE;
+        }
+
+        info!(
+            sessions = total_sessions,
+            entities = total_entities,
+            relations = total_relations,
+            "Backfill DISCUSSED: complete"
+        );
+
+        Ok((total_sessions, total_entities, total_relations))
+    }
 }

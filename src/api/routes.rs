@@ -639,6 +639,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/admin/backfill-decision-embeddings",
             post(handlers::backfill_decision_embeddings),
         )
+        .route(
+            "/api/admin/backfill-discussed",
+            post(handlers::backfill_discussed),
+        )
         // ================================================================
         // Meilisearch Maintenance
         // ================================================================
@@ -781,6 +785,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/chat/sessions/{id}/messages",
             get(chat_handlers::list_messages),
+        )
+        // DISCUSSED relations (ChatSession → Entity)
+        .route(
+            "/api/chat/sessions/{id}/discussed",
+            post(chat_handlers::add_discussed).get(chat_handlers::get_session_entities),
         )
         // Chat permission config (runtime GET/PUT)
         .route(

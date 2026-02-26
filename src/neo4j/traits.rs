@@ -1519,6 +1519,29 @@ pub trait GraphStore: Send + Sync {
     async fn delete_chat_events(&self, session_id: Uuid) -> Result<()>;
 
     // ========================================================================
+    // Chat DISCUSSED relations (ChatSession → Entity)
+    // ========================================================================
+
+    /// Add DISCUSSED relations between a chat session and entities (MERGE-based, idempotent).
+    /// Each entity is `(entity_type, entity_id)`.
+    async fn add_discussed(
+        &self,
+        session_id: Uuid,
+        entities: &[(String, String)],
+    ) -> Result<usize>;
+
+    /// Get all entities discussed in a chat session, optionally scoped by project_id.
+    async fn get_session_entities(
+        &self,
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<DiscussedEntity>>;
+
+    /// Backfill DISCUSSED relations on all existing sessions.
+    /// Returns `(sessions_processed, entities_found, relations_created)`.
+    async fn backfill_discussed(&self) -> Result<(usize, usize, usize)>;
+
+    // ========================================================================
     // User / Auth operations
     // ========================================================================
 
