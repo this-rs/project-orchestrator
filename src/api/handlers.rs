@@ -1334,6 +1334,18 @@ pub async fn cleanup_builtin_calls(
     Ok(Json(serde_json::json!({ "deleted_count": deleted })))
 }
 
+/// POST /api/admin/migrate-calls-confidence — Add confidence/reason to existing CALLS relationships
+pub async fn migrate_calls_confidence(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let updated = state
+        .orchestrator
+        .neo4j()
+        .migrate_calls_confidence()
+        .await?;
+    Ok(Json(serde_json::json!({ "updated_count": updated })))
+}
+
 /// POST /api/admin/cleanup-sync-data — Delete all sync data (File/Function/Struct nodes) and Meilisearch code index
 pub async fn cleanup_sync_data(
     State(state): State<OrchestratorState>,

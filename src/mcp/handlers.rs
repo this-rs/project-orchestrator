@@ -288,6 +288,7 @@ impl ToolHandler {
             ("admin", "delete_meilisearch_orphans") => "delete_meilisearch_orphans",
             ("admin", "cleanup_cross_project_calls") => "cleanup_cross_project_calls",
             ("admin", "cleanup_builtin_calls") => "cleanup_builtin_calls",
+            ("admin", "migrate_calls_confidence") => "migrate_calls_confidence",
             ("admin", "cleanup_sync_data") => "cleanup_sync_data",
             ("admin", "update_staleness_scores") => "update_staleness_scores",
             ("admin", "update_energy_scores") => "update_energy_scores",
@@ -2847,6 +2848,13 @@ impl ToolHandler {
             "cleanup_builtin_calls" => {
                 let result = http
                     .post("/api/admin/cleanup-builtin-calls", &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "migrate_calls_confidence" => {
+                let result = http
+                    .post("/api/admin/migrate-calls-confidence", &json!({}))
                     .await?;
                 Ok(Some(result))
             }

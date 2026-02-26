@@ -768,11 +768,14 @@ impl Neo4jClient {
     /// Create a CALLS relationship between functions, scoped to the same project.
     /// Uses a 2-phase strategy: prefer same-file callee, then project-scoped with LIMIT 1
     /// to avoid Cartesian products on common names like "new", "default", "from".
+    /// Sets `confidence` (0.0-1.0) and `reason` properties on the CALLS relationship.
     pub async fn create_call_relationship(
         &self,
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
     ) -> Result<()> {
         // Double protection: filter out built-in calls at insertion level
         use crate::parser::noise_filter;
@@ -790,13 +793,16 @@ impl Neo4jClient {
             MATCH (callee:Function {name: $callee_name})
             WHERE callee.file_path = $caller_file_path AND callee.id <> $caller_id
             WITH caller, callee LIMIT 1
-            MERGE (caller)-[:CALLS]->(callee)
+            MERGE (caller)-[r:CALLS]->(callee)
+            SET r.confidence = $confidence, r.reason = $reason
             RETURN count(*) AS linked
             "#,
         )
         .param("caller_id", caller_id)
         .param("callee_name", callee_name)
-        .param("caller_file_path", caller_file_path);
+        .param("caller_file_path", caller_file_path)
+        .param("confidence", confidence)
+        .param("reason", reason);
 
         let same_file_linked = match self.graph.execute(same_file_q).await {
             Ok(mut result) => {
@@ -821,23 +827,29 @@ impl Neo4jClient {
                 MATCH (callee:Function {name: $callee_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
                 WHERE callee.id <> $caller_id
                 WITH caller, callee LIMIT 1
-                MERGE (caller)-[:CALLS]->(callee)
+                MERGE (caller)-[r:CALLS]->(callee)
+                SET r.confidence = $confidence, r.reason = $reason
                 "#,
             )
             .param("caller_id", caller_id)
             .param("callee_name", callee_name)
-            .param("project_id", pid.to_string()),
+            .param("project_id", pid.to_string())
+            .param("confidence", confidence)
+            .param("reason", reason),
             None => query(
                 r#"
                 MATCH (caller:Function {id: $caller_id})
                 MATCH (callee:Function {name: $callee_name})
                 WHERE callee.id <> $caller_id
                 WITH caller, callee LIMIT 1
-                MERGE (caller)-[:CALLS]->(callee)
+                MERGE (caller)-[r:CALLS]->(callee)
+                SET r.confidence = $confidence, r.reason = $reason
                 "#,
             )
             .param("caller_id", caller_id)
-            .param("callee_name", callee_name),
+            .param("callee_name", callee_name)
+            .param("confidence", confidence)
+            .param("reason", reason),
         };
 
         // Ignore errors if callee not found (might be external)
@@ -1519,6 +1531,8 @@ impl Neo4jClient {
                 m.insert("caller_id".into(), call.caller_id.clone().into());
                 m.insert("callee_name".into(), call.callee_name.clone().into());
                 m.insert("caller_file_path".into(), caller_file_path.into());
+                m.insert("confidence".into(), neo4rs::BoltType::Float(neo4rs::BoltFloat { value: call.confidence }));
+                m.insert("reason".into(), call.reason.clone().into());
                 m
             })
             .collect();
@@ -1532,8 +1546,9 @@ impl Neo4jClient {
                 MATCH (caller:Function {id: call.caller_id})
                 MATCH (callee:Function {name: call.callee_name})
                 WHERE callee.file_path = call.caller_file_path AND callee.id <> call.caller_id
-                WITH caller, callee LIMIT 1
-                MERGE (caller)-[:CALLS]->(callee)
+                WITH caller, callee, call LIMIT 1
+                MERGE (caller)-[r:CALLS]->(callee)
+                SET r.confidence = call.confidence, r.reason = call.reason
                 RETURN caller.id AS resolved_caller, callee.name AS resolved_callee
             }
             RETURN resolved_caller, resolved_callee
@@ -1581,8 +1596,9 @@ impl Neo4jClient {
                         MATCH (caller:Function {id: call.caller_id})
                         MATCH (callee:Function {name: call.callee_name, project_id: $project_id})
                         WHERE callee.id <> call.caller_id
-                        WITH caller, callee LIMIT 1
-                        MERGE (caller)-[:CALLS]->(callee)
+                        WITH caller, callee, call LIMIT 1
+                        MERGE (caller)-[r:CALLS]->(callee)
+                        SET r.confidence = call.confidence, r.reason = call.reason
                     }
                     "#,
                 )
@@ -1596,8 +1612,9 @@ impl Neo4jClient {
                         MATCH (caller:Function {id: call.caller_id})
                         MATCH (callee:Function {name: call.callee_name})
                         WHERE callee.id <> call.caller_id
-                        WITH caller, callee LIMIT 1
-                        MERGE (caller)-[:CALLS]->(callee)
+                        WITH caller, callee, call LIMIT 1
+                        MERGE (caller)-[r:CALLS]->(callee)
+                        SET r.confidence = call.confidence, r.reason = call.reason
                     }
                     "#,
                 )
@@ -1817,6 +1834,56 @@ impl Neo4jClient {
             total_deleted
         );
         Ok(total_deleted)
+    }
+
+    /// Migrate existing CALLS relationships: set default confidence and reason
+    /// for any CALLS rel that doesn't have these properties yet.
+    /// Returns the number of relationships updated.
+    pub async fn migrate_calls_confidence(&self) -> Result<i64> {
+        let batch_size = 10_000;
+        let mut total_updated: i64 = 0;
+
+        loop {
+            let q = query(&format!(
+                r#"
+                MATCH (caller:Function)-[r:CALLS]->(callee:Function)
+                WHERE r.confidence IS NULL
+                WITH r LIMIT {}
+                SET r.confidence = 0.50, r.reason = 'fuzzy-global'
+                RETURN count(r) AS cnt
+                "#,
+                batch_size
+            ));
+
+            match self.graph.execute(q).await {
+                Ok(mut result) => {
+                    if let Ok(Some(row)) = result.next().await {
+                        let cnt: i64 = row.get("cnt").unwrap_or(0);
+                        if cnt == 0 {
+                            break;
+                        }
+                        total_updated += cnt;
+                        tracing::info!(
+                            "migrate_calls_confidence: updated batch of {} CALLS rels (total: {})",
+                            cnt,
+                            total_updated
+                        );
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("migrate_calls_confidence query failed: {}", e);
+                    break;
+                }
+            }
+        }
+
+        tracing::info!(
+            "migrate_calls_confidence: updated {} CALLS relationships total",
+            total_updated
+        );
+        Ok(total_updated)
     }
 
     /// Get all functions called by a function
@@ -2383,6 +2450,104 @@ impl Neo4jClient {
         while let Some(row) = result.next().await? {
             if let Ok(name) = row.get::<String>("name") {
                 callees.push(name);
+            }
+        }
+
+        Ok(callees)
+    }
+
+    /// Get direct callers of a function with confidence scores on each CALLS edge.
+    /// Depth 1 only (direct callers) to return per-edge confidence.
+    pub async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        // Returns (caller_name, caller_file, confidence, reason)
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (f:Function {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                MATCH (caller:Function)-[r:CALLS]->(f)
+                WHERE EXISTS { MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                RETURN DISTINCT caller.name AS name, caller.file_path AS file,
+                       coalesce(r.confidence, 0.50) AS confidence,
+                       coalesce(r.reason, 'unknown') AS reason
+                "#,
+            )
+            .param("name", function_name)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (f:Function {name: $name})
+                MATCH (caller:Function)-[r:CALLS]->(f)
+                RETURN DISTINCT caller.name AS name, caller.file_path AS file,
+                       coalesce(r.confidence, 0.50) AS confidence,
+                       coalesce(r.reason, 'unknown') AS reason
+                "#,
+            )
+            .param("name", function_name),
+        };
+
+        let mut result = self.graph.execute(q).await?;
+        let mut callers = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(name), Ok(file)) = (
+                row.get::<String>("name"),
+                row.get::<String>("file"),
+            ) {
+                let confidence = row.get::<f64>("confidence").unwrap_or(0.50);
+                let reason = row.get::<String>("reason").unwrap_or_else(|_| "unknown".to_string());
+                callers.push((name, file, confidence, reason));
+            }
+        }
+
+        Ok(callers)
+    }
+
+    /// Get direct callees of a function with confidence scores on each CALLS edge.
+    pub async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (f:Function {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                MATCH (f)-[r:CALLS]->(callee:Function)
+                WHERE EXISTS { MATCH (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                RETURN DISTINCT callee.name AS name, callee.file_path AS file,
+                       coalesce(r.confidence, 0.50) AS confidence,
+                       coalesce(r.reason, 'unknown') AS reason
+                "#,
+            )
+            .param("name", function_name)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (f:Function {name: $name})
+                MATCH (f)-[r:CALLS]->(callee:Function)
+                RETURN DISTINCT callee.name AS name, callee.file_path AS file,
+                       coalesce(r.confidence, 0.50) AS confidence,
+                       coalesce(r.reason, 'unknown') AS reason
+                "#,
+            )
+            .param("name", function_name),
+        };
+
+        let mut result = self.graph.execute(q).await?;
+        let mut callees = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(name), Ok(file)) = (
+                row.get::<String>("name"),
+                row.get::<String>("file"),
+            ) {
+                let confidence = row.get::<f64>("confidence").unwrap_or(0.50);
+                let reason = row.get::<String>("reason").unwrap_or_else(|_| "unknown".to_string());
+                callees.push((name, file, confidence, reason));
             }
         }
 

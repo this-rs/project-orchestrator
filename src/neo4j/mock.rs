@@ -1332,6 +1332,8 @@ impl GraphStore for MockGraphStore {
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
+        _confidence: f64,
+        _reason: &str,
     ) -> Result<()> {
         // When project_id is provided, only create the relationship if the callee
         // belongs to a file in the same project (mirrors the Cypher join via File→Project)
@@ -1438,7 +1440,7 @@ impl GraphStore for MockGraphStore {
         project_id: Option<Uuid>,
     ) -> Result<()> {
         for call in calls {
-            self.create_call_relationship(&call.caller_id, &call.callee_name, project_id)
+            self.create_call_relationship(&call.caller_id, &call.callee_name, project_id, call.confidence, &call.reason)
                 .await?;
         }
         Ok(())
@@ -1520,6 +1522,11 @@ impl GraphStore for MockGraphStore {
         }
 
         Ok(deleted)
+    }
+
+    async fn migrate_calls_confidence(&self) -> Result<i64> {
+        // Mock: no-op, confidence is always set at creation time in tests
+        Ok(0)
     }
 
     async fn cleanup_sync_data(&self) -> Result<i64> {
@@ -1832,6 +1839,47 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(callees_result)
+    }
+
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        // Mock: return callers with default confidence
+        let cr = self.call_relationships.read().await;
+        let mut result = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            if callees.iter().any(|c| c == function_name) {
+                let file = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
+                result.push((
+                    caller_id.clone(),
+                    file.to_string(),
+                    0.50,
+                    "unscored".to_string(),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        let cr = self.call_relationships.read().await;
+        let mut result = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            if caller_id.ends_with(&format!("::{}", function_name))
+                || caller_id.ends_with(&format!(":{}", function_name))
+            {
+                for callee in callees {
+                    result.push((callee.clone(), String::new(), 0.50, "unscored".to_string()));
+                }
+            }
+        }
+        Ok(result)
     }
 
     async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>> {
@@ -7002,7 +7050,7 @@ mod tests {
 
         // Create a call: main -> helper
         store
-            .create_call_relationship("src/main.rs::main", "helper", Some(project.id))
+            .create_call_relationship("src/main.rs::main", "helper", Some(project.id), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7032,7 +7080,7 @@ mod tests {
 
         // Try to create a call from project_a::process -> transform (which only exists in project_b)
         store
-            .create_call_relationship("a/src/main.rs::process", "transform", Some(project_a.id))
+            .create_call_relationship("a/src/main.rs::process", "transform", Some(project_a.id), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7055,7 +7103,7 @@ mod tests {
 
         // Without project_id (None), cross-project call is allowed (backward compat)
         store
-            .create_call_relationship("a/src/main.rs::process", "transform", None)
+            .create_call_relationship("a/src/main.rs::process", "transform", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7076,11 +7124,11 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("src/lib.rs::caller_a", "target", Some(project.id))
+            .create_call_relationship("src/lib.rs::caller_a", "target", Some(project.id), 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("src/lib.rs::caller_b", "target", Some(project.id))
+            .create_call_relationship("src/lib.rs::caller_b", "target", Some(project.id), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7116,11 +7164,11 @@ mod tests {
 
         // Both call "target" but via None (unscoped create)
         store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7160,11 +7208,11 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7204,11 +7252,11 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("a/src/lib.rs::process", "helper", None)
+            .create_call_relationship("a/src/lib.rs::process", "helper", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::process", "other", None)
+            .create_call_relationship("b/src/lib.rs::process", "other", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7248,15 +7296,15 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b1", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b1", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b2", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b2", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7289,7 +7337,7 @@ mod tests {
         seed_project(&store, &project, &[("src/lib.rs", &["caller", "target"])]).await;
 
         store
-            .create_call_relationship("src/lib.rs::caller", "target", Some(project.id))
+            .create_call_relationship("src/lib.rs::caller", "target", Some(project.id), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7323,11 +7371,11 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7374,6 +7422,8 @@ mod tests {
                 "a/src/handler.rs::handle_request",
                 "validate",
                 Some(project_a.id),
+                0.50,
+                "unscored",
             )
             .await
             .unwrap();
@@ -7384,6 +7434,8 @@ mod tests {
                 "b/src/handler.rs::handle_request",
                 "validate",
                 Some(project_b.id),
+                0.50,
+                "unscored",
             )
             .await
             .unwrap();
@@ -7564,7 +7616,7 @@ mod tests {
 
         // service.rs::do_work calls lib.rs::execute (CALLS axis)
         store
-            .create_call_relationship("src/service.rs::do_work", "execute", Some(project.id))
+            .create_call_relationship("src/service.rs::do_work", "execute", Some(project.id), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7593,7 +7645,7 @@ mod tests {
         seed_project(&store, &project, &[("src/lib.rs", &["fn_a", "fn_b"])]).await;
 
         store
-            .create_call_relationship("src/lib.rs::fn_a", "fn_b", Some(project.id))
+            .create_call_relationship("src/lib.rs::fn_a", "fn_b", Some(project.id), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7627,11 +7679,11 @@ mod tests {
 
         // Both projects' functions call target in project_a
         store
-            .create_call_relationship("a/src/caller.rs::call_it", "target", None)
+            .create_call_relationship("a/src/caller.rs::call_it", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/caller.rs::call_it_b", "target", None)
+            .create_call_relationship("b/src/caller.rs::call_it_b", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7904,7 +7956,7 @@ mod tests {
         let callee_func = make_function("process_data", "src/processor.rs", 1);
         store.upsert_function(&callee_func).await.unwrap();
         store
-            .create_call_relationship("handle_request", "process_data", Some(pid))
+            .create_call_relationship("handle_request", "process_data", Some(pid), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -8121,11 +8173,11 @@ mod tests {
 
         // Chain: entry_fn → direct_fn → transitive_fn
         store
-            .create_call_relationship("entry_fn", "direct_fn", Some(pid))
+            .create_call_relationship("entry_fn", "direct_fn", Some(pid), 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("direct_fn", "transitive_fn", Some(pid))
+            .create_call_relationship("direct_fn", "transitive_fn", Some(pid), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -8550,7 +8602,7 @@ mod tests {
 
         // entry_fn calls helper_fn (call graph link)
         store
-            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None)
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -8780,7 +8832,7 @@ mod tests {
 
         // entry_fn calls helper_fn
         store
-            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None)
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -9174,11 +9226,15 @@ mod tests {
                 caller_id: "src/lib.rs:foo:1".to_string(),
                 callee_name: "bar".to_string(),
                 line: 5,
+                confidence: 0.85,
+                reason: "same-file".to_string(),
             },
             crate::parser::FunctionCall {
                 caller_id: "src/lib.rs:foo:1".to_string(),
                 callee_name: "baz".to_string(),
                 line: 6,
+                confidence: 0.50,
+                reason: "fuzzy-unique".to_string(),
             },
         ];
 
@@ -9423,11 +9479,11 @@ mod tests {
         // Create CALLS: process -> transform_data (real) and process -> println (built-in)
         // Use None for project_id to skip project-file scoping in mock
         store
-            .create_call_relationship("src/main.rs::process", "transform_data", None)
+            .create_call_relationship("src/main.rs::process", "transform_data", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("src/main.rs::process", "println", None)
+            .create_call_relationship("src/main.rs::process", "println", None, 0.50, "unscored")
             .await
             .unwrap();
 

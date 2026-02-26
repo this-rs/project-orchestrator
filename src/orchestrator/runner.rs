@@ -1945,10 +1945,18 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .batch_create_imports_symbol_relationships(&symbol_rels)
             .await?;
 
+        // Score confidence for each function call before persisting
+        let scored_calls = Self::score_function_calls(
+            &parsed.function_calls,
+            parsed,
+            &import_rels,
+            ctx.as_ref().map(|c| &**c),
+        );
+
         // Batch create CALLS relationships (scoped to project to prevent cross-project pollution)
         self.state
             .neo4j
-            .batch_create_call_relationships(&parsed.function_calls, project_id)
+            .batch_create_call_relationships(&scored_calls, project_id)
             .await?;
 
         // Embed file and functions (best-effort, non-blocking)
@@ -2810,6 +2818,113 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         None
+    }
+
+    // ========================================================================
+    // Confidence scoring for CALLS relationships
+    // ========================================================================
+
+    /// Score each function call with a confidence level based on how the callee was resolved.
+    ///
+    /// Scoring levels:
+    /// - **import-resolved** (0.90): callee is defined in a file that the caller's file imports
+    /// - **same-file** (0.85): callee is defined in the same file as the caller
+    /// - **fuzzy-unique** (0.50): callee name found exactly once in the SymbolTable
+    /// - **fuzzy-ambiguous** (0.30): callee name found in multiple files
+    /// - **unscored** (0.50): no SymbolTable available (legacy fallback)
+    fn score_function_calls(
+        calls: &[crate::parser::FunctionCall],
+        parsed: &ParsedFile,
+        import_rels: &[(String, String, String)], // (source_file, target_file, import_path)
+        ctx: Option<&crate::resolver::ImportResolutionContext>,
+    ) -> Vec<crate::parser::FunctionCall> {
+        // Build set of function names defined in this file
+        let same_file_names: std::collections::HashSet<&str> = parsed
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+
+        // Build set of imported file paths from this file
+        let imported_files: std::collections::HashSet<&str> = import_rels
+            .iter()
+            .filter(|(src, _, _)| *src == parsed.path)
+            .map(|(_, target, _)| target.as_str())
+            .collect();
+
+        calls
+            .iter()
+            .map(|call| {
+                let (confidence, reason) = Self::score_single_call(
+                    &call.callee_name,
+                    &call.caller_id,
+                    &same_file_names,
+                    &imported_files,
+                    ctx,
+                );
+
+                crate::parser::FunctionCall {
+                    caller_id: call.caller_id.clone(),
+                    callee_name: call.callee_name.clone(),
+                    line: call.line,
+                    confidence,
+                    reason,
+                }
+            })
+            .collect()
+    }
+
+    /// Score a single function call.
+    fn score_single_call(
+        callee_name: &str,
+        caller_id: &str,
+        same_file_names: &std::collections::HashSet<&str>,
+        imported_files: &std::collections::HashSet<&str>,
+        ctx: Option<&crate::resolver::ImportResolutionContext>,
+    ) -> (f64, String) {
+        // Priority 1: same-file match (callee defined in same file as caller)
+        if same_file_names.contains(callee_name) {
+            return (0.85, "same-file".to_string());
+        }
+
+        // Use SymbolTable from context for deeper resolution
+        if let Some(ctx) = ctx {
+            let defs = ctx.symbol_table.lookup_fuzzy(callee_name);
+
+            if defs.is_empty() {
+                // Not found in any parsed file — could be external
+                return (0.30, "fuzzy-unresolved".to_string());
+            }
+
+            // Check if any definition is in an imported file
+            let caller_file = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
+            for def in defs {
+                // Normalize: imported_files may have full paths, def.file_path may be relative
+                let def_path = def.file_path.as_str();
+                if imported_files.contains(def_path)
+                    || imported_files.iter().any(|f| f.ends_with(def_path) || def_path.ends_with(f))
+                {
+                    return (0.90, "import-resolved".to_string());
+                }
+                // Also check if the def is in the same file (by file_path comparison)
+                if def_path == caller_file
+                    || caller_file.ends_with(def_path)
+                    || def_path.ends_with(caller_file)
+                {
+                    return (0.85, "same-file".to_string());
+                }
+            }
+
+            // Fuzzy: callee found but not in imported or same file
+            if defs.len() == 1 {
+                return (0.50, "fuzzy-unique".to_string());
+            } else {
+                return (0.30, "fuzzy-ambiguous".to_string());
+            }
+        }
+
+        // No context available — keep the default
+        (0.50, "unscored".to_string())
     }
 
     // ========================================================================
@@ -3832,6 +3947,7 @@ pub struct SyncResult {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType as EventEntityType, EventBus, HybridEmitter};
+    use crate::parser::FunctionCall;
     use crate::test_helpers::*;
 
     /// Helper: create an Orchestrator with HybridEmitter, return (orchestrator, receiver)
@@ -5247,6 +5363,8 @@ mod tests {
                 caller_id: format!("{}:foo:1", file_path),
                 callee_name: "bar".to_string(),
                 line: 5,
+                confidence: 0.50,
+                reason: "unscored".to_string(),
             }],
             symbols: vec!["foo".to_string(), "bar".to_string()],
         };
@@ -5763,5 +5881,227 @@ mod tests {
             ctx.suffix_index.get("handlers.rs"),
             Some("src/api/handlers.rs")
         );
+    }
+
+    // =========================================================================
+    // Confidence scoring tests
+    // =========================================================================
+
+    fn make_test_parsed_file(path: &str, func_names: &[&str]) -> ParsedFile {
+        ParsedFile {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            hash: "test".to_string(),
+            functions: func_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| FunctionNode {
+                    name: name.to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: path.to_string(),
+                    line_start: (i as u32 + 1) * 10,
+                    line_end: (i as u32 + 1) * 10 + 5,
+                    docstring: None,
+                })
+                .collect(),
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            imports: vec![],
+            impl_blocks: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        }
+    }
+
+    #[test]
+    fn test_score_same_file() {
+        // foo calls bar, both in the same file → same-file (0.85)
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo", "bar"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "bar".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![];
+
+        let scored = Orchestrator::score_function_calls(
+            &calls, &parsed, &import_rels, None,
+        );
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.85);
+        assert_eq!(scored[0].reason, "same-file");
+    }
+
+    #[test]
+    fn test_score_import_resolved_with_symbol_table() {
+        // foo calls helper, helper is in "src/utils.rs" which is imported
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "helper".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![(
+            "src/lib.rs".to_string(),
+            "src/utils.rs".to_string(),
+            "crate::utils".to_string(),
+        )];
+
+        // Build a symbol table with helper in src/utils.rs
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&[
+            "src/lib.rs".to_string(),
+            "src/utils.rs".to_string(),
+        ]);
+        ctx.symbol_table.add(
+            "helper",
+            "src/utils.rs:helper:1",
+            "src/utils.rs",
+            crate::resolver::symbol_table::SymbolType::Function,
+            1,
+        );
+
+        let scored = Orchestrator::score_function_calls(
+            &calls, &parsed, &import_rels, Some(&ctx),
+        );
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.90);
+        assert_eq!(scored[0].reason, "import-resolved");
+    }
+
+    #[test]
+    fn test_score_fuzzy_unique() {
+        // foo calls helper, helper exists in exactly 1 file but NOT imported
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "helper".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![]; // No imports
+
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&[
+            "src/lib.rs".to_string(),
+            "src/other.rs".to_string(),
+        ]);
+        ctx.symbol_table.add(
+            "helper",
+            "src/other.rs:helper:1",
+            "src/other.rs",
+            crate::resolver::symbol_table::SymbolType::Function,
+            1,
+        );
+
+        let scored = Orchestrator::score_function_calls(
+            &calls, &parsed, &import_rels, Some(&ctx),
+        );
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.50);
+        assert_eq!(scored[0].reason, "fuzzy-unique");
+    }
+
+    #[test]
+    fn test_score_fuzzy_ambiguous() {
+        // foo calls process, process exists in 2 different files, not imported
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "process".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![];
+
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&[
+            "src/lib.rs".to_string(),
+            "src/a.rs".to_string(),
+            "src/b.rs".to_string(),
+        ]);
+        ctx.symbol_table.add(
+            "process",
+            "src/a.rs:process:1",
+            "src/a.rs",
+            crate::resolver::symbol_table::SymbolType::Function,
+            1,
+        );
+        ctx.symbol_table.add(
+            "process",
+            "src/b.rs:process:10",
+            "src/b.rs",
+            crate::resolver::symbol_table::SymbolType::Function,
+            10,
+        );
+
+        let scored = Orchestrator::score_function_calls(
+            &calls, &parsed, &import_rels, Some(&ctx),
+        );
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.30);
+        assert_eq!(scored[0].reason, "fuzzy-ambiguous");
+    }
+
+    #[test]
+    fn test_score_unresolved() {
+        // foo calls unknown_fn, not in symbol table at all
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "unknown_fn".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![];
+
+        let ctx = crate::resolver::ImportResolutionContext::new(&[
+            "src/lib.rs".to_string(),
+        ]);
+
+        let scored = Orchestrator::score_function_calls(
+            &calls, &parsed, &import_rels, Some(&ctx),
+        );
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.30);
+        assert_eq!(scored[0].reason, "fuzzy-unresolved");
+    }
+
+    #[test]
+    fn test_score_no_context_fallback() {
+        // Without context, calls that are not same-file get default unscored
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "external_fn".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![];
+
+        let scored = Orchestrator::score_function_calls(
+            &calls, &parsed, &import_rels, None,
+        );
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.50);
+        assert_eq!(scored[0].reason, "unscored");
     }
 }

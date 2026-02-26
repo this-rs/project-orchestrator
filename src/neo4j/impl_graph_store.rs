@@ -483,8 +483,10 @@ impl GraphStore for Neo4jClient {
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
     ) -> anyhow::Result<()> {
-        self.create_call_relationship(caller_id, callee_name, project_id)
+        self.create_call_relationship(caller_id, callee_name, project_id, confidence, reason)
             .await
     }
 
@@ -546,6 +548,10 @@ impl GraphStore for Neo4jClient {
 
     async fn cleanup_builtin_calls(&self) -> anyhow::Result<i64> {
         self.cleanup_builtin_calls().await
+    }
+
+    async fn migrate_calls_confidence(&self) -> anyhow::Result<i64> {
+        self.migrate_calls_confidence().await
     }
 
     async fn cleanup_sync_data(&self) -> anyhow::Result<i64> {
@@ -634,6 +640,24 @@ impl GraphStore for Neo4jClient {
         project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<String>> {
         self.get_function_callees_by_name(function_name, depth, project_id)
+            .await
+    }
+
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(String, String, f64, String)>> {
+        self.get_callers_with_confidence(function_name, project_id)
+            .await
+    }
+
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(String, String, f64, String)>> {
+        self.get_callees_with_confidence(function_name, project_id)
             .await
     }
 

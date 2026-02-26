@@ -683,6 +683,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::cleanup_builtin_calls),
         )
         .route(
+            "/api/admin/migrate-calls-confidence",
+            post(handlers::migrate_calls_confidence),
+        )
+        .route(
             "/api/admin/cleanup-sync-data",
             post(handlers::cleanup_sync_data),
         )

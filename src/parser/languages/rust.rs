@@ -347,6 +347,8 @@ fn extract_calls_recursive(
                             caller_id: caller_id.to_string(),
                             callee_name: callee,
                             line: node.start_position().row as u32 + 1,
+                            confidence: 0.50,
+                            reason: "unscored".to_string(),
                         });
                     }
                 }

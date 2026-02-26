@@ -375,11 +375,14 @@ pub trait GraphStore: Send + Sync {
     /// Create a CALLS relationship between functions, scoped to the same project.
     /// When project_id is provided, the callee is matched only within the same project
     /// to prevent cross-project CALLS pollution.
+    /// Sets `confidence` (0.0-1.0) and `reason` properties on the CALLS relationship.
     async fn create_call_relationship(
         &self,
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
     ) -> Result<()>;
 
     // ========================================================================
@@ -430,6 +433,10 @@ pub trait GraphStore: Send + Sync {
     /// Delete all CALLS relationships where the callee function name is a known built-in.
     /// Returns the number of deleted relationships.
     async fn cleanup_builtin_calls(&self) -> Result<i64>;
+
+    /// Migrate existing CALLS: set default confidence=0.50 and reason='fuzzy-global'
+    /// for relationships missing these properties.
+    async fn migrate_calls_confidence(&self) -> Result<i64>;
 
     /// Clean up ALL sync-generated data (File, Function, Struct, Trait, Enum, Impl, Import, FeatureGraph).
     /// Returns the total number of deleted entities/relationships.
@@ -496,6 +503,21 @@ pub trait GraphStore: Send + Sync {
         depth: u32,
         project_id: Option<Uuid>,
     ) -> Result<Vec<String>>;
+
+    /// Get direct callers with confidence scores (depth 1 only).
+    /// Returns (name, file_path, confidence, reason) tuples.
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>>;
+
+    /// Get direct callees with confidence scores (depth 1 only).
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>>;
 
     /// Get language statistics across all files
     async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>>;

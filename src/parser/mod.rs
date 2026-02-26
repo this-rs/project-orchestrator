@@ -313,6 +313,11 @@ pub struct FunctionCall {
     pub callee_name: String,
     /// Line where the call occurs
     pub line: u32,
+    /// Confidence score (0.0-1.0) for the call relationship.
+    /// Set during import resolution: import-resolved=0.90, same-file=0.85, fuzzy-global=0.30-0.50
+    pub confidence: f64,
+    /// Reason for the confidence level (e.g., "import-resolved", "same-file", "fuzzy-unique", "fuzzy-ambiguous")
+    pub reason: String,
 }
 
 #[cfg(test)]
@@ -749,11 +754,15 @@ struct Bar {}
             caller_id: "main".to_string(),
             callee_name: "helper".to_string(),
             line: 42,
+            confidence: 0.85,
+            reason: "same-file".to_string(),
         };
 
         assert_eq!(call.caller_id, "main");
         assert_eq!(call.callee_name, "helper");
         assert_eq!(call.line, 42);
+        assert_eq!(call.confidence, 0.85);
+        assert_eq!(call.reason, "same-file");
     }
 
     // =========================================================================

@@ -357,12 +357,28 @@ pub struct CallGraphQuery {
 }
 
 #[derive(Serialize)]
+pub struct CallGraphEdge {
+    pub name: String,
+    pub file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct CallGraphNode {
     pub name: String,
     pub file_path: String,
     pub line: u32,
     pub callers: Vec<String>,
     pub callees: Vec<String>,
+    /// Detailed caller info including confidence scores (when available)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub caller_details: Vec<CallGraphEdge>,
+    /// Detailed callee info including confidence scores (when available)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub callee_details: Vec<CallGraphEdge>,
 }
 
 /// Get call graph for a function
@@ -389,6 +405,8 @@ pub async fn get_call_graph(
 
     let mut callers = vec![];
     let mut callees = vec![];
+    let mut caller_details = vec![];
+    let mut callee_details = vec![];
 
     if direction == "callers" || direction == "both" {
         callers = state
@@ -396,6 +414,23 @@ pub async fn get_call_graph(
             .neo4j()
             .get_function_callers_by_name(&query.function, depth, project_id)
             .await?;
+        // Also get direct callers with confidence (depth 1)
+        if let Ok(details) = state
+            .orchestrator
+            .neo4j()
+            .get_callers_with_confidence(&query.function, project_id)
+            .await
+        {
+            caller_details = details
+                .into_iter()
+                .map(|(name, file, conf, reason)| CallGraphEdge {
+                    name,
+                    file_path: file,
+                    confidence: Some(conf),
+                    reason: Some(reason),
+                })
+                .collect();
+        }
     }
 
     if direction == "callees" || direction == "both" {
@@ -404,6 +439,22 @@ pub async fn get_call_graph(
             .neo4j()
             .get_function_callees_by_name(&query.function, depth, project_id)
             .await?;
+        if let Ok(details) = state
+            .orchestrator
+            .neo4j()
+            .get_callees_with_confidence(&query.function, project_id)
+            .await
+        {
+            callee_details = details
+                .into_iter()
+                .map(|(name, file, conf, reason)| CallGraphEdge {
+                    name,
+                    file_path: file,
+                    confidence: Some(conf),
+                    reason: Some(reason),
+                })
+                .collect();
+        }
     }
 
     Ok(Json(CallGraphNode {
@@ -412,6 +463,8 @@ pub async fn get_call_graph(
         line: 0,
         callers,
         callees,
+        caller_details,
+        callee_details,
     }))
 }
 
