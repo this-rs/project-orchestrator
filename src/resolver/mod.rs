@@ -7,5 +7,7 @@
 //! - `ResolveCache`: LRU cache for resolved imports
 
 pub mod suffix_index;
+pub mod symbol_table;
 
 pub use suffix_index::SuffixIndex;
+pub use symbol_table::SymbolTable;
