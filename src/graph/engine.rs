@@ -150,13 +150,18 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         weights: &FabricWeights,
     ) -> Result<GraphAnalytics> {
         // 1. Extract multi-layer graph
-        let graph = self.extractor.extract_fabric_graph(project_id, weights).await?;
+        let graph = self
+            .extractor
+            .extract_fabric_graph(project_id, weights)
+            .await?;
 
         // 2. Compute analytics (PageRank, Louvain, Betweenness all use edge weights)
         let analytics = compute_all(&graph, &self.config);
 
         // 3. Persist to fabric_* properties (NOT the code-only properties)
-        self.writer.write_fabric_analytics(&analytics, &graph).await?;
+        self.writer
+            .write_fabric_analytics(&analytics, &graph)
+            .await?;
 
         Ok(analytics)
     }

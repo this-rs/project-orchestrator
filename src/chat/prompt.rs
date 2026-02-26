@@ -1215,10 +1215,7 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
                 serde_json::json!(fm.critical_risk_files),
             );
         }
-        map.insert(
-            "knowledge_fabric".into(),
-            serde_json::Value::Object(fabric),
-        );
+        map.insert("knowledge_fabric".into(), serde_json::Value::Object(fabric));
     }
 
     if let Some(ref ts) = ctx.last_synced {

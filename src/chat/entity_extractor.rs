@@ -90,33 +90,71 @@ pub struct ValidatedEntity {
 
 /// Known source code file extensions for path detection.
 const CODE_EXTENSIONS: &[&str] = &[
-    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".cpp",
-    ".h", ".hpp", ".rb", ".php", ".kt", ".swift", ".sh", ".bash", ".zsh",
-    ".yaml", ".yml", ".toml", ".json", ".xml", ".html", ".css", ".scss",
-    ".md", ".txt", ".sql", ".graphql", ".proto", ".dockerfile",
+    ".rs",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".py",
+    ".go",
+    ".java",
+    ".c",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".rb",
+    ".php",
+    ".kt",
+    ".swift",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".json",
+    ".xml",
+    ".html",
+    ".css",
+    ".scss",
+    ".md",
+    ".txt",
+    ".sql",
+    ".graphql",
+    ".proto",
+    ".dockerfile",
 ];
 
 /// Known config/root file names (no directory prefix needed).
 const ROOT_FILES: &[&str] = &[
-    "Cargo.toml", "Cargo.lock", "package.json", "package-lock.json",
-    "tsconfig.json", "pyproject.toml", "setup.py", "go.mod", "go.sum",
-    "Makefile", "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-    ".gitignore", ".env", ".env.example", "README.md",
+    "Cargo.toml",
+    "Cargo.lock",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "pyproject.toml",
+    "setup.py",
+    "go.mod",
+    "go.sum",
+    "Makefile",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    ".gitignore",
+    ".env",
+    ".env.example",
+    "README.md",
 ];
 
 /// Words that look like identifiers but are common English / code noise.
 const NOISE_WORDS: &[&str] = &[
-    "true", "false", "null", "None", "Some", "Ok", "Err", "self", "Self",
-    "super", "crate", "pub", "fn", "let", "mut", "if", "else", "match",
-    "for", "while", "loop", "return", "break", "continue", "use", "mod",
-    "struct", "enum", "trait", "impl", "type", "where", "async", "await",
-    "const", "static", "ref", "move", "dyn", "box", "in", "as", "is",
-    "TODO", "FIXME", "NOTE", "HACK", "XXX", "SAFETY",
-    "String", "Vec", "Option", "Result", "Box", "Arc", "Rc", "HashMap",
-    "HashSet", "BTreeMap", "BTreeSet", "Uuid", "DateTime",
-    "i8", "i16", "i32", "i64", "i128", "isize",
-    "u8", "u16", "u32", "u64", "u128", "usize",
-    "f32", "f64", "bool", "char", "str",
+    "true", "false", "null", "None", "Some", "Ok", "Err", "self", "Self", "super", "crate", "pub",
+    "fn", "let", "mut", "if", "else", "match", "for", "while", "loop", "return", "break",
+    "continue", "use", "mod", "struct", "enum", "trait", "impl", "type", "where", "async", "await",
+    "const", "static", "ref", "move", "dyn", "box", "in", "as", "is", "TODO", "FIXME", "NOTE",
+    "HACK", "XXX", "SAFETY", "String", "Vec", "Option", "Result", "Box", "Arc", "Rc", "HashMap",
+    "HashSet", "BTreeMap", "BTreeSet", "Uuid", "DateTime", "i8", "i16", "i32", "i64", "i128",
+    "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64", "bool", "char", "str",
 ];
 
 /// Extract code entity references from a chat message.
@@ -170,8 +208,20 @@ fn extract_file_paths(text: &str) -> Vec<ExtractedEntity> {
 
     // Split text into tokens (whitespace, backticks, quotes, parens)
     for token in tokenize(text) {
-        let cleaned = token
-            .trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == ',' || c == ';' || c == ':');
+        let cleaned = token.trim_matches(|c: char| {
+            c == '`'
+                || c == '\''
+                || c == '"'
+                || c == '('
+                || c == ')'
+                || c == '['
+                || c == ']'
+                || c == '{'
+                || c == '}'
+                || c == ','
+                || c == ';'
+                || c == ':'
+        });
 
         if cleaned.is_empty() {
             continue;
@@ -220,7 +270,10 @@ fn is_file_path(token: &str) -> bool {
     // If it has a separator, verify it looks like a path (not a URL protocol, etc.)
     if has_separator {
         // Reject URLs
-        if token.starts_with("http://") || token.starts_with("https://") || token.starts_with("ftp://") {
+        if token.starts_with("http://")
+            || token.starts_with("https://")
+            || token.starts_with("ftp://")
+        {
             return false;
         }
 
@@ -343,8 +396,8 @@ fn extract_code_patterns(text: &str) -> Vec<ExtractedEntity> {
                 let abs_pos = search_from + pos;
 
                 // Ensure keyword is at word boundary (start of line or preceded by space/punct)
-                let at_boundary = abs_pos == 0
-                    || !trimmed.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+                let at_boundary =
+                    abs_pos == 0 || !trimmed.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
 
                 if at_boundary {
                     let after_keyword = &trimmed[abs_pos + keyword.len()..];
@@ -394,10 +447,7 @@ fn is_valid_identifier(s: &str) -> bool {
         if !first.is_ascii_alphabetic() && first != '_' {
             return false;
         }
-        if !part
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return false;
         }
     }
@@ -422,7 +472,9 @@ fn classify_identifier(s: &str) -> EntityType {
     // If starts with uppercase → likely Struct/Trait/Enum
     if first.is_ascii_uppercase() {
         // Check if ALL uppercase + underscores → constant, not a type
-        if s.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()) {
+        if s.chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        {
             return EntityType::Symbol;
         }
         return EntityType::Struct; // Will be refined during validation
@@ -494,7 +546,8 @@ pub async fn validate_entities<G: GraphStore>(
                     Ok(refs) if !refs.is_empty() => {
                         // Determine the actual node type from the reference
                         let ref_type = &refs[0].reference_type;
-                        let (resolved_type, node_label) = resolve_node_type(ref_type, &entity.identifier);
+                        let (resolved_type, node_label) =
+                            resolve_node_type(ref_type, &entity.identifier);
                         validated.push(ValidatedEntity {
                             entity_type: resolved_type,
                             identifier: entity.identifier.clone(),
@@ -564,7 +617,9 @@ mod tests {
         let text = "Modifie le fichier src/main.rs pour ajouter le handler";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.entity_type == EntityType::File && e.identifier == "src/main.rs"),
+            entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::File && e.identifier == "src/main.rs"),
             "Should extract src/main.rs, got: {:?}",
             entities
         );
@@ -586,7 +641,9 @@ mod tests {
         let text = "Ajoute une dep dans Cargo.toml";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.entity_type == EntityType::File && e.identifier == "Cargo.toml"),
+            entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::File && e.identifier == "Cargo.toml"),
             "Should extract Cargo.toml, got: {:?}",
             entities
         );
@@ -597,7 +654,9 @@ mod tests {
         let text = "Regarde ./src/chat/mod.rs";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.entity_type == EntityType::File && e.identifier == "src/chat/mod.rs"),
+            entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::File && e.identifier == "src/chat/mod.rs"),
             "Should normalize ./src/ to src/, got: {:?}",
             entities
         );
@@ -608,7 +667,9 @@ mod tests {
         let text = "Regarde https://github.com/foo/bar";
         let entities = extract_entities(text);
         assert!(
-            !entities.iter().any(|e| e.entity_type == EntityType::File && e.identifier.contains("github.com")),
+            !entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::File && e.identifier.contains("github.com")),
             "Should not extract URLs as file paths, got: {:?}",
             entities
         );
@@ -621,7 +682,9 @@ mod tests {
         let text = "La fonction `build_prompt` doit retourner un String";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.identifier == "build_prompt" && e.source == ExtractionSource::Backtick),
+            entities
+                .iter()
+                .any(|e| e.identifier == "build_prompt" && e.source == ExtractionSource::Backtick),
             "Should extract build_prompt from backticks, got: {:?}",
             entities
         );
@@ -632,7 +695,9 @@ mod tests {
         let text = "Le `ChatManager` gere les sessions";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.identifier == "ChatManager" && e.entity_type == EntityType::Struct),
+            entities
+                .iter()
+                .any(|e| e.identifier == "ChatManager" && e.entity_type == EntityType::Struct),
             "Should extract ChatManager as Struct, got: {:?}",
             entities
         );
@@ -643,7 +708,9 @@ mod tests {
         let text = "Regarde `src/chat/mod.rs` pour voir les modules";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.entity_type == EntityType::File && e.identifier == "src/chat/mod.rs"),
+            entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::File && e.identifier == "src/chat/mod.rs"),
             "Should extract file path from backticks, got: {:?}",
             entities
         );
@@ -654,7 +721,9 @@ mod tests {
         let text = "Utilise `Option` et `Result` pour le retour";
         let entities = extract_entities(text);
         assert!(
-            !entities.iter().any(|e| e.identifier == "Option" || e.identifier == "Result"),
+            !entities
+                .iter()
+                .any(|e| e.identifier == "Option" || e.identifier == "Result"),
             "Should skip standard library types, got: {:?}",
             entities
         );
@@ -666,7 +735,9 @@ mod tests {
         let entities = extract_entities(text);
         // Should not extract `rust` as an identifier from ```rust
         assert!(
-            !entities.iter().any(|e| e.identifier == "rust" && e.source == ExtractionSource::Backtick),
+            !entities
+                .iter()
+                .any(|e| e.identifier == "rust" && e.source == ExtractionSource::Backtick),
             "Should not extract language tag from code block, got: {:?}",
             entities
         );
@@ -677,7 +748,9 @@ mod tests {
         let text = "Appelle `crate::chat::manager::send_message`";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.identifier == "crate::chat::manager::send_message"),
+            entities
+                .iter()
+                .any(|e| e.identifier == "crate::chat::manager::send_message"),
             "Should extract qualified paths, got: {:?}",
             entities
         );
@@ -690,7 +763,10 @@ mod tests {
         let text = "Il faut modifier fn build_system_prompt dans le module chat";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.identifier == "build_system_prompt" && e.entity_type == EntityType::Function),
+            entities
+                .iter()
+                .any(|e| e.identifier == "build_system_prompt"
+                    && e.entity_type == EntityType::Function),
             "Should extract function from 'fn' pattern, got: {:?}",
             entities
         );
@@ -701,7 +777,9 @@ mod tests {
         let text = "Ajoute un champ a struct EntityExtractor";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.identifier == "EntityExtractor" && e.entity_type == EntityType::Struct),
+            entities
+                .iter()
+                .any(|e| e.identifier == "EntityExtractor" && e.entity_type == EntityType::Struct),
             "Should extract struct from 'struct' pattern, got: {:?}",
             entities
         );
@@ -712,7 +790,9 @@ mod tests {
         let text = "Implemente trait GraphStore pour MockGraphStore";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.identifier == "GraphStore" && e.entity_type == EntityType::Trait),
+            entities
+                .iter()
+                .any(|e| e.identifier == "GraphStore" && e.entity_type == EntityType::Trait),
             "Should extract trait from 'trait' pattern, got: {:?}",
             entities
         );
@@ -723,7 +803,9 @@ mod tests {
         let text = "Ajoute une variante a enum ChatEvent";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.identifier == "ChatEvent" && e.entity_type == EntityType::Enum),
+            entities
+                .iter()
+                .any(|e| e.identifier == "ChatEvent" && e.entity_type == EntityType::Enum),
             "Should extract enum from 'enum' pattern, got: {:?}",
             entities
         );
@@ -733,10 +815,13 @@ mod tests {
 
     #[test]
     fn test_realistic_message_1() {
-        let text = "Modifie src/main.rs et la fonction `build_prompt` pour supporter le nouveau format";
+        let text =
+            "Modifie src/main.rs et la fonction `build_prompt` pour supporter le nouveau format";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.entity_type == EntityType::File && e.identifier == "src/main.rs"),
+            entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::File && e.identifier == "src/main.rs"),
             "Should extract file"
         );
         assert!(
@@ -750,7 +835,9 @@ mod tests {
         let text = "Le `ChatManager` dans src/chat/manager.rs appelle `send_message` qui est defini dans le trait `GraphStore`";
         let entities = extract_entities(text);
         assert!(entities.iter().any(|e| e.identifier == "ChatManager"));
-        assert!(entities.iter().any(|e| e.entity_type == EntityType::File && e.identifier == "src/chat/manager.rs"));
+        assert!(entities
+            .iter()
+            .any(|e| e.entity_type == EntityType::File && e.identifier == "src/chat/manager.rs"));
         assert!(entities.iter().any(|e| e.identifier == "send_message"));
         assert!(entities.iter().any(|e| e.identifier == "GraphStore"));
     }
@@ -760,9 +847,15 @@ mod tests {
         let text = "Il faut ajouter un champ `energy` a struct NoteNode dans src/neo4j/models.rs et mettre a jour impl GraphStore dans src/neo4j/impl_graph_store.rs";
         let entities = extract_entities(text);
         assert!(entities.iter().any(|e| e.identifier == "energy"));
-        assert!(entities.iter().any(|e| e.identifier == "NoteNode" || e.identifier == "GraphStore"));
-        assert!(entities.iter().any(|e| e.identifier == "src/neo4j/models.rs"));
-        assert!(entities.iter().any(|e| e.identifier == "src/neo4j/impl_graph_store.rs"));
+        assert!(entities
+            .iter()
+            .any(|e| e.identifier == "NoteNode" || e.identifier == "GraphStore"));
+        assert!(entities
+            .iter()
+            .any(|e| e.identifier == "src/neo4j/models.rs"));
+        assert!(entities
+            .iter()
+            .any(|e| e.identifier == "src/neo4j/impl_graph_store.rs"));
     }
 
     #[test]
@@ -783,7 +876,10 @@ mod tests {
     #[test]
     fn test_empty_message() {
         let entities = extract_entities("");
-        assert!(entities.is_empty(), "Empty message should yield no entities");
+        assert!(
+            entities.is_empty(),
+            "Empty message should yield no entities"
+        );
     }
 
     #[test]

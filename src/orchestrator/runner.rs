@@ -5,8 +5,8 @@ use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
 use crate::graph::{
-    AnalyticsConfig, AnalyticsDebouncer, CoChangeDebouncer, NeuralReinforcementDebouncer,
-    AnalyticsEngine, GraphAnalyticsEngine,
+    AnalyticsConfig, AnalyticsDebouncer, AnalyticsEngine, CoChangeDebouncer, GraphAnalyticsEngine,
+    NeuralReinforcementDebouncer,
 };
 use crate::neo4j::models::*;
 use crate::neurons::{AutoReinforcementConfig, SpreadingActivationEngine};
@@ -300,11 +300,8 @@ impl Orchestrator {
         );
         let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();
-        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
-            state.neo4j.clone(),
-            ar_config.clone(),
-            5_000,
-        );
+        let neural_reinforcement_debouncer =
+            NeuralReinforcementDebouncer::new(state.neo4j.clone(), ar_config.clone(), 5_000);
 
         Ok(Self {
             state,
@@ -391,11 +388,8 @@ impl Orchestrator {
         );
         let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();
-        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
-            state.neo4j.clone(),
-            ar_config.clone(),
-            5_000,
-        );
+        let neural_reinforcement_debouncer =
+            NeuralReinforcementDebouncer::new(state.neo4j.clone(), ar_config.clone(), 5_000);
 
         Ok(Self {
             state,
@@ -484,11 +478,8 @@ impl Orchestrator {
         );
         let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();
-        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
-            state.neo4j.clone(),
-            ar_config.clone(),
-            5_000,
-        );
+        let neural_reinforcement_debouncer =
+            NeuralReinforcementDebouncer::new(state.neo4j.clone(), ar_config.clone(), 5_000);
 
         Ok(Self {
             state,
@@ -1271,9 +1262,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         .iter()
                         .map(|f| crate::neo4j::models::FileChangedInfo::from(f.as_str()))
                         .collect();
-                    neo4j
-                        .create_commit_touches(&gc.hash, &file_infos)
-                        .await?;
+                    neo4j.create_commit_touches(&gc.hash, &file_infos).await?;
                     touches_created += gc.files.len() as u64;
                 }
                 commits_backfilled += 1;
@@ -1312,10 +1301,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ///
     /// Uses `git log --name-only --format=...` for efficient parsing.
     /// Limited to `max_commits` most recent commits.
-    fn git_log_touched_files(
-        root_path: &Path,
-        max_commits: usize,
-    ) -> Result<Vec<GitCommitFiles>> {
+    fn git_log_touched_files(root_path: &Path, max_commits: usize) -> Result<Vec<GitCommitFiles>> {
         use std::process::Command;
 
         let output = Command::new("git")

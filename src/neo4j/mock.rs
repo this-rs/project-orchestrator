@@ -3379,10 +3379,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn list_decision_affects(
-        &self,
-        _decision_id: Uuid,
-    ) -> Result<Vec<AffectsRelation>> {
+    async fn list_decision_affects(&self, _decision_id: Uuid) -> Result<Vec<AffectsRelation>> {
         Ok(vec![])
     }
 
@@ -5077,10 +5074,7 @@ impl GraphStore for MockGraphStore {
         Ok(created)
     }
 
-    async fn get_cross_entity_synapses(
-        &self,
-        node_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64, String)>> {
+    async fn get_cross_entity_synapses(&self, node_id: Uuid) -> Result<Vec<(Uuid, f64, String)>> {
         let synapses = self.note_synapses.read().await;
         let notes = self.notes.read().await;
         if let Some(neighbors) = synapses.get(&node_id) {
@@ -6461,10 +6455,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn get_risk_summary(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<serde_json::Value> {
+    async fn get_risk_summary(&self, _project_id: Uuid) -> anyhow::Result<serde_json::Value> {
         Ok(serde_json::json!(null))
     }
 

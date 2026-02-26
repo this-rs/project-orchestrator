@@ -1385,7 +1385,9 @@ impl ToolHandler {
                 if let Some(limit) = args.get("limit").and_then(|v| v.as_i64()) {
                     query_params.push(("limit".to_string(), limit.to_string()));
                 }
-                let result = http.get_with_query("/api/files/history", &query_params).await?;
+                let result = http
+                    .get_with_query("/api/files/history", &query_params)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -2591,10 +2593,7 @@ impl ToolHandler {
 
             "add_discussed" => {
                 let id = extract_id(args, "session_id")?;
-                let entities = args
-                    .get("entities")
-                    .cloned()
-                    .unwrap_or_else(|| json!([]));
+                let entities = args.get("entities").cloned().unwrap_or_else(|| json!([]));
                 let body = json!({ "entities": entities });
                 let result = http
                     .post(&format!("/api/chat/sessions/{}/discussed", id), &body)
@@ -2746,7 +2745,8 @@ impl ToolHandler {
                     query_params.push(("limit".to_string(), v.to_string()));
                 }
                 let result = if query_params.is_empty() {
-                    http.get(&format!("/api/projects/{}/co-changes", project_id)).await?
+                    http.get(&format!("/api/projects/{}/co-changes", project_id))
+                        .await?
                 } else {
                     http.get_with_query(
                         &format!("/api/projects/{}/co-changes", project_id),

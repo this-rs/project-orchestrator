@@ -375,9 +375,10 @@ impl PlanManager {
     ///
     /// Returns the count of decisions processed and embeddings created.
     pub async fn backfill_decision_embeddings(&self) -> Result<(usize, usize)> {
-        let provider = self.embedding_provider.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Embedding provider not configured")
-        })?;
+        let provider = self
+            .embedding_provider
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Embedding provider not configured"))?;
 
         let decisions = self.neo4j.get_decisions_without_embedding().await?;
         let total = decisions.len();

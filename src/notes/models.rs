@@ -1218,7 +1218,10 @@ mod tests {
             propagation_path: vec!["hub_file".to_string(), "target".to_string()],
             distance: 2,
             path_pagerank: Some(hub_pagerank),
-            relation_path: vec![RelationHop::structural("IMPORTS"), RelationHop::structural("CALLS")],
+            relation_path: vec![
+                RelationHop::structural("IMPORTS"),
+                RelationHop::structural("CALLS"),
+            ],
             path_rel_weight: Some(0.9),
         };
         assert_eq!(pn.path_pagerank, Some(0.15));

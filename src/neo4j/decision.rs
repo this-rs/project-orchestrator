@@ -450,10 +450,7 @@ impl Neo4jClient {
     /// List all entities affected by a Decision.
     ///
     /// Returns tuples of (entity_type, entity_id, impact_description).
-    pub async fn list_decision_affects(
-        &self,
-        decision_id: Uuid,
-    ) -> Result<Vec<AffectsRelation>> {
+    pub async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>> {
         let q = query(
             r#"
             MATCH (d:Decision {id: $did})-[r:AFFECTS]->(e)

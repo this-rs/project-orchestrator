@@ -1213,8 +1213,7 @@ impl GraphStore for Neo4jClient {
         min_count: i64,
         limit: i64,
     ) -> anyhow::Result<Vec<CoChanger>> {
-        self.get_file_co_changers(file_path, min_count, limit)
-            .await
+        self.get_file_co_changers(file_path, min_count, limit).await
     }
 
     // ========================================================================
@@ -2157,10 +2156,7 @@ impl GraphStore for Neo4jClient {
         self.batch_update_risk_scores(updates).await
     }
 
-    async fn get_risk_summary(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<serde_json::Value> {
+    async fn get_risk_summary(&self, project_id: Uuid) -> anyhow::Result<serde_json::Value> {
         self.get_risk_summary(project_id).await
     }
 

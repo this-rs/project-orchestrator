@@ -1662,8 +1662,7 @@ pub async fn get_change_hotspots(
         .compute_churn_scores(project.id)
         .await?;
 
-    let limited: Vec<&crate::neo4j::models::FileChurnScore> =
-        scores.iter().take(limit).collect();
+    let limited: Vec<&crate::neo4j::models::FileChurnScore> = scores.iter().take(limit).collect();
 
     Ok(Json(serde_json::json!({
         "hotspots": limited,
@@ -1751,8 +1750,7 @@ pub async fn get_risk_assessment(
         .compute_risk_scores(project.id)
         .await?;
 
-    let limited: Vec<&crate::neo4j::models::FileRiskScore> =
-        scores.iter().take(limit).collect();
+    let limited: Vec<&crate::neo4j::models::FileRiskScore> = scores.iter().take(limit).collect();
 
     // Compute summary stats
     let total = scores.len();

@@ -190,10 +190,9 @@ impl GraphExtractor {
             Ok(synapse_pairs) => {
                 let mut added = 0;
                 for (source, target, weight) in &synapse_pairs {
-                    if let (Some(&src_idx), Some(&tgt_idx)) = (
-                        graph.id_to_index.get(source),
-                        graph.id_to_index.get(target),
-                    ) {
+                    if let (Some(&src_idx), Some(&tgt_idx)) =
+                        (graph.id_to_index.get(source), graph.id_to_index.get(target))
+                    {
                         graph.graph.add_edge(
                             src_idx,
                             tgt_idx,

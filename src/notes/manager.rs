@@ -814,8 +814,10 @@ impl NoteManager {
             vec![]
         };
 
-        let total_count =
-            notes.direct_notes.len() + notes.propagated_notes.len() + decisions.len() + recent_commits.len();
+        let total_count = notes.direct_notes.len()
+            + notes.propagated_notes.len()
+            + decisions.len()
+            + recent_commits.len();
 
         Ok(crate::notes::ContextKnowledge {
             direct_notes: notes.direct_notes,
@@ -847,7 +849,13 @@ impl NoteManager {
 
         // 1. Get propagated notes with full scoring
         let propagated_notes = self
-            .get_propagated_notes(entity_type, entity_id, capped_depth, min_score, relation_types)
+            .get_propagated_notes(
+                entity_type,
+                entity_id,
+                capped_depth,
+                min_score,
+                relation_types,
+            )
             .await?;
 
         // 2. Get decisions related to this entity
@@ -880,15 +888,17 @@ impl NoteManager {
 
         let mut relation_stats: Vec<crate::notes::RelationStats> = rel_map
             .into_iter()
-            .map(|(relation_type, (count, total_score))| crate::notes::RelationStats {
-                relation_type,
-                count,
-                avg_score: if count > 0 {
-                    total_score / count as f64
-                } else {
-                    0.0
+            .map(
+                |(relation_type, (count, total_score))| crate::notes::RelationStats {
+                    relation_type,
+                    count,
+                    avg_score: if count > 0 {
+                        total_score / count as f64
+                    } else {
+                        0.0
+                    },
                 },
-            })
+            )
             .collect();
         relation_stats.sort_by(|a, b| b.count.cmp(&a.count));
 

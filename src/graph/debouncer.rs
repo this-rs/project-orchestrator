@@ -348,7 +348,10 @@ impl NeuralReinforcementDebouncer {
             loop {
                 match tokio::time::timeout(debounce, rx.recv()).await {
                     Ok(Some(p)) => {
-                        pending.entry(p.project_id).or_default().extend(p.file_paths);
+                        pending
+                            .entry(p.project_id)
+                            .or_default()
+                            .extend(p.file_paths);
                     }
                     Ok(None) => return, // channel closed
                     Err(_) => break,    // timeout = quiet period elapsed
@@ -363,10 +366,7 @@ impl NeuralReinforcementDebouncer {
 
                 for file_path in file_paths {
                     match graph_store
-                        .get_notes_for_entity(
-                            &crate::notes::EntityType::File,
-                            file_path,
-                        )
+                        .get_notes_for_entity(&crate::notes::EntityType::File, file_path)
                         .await
                     {
                         Ok(notes) => {

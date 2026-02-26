@@ -838,11 +838,7 @@ pub async fn get_decision_timeline(
     let entries = state
         .orchestrator
         .neo4j()
-        .get_decision_timeline(
-            params.task_id,
-            params.from.as_deref(),
-            params.to.as_deref(),
-        )
+        .get_decision_timeline(params.task_id, params.from.as_deref(), params.to.as_deref())
         .await?;
     Ok(Json(entries))
 }
@@ -1327,7 +1323,10 @@ pub struct CreateCommitRequest {
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
     /// Files changed in this commit (enables incremental sync + TOUCHES relations).
     /// Accepts either simple strings `["a.rs"]` or objects `[{"path": "a.rs", "additions": 10}]`.
-    #[serde(default, deserialize_with = "crate::neo4j::models::deserialize_files_changed")]
+    #[serde(
+        default,
+        deserialize_with = "crate::neo4j::models::deserialize_files_changed"
+    )]
     pub files_changed: Option<Vec<crate::neo4j::models::FileChangedInfo>>,
     /// Project UUID (enables incremental sync + analytics)
     pub project_id: Option<String>,
@@ -1426,12 +1425,12 @@ pub async fn create_commit(
         // which batches file paths across rapid-fire commits (e.g., during git
         // checkout/rebase) and performs a single pass after a 5s quiet period.
         if orchestrator.auto_reinforcement_config().enabled && !paths_for_boost.is_empty() {
-            orchestrator
-                .neural_reinforcement_debouncer()
-                .trigger(crate::graph::ReinforcementPayload {
+            orchestrator.neural_reinforcement_debouncer().trigger(
+                crate::graph::ReinforcementPayload {
                     project_id: pid,
                     file_paths: paths_for_boost,
-                });
+                },
+            );
         }
     }
 
@@ -1544,7 +1543,11 @@ pub async fn get_co_change_graph(
     let pairs = state
         .orchestrator
         .neo4j()
-        .get_co_change_graph(project_id, query.min_count.unwrap_or(3), query.limit.unwrap_or(100))
+        .get_co_change_graph(
+            project_id,
+            query.min_count.unwrap_or(3),
+            query.limit.unwrap_or(100),
+        )
         .await?;
     Ok(Json(pairs))
 }
@@ -1565,7 +1568,11 @@ pub async fn get_file_co_changers(
     let changers = state
         .orchestrator
         .neo4j()
-        .get_file_co_changers(&query.path, query.min_count.unwrap_or(3), query.limit.unwrap_or(50))
+        .get_file_co_changers(
+            &query.path,
+            query.min_count.unwrap_or(3),
+            query.limit.unwrap_or(50),
+        )
         .await?;
     Ok(Json(changers))
 }
@@ -1746,12 +1753,7 @@ pub async fn bootstrap_knowledge_fabric(
     }
 
     // Step 3: Backfill DISCUSSED relations
-    match state
-        .orchestrator
-        .neo4j()
-        .backfill_discussed()
-        .await
-    {
+    match state.orchestrator.neo4j().backfill_discussed().await {
         Ok((sessions, entities, relations)) => completed.push(serde_json::json!({
             "step": "backfill_discussed",
             "sessions_processed": sessions,

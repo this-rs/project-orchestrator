@@ -343,8 +343,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Decision Affects
         .route(
             "/api/decisions/{decision_id}/affects",
-            post(handlers::add_decision_affects)
-                .get(handlers::list_decision_affects),
+            post(handlers::add_decision_affects).get(handlers::list_decision_affects),
         )
         .route(
             "/api/decisions/{decision_id}/affects/{entity_type}/{entity_id}",
@@ -420,7 +419,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/projects/{project_id}/co-changes",
             get(handlers::get_co_change_graph),
         )
-        .route("/api/files/co-changers", get(handlers::get_file_co_changers))
+        .route(
+            "/api/files/co-changers",
+            get(handlers::get_file_co_changers),
+        )
         // Backfill TOUCHES from git history
         .route(
             "/api/projects/{project_slug}/backfill-touches",

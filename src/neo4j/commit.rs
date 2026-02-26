@@ -161,14 +161,8 @@ impl Neo4jClient {
             .map(|f| {
                 let mut m = std::collections::HashMap::new();
                 m.insert("path".into(), f.path.clone().into());
-                m.insert(
-                    "additions".into(),
-                    f.additions.unwrap_or(-1).into(),
-                );
-                m.insert(
-                    "deletions".into(),
-                    f.deletions.unwrap_or(-1).into(),
-                );
+                m.insert("additions".into(), f.additions.unwrap_or(-1).into());
+                m.insert("deletions".into(), f.deletions.unwrap_or(-1).into());
                 m
             })
             .collect();
@@ -206,10 +200,7 @@ impl Neo4jClient {
     }
 
     /// Get all files touched by a commit (via TOUCHES relationships)
-    pub async fn get_commit_files(
-        &self,
-        commit_hash: &str,
-    ) -> Result<Vec<CommitFileInfo>> {
+    pub async fn get_commit_files(&self, commit_hash: &str) -> Result<Vec<CommitFileInfo>> {
         let q = query(
             r#"
             MATCH (c:Commit {hash: $hash})-[r:TOUCHES]->(f:File)

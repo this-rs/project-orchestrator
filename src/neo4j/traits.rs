@@ -4,7 +4,9 @@
 //! This trait mirrors all public async methods of `Neo4jClient`,
 //! enabling testing with mock implementations and future backend swaps.
 
-use crate::graph::models::{FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate};
+use crate::graph::models::{
+    FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate,
+};
 use crate::neo4j::models::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -821,11 +823,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>>;
 
     /// Mark a decision as superseded by a newer decision
-    async fn supersede_decision(
-        &self,
-        new_decision_id: Uuid,
-        old_decision_id: Uuid,
-    ) -> Result<()>;
+    async fn supersede_decision(&self, new_decision_id: Uuid, old_decision_id: Uuid) -> Result<()>;
 
     /// Get a timeline of decisions, optionally filtered by task and date range
     async fn get_decision_timeline(
@@ -1425,10 +1423,7 @@ pub trait GraphStore: Send + Sync {
 
     /// Get all SYNAPSE neighbors for any node (Note or Decision).
     /// Returns (neighbor_id, weight, entity_type) where entity_type is "Note" or "Decision".
-    async fn get_cross_entity_synapses(
-        &self,
-        node_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64, String)>>;
+    async fn get_cross_entity_synapses(&self, node_id: Uuid) -> Result<Vec<(Uuid, f64, String)>>;
 
     /// List Decision nodes that have embeddings but no SYNAPSE relationships.
     /// Used for cross-entity synapse backfill.
@@ -1526,11 +1521,8 @@ pub trait GraphStore: Send + Sync {
 
     /// Add DISCUSSED relations between a chat session and entities (MERGE-based, idempotent).
     /// Each entity is `(entity_type, entity_id)`.
-    async fn add_discussed(
-        &self,
-        session_id: Uuid,
-        entities: &[(String, String)],
-    ) -> Result<usize>;
+    async fn add_discussed(&self, session_id: Uuid, entities: &[(String, String)])
+        -> Result<usize>;
 
     /// Get all entities discussed in a chat session, optionally scoped by project_id.
     async fn get_session_entities(
@@ -1733,11 +1725,8 @@ pub trait GraphStore: Send + Sync {
     async fn batch_update_churn_scores(&self, updates: &[FileChurnScore]) -> Result<()>;
 
     /// Get top N files by churn_score (pre-computed on File nodes).
-    async fn get_top_hotspots(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<FileChurnScore>>;
+    async fn get_top_hotspots(&self, project_id: Uuid, limit: usize)
+        -> Result<Vec<FileChurnScore>>;
 
     // ========================================================================
     // T5.6 — Knowledge density score
@@ -1750,10 +1739,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Vec<FileKnowledgeDensity>>;
 
     /// Batch-write knowledge density scores to File nodes.
-    async fn batch_update_knowledge_density(
-        &self,
-        updates: &[FileKnowledgeDensity],
-    ) -> Result<()>;
+    async fn batch_update_knowledge_density(&self, updates: &[FileKnowledgeDensity]) -> Result<()>;
 
     /// Get top N files with lowest knowledge_density (knowledge gaps).
     async fn get_top_knowledge_gaps(

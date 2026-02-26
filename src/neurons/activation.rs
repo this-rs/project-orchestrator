@@ -155,7 +155,12 @@ impl SpreadingActivationEngine {
             }
             activations.insert(
                 note.id,
-                (*score, ActivationSource::Direct, note.clone(), "note".to_string()),
+                (
+                    *score,
+                    ActivationSource::Direct,
+                    note.clone(),
+                    "note".to_string(),
+                ),
             );
         }
 
@@ -179,7 +184,10 @@ impl SpreadingActivationEngine {
                         debug!("Failed to get cross-entity synapses for {}: {}", node_id, e);
                         // Fallback to Note-only synapses
                         match self.graph_store.get_synapses(*node_id).await {
-                            Ok(s) => s.into_iter().map(|(id, w)| (id, w, "Note".to_string())).collect(),
+                            Ok(s) => s
+                                .into_iter()
+                                .map(|(id, w)| (id, w, "Note".to_string()))
+                                .collect(),
                             Err(_) => continue,
                         }
                     }

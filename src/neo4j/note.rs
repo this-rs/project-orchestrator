@@ -652,7 +652,11 @@ impl Neo4jClient {
             // hop_weights: parallel array — null for structural, f64 for SYNAPSE
             let hop_weights: Vec<Option<f64>> = row
                 .get::<Vec<f64>>("hop_weights")
-                .map(|ws| ws.into_iter().map(|w| if w == 0.0 { None } else { Some(w) }).collect())
+                .map(|ws| {
+                    ws.into_iter()
+                        .map(|w| if w == 0.0 { None } else { Some(w) })
+                        .collect()
+                })
                 .unwrap_or_else(|_| vec![None; rel_types.len()]);
 
             // Build RelationHop vec combining type + weight info
