@@ -2949,6 +2949,15 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         parsed_path,
                         &ctx.suffix_index,
                     ),
+                    "swift" => Self::resolve_swift_import_indexed(
+                        &import.path,
+                        &ctx.suffix_index,
+                    ),
+                    "bash" => Self::resolve_bash_import_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3662,6 +3671,123 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             if let Some(resolved) = index.get(path) {
                 return vec![resolved.to_string()];
             }
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Swift import using SuffixIndex.
+    ///
+    /// Swift `import Module` imports an entire module. System frameworks
+    /// (Foundation, UIKit, SwiftUI, etc.) are ignored. For local modules,
+    /// we look for `.swift` files in a `Sources/<Module>/` directory
+    /// (Swift Package Manager convention).
+    fn resolve_swift_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Handle `import class/struct/func Module.Type` → extract module name
+        let module = if path.starts_with("class ")
+            || path.starts_with("struct ")
+            || path.starts_with("enum ")
+            || path.starts_with("func ")
+            || path.starts_with("var ")
+            || path.starts_with("typealias ")
+            || path.starts_with("protocol ")
+        {
+            // e.g. "class Foundation.NSObject" → "Foundation"
+            let rest = path.split_whitespace().nth(1).unwrap_or("");
+            rest.split('.').next().unwrap_or("")
+        } else {
+            // e.g. "Foundation" or "MyModule.SubModule"
+            path.split('.').next().unwrap_or(path)
+        };
+
+        if module.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore Apple/system frameworks
+        const SYSTEM_FRAMEWORKS: &[&str] = &[
+            "Foundation", "UIKit", "SwiftUI", "AppKit", "Combine", "CoreData",
+            "CoreGraphics", "CoreLocation", "CoreImage", "CoreML", "MapKit",
+            "Metal", "MetalKit", "SceneKit", "SpriteKit", "AVFoundation",
+            "ARKit", "RealityKit", "GameplayKit", "StoreKit", "CloudKit",
+            "HealthKit", "HomeKit", "WatchKit", "WidgetKit", "ActivityKit",
+            "Accelerate", "Darwin", "Dispatch", "ObjectiveC", "os", "Swift",
+            "XCTest", "PlaygroundSupport", "CryptoKit", "Network", "NaturalLanguage",
+            "Vision", "CoreMotion", "CoreBluetooth", "MultipeerConnectivity",
+            "Security", "LocalAuthentication", "WebKit", "SafariServices",
+            "MessageUI", "Contacts", "EventKit", "Photos", "PhotosUI",
+            "UniformTypeIdentifiers", "Intents", "IntentsUI", "UserNotifications",
+            "NotificationCenter", "SystemConfiguration", "IOKit", "OSLog",
+        ];
+
+        if SYSTEM_FRAMEWORKS.contains(&module) {
+            return Vec::new();
+        }
+
+        // SPM convention: Sources/<Module>/*.swift
+        let dir = format!("Sources/{}", module);
+        let files = index.get_files_in_dir(&dir, "swift");
+        if !files.is_empty() {
+            return files.into_iter().map(|f| f.to_string()).collect();
+        }
+
+        // Fallback: try to find <Module>.swift directly
+        let suffix = format!("{}.swift", module);
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Bash source/. import using SuffixIndex.
+    ///
+    /// `source ./script.sh` → relative to source file.
+    /// `. /path/to/lib.sh` → resolve relative to source file.
+    /// Paths containing shell variables ($HOME, ${DIR}, etc.) are ignored.
+    fn resolve_bash_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim().trim_matches('"').trim_matches('\'');
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore paths with shell variables
+        if path.contains('$') {
+            return Vec::new();
+        }
+
+        let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+
+        // Strip leading ./ if present
+        let clean_path = path.strip_prefix("./").unwrap_or(path);
+
+        // Build relative candidate
+        let candidate = if source_dir.is_empty() {
+            clean_path.to_string()
+        } else {
+            format!("{}/{}", source_dir, clean_path)
+        };
+
+        // Try relative resolution
+        if let Some(resolved) = index.get(&candidate) {
+            return vec![resolved.to_string()];
+        }
+
+        // Fallback: suffix-only lookup (basename)
+        if let Some(resolved) = index.get(clean_path) {
+            return vec![resolved.to_string()];
         }
 
         Vec::new()
@@ -7779,6 +7905,115 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         let result = Orchestrator::resolve_zig_import_indexed("nonexistent.zig", "src/main.zig", &index);
+        assert!(result.is_empty());
+    }
+
+    // ── Swift resolver tests ────────────────────────────────────
+
+    #[test]
+    fn test_resolve_swift_import_local_module() {
+        let paths = vec![
+            "Sources/MyModule/Foo.swift".to_string(),
+            "Sources/MyModule/Bar.swift".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_swift_import_indexed("MyModule", &index);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"Sources/MyModule/Foo.swift".to_string()));
+        assert!(result.contains(&"Sources/MyModule/Bar.swift".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_swift_import_single_file() {
+        let paths = vec!["lib/Networking.swift".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // No Sources/Networking/ dir, falls back to Networking.swift
+        let result = Orchestrator::resolve_swift_import_indexed("Networking", &index);
+        assert_eq!(result, vec!["lib/Networking.swift"]);
+    }
+
+    #[test]
+    fn test_resolve_swift_system_framework_ignored() {
+        let paths = vec!["Sources/Foundation/fake.swift".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_swift_import_indexed("Foundation", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_swift_import_indexed("UIKit", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_swift_import_indexed("SwiftUI", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_swift_import_submodule() {
+        let paths = vec!["Sources/MyLib/Core.swift".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // `import MyLib.Core` → module = "MyLib"
+        let result = Orchestrator::resolve_swift_import_indexed("MyLib.Core", &index);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_swift_import_kind_prefix() {
+        let paths = vec!["Sources/MyModule/Types.swift".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // `import class MyModule.SomeClass` → module = "MyModule"
+        let result = Orchestrator::resolve_swift_import_indexed("class MyModule.SomeClass", &index);
+        assert_eq!(result.len(), 1);
+    }
+
+    // ── Bash resolver tests ─────────────────────────────────────
+
+    #[test]
+    fn test_resolve_bash_source_relative() {
+        let paths = vec![
+            "scripts/main.sh".to_string(),
+            "scripts/utils.sh".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_bash_import_indexed("./utils.sh", "scripts/main.sh", &index);
+        assert_eq!(result, vec!["scripts/utils.sh"]);
+    }
+
+    #[test]
+    fn test_resolve_bash_dot_source() {
+        let paths = vec![
+            "bin/run.sh".to_string(),
+            "bin/lib/helpers.sh".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // `. lib/helpers.sh` from bin/run.sh
+        let result = Orchestrator::resolve_bash_import_indexed("lib/helpers.sh", "bin/run.sh", &index);
+        assert_eq!(result, vec!["bin/lib/helpers.sh"]);
+    }
+
+    #[test]
+    fn test_resolve_bash_variable_ignored() {
+        let paths = vec!["scripts/lib.sh".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_bash_import_indexed("$HOME/scripts/lib.sh", "main.sh", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_bash_import_indexed("${DIR}/lib.sh", "main.sh", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_bash_nonexistent() {
+        let paths = vec!["scripts/main.sh".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_bash_import_indexed("./missing.sh", "scripts/main.sh", &index);
         assert!(result.is_empty());
     }
 
