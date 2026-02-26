@@ -158,6 +158,9 @@ pub struct Orchestrator {
     /// Embedding provider for code embeddings (File/Function nodes).
     /// Shared with NoteManager and SpreadingActivationEngine.
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    /// LRU cache for parsed AST results, avoiding re-parsing unchanged files
+    /// across consecutive syncs.
+    ast_cache: tokio::sync::Mutex<crate::parser::ast_cache::AstCache>,
 }
 
 /// Create an embedding provider from resolved [`Config`] fields.
@@ -338,6 +341,7 @@ impl Orchestrator {
             event_bus: None,
             event_emitter: None,
             embedding_provider: embedding_provider.clone(),
+            ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
         })
     }
 
@@ -426,6 +430,7 @@ impl Orchestrator {
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
+            ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
         })
     }
 
@@ -516,6 +521,7 @@ impl Orchestrator {
             event_bus: None,
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
+            ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
         })
     }
 
@@ -529,6 +535,16 @@ impl Orchestrator {
         if let Some(emitter) = &self.event_emitter {
             emitter.emit(event);
         }
+    }
+
+    /// Get AST cache statistics (hits, misses, size).
+    pub async fn ast_cache_stats(&self) -> crate::parser::ast_cache::AstCacheStats {
+        self.ast_cache.lock().await.stats()
+    }
+
+    /// Reset AST cache hit/miss counters (useful between test sync runs).
+    pub async fn reset_ast_cache_stats(&self) {
+        self.ast_cache.lock().await.reset_stats();
     }
 
     /// Get the plan manager
@@ -1455,8 +1471,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             to_parse.push(fc);
         }
 
-        // ── Phase 3: Parse ─────────────────────────────────────────
-        let parsed_files = parse_files(to_parse, &self.parser).await;
+        // ── Phase 3: Parse (with AST cache) ─────────────────────────
+        let mut cache_guard = self.ast_cache.lock().await;
+        let parsed_files = parse_files_with_cache(to_parse, Some(&mut *cache_guard)).await;
+        drop(cache_guard); // Release lock before Neo4j calls
         let parse_count = parsed_files.len();
 
         // ── Build ImportResolutionContext once for all files ────────
@@ -4329,6 +4347,10 @@ pub fn chunk_by_size(files: Vec<FileContent>, budget: u64) -> Vec<Vec<FileConten
 /// rayon's thread pool. Each rayon thread gets its own `CodeParser` via
 /// `thread_local!` (tree-sitter `Parser` is not `Send`).
 ///
+/// An optional [`AstCache`] is consulted before parsing: cache hits skip
+/// the tree-sitter step entirely. Cache misses are parsed via rayon and
+/// then inserted into the cache.
+///
 /// The `_parser` parameter is kept for API compatibility but is NOT used —
 /// parallel parsing creates thread-local parsers instead.
 ///
@@ -4337,91 +4359,151 @@ pub async fn parse_files(
     files: Vec<FileContent>,
     _parser: &Arc<RwLock<CodeParser>>,
 ) -> Vec<ParsedFile> {
+    parse_files_with_cache(files, None).await
+}
+
+/// Parse files with optional AST cache.
+///
+/// See [`parse_files`] for details. When `cache` is provided, files whose
+/// `(path, hash)` pair is in the cache are returned immediately without
+/// re-parsing.
+pub async fn parse_files_with_cache(
+    files: Vec<FileContent>,
+    mut cache: Option<&mut crate::parser::ast_cache::AstCache>,
+) -> Vec<ParsedFile> {
     let start = std::time::Instant::now();
     let total_files = files.len();
     let total_bytes: u64 = files.iter().map(|f| f.size.max(f.content.len() as u64)).sum();
 
-    let chunks = chunk_by_size(files, CHUNK_BYTE_BUDGET);
+    // ── Cache lookup (single-threaded, before rayon) ───────────
+    let mut cached_results: Vec<ParsedFile> = Vec::new();
+    let to_parse: Vec<FileContent> = if cache.is_some() {
+        let c = cache.as_mut().unwrap();
+        let mut needs_parse = Vec::new();
+        for file in files {
+            if let Some(cached) = c.get(&file.path, &file.hash) {
+                cached_results.push(cached.clone());
+            } else {
+                needs_parse.push(file);
+            }
+        }
+        needs_parse
+    } else {
+        files
+    };
+
+    let cache_hits = cached_results.len();
+
+    // ── Capture original FileContent hashes for cache population ──
+    // We use FileContent.hash (from read_files) as the cache key, not
+    // ParsedFile.hash (recomputed by parse_file). In production they are
+    // identical (both SHA-256 of the same content), but keeping the key
+    // source consistent avoids subtle mismatches.
+    let file_hashes: std::collections::HashMap<String, String> = to_parse
+        .iter()
+        .map(|f| (f.path.clone(), f.hash.clone()))
+        .collect();
+
+    // ── Chunk + parallel parse for cache misses ────────────────
+    let chunks = chunk_by_size(to_parse, CHUNK_BYTE_BUDGET);
     let num_chunks = chunks.len();
 
-    // Run CPU-intensive parsing on the rayon thread pool via spawn_blocking
-    // to avoid blocking the tokio runtime's async threads.
-    let (parsed, parse_errors) = tokio::task::spawn_blocking(move || {
-        use rayon::prelude::*;
-        use std::cell::RefCell;
+    let (newly_parsed, parse_errors) = if chunks.is_empty() {
+        (Vec::new(), 0)
+    } else {
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            use std::cell::RefCell;
 
-        thread_local! {
-            static TL_PARSER: RefCell<Option<CodeParser>> = RefCell::new(None);
-        }
+            thread_local! {
+                static TL_PARSER: RefCell<Option<CodeParser>> = RefCell::new(None);
+            }
 
-        let mut all_parsed = Vec::with_capacity(total_files);
-        let mut total_errors = 0usize;
+            let mut all_parsed = Vec::new();
+            let mut total_errors = 0usize;
 
-        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            let chunk_files = chunk.len();
-            let chunk_bytes: u64 = chunk
-                .iter()
-                .map(|f| f.size.max(f.content.len() as u64))
-                .sum();
+            for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+                let chunk_files = chunk.len();
+                let chunk_bytes: u64 = chunk
+                    .iter()
+                    .map(|f| f.size.max(f.content.len() as u64))
+                    .sum();
 
-            let chunk_results: Vec<Option<ParsedFile>> = chunk
-                .par_iter()
-                .map(|file| {
-                    TL_PARSER.with(|p| {
-                        let mut p = p.borrow_mut();
-                        if p.is_none() {
-                            *p = CodeParser::new().ok();
-                        }
-                        let parser = p.as_mut()?;
-                        let file_path = std::path::Path::new(&file.path);
-                        match parser.parse_file(file_path, &file.content) {
-                            Ok(pf) => Some(pf),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "parse_files: failed to parse {}: {}",
-                                    file.path,
-                                    e
-                                );
-                                None
+                let chunk_results: Vec<Option<ParsedFile>> = chunk
+                    .par_iter()
+                    .map(|file| {
+                        TL_PARSER.with(|p| {
+                            let mut p = p.borrow_mut();
+                            if p.is_none() {
+                                *p = CodeParser::new().ok();
                             }
-                        }
+                            let parser = p.as_mut()?;
+                            let file_path = std::path::Path::new(&file.path);
+                            match parser.parse_file(file_path, &file.content) {
+                                Ok(pf) => Some(pf),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "parse_files: failed to parse {}: {}",
+                                        file.path,
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        })
                     })
-                })
-                .collect();
+                    .collect();
 
-            let chunk_errors = chunk_results.iter().filter(|r| r.is_none()).count();
-            total_errors += chunk_errors;
-            all_parsed.extend(chunk_results.into_iter().flatten());
+                let chunk_errors = chunk_results.iter().filter(|r| r.is_none()).count();
+                total_errors += chunk_errors;
+                all_parsed.extend(chunk_results.into_iter().flatten());
 
-            tracing::info!(
-                "parse_files: chunk {}/{}: {} files ({} errors), {:.1} MB",
-                chunk_idx + 1,
-                num_chunks,
-                chunk_files,
-                chunk_errors,
-                chunk_bytes as f64 / (1024.0 * 1024.0),
-            );
+                tracing::info!(
+                    "parse_files: chunk {}/{}: {} files ({} errors), {:.1} MB",
+                    chunk_idx + 1,
+                    num_chunks,
+                    chunk_files,
+                    chunk_errors,
+                    chunk_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+
+            (all_parsed, total_errors)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("parse_files: spawn_blocking panicked: {}", e);
+            (Vec::new(), total_files)
+        })
+    };
+
+    // ── Populate cache with newly parsed files ─────────────────
+    // Use the original FileContent hash as the cache key so that lookups
+    // (which also use FileContent.hash) will match on subsequent calls.
+    if let Some(c) = cache {
+        for parsed in &newly_parsed {
+            let hash = file_hashes.get(&parsed.path).unwrap_or(&parsed.hash);
+            c.set(&parsed.path, hash, parsed.clone());
         }
+    }
 
-        (all_parsed, total_errors)
-    })
-    .await
-    .unwrap_or_else(|e| {
-        tracing::error!("parse_files: spawn_blocking panicked: {}", e);
-        (Vec::new(), total_files)
-    });
+    // ── Merge cached + newly parsed ────────────────────────────
+    let mut all_parsed = cached_results;
+    all_parsed.extend(newly_parsed);
 
     let elapsed = start.elapsed();
     tracing::info!(
-        "parse_files: parsed {} files ({} errors, {:.1} MB, {} chunks) in {:?} [rayon]",
-        parsed.len(),
+        "parse_files: {} total ({} cached, {} parsed, {} errors, {:.1} MB, {} chunks) in {:?}",
+        all_parsed.len(),
+        cache_hits,
+        all_parsed.len() - cache_hits,
         parse_errors,
         total_bytes as f64 / (1024.0 * 1024.0),
         num_chunks,
         elapsed
     );
 
-    parsed
+    all_parsed
 }
 
 /// Phase 2: Read file contents from disk.
@@ -7359,6 +7441,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored, 0);
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_with_cache_hit() {
+        use crate::parser::SupportedLanguage;
+        use crate::parser::ast_cache::AstCache;
+
+        let mut cache = AstCache::new();
+
+        let files = vec![FileContent {
+            path: "/tmp/cached.rs".to_string(),
+            content: "pub fn cached_fn() {}".to_string(),
+            size: 21,
+            language: SupportedLanguage::Rust,
+            hash: "hash_v1".to_string(),
+        }];
+
+        // First parse — cache miss
+        let parsed1 = parse_files_with_cache(files.clone(), Some(&mut cache)).await;
+        assert_eq!(parsed1.len(), 1);
+        let stats1 = cache.stats();
+        assert_eq!(stats1.misses, 1);
+        assert_eq!(stats1.hits, 0);
+        assert_eq!(stats1.size, 1);
+
+        // Second parse with same content — cache hit
+        let parsed2 = parse_files_with_cache(files, Some(&mut cache)).await;
+        assert_eq!(parsed2.len(), 1);
+        let stats2 = cache.stats();
+        assert_eq!(stats2.hits, 1);
+        assert_eq!(stats2.misses, 1);
+
+        // Results should be identical
+        assert_eq!(parsed1[0].path, parsed2[0].path);
+        assert_eq!(parsed1[0].functions.len(), parsed2[0].functions.len());
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_with_cache_miss_on_changed_content() {
+        use crate::parser::SupportedLanguage;
+        use crate::parser::ast_cache::AstCache;
+
+        let mut cache = AstCache::new();
+
+        // First version
+        let files_v1 = vec![FileContent {
+            path: "/tmp/changing.rs".to_string(),
+            content: "pub fn version_one() {}".to_string(),
+            size: 23,
+            language: SupportedLanguage::Rust,
+            hash: "hash_v1".to_string(),
+        }];
+        let p1 = parse_files_with_cache(files_v1, Some(&mut cache)).await;
+        assert_eq!(p1.len(), 1);
+
+        // Second version — different hash → cache miss
+        let files_v2 = vec![FileContent {
+            path: "/tmp/changing.rs".to_string(),
+            content: "pub fn version_two() {}".to_string(),
+            size: 23,
+            language: SupportedLanguage::Rust,
+            hash: "hash_v2".to_string(),
+        }];
+        let p2 = parse_files_with_cache(files_v2, Some(&mut cache)).await;
+        assert_eq!(p2.len(), 1);
+
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 2); // both were misses (different hashes)
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_without_cache_still_works() {
+        use crate::parser::SupportedLanguage;
+
+        let files = vec![FileContent {
+            path: "/tmp/no_cache.rs".to_string(),
+            content: "pub fn no_cache() {}".to_string(),
+            size: 20,
+            language: SupportedLanguage::Rust,
+            hash: "h".to_string(),
+        }];
+
+        // None cache — should still parse
+        let parsed = parse_files_with_cache(files, None).await;
+        assert_eq!(parsed.len(), 1);
+    }
+
+    /// Test that consecutive syncs with the AST cache only re-parse changed files.
+    ///
+    /// 1. Create 10 .rs files in a temp dir
+    /// 2. First sync (force=true) → all 10 are cache misses (parsed fresh)
+    /// 3. Modify 3 of the 10 files
+    /// 4. Second sync (force=true) → 7 cache hits + 3 misses
+    #[tokio::test]
+    async fn test_sync_ast_cache_skips_unchanged_files() {
+        use crate::test_helpers::mock_app_state_with_stores;
+        use std::fs;
+
+        // ── Setup: temp dir with 10 .rs files ──────────────────────
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        for i in 0..10 {
+            let file_path = src_dir.join(format!("file_{}.rs", i));
+            fs::write(&file_path, format!("pub fn func_{}() {{}}", i)).unwrap();
+        }
+
+        let (state, _neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        // ── First sync: all 10 files are cache misses ──────────────
+        let result1 = orch
+            .sync_directory_for_project_with_options(tmp.path(), None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result1.files_synced, 10, "First sync should parse all 10 files");
+
+        let stats1 = orch.ast_cache_stats().await;
+        assert_eq!(stats1.misses, 10, "All 10 files should be cache misses");
+        assert_eq!(stats1.hits, 0, "No cache hits on first sync");
+        assert_eq!(stats1.size, 10, "Cache should hold all 10 entries");
+
+        // ── Modify 3 files ─────────────────────────────────────────
+        for i in 0..3 {
+            let file_path = src_dir.join(format!("file_{}.rs", i));
+            fs::write(&file_path, format!("pub fn func_{}_v2() {{ /* updated */ }}", i)).unwrap();
+        }
+
+        // Reset counters to isolate second sync stats
+        orch.reset_ast_cache_stats().await;
+
+        // ── Second sync: 7 cache hits + 3 misses ──────────────────
+        let result2 = orch
+            .sync_directory_for_project_with_options(tmp.path(), None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result2.files_synced, 10, "All 10 files should be stored (force=true)");
+
+        let stats2 = orch.ast_cache_stats().await;
+        assert_eq!(stats2.hits, 7, "7 unchanged files should be cache hits");
+        assert_eq!(stats2.misses, 3, "3 modified files should be cache misses");
+        // Cache has 13 entries: 10 original + 3 new (old entries have different hashes
+        // and will be evicted naturally via LRU when capacity is reached)
+        assert_eq!(stats2.size, 13, "Cache should hold 10 + 3 entries (old + new hashes)");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //!
 //! Supports multiple programming languages with full AST extraction.
 
+pub mod ast_cache;
 pub mod helpers;
 pub mod languages;
 pub mod noise_filter;
