@@ -524,6 +524,13 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(code_handlers::get_risk_assessment),
         )
         // ================================================================
+        // Process Detection
+        // ================================================================
+        .route(
+            "/api/code/processes/detect",
+            get(code_handlers::detect_processes),
+        )
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(

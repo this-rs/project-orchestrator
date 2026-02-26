@@ -1848,6 +1848,60 @@ pub async fn get_risk_assessment(
     })))
 }
 
+// ============================================================================
+// Process Detection
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct DetectProcessesQuery {
+    pub project_slug: String,
+}
+
+/// POST /api/code/processes/detect
+///
+/// Detect business processes by scoring entry points, BFS traversal through
+/// the CALLS graph, deduplication, and classification.
+pub async fn detect_processes(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<DetectProcessesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let processes = state
+        .orchestrator
+        .analytics()
+        .detect_processes(project.id)
+        .await?;
+
+    let processes_json: Vec<serde_json::Value> = processes
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "label": p.label,
+                "process_type": p.process_type.to_string(),
+                "step_count": p.steps.len(),
+                "entry_point": p.entry_point_id,
+                "terminal": p.terminal_id,
+                "steps": p.steps,
+                "communities": p.communities.iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "processes": processes_json,
+        "total": processes.len(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

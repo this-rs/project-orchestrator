@@ -278,6 +278,7 @@ impl ToolHandler {
             ("code", "plan_implementation") => "plan_implementation",
             ("code", "get_co_change_graph") => "get_co_change_graph",
             ("code", "get_file_co_changers") => "get_file_co_changers",
+            ("code", "detect_processes") => "detect_processes",
 
             // Admin
             ("admin", "sync_directory") => "sync_directory",
@@ -2780,6 +2781,15 @@ impl ToolHandler {
                 }
                 let result = http
                     .get_with_query("/api/files/co-changers", &query_params)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "detect_processes" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![("project_slug".to_string(), project_slug)];
+                let result = http
+                    .get_with_query("/api/code/processes/detect", &query)
                     .await?;
                 Ok(Some(result))
             }
