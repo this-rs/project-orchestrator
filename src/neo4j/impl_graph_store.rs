@@ -414,6 +414,10 @@ impl GraphStore for Neo4jClient {
         self.upsert_file(file).await
     }
 
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> anyhow::Result<()> {
+        self.batch_upsert_files(files).await
+    }
+
     async fn get_file(&self, path: &str) -> anyhow::Result<Option<FileNode>> {
         self.get_file(path).await
     }

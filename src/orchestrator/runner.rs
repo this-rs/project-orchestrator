@@ -1469,44 +1469,42 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         import_ctx.populate_symbols(&parsed_files);
         import_ctx.log_stats();
 
-        // ── Store: Neo4j + MeiliSearch ─────────────────────────────
-        for parsed in &parsed_files {
-            match self
-                .store_parsed_file_for_project_with_ctx(parsed, project_id, Some(&mut import_ctx))
-                .await
-            {
-                Ok(()) => {
-                    // Index in Meilisearch only if project context is available
-                    if let (Some(pid), Some(slug)) = (project_id, project_slug.as_deref()) {
-                        let doc = CodeParser::to_code_document(parsed, &pid.to_string(), slug);
-                        if let Err(e) = self.state.meili.index_code(&doc).await {
-                            tracing::warn!(
-                                "Failed to index {} in Meilisearch: {}",
-                                parsed.path,
-                                e
-                            );
-                        }
-                    }
+        // ── Store: Batch Neo4j (~10 queries total) ─────────────────
+        match self
+            .store_parsed_files_batch(&parsed_files, project_id, &mut import_ctx)
+            .await
+        {
+            Ok(stored) => {
+                result.files_synced = stored;
+            }
+            Err(e) => {
+                tracing::error!("Batch store failed: {}", e);
+                result.errors = parse_count;
+            }
+        }
 
-                    // Verify notes attached to this file
-                    if let Ok(content) = tokio::fs::read_to_string(&parsed.path).await {
-                        if let Err(e) = self
-                            .verify_notes_for_file(&parsed.path, parsed, &content)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to verify notes for {}: {}",
-                                parsed.path,
-                                e
-                            );
-                        }
-                    }
-
-                    result.files_synced += 1;
+        // ── Index in MeiliSearch ───────────────────────────────────
+        if let (Some(pid), Some(slug)) = (project_id, project_slug.as_deref()) {
+            for parsed in &parsed_files {
+                let doc = CodeParser::to_code_document(parsed, &pid.to_string(), slug);
+                if let Err(e) = self.state.meili.index_code(&doc).await {
+                    tracing::warn!(
+                        "Failed to index {} in Meilisearch: {}",
+                        parsed.path,
+                        e
+                    );
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to store {}: {}", parsed.path, e);
-                    result.errors += 1;
+            }
+        }
+
+        // ── Verify notes (best-effort) ─────────────────────────────
+        for parsed in &parsed_files {
+            if let Ok(content) = tokio::fs::read_to_string(&parsed.path).await {
+                if let Err(e) = self
+                    .verify_notes_for_file(&parsed.path, parsed, &content)
+                    .await
+                {
+                    tracing::warn!("Failed to verify notes for {}: {}", parsed.path, e);
                 }
             }
         }
@@ -2039,6 +2037,188 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         Ok(())
+    }
+
+    /// Store multiple parsed files in Neo4j using batch operations.
+    ///
+    /// Instead of calling `store_parsed_file_for_project_with_ctx` per file
+    /// (which issues ~10 Neo4j queries each), this method accumulates all
+    /// entities across files and issues ~10 batch queries total:
+    ///
+    /// 1. batch_upsert_files
+    /// 2. batch_upsert_functions
+    /// 3. batch_upsert_structs
+    /// 4. batch_upsert_traits
+    /// 5. batch_upsert_enums
+    /// 6. batch_upsert_impls
+    /// 7. batch_upsert_imports
+    /// 8. batch_create_import_relationships (per-file resolution, batched write)
+    /// 9. batch_create_imports_symbol_relationships
+    /// 10. batch_create_call_relationships (per-file scoring, batched write)
+    ///
+    /// This reduces Neo4j round-trips from O(files × 10) to O(10).
+    async fn store_parsed_files_batch(
+        &self,
+        parsed_files: &[ParsedFile],
+        project_id: Option<Uuid>,
+        ctx: &mut crate::resolver::ImportResolutionContext,
+    ) -> Result<usize> {
+        if parsed_files.is_empty() {
+            return Ok(0);
+        }
+
+        let store_start = std::time::Instant::now();
+
+        // ── 1. Accumulate file nodes ──────────────────────────────────
+        let file_nodes: Vec<FileNode> = parsed_files
+            .iter()
+            .map(|p| FileNode {
+                path: normalize_path(&p.path),
+                language: p.language.clone(),
+                hash: p.hash.clone(),
+                last_parsed: chrono::Utc::now(),
+                project_id,
+            })
+            .collect();
+        self.state.neo4j.batch_upsert_files(&file_nodes).await?;
+
+        // ── 2. Accumulate all symbols ─────────────────────────────────
+        let all_functions: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.functions.iter().cloned())
+            .collect();
+        let all_structs: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.structs.iter().cloned())
+            .collect();
+        let all_traits: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.traits.iter().cloned())
+            .collect();
+        let all_enums: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.enums.iter().cloned())
+            .collect();
+        let all_impls: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.impl_blocks.iter().cloned())
+            .collect();
+        let all_imports: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.imports.iter().cloned())
+            .collect();
+
+        self.state
+            .neo4j
+            .batch_upsert_functions(&all_functions)
+            .await?;
+        self.state
+            .neo4j
+            .batch_upsert_structs(&all_structs)
+            .await?;
+        self.state.neo4j.batch_upsert_traits(&all_traits).await?;
+        self.state.neo4j.batch_upsert_enums(&all_enums).await?;
+        self.state.neo4j.batch_upsert_impls(&all_impls).await?;
+        self.state
+            .neo4j
+            .batch_upsert_imports(&all_imports)
+            .await?;
+
+        // ── 3. Resolve imports per-file, accumulate relationships ─────
+        let mut all_import_rels: Vec<(String, String, String)> = Vec::new();
+        let mut all_symbol_rels: Vec<(String, String, Option<Uuid>)> = Vec::new();
+        let mut all_scored_calls: Vec<crate::parser::FunctionCall> = Vec::new();
+
+        for parsed in parsed_files {
+            // Import resolution (per-file — needs source file path)
+            let mut file_import_rels: Vec<(String, String, String)> = Vec::new();
+            for import in &parsed.imports {
+                let resolved_files = self.resolve_imports_for_language_with_ctx(
+                    import,
+                    &parsed.path,
+                    &parsed.language,
+                    Some(ctx),
+                );
+                for target_file in &resolved_files {
+                    file_import_rels.push((
+                        parsed.path.clone(),
+                        target_file.clone(),
+                        import.path.clone(),
+                    ));
+                }
+
+                // IMPORTS_SYMBOL relationships
+                let import_id =
+                    format!("{}:{}:{}", import.file_path, import.line, import.path);
+                let symbols = Self::extract_imported_symbols(import);
+                for symbol_name in &symbols {
+                    all_symbol_rels.push((
+                        import_id.clone(),
+                        symbol_name.clone(),
+                        project_id,
+                    ));
+                }
+            }
+
+            // Score function calls (per-file — needs same-file context)
+            let scored_calls = Self::score_function_calls(
+                &parsed.function_calls,
+                parsed,
+                &file_import_rels,
+                Some(ctx),
+            );
+            all_scored_calls.extend(scored_calls);
+            all_import_rels.extend(file_import_rels);
+        }
+
+        // ── 4. Batch write all relationships ──────────────────────────
+        self.state
+            .neo4j
+            .batch_create_import_relationships(&all_import_rels)
+            .await?;
+        self.state
+            .neo4j
+            .batch_create_imports_symbol_relationships(&all_symbol_rels)
+            .await?;
+        self.state
+            .neo4j
+            .batch_create_call_relationships(&all_scored_calls, project_id)
+            .await?;
+
+        // ── 5. Embeddings (best-effort, non-blocking) ─────────────────
+        if self.embedding_provider.is_some() {
+            for parsed in parsed_files {
+                let provider = self.embedding_provider.clone().unwrap();
+                let neo4j = self.state.neo4j.clone();
+                let parsed_clone = parsed.clone();
+                let file_path = normalize_path(&parsed.path);
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path)
+                            .await
+                    {
+                        tracing::warn!(
+                            file = %file_path,
+                            error = %e,
+                            "Failed to embed file (best-effort)"
+                        );
+                    }
+                });
+            }
+        }
+
+        let elapsed = store_start.elapsed();
+        tracing::info!(
+            "store_parsed_files_batch: stored {} files ({} functions, {} imports, {} calls) \
+             in ~10 Neo4j queries, {:?}",
+            parsed_files.len(),
+            all_functions.len(),
+            all_imports.len(),
+            all_scored_calls.len(),
+            elapsed,
+        );
+
+        Ok(parsed_files.len())
     }
 
     /// Build a summary text for embedding a file.
@@ -7071,6 +7251,114 @@ mod tests {
         let defs = ctx.symbol_table.lookup_fuzzy("handle_request");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].file_path, "src/api/handlers.rs");
+    }
+
+    #[tokio::test]
+    async fn test_store_parsed_files_batch_accumulates() {
+        // Verify that batch store accumulates all entities across files
+        let (orch, _rx) = orch_with_bus().await;
+        let mock = orch.neo4j().clone();
+
+        let parsed_files = vec![
+            ParsedFile {
+                path: "/tmp/batch_a.rs".to_string(),
+                language: "rust".to_string(),
+                hash: "ha".to_string(),
+                functions: vec![FunctionNode {
+                    name: "fn_a".to_string(),
+                    file_path: "/tmp/batch_a.rs".to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    docstring: None,
+                }],
+                structs: vec![],
+                traits: vec![],
+                enums: vec![],
+                imports: vec![],
+                impl_blocks: vec![],
+                function_calls: vec![],
+                symbols: vec![],
+            },
+            ParsedFile {
+                path: "/tmp/batch_b.rs".to_string(),
+                language: "rust".to_string(),
+                hash: "hb".to_string(),
+                functions: vec![FunctionNode {
+                    name: "fn_b".to_string(),
+                    file_path: "/tmp/batch_b.rs".to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    docstring: None,
+                }],
+                structs: vec![],
+                traits: vec![],
+                enums: vec![],
+                imports: vec![],
+                impl_blocks: vec![],
+                function_calls: vec![],
+                symbols: vec![],
+            },
+        ];
+
+        let all_paths = vec![
+            "/tmp/batch_a.rs".to_string(),
+            "/tmp/batch_b.rs".to_string(),
+        ];
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
+        ctx.populate_symbols(&parsed_files);
+
+        let stored = orch
+            .store_parsed_files_batch(&parsed_files, None, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(stored, 2);
+
+        // Both files should exist
+        let file_a: Option<FileNode> = mock.get_file("/tmp/batch_a.rs").await.unwrap();
+        let file_b: Option<FileNode> = mock.get_file("/tmp/batch_b.rs").await.unwrap();
+        assert!(file_a.is_some(), "file_a should be stored");
+        assert!(file_b.is_some(), "file_b should be stored");
+
+        // Both functions should exist (check via get_file_symbol_names)
+        let symbols_a = mock.get_file_symbol_names("/tmp/batch_a.rs").await.unwrap();
+        assert!(
+            symbols_a.functions.contains(&"fn_a".to_string()),
+            "fn_a should be stored, got: {:?}",
+            symbols_a.functions
+        );
+        let symbols_b = mock.get_file_symbol_names("/tmp/batch_b.rs").await.unwrap();
+        assert!(
+            symbols_b.functions.contains(&"fn_b".to_string()),
+            "fn_b should be stored, got: {:?}",
+            symbols_b.functions
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_parsed_files_batch_empty() {
+        let (orch, _rx) = orch_with_bus().await;
+        let all_paths: Vec<String> = vec![];
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
+
+        let stored = orch
+            .store_parsed_files_batch(&[], None, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(stored, 0);
     }
 
     #[test]

@@ -322,6 +322,9 @@ pub trait GraphStore: Send + Sync {
     /// Create or update a file node
     async fn upsert_file(&self, file: &FileNode) -> Result<()>;
 
+    /// Batch create or update file nodes (UNWIND)
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()>;
+
     /// Get a file by path
     async fn get_file(&self, path: &str) -> Result<Option<FileNode>>;
 

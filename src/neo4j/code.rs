@@ -165,6 +165,82 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Batch upsert file nodes using UNWIND.
+    ///
+    /// Creates or updates all file nodes in a single query and links them
+    /// to their project in a second query.
+    pub async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        use crate::neo4j::batch::{run_unwind_in_chunks, BoltMap};
+
+        let items: Vec<BoltMap> = files
+            .iter()
+            .map(|f| {
+                let mut m = BoltMap::new();
+                m.insert("path".into(), f.path.clone().into());
+                m.insert("language".into(), f.language.clone().into());
+                m.insert("hash".into(), f.hash.clone().into());
+                m.insert("last_parsed".into(), f.last_parsed.to_rfc3339().into());
+                m.insert(
+                    "project_id".into(),
+                    f.project_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default()
+                        .into(),
+                );
+                m
+            })
+            .collect();
+
+        run_unwind_in_chunks(
+            &self.graph,
+            items,
+            r#"
+            UNWIND $items AS item
+            MERGE (f:File {path: item.path})
+            SET f.language = item.language,
+                f.hash = item.hash,
+                f.last_parsed = datetime(item.last_parsed),
+                f.project_id = item.project_id
+            "#,
+        )
+        .await?;
+
+        // Link files to projects (only for files with a project_id)
+        let project_items: Vec<BoltMap> = files
+            .iter()
+            .filter(|f| f.project_id.is_some())
+            .map(|f| {
+                let mut m = BoltMap::new();
+                m.insert("path".into(), f.path.clone().into());
+                m.insert(
+                    "project_id".into(),
+                    f.project_id.unwrap().to_string().into(),
+                );
+                m
+            })
+            .collect();
+
+        if !project_items.is_empty() {
+            run_unwind_in_chunks(
+                &self.graph,
+                project_items,
+                r#"
+                UNWIND $items AS item
+                MATCH (p:Project {id: item.project_id})
+                MATCH (f:File {path: item.path})
+                MERGE (p)-[:CONTAINS]->(f)
+                "#,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     /// Get a file by path
     pub async fn get_file(&self, path: &str) -> Result<Option<FileNode>> {
         let q = query(

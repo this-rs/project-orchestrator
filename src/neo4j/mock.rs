@@ -1240,6 +1240,14 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()> {
+        let mut store = self.files.write().await;
+        for file in files {
+            store.insert(file.path.clone(), file.clone());
+        }
+        Ok(())
+    }
+
     async fn get_file(&self, path: &str) -> Result<Option<FileNode>> {
         Ok(self.files.read().await.get(path).cloned())
     }
