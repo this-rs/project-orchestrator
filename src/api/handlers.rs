@@ -2268,108 +2268,143 @@ pub struct MilestoneDetailsResponse {
     pub progress: MilestoneProgressResponse,
 }
 
+/// Query parameters for GET /api/milestones/:id
+#[derive(Deserialize)]
+pub struct MilestoneGetQuery {
+    /// Include tasks/plans/steps in the response (default: true for backward compat)
+    pub include_tasks: Option<bool>,
+}
+
 /// Get milestone details
 pub async fn get_milestone(
     State(state): State<OrchestratorState>,
     Path(milestone_id): Path<Uuid>,
+    Query(query): Query<MilestoneGetQuery>,
 ) -> Result<Json<MilestoneDetailsResponse>, AppError> {
     let neo4j = state.orchestrator.neo4j();
+    let include_tasks = query.include_tasks.unwrap_or(true);
 
-    // 1. Get milestone + flat tasks (for backward compat tasks field)
-    let (milestone, flat_tasks) = neo4j
-        .get_milestone_details(milestone_id)
-        .await?
-        .ok_or(AppError::NotFound("Milestone not found".into()))?;
+    if include_tasks {
+        // Full response: milestone + plans/tasks/steps + progress
+        let (milestone, flat_tasks) = neo4j
+            .get_milestone_details(milestone_id)
+            .await?
+            .ok_or(AppError::NotFound("Milestone not found".into()))?;
 
-    // 2. Get tasks with plan info
-    let tasks_with_plan = neo4j.get_milestone_tasks_with_plans(milestone_id).await?;
+        let tasks_with_plan = neo4j.get_milestone_tasks_with_plans(milestone_id).await?;
 
-    // 3. Get progress stats
-    let (total, completed, in_progress, pending) =
-        neo4j.get_milestone_progress(milestone_id).await?;
+        let (total, completed, in_progress, pending) =
+            neo4j.get_milestone_progress(milestone_id).await?;
 
-    let percentage = if total > 0 {
-        (completed as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
+        let percentage = if total > 0 {
+            (completed as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
 
-    // 4. Get all steps in one batch query
-    let mut steps_map = neo4j.get_milestone_steps_batch(milestone_id).await?;
+        let mut steps_map = neo4j.get_milestone_steps_batch(milestone_id).await?;
 
-    // 5. Group tasks by plan and build hierarchical response
-    let mut plan_order: Vec<Uuid> = Vec::new();
-    let mut plan_map: std::collections::HashMap<
-        Uuid,
-        (String, Option<String>, Vec<MilestoneTaskSummary>),
-    > = std::collections::HashMap::new();
+        let mut plan_order: Vec<Uuid> = Vec::new();
+        let mut plan_map: std::collections::HashMap<
+            Uuid,
+            (String, Option<String>, Vec<MilestoneTaskSummary>),
+        > = std::collections::HashMap::new();
 
-    for twp in tasks_with_plan {
-        let steps = steps_map
-            .remove(&twp.task.id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| MilestoneStepSummary {
-                id: s.id.to_string(),
-                order: s.order,
-                description: s.description,
-                status: serde_json::to_value(&s.status)
+        for twp in tasks_with_plan {
+            let steps = steps_map
+                .remove(&twp.task.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| MilestoneStepSummary {
+                    id: s.id.to_string(),
+                    order: s.order,
+                    description: s.description,
+                    status: serde_json::to_value(&s.status)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    verification: s.verification,
+                })
+                .collect();
+
+            let task_summary = MilestoneTaskSummary {
+                id: twp.task.id.to_string(),
+                title: twp.task.title,
+                description: twp.task.description,
+                status: serde_json::to_value(&twp.task.status)
                     .unwrap()
                     .as_str()
                     .unwrap()
                     .to_string(),
-                verification: s.verification,
+                priority: twp.task.priority,
+                tags: twp.task.tags,
+                created_at: twp.task.created_at.to_rfc3339(),
+                completed_at: twp.task.completed_at.map(|dt| dt.to_rfc3339()),
+                steps,
+            };
+
+            let entry = plan_map.entry(twp.plan_id).or_insert_with(|| {
+                plan_order.push(twp.plan_id);
+                (twp.plan_title.clone(), twp.plan_status.clone(), vec![])
+            });
+            entry.2.push(task_summary);
+        }
+
+        let plans: Vec<MilestonePlanSummary> = plan_order
+            .into_iter()
+            .filter_map(|pid| {
+                let (title, status, tasks) = plan_map.remove(&pid)?;
+                Some(MilestonePlanSummary {
+                    id: pid.to_string(),
+                    title,
+                    status,
+                    tasks,
+                })
             })
             .collect();
 
-        let task_summary = MilestoneTaskSummary {
-            id: twp.task.id.to_string(),
-            title: twp.task.title,
-            description: twp.task.description,
-            status: serde_json::to_value(&twp.task.status)
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string(),
-            priority: twp.task.priority,
-            tags: twp.task.tags,
-            created_at: twp.task.created_at.to_rfc3339(),
-            completed_at: twp.task.completed_at.map(|dt| dt.to_rfc3339()),
-            steps,
+        Ok(Json(MilestoneDetailsResponse {
+            milestone,
+            plans,
+            tasks: flat_tasks,
+            progress: MilestoneProgressResponse {
+                total,
+                completed,
+                in_progress,
+                pending,
+                percentage,
+            },
+        }))
+    } else {
+        // Lightweight response: milestone + progress only (no tasks/plans/steps)
+        let milestone = neo4j
+            .get_milestone(milestone_id)
+            .await?
+            .ok_or(AppError::NotFound("Milestone not found".into()))?;
+
+        let (total, completed, in_progress, pending) =
+            neo4j.get_milestone_progress(milestone_id).await?;
+
+        let percentage = if total > 0 {
+            (completed as f64 / total as f64) * 100.0
+        } else {
+            0.0
         };
 
-        let entry = plan_map.entry(twp.plan_id).or_insert_with(|| {
-            plan_order.push(twp.plan_id);
-            (twp.plan_title.clone(), twp.plan_status.clone(), vec![])
-        });
-        entry.2.push(task_summary);
+        Ok(Json(MilestoneDetailsResponse {
+            milestone,
+            plans: vec![],
+            tasks: vec![],
+            progress: MilestoneProgressResponse {
+                total,
+                completed,
+                in_progress,
+                pending,
+                percentage,
+            },
+        }))
     }
-
-    let plans: Vec<MilestonePlanSummary> = plan_order
-        .into_iter()
-        .filter_map(|pid| {
-            let (title, status, tasks) = plan_map.remove(&pid)?;
-            Some(MilestonePlanSummary {
-                id: pid.to_string(),
-                title,
-                status,
-                tasks,
-            })
-        })
-        .collect();
-
-    Ok(Json(MilestoneDetailsResponse {
-        milestone,
-        plans,
-        tasks: flat_tasks,
-        progress: MilestoneProgressResponse {
-            total,
-            completed,
-            in_progress,
-            pending,
-            percentage,
-        },
-    }))
 }
 
 /// Milestone progress response

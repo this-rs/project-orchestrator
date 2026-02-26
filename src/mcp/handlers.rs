@@ -1079,8 +1079,15 @@ impl ToolHandler {
 
             "get_milestone" => {
                 let milestone_id = extract_id(args, "milestone_id")?;
+                let include_tasks = args
+                    .get("include_tasks")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let result = http
-                    .get(&format!("/api/milestones/{}", milestone_id))
+                    .get(&format!(
+                        "/api/milestones/{}?include_tasks={}",
+                        milestone_id, include_tasks
+                    ))
                     .await?;
                 Ok(Some(result))
             }
