@@ -546,6 +546,20 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_extends_relationships(rels).await
+    }
+
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_implements_relationships(rels).await
+    }
+
     async fn cleanup_cross_project_calls(&self) -> anyhow::Result<i64> {
         self.cleanup_cross_project_calls().await
     }

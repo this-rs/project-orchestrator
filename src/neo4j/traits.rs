@@ -429,6 +429,21 @@ pub trait GraphStore: Send + Sync {
         project_id: Option<Uuid>,
     ) -> Result<()>;
 
+    /// Batch create EXTENDS relationships (class inheritance) using UNWIND.
+    /// Takes (child_name, child_file_path, parent_name, project_id) tuples.
+    /// Phase 1: same-file match. Phase 2: project-scoped fallback.
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()>;
+
+    /// Batch create IMPLEMENTS relationships (interface/protocol implementation) using UNWIND.
+    /// Takes (struct_name, struct_file_path, interface_name, project_id) tuples.
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()>;
+
     /// Delete all CALLS relationships where caller and callee belong to different projects.
     /// Returns the number of deleted relationships.
     async fn cleanup_cross_project_calls(&self) -> Result<i64>;

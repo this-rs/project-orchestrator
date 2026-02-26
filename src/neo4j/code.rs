@@ -1719,6 +1719,127 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Batch create EXTENDS relationships (class inheritance).
+    /// Two-phase: 1) same-file match, 2) project-scoped fallback.
+    pub async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        if rels.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = rels
+            .iter()
+            .map(|(child_name, child_file, parent_name, pid)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("child_name".into(), child_name.clone().into());
+                m.insert("child_file".into(), child_file.clone().into());
+                m.insert("parent_name".into(), parent_name.clone().into());
+                m.insert("project_id".into(), pid.clone().into());
+                m
+            })
+            .collect();
+
+        // Phase 1: same-file match
+        let q = query(
+            r#"
+            UNWIND $items AS rel
+            CALL {
+                WITH rel
+                MATCH (child:Struct {name: rel.child_name, file_path: rel.child_file})
+                MATCH (parent:Struct {name: rel.parent_name, file_path: rel.child_file})
+                WITH child, parent LIMIT 1
+                MERGE (child)-[:EXTENDS]->(parent)
+                RETURN child.name AS resolved
+            }
+            RETURN resolved
+            "#,
+        )
+        .param("items", items.clone());
+
+        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(mut result) = self.graph.execute(q).await {
+            while let Ok(Some(row)) = result.next().await {
+                if let Ok(name) = row.get::<String>("resolved") {
+                    resolved.insert(name);
+                }
+            }
+        }
+
+        // Phase 2: project-scoped fallback for unresolved
+        let unresolved: Vec<_> = items
+            .into_iter()
+            .filter(|m| {
+                let child = match m.get("child_name") {
+                    Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                    _ => String::new(),
+                };
+                !resolved.contains(&child)
+            })
+            .collect();
+
+        if !unresolved.is_empty() {
+            let q = query(
+                r#"
+                UNWIND $items AS rel
+                CALL {
+                    WITH rel
+                    MATCH (child:Struct {name: rel.child_name, file_path: rel.child_file})
+                    MATCH (parent:Struct {name: rel.parent_name, project_id: rel.project_id})
+                    WHERE parent.file_path <> child.file_path
+                    WITH child, parent LIMIT 1
+                    MERGE (child)-[:EXTENDS]->(parent)
+                }
+                "#,
+            )
+            .param("items", unresolved);
+            let _ = self.graph.run(q).await;
+        }
+
+        Ok(())
+    }
+
+    /// Batch create IMPLEMENTS relationships (interface/protocol implementation).
+    /// Matches against Trait nodes (interfaces stored as Trait in Java, TS, PHP, Kotlin, Swift).
+    pub async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        if rels.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = rels
+            .iter()
+            .map(|(struct_name, struct_file, iface_name, pid)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("struct_name".into(), struct_name.clone().into());
+                m.insert("struct_file".into(), struct_file.clone().into());
+                m.insert("iface_name".into(), iface_name.clone().into());
+                m.insert("project_id".into(), pid.clone().into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS rel
+            CALL {
+                WITH rel
+                MATCH (s:Struct {name: rel.struct_name, file_path: rel.struct_file})
+                MATCH (iface:Trait {name: rel.iface_name, project_id: rel.project_id})
+                WITH s, iface LIMIT 1
+                MERGE (s)-[:IMPLEMENTS]->(iface)
+            }
+            "#,
+        )
+        .param("items", items);
+
+        let _ = self.graph.run(q).await;
+        Ok(())
+    }
+
     /// Clean up ALL sync-generated data from Neo4j.
     /// This deletes File, Function, Struct, Trait, Enum, Impl, Import nodes
     /// and their relationships (CALLS, IMPORTS, IMPLEMENTS_FOR, IMPLEMENTS_TRAIT, CONTAINS, HAS_IMPORT).

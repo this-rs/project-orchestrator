@@ -1491,6 +1491,32 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        let mut cr = self.call_relationships.write().await;
+        for (child_name, _child_file, parent_name, _pid) in rels {
+            cr.entry(format!("extends:{}", child_name))
+                .or_default()
+                .push(parent_name.clone());
+        }
+        Ok(())
+    }
+
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        let mut cr = self.call_relationships.write().await;
+        for (struct_name, _struct_file, iface_name, _pid) in rels {
+            cr.entry(format!("implements:{}", struct_name))
+                .or_default()
+                .push(iface_name.clone());
+        }
+        Ok(())
+    }
+
     async fn cleanup_cross_project_calls(&self) -> Result<i64> {
         let mut cr = self.call_relationships.write().await;
         let functions = self.functions.read().await;
