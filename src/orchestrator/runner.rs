@@ -2039,6 +2039,47 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .batch_create_call_relationships(&scored_calls, project_id)
             .await?;
 
+        // ── Heritage relationships (EXTENDS / IMPLEMENTS) ───────────────
+        let project_id_str = project_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+
+        let mut extends_rels: Vec<(String, String, String, String)> = Vec::new();
+        let mut implements_rels: Vec<(String, String, String, String)> = Vec::new();
+
+        for s in &parsed.structs {
+            let file_path = normalize_path(&s.file_path);
+            if let Some(ref parent) = s.parent_class {
+                extends_rels.push((
+                    s.name.clone(),
+                    file_path.clone(),
+                    parent.clone(),
+                    project_id_str.clone(),
+                ));
+            }
+            for iface in &s.interfaces {
+                implements_rels.push((
+                    s.name.clone(),
+                    file_path.clone(),
+                    iface.clone(),
+                    project_id_str.clone(),
+                ));
+            }
+        }
+
+        if !extends_rels.is_empty() {
+            self.state
+                .neo4j
+                .batch_create_extends_relationships(&extends_rels)
+                .await?;
+        }
+        if !implements_rels.is_empty() {
+            self.state
+                .neo4j
+                .batch_create_implements_relationships(&implements_rels)
+                .await?;
+        }
+
         // Embed file and functions (best-effort, non-blocking)
         if self.embedding_provider.is_some() {
             let provider = self.embedding_provider.clone().unwrap();
@@ -2146,6 +2187,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let mut all_import_rels: Vec<(String, String, String)> = Vec::new();
         let mut all_symbol_rels: Vec<(String, String, Option<Uuid>)> = Vec::new();
         let mut all_scored_calls: Vec<crate::parser::FunctionCall> = Vec::new();
+        let mut all_extends_rels: Vec<(String, String, String, String)> = Vec::new();
+        let mut all_implements_rels: Vec<(String, String, String, String)> = Vec::new();
+        let project_id_str = project_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
 
         for parsed in parsed_files {
             // Import resolution (per-file — needs source file path)
@@ -2187,6 +2233,27 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             );
             all_scored_calls.extend(scored_calls);
             all_import_rels.extend(file_import_rels);
+
+            // Heritage (EXTENDS / IMPLEMENTS)
+            for s in &parsed.structs {
+                let file_path = normalize_path(&s.file_path);
+                if let Some(ref parent) = s.parent_class {
+                    all_extends_rels.push((
+                        s.name.clone(),
+                        file_path.clone(),
+                        parent.clone(),
+                        project_id_str.clone(),
+                    ));
+                }
+                for iface in &s.interfaces {
+                    all_implements_rels.push((
+                        s.name.clone(),
+                        file_path.clone(),
+                        iface.clone(),
+                        project_id_str.clone(),
+                    ));
+                }
+            }
         }
 
         // ── 4. Batch write all relationships ──────────────────────────
@@ -2202,6 +2269,20 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .neo4j
             .batch_create_call_relationships(&all_scored_calls, project_id)
             .await?;
+
+        // Heritage relationships (EXTENDS / IMPLEMENTS)
+        if !all_extends_rels.is_empty() {
+            self.state
+                .neo4j
+                .batch_create_extends_relationships(&all_extends_rels)
+                .await?;
+        }
+        if !all_implements_rels.is_empty() {
+            self.state
+                .neo4j
+                .batch_create_implements_relationships(&all_implements_rels)
+                .await?;
+        }
 
         // ── 5. Embeddings (best-effort, non-blocking) ─────────────────
         if self.embedding_provider.is_some() {
@@ -8651,6 +8732,163 @@ mod tests {
             mock_store.files.read().await.len(),
             0,
             "All files should be deleted"
+        );
+    }
+
+    // ── Heritage pipeline integration tests ─────────────────────────
+
+    #[tokio::test]
+    async fn test_heritage_extends_implements_wired_in_pipeline() {
+        use crate::neo4j::models::*;
+        use crate::parser::ParsedFile;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_path = "/tmp/test-heritage/src/models.java".to_string();
+
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "java".to_string(),
+            hash: "heritage123".to_string(),
+            functions: vec![],
+            structs: vec![
+                // Dog extends Animal
+                StructNode {
+                    name: "Dog".to_string(),
+                    visibility: Visibility::Public,
+                    generics: vec![],
+                    file_path: file_path.clone(),
+                    line_start: 1,
+                    line_end: 20,
+                    docstring: None,
+                    parent_class: Some("Animal".to_string()),
+                    interfaces: vec!["Serializable".to_string(), "Comparable".to_string()],
+                },
+                // Cat extends Animal implements Serializable
+                StructNode {
+                    name: "Cat".to_string(),
+                    visibility: Visibility::Public,
+                    generics: vec![],
+                    file_path: file_path.clone(),
+                    line_start: 30,
+                    line_end: 50,
+                    docstring: None,
+                    parent_class: Some("Animal".to_string()),
+                    interfaces: vec!["Serializable".to_string()],
+                },
+                // Animal — no parent, no interfaces
+                StructNode {
+                    name: "Animal".to_string(),
+                    visibility: Visibility::Public,
+                    generics: vec![],
+                    file_path: file_path.clone(),
+                    line_start: 60,
+                    line_end: 80,
+                    docstring: None,
+                    parent_class: None,
+                    interfaces: vec![],
+                },
+            ],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+
+        // Verify EXTENDS relationships
+        let cr = mock_store.call_relationships.read().await;
+
+        let dog_extends = cr.get("extends:Dog").expect("Dog should have an extends edge");
+        assert_eq!(dog_extends, &vec!["Animal".to_string()], "Dog extends Animal");
+
+        let cat_extends = cr.get("extends:Cat").expect("Cat should have an extends edge");
+        assert_eq!(cat_extends, &vec!["Animal".to_string()], "Cat extends Animal");
+
+        assert!(
+            cr.get("extends:Animal").is_none(),
+            "Animal has no parent class"
+        );
+
+        // Verify IMPLEMENTS relationships
+        let dog_implements = cr
+            .get("implements:Dog")
+            .expect("Dog should have implements edges");
+        assert_eq!(
+            dog_implements,
+            &vec!["Serializable".to_string(), "Comparable".to_string()],
+            "Dog implements Serializable and Comparable"
+        );
+
+        let cat_implements = cr
+            .get("implements:Cat")
+            .expect("Cat should have implements edges");
+        assert_eq!(
+            cat_implements,
+            &vec!["Serializable".to_string()],
+            "Cat implements Serializable"
+        );
+
+        assert!(
+            cr.get("implements:Animal").is_none(),
+            "Animal implements nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heritage_no_edges_when_no_inheritance() {
+        use crate::neo4j::models::*;
+        use crate::parser::ParsedFile;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_path = "/tmp/test-heritage-empty/src/plain.rs".to_string();
+
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "noinherit".to_string(),
+            functions: vec![],
+            structs: vec![StructNode {
+                name: "PlainStruct".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: 10,
+                docstring: None,
+                parent_class: None,
+                interfaces: vec![],
+            }],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+
+        // No heritage relationships should exist
+        let cr = mock_store.call_relationships.read().await;
+        let has_extends = cr.keys().any(|k| k.starts_with("extends:"));
+        let has_implements = cr.keys().any(|k| k.starts_with("implements:"));
+        assert!(!has_extends, "No extends edges for struct without parent");
+        assert!(
+            !has_implements,
+            "No implements edges for struct without interfaces"
         );
     }
 }
