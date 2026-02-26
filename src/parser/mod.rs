@@ -31,6 +31,7 @@ pub enum SupportedLanguage {
     Swift,
     Bash,
     CSharp,
+    Scala,
 }
 
 impl SupportedLanguage {
@@ -51,6 +52,7 @@ impl SupportedLanguage {
             "swift" => Some(Self::Swift),
             "sh" | "bash" | "zsh" => Some(Self::Bash),
             "cs" => Some(Self::CSharp),
+            "scala" | "sc" => Some(Self::Scala),
             _ => None,
         }
     }
@@ -71,6 +73,7 @@ impl SupportedLanguage {
             Self::Swift => tree_sitter_swift::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Self::Scala => tree_sitter_scala::LANGUAGE.into(),
         }
     }
 
@@ -90,6 +93,7 @@ impl SupportedLanguage {
             Self::Swift => "swift",
             Self::Bash => "bash",
             Self::CSharp => "csharp",
+            Self::Scala => "scala",
         }
     }
 
@@ -109,6 +113,7 @@ impl SupportedLanguage {
             Self::Swift,
             Self::Bash,
             Self::CSharp,
+            Self::Scala,
         ]
     }
 }
@@ -215,6 +220,9 @@ impl CodeParser {
             }
             SupportedLanguage::CSharp => {
                 languages::csharp::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Scala => {
+                languages::scala::extract(&root, content, &path_str, &mut parsed)?;
             }
         }
 
@@ -559,12 +567,13 @@ mod tests {
         assert_eq!(SupportedLanguage::Swift.as_str(), "swift");
         assert_eq!(SupportedLanguage::Bash.as_str(), "bash");
         assert_eq!(SupportedLanguage::CSharp.as_str(), "csharp");
+        assert_eq!(SupportedLanguage::Scala.as_str(), "scala");
     }
 
     #[test]
     fn test_all_returns_12_languages() {
         let all = SupportedLanguage::all();
-        assert_eq!(all.len(), 13);
+        assert_eq!(all.len(), 14);
     }
 
     #[test]
@@ -583,6 +592,7 @@ mod tests {
         assert!(all.contains(&SupportedLanguage::Swift));
         assert!(all.contains(&SupportedLanguage::Bash));
         assert!(all.contains(&SupportedLanguage::CSharp));
+        assert!(all.contains(&SupportedLanguage::Scala));
     }
 
     // =========================================================================

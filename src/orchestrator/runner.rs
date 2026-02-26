@@ -2936,6 +2936,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         parsed_path,
                         &ctx.suffix_index,
                     ),
+                    "scala" => Self::resolve_scala_import_indexed(
+                        &import.path,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3472,6 +3476,87 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Try with lib/ prefix (common Ruby project layout)
         let lib_path = format!("lib/{}", with_ext);
         if let Some(resolved) = index.get(&lib_path) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Scala import to project files.
+    ///
+    /// Handles four patterns:
+    /// - `import com.example.Foo` → com/example/Foo.scala
+    /// - `import com.example._` → all .scala files in com/example/
+    /// - `import com.example.{Foo, Bar}` → resolve each selectively
+    /// - `import com.example.{Foo => MyFoo}` → resolve Foo (ignore rename)
+    ///
+    /// Scala stdlib (scala.*, java.*) is ignored.
+    fn resolve_scala_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore Scala/Java stdlib
+        if path.starts_with("scala.") || path.starts_with("java.") {
+            return Vec::new();
+        }
+
+        // Check for selective import: com.example.{Foo, Bar}
+        if let Some(brace_start) = path.find('{') {
+            let package = &path[..brace_start].trim_end_matches('.');
+            let selectors = &path[brace_start + 1..].trim_end_matches('}');
+
+            let mut results = Vec::new();
+            for selector in selectors.split(',') {
+                let selector = selector.trim();
+                // Handle rename: Foo => MyFoo — use original name
+                let name = selector
+                    .split("=>")
+                    .next()
+                    .unwrap_or(selector)
+                    .trim();
+
+                if name == "_" {
+                    // Wildcard within selective import
+                    let dir = package.replace('.', "/");
+                    let files = index.get_files_in_dir(&dir, "scala");
+                    for f in files {
+                        let s = f.to_string();
+                        if !results.contains(&s) {
+                            results.push(s);
+                        }
+                    }
+                } else {
+                    let suffix = format!("{}/{}.scala", package.replace('.', "/"), name);
+                    if let Some(resolved) = index.get(&suffix) {
+                        let s = resolved.to_string();
+                        if !results.contains(&s) {
+                            results.push(s);
+                        }
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Check for wildcard: com.example._
+        if path.ends_with("._") {
+            let package = &path[..path.len() - 2];
+            let dir = package.replace('.', "/");
+            return index
+                .get_files_in_dir(&dir, "scala")
+                .into_iter()
+                .map(|f| f.to_string())
+                .collect();
+        }
+
+        // Standard import: com.example.Foo → com/example/Foo.scala
+        let suffix = format!("{}.scala", path.replace('.', "/"));
+        if let Some(resolved) = index.get(&suffix) {
             return vec![resolved.to_string()];
         }
 
@@ -7440,6 +7525,72 @@ mod tests {
             &index,
         );
         assert_eq!(result, vec!["lib/config.rb"]);
+    }
+
+    // ── Scala resolver tests ─────────────────────────────────────
+
+    #[test]
+    fn test_resolve_scala_import_standard() {
+        let paths = vec!["com/example/Foo.scala".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_scala_import_indexed("com.example.Foo", &index);
+        assert_eq!(result, vec!["com/example/Foo.scala"]);
+    }
+
+    #[test]
+    fn test_resolve_scala_import_wildcard() {
+        let paths = vec![
+            "com/example/Foo.scala".to_string(),
+            "com/example/Bar.scala".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_scala_import_indexed("com.example._", &index);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_scala_import_selective() {
+        let paths = vec![
+            "com/example/Foo.scala".to_string(),
+            "com/example/Bar.scala".to_string(),
+            "com/example/Baz.scala".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_scala_import_indexed(
+            "com.example.{Foo, Bar}",
+            &index,
+        );
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"com/example/Foo.scala".to_string()));
+        assert!(result.contains(&"com/example/Bar.scala".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_scala_import_rename() {
+        let paths = vec!["com/example/Foo.scala".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Rename: Foo => MyFoo — should resolve Foo
+        let result = Orchestrator::resolve_scala_import_indexed(
+            "com.example.{Foo => MyFoo}",
+            &index,
+        );
+        assert_eq!(result, vec!["com/example/Foo.scala"]);
+    }
+
+    #[test]
+    fn test_resolve_scala_stdlib_ignored() {
+        let paths = vec!["scala/collection/List.scala".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_scala_import_indexed("scala.collection.mutable._", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_scala_import_indexed("java.util.List", &index);
+        assert!(result.is_empty());
     }
 
     #[test]
