@@ -4477,11 +4477,7 @@ impl ChatManager {
                 .output()
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| {
-                    s.lines()
-                        .filter_map(|l| l.trim().parse().ok())
-                        .collect()
-                })
+                .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
                 .unwrap_or_default()
         }
 
