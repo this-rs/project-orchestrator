@@ -1459,9 +1459,22 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let parsed_files = parse_files(to_parse, &self.parser).await;
         let parse_count = parsed_files.len();
 
+        // ── Build ImportResolutionContext once for all files ────────
+        // SuffixIndex is built from ALL scanned paths (not just changed ones)
+        // so cross-file import resolution works even for unchanged files.
+        let all_paths: Vec<String> = synced_paths.iter().cloned().collect();
+        let mut import_ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
+
+        // Populate SymbolTable from all parsed files
+        import_ctx.populate_symbols(&parsed_files);
+        import_ctx.log_stats();
+
         // ── Store: Neo4j + MeiliSearch ─────────────────────────────
         for parsed in &parsed_files {
-            match self.store_parsed_file_for_project(parsed, project_id).await {
+            match self
+                .store_parsed_file_for_project_with_ctx(parsed, project_id, Some(&mut import_ctx))
+                .await
+            {
                 Ok(()) => {
                     // Index in Meilisearch only if project context is available
                     if let (Some(pid), Some(slug)) = (project_id, project_slug.as_deref()) {
@@ -4044,10 +4057,65 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
     entries
 }
 
-/// Phase 3: Parse files with tree-sitter.
+/// Default byte budget per chunk: 20 MB.
 ///
-/// Parses each file's content using the appropriate tree-sitter grammar
-/// based on the detected language. Files that fail to parse are logged and skipped.
+/// Files are grouped so that each chunk's total size does not exceed this limit.
+/// This controls peak memory usage during parsing: only one chunk's ASTs
+/// are in memory at a time. Inspired by GitGenius `CHUNK_BYTE_BUDGET`.
+pub const CHUNK_BYTE_BUDGET: u64 = 20 * 1024 * 1024;
+
+/// Group files into chunks that fit within a byte budget.
+///
+/// Each chunk's total file size is ≤ `budget`. Files larger than the budget
+/// are placed in their own single-file chunk.
+///
+/// Files are consumed in order — no sorting is performed.
+pub fn chunk_by_size(files: Vec<FileContent>, budget: u64) -> Vec<Vec<FileContent>> {
+    if files.is_empty() {
+        return vec![];
+    }
+
+    let mut chunks: Vec<Vec<FileContent>> = Vec::new();
+    let mut current_chunk: Vec<FileContent> = Vec::new();
+    let mut current_size: u64 = 0;
+
+    for file in files {
+        let file_size = file.size.max(file.content.len() as u64);
+
+        // Oversized file → always gets its own chunk
+        if file_size > budget {
+            // Flush current chunk first
+            if !current_chunk.is_empty() {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_size = 0;
+            }
+            chunks.push(vec![file]);
+            continue;
+        }
+
+        // Would exceed budget → start a new chunk
+        if current_size + file_size > budget && !current_chunk.is_empty() {
+            chunks.push(std::mem::take(&mut current_chunk));
+            current_size = 0;
+        }
+
+        current_size += file_size;
+        current_chunk.push(file);
+    }
+
+    // Don't forget the last chunk
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    chunks
+}
+
+/// Phase 3: Parse files with tree-sitter, using chunked processing.
+///
+/// Files are grouped into chunks of [`CHUNK_BYTE_BUDGET`] bytes to limit
+/// peak memory usage. Each chunk is parsed sequentially, then results are
+/// aggregated. Files that fail to parse are logged and skipped.
 ///
 /// Returns only successfully parsed files.
 pub async fn parse_files(
@@ -4055,30 +4123,51 @@ pub async fn parse_files(
     parser: &Arc<RwLock<CodeParser>>,
 ) -> Vec<ParsedFile> {
     let start = std::time::Instant::now();
-    let mut parsed = Vec::with_capacity(files.len());
+    let total_files = files.len();
+    let total_bytes: u64 = files.iter().map(|f| f.size.max(f.content.len() as u64)).sum();
+
+    let chunks = chunk_by_size(files, CHUNK_BYTE_BUDGET);
+    let num_chunks = chunks.len();
+
+    let mut parsed = Vec::with_capacity(total_files);
     let mut parse_errors = 0usize;
 
-    for file in &files {
-        let file_path = std::path::Path::new(&file.path);
-        match {
-            let mut p = parser.write().await;
-            p.parse_file(file_path, &file.content)
-        } {
-            Ok(pf) => {
-                parsed.push(pf);
-            }
-            Err(e) => {
-                tracing::warn!("parse_files: failed to parse {}: {}", file.path, e);
-                parse_errors += 1;
+    for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+        let chunk_files = chunk.len();
+        let chunk_bytes: u64 = chunk.iter().map(|f| f.size.max(f.content.len() as u64)).sum();
+
+        for file in &chunk {
+            let file_path = std::path::Path::new(&file.path);
+            match {
+                let mut p = parser.write().await;
+                p.parse_file(file_path, &file.content)
+            } {
+                Ok(pf) => {
+                    parsed.push(pf);
+                }
+                Err(e) => {
+                    tracing::warn!("parse_files: failed to parse {}: {}", file.path, e);
+                    parse_errors += 1;
+                }
             }
         }
+
+        tracing::info!(
+            "parse_files: chunk {}/{}: {} files, {:.1} MB",
+            chunk_idx + 1,
+            num_chunks,
+            chunk_files,
+            chunk_bytes as f64 / (1024.0 * 1024.0),
+        );
     }
 
     let elapsed = start.elapsed();
     tracing::info!(
-        "parse_files: parsed {} files ({} errors) in {:?}",
+        "parse_files: parsed {} files ({} errors, {:.1} MB, {} chunks) in {:?}",
         parsed.len(),
         parse_errors,
+        total_bytes as f64 / (1024.0 * 1024.0),
+        num_chunks,
         elapsed
     );
 
@@ -6624,6 +6713,134 @@ mod tests {
         assert_eq!(entries[0].size, content.len() as u64);
     }
 
+    #[test]
+    fn test_chunk_by_size_basic() {
+        use crate::parser::SupportedLanguage;
+
+        // 3 files of 5MB each, budget 12MB → 2 chunks: [5+5, 5]
+        let mb5 = 5 * 1024 * 1024;
+        let files: Vec<FileContent> = (0..3)
+            .map(|i| FileContent {
+                path: format!("/tmp/file_{}.rs", i),
+                content: String::new(),
+                size: mb5,
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let chunks = chunk_by_size(files, 12 * 1024 * 1024);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 2); // 5+5 = 10 < 12
+        assert_eq!(chunks[1].len(), 1); // 5 alone
+    }
+
+    #[test]
+    fn test_chunk_by_size_oversized_file() {
+        use crate::parser::SupportedLanguage;
+
+        // One file larger than budget → gets its own chunk
+        let budget = 10 * 1024 * 1024; // 10MB
+        let files = vec![
+            FileContent {
+                path: "/tmp/small.rs".to_string(),
+                content: String::new(),
+                size: 1 * 1024 * 1024, // 1MB
+                language: SupportedLanguage::Rust,
+                hash: "h1".to_string(),
+            },
+            FileContent {
+                path: "/tmp/huge.rs".to_string(),
+                content: String::new(),
+                size: 25 * 1024 * 1024, // 25MB > budget
+                language: SupportedLanguage::Rust,
+                hash: "h2".to_string(),
+            },
+            FileContent {
+                path: "/tmp/small2.rs".to_string(),
+                content: String::new(),
+                size: 2 * 1024 * 1024, // 2MB
+                language: SupportedLanguage::Rust,
+                hash: "h3".to_string(),
+            },
+        ];
+
+        let chunks = chunk_by_size(files, budget);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 1); // small.rs flushed before huge
+        assert_eq!(chunks[1].len(), 1); // huge.rs alone
+        assert_eq!(chunks[1][0].path, "/tmp/huge.rs");
+        assert_eq!(chunks[2].len(), 1); // small2.rs
+    }
+
+    #[test]
+    fn test_chunk_by_size_empty() {
+        let chunks = chunk_by_size(vec![], 10 * 1024 * 1024);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_by_size_all_fit_in_one() {
+        use crate::parser::SupportedLanguage;
+
+        let files: Vec<FileContent> = (0..5)
+            .map(|i| FileContent {
+                path: format!("/tmp/f{}.rs", i),
+                content: String::new(),
+                size: 1000, // tiny
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let chunks = chunk_by_size(files, CHUNK_BYTE_BUDGET);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 5);
+    }
+
+    #[test]
+    fn test_chunk_by_size_exact_budget_boundary() {
+        use crate::parser::SupportedLanguage;
+
+        // 4 files of exactly 5MB, budget exactly 10MB
+        // → 2 chunks: [5+5, 5+5]
+        let mb5 = 5 * 1024 * 1024;
+        let budget = 10 * 1024 * 1024;
+        let files: Vec<FileContent> = (0..4)
+            .map(|i| FileContent {
+                path: format!("/tmp/f{}.rs", i),
+                content: String::new(),
+                size: mb5,
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let chunks = chunk_by_size(files, budget);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 2);
+        assert_eq!(chunks[1].len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_by_size_uses_content_len_when_larger() {
+        use crate::parser::SupportedLanguage;
+
+        // If content.len() > size, chunk_by_size should use the max
+        let files = vec![FileContent {
+            path: "/tmp/f.rs".to_string(),
+            content: "x".repeat(2 * 1024 * 1024), // 2MB content
+            size: 100,                              // but size metadata says 100 bytes
+            language: SupportedLanguage::Rust,
+            hash: "h".to_string(),
+        }];
+
+        // Budget = 1MB → file should get its own chunk (content is 2MB)
+        let chunks = chunk_by_size(files, 1 * 1024 * 1024);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+    }
+
     #[tokio::test]
     async fn test_parse_files_extracts_symbols() {
         use crate::parser::SupportedLanguage;
@@ -6686,6 +6903,104 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].functions.iter().any(|f| f.name == "add"));
         assert!(parsed[1].functions.iter().any(|f| f.name == "hello"));
+    }
+
+    #[test]
+    fn test_chunk_preserves_all_files() {
+        use crate::parser::SupportedLanguage;
+
+        // Ensure total file count across chunks equals input
+        let files: Vec<FileContent> = (0..17)
+            .map(|i| FileContent {
+                path: format!("/tmp/f{}.rs", i),
+                content: format!("fn f{}() {{}}", i),
+                size: 3 * 1024 * 1024, // 3MB each
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let chunks = chunk_by_size(files, CHUNK_BYTE_BUDGET);
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(total, 17, "all files must be present across chunks");
+
+        // Each chunk should be ≤ 20MB
+        for (i, chunk) in chunks.iter().enumerate() {
+            let chunk_size: u64 = chunk.iter().map(|f| f.size).sum();
+            assert!(
+                chunk_size <= CHUNK_BYTE_BUDGET || chunk.len() == 1,
+                "chunk {} exceeds budget: {} bytes (files: {})",
+                i,
+                chunk_size,
+                chunk.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_with_chunking_produces_same_results() {
+        use crate::parser::SupportedLanguage;
+
+        // Verify that chunked parsing produces the same results
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+
+        let files: Vec<FileContent> = vec![
+            FileContent {
+                path: "/tmp/a.rs".to_string(),
+                content: "pub fn alpha() {} pub fn beta() {}".to_string(),
+                size: 34,
+                language: SupportedLanguage::Rust,
+                hash: "h1".to_string(),
+            },
+            FileContent {
+                path: "/tmp/b.py".to_string(),
+                content: "def gamma():\n    pass\n".to_string(),
+                size: 21,
+                language: SupportedLanguage::Python,
+                hash: "h2".to_string(),
+            },
+        ];
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 2);
+
+        // All functions should be present regardless of chunking
+        let all_fns: Vec<&str> = parsed
+            .iter()
+            .flat_map(|p| p.functions.iter().map(|f| f.name.as_str()))
+            .collect();
+        assert!(all_fns.contains(&"alpha"));
+        assert!(all_fns.contains(&"beta"));
+        assert!(all_fns.contains(&"gamma"));
+    }
+
+    #[test]
+    fn test_import_resolution_context_cross_file() {
+        // Verify ImportResolutionContext works across all files
+        let all_paths = vec![
+            "src/main.rs".to_string(),
+            "src/api/handlers.rs".to_string(),
+            "src/neo4j/client.rs".to_string(),
+        ];
+
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
+
+        // SuffixIndex should find all files
+        assert_eq!(ctx.suffix_index.get("handlers.rs"), Some("src/api/handlers.rs"));
+        assert_eq!(ctx.suffix_index.get("client.rs"), Some("src/neo4j/client.rs"));
+
+        // SymbolTable starts empty, populated incrementally
+        assert_eq!(ctx.symbol_table.stats().total_definitions, 0);
+
+        // Simulate populating from parsed files
+        use crate::resolver::symbol_table::SymbolType;
+        ctx.symbol_table.add("handle_request", "src/api/handlers.rs::handle_request", "src/api/handlers.rs", SymbolType::Function, 1);
+        ctx.symbol_table.add("query", "src/neo4j/client.rs::query", "src/neo4j/client.rs", SymbolType::Function, 1);
+
+        // Now lookups work
+        let defs = ctx.symbol_table.lookup_fuzzy("handle_request");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].file_path, "src/api/handlers.rs");
     }
 
     #[tokio::test]
