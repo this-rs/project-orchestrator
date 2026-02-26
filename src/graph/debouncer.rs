@@ -477,6 +477,14 @@ mod tests {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.inner.analyze_project(project_id).await
         }
+
+        async fn analyze_fabric_graph(
+            &self,
+            project_id: Uuid,
+            weights: &crate::graph::models::FabricWeights,
+        ) -> anyhow::Result<GraphAnalytics> {
+            self.inner.analyze_fabric_graph(project_id, weights).await
+        }
     }
 
     #[tokio::test]

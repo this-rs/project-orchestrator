@@ -46,6 +46,6 @@ pub use debouncer::{
 pub use engine::{AnalyticsEngine, GraphAnalyticsEngine, ProjectAnalytics};
 pub use models::{
     AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeHealthReport, CodeNode, CodeNodeType,
-    CommunityInfo, ComponentInfo, FileAnalyticsUpdate, FunctionAnalyticsUpdate, GraphAnalytics,
-    NodeMetrics,
+    CommunityInfo, ComponentInfo, FabricFileAnalyticsUpdate, FabricWeights, FileAnalyticsUpdate,
+    FunctionAnalyticsUpdate, GraphAnalytics, NodeMetrics,
 };

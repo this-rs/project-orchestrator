@@ -120,8 +120,9 @@ Workspace
 Avant tout travail, charger les connaissances pertinentes :
 1. `note(action: "search_semantic", query)` — recherche vectorielle de notes (cosine similarity, trouve les notes sémantiquement proches même sans correspondance de mots-clés)
 2. `note(action: "get_context", entity_type, entity_id)` — notes contextuelles pour les fichiers/fonctions concernés
-3. `decision(action: "search", query)` — décisions architecturales passées sur le sujet
-4. `note(action: "search", query)` — recherche BM25 complémentaire si besoin de correspondance exacte de mots-clés
+3. `decision(action: "search_semantic", query)` — décisions architecturales passées (recherche vectorielle, plus précise que BM25)
+4. `note(action: "get_propagated", slug, file_path)` — notes propagées via le Knowledge Fabric (IMPORTS, CO_CHANGED, AFFECTS) pour les fichiers concernés
+5. `note(action: "search", query)` — recherche BM25 complémentaire si besoin de correspondance exacte de mots-clés
 
 Cela évite de refaire un travail déjà documenté ou de violer une convention déjà établie.
 
@@ -130,10 +131,11 @@ Cela évite de refaire un travail déjà documenté ou de violer une convention 
 1. `task(action: "get_next", plan_id)` — récupérer la prochaine tâche non bloquée (priorité la plus haute)
 2. `task(action: "get_context", plan_id, task_id)` — charger le contexte complet (steps, constraints, decisions, notes, code)
 3. `task(action: "get_blockers", task_id)` — vérifier qu'il n'y a pas de bloqueurs non résolus
-4. `decision(action: "search", query)` — consulter les décisions architecturales passées
-5. `code(action: "analyze_impact", target)` — évaluer l'impact avant modification
-6. `task(action: "update", task_id, status: "in_progress")` — passer la tâche en cours
-7. Préparer git (branche dédiée si pas encore fait)
+4. `decision(action: "search_semantic", query)` — consulter les décisions architecturales passées (vectoriel)
+5. `code(action: "analyze_impact", target)` — évaluer l'impact avant modification (inclut les décisions AFFECTS)
+6. `code(action: "get_health", project_slug)` — vérifier les hotspots, knowledge gaps et risques sur les fichiers concernés
+7. `task(action: "update", task_id, status: "in_progress")` — passer la tâche en cours
+8. Préparer git (branche dédiée si pas encore fait)
 
 ### Phase 2 — Exécution (pour chaque step)
 
@@ -229,21 +231,26 @@ Exemple de décomposition correcte :
 
 ### Analyse d'impact avant modification
 
-- `code(action: "analyze_impact", target)` → fichiers et symboles affectés
+- `code(action: "analyze_impact", target)` → fichiers et symboles affectés + décisions architecturales AFFECTS sur les fichiers impactés
 - `code(action: "get_file_dependencies", file_path)` → imports et dépendants
 - `note(action: "get_context", entity_type, entity_id)` → notes pertinentes (guidelines, gotchas...)
+- `note(action: "get_propagated", slug, file_path)` → notes propagées via le graphe de connaissances (IMPORTS, CO_CHANGED, AFFECTS)
 
-### Analyse structurelle (GDS)
+### Analyse structurelle (GDS) et Knowledge Fabric
 
 Quand les données GDS (Graph Data Science) sont disponibles sur le projet :
 
 1. **Comprendre la structure modulaire** → `code(action: "get_communities", project_slug)`
-   - Clusters Louvain de fichiers/fonctions fortement couplés
+   - Clusters Louvain de fichiers/fonctions fortement couplés (fabric = multi-couche incluant CO_CHANGED, AFFECTS, SYNAPSE)
    - Chaque communauté a ses fichiers clés et métriques de cohésion
    - **Utilise ceci** : avant un refactoring, pour comprendre les frontières modulaires
 
 2. **Évaluer la santé du codebase** → `code(action: "get_health", project_slug)`
-   - God functions (trop de connexions), fichiers orphelins (0 connexions), couplage moyen, dépendances circulaires
+   - God functions, fichiers orphelins, couplage moyen, dépendances circulaires
+   - **Hotspots** : fichiers à haut churn_score (fréquemment modifiés via TOUCHES)
+   - **Knowledge gaps** : fichiers à faible knowledge_density (sous-documentés, peu de notes/décisions liées)
+   - **Risk assessment** : score composite (pagerank × churn × knowledge_gap × betweenness) avec niveaux critical/high/medium/low
+   - **Neural metrics** : synapses actives, énergie moyenne, taux de synapses faibles, notes mortes
    - **Utilise ceci** : en début de projet, revue de code, ou priorisation de dette technique
 
 3. **Évaluer l'importance d'un nœud** → `code(action: "get_node_importance", project_slug, node_path, node_type)`
@@ -251,7 +258,13 @@ Quand les données GDS (Graph Data Science) sont disponibles sur le projet :
    - Retourne un summary interprétatif (critical/high/medium/low)
    - **Utilise ceci** : avant de modifier un fichier/fonction, pour évaluer le risque de régression
 
-**Note** : ces outils nécessitent que les métriques GDS aient été calculées. Si les résultats sont vides, le codebase n'a pas encore été analysé par GDS.
+4. **Identifier les zones à risque** → Combiner les signaux :
+   - Fichier à haut risk_score + faible knowledge_density = zone dangereuse, ajouter des notes/décisions
+   - Fichier à haut churn_score + haute betweenness = hot bridge, modifier avec précaution
+   - `admin(action: "update_fabric_scores")` pour recalculer tous les scores après des changements significatifs
+   - `admin(action: "bootstrap_knowledge_fabric")` pour initialiser le Knowledge Fabric sur un projet existant
+
+**Note** : ces outils nécessitent que les métriques GDS aient été calculées. Si les résultats sont vides, lancer `admin(action: "bootstrap_knowledge_fabric")` pour initialiser.
 
 ### Stratégie de recherche — MCP-first (OBLIGATOIRE)
 
@@ -320,6 +333,34 @@ note(action: "link_to_entity", note_id, "function", "build_system_prompt")
 **Décisions architecturales** : à chaque choix non trivial
 - Documenter les alternatives considérées + la raison du choix
 - `decision(action: "add", task_id, description, rationale, alternatives, chosen_option)`
+- Lier les décisions aux fichiers impactés : `decision(action: "add_affects", decision_id, entity_type: "File", entity_id: "src/path.rs")`
+- Quand une décision est remplacée : `decision(action: "supersede", decision_id, new_decision_id)`
+
+### Knowledge Fabric
+
+Le Knowledge Fabric connecte toutes les entités du graphe via des relations sémantiques :
+
+**Relations automatiques** (créées par le système) :
+- `TOUCHES` : Commit → File (avec additions/deletions) — créé automatiquement via `commit(action: "create", files_changed)`
+- `CO_CHANGED` : File ↔ File — fichiers qui changent ensemble fréquemment (calculé depuis TOUCHES)
+- `SYNAPSE` : Note ↔ Note — connexions neurales pondérées (créées par spreading activation, renforcées par co-activation)
+
+**Relations explicites** (créées par l'agent) :
+- `AFFECTS` : Decision → File/Function — décisions architecturales impactant du code
+- `DISCUSSED` : ChatSession → File/Function — fichiers discutés dans une conversation
+- `LINKED_TO` : Note → File/Function/Struct — notes attachées à des entités de code
+
+**Cycle de feedback neural** :
+1. Les notes liées au même fichier développent des SYNAPSE (connexions neurales)
+2. L'énergie des notes se propage via spreading activation (co-activation renforce les synapses)
+3. Les synapses faibles décroissent naturellement (`admin(action: "decay_synapses")`)
+4. Les notes sans activité perdent leur énergie et deviennent "mortes"
+5. `admin(action: "update_energy_scores")` recalcule l'énergie globale
+
+**Maintenance** :
+- `admin(action: "bootstrap_knowledge_fabric")` — initialise le Knowledge Fabric complet sur un projet existant
+- `admin(action: "update_fabric_scores")` — recalcule tous les scores GDS multi-couche
+- `admin(action: "update_staleness_scores")` — recalcule la fraîcheur des notes
 
 ### Workspace (multi-projets)
 
@@ -394,12 +435,15 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Decisions & Constraints ─────────────────────────────────────
     ToolGroup {
         name: "decisions_constraints",
-        description: "Choix architecturaux et contraintes des plans",
-        keywords: &["décision", "choix", "alternative", "contrainte", "règle", "sécurité"],
+        description: "Choix architecturaux, contraintes, relations AFFECTS et timeline",
+        keywords: &[
+            "décision", "choix", "alternative", "contrainte", "règle", "sécurité",
+            "architectural", "supersede", "affects", "timeline", "historique décision",
+        ],
         tools: &[
             ToolRef {
                 name: "decision",
-                description: "Manage decisions (add/get/update/delete/search)",
+                description: "Manage decisions (add/get/update/delete/search/search_semantic/add_affects/remove_affects/list_affects/supersede/get_timeline)",
             },
             ToolRef {
                 name: "constraint",
@@ -410,39 +454,42 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Code Exploration & Analytics ────────────────────────────────
     ToolGroup {
         name: "code_exploration",
-        description: "Recherche sémantique, graphe d'appels, impact, analytics GDS",
+        description: "Recherche sémantique, graphe d'appels, impact, analytics GDS, hotspots, risk",
         keywords: &[
             "code", "fonction", "struct", "fichier", "import", "appel",
             "architecture", "symbole", "trait", "impl", "référence",
             "impact", "chercher", "explorer", "communauté", "santé",
             "pagerank", "GDS", "plan_implementation",
+            "risque", "hotspot", "churn", "health", "knowledge-gap",
+            "risk-assessment", "density",
         ],
         tools: &[ToolRef {
             name: "code",
-            description: "Explore code (search/find_references/get_call_graph/analyze_impact/get_architecture/get_communities/get_health/get_node_importance/plan_implementation)",
+            description: "Explore code (search/find_references/get_call_graph/analyze_impact/get_architecture/get_communities/get_health/get_node_importance/plan_implementation) — get_health includes hotspots, knowledge_gaps, risk_assessment, neural_metrics; analyze_impact includes affecting_decisions",
         }],
     },
     // ── Knowledge / Notes ───────────────────────────────────────────
     ToolGroup {
         name: "knowledge",
-        description: "Notes, guidelines, gotchas, patterns",
+        description: "Notes, guidelines, gotchas, patterns, propagation Knowledge Fabric",
         keywords: &[
             "note", "guideline", "gotcha", "pattern", "connaissance",
             "tip", "observation", "assertion", "savoir", "contexte", "mémoire",
+            "propagation", "fabric", "knowledge",
         ],
         tools: &[ToolRef {
             name: "note",
-            description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/get_context/get_entity)",
+            description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/get_context/get_context_knowledge/get_propagated/get_entity/get_needing_review)",
         }],
     },
     // ── Git Tracking ────────────────────────────────────────────────
     ToolGroup {
         name: "git_tracking",
-        description: "Enregistrer et lier les commits",
-        keywords: &["commit", "git", "branche", "sha", "push"],
+        description: "Enregistrer, lier les commits, historique fichiers, TOUCHES",
+        keywords: &["commit", "git", "branche", "sha", "push", "historique", "touché", "co-change"],
         tools: &[ToolRef {
             name: "commit",
-            description: "Register and link commits (create/link_to_task/link_to_plan/get_task_commits/get_plan_commits)",
+            description: "Register and link commits (create/link_to_task/link_to_plan/get_task_commits/get_plan_commits) — create with files_changed triggers TOUCHES relations + incremental sync",
         }],
     },
     // ── Releases & Milestones ───────────────────────────────────────
@@ -510,11 +557,15 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Admin & Sync ────────────────────────────────────────────────
     ToolGroup {
         name: "sync_admin",
-        description: "Synchronisation code et administration",
-        keywords: &["sync", "watch", "watcher", "meilisearch", "index", "admin", "cleanup"],
+        description: "Synchronisation code, administration, Knowledge Fabric bootstrap",
+        keywords: &[
+            "sync", "watch", "watcher", "meilisearch", "index", "admin", "cleanup",
+            "fabric", "bootstrap", "neural", "synapse", "neuron", "energy",
+            "staleness", "decay", "backfill",
+        ],
         tools: &[ToolRef {
             name: "admin",
-            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/cleanup_sync_data/backfill_synapses)",
+            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/update_fabric_scores/bootstrap_knowledge_fabric)",
         }],
     },
 ];
@@ -626,6 +677,19 @@ pub struct ProjectContext {
     pub last_synced: Option<DateTime<Utc>>,
     /// Pre-built GDS topology section (communities, bridges, health alerts)
     pub structural_topology: Option<String>,
+    /// Knowledge Fabric metrics (TOUCHES count, SYNAPSE count, avg energy, top hotspots)
+    pub fabric_metrics: Option<FabricPromptMetrics>,
+}
+
+/// Lightweight Knowledge Fabric metrics for the system prompt context.
+#[derive(Default)]
+pub struct FabricPromptMetrics {
+    pub touches_count: i64,
+    pub co_changed_count: i64,
+    pub synapse_count: i64,
+    pub avg_energy: f64,
+    pub top_hotspots: Vec<String>,
+    pub critical_risk_files: Vec<String>,
 }
 
 // ============================================================================
@@ -776,7 +840,64 @@ pub async fn fetch_project_context(
     // 12. Structural topology (GDS communities, bridges, health alerts)
     ctx.structural_topology = build_gds_topology_section(graph, project_id).await;
 
+    // 13. Knowledge Fabric metrics (lightweight counts for prompt context)
+    ctx.fabric_metrics = build_fabric_metrics(graph, project_id).await;
+
     Ok(ctx)
+}
+
+/// Build lightweight Knowledge Fabric metrics for the system prompt.
+/// Returns None if no fabric data exists (graceful degradation).
+async fn build_fabric_metrics(
+    graph: &Arc<dyn GraphStore>,
+    project_id: Uuid,
+) -> Option<FabricPromptMetrics> {
+    // Try to get hotspots — if churn_score doesn't exist yet, no fabric data
+    let hotspots = graph
+        .get_top_hotspots(project_id, 3)
+        .await
+        .unwrap_or_default();
+
+    let risk_files = graph
+        .get_risk_summary(project_id)
+        .await
+        .unwrap_or(serde_json::json!(null));
+
+    // If no hotspots and no risk data, fabric hasn't been computed
+    if hotspots.is_empty() && risk_files.is_null() {
+        return None;
+    }
+
+    let neural = graph.get_neural_metrics(project_id).await.ok();
+
+    let top_hotspot_paths: Vec<String> = hotspots.iter().map(|h| h.path.clone()).collect();
+
+    let critical_count = risk_files
+        .get("critical_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let high_count = risk_files
+        .get("high_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let critical_risk = if critical_count > 0 || high_count > 0 {
+        vec![format!(
+            "{} critical, {} high risk files",
+            critical_count, high_count
+        )]
+    } else {
+        vec![]
+    };
+
+    Some(FabricPromptMetrics {
+        touches_count: 0, // Enriched when count queries are available
+        co_changed_count: 0,
+        synapse_count: neural.as_ref().map(|n| n.active_synapses).unwrap_or(0),
+        avg_energy: neural.as_ref().map(|n| n.avg_energy).unwrap_or(0.0),
+        top_hotspots: top_hotspot_paths,
+        critical_risk_files: critical_risk,
+    })
 }
 
 /// Build a Markdown section with GDS topology data for the system prompt.
@@ -1081,6 +1202,25 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
         );
     }
 
+    if let Some(ref fm) = ctx.fabric_metrics {
+        let mut fabric = serde_json::Map::new();
+        fabric.insert("synapse_count".into(), serde_json::json!(fm.synapse_count));
+        fabric.insert("avg_energy".into(), serde_json::json!(fm.avg_energy));
+        if !fm.top_hotspots.is_empty() {
+            fabric.insert("top_hotspots".into(), serde_json::json!(fm.top_hotspots));
+        }
+        if !fm.critical_risk_files.is_empty() {
+            fabric.insert(
+                "risk_summary".into(),
+                serde_json::json!(fm.critical_risk_files),
+            );
+        }
+        map.insert(
+            "knowledge_fabric".into(),
+            serde_json::Value::Object(fabric),
+        );
+    }
+
     if let Some(ref ts) = ctx.last_synced {
         map.insert(
             "last_synced".into(),
@@ -1232,6 +1372,29 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
         md.push_str("## Topologie structurelle\n");
         md.push_str(topo);
         md.push_str("\n\n");
+    }
+
+    if let Some(ref fm) = ctx.fabric_metrics {
+        md.push_str("## Knowledge Fabric\n");
+        if fm.synapse_count > 0 {
+            md.push_str(&format!(
+                "- **Réseau neural** : {} synapses actives, énergie moy. {:.2}\n",
+                fm.synapse_count, fm.avg_energy
+            ));
+        }
+        if !fm.top_hotspots.is_empty() {
+            md.push_str(&format!(
+                "- **Hotspots** : {}\n",
+                fm.top_hotspots.join(", ")
+            ));
+        }
+        if !fm.critical_risk_files.is_empty() {
+            md.push_str(&format!(
+                "- **Risque** : {}\n",
+                fm.critical_risk_files.join(", ")
+            ));
+        }
+        md.push('\n');
     }
 
     if !ctx.feature_graphs.is_empty() {

@@ -2245,6 +2245,10 @@ impl GraphStore for MockGraphStore {
                         community_label: None,
                         in_degree,
                         out_degree,
+                        fabric_pagerank: None,
+                        fabric_betweenness: None,
+                        fabric_community_id: None,
+                        fabric_community_label: None,
                     }))
                 } else {
                     // Node exists but no GDS metrics
@@ -2258,6 +2262,10 @@ impl GraphStore for MockGraphStore {
                         community_label: None,
                         in_degree,
                         out_degree,
+                        fabric_pagerank: None,
+                        fabric_betweenness: None,
+                        fabric_community_id: None,
+                        fabric_community_label: None,
                     }))
                 }
             }
@@ -2287,6 +2295,10 @@ impl GraphStore for MockGraphStore {
                         community_label: Some(analytics.community_label.clone()),
                         in_degree,
                         out_degree,
+                        fabric_pagerank: None,
+                        fabric_betweenness: None,
+                        fabric_community_id: None,
+                        fabric_community_label: None,
                     }))
                 } else {
                     Ok(Some(NodeGdsMetrics {
@@ -2299,6 +2311,10 @@ impl GraphStore for MockGraphStore {
                         community_label: None,
                         in_degree,
                         out_degree,
+                        fabric_pagerank: None,
+                        fabric_betweenness: None,
+                        fabric_community_id: None,
+                        fabric_community_label: None,
                     }))
                 }
             }
@@ -3329,6 +3345,7 @@ impl GraphStore for MockGraphStore {
         &self,
         _query_embedding: &[f32],
         _limit: usize,
+        _project_id: Option<&str>,
     ) -> Result<Vec<(DecisionNode, f64)>> {
         // Mock: return empty — vector search requires real Neo4j index
         Ok(vec![])
@@ -6353,6 +6370,102 @@ impl GraphStore for MockGraphStore {
             fa.insert(update.id.clone(), update.clone());
         }
         Ok(())
+    }
+
+    async fn batch_update_fabric_file_analytics(
+        &self,
+        _updates: &[crate::graph::models::FabricFileAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        // Mock: fabric analytics are not stored separately in tests
+        Ok(())
+    }
+
+    async fn get_project_synapse_edges(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        // Mock: no SYNAPSE edges in tests by default
+        Ok(vec![])
+    }
+
+    async fn get_neural_metrics(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::NeuralMetrics> {
+        Ok(crate::neo4j::models::NeuralMetrics {
+            active_synapses: 0,
+            avg_energy: 0.0,
+            weak_synapses_ratio: 0.0,
+            dead_notes_count: 0,
+        })
+    }
+
+    // T5.5 — Churn score
+    async fn compute_churn_scores(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileChurnScore>> {
+        Ok(vec![])
+    }
+
+    async fn batch_update_churn_scores(
+        &self,
+        _updates: &[crate::neo4j::models::FileChurnScore],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_top_hotspots(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileChurnScore>> {
+        Ok(vec![])
+    }
+
+    // T5.6 — Knowledge density
+    async fn compute_knowledge_density(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileKnowledgeDensity>> {
+        Ok(vec![])
+    }
+
+    async fn batch_update_knowledge_density(
+        &self,
+        _updates: &[crate::neo4j::models::FileKnowledgeDensity],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_top_knowledge_gaps(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileKnowledgeDensity>> {
+        Ok(vec![])
+    }
+
+    // T5.7 — Risk score composite
+    async fn compute_risk_scores(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileRiskScore>> {
+        Ok(vec![])
+    }
+
+    async fn batch_update_risk_scores(
+        &self,
+        _updates: &[crate::neo4j::models::FileRiskScore],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_risk_summary(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!(null))
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {

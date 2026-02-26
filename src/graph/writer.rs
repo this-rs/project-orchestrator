@@ -11,7 +11,8 @@ use anyhow::Result;
 use std::sync::Arc;
 
 use super::models::{
-    CodeGraph, CodeNodeType, FileAnalyticsUpdate, FunctionAnalyticsUpdate, GraphAnalytics,
+    CodeGraph, CodeNodeType, FabricFileAnalyticsUpdate, FileAnalyticsUpdate,
+    FunctionAnalyticsUpdate, GraphAnalytics,
 };
 
 /// Writes analytics results back to Neo4j via the `GraphStore` trait.
@@ -96,6 +97,56 @@ impl AnalyticsWriter {
         if !function_updates.is_empty() {
             self.store
                 .batch_update_function_analytics(&function_updates)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Write fabric analytics results to Neo4j as `fabric_*` properties.
+    ///
+    /// Separates File-type nodes from the graph and writes fabric-specific
+    /// scores (`fabric_pagerank`, `fabric_betweenness`, `fabric_community_id`)
+    /// without overwriting the code-only scores.
+    pub async fn write_fabric_analytics(
+        &self,
+        analytics: &GraphAnalytics,
+        graph: &CodeGraph,
+    ) -> Result<()> {
+        // Build community_id → label lookup
+        let community_labels: std::collections::HashMap<u32, &str> = analytics
+            .communities
+            .iter()
+            .map(|c| (c.id, c.label.as_str()))
+            .collect();
+
+        let mut fabric_updates: Vec<FabricFileAnalyticsUpdate> = Vec::new();
+
+        for (node_id, metrics) in &analytics.metrics {
+            let node = match graph.get_node(node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Fabric graph is file-level only (for now)
+            if node.node_type == CodeNodeType::File {
+                let label = community_labels
+                    .get(&metrics.community_id)
+                    .unwrap_or(&"unknown");
+                fabric_updates.push(FabricFileAnalyticsUpdate {
+                    path: node_id.clone(),
+                    fabric_pagerank: metrics.pagerank,
+                    fabric_betweenness: metrics.betweenness,
+                    fabric_community_id: metrics.community_id,
+                    fabric_community_label: label.to_string(),
+                    fabric_clustering_coefficient: metrics.clustering_coefficient,
+                });
+            }
+        }
+
+        if !fabric_updates.is_empty() {
+            self.store
+                .batch_update_fabric_file_analytics(&fabric_updates)
                 .await?;
         }
 

@@ -17,7 +17,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::models::{CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType};
+use super::models::{CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType, FabricWeights};
 
 /// Extracts code graphs from the knowledge graph (Neo4j) via the `GraphStore` trait.
 ///
@@ -74,6 +74,141 @@ impl GraphExtractor {
                         weight: 1.0,
                     },
                 );
+            }
+        }
+
+        Ok(graph)
+    }
+
+    /// Extract a multi-layer fabric graph for a project.
+    ///
+    /// Combines multiple relationship types into a single petgraph,
+    /// each with a configurable weight reflecting its coupling strength:
+    /// - **IMPORTS** (structural code dependencies, weight: 0.8)
+    /// - **CO_CHANGED** (temporal coupling from commits, weight: 0.4)
+    ///
+    /// Additional layers (AFFECTS, DISCUSSED, SYNAPSE) can be added by
+    /// later tasks (T5.5, T5.6, T5.9) — the graph gracefully degrades
+    /// when those edges don't exist yet.
+    ///
+    /// The resulting graph feeds into the same PageRank/Louvain/Betweenness
+    /// algorithms, but produces "fabric" scores that reflect both structural
+    /// AND temporal coupling patterns.
+    pub async fn extract_fabric_graph(
+        &self,
+        project_id: Uuid,
+        weights: &FabricWeights,
+    ) -> Result<CodeGraph> {
+        // 1. Fetch all file nodes (same as extract_file_graph)
+        let files = self.store.list_project_files(project_id).await?;
+
+        let mut graph = CodeGraph::with_capacity(files.len(), files.len() * 3);
+
+        for file in &files {
+            graph.add_node(CodeNode {
+                id: file.path.clone(),
+                node_type: CodeNodeType::File,
+                path: Some(file.path.clone()),
+                name: file
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&file.path)
+                    .to_string(),
+                project_id: file.project_id.map(|id| id.to_string()),
+            });
+        }
+
+        // 2. Layer 1: IMPORTS edges (structural)
+        let import_edges = self.store.get_project_import_edges(project_id).await?;
+        for (source, target) in &import_edges {
+            if graph.get_index(source).is_some() && graph.get_index(target).is_some() {
+                graph.add_edge(
+                    source,
+                    target,
+                    CodeEdge {
+                        edge_type: CodeEdgeType::Imports,
+                        weight: weights.imports,
+                    },
+                );
+            }
+        }
+
+        // 3. Layer 2: CO_CHANGED edges (temporal coupling)
+        // Graceful degradation: if no CO_CHANGED data exists, this returns empty
+        match self
+            .store
+            .get_co_change_graph(project_id, weights.co_changed_min_count, 10_000)
+            .await
+        {
+            Ok(co_change_pairs) => {
+                for pair in &co_change_pairs {
+                    // Both nodes must exist in the file graph
+                    if graph.get_index(&pair.file_a).is_some()
+                        && graph.get_index(&pair.file_b).is_some()
+                    {
+                        // Scale CO_CHANGED weight by count (more co-changes = stronger coupling)
+                        // Normalize: weight * min(count/10, 1.0) — cap at 10 co-changes
+                        let count_factor = (pair.count as f64 / 10.0).min(1.0);
+                        let edge_weight = weights.co_changed * count_factor;
+
+                        // CO_CHANGED is bidirectional — add both directions
+                        graph.add_edge(
+                            &pair.file_a,
+                            &pair.file_b,
+                            CodeEdge {
+                                edge_type: CodeEdgeType::CoChanged,
+                                weight: edge_weight,
+                            },
+                        );
+                        graph.add_edge(
+                            &pair.file_b,
+                            &pair.file_a,
+                            CodeEdge {
+                                edge_type: CodeEdgeType::CoChanged,
+                                weight: edge_weight,
+                            },
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    project_id = %project_id,
+                    error = %e,
+                    "Fabric extraction: CO_CHANGED layer unavailable (graceful degradation)"
+                );
+            }
+        }
+
+        // Future layers (T5.5, T5.6):
+        // - AFFECTS: Decision → File edges (requires get_project_affects_edges)
+        // - DISCUSSED: Session → File edges (requires get_project_discussed_edges)
+
+        // 4. Layer 3: SYNAPSE (neural connections bridged through Note→File)
+        match self.store.get_project_synapse_edges(project_id).await {
+            Ok(synapse_pairs) => {
+                let mut added = 0;
+                for (source, target, weight) in &synapse_pairs {
+                    if let (Some(&src_idx), Some(&tgt_idx)) = (
+                        graph.id_to_index.get(source),
+                        graph.id_to_index.get(target),
+                    ) {
+                        graph.graph.add_edge(
+                            src_idx,
+                            tgt_idx,
+                            CodeEdge {
+                                edge_type: CodeEdgeType::Synapse,
+                                weight: weights.synapse * weight,
+                            },
+                        );
+                        added += 1;
+                    }
+                }
+                tracing::debug!(project_id = %project_id, synapse_edges = added, "Fabric extraction: SYNAPSE layer added");
+            }
+            Err(e) => {
+                tracing::debug!(project_id = %project_id, error = %e, "Fabric extraction: SYNAPSE layer unavailable (graceful degradation)");
             }
         }
 

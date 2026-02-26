@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use super::algorithms::compute_all;
 use super::extraction::GraphExtractor;
-use super::models::{AnalyticsConfig, GraphAnalytics};
+use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
 use super::writer::AnalyticsWriter;
 
 // ============================================================================
@@ -65,6 +65,19 @@ pub trait AnalyticsEngine: Send + Sync {
     ///
     /// Returns a `ProjectAnalytics` with both result sets and a timestamp.
     async fn analyze_project(&self, project_id: Uuid) -> Result<ProjectAnalytics>;
+
+    /// Compute analytics on the multi-layer fabric graph.
+    ///
+    /// The fabric graph combines IMPORTS + CO_CHANGED (and future layers)
+    /// into a single weighted graph. Produces `fabric_pagerank`, `fabric_betweenness`,
+    /// and `fabric_community_id` scores that reflect both structural AND temporal coupling.
+    ///
+    /// Pipeline: extract fabric graph → compute_all → write scores to Neo4j → return analytics.
+    async fn analyze_fabric_graph(
+        &self,
+        project_id: Uuid,
+        weights: &FabricWeights,
+    ) -> Result<GraphAnalytics>;
 }
 
 // ============================================================================
@@ -129,6 +142,23 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             function_analytics,
             computed_at: Utc::now(),
         })
+    }
+
+    async fn analyze_fabric_graph(
+        &self,
+        project_id: Uuid,
+        weights: &FabricWeights,
+    ) -> Result<GraphAnalytics> {
+        // 1. Extract multi-layer graph
+        let graph = self.extractor.extract_fabric_graph(project_id, weights).await?;
+
+        // 2. Compute analytics (PageRank, Louvain, Betweenness all use edge weights)
+        let analytics = compute_all(&graph, &self.config);
+
+        // 3. Persist to fabric_* properties (NOT the code-only properties)
+        self.writer.write_fabric_analytics(&analytics, &graph).await?;
+
+        Ok(analytics)
     }
 }
 

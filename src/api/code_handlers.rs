@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::handlers::{AppError, OrchestratorState};
-use crate::neo4j::models::ConnectedFileNode;
+use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
 
 // ============================================================================
 // Code Search (Meilisearch)
@@ -447,6 +447,9 @@ pub struct ImpactAnalysis {
     /// Human-readable explanation of the risk score computation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risk_formula: Option<String>,
+    /// Architectural decisions that AFFECT the target or its impacted files
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub affecting_decisions: Vec<DecisionNode>,
 }
 
 /// Analyze impact of changing a file or function
@@ -638,6 +641,39 @@ pub async fn analyze_impact(
             .join(", ")
     );
 
+    // Fetch architectural decisions that AFFECT the target and its direct dependencies.
+    // Uses the reverse AFFECTS lookup: (Decision)-[:AFFECTS]->(File/Function).
+    // Best-effort: returns empty vec if no AFFECTS relations exist yet.
+    let affecting_decisions = {
+        let entity_type_label = match target_type {
+            "function" => "Function",
+            _ => "File",
+        };
+        // Get decisions affecting the target itself
+        let mut decisions = state
+            .orchestrator
+            .neo4j()
+            .get_decisions_affecting(entity_type_label, &target, None)
+            .await
+            .unwrap_or_default();
+
+        // Also check decisions affecting directly affected files (deduplicated)
+        for affected_file in directly_affected.iter().take(5) {
+            let file_decisions = state
+                .orchestrator
+                .neo4j()
+                .get_decisions_affecting("File", affected_file, None)
+                .await
+                .unwrap_or_default();
+            for d in file_decisions {
+                if !decisions.iter().any(|existing| existing.id == d.id) {
+                    decisions.push(d);
+                }
+            }
+        }
+        decisions
+    };
+
     Ok(Json(ImpactAnalysis {
         target,
         directly_affected,
@@ -649,6 +685,7 @@ pub async fn analyze_impact(
         affected_communities,
         betweenness_score,
         risk_formula,
+        affecting_decisions,
     }))
 }
 
@@ -1387,6 +1424,29 @@ pub async fn get_code_health(
         })
     });
 
+    // Best-effort: fetch hotspots, knowledge gaps, and risk summary.
+    // Returns empty arrays / null if properties have not been computed yet.
+    let hotspots = state
+        .orchestrator
+        .neo4j()
+        .get_top_hotspots(project.id, 5)
+        .await
+        .unwrap_or_default();
+
+    let knowledge_gaps = state
+        .orchestrator
+        .neo4j()
+        .get_top_knowledge_gaps(project.id, 5)
+        .await
+        .unwrap_or_default();
+
+    let risk_assessment = state
+        .orchestrator
+        .neo4j()
+        .get_risk_summary(project.id)
+        .await
+        .unwrap_or(serde_json::json!(null));
+
     Ok(Json(serde_json::json!({
         "god_functions": god_functions_json,
         "god_function_count": god_functions_json.len(),
@@ -1396,6 +1456,9 @@ pub async fn get_code_health(
         "coupling_metrics": coupling_json,
         "circular_dependencies": circular_deps,
         "circular_dependency_count": circular_deps.len(),
+        "hotspots": hotspots,
+        "knowledge_gaps": knowledge_gaps,
+        "risk_assessment": risk_assessment,
     })))
 }
 
@@ -1497,6 +1560,12 @@ pub async fn get_node_importance(
             "in_degree": metrics.in_degree,
             "out_degree": metrics.out_degree,
         },
+        "fabric_metrics": {
+            "fabric_pagerank": metrics.fabric_pagerank,
+            "fabric_betweenness": metrics.fabric_betweenness,
+            "fabric_community_id": metrics.fabric_community_id,
+            "fabric_community_label": metrics.fabric_community_label,
+        },
         "percentiles": {
             "pagerank_p80": percentiles.pagerank_p80,
             "pagerank_p95": percentiles.pagerank_p95,
@@ -1560,6 +1629,155 @@ pub async fn plan_implementation(
     Ok(Json(
         serde_json::to_value(&plan).map_err(anyhow::Error::from)?,
     ))
+}
+
+// ============================================================================
+// T5.5 — Change Hotspots (Churn Score)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct HotspotsQuery {
+    pub project_slug: String,
+    pub limit: Option<usize>,
+}
+
+/// GET /api/code/hotspots — Get files sorted by churn score (most frequently changed first)
+pub async fn get_change_hotspots(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<HotspotsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let limit = params.limit.unwrap_or(20);
+    let scores = state
+        .orchestrator
+        .neo4j()
+        .compute_churn_scores(project.id)
+        .await?;
+
+    let limited: Vec<&crate::neo4j::models::FileChurnScore> =
+        scores.iter().take(limit).collect();
+
+    Ok(Json(serde_json::json!({
+        "hotspots": limited,
+        "total_files": scores.len(),
+        "limit": limit,
+    })))
+}
+
+// ============================================================================
+// T5.6 — Knowledge Gaps (Knowledge Density)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct KnowledgeGapsQuery {
+    pub project_slug: String,
+    pub limit: Option<usize>,
+}
+
+/// GET /api/code/knowledge-gaps — Get files sorted by knowledge density ASC (least documented first)
+pub async fn get_knowledge_gaps(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<KnowledgeGapsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let limit = params.limit.unwrap_or(20);
+    let mut scores = state
+        .orchestrator
+        .neo4j()
+        .compute_knowledge_density(project.id)
+        .await?;
+
+    // Sort by knowledge_density ASC (least documented first)
+    scores.sort_by(|a, b| {
+        a.knowledge_density
+            .partial_cmp(&b.knowledge_density)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let limited: Vec<&crate::neo4j::models::FileKnowledgeDensity> =
+        scores.iter().take(limit).collect();
+
+    Ok(Json(serde_json::json!({
+        "knowledge_gaps": limited,
+        "total_files": scores.len(),
+        "limit": limit,
+    })))
+}
+
+// ============================================================================
+// T5.7 — Risk Assessment (Composite Risk Score)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct RiskAssessmentQuery {
+    pub project_slug: String,
+    pub limit: Option<usize>,
+}
+
+/// GET /api/code/risk-assessment — Get files sorted by composite risk score DESC
+pub async fn get_risk_assessment(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<RiskAssessmentQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let limit = params.limit.unwrap_or(20);
+    let scores = state
+        .orchestrator
+        .neo4j()
+        .compute_risk_scores(project.id)
+        .await?;
+
+    let limited: Vec<&crate::neo4j::models::FileRiskScore> =
+        scores.iter().take(limit).collect();
+
+    // Compute summary stats
+    let total = scores.len();
+    let critical = scores.iter().filter(|s| s.risk_level == "critical").count();
+    let high = scores.iter().filter(|s| s.risk_level == "high").count();
+    let medium = scores.iter().filter(|s| s.risk_level == "medium").count();
+    let low = scores.iter().filter(|s| s.risk_level == "low").count();
+    let avg_risk = if total > 0 {
+        scores.iter().map(|s| s.risk_score).sum::<f64>() / total as f64
+    } else {
+        0.0
+    };
+
+    Ok(Json(serde_json::json!({
+        "risk_files": limited,
+        "total_files": total,
+        "limit": limit,
+        "summary": {
+            "avg_risk_score": avg_risk,
+            "critical_count": critical,
+            "high_count": high,
+            "medium_count": medium,
+            "low_count": low,
+        }
+    })))
 }
 
 #[cfg(test)]

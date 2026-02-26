@@ -70,6 +70,16 @@ pub enum CodeEdgeType {
     Defines,
     ImplementsTrait,
     ImplementsFor,
+    /// Temporal coupling — files changed together in commits (Knowledge Fabric P1)
+    CoChanged,
+    /// Commit touches — file was modified by a commit (Knowledge Fabric P1)
+    Touches,
+    /// Chat discussed — entity was discussed in a chat session (Knowledge Fabric P4)
+    Discussed,
+    /// Decision affects — decision affects this entity (Knowledge Fabric P3)
+    Affects,
+    /// Neural synapse — weighted connection between notes (Knowledge Fabric P3)
+    Synapse,
 }
 
 impl std::fmt::Display for CodeEdgeType {
@@ -80,6 +90,11 @@ impl std::fmt::Display for CodeEdgeType {
             Self::Defines => write!(f, "DEFINES"),
             Self::ImplementsTrait => write!(f, "IMPLEMENTS_TRAIT"),
             Self::ImplementsFor => write!(f, "IMPLEMENTS_FOR"),
+            Self::CoChanged => write!(f, "CO_CHANGED"),
+            Self::Touches => write!(f, "TOUCHES"),
+            Self::Discussed => write!(f, "DISCUSSED"),
+            Self::Affects => write!(f, "AFFECTS"),
+            Self::Synapse => write!(f, "SYNAPSE"),
         }
     }
 }
@@ -387,6 +402,74 @@ impl Default for AnalyticsConfig {
     }
 }
 
+/// Batch update payload for File nodes' **fabric** analytics properties.
+///
+/// Used by the `AnalyticsWriter` to persist fabric-specific scores
+/// (from the multi-layer graph) separately from the code-only scores.
+/// Written to `fabric_pagerank`, `fabric_betweenness`, `fabric_community_id`, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FabricFileAnalyticsUpdate {
+    /// File path (matches the `path` property on File nodes)
+    pub path: String,
+    /// PageRank from fabric graph (multi-layer)
+    pub fabric_pagerank: f64,
+    /// Betweenness centrality from fabric graph
+    pub fabric_betweenness: f64,
+    /// Louvain community ID from fabric graph
+    pub fabric_community_id: u32,
+    /// Human-readable community label from fabric graph
+    pub fabric_community_label: String,
+    /// Local clustering coefficient from fabric graph
+    pub fabric_clustering_coefficient: f64,
+}
+
+// ============================================================================
+// Fabric layer weights — configurable per-relation weights for multi-layer graph
+// ============================================================================
+
+/// Configurable weights for each relationship type in the fabric graph.
+///
+/// The fabric graph overlays multiple relationship types into a single
+/// petgraph, each with a distinct weight reflecting its coupling strength.
+/// Higher weight = stronger coupling signal for PageRank/Louvain/Betweenness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FabricWeights {
+    /// Weight for IMPORTS edges (code dependency, default: 0.8)
+    pub imports: f64,
+    /// Weight for CALLS edges (function calls, default: 0.9)
+    pub calls: f64,
+    /// Weight for CO_CHANGED edges (temporal coupling, default: 0.4)
+    pub co_changed: f64,
+    /// Weight for AFFECTS edges (decision impact, default: 0.7)
+    pub affects: f64,
+    /// Weight for TOUCHES edges (commit coupling, default: 0.5)
+    pub touches: f64,
+    /// Weight for DISCUSSED edges (chat mentions, default: 0.3)
+    pub discussed: f64,
+    /// Weight for SYNAPSE edges (neural connections, default: 0.6)
+    pub synapse: f64,
+    /// Weight for DEFINES/CONTAINS edges (structural, default: 1.0)
+    pub defines: f64,
+    /// Minimum CO_CHANGED count to include an edge (filters noise)
+    pub co_changed_min_count: i64,
+}
+
+impl Default for FabricWeights {
+    fn default() -> Self {
+        Self {
+            imports: 0.8,
+            calls: 0.9,
+            co_changed: 0.4,
+            affects: 0.7,
+            touches: 0.5,
+            discussed: 0.3,
+            synapse: 0.6,
+            defines: 1.0,
+            co_changed_min_count: 2,
+        }
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -466,6 +549,25 @@ mod tests {
             "IMPLEMENTS_TRAIT"
         );
         assert_eq!(CodeEdgeType::ImplementsFor.to_string(), "IMPLEMENTS_FOR");
+        assert_eq!(CodeEdgeType::CoChanged.to_string(), "CO_CHANGED");
+        assert_eq!(CodeEdgeType::Touches.to_string(), "TOUCHES");
+        assert_eq!(CodeEdgeType::Discussed.to_string(), "DISCUSSED");
+        assert_eq!(CodeEdgeType::Affects.to_string(), "AFFECTS");
+        assert_eq!(CodeEdgeType::Synapse.to_string(), "SYNAPSE");
+    }
+
+    #[test]
+    fn test_fabric_weights_default() {
+        let w = FabricWeights::default();
+        assert!((w.imports - 0.8).abs() < f64::EPSILON);
+        assert!((w.calls - 0.9).abs() < f64::EPSILON);
+        assert!((w.co_changed - 0.4).abs() < f64::EPSILON);
+        assert!((w.affects - 0.7).abs() < f64::EPSILON);
+        assert!((w.touches - 0.5).abs() < f64::EPSILON);
+        assert!((w.discussed - 0.3).abs() < f64::EPSILON);
+        assert!((w.synapse - 0.6).abs() < f64::EPSILON);
+        assert!((w.defines - 1.0).abs() < f64::EPSILON);
+        assert_eq!(w.co_changed_min_count, 2);
     }
 
     // --- NodeMetrics ---

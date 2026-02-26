@@ -291,23 +291,51 @@ impl Neo4jClient {
     /// Semantic search over Decision embeddings using Neo4j vector index.
     ///
     /// Returns decisions ordered by cosine similarity to the query embedding.
+    /// When `project_id` is provided, fetches `limit * 3` results from the global
+    /// vector index and filters post-query (the index is global, not project-scoped).
     pub async fn search_decisions_by_vector(
         &self,
         query_embedding: &[f32],
         limit: usize,
+        project_id: Option<&str>,
     ) -> Result<Vec<(DecisionNode, f64)>> {
         let embedding_f64: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
 
-        let q = query(
+        // When filtering by project, overfetch x3 then filter post-query
+        let fetch_limit = if project_id.is_some() {
+            limit * 3
+        } else {
+            limit
+        };
+
+        let cypher = if project_id.is_some() {
             r#"
-            CALL db.index.vector.queryNodes('decision_embedding', $limit, $embedding)
+            CALL db.index.vector.queryNodes('decision_embedding', $fetch_limit, $embedding)
+            YIELD node AS d, score
+            // Filter by project: Decision is linked via Task→Plan→Project
+            MATCH (t:Task)-[:INFORMED_BY]->(d)
+            MATCH (p:Plan {id: t.plan_id})-[:BELONGS_TO]->(proj:Project {id: $project_id})
+            RETURN d, score
+            ORDER BY score DESC
+            LIMIT $limit
+            "#
+        } else {
+            r#"
+            CALL db.index.vector.queryNodes('decision_embedding', $fetch_limit, $embedding)
             YIELD node AS d, score
             RETURN d, score
             ORDER BY score DESC
-            "#,
-        )
-        .param("limit", limit as i64)
-        .param("embedding", embedding_f64);
+            "#
+        };
+
+        let mut q = query(cypher)
+            .param("fetch_limit", fetch_limit as i64)
+            .param("limit", limit as i64)
+            .param("embedding", embedding_f64);
+
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
 
         let mut result = self.graph.execute(q).await?;
         let mut results = Vec::new();

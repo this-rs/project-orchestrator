@@ -297,6 +297,8 @@ impl ToolHandler {
             ("admin", "backfill_decision_embeddings") => "backfill_decision_embeddings",
             ("admin", "backfill_touches") => "backfill_touches",
             ("admin", "backfill_discussed") => "backfill_discussed",
+            ("admin", "update_fabric_scores") => "update_fabric_scores",
+            ("admin", "bootstrap_knowledge_fabric") => "bootstrap_knowledge_fabric",
 
             _ => {
                 return Err(anyhow!(
@@ -931,6 +933,9 @@ impl ToolHandler {
                 let mut query = vec![("query".to_string(), query_str)];
                 if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
                     query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), pid.to_string()));
                 }
                 let result = http
                     .get_with_query("/api/decisions/search-semantic", &query)
@@ -1796,6 +1801,31 @@ impl ToolHandler {
             "backfill_discussed" => {
                 let result = http
                     .post("/api/admin/backfill-discussed", &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "update_fabric_scores" => {
+                let mut body = serde_json::Map::new();
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), Value::String(pid.to_string()));
+                }
+                let result = http
+                    .post("/api/admin/update-fabric-scores", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "bootstrap_knowledge_fabric" => {
+                let mut body = serde_json::Map::new();
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), Value::String(pid.to_string()));
+                }
+                let result = http
+                    .post(
+                        "/api/admin/bootstrap-knowledge-fabric",
+                        &Value::Object(body),
+                    )
                     .await?;
                 Ok(Some(result))
             }

@@ -704,6 +704,7 @@ pub async fn search_decisions(
 pub struct SearchDecisionsSemanticQuery {
     pub query: String,
     pub limit: Option<usize>,
+    pub project_id: Option<String>,
 }
 
 pub async fn search_decisions_semantic(
@@ -713,7 +714,11 @@ pub async fn search_decisions_semantic(
     let results = state
         .orchestrator
         .plan_manager()
-        .search_decisions_semantic(&params.query, params.limit.unwrap_or(10))
+        .search_decisions_semantic(
+            &params.query,
+            params.limit.unwrap_or(10),
+            params.project_id.as_deref(),
+        )
         .await?;
     Ok(Json(results))
 }
@@ -1620,6 +1625,170 @@ pub async fn backfill_discussed(
         "sessions_processed": sessions,
         "entities_found": entities,
         "relations_created": relations,
+    })))
+}
+
+// ============================================================================
+// Knowledge Fabric Admin
+// ============================================================================
+
+/// Request body for update-fabric-scores and bootstrap-knowledge-fabric
+#[derive(Deserialize)]
+pub struct FabricProjectRequest {
+    pub project_id: Uuid,
+}
+
+/// POST /api/admin/update-fabric-scores
+///
+/// Orchestrates the full fabric analytics pipeline: extracts the multi-layer
+/// fabric graph (IMPORTS + CO_CHANGED + SYNAPSE) and computes PageRank,
+/// Louvain, and Betweenness scores on it.
+pub async fn update_fabric_scores(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FabricProjectRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    // Verify project exists
+    let _project = state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let start = std::time::Instant::now();
+
+    // Compute fabric graph analytics (IMPORTS + CO_CHANGED + SYNAPSE layers)
+    let weights = crate::graph::models::FabricWeights::default();
+    let analytics = state
+        .orchestrator
+        .analytics()
+        .analyze_fabric_graph(project_id, &weights)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let computation_ms = start.elapsed().as_millis() as u64;
+
+    // Stub calls for future T5.5-T5.7 metrics (churn, knowledge_density, risk)
+    // These will be wired when both agents finish their respective tasks.
+    // For now, return the fabric scores result.
+
+    Ok(Json(serde_json::json!({
+        "nodes_updated": analytics.metrics.len(),
+        "computation_ms": computation_ms,
+        "fabric_scores_computed": true,
+        "communities": analytics.communities.len(),
+        "components": analytics.components.len(),
+    })))
+}
+
+/// POST /api/admin/bootstrap-knowledge-fabric
+///
+/// Chains ALL knowledge fabric backfill steps in order, then computes
+/// fabric scores. Each step is best-effort (continues on failure).
+/// Returns a report of completed and failed steps.
+pub async fn bootstrap_knowledge_fabric(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FabricProjectRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    // Verify project exists
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let start = std::time::Instant::now();
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+
+    // Step 1: Backfill commit touches
+    let root_path = std::path::PathBuf::from(&project.root_path);
+    match state
+        .orchestrator
+        .backfill_commit_touches(project_id, &root_path)
+        .await
+    {
+        Ok(result) => completed.push(serde_json::json!({
+            "step": "backfill_touches",
+            "commits_parsed": result.commits_parsed,
+            "commits_backfilled": result.commits_backfilled,
+            "touches_created": result.touches_created,
+        })),
+        Err(e) => failed.push(serde_json::json!({
+            "step": "backfill_touches",
+            "error": e.to_string(),
+        })),
+    }
+
+    // Step 2: Backfill decision embeddings
+    match state
+        .orchestrator
+        .plan_manager()
+        .backfill_decision_embeddings()
+        .await
+    {
+        Ok((total, created)) => completed.push(serde_json::json!({
+            "step": "backfill_decision_embeddings",
+            "decisions_processed": total,
+            "embeddings_created": created,
+        })),
+        Err(e) => failed.push(serde_json::json!({
+            "step": "backfill_decision_embeddings",
+            "error": e.to_string(),
+        })),
+    }
+
+    // Step 3: Backfill DISCUSSED relations
+    match state
+        .orchestrator
+        .neo4j()
+        .backfill_discussed()
+        .await
+    {
+        Ok((sessions, entities, relations)) => completed.push(serde_json::json!({
+            "step": "backfill_discussed",
+            "sessions_processed": sessions,
+            "entities_found": entities,
+            "relations_created": relations,
+        })),
+        Err(e) => failed.push(serde_json::json!({
+            "step": "backfill_discussed",
+            "error": e.to_string(),
+        })),
+    }
+
+    // Step 4: Update fabric scores (the final analytics computation)
+    let weights = crate::graph::models::FabricWeights::default();
+    match state
+        .orchestrator
+        .analytics()
+        .analyze_fabric_graph(project_id, &weights)
+        .await
+    {
+        Ok(analytics) => completed.push(serde_json::json!({
+            "step": "update_fabric_scores",
+            "nodes_updated": analytics.metrics.len(),
+            "communities": analytics.communities.len(),
+        })),
+        Err(e) => failed.push(serde_json::json!({
+            "step": "update_fabric_scores",
+            "error": e.to_string(),
+        })),
+    }
+
+    let total_time_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "steps_completed": completed,
+        "steps_failed": failed,
+        "total_time_ms": total_time_ms,
     })))
 }
 

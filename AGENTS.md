@@ -92,11 +92,41 @@ GET /api/code/search?q=error+handling&limit=10
 ### Check impact before changes
 ```bash
 GET /api/code/impact?target=src/models/user.rs
+# Impact analysis now includes affecting_decisions (architectural decisions linked via AFFECTS)
 ```
 
 ### Find past decisions
 ```bash
+# BM25 keyword search
 GET /api/decisions/search?q=authentication
+# Semantic vector search (recommended)
+POST /api/decisions/search-semantic {"query": "how do we handle auth?", "limit": 5}
+```
+
+### Knowledge Fabric — Risk & Health
+
+```bash
+# Hotspots: files with high churn (frequently modified)
+GET /api/code/hotspots?project_slug=my-project&limit=10
+
+# Knowledge gaps: under-documented files
+GET /api/code/knowledge-gaps?project_slug=my-project&limit=10
+
+# Risk assessment: composite score (pagerank × churn × knowledge_gap × betweenness)
+GET /api/code/risk-assessment?project_slug=my-project&limit=10
+
+# Full health report (includes hotspots, knowledge_gaps, risk, neural_metrics)
+GET /api/code/health?project_slug=my-project
+```
+
+### Knowledge Fabric — Admin Commands
+
+```bash
+# Bootstrap: initialize all Knowledge Fabric relations from historical data
+POST /api/admin/bootstrap-knowledge-fabric {"project_id": "uuid"}
+
+# Recalculate all GDS fabric scores (PageRank, Louvain, Betweenness multi-layer)
+POST /api/admin/update-fabric-scores {"project_id": "uuid"}
 ```
 
 ---

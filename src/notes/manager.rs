@@ -1457,7 +1457,7 @@ impl NoteManager {
                 // Also search for similar Decisions via the decision vector index
                 match self
                     .neo4j
-                    .search_decisions_by_vector(&embedding, max_neighbors)
+                    .search_decisions_by_vector(&embedding, max_neighbors, None)
                     .await
                 {
                     Ok(decision_results) => {

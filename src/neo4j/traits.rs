@@ -4,7 +4,7 @@
 //! This trait mirrors all public async methods of `Neo4jClient`,
 //! enabling testing with mock implementations and future backend swaps.
 
-use crate::graph::models::{FileAnalyticsUpdate, FunctionAnalyticsUpdate};
+use crate::graph::models::{FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate};
 use crate::neo4j::models::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -783,11 +783,13 @@ pub trait GraphStore: Send + Sync {
     /// Get all Decision IDs that have no embedding yet (for backfill)
     async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>>;
 
-    /// Semantic search over Decision embeddings using Neo4j vector index
+    /// Semantic search over Decision embeddings using Neo4j vector index.
+    /// When `project_id` is provided, filters results to that project (post-query).
     async fn search_decisions_by_vector(
         &self,
         query_embedding: &[f32],
         limit: usize,
+        project_id: Option<&str>,
     ) -> Result<Vec<(DecisionNode, f64)>>;
 
     /// Get decisions that AFFECT a given entity (reverse AFFECTS lookup)
@@ -1694,6 +1696,84 @@ pub trait GraphStore: Send + Sync {
         &self,
         updates: &[FunctionAnalyticsUpdate],
     ) -> Result<()>;
+
+    /// Batch-update **fabric** analytics scores on File nodes.
+    /// Writes to `fabric_pagerank`, `fabric_betweenness`, `fabric_community_id`, etc.
+    /// These are separate from the code-only scores written by `batch_update_file_analytics`.
+    async fn batch_update_fabric_file_analytics(
+        &self,
+        updates: &[FabricFileAnalyticsUpdate],
+    ) -> Result<()>;
+
+    // ========================================================================
+    // SYNAPSE (neural connections bridged to file-level)
+    // ========================================================================
+
+    /// Get SYNAPSE edges bridged from Note-level to File-level.
+    /// Returns (source_file_path, target_file_path, avg_weight) tuples.
+    async fn get_project_synapse_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String, f64)>>;
+
+    /// Get neural network metrics for a project's SYNAPSE layer.
+    async fn get_neural_metrics(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::NeuralMetrics>;
+
+    // ========================================================================
+    // T5.5 — Churn score (commit frequency per file)
+    // ========================================================================
+
+    /// Compute churn metrics per file via TOUCHES relations.
+    async fn compute_churn_scores(&self, project_id: Uuid) -> Result<Vec<FileChurnScore>>;
+
+    /// Batch-write churn scores to File nodes.
+    async fn batch_update_churn_scores(&self, updates: &[FileChurnScore]) -> Result<()>;
+
+    /// Get top N files by churn_score (pre-computed on File nodes).
+    async fn get_top_hotspots(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<FileChurnScore>>;
+
+    // ========================================================================
+    // T5.6 — Knowledge density score
+    // ========================================================================
+
+    /// Compute knowledge density per file based on linked notes and decisions.
+    async fn compute_knowledge_density(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<FileKnowledgeDensity>>;
+
+    /// Batch-write knowledge density scores to File nodes.
+    async fn batch_update_knowledge_density(
+        &self,
+        updates: &[FileKnowledgeDensity],
+    ) -> Result<()>;
+
+    /// Get top N files with lowest knowledge_density (knowledge gaps).
+    async fn get_top_knowledge_gaps(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<FileKnowledgeDensity>>;
+
+    // ========================================================================
+    // T5.7 — Risk score composite
+    // ========================================================================
+
+    /// Compute composite risk scores for all files in a project.
+    async fn compute_risk_scores(&self, project_id: Uuid) -> Result<Vec<FileRiskScore>>;
+
+    /// Batch-write composite risk scores to File nodes.
+    async fn batch_update_risk_scores(&self, updates: &[FileRiskScore]) -> Result<()>;
+
+    /// Get risk assessment summary stats for a project.
+    async fn get_risk_summary(&self, project_id: Uuid) -> Result<serde_json::Value>;
 
     // ========================================================================
     // Health check

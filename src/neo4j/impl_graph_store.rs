@@ -1022,8 +1022,9 @@ impl GraphStore for Neo4jClient {
         &self,
         query_embedding: &[f32],
         limit: usize,
+        project_id: Option<&str>,
     ) -> anyhow::Result<Vec<(DecisionNode, f64)>> {
-        self.search_decisions_by_vector(query_embedding, limit)
+        self.search_decisions_by_vector(query_embedding, limit, project_id)
             .await
     }
 
@@ -2072,6 +2073,95 @@ impl GraphStore for Neo4jClient {
         updates: &[crate::graph::models::FunctionAnalyticsUpdate],
     ) -> anyhow::Result<()> {
         self.batch_update_function_analytics(updates).await
+    }
+
+    async fn batch_update_fabric_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FabricFileAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        self.batch_update_fabric_file_analytics(updates).await
+    }
+
+    async fn get_project_synapse_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        self.get_project_synapse_edges(project_id).await
+    }
+
+    async fn get_neural_metrics(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::NeuralMetrics> {
+        self.get_neural_metrics(project_id).await
+    }
+
+    // T5.5 — Churn score
+    async fn compute_churn_scores(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileChurnScore>> {
+        self.compute_churn_scores(project_id).await
+    }
+
+    async fn batch_update_churn_scores(
+        &self,
+        updates: &[crate::neo4j::models::FileChurnScore],
+    ) -> anyhow::Result<()> {
+        self.batch_update_churn_scores(updates).await
+    }
+
+    async fn get_top_hotspots(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileChurnScore>> {
+        self.get_top_hotspots(project_id, limit).await
+    }
+
+    // T5.6 — Knowledge density
+    async fn compute_knowledge_density(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileKnowledgeDensity>> {
+        self.compute_knowledge_density(project_id).await
+    }
+
+    async fn batch_update_knowledge_density(
+        &self,
+        updates: &[crate::neo4j::models::FileKnowledgeDensity],
+    ) -> anyhow::Result<()> {
+        self.batch_update_knowledge_density(updates).await
+    }
+
+    async fn get_top_knowledge_gaps(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileKnowledgeDensity>> {
+        self.get_top_knowledge_gaps(project_id, limit).await
+    }
+
+    // T5.7 — Risk score composite
+    async fn compute_risk_scores(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileRiskScore>> {
+        self.compute_risk_scores(project_id).await
+    }
+
+    async fn batch_update_risk_scores(
+        &self,
+        updates: &[crate::neo4j::models::FileRiskScore],
+    ) -> anyhow::Result<()> {
+        self.batch_update_risk_scores(updates).await
+    }
+
+    async fn get_risk_summary(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.get_risk_summary(project_id).await
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {

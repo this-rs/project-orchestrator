@@ -440,11 +440,15 @@ impl PlanManager {
         Ok(decisions)
     }
 
-    /// Semantic search for decisions using vector embeddings
+    /// Semantic search for decisions using vector embeddings.
+    ///
+    /// When `project_id` is provided, results are filtered to decisions
+    /// belonging to that project (post-query filtering with x3 overfetch).
     pub async fn search_decisions_semantic(
         &self,
         query: &str,
         limit: usize,
+        project_id: Option<&str>,
     ) -> Result<Vec<DecisionSearchHit>> {
         let provider = self
             .embedding_provider
@@ -453,7 +457,7 @@ impl PlanManager {
         let embedding = provider.embed_text(query).await?;
         let results = self
             .neo4j
-            .search_decisions_by_vector(&embedding, limit)
+            .search_decisions_by_vector(&embedding, limit, project_id)
             .await?;
         Ok(results
             .into_iter()

@@ -1004,6 +1004,18 @@ pub struct NodeGdsMetrics {
     pub community_label: Option<String>,
     pub in_degree: i64,
     pub out_degree: i64,
+    /// Fabric PageRank — computed on multi-layer graph (IMPORTS + CO_CHANGED + ...)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fabric_pagerank: Option<f64>,
+    /// Fabric betweenness centrality — computed on multi-layer graph
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fabric_betweenness: Option<f64>,
+    /// Fabric community ID — Louvain on multi-layer graph
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fabric_community_id: Option<i64>,
+    /// Fabric community label — human-readable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fabric_community_label: Option<String>,
 }
 
 /// Statistical percentiles for a project's GDS metrics distribution.
@@ -1034,6 +1046,18 @@ pub struct BridgeFile {
     pub path: String,
     pub betweenness: f64,
     pub community_label: Option<String>,
+}
+
+/// Neural network metrics for a project's SYNAPSE layer.
+///
+/// Summarizes the state of the note-level neural connections:
+/// active synapses, average energy, weak synapse ratio, and dead notes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeuralMetrics {
+    pub active_synapses: i64,
+    pub avg_energy: f64,
+    pub weak_synapses_ratio: f64,
+    pub dead_notes_count: i64,
 }
 
 /// A feature graph — a named subgraph capturing all code entities related to a feature.
@@ -1235,6 +1259,49 @@ pub struct RefreshTokenNode {
     pub created_at: DateTime<Utc>,
     /// Whether this token has been revoked (logout, rotation, etc.)
     pub revoked: bool,
+}
+
+// ============================================================================
+// Analytics: Churn, Knowledge Density, Risk Score (T5.5, T5.6, T5.7)
+// ============================================================================
+
+/// Churn score for a file based on commit frequency and co-change patterns.
+/// Computed from TOUCHES relations between Commit and File nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChurnScore {
+    pub path: String,
+    pub commit_count: i64,
+    pub total_churn: i64, // additions + deletions
+    pub co_change_count: i64,
+    pub churn_score: f64, // normalized 0.0-1.0
+}
+
+/// Knowledge density for a file based on associated notes and decisions.
+/// Files with low density are "knowledge gaps" that may need documentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileKnowledgeDensity {
+    pub path: String,
+    pub note_count: i64,
+    pub decision_count: i64,
+    pub knowledge_density: f64, // normalized 0.0-1.0
+}
+
+/// Composite risk score for a file combining structural importance, churn, and knowledge gaps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRiskScore {
+    pub path: String,
+    pub risk_score: f64,
+    pub risk_level: String, // "low", "medium", "high", "critical"
+    pub factors: RiskFactors,
+}
+
+/// Individual risk factor contributions for a file's composite risk score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskFactors {
+    pub pagerank: f64,
+    pub churn: f64,
+    pub knowledge_gap: f64, // 1 - density
+    pub betweenness: f64,
 }
 
 #[cfg(test)]

@@ -391,7 +391,8 @@ fn decision_tool() -> ToolDefinition {
                 "chosen_option": {"type": "string", "description": "Chosen option (add/update)"},
                 "status": {"type": "string", "description": "New status (update): proposed, accepted, deprecated, superseded"},
                 "query": {"type": "string", "description": "Search query (search/search_semantic)"},
-                "entity_type": {"type": "string", "description": "Entity type (add_affects/remove_affects)"},
+                "project_id": {"type": "string", "description": "Project UUID filter (search_semantic — post-query filtering)"},
+                "entity_type": {"type": "string", "description": "Entity type (add_affects/remove_affects/get_affecting)"},
                 "entity_id": {"type": "string", "description": "Entity identifier (add_affects/remove_affects)"},
                 "impact_description": {"type": "string", "description": "Description of how the decision impacts the entity (add_affects)"},
                 "superseded_by_id": {"type": "string", "description": "Decision UUID being superseded (supersede)"},
@@ -757,17 +758,17 @@ fn code_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, backfill_decision_embeddings, backfill_touches, backfill_discussed".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
-                "project_id": {"type": "string", "description": "Project UUID (sync_directory/start_watch/update_staleness_scores/update_energy_scores)"},
+                "project_id": {"type": "string", "description": "Project UUID (sync_directory/start_watch/update_staleness_scores/update_energy_scores/update_fabric_scores/bootstrap_knowledge_fabric)"},
                 "query": {"type": "string", "description": "Search query (search_neurons)"},
                 "source_note_id": {"type": "string", "description": "Source note UUID (reinforce_neurons)"},
                 "target_note_id": {"type": "string", "description": "Target note UUID (reinforce_neurons)"},

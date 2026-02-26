@@ -9,7 +9,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use super::engine::{AnalyticsEngine, ProjectAnalytics};
-use super::models::{CodeHealthReport, GraphAnalytics};
+use super::models::{CodeHealthReport, FabricWeights, GraphAnalytics};
 
 /// Mock implementation of `AnalyticsEngine` for testing.
 ///
@@ -82,6 +82,18 @@ impl AnalyticsEngine for MockAnalyticsEngine {
             function_analytics,
             computed_at: Utc::now(),
         })
+    }
+
+    async fn analyze_fabric_graph(
+        &self,
+        _project_id: Uuid,
+        _weights: &FabricWeights,
+    ) -> Result<GraphAnalytics> {
+        // Return file result as fabric result (mock approximation)
+        Ok(self
+            .file_result
+            .clone()
+            .unwrap_or_else(Self::empty_analytics))
     }
 }
 

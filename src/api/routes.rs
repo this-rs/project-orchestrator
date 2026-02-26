@@ -506,6 +506,19 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/node-importance",
             get(code_handlers::get_node_importance),
         )
+        // Churn hotspots, knowledge gaps, risk assessment (T5.5, T5.6, T5.7)
+        .route(
+            "/api/code/hotspots",
+            get(code_handlers::get_change_hotspots),
+        )
+        .route(
+            "/api/code/knowledge-gaps",
+            get(code_handlers::get_knowledge_gaps),
+        )
+        .route(
+            "/api/code/risk-assessment",
+            get(code_handlers::get_risk_assessment),
+        )
         // ================================================================
         // Implementation Planner
         // ================================================================
@@ -664,6 +677,17 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/admin/cleanup-sync-data",
             post(handlers::cleanup_sync_data),
+        )
+        // ================================================================
+        // Admin — Knowledge Fabric
+        // ================================================================
+        .route(
+            "/api/admin/update-fabric-scores",
+            post(handlers::update_fabric_scores),
+        )
+        .route(
+            "/api/admin/bootstrap-knowledge-fabric",
+            post(handlers::bootstrap_knowledge_fabric),
         )
         // ================================================================
         // Workspaces
