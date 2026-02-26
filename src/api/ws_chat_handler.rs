@@ -765,12 +765,46 @@ async fn handle_ws_chat_loop(
                                                 }
                                             }
                                             Err(e) => {
-                                                error!(session_id = %session_id, error = %e, "Failed to send message");
-                                                let err = serde_json::json!({
-                                                    "type": "error",
-                                                    "message": format!("Failed to send message: {}", e),
-                                                });
-                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                                // send_message failed — likely dead CLI (ChannelSendError).
+                                                // Fall through to resume_session as a recovery mechanism.
+                                                warn!(
+                                                    session_id = %session_id,
+                                                    error = %e,
+                                                    "send_message failed, attempting resume_session as fallback"
+                                                );
+                                                match chat_manager.resume_session(&session_id, &content, Some(&claims)).await {
+                                                    Ok(()) => {
+                                                        // Resume succeeded — subscribe to the new broadcast channel
+                                                        // (the old one is dead since the CLI was replaced)
+                                                        match chat_manager.subscribe(&session_id).await {
+                                                            Ok(rx) => {
+                                                                event_rx = Some(rx);
+                                                                if nats_chat_sub.is_some() {
+                                                                    debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active (after resume fallback)");
+                                                                    nats_chat_sub = None;
+                                                                }
+                                                                info!(session_id = %session_id, "Recovered via resume_session after send_message failure");
+                                                            }
+                                                            Err(sub_err) => {
+                                                                debug!(session_id = %session_id, error = %sub_err, "No local broadcast after resume fallback");
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(resume_err) => {
+                                                        // Both send_message and resume_session failed — show error
+                                                        error!(
+                                                            session_id = %session_id,
+                                                            send_error = %e,
+                                                            resume_error = %resume_err,
+                                                            "Both send_message and resume_session failed"
+                                                        );
+                                                        let err = serde_json::json!({
+                                                            "type": "error",
+                                                            "message": format!("Failed to send message: {}", resume_err),
+                                                        });
+                                                        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                                    }
+                                                }
                                             }
                                         }
                                     }

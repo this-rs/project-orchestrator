@@ -2203,6 +2203,22 @@ impl ChatManager {
                         } else {
                             // Not retryable or max retries exceeded — propagate error
                             error!("Error starting stream for session {}: {}", session_id, e);
+
+                            // If this is a ChannelSendError (CLI is dead), remove the
+                            // session from active_sessions so the next user message
+                            // routes to resume_session instead of hitting the same dead CLI.
+                            let is_channel_dead = err_str.contains("channel")
+                                || err_str.contains("Channel")
+                                || err_str.contains("Not connected");
+                            if is_channel_dead {
+                                warn!(
+                                    "CLI appears dead for session {} ({}), removing from active_sessions \
+                                     so next message triggers resume_session",
+                                    session_id, err_str
+                                );
+                                active_sessions.write().await.remove(&session_id);
+                            }
+
                             emit_chat(
                                 ChatEvent::Error {
                                     message: format!("Error: {}", e),
@@ -4393,26 +4409,39 @@ impl ChatManager {
                 }
             }
 
-            // Send SIGINT to the CLI's process group to kill child processes
-            // (find, sleep, cargo, etc.) that survive the control_request interrupt.
-            // The CLI process (group leader) handles SIGINT gracefully.
-            // Child processes receive SIGINT and terminate immediately.
+            // Kill descendant processes of the CLI (find, sleep, cargo, etc.)
+            // WITHOUT killing the CLI itself. Sending SIGINT to the entire process
+            // group (-pgid) would kill the CLI too, making the session unusable
+            // and causing "Failed to send message through channel" on the next message.
+            // Instead, enumerate child PIDs recursively and signal them individually.
             #[cfg(unix)]
             if let Some(pid) = child_pid {
-                unsafe {
-                    let pgid = -(pid as i32);
-                    libc::kill(pgid, libc::SIGINT);
+                let descendants = Self::get_descendant_pids(pid);
+                if !descendants.is_empty() {
+                    for &desc_pid in &descendants {
+                        unsafe {
+                            libc::kill(desc_pid as i32, libc::SIGINT);
+                        }
+                    }
+                    info!(
+                        session_id = %session_id,
+                        cli_pid = pid,
+                        descendant_count = descendants.len(),
+                        descendant_pids = ?descendants,
+                        "Sent SIGINT to CLI descendant processes (not the CLI itself)"
+                    );
+                } else {
+                    debug!(
+                        session_id = %session_id,
+                        cli_pid = pid,
+                        "No descendant processes found to kill"
+                    );
                 }
-                info!(
-                    session_id = %session_id,
-                    pid = pid,
-                    "Sent SIGINT to CLI process group"
-                );
             }
 
             info!(
                 session_id = %session_id,
-                "Interrupt: flag set, token cancelled, control_request sent, SIGINT sent"
+                "Interrupt: flag set, token cancelled, control_request sent, descendants killed"
             );
         } else {
             debug!(
@@ -4432,6 +4461,37 @@ impl ChatManager {
         }
 
         Ok(())
+    }
+
+    /// Recursively enumerate all descendant PIDs of a given process.
+    ///
+    /// Uses `pgrep -P <pid>` to find direct children, then recurses.
+    /// Returns an empty Vec if the process has no children or pgrep fails.
+    /// This is used by `interrupt()` to kill tool subprocesses (find, sleep, etc.)
+    /// without killing the CLI itself (which would break the session).
+    #[cfg(unix)]
+    fn get_descendant_pids(pid: u32) -> Vec<u32> {
+        fn get_children(pid: u32) -> Vec<u32> {
+            std::process::Command::new("pgrep")
+                .args(["-P", &pid.to_string()])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| {
+                    s.lines()
+                        .filter_map(|l| l.trim().parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        let mut result = Vec::new();
+        let mut stack = get_children(pid);
+        while let Some(child) = stack.pop() {
+            result.push(child);
+            stack.extend(get_children(child));
+        }
+        result
     }
 
     /// Close an active session: interrupt first, then disconnect and remove.
