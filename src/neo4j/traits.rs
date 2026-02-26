@@ -308,13 +308,13 @@ pub trait GraphStore: Send + Sync {
     /// Delete a file and all its symbols
     async fn delete_file(&self, path: &str) -> Result<()>;
 
-    /// Delete files that are no longer on the filesystem
-    /// Returns the number of files and symbols deleted
+    /// Delete files that are no longer on the filesystem.
+    /// Returns `(files_deleted, symbols_deleted, deleted_paths)`.
     async fn delete_stale_files(
         &self,
         project_id: Uuid,
         valid_paths: &[String],
-    ) -> Result<(usize, usize)>;
+    ) -> Result<(usize, usize, Vec<String>)>;
 
     /// Link a file to a project (create CONTAINS relationship)
     async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()>;

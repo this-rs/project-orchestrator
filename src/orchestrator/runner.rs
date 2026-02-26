@@ -1501,9 +1501,27 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         if let Some(pid) = project_id {
             let valid_paths: Vec<String> = synced_paths.into_iter().collect();
             match self.neo4j().delete_stale_files(pid, &valid_paths).await {
-                Ok((files_deleted, symbols_deleted)) => {
+                Ok((files_deleted, symbols_deleted, stale_paths)) => {
                     result.files_deleted = files_deleted;
                     result.symbols_deleted = symbols_deleted;
+
+                    // Also clean up stale files from Meilisearch search index
+                    if !stale_paths.is_empty() {
+                        tracing::info!(
+                            "Cleaning {} stale file(s) from Meilisearch for project {}",
+                            stale_paths.len(),
+                            pid
+                        );
+                        for path in &stale_paths {
+                            if let Err(e) = self.meili().delete_code(path).await {
+                                tracing::warn!(
+                                    "Failed to delete stale file {} from Meilisearch: {}",
+                                    path,
+                                    e
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to clean up stale files: {}", e);

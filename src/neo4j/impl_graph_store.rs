@@ -402,7 +402,7 @@ impl GraphStore for Neo4jClient {
         &self,
         project_id: Uuid,
         valid_paths: &[String],
-    ) -> anyhow::Result<(usize, usize)> {
+    ) -> anyhow::Result<(usize, usize, Vec<String>)> {
         self.delete_stale_files(project_id, valid_paths).await
     }
 

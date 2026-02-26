@@ -48,36 +48,41 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// Delete files that are no longer on the filesystem
-    /// Returns the number of files and symbols deleted
+    /// Delete files that are no longer on the filesystem.
+    ///
+    /// Returns `(files_deleted, symbols_deleted, deleted_paths)` so the caller
+    /// can also clean secondary indexes (e.g. Meilisearch).
     pub async fn delete_stale_files(
         &self,
         project_id: Uuid,
         valid_paths: &[String],
-    ) -> Result<(usize, usize)> {
-        // First, count what we're about to delete
+    ) -> Result<(usize, usize, Vec<String>)> {
+        // First, count and collect paths of what we're about to delete
         let count_q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
             WHERE NOT f.path IN $valid_paths
             OPTIONAL MATCH (f)-[:CONTAINS]->(symbol)
-            RETURN count(DISTINCT f) AS file_count, count(DISTINCT symbol) AS symbol_count
+            RETURN count(DISTINCT f) AS file_count,
+                   count(DISTINCT symbol) AS symbol_count,
+                   collect(DISTINCT f.path) AS stale_paths
             "#,
         )
         .param("project_id", project_id.to_string())
         .param("valid_paths", valid_paths.to_vec());
 
         let mut result = self.graph.execute(count_q).await?;
-        let (file_count, symbol_count) = if let Some(row) = result.next().await? {
+        let (file_count, symbol_count, stale_paths) = if let Some(row) = result.next().await? {
             let files: i64 = row.get("file_count").unwrap_or(0);
             let symbols: i64 = row.get("symbol_count").unwrap_or(0);
-            (files as usize, symbols as usize)
+            let paths: Vec<String> = row.get("stale_paths").unwrap_or_default();
+            (files as usize, symbols as usize, paths)
         } else {
-            (0, 0)
+            (0, 0, vec![])
         };
 
         if file_count == 0 {
-            return Ok((0, 0));
+            return Ok((0, 0, vec![]));
         }
 
         // Delete the stale files and their symbols
@@ -101,7 +106,7 @@ impl Neo4jClient {
             project_id
         );
 
-        Ok((file_count, symbol_count))
+        Ok((file_count, symbol_count, stale_paths))
     }
 
     /// Link a file to a project (create CONTAINS relationship)

@@ -1160,7 +1160,7 @@ impl GraphStore for MockGraphStore {
         &self,
         project_id: Uuid,
         valid_paths: &[String],
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, Vec<String>)> {
         let current_paths = self
             .project_files
             .read()
@@ -1170,19 +1170,21 @@ impl GraphStore for MockGraphStore {
             .unwrap_or_default();
         let mut files_deleted = 0usize;
         let mut symbols_deleted = 0usize;
+        let mut deleted_paths = Vec::new();
         for path in &current_paths {
             if !valid_paths.contains(path) {
                 self.files.write().await.remove(path);
                 if let Some(syms) = self.file_symbols.write().await.remove(path) {
                     symbols_deleted += syms.len();
                 }
+                deleted_paths.push(path.clone());
                 files_deleted += 1;
             }
         }
         if let Some(paths) = self.project_files.write().await.get_mut(&project_id) {
             paths.retain(|p| valid_paths.contains(p));
         }
-        Ok((files_deleted, symbols_deleted))
+        Ok((files_deleted, symbols_deleted, deleted_paths))
     }
 
     async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()> {
