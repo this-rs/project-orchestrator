@@ -4000,6 +4000,37 @@ pub struct GitFileChange {
 // ── Pipeline functions ──────────────────────────────────────────────
 // 3-phase sync pipeline: scan → read → parse
 
+/// Initialize the rayon global thread pool for parallel parsing.
+///
+/// Limits threads to `min(8, num_cpus - 1)` to leave one core for
+/// the OS/tokio and avoid diminishing returns past 8 parser threads.
+///
+/// This is idempotent — calling it when the pool is already initialized
+/// is a no-op (rayon logs a warning but doesn't panic).
+pub fn init_rayon_pool() {
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let max_threads = num_cpus.saturating_sub(1).min(8).max(1);
+
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(max_threads)
+        .thread_name(|idx| format!("po-parse-{}", idx))
+        .build_global()
+    {
+        Ok(()) => {
+            tracing::info!(
+                "rayon pool initialized: {} threads (cpus: {})",
+                max_threads,
+                num_cpus
+            );
+        }
+        Err(_) => {
+            // Already initialized — that's fine
+        }
+    }
+}
+
 /// Phase 1: Scan a directory and return all eligible files.
 ///
 /// Walks the directory tree, applies gitignore-like filtering via
@@ -4111,16 +4142,20 @@ pub fn chunk_by_size(files: Vec<FileContent>, budget: u64) -> Vec<Vec<FileConten
     chunks
 }
 
-/// Phase 3: Parse files with tree-sitter, using chunked processing.
+/// Phase 3: Parse files with tree-sitter, using chunked + parallel processing.
 ///
 /// Files are grouped into chunks of [`CHUNK_BYTE_BUDGET`] bytes to limit
-/// peak memory usage. Each chunk is parsed sequentially, then results are
-/// aggregated. Files that fail to parse are logged and skipped.
+/// peak memory usage. Within each chunk, files are parsed in parallel using
+/// rayon's thread pool. Each rayon thread gets its own `CodeParser` via
+/// `thread_local!` (tree-sitter `Parser` is not `Send`).
+///
+/// The `_parser` parameter is kept for API compatibility but is NOT used —
+/// parallel parsing creates thread-local parsers instead.
 ///
 /// Returns only successfully parsed files.
 pub async fn parse_files(
     files: Vec<FileContent>,
-    parser: &Arc<RwLock<CodeParser>>,
+    _parser: &Arc<RwLock<CodeParser>>,
 ) -> Vec<ParsedFile> {
     let start = std::time::Instant::now();
     let total_files = files.len();
@@ -4129,41 +4164,76 @@ pub async fn parse_files(
     let chunks = chunk_by_size(files, CHUNK_BYTE_BUDGET);
     let num_chunks = chunks.len();
 
-    let mut parsed = Vec::with_capacity(total_files);
-    let mut parse_errors = 0usize;
+    // Run CPU-intensive parsing on the rayon thread pool via spawn_blocking
+    // to avoid blocking the tokio runtime's async threads.
+    let (parsed, parse_errors) = tokio::task::spawn_blocking(move || {
+        use rayon::prelude::*;
+        use std::cell::RefCell;
 
-    for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-        let chunk_files = chunk.len();
-        let chunk_bytes: u64 = chunk.iter().map(|f| f.size.max(f.content.len() as u64)).sum();
-
-        for file in &chunk {
-            let file_path = std::path::Path::new(&file.path);
-            match {
-                let mut p = parser.write().await;
-                p.parse_file(file_path, &file.content)
-            } {
-                Ok(pf) => {
-                    parsed.push(pf);
-                }
-                Err(e) => {
-                    tracing::warn!("parse_files: failed to parse {}: {}", file.path, e);
-                    parse_errors += 1;
-                }
-            }
+        thread_local! {
+            static TL_PARSER: RefCell<Option<CodeParser>> = RefCell::new(None);
         }
 
-        tracing::info!(
-            "parse_files: chunk {}/{}: {} files, {:.1} MB",
-            chunk_idx + 1,
-            num_chunks,
-            chunk_files,
-            chunk_bytes as f64 / (1024.0 * 1024.0),
-        );
-    }
+        let mut all_parsed = Vec::with_capacity(total_files);
+        let mut total_errors = 0usize;
+
+        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+            let chunk_files = chunk.len();
+            let chunk_bytes: u64 = chunk
+                .iter()
+                .map(|f| f.size.max(f.content.len() as u64))
+                .sum();
+
+            let chunk_results: Vec<Option<ParsedFile>> = chunk
+                .par_iter()
+                .map(|file| {
+                    TL_PARSER.with(|p| {
+                        let mut p = p.borrow_mut();
+                        if p.is_none() {
+                            *p = CodeParser::new().ok();
+                        }
+                        let parser = p.as_mut()?;
+                        let file_path = std::path::Path::new(&file.path);
+                        match parser.parse_file(file_path, &file.content) {
+                            Ok(pf) => Some(pf),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "parse_files: failed to parse {}: {}",
+                                    file.path,
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let chunk_errors = chunk_results.iter().filter(|r| r.is_none()).count();
+            total_errors += chunk_errors;
+            all_parsed.extend(chunk_results.into_iter().flatten());
+
+            tracing::info!(
+                "parse_files: chunk {}/{}: {} files ({} errors), {:.1} MB",
+                chunk_idx + 1,
+                num_chunks,
+                chunk_files,
+                chunk_errors,
+                chunk_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
+
+        (all_parsed, total_errors)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!("parse_files: spawn_blocking panicked: {}", e);
+        (Vec::new(), total_files)
+    });
 
     let elapsed = start.elapsed();
     tracing::info!(
-        "parse_files: parsed {} files ({} errors, {:.1} MB, {} chunks) in {:?}",
+        "parse_files: parsed {} files ({} errors, {:.1} MB, {} chunks) in {:?} [rayon]",
         parsed.len(),
         parse_errors,
         total_bytes as f64 / (1024.0 * 1024.0),
@@ -7001,6 +7071,123 @@ mod tests {
         let defs = ctx.symbol_table.lookup_fuzzy("handle_request");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].file_path, "src/api/handlers.rs");
+    }
+
+    #[test]
+    fn test_rayon_pool_init_idempotent() {
+        // Calling init_rayon_pool multiple times should not panic
+        init_rayon_pool();
+        init_rayon_pool(); // second call is a no-op
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_parallel_correctness() {
+        use crate::parser::SupportedLanguage;
+
+        // Parse 20 files in parallel and verify all are parsed correctly
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let files: Vec<FileContent> = (0..20)
+            .map(|i| FileContent {
+                path: format!("/tmp/par_test_{}.rs", i),
+                content: format!("pub fn func_{}() -> i32 {{ {} }}", i, i),
+                size: 40,
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 20, "all 20 files should be parsed");
+
+        // Verify each file has exactly one function with the correct name
+        for i in 0..20 {
+            let expected_name = format!("func_{}", i);
+            let found = parsed.iter().any(|p| {
+                p.path == format!("/tmp/par_test_{}.rs", i)
+                    && p.functions.iter().any(|f| f.name == expected_name)
+            });
+            assert!(found, "should find func_{} in parsed results", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_parallel_multi_language() {
+        use crate::parser::SupportedLanguage;
+
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let files = vec![
+            FileContent {
+                path: "/tmp/a.rs".to_string(),
+                content: "pub fn rust_fn() {}".to_string(),
+                size: 19,
+                language: SupportedLanguage::Rust,
+                hash: "h1".to_string(),
+            },
+            FileContent {
+                path: "/tmp/b.py".to_string(),
+                content: "def python_fn():\n    pass\n".to_string(),
+                size: 25,
+                language: SupportedLanguage::Python,
+                hash: "h2".to_string(),
+            },
+            FileContent {
+                path: "/tmp/c.ts".to_string(),
+                content: "export function ts_fn() {}".to_string(),
+                size: 26,
+                language: SupportedLanguage::TypeScript,
+                hash: "h3".to_string(),
+            },
+            FileContent {
+                path: "/tmp/d.go".to_string(),
+                content: "package main\nfunc go_fn() {}".to_string(),
+                size: 28,
+                language: SupportedLanguage::Go,
+                hash: "h4".to_string(),
+            },
+        ];
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 4, "all 4 language files should parse");
+
+        let fn_names: Vec<&str> = parsed
+            .iter()
+            .flat_map(|p| p.functions.iter().map(|f| f.name.as_str()))
+            .collect();
+        assert!(fn_names.contains(&"rust_fn"));
+        assert!(fn_names.contains(&"python_fn"));
+        assert!(fn_names.contains(&"ts_fn"));
+        assert!(fn_names.contains(&"go_fn"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_parallel_no_data_race() {
+        use crate::parser::SupportedLanguage;
+
+        // Run parsing 5 times to catch any potential data races
+        for iteration in 0..5 {
+            let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+            let files: Vec<FileContent> = (0..50)
+                .map(|i| FileContent {
+                    path: format!("/tmp/race_test_{}_{}.rs", iteration, i),
+                    content: format!(
+                        "pub fn check_{}_{i}(x: i32) -> bool {{ x > {i} }}",
+                        iteration,
+                        i = i
+                    ),
+                    size: 50,
+                    language: SupportedLanguage::Rust,
+                    hash: format!("h{}", i),
+                })
+                .collect();
+
+            let parsed = parse_files(files, &parser).await;
+            assert_eq!(
+                parsed.len(),
+                50,
+                "iteration {}: all 50 files should parse without data race",
+                iteration
+            );
+        }
     }
 
     #[tokio::test]

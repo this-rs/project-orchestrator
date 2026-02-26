@@ -67,6 +67,7 @@ walkdir = "2.5"
 glob = "0.3"
 sha2 = "0.10"
 hex = "0.4"
+rayon = "1.10"
 futures = "0.3"
 async-trait = "0.1"
 
