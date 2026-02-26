@@ -3258,6 +3258,7 @@ impl GraphStore for MockGraphStore {
         description: Option<String>,
         rationale: Option<String>,
         chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
     ) -> Result<()> {
         if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
             if let Some(desc) = description {
@@ -3268,6 +3269,9 @@ impl GraphStore for MockGraphStore {
             }
             if let Some(co) = chosen_option {
                 d.chosen_option = Some(co);
+            }
+            if let Some(st) = status {
+                d.status = st;
             }
         }
         Ok(())
@@ -3289,6 +3293,96 @@ impl GraphStore for MockGraphStore {
         _limit: u32,
     ) -> Result<Vec<DecisionNode>> {
         // Mock: return empty — decision entity traversal requires graph
+        Ok(vec![])
+    }
+
+    async fn set_decision_embedding(
+        &self,
+        decision_id: Uuid,
+        _embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
+            d.embedding_model = Some(model.to_string());
+        }
+        Ok(())
+    }
+
+    async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let decisions = self.decisions.read().await;
+        Ok(decisions
+            .get(&decision_id)
+            .and_then(|d| d.embedding.as_ref())
+            .map(|emb| emb.iter().map(|&x| x as f32).collect()))
+    }
+
+    async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>> {
+        let decisions = self.decisions.read().await;
+        Ok(decisions
+            .values()
+            .filter(|d| d.embedding.is_none())
+            .map(|d| (d.id, d.description.clone(), d.rationale.clone()))
+            .collect())
+    }
+
+    async fn search_decisions_by_vector(
+        &self,
+        _query_embedding: &[f32],
+        _limit: usize,
+    ) -> Result<Vec<(DecisionNode, f64)>> {
+        // Mock: return empty — vector search requires real Neo4j index
+        Ok(vec![])
+    }
+
+    async fn get_decisions_affecting(
+        &self,
+        _entity_type: &str,
+        _entity_id: &str,
+        _status_filter: Option<&str>,
+    ) -> Result<Vec<DecisionNode>> {
+        Ok(vec![])
+    }
+
+    async fn add_decision_affects(
+        &self,
+        _decision_id: Uuid,
+        _entity_type: &str,
+        _entity_id: &str,
+        _impact_description: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_decision_affects(
+        &self,
+        _decision_id: Uuid,
+        _entity_type: &str,
+        _entity_id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list_decision_affects(
+        &self,
+        _decision_id: Uuid,
+    ) -> Result<Vec<AffectsRelation>> {
+        Ok(vec![])
+    }
+
+    async fn supersede_decision(
+        &self,
+        _new_decision_id: Uuid,
+        _old_decision_id: Uuid,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_decision_timeline(
+        &self,
+        _task_id: Option<Uuid>,
+        _from: Option<&str>,
+        _to: Option<&str>,
+    ) -> Result<Vec<DecisionTimelineEntry>> {
         Ok(vec![])
     }
 
@@ -4944,6 +5038,60 @@ impl GraphStore for MockGraphStore {
         let total = needing.len();
         let batch: Vec<crate::notes::Note> = needing.into_iter().take(limit).collect();
         Ok((batch, total))
+    }
+
+    async fn create_cross_entity_synapses(
+        &self,
+        source_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> Result<usize> {
+        // Reuse existing synapse storage (Note synapses) — in mock, we don't distinguish
+        let mut synapses = self.note_synapses.write().await;
+        let mut created = 0usize;
+        for (target_id, weight) in neighbors {
+            // Forward
+            let entry = synapses.entry(source_id).or_default();
+            entry.push((*target_id, *weight));
+            // Backward
+            let entry = synapses.entry(*target_id).or_default();
+            entry.push((source_id, *weight));
+            created += 2;
+        }
+        Ok(created)
+    }
+
+    async fn get_cross_entity_synapses(
+        &self,
+        node_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64, String)>> {
+        let synapses = self.note_synapses.read().await;
+        let notes = self.notes.read().await;
+        if let Some(neighbors) = synapses.get(&node_id) {
+            let mut result: Vec<(Uuid, f64, String)> = neighbors
+                .iter()
+                .map(|(id, weight)| {
+                    let entity_type = if notes.contains_key(id) {
+                        "Note".to_string()
+                    } else {
+                        "Decision".to_string()
+                    };
+                    (*id, *weight, entity_type)
+                })
+                .collect();
+            result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            Ok(result)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    async fn list_decisions_needing_synapses(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<(Vec<DecisionNode>, usize)> {
+        // Mock: return empty — decisions needing synapses not tracked in mock
+        Ok((vec![], 0))
     }
 
     // ========================================================================

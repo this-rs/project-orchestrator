@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::embeddings::EmbeddingProvider;
 use crate::neo4j::GraphStore;
-use crate::notes::Note;
+use crate::notes::{Note, NoteImportance, NoteType};
 
 use super::config::SpreadingActivationConfig;
 
@@ -42,10 +42,10 @@ pub enum ActivationSource {
     },
 }
 
-/// A note that was activated by the spreading activation algorithm.
+/// A note or decision that was activated by the spreading activation algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivatedNote {
-    /// The note itself.
+    /// The note itself (for Decision entities, a synthetic Note is created).
     pub note: Note,
     /// Final activation score (0.0 - 1.0+).
     /// For direct matches this is the cosine similarity.
@@ -53,6 +53,14 @@ pub struct ActivatedNote {
     pub activation_score: f64,
     /// How this note was activated.
     pub source: ActivationSource,
+    /// Entity type: "note" for knowledge notes, "decision" for architectural decisions.
+    /// Defaults to "note" for backward compatibility.
+    #[serde(default = "default_entity_type")]
+    pub entity_type: String,
+}
+
+fn default_entity_type() -> String {
+    "note".to_string()
 }
 
 // ============================================================================
@@ -80,6 +88,27 @@ impl SpreadingActivationEngine {
             graph_store,
             embedding_provider,
         }
+    }
+
+    /// Convert a DecisionNode into a synthetic Note for inclusion in activation results.
+    ///
+    /// Decisions don't have the same fields as Notes, so we create a lightweight
+    /// Note carrier with the decision's content. The `entity_type` field on
+    /// `ActivatedNote` distinguishes decisions from real notes.
+    fn decision_to_synthetic_note(decision: &crate::neo4j::models::DecisionNode) -> Note {
+        let mut note = Note::new(
+            None, // Decisions are task-scoped, not project-scoped
+            NoteType::Observation,
+            format!(
+                "Decision: {}\nRationale: {}",
+                decision.description, decision.rationale
+            ),
+            decision.decided_by.clone(),
+        );
+        note.id = decision.id;
+        note.energy = 1.0; // Decisions are always active
+        note.importance = NoteImportance::High;
+        note
     }
 
     /// Run the full spreading activation algorithm for a query.
@@ -115,22 +144,26 @@ impl SpreadingActivationEngine {
             return Ok(vec![]);
         }
 
-        // Build activation map: note_id → (score, source, Note)
-        let mut activations: HashMap<Uuid, (f64, ActivationSource, Note)> = HashMap::new();
+        // Build activation map: id → (score, source, Note, entity_type)
+        // For Decision entities, a synthetic Note is created from the decision data.
+        let mut activations: HashMap<Uuid, (f64, ActivationSource, Note, String)> = HashMap::new();
 
         for (note, score) in &seed_notes {
             // Skip dead neurons
             if note.energy < config.min_energy {
                 continue;
             }
-            activations.insert(note.id, (*score, ActivationSource::Direct, note.clone()));
+            activations.insert(
+                note.id,
+                (*score, ActivationSource::Direct, note.clone(), "note".to_string()),
+            );
         }
 
-        // Phase 2: Spreading through synapses
+        // Phase 2: Spreading through synapses (cross-entity: Note ↔ Decision)
         // BFS-style: process hop by hop
         let mut frontier: Vec<(Uuid, f64)> = activations
             .iter()
-            .map(|(id, (score, _, _))| (*id, *score))
+            .map(|(id, (score, _, _, _))| (*id, *score))
             .collect();
 
         let mut visited: HashSet<Uuid> = activations.keys().copied().collect();
@@ -138,35 +171,55 @@ impl SpreadingActivationEngine {
         for hop in 0..config.max_hops {
             let mut next_frontier: Vec<(Uuid, f64)> = Vec::new();
 
-            for (note_id, parent_activation) in &frontier {
-                // Get synapses for this note
-                let synapses = match self.graph_store.get_synapses(*note_id).await {
+            for (node_id, parent_activation) in &frontier {
+                // Get cross-entity synapses (Note↔Note, Note↔Decision, Decision↔Note)
+                let synapses = match self.graph_store.get_cross_entity_synapses(*node_id).await {
                     Ok(s) => s,
                     Err(e) => {
-                        debug!("Failed to get synapses for {}: {}", note_id, e);
-                        continue;
+                        debug!("Failed to get cross-entity synapses for {}: {}", node_id, e);
+                        // Fallback to Note-only synapses
+                        match self.graph_store.get_synapses(*node_id).await {
+                            Ok(s) => s.into_iter().map(|(id, w)| (id, w, "Note".to_string())).collect(),
+                            Err(_) => continue,
+                        }
                     }
                 };
 
-                for (neighbor_id, synapse_weight) in synapses {
+                for (neighbor_id, synapse_weight, entity_type) in synapses {
                     if visited.contains(&neighbor_id) {
                         continue;
                     }
 
-                    // Get neighbor note to check energy
-                    let neighbor = match self.graph_store.get_note(neighbor_id).await {
-                        Ok(Some(n)) => n,
-                        _ => continue,
-                    };
+                    // Resolve neighbor: Note or Decision
+                    let (neighbor_note, neighbor_energy, neighbor_entity_type) =
+                        if entity_type == "Decision" {
+                            // Decision neighbor: create synthetic Note, energy=1.0
+                            match self.graph_store.get_decision(neighbor_id).await {
+                                Ok(Some(decision)) => {
+                                    let synthetic = Self::decision_to_synthetic_note(&decision);
+                                    (synthetic, 1.0_f64, "decision".to_string())
+                                }
+                                _ => continue,
+                            }
+                        } else {
+                            // Note neighbor: use real Note with energy
+                            match self.graph_store.get_note(neighbor_id).await {
+                                Ok(Some(n)) => {
+                                    let energy = n.energy;
+                                    (n, energy, "note".to_string())
+                                }
+                                _ => continue,
+                            }
+                        };
 
-                    // Skip dead neurons
-                    if neighbor.energy < config.min_energy {
+                    // Skip dead neurons (decisions always have energy=1.0)
+                    if neighbor_energy < config.min_energy {
                         continue;
                     }
 
                     // Calculate spread score
                     let spread_score =
-                        parent_activation * synapse_weight * neighbor.energy * config.decay_per_hop;
+                        parent_activation * synapse_weight * neighbor_energy * config.decay_per_hop;
 
                     // Skip if below threshold
                     if spread_score < config.min_activation {
@@ -177,7 +230,7 @@ impl SpreadingActivationEngine {
                     let existing = activations.get(&neighbor_id);
                     let should_insert = match existing {
                         None => true,
-                        Some((existing_score, _, _)) => spread_score > *existing_score,
+                        Some((existing_score, _, _, _)) => spread_score > *existing_score,
                     };
 
                     if should_insert {
@@ -186,10 +239,11 @@ impl SpreadingActivationEngine {
                             (
                                 spread_score,
                                 ActivationSource::Propagated {
-                                    via: *note_id,
+                                    via: *node_id,
                                     hops: hop + 1,
                                 },
-                                neighbor,
+                                neighbor_note,
+                                neighbor_entity_type,
                             ),
                         );
                     }
@@ -200,7 +254,7 @@ impl SpreadingActivationEngine {
             }
 
             debug!(
-                "Phase 2: hop {} spread to {} new notes",
+                "Phase 2: hop {} spread to {} new entities",
                 hop + 1,
                 next_frontier.len()
             );
@@ -213,36 +267,36 @@ impl SpreadingActivationEngine {
         }
 
         // Phase 2.5: Connectivity re-ranking — boost direct matches that are
-        // connected to other activated notes via synapses ("hub bonus").
+        // connected to other activated entities via synapses ("hub bonus").
         // This makes well-connected notes rank higher than isolated ones,
         // differentiating search_neurons from plain vector search.
         if config.connectivity_boost > 0.0 {
             let activated_ids: HashSet<Uuid> = activations.keys().copied().collect();
             let mut boost_map: HashMap<Uuid, f64> = HashMap::new();
 
-            for (note_id, (_, source, _)) in &activations {
+            for (node_id, (_, source, _, _)) in &activations {
                 if !matches!(source, ActivationSource::Direct) {
                     continue;
                 }
-                // Count how many other activated notes this direct match
+                // Count how many other activated entities this direct match
                 // is connected to via synapses
-                if let Ok(synapses) = self.graph_store.get_synapses(*note_id).await {
+                if let Ok(synapses) = self.graph_store.get_synapses(*node_id).await {
                     let connected_activated = synapses
                         .iter()
                         .filter(|(neighbor_id, _)| {
-                            *neighbor_id != *note_id && activated_ids.contains(neighbor_id)
+                            *neighbor_id != *node_id && activated_ids.contains(neighbor_id)
                         })
                         .count();
                     if connected_activated > 0 {
                         let bonus = config.connectivity_boost * connected_activated as f64;
-                        boost_map.insert(*note_id, bonus);
+                        boost_map.insert(*node_id, bonus);
                     }
                 }
             }
 
             // Apply boosts
-            for (note_id, bonus) in &boost_map {
-                if let Some(entry) = activations.get_mut(note_id) {
+            for (node_id, bonus) in &boost_map {
+                if let Some(entry) = activations.get_mut(node_id) {
                     entry.0 += bonus;
                 }
             }
@@ -266,10 +320,11 @@ impl SpreadingActivationEngine {
         // propagated, 6 for direct. Unused slots overflow to the other pool.
         let (mut direct, mut propagated): (Vec<ActivatedNote>, Vec<ActivatedNote>) = activations
             .into_values()
-            .map(|(score, source, note)| ActivatedNote {
+            .map(|(score, source, note, entity_type)| ActivatedNote {
                 note,
                 activation_score: score,
                 source,
+                entity_type,
             })
             .partition(|r| matches!(r.source, ActivationSource::Direct));
 

@@ -356,6 +356,44 @@ pub enum StepStatus {
     Skipped,
 }
 
+/// Decision status lifecycle: proposed → accepted → deprecated/superseded
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionStatus {
+    /// Newly created, not yet validated
+    Proposed,
+    /// Validated and active
+    Accepted,
+    /// No longer recommended but not replaced
+    Deprecated,
+    /// Replaced by another decision (via SUPERSEDES relation)
+    Superseded,
+}
+
+impl std::fmt::Display for DecisionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proposed => write!(f, "proposed"),
+            Self::Accepted => write!(f, "accepted"),
+            Self::Deprecated => write!(f, "deprecated"),
+            Self::Superseded => write!(f, "superseded"),
+        }
+    }
+}
+
+impl std::str::FromStr for DecisionStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "proposed" => Ok(Self::Proposed),
+            "accepted" => Ok(Self::Accepted),
+            "deprecated" => Ok(Self::Deprecated),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(anyhow::anyhow!("Invalid decision status: {}", s)),
+        }
+    }
+}
+
 /// An architectural decision
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionNode {
@@ -366,6 +404,47 @@ pub struct DecisionNode {
     pub chosen_option: Option<String>,
     pub decided_by: String,
     pub decided_at: DateTime<Utc>,
+    /// Lifecycle status: proposed, accepted, deprecated, superseded
+    #[serde(default = "default_decision_status")]
+    pub status: DecisionStatus,
+    /// Vector embedding (768d, nomic-embed-text) for semantic search.
+    /// Stored via `db.create.setNodeVectorProperty` for HNSW index compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f64>>,
+    /// Name of the embedding model used (for traceability on re-embed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+}
+
+fn default_decision_status() -> DecisionStatus {
+    DecisionStatus::Proposed
+}
+
+/// An AFFECTS relation from a Decision to an entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectsRelation {
+    /// Type of the affected entity (File, Function, Struct, Trait, etc.)
+    pub entity_type: String,
+    /// Identifier of the affected entity (path for File, id for others)
+    pub entity_id: String,
+    /// Human-readable name of the entity
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_name: Option<String>,
+    /// Optional description of how the decision impacts this entity
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact_description: Option<String>,
+}
+
+/// A decision in a timeline view, with its supersession chain
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionTimelineEntry {
+    pub decision: DecisionNode,
+    /// IDs of decisions this one supersedes (chain from newest to oldest)
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub supersedes_chain: Vec<Uuid>,
+    /// ID of the decision that supersedes this one (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Uuid>,
 }
 
 /// A constraint on a plan

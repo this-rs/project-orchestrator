@@ -133,6 +133,13 @@ impl ToolHandler {
             ("decision", "update") => "update_decision",
             ("decision", "delete") => "delete_decision",
             ("decision", "search") => "search_decisions",
+            ("decision", "search_semantic") => "search_decisions_semantic",
+            ("decision", "add_affects") => "add_decision_affects",
+            ("decision", "remove_affects") => "remove_decision_affects",
+            ("decision", "list_affects") => "list_decision_affects",
+            ("decision", "get_affecting") => "get_decisions_affecting",
+            ("decision", "supersede") => "supersede_decision",
+            ("decision", "get_timeline") => "get_decision_timeline",
 
             // Constraint
             ("constraint", "list") => "list_constraints",
@@ -285,6 +292,7 @@ impl ToolHandler {
             ("admin", "reinforce_neurons") => "reinforce_neurons",
             ("admin", "decay_synapses") => "decay_synapses",
             ("admin", "backfill_synapses") => "backfill_synapses",
+            ("admin", "backfill_decision_embeddings") => "backfill_decision_embeddings",
             ("admin", "backfill_touches") => "backfill_touches",
 
             _ => {
@@ -874,6 +882,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("chosen_option") {
                     body.insert("chosen_option".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("status") {
+                    body.insert("status".to_string(), v.clone());
+                }
                 let result = http
                     .patch(
                         &format!("/api/decisions/{}", decision_id),
@@ -909,6 +920,119 @@ impl ToolHandler {
                     query.push(("project_slug".to_string(), s));
                 }
                 let result = http.get_with_query("/api/decisions/search", &query).await?;
+                Ok(Some(result))
+            }
+
+            "search_decisions_semantic" => {
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![("query".to_string(), query_str)];
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/decisions/search-semantic", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "add_decision_affects" => {
+                let decision_id = extract_id(args, "decision_id")?;
+                let mut body = serde_json::Map::new();
+                body.insert(
+                    "entity_type".to_string(),
+                    Value::String(extract_string(args, "entity_type")?),
+                );
+                body.insert(
+                    "entity_id".to_string(),
+                    Value::String(extract_string(args, "entity_id")?),
+                );
+                if let Some(v) = args.get("impact_description") {
+                    body.insert("impact_description".to_string(), v.clone());
+                }
+                let result = http
+                    .post(
+                        &format!("/api/decisions/{}/affects", decision_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"status": "ok"})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_decision_affects" => {
+                let decision_id = extract_id(args, "decision_id")?;
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let result = http
+                    .delete(&format!(
+                        "/api/decisions/{}/affects/{}/{}",
+                        decision_id, entity_type, entity_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"status": "ok"})
+                } else {
+                    result
+                }))
+            }
+
+            "list_decision_affects" => {
+                let decision_id = extract_id(args, "decision_id")?;
+                let result = http
+                    .get(&format!("/api/decisions/{}/affects", decision_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_decisions_affecting" => {
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_string(args, "entity_id")?;
+                let mut query = vec![
+                    ("entity_type".to_string(), entity_type),
+                    ("entity_id".to_string(), entity_id),
+                ];
+                if let Some(s) = extract_optional_string(args, "status") {
+                    query.push(("status".to_string(), s));
+                }
+                let result = http
+                    .get_with_query("/api/decisions/affecting", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "supersede_decision" => {
+                let new_id = extract_id(args, "decision_id")?;
+                let old_id = extract_id(args, "superseded_by_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/decisions/{}/supersedes/{}", new_id, old_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"status": "ok"})
+                } else {
+                    result
+                }))
+            }
+
+            "get_decision_timeline" => {
+                let mut query = Vec::new();
+                if let Some(tid) = extract_optional_string(args, "task_id") {
+                    query.push(("task_id".to_string(), tid));
+                }
+                if let Some(f) = extract_optional_string(args, "from") {
+                    query.push(("from".to_string(), f));
+                }
+                if let Some(t) = extract_optional_string(args, "to") {
+                    query.push(("to".to_string(), t));
+                }
+                let result = http
+                    .get_with_query("/api/decisions/timeline", &query)
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -1643,6 +1767,13 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/admin/backfill-synapses", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "backfill_decision_embeddings" => {
+                let result = http
+                    .post("/api/admin/backfill-decision-embeddings", &json!({}))
                     .await?;
                 Ok(Some(result))
             }

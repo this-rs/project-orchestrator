@@ -322,12 +322,39 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::add_decision),
         )
         .route(
+            "/api/decisions/affecting",
+            get(handlers::get_decisions_affecting),
+        )
+        .route(
+            "/api/decisions/timeline",
+            get(handlers::get_decision_timeline),
+        )
+        .route(
             "/api/decisions/{decision_id}",
             get(handlers::get_decision)
                 .patch(handlers::update_decision)
                 .delete(handlers::delete_decision),
         )
         .route("/api/decisions/search", get(handlers::search_decisions))
+        .route(
+            "/api/decisions/search-semantic",
+            get(handlers::search_decisions_semantic),
+        )
+        // Decision Affects
+        .route(
+            "/api/decisions/{decision_id}/affects",
+            post(handlers::add_decision_affects)
+                .get(handlers::list_decision_affects),
+        )
+        .route(
+            "/api/decisions/{decision_id}/affects/{entity_type}/{entity_id}",
+            delete(handlers::remove_decision_affects),
+        )
+        // Decision Supersedes
+        .route(
+            "/api/decisions/{new_id}/supersedes/{old_id}",
+            post(handlers::supersede_decision),
+        )
         // Sync
         .route("/api/sync", post(handlers::sync_directory))
         // Releases
@@ -604,6 +631,13 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/admin/backfill-synapses/status",
             get(note_handlers::get_backfill_synapses_status),
+        )
+        // ================================================================
+        // Admin — Decision Embedding Backfill
+        // ================================================================
+        .route(
+            "/api/admin/backfill-decision-embeddings",
+            post(handlers::backfill_decision_embeddings),
         )
         // ================================================================
         // Meilisearch Maintenance

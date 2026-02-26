@@ -152,25 +152,7 @@ impl Neo4jClient {
         })
     }
 
-    /// Convert a Neo4j Node to a DecisionNode
-    fn node_to_decision(&self, node: &neo4rs::Node) -> Option<DecisionNode> {
-        Some(DecisionNode {
-            id: node.get::<String>("id").ok()?.parse().ok()?,
-            description: node.get::<String>("description").ok()?,
-            rationale: node.get::<String>("rationale").ok()?,
-            alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
-            chosen_option: node
-                .get::<String>("chosen_option")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
-            decided_at: node
-                .get::<String>("decided_at")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(chrono::Utc::now),
-        })
-    }
+    // node_to_decision is defined in decision.rs as an associated function
 
     /// Get full task details including steps, decisions, dependencies, and modified files
     pub async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>> {
@@ -212,7 +194,7 @@ impl Neo4jClient {
         let decision_nodes: Vec<neo4rs::Node> = row.get("decisions").unwrap_or_default();
         let decisions: Vec<DecisionNode> = decision_nodes
             .iter()
-            .filter_map(|n| self.node_to_decision(n))
+            .filter_map(|n| Self::node_to_decision(n).ok())
             .collect();
 
         // Parse dependencies

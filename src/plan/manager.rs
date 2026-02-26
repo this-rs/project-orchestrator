@@ -1,6 +1,7 @@
 //! Plan management operations
 
 use super::models::*;
+use crate::embeddings::EmbeddingProvider;
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::meilisearch::indexes::DecisionDocument;
 use crate::meilisearch::SearchStore;
@@ -15,6 +16,7 @@ pub struct PlanManager {
     neo4j: Arc<dyn GraphStore>,
     meili: Arc<dyn SearchStore>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl PlanManager {
@@ -24,6 +26,7 @@ impl PlanManager {
             neo4j,
             meili,
             event_emitter: None,
+            embedding_provider: None,
         }
     }
 
@@ -37,7 +40,14 @@ impl PlanManager {
             neo4j,
             meili,
             event_emitter: Some(emitter),
+            embedding_provider: None,
         }
+    }
+
+    /// Set the embedding provider for decision embeddings
+    pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedding_provider = Some(provider);
+        self
     }
 
     /// Emit a CRUD event (no-op if event_emitter is None)
@@ -291,6 +301,9 @@ impl PlanManager {
             chosen_option: req.chosen_option.clone(),
             decided_by: decided_by.to_string(),
             decided_at: chrono::Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
         };
 
         self.neo4j.create_decision(task_id, &decision).await?;
@@ -310,12 +323,89 @@ impl PlanManager {
         };
         self.meili.index_decision(&doc).await?;
 
+        // Generate and store embedding (best-effort, non-blocking)
+        self.embed_decision(decision.id, &decision.description, &decision.rationale)
+            .await;
+
         self.emit(
             CrudEvent::new(EntityType::Decision, CrudAction::Created, decision.id.to_string())
                 .with_payload(serde_json::json!({"task_id": task_id.to_string(), "description": &decision.description})),
         );
 
         Ok(decision)
+    }
+
+    /// Generate and store an embedding for a decision's description+rationale.
+    ///
+    /// Best-effort: if embedding provider is not configured or fails, the decision
+    /// is still created/updated successfully. Errors are logged at warn level.
+    async fn embed_decision(&self, decision_id: Uuid, description: &str, rationale: &str) {
+        let provider = match &self.embedding_provider {
+            Some(p) => p,
+            None => return,
+        };
+
+        let text = format!("{}\n{}", description, rationale);
+        match provider.embed_text(&text).await {
+            Ok(embedding) => {
+                let model = provider.model_name().to_string();
+                if let Err(e) = self
+                    .neo4j
+                    .set_decision_embedding(decision_id, &embedding, &model)
+                    .await
+                {
+                    tracing::warn!(
+                        decision_id = %decision_id,
+                        error = %e,
+                        "Failed to store decision embedding"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    decision_id = %decision_id,
+                    error = %e,
+                    "Failed to generate decision embedding"
+                );
+            }
+        }
+    }
+
+    /// Backfill embeddings for all decisions that don't have one yet.
+    ///
+    /// Returns the count of decisions processed and embeddings created.
+    pub async fn backfill_decision_embeddings(&self) -> Result<(usize, usize)> {
+        let provider = self.embedding_provider.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Embedding provider not configured")
+        })?;
+
+        let decisions = self.neo4j.get_decisions_without_embedding().await?;
+        let total = decisions.len();
+        let mut created = 0;
+
+        for (id, description, rationale) in &decisions {
+            let text = format!("{}\n{}", description, rationale);
+            match provider.embed_text(&text).await {
+                Ok(embedding) => {
+                    let model = provider.model_name().to_string();
+                    if let Err(e) = self
+                        .neo4j
+                        .set_decision_embedding(*id, &embedding, &model)
+                        .await
+                    {
+                        tracing::warn!(decision_id = %id, error = %e, "Failed to store decision embedding during backfill");
+                    } else {
+                        created += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(decision_id = %id, error = %e, "Failed to generate embedding during backfill");
+                }
+            }
+        }
+
+        tracing::info!(total, created, "Decision embeddings backfill complete");
+        Ok((total, created))
     }
 
     /// Search for related decisions
@@ -341,10 +431,34 @@ impl PlanManager {
                 chosen_option: None,
                 decided_by: doc.agent,
                 decided_at: doc.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                status: DecisionStatus::Accepted,
+                embedding: None,
+                embedding_model: None,
             })
             .collect();
 
         Ok(decisions)
+    }
+
+    /// Semantic search for decisions using vector embeddings
+    pub async fn search_decisions_semantic(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<DecisionSearchHit>> {
+        let provider = self
+            .embedding_provider
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Embedding provider not configured"))?;
+        let embedding = provider.embed_text(query).await?;
+        let results = self
+            .neo4j
+            .search_decisions_by_vector(&embedding, limit)
+            .await?;
+        Ok(results
+            .into_iter()
+            .map(|(decision, score)| DecisionSearchHit { decision, score })
+            .collect())
     }
 
     // ========================================================================

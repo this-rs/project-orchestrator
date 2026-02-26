@@ -1,6 +1,7 @@
 //! Neo4j Knowledge Note operations
 
 use super::client::Neo4jClient;
+use super::models::DecisionNode;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance, NoteScope, NoteStatus,
     NoteType, PropagatedNote,
@@ -1346,6 +1347,144 @@ impl Neo4jClient {
         } else {
             Ok(0)
         }
+    }
+
+    // ========================================================================
+    // Cross-entity SYNAPSE operations (Decision ↔ Note)
+    // ========================================================================
+
+    /// Create bidirectional SYNAPSE relationships between any two nodes (Note or Decision).
+    ///
+    /// Unlike `create_synapses` which is Note-specific, this method matches nodes
+    /// by their `id` property regardless of label. This enables Decision↔Note
+    /// and Decision↔Decision synapses for cross-entity neural linking.
+    ///
+    /// Uses MERGE for idempotence. Returns the number of synapses created.
+    pub async fn create_cross_entity_synapses(
+        &self,
+        source_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> Result<usize> {
+        if neighbors.is_empty() {
+            return Ok(0);
+        }
+
+        // Build UNWIND list (internal computed data, no injection risk)
+        let entries: Vec<String> = neighbors
+            .iter()
+            .map(|(nid, weight)| format!("{{id: '{}', weight: {}}}", nid, weight))
+            .collect();
+
+        let cypher = format!(
+            r#"
+            MATCH (source {{id: $source_id}})
+            WHERE source:Note OR source:Decision
+            UNWIND [{}] AS neighbor
+            MATCH (target {{id: neighbor.id}})
+            WHERE target:Note OR target:Decision
+            MERGE (source)-[s1:SYNAPSE]->(target)
+            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime()
+            ON MATCH SET s1.weight = neighbor.weight
+            MERGE (target)-[s2:SYNAPSE]->(source)
+            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime()
+            ON MATCH SET s2.weight = neighbor.weight
+            RETURN count(s1) + count(s2) AS total
+            "#,
+            entries.join(", ")
+        );
+
+        let q = query(&cypher).param("source_id", source_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total")?;
+            Ok(total as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get all SYNAPSE relationships for any node (Note or Decision), both directions.
+    ///
+    /// Returns (neighbor_id, weight, entity_type) where entity_type is "Note" or "Decision".
+    /// Sorted by weight descending.
+    pub async fn get_cross_entity_synapses(
+        &self,
+        node_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64, String)>> {
+        let cypher = r#"
+            MATCH (n {id: $id})-[s:SYNAPSE]-(neighbor)
+            WHERE (n:Note OR n:Decision) AND (neighbor:Note OR neighbor:Decision)
+            RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight,
+                   CASE WHEN neighbor:Decision THEN 'Decision' ELSE 'Note' END AS entity_type
+            ORDER BY weight DESC
+        "#;
+
+        let q = query(cypher).param("id", node_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut synapses = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let neighbor_id_str: String = row.get("neighbor_id")?;
+            let weight: f64 = row.get("weight")?;
+            let entity_type: String = row.get("entity_type")?;
+            if let Ok(nid) = neighbor_id_str.parse::<Uuid>() {
+                synapses.push((nid, weight, entity_type));
+            }
+        }
+
+        Ok(synapses)
+    }
+
+    /// List Decision nodes that have embeddings but no SYNAPSE relationships.
+    ///
+    /// Used by `backfill_synapses` to process Decision nodes for cross-entity linking.
+    pub async fn list_decisions_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionNode>, usize)> {
+        // Count total
+        let count_q = query(
+            r#"
+            MATCH (d:Decision)
+            WHERE d.embedding IS NOT NULL AND NOT (d)-[:SYNAPSE]->()
+            RETURN count(d) AS total
+            "#,
+        );
+        let mut result = self.graph.execute(count_q).await?;
+        let total = if let Some(row) = result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if total == 0 || limit == 0 {
+            return Ok((vec![], total));
+        }
+
+        // Fetch batch
+        let fetch_q = query(
+            r#"
+            MATCH (d:Decision)
+            WHERE d.embedding IS NOT NULL AND NOT (d)-[:SYNAPSE]->()
+            RETURN d
+            ORDER BY d.decided_at
+            SKIP $offset LIMIT $limit
+            "#,
+        )
+        .param("offset", offset as i64)
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(fetch_q).await?;
+        let mut decisions = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            decisions.push(Self::node_to_decision(&node)?);
+        }
+
+        Ok((decisions, total))
     }
 
     // ========================================================================

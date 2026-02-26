@@ -429,7 +429,8 @@ impl ContextBuilder {
 mod tests {
     use super::*;
     use crate::neo4j::models::{
-        ConstraintNode, ConstraintType, DecisionNode, StepNode, StepStatus, TaskNode, TaskStatus,
+        ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, StepNode, StepStatus,
+        TaskNode, TaskStatus,
     };
     use crate::notes::NoteScope;
     use crate::plan::models::{AgentContext, CodeReference, ContextNote, FileContext};
@@ -586,6 +587,9 @@ mod tests {
                 chosen_option: Some("async/await".to_string()),
                 decided_by: "architect".to_string(),
                 decided_at: chrono::Utc::now(),
+                status: DecisionStatus::Accepted,
+                embedding: None,
+                embedding_model: None,
             }],
             target_files: vec![],
             similar_code: vec![],

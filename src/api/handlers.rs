@@ -7,8 +7,9 @@ use crate::api::{
 use crate::chat::ChatManager;
 use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
 use crate::neo4j::models::{
-    CommitNode, ConstraintNode, DecisionNode, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus,
-    ReleaseNode, ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
+    AffectsRelation, CommitNode, ConstraintNode, DecisionNode, DecisionStatus,
+    DecisionTimelineEntry, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ReleaseNode,
+    ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
 };
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
@@ -643,6 +644,7 @@ pub struct UpdateDecisionRequest {
     pub description: Option<String>,
     pub rationale: Option<String>,
     pub chosen_option: Option<String>,
+    pub status: Option<DecisionStatus>,
 }
 
 /// Update a decision
@@ -658,6 +660,7 @@ pub async fn update_decision(
             req.description,
             req.rationale,
             req.chosen_option,
+            req.status,
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -694,6 +697,149 @@ pub async fn search_decisions(
         )
         .await?;
     Ok(Json(decisions))
+}
+
+/// Semantic search for decisions using vector embeddings
+#[derive(Deserialize)]
+pub struct SearchDecisionsSemanticQuery {
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+pub async fn search_decisions_semantic(
+    State(state): State<OrchestratorState>,
+    axum::extract::Query(params): axum::extract::Query<SearchDecisionsSemanticQuery>,
+) -> Result<Json<Vec<DecisionSearchHit>>, AppError> {
+    let results = state
+        .orchestrator
+        .plan_manager()
+        .search_decisions_semantic(&params.query, params.limit.unwrap_or(10))
+        .await?;
+    Ok(Json(results))
+}
+
+// ============================================================================
+// Decision Affects
+// ============================================================================
+
+/// Query params for getting decisions that affect an entity
+#[derive(Deserialize)]
+pub struct DecisionsAffectingQuery {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub status: Option<String>,
+}
+
+/// Get decisions that affect a given entity (reverse AFFECTS lookup)
+pub async fn get_decisions_affecting(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<DecisionsAffectingQuery>,
+) -> Result<Json<Vec<DecisionNode>>, AppError> {
+    let results = state
+        .orchestrator
+        .neo4j()
+        .get_decisions_affecting(
+            &params.entity_type,
+            &params.entity_id,
+            params.status.as_deref(),
+        )
+        .await?;
+    Ok(Json(results))
+}
+
+/// Request to add an AFFECTS relation from a decision to an entity
+#[derive(Deserialize)]
+pub struct AddAffectsRequest {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub impact_description: Option<String>,
+}
+
+/// Add an AFFECTS relation from a decision to an entity
+pub async fn add_decision_affects(
+    State(state): State<OrchestratorState>,
+    Path(decision_id): Path<Uuid>,
+    Json(req): Json<AddAffectsRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .add_decision_affects(
+            decision_id,
+            &req.entity_type,
+            &req.entity_id,
+            req.impact_description.as_deref(),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove an AFFECTS relation from a decision to an entity
+pub async fn remove_decision_affects(
+    State(state): State<OrchestratorState>,
+    Path((decision_id, entity_type, entity_id)): Path<(Uuid, String, String)>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .remove_decision_affects(decision_id, &entity_type, &entity_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// List all entities affected by a decision
+pub async fn list_decision_affects(
+    State(state): State<OrchestratorState>,
+    Path(decision_id): Path<Uuid>,
+) -> Result<Json<Vec<AffectsRelation>>, AppError> {
+    let affects = state
+        .orchestrator
+        .neo4j()
+        .list_decision_affects(decision_id)
+        .await?;
+    Ok(Json(affects))
+}
+
+/// Mark a decision as superseded by a newer decision
+pub async fn supersede_decision(
+    State(state): State<OrchestratorState>,
+    Path((new_id, old_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .supersede_decision(new_id, old_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ============================================================================
+// Decision Timeline
+// ============================================================================
+
+/// Query parameters for the decision timeline endpoint
+#[derive(Deserialize)]
+pub struct DecisionTimelineQuery {
+    pub task_id: Option<Uuid>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// Get a timeline of decisions with supersession chains
+pub async fn get_decision_timeline(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<DecisionTimelineQuery>,
+) -> Result<Json<Vec<DecisionTimelineEntry>>, AppError> {
+    let entries = state
+        .orchestrator
+        .neo4j()
+        .get_decision_timeline(
+            params.task_id,
+            params.from.as_deref(),
+            params.to.as_deref(),
+        )
+        .await?;
+    Ok(Json(entries))
 }
 
 // ============================================================================
@@ -1439,6 +1585,24 @@ pub async fn backfill_commit_touches(
         .await?;
 
     Ok(Json(result))
+}
+
+/// Backfill embeddings for all decisions that don't have one yet.
+///
+/// Returns synchronously with the count of decisions processed.
+pub async fn backfill_decision_embeddings(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (total, created) = state
+        .orchestrator
+        .plan_manager()
+        .backfill_decision_embeddings()
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "decisions_processed": total,
+        "embeddings_created": created,
+    })))
 }
 
 // ============================================================================

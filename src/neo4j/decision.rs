@@ -11,6 +11,35 @@ impl Neo4jClient {
     // Decision operations
     // ========================================================================
 
+    /// Deserialize a DecisionNode from a neo4rs::Node.
+    pub(crate) fn node_to_decision(node: &neo4rs::Node) -> Result<DecisionNode> {
+        Ok(DecisionNode {
+            id: node.get::<String>("id")?.parse()?,
+            description: node.get("description")?,
+            rationale: node.get("rationale")?,
+            alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
+            chosen_option: node
+                .get::<String>("chosen_option")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
+            decided_at: node
+                .get::<String>("decided_at")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(chrono::Utc::now),
+            status: node
+                .get::<String>("status")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DecisionStatus::Accepted),
+            // Embeddings are not loaded by default (too large for list queries).
+            // Use get_decision_embedding() for explicit retrieval.
+            embedding: None,
+            embedding_model: node.get::<String>("embedding_model").ok(),
+        })
+    }
+
     /// Record a decision
     pub async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()> {
         let q = query(
@@ -23,7 +52,8 @@ impl Neo4jClient {
                 alternatives: $alternatives,
                 chosen_option: $chosen_option,
                 decided_by: $decided_by,
-                decided_at: datetime($decided_at)
+                decided_at: datetime($decided_at),
+                status: $status
             })
             CREATE (t)-[:INFORMED_BY]->(d)
             "#,
@@ -38,7 +68,8 @@ impl Neo4jClient {
             decision.chosen_option.clone().unwrap_or_default(),
         )
         .param("decided_by", decision.decided_by.clone())
-        .param("decided_at", decision.decided_at.to_rfc3339());
+        .param("decided_at", decision.decided_at.to_rfc3339())
+        .param("status", decision.status.to_string());
 
         self.graph.run(q).await?;
         Ok(())
@@ -57,22 +88,7 @@ impl Neo4jClient {
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("d")?;
-            Ok(Some(DecisionNode {
-                id: node.get::<String>("id")?.parse()?,
-                description: node.get("description")?,
-                rationale: node.get("rationale")?,
-                alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
-                chosen_option: node
-                    .get::<String>("chosen_option")
-                    .ok()
-                    .filter(|s| !s.is_empty()),
-                decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
-                decided_at: node
-                    .get::<String>("decided_at")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(chrono::Utc::now),
-            }))
+            Ok(Some(Self::node_to_decision(&node)?))
         } else {
             Ok(None)
         }
@@ -85,6 +101,7 @@ impl Neo4jClient {
         description: Option<String>,
         rationale: Option<String>,
         chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
     ) -> Result<()> {
         let mut set_clauses = vec![];
         if description.is_some() {
@@ -95,6 +112,9 @@ impl Neo4jClient {
         }
         if chosen_option.is_some() {
             set_clauses.push("d.chosen_option = $chosen_option");
+        }
+        if status.is_some() {
+            set_clauses.push("d.status = $status");
         }
 
         if set_clauses.is_empty() {
@@ -115,6 +135,9 @@ impl Neo4jClient {
         }
         if let Some(chosen_option) = chosen_option {
             q = q.param("chosen_option", chosen_option);
+        }
+        if let Some(status) = status {
+            q = q.param("status", status.to_string());
         }
 
         self.graph.run(q).await?;
@@ -182,24 +205,367 @@ impl Neo4jClient {
 
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("d")?;
-            decisions.push(DecisionNode {
-                id: node.get::<String>("id")?.parse()?,
-                description: node.get("description")?,
-                rationale: node.get("rationale")?,
-                alternatives: node.get::<Vec<String>>("alternatives").unwrap_or_default(),
-                chosen_option: node
-                    .get::<String>("chosen_option")
-                    .ok()
-                    .filter(|s| !s.is_empty()),
-                decided_by: node.get::<String>("decided_by").ok().unwrap_or_default(),
-                decided_at: node
-                    .get::<String>("decided_at")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(chrono::Utc::now),
-            });
+            decisions.push(Self::node_to_decision(&node)?);
         }
 
         Ok(decisions)
+    }
+
+    /// Store a vector embedding on a Decision node.
+    ///
+    /// Uses `db.create.setNodeVectorProperty` to ensure the correct type
+    /// for the HNSW vector index. Also stores the model name for traceability.
+    pub async fn set_decision_embedding(
+        &self,
+        decision_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+
+        let q = query(
+            r#"
+            MATCH (d:Decision {id: $id})
+            CALL db.create.setNodeVectorProperty(d, 'embedding', $embedding)
+            SET d.embedding_model = $model,
+                d.embedded_at = datetime()
+            "#,
+        )
+        .param("id", decision_id.to_string())
+        .param("embedding", embedding_f64)
+        .param("model", model.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Retrieve the stored vector embedding for a Decision node.
+    ///
+    /// Returns None if the decision has no embedding (not yet embedded).
+    pub async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let q = query(
+            r#"
+            MATCH (d:Decision {id: $id})
+            WHERE d.embedding IS NOT NULL
+            RETURN d.embedding AS embedding
+            "#,
+        )
+        .param("id", decision_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let embedding_f64: Vec<f64> = row.get("embedding")?;
+            let embedding_f32: Vec<f32> = embedding_f64.iter().map(|&x| x as f32).collect();
+            Ok(Some(embedding_f32))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get all Decision IDs that have no embedding yet.
+    /// Used by the backfill command.
+    pub async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>> {
+        let q = query(
+            r#"
+            MATCH (d:Decision)
+            WHERE d.embedding IS NULL
+            RETURN d.id AS id, d.description AS description, d.rationale AS rationale
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut decisions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id")?;
+            let description: String = row.get::<String>("description").unwrap_or_default();
+            let rationale: String = row.get::<String>("rationale").unwrap_or_default();
+            if let Ok(uuid) = id.parse::<Uuid>() {
+                decisions.push((uuid, description, rationale));
+            }
+        }
+
+        Ok(decisions)
+    }
+
+    /// Semantic search over Decision embeddings using Neo4j vector index.
+    ///
+    /// Returns decisions ordered by cosine similarity to the query embedding.
+    pub async fn search_decisions_by_vector(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(DecisionNode, f64)>> {
+        let embedding_f64: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
+
+        let q = query(
+            r#"
+            CALL db.index.vector.queryNodes('decision_embedding', $limit, $embedding)
+            YIELD node AS d, score
+            RETURN d, score
+            ORDER BY score DESC
+            "#,
+        )
+        .param("limit", limit as i64)
+        .param("embedding", embedding_f64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut results = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            let score: f64 = row.get("score")?;
+            results.push((Self::node_to_decision(&node)?, score));
+        }
+
+        Ok(results)
+    }
+
+    /// Get decisions that AFFECT a given entity (reverse AFFECTS lookup).
+    ///
+    /// Finds decisions connected via `(Decision)-[:AFFECTS]->(entity)`.
+    /// Defaults to status_filter = "accepted" when not specified.
+    pub async fn get_decisions_affecting(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<DecisionNode>> {
+        let match_field = if entity_type == "File" { "path" } else { "id" };
+        let status = status_filter.unwrap_or("accepted");
+
+        let cypher = format!(
+            r#"
+            MATCH (d:Decision)-[:AFFECTS]->(e:{} {{{}: $entity_id}})
+            WHERE ($status IS NULL OR d.status = $status)
+            RETURN d
+            ORDER BY d.decided_at DESC
+            "#,
+            entity_type, match_field
+        );
+
+        let q = query(&cypher)
+            .param("entity_id", entity_id.to_string())
+            .param("status", status.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut decisions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            decisions.push(Self::node_to_decision(&node)?);
+        }
+
+        Ok(decisions)
+    }
+
+    // ========================================================================
+    // AFFECTS relations (Decision → Entity)
+    // ========================================================================
+
+    /// Create an AFFECTS relation from a Decision to any entity in the graph.
+    ///
+    /// The entity is matched by a generic `{id: $entity_id}` or `{path: $entity_id}`
+    /// (for File nodes). The `impact_description` is optional free-text.
+    pub async fn add_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
+    ) -> Result<()> {
+        let match_field = if entity_type == "File" { "path" } else { "id" };
+        let cypher = format!(
+            r#"
+            MATCH (d:Decision {{id: $did}})
+            MATCH (e:{} {{{}: $eid}})
+            MERGE (d)-[r:AFFECTS]->(e)
+            SET r.impact_description = $desc,
+                r.created_at = datetime()
+            "#,
+            entity_type, match_field
+        );
+
+        let q = query(&cypher)
+            .param("did", decision_id.to_string())
+            .param("eid", entity_id.to_string())
+            .param("desc", impact_description.unwrap_or("").to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Remove an AFFECTS relation from a Decision to an entity.
+    pub async fn remove_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()> {
+        let match_field = if entity_type == "File" { "path" } else { "id" };
+        let cypher = format!(
+            r#"
+            MATCH (d:Decision {{id: $did}})-[r:AFFECTS]->(e:{} {{{}: $eid}})
+            DELETE r
+            "#,
+            entity_type, match_field
+        );
+
+        let q = query(&cypher)
+            .param("did", decision_id.to_string())
+            .param("eid", entity_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// List all entities affected by a Decision.
+    ///
+    /// Returns tuples of (entity_type, entity_id, impact_description).
+    pub async fn list_decision_affects(
+        &self,
+        decision_id: Uuid,
+    ) -> Result<Vec<AffectsRelation>> {
+        let q = query(
+            r#"
+            MATCH (d:Decision {id: $did})-[r:AFFECTS]->(e)
+            RETURN labels(e)[0] AS entity_type,
+                   coalesce(e.path, e.id) AS entity_id,
+                   coalesce(e.name, e.path, e.id) AS entity_name,
+                   r.impact_description AS impact_description
+            ORDER BY entity_type, entity_id
+            "#,
+        )
+        .param("did", decision_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut affects = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            affects.push(AffectsRelation {
+                entity_type: row.get::<String>("entity_type").unwrap_or_default(),
+                entity_id: row.get::<String>("entity_id").unwrap_or_default(),
+                entity_name: row.get::<String>("entity_name").ok(),
+                impact_description: row
+                    .get::<String>("impact_description")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            });
+        }
+
+        Ok(affects)
+    }
+
+    // ========================================================================
+    // Decision Timeline
+    // ========================================================================
+
+    /// Get a timeline of decisions, optionally filtered by task and date range.
+    ///
+    /// For each decision, resolves the SUPERSEDES chain (decisions it supersedes)
+    /// and checks if it has been superseded by a newer decision.
+    /// Returns entries ordered by decided_at DESC.
+    pub async fn get_decision_timeline(
+        &self,
+        task_id: Option<Uuid>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<DecisionTimelineEntry>> {
+        let mut where_clauses = Vec::new();
+        if task_id.is_some() {
+            where_clauses.push("t.id = $task_id".to_string());
+        }
+        if from.is_some() {
+            where_clauses.push("d.decided_at >= datetime($from)".to_string());
+        }
+        if to.is_some() {
+            where_clauses.push("d.decided_at <= datetime($to)".to_string());
+        }
+
+        let where_clause = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let cypher = format!(
+            r#"
+            MATCH (t:Task)-[:INFORMED_BY]->(d:Decision)
+            {}
+            OPTIONAL MATCH chain = (d)-[:SUPERSEDES*]->(old)
+            WITH d, [n IN nodes(chain) WHERE n <> d | n.id] AS chain_ids
+            OPTIONAL MATCH (newer)-[:SUPERSEDES]->(d)
+            RETURN d, chain_ids, newer.id AS superseded_by
+            ORDER BY d.decided_at DESC
+            "#,
+            where_clause
+        );
+
+        let mut q = query(&cypher);
+        if let Some(tid) = task_id {
+            q = q.param("task_id", tid.to_string());
+        }
+        if let Some(f) = from {
+            q = q.param("from", f.to_string());
+        }
+        if let Some(t) = to {
+            q = q.param("to", t.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut entries = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            let decision = Self::node_to_decision(&node)?;
+
+            let chain_ids: Vec<Uuid> = row
+                .get::<Vec<String>>("chain_ids")
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+
+            let superseded_by: Option<Uuid> = row
+                .get::<String>("superseded_by")
+                .ok()
+                .and_then(|s| s.parse().ok());
+
+            entries.push(DecisionTimelineEntry {
+                decision,
+                supersedes_chain: chain_ids,
+                superseded_by,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    // ========================================================================
+    // SUPERSEDES relation (Decision → Decision)
+    // ========================================================================
+
+    /// Mark a decision as superseded by a newer decision.
+    ///
+    /// Sets the old decision's status to 'superseded' and creates a
+    /// SUPERSEDES relationship from the new decision to the old one.
+    pub async fn supersede_decision(
+        &self,
+        new_decision_id: Uuid,
+        old_decision_id: Uuid,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (new:Decision {id: $new_id})
+            MATCH (old:Decision {id: $old_id})
+            SET old.status = 'superseded'
+            MERGE (new)-[:SUPERSEDES {created_at: datetime()}]->(old)
+            "#,
+        )
+        .param("new_id", new_decision_id.to_string())
+        .param("old_id", old_decision_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
     }
 }

@@ -249,9 +249,13 @@ fn init_http_embedding_provider(config: &crate::Config) -> Option<Arc<dyn Embedd
 impl Orchestrator {
     /// Create a new orchestrator
     pub async fn new(state: AppState) -> Result<Self> {
-        let plan_manager = Arc::new(PlanManager::new(state.neo4j.clone(), state.meili.clone()));
-
         let embedding_provider = init_embedding_provider(&state.config);
+
+        let mut pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
+        if let Some(ref provider) = embedding_provider {
+            pm = pm.with_embedding_provider(provider.clone());
+        }
+        let plan_manager = Arc::new(pm);
 
         let mut note_manager = NoteManager::new(state.neo4j.clone(), state.meili.clone());
         if let Some(ref provider) = embedding_provider {
@@ -330,11 +334,15 @@ impl Orchestrator {
         let emitter: Arc<dyn EventEmitter> = event_bus.clone();
         let embedding_provider = init_embedding_provider(&state.config);
 
-        let plan_manager = Arc::new(PlanManager::with_event_emitter(
+        let mut pm = PlanManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
             emitter.clone(),
-        ));
+        );
+        if let Some(ref provider) = embedding_provider {
+            pm = pm.with_embedding_provider(provider.clone());
+        }
+        let plan_manager = Arc::new(pm);
 
         let mut note_manager = NoteManager::with_event_emitter(
             state.neo4j.clone(),
@@ -419,11 +427,15 @@ impl Orchestrator {
     ) -> Result<Self> {
         let embedding_provider = init_embedding_provider(&state.config);
 
-        let plan_manager = Arc::new(PlanManager::with_event_emitter(
+        let mut pm = PlanManager::with_event_emitter(
             state.neo4j.clone(),
             state.meili.clone(),
             emitter.clone(),
-        ));
+        );
+        if let Some(ref provider) = embedding_provider {
+            pm = pm.with_embedding_provider(provider.clone());
+        }
+        let plan_manager = Arc::new(pm);
 
         let mut note_manager = NoteManager::with_event_emitter(
             state.neo4j.clone(),
@@ -2755,9 +2767,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         description: Option<String>,
         rationale: Option<String>,
         chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
     ) -> Result<()> {
         self.neo4j()
-            .update_decision(decision_id, description, rationale, chosen_option)
+            .update_decision(decision_id, description, rationale, chosen_option, status)
             .await?;
         self.emit(CrudEvent::new(
             EventEntityType::Decision,
@@ -3605,7 +3618,7 @@ mod tests {
     async fn test_update_decision_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
         let id = Uuid::new_v4();
-        orch.update_decision(id, Some("desc".into()), None, None)
+        orch.update_decision(id, Some("desc".into()), None, None, None)
             .await
             .unwrap();
         let ev = rx.try_recv().unwrap();

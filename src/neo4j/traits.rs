@@ -755,6 +755,7 @@ pub trait GraphStore: Send + Sync {
         description: Option<String>,
         rationale: Option<String>,
         chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
     ) -> Result<()>;
 
     /// Delete a decision
@@ -767,6 +768,70 @@ pub trait GraphStore: Send + Sync {
         entity_id: &str,
         limit: u32,
     ) -> Result<Vec<DecisionNode>>;
+
+    /// Store a vector embedding on a Decision node
+    async fn set_decision_embedding(
+        &self,
+        decision_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()>;
+
+    /// Retrieve the stored vector embedding for a Decision node
+    async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>>;
+
+    /// Get all Decision IDs that have no embedding yet (for backfill)
+    async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>>;
+
+    /// Semantic search over Decision embeddings using Neo4j vector index
+    async fn search_decisions_by_vector(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(DecisionNode, f64)>>;
+
+    /// Get decisions that AFFECT a given entity (reverse AFFECTS lookup)
+    async fn get_decisions_affecting(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<DecisionNode>>;
+
+    /// Create an AFFECTS relation from a Decision to any entity in the graph
+    async fn add_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
+    ) -> Result<()>;
+
+    /// Remove an AFFECTS relation from a Decision to an entity
+    async fn remove_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()>;
+
+    /// List all entities affected by a Decision
+    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>>;
+
+    /// Mark a decision as superseded by a newer decision
+    async fn supersede_decision(
+        &self,
+        new_decision_id: Uuid,
+        old_decision_id: Uuid,
+    ) -> Result<()>;
+
+    /// Get a timeline of decisions, optionally filtered by task and date range
+    async fn get_decision_timeline(
+        &self,
+        task_id: Option<Uuid>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<DecisionTimelineEntry>>;
 
     // ========================================================================
     // Dependency analysis
@@ -1343,6 +1408,33 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<crate::notes::Note>, usize)>;
+
+    // ========================================================================
+    // Cross-entity SYNAPSE operations (Decision ↔ Note)
+    // ========================================================================
+
+    /// Create bidirectional SYNAPSE relationships between any two nodes (Note or Decision).
+    /// Enables cross-entity neural linking for the Knowledge Fabric.
+    async fn create_cross_entity_synapses(
+        &self,
+        source_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> Result<usize>;
+
+    /// Get all SYNAPSE neighbors for any node (Note or Decision).
+    /// Returns (neighbor_id, weight, entity_type) where entity_type is "Note" or "Decision".
+    async fn get_cross_entity_synapses(
+        &self,
+        node_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64, String)>>;
+
+    /// List Decision nodes that have embeddings but no SYNAPSE relationships.
+    /// Used for cross-entity synapse backfill.
+    async fn list_decisions_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionNode>, usize)>;
 
     // ========================================================================
     // Chat session operations

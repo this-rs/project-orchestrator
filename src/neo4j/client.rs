@@ -272,6 +272,10 @@ impl Neo4jClient {
             // Knowledge Fabric — CO_CHANGED relationship indexes (File↔File)
             "CREATE INDEX co_changed_count IF NOT EXISTS FOR ()-[r:CO_CHANGED]-() ON (r.count)",
             "CREATE INDEX co_changed_project IF NOT EXISTS FOR ()-[r:CO_CHANGED]-() ON (r.project_id)",
+            // Decision AFFECTS relationship index
+            "CREATE INDEX affects_rel_idx IF NOT EXISTS FOR ()-[r:AFFECTS]->() ON (r.created_at)",
+            // Decision SUPERSEDES relationship index
+            "CREATE INDEX supersedes_rel_idx IF NOT EXISTS FOR ()-[r:SUPERSEDES]->() ON (r.created_at)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)
@@ -297,6 +301,13 @@ impl Neo4jClient {
                    `vector.dimensions`: 768,
                    `vector.similarity_function`: 'cosine'
                }}"#,
+            // HNSW vector index for cosine similarity search on Decision embeddings
+            r#"CREATE VECTOR INDEX decision_embedding IF NOT EXISTS
+               FOR (d:Decision) ON (d.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
         ];
 
         for constraint in constraints {
@@ -308,6 +319,17 @@ impl Neo4jClient {
         for index in indexes {
             if let Err(e) = self.graph.run(query(index)).await {
                 tracing::warn!("Index may already exist: {}", e);
+            }
+        }
+
+        // Data migrations — idempotent, run on every startup
+        let migrations = vec![
+            // T3.2: Set default status on existing Decision nodes without one
+            r#"MATCH (d:Decision) WHERE d.status IS NULL SET d.status = 'accepted'"#,
+        ];
+        for migration in migrations {
+            if let Err(e) = self.graph.run(query(migration)).await {
+                tracing::warn!("Migration failed (non-fatal): {}", e);
             }
         }
 

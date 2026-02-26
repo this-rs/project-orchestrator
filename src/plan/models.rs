@@ -1,8 +1,8 @@
 //! Plan-related models and DTOs
 
 use crate::neo4j::models::{
-    ConstraintNode, ConstraintType, DecisionNode, PlanNode, PlanStatus, StepNode, StepStatus,
-    TaskNode, TaskStatus,
+    ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, PlanNode, PlanStatus, StepNode,
+    StepStatus, TaskNode, TaskStatus,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -194,6 +194,13 @@ pub struct ContextNote {
     pub relevance_score: f64,
 }
 
+/// Semantic search hit for a decision with relevance score
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionSearchHit {
+    pub decision: DecisionNode,
+    pub score: f64,
+}
+
 /// Reference to similar code
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeReference {
@@ -330,6 +337,9 @@ impl DecisionNode {
             chosen_option: None,
             decided_by,
             decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
         }
     }
 }

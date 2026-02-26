@@ -90,6 +90,13 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "update_decision" => Some(("decision", "update")),
         "delete_decision" => Some(("decision", "delete")),
         "search_decisions" => Some(("decision", "search")),
+        "search_decisions_semantic" => Some(("decision", "search_semantic")),
+        "add_decision_affects" => Some(("decision", "add_affects")),
+        "remove_decision_affects" => Some(("decision", "remove_affects")),
+        "list_decision_affects" => Some(("decision", "list_affects")),
+        "get_decisions_affecting" => Some(("decision", "get_affecting")),
+        "supersede_decision" => Some(("decision", "supersede")),
+        "get_decision_timeline" => Some(("decision", "get_timeline")),
 
         // Constraint
         "list_constraints" => Some(("constraint", "list")),
@@ -237,6 +244,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "reinforce_neurons" => Some(("admin", "reinforce_neurons")),
         "decay_synapses" => Some(("admin", "decay_synapses")),
         "backfill_synapses" => Some(("admin", "backfill_synapses")),
+        "backfill_decision_embeddings" => Some(("admin", "backfill_decision_embeddings")),
 
         _ => None,
     }
@@ -365,23 +373,30 @@ fn step_tool() -> ToolDefinition {
 fn decision_tool() -> ToolDefinition {
     ToolDefinition {
         name: "decision".to_string(),
-        description: "Manage architectural decisions. Actions: add, get, update, delete, search"
+        description: "Manage architectural decisions. Actions: add, get, update, delete, search, search_semantic, add_affects, remove_affects, list_affects, get_affecting, supersede, get_timeline"
             .to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["add", "get", "update", "delete", "search"],
+                    "enum": ["add", "get", "update", "delete", "search", "search_semantic", "add_affects", "remove_affects", "list_affects", "get_affecting", "supersede", "get_timeline"],
                     "description": "Operation to perform"
                 },
-                "decision_id": {"type": "string", "description": "Decision UUID (get/update/delete)"},
-                "task_id": {"type": "string", "description": "Task UUID (add)"},
+                "decision_id": {"type": "string", "description": "Decision UUID (get/update/delete/add_affects/remove_affects/list_affects)"},
+                "task_id": {"type": "string", "description": "Task UUID (add/get_timeline)"},
                 "description": {"type": "string", "description": "Decision description (add/update)"},
                 "rationale": {"type": "string", "description": "Rationale (add/update)"},
                 "alternatives": {"type": "array", "items": {"type": "string"}, "description": "Alternatives considered (add)"},
                 "chosen_option": {"type": "string", "description": "Chosen option (add/update)"},
-                "query": {"type": "string", "description": "Search query (search)"}
+                "status": {"type": "string", "description": "New status (update): proposed, accepted, deprecated, superseded"},
+                "query": {"type": "string", "description": "Search query (search/search_semantic)"},
+                "entity_type": {"type": "string", "description": "Entity type (add_affects/remove_affects)"},
+                "entity_id": {"type": "string", "description": "Entity identifier (add_affects/remove_affects)"},
+                "impact_description": {"type": "string", "description": "Description of how the decision impacts the entity (add_affects)"},
+                "superseded_by_id": {"type": "string", "description": "Decision UUID being superseded (supersede)"},
+                "from": {"type": "string", "description": "Start date ISO filter (get_timeline)"},
+                "to": {"type": "string", "description": "End date ISO filter (get_timeline)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -740,13 +755,13 @@ fn code_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, backfill_touches".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, backfill_decision_embeddings, backfill_touches".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_touches"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
@@ -913,6 +928,7 @@ mod tests {
             "update_decision",
             "delete_decision",
             "search_decisions",
+            "search_decisions_semantic",
             "search_workspace_code",
             "sync_directory",
             "start_watch",

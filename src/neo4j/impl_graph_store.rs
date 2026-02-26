@@ -980,8 +980,9 @@ impl GraphStore for Neo4jClient {
         description: Option<String>,
         rationale: Option<String>,
         chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
     ) -> anyhow::Result<()> {
-        self.update_decision(decision_id, description, rationale, chosen_option)
+        self.update_decision(decision_id, description, rationale, chosen_option, status)
             .await
     }
 
@@ -997,6 +998,89 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<DecisionNode>> {
         self.get_decisions_for_entity(entity_type, entity_id, limit)
             .await
+    }
+
+    async fn set_decision_embedding(
+        &self,
+        decision_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.set_decision_embedding(decision_id, embedding, model)
+            .await
+    }
+
+    async fn get_decision_embedding(&self, decision_id: Uuid) -> anyhow::Result<Option<Vec<f32>>> {
+        self.get_decision_embedding(decision_id).await
+    }
+
+    async fn get_decisions_without_embedding(&self) -> anyhow::Result<Vec<(Uuid, String, String)>> {
+        self.get_decisions_without_embedding().await
+    }
+
+    async fn search_decisions_by_vector(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<(DecisionNode, f64)>> {
+        self.search_decisions_by_vector(query_embedding, limit)
+            .await
+    }
+
+    async fn get_decisions_affecting(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        status_filter: Option<&str>,
+    ) -> anyhow::Result<Vec<DecisionNode>> {
+        self.get_decisions_affecting(entity_type, entity_id, status_filter)
+            .await
+    }
+
+    async fn add_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.add_decision_affects(decision_id, entity_type, entity_id, impact_description)
+            .await
+    }
+
+    async fn remove_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> anyhow::Result<()> {
+        self.remove_decision_affects(decision_id, entity_type, entity_id)
+            .await
+    }
+
+    async fn list_decision_affects(
+        &self,
+        decision_id: Uuid,
+    ) -> anyhow::Result<Vec<AffectsRelation>> {
+        self.list_decision_affects(decision_id).await
+    }
+
+    async fn supersede_decision(
+        &self,
+        new_decision_id: Uuid,
+        old_decision_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.supersede_decision(new_decision_id, old_decision_id)
+            .await
+    }
+
+    async fn get_decision_timeline(
+        &self,
+        task_id: Option<Uuid>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> anyhow::Result<Vec<DecisionTimelineEntry>> {
+        self.get_decision_timeline(task_id, from, to).await
     }
 
     // ========================================================================
@@ -1653,6 +1737,30 @@ impl GraphStore for Neo4jClient {
         offset: usize,
     ) -> anyhow::Result<(Vec<crate::notes::Note>, usize)> {
         self.list_notes_needing_synapses(limit, offset).await
+    }
+
+    async fn create_cross_entity_synapses(
+        &self,
+        source_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> anyhow::Result<usize> {
+        self.create_cross_entity_synapses(source_id, neighbors)
+            .await
+    }
+
+    async fn get_cross_entity_synapses(
+        &self,
+        node_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, f64, String)>> {
+        self.get_cross_entity_synapses(node_id).await
+    }
+
+    async fn list_decisions_needing_synapses(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<DecisionNode>, usize)> {
+        self.list_decisions_needing_synapses(limit, offset).await
     }
 
     // ========================================================================
