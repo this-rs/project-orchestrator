@@ -95,6 +95,13 @@ impl AnalyticsEngine for MockAnalyticsEngine {
             .clone()
             .unwrap_or_else(Self::empty_analytics))
     }
+
+    async fn detect_processes(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<Vec<crate::graph::process::Process>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

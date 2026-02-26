@@ -485,6 +485,13 @@ mod tests {
         ) -> anyhow::Result<GraphAnalytics> {
             self.inner.analyze_fabric_graph(project_id, weights).await
         }
+
+        async fn detect_processes(
+            &self,
+            project_id: Uuid,
+        ) -> anyhow::Result<Vec<crate::graph::process::Process>> {
+            self.inner.detect_processes(project_id).await
+        }
     }
 
     #[tokio::test]
