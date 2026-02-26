@@ -2940,6 +2940,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         &import.path,
                         &ctx.suffix_index,
                     ),
+                    "kotlin" => Self::resolve_kotlin_import_indexed(
+                        &import.path,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3557,6 +3561,59 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Standard import: com.example.Foo → com/example/Foo.scala
         let suffix = format!("{}.scala", path.replace('.', "/"));
         if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Kotlin import to project files.
+    ///
+    /// Same convention as Java (package → directory) with .kt extension:
+    /// - `import com.example.Foo` → com/example/Foo.kt
+    /// - `import com.example.*` → all .kt files in com/example/
+    ///
+    /// Kotlin stdlib (kotlin.*, kotlinx.*, java.*) is ignored.
+    fn resolve_kotlin_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore Kotlin/Java stdlib
+        if path.starts_with("kotlin.")
+            || path.starts_with("kotlinx.")
+            || path.starts_with("java.")
+            || path.starts_with("javax.")
+            || path.starts_with("android.")
+        {
+            return Vec::new();
+        }
+
+        // Wildcard import: com.example.*
+        if path.ends_with(".*") {
+            let package = &path[..path.len() - 2];
+            let dir = package.replace('.', "/");
+            return index
+                .get_files_in_dir(&dir, "kt")
+                .into_iter()
+                .map(|f| f.to_string())
+                .collect();
+        }
+
+        // Standard import: com.example.Foo → com/example/Foo.kt
+        let parts: Vec<&str> = path.split('.').collect();
+        let suffix = format!("{}.kt", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        // Try .kts (Gradle script)
+        let suffix_kts = format!("{}.kts", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix_kts) {
             return vec![resolved.to_string()];
         }
 
@@ -7590,6 +7647,44 @@ mod tests {
         assert!(result.is_empty());
 
         let result = Orchestrator::resolve_scala_import_indexed("java.util.List", &index);
+        assert!(result.is_empty());
+    }
+
+    // ── Kotlin resolver tests ────────────────────────────────────
+
+    #[test]
+    fn test_resolve_kotlin_import_standard() {
+        let paths = vec!["com/example/UserService.kt".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("com.example.UserService", &index);
+        assert_eq!(result, vec!["com/example/UserService.kt"]);
+    }
+
+    #[test]
+    fn test_resolve_kotlin_import_wildcard() {
+        let paths = vec![
+            "com/example/Foo.kt".to_string(),
+            "com/example/Bar.kt".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("com.example.*", &index);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_kotlin_stdlib_ignored() {
+        let paths = vec!["kotlin/collections/List.kt".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("kotlin.collections.List", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("kotlinx.coroutines.launch", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("android.os.Bundle", &index);
         assert!(result.is_empty());
     }
 
