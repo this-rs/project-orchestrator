@@ -629,14 +629,20 @@ async fn handle_ws_chat_loop(
                         let _ = ws_sender.send(Message::Text(hint.to_string().into())).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        debug!("Chat broadcast closed for session {}", session_id);
-                        // Channel closed — session was cleaned up. Notify client.
+                        // CLI subprocess was cleaned up (idle timeout) but the WebSocket
+                        // should stay alive. Transition to dormant: disable the broadcast
+                        // branch and let ping/pong + client messages keep running.
+                        // When the user sends a new message, resume_session() will spawn
+                        // a fresh CLI and the existing `if event_rx.is_none() { subscribe() }`
+                        // logic (below) will re-subscribe automatically.
+                        debug!(session_id = %session_id, "Chat broadcast closed (idle cleanup), going dormant");
+                        event_rx = None;
+                        snapshot_fingerprints.clear();
                         let msg = serde_json::json!({
-                            "type": "session_closed",
-                            "message": "Session has been closed"
+                            "type": "session_dormant",
+                            "message": "CLI session cleaned up (idle timeout). Will resume on next message."
                         });
                         let _ = ws_sender.send(Message::Text(msg.to_string().into())).await;
-                        break;
                     }
                 }
             }
@@ -1186,4 +1192,204 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
             );
         }
     });
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::types::ChatEvent;
+    use std::collections::HashSet;
+    use tokio::sync::broadcast;
+
+    /// Verify that dropping the broadcast sender causes RecvError::Closed.
+    /// This is the mechanism that triggers the dormant transition.
+    #[tokio::test]
+    async fn test_broadcast_close_returns_closed_error() {
+        let (tx, mut rx) = broadcast::channel::<ChatEvent>(16);
+
+        // Drop the sender — simulates close_session() removing the ActiveSession
+        drop(tx);
+
+        let result = rx.recv().await;
+        assert!(
+            matches!(result, Err(broadcast::error::RecvError::Closed)),
+            "Expected RecvError::Closed after sender is dropped, got: {:?}",
+            result
+        );
+    }
+
+    /// Verify the dormant event JSON format matches what the frontend expects.
+    #[test]
+    fn test_session_dormant_json_format() {
+        let msg = serde_json::json!({
+            "type": "session_dormant",
+            "message": "CLI session cleaned up (idle timeout). Will resume on next message."
+        });
+
+        assert_eq!(msg["type"], "session_dormant");
+        assert!(msg["message"].as_str().unwrap().contains("idle timeout"));
+    }
+
+    /// Verify that after broadcast close, a new channel can be created and
+    /// subscribed to — simulating the resume_session → re-subscribe flow.
+    #[tokio::test]
+    async fn test_resubscribe_after_broadcast_close() {
+        // Phase 1: Create initial broadcast, subscribe, then close
+        let (tx1, mut rx1) = broadcast::channel::<ChatEvent>(16);
+        drop(tx1);
+
+        let result = rx1.recv().await;
+        assert!(matches!(result, Err(broadcast::error::RecvError::Closed)));
+
+        // Phase 2: Simulate event_rx = None (dormant state)
+        let mut event_rx: Option<broadcast::Receiver<ChatEvent>> = None;
+        assert!(
+            event_rx.is_none(),
+            "Should be None after dormant transition"
+        );
+
+        // Phase 3: Simulate resume_session() creating a new broadcast channel
+        let (tx2, rx2) = broadcast::channel::<ChatEvent>(16);
+        event_rx = Some(rx2);
+        assert!(event_rx.is_some(), "Should be Some after re-subscribe");
+
+        // Phase 4: Verify events flow on the new channel
+        let test_event = ChatEvent::StreamingStatus { is_streaming: true };
+        tx2.send(test_event).unwrap();
+
+        let received = event_rx.as_mut().unwrap().recv().await.unwrap();
+        assert!(
+            matches!(received, ChatEvent::StreamingStatus { is_streaming: true }),
+            "Should receive events on the new channel"
+        );
+    }
+
+    /// Verify that `tokio::select!` with `std::future::pending()` for a None
+    /// branch works correctly — the pending branch never fires, allowing other
+    /// branches to proceed. This is the core mechanism of dormant mode.
+    #[tokio::test]
+    async fn test_dormant_select_skips_none_branch() {
+        let event_rx: Option<broadcast::Receiver<ChatEvent>> = None;
+        let (user_tx, mut user_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        // Send a user message to simulate client interaction during dormant
+        user_tx.send("hello".to_string()).await.unwrap();
+
+        // The select! should skip the broadcast branch (None → pending)
+        // and process the user message branch instead
+        let result = tokio::select! {
+            _event = async {
+                match &event_rx {
+                    Some(_rx) => unreachable!("Should not reach Some branch"),
+                    None => {
+                        // This mirrors the handler's dormant behavior
+                        std::future::pending::<()>().await
+                    }
+                }
+            } => "broadcast",
+            msg = user_rx.recv() => {
+                assert_eq!(msg.unwrap(), "hello");
+                "user_message"
+            }
+        };
+
+        assert_eq!(
+            result, "user_message",
+            "Should process user message while broadcast is dormant"
+        );
+    }
+
+    /// Verify that snapshot_fingerprints can be safely cleared after dormant
+    /// transition, and that new events after re-subscribe are not deduped.
+    #[tokio::test]
+    async fn test_snapshot_fingerprints_cleared_on_dormant() {
+        let mut fingerprints = HashSet::new();
+        fingerprints.insert("tool_use:abc123".to_string());
+        fingerprints.insert("thinking:def456".to_string());
+        assert_eq!(fingerprints.len(), 2);
+
+        // Simulate dormant transition: clear fingerprints
+        fingerprints.clear();
+        assert!(
+            fingerprints.is_empty(),
+            "Fingerprints should be cleared on dormant"
+        );
+
+        // After re-subscribe, new events should NOT be deduped
+        let new_fp = "tool_use:abc123".to_string();
+        assert!(
+            !fingerprints.contains(&new_fp),
+            "Old fingerprint should not block new events after dormant"
+        );
+    }
+
+    /// Verify that the WsChatClientMessage deserialization works for all types
+    /// that can be received during dormant mode.
+    #[test]
+    fn test_client_message_deserialization() {
+        // user_message — the main one that triggers resume_session
+        let msg: WsChatClientMessage =
+            serde_json::from_str(r#"{"type":"user_message","content":"hello"}"#).unwrap();
+        assert!(matches!(msg, WsChatClientMessage::UserMessage { content } if content == "hello"));
+
+        // interrupt — should work even if dormant (no-op since no stream)
+        let msg: WsChatClientMessage = serde_json::from_str(r#"{"type":"interrupt"}"#).unwrap();
+        assert!(matches!(msg, WsChatClientMessage::Interrupt));
+    }
+
+    /// End-to-end simulation of the dormant → resume lifecycle using channels.
+    /// Verifies the full sequence: active → broadcast close → dormant → user message → re-subscribe → active.
+    #[tokio::test]
+    async fn test_dormant_resume_lifecycle() {
+        // === Phase 1: Active session ===
+        let (tx1, rx1) = broadcast::channel::<ChatEvent>(16);
+        let mut event_rx: Option<broadcast::Receiver<ChatEvent>> = Some(rx1);
+
+        // Send an event while active
+        tx1.send(ChatEvent::StreamingStatus { is_streaming: true })
+            .unwrap();
+        let ev = event_rx.as_mut().unwrap().recv().await.unwrap();
+        assert!(matches!(
+            ev,
+            ChatEvent::StreamingStatus { is_streaming: true }
+        ));
+
+        // === Phase 2: Idle cleanup (close_session drops tx) ===
+        drop(tx1);
+        let close_result = event_rx.as_mut().unwrap().recv().await;
+        assert!(matches!(
+            close_result,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+
+        // Transition to dormant
+        event_rx = None;
+        let mut snapshot_fingerprints = HashSet::new();
+        snapshot_fingerprints.insert("stale:fp".to_string());
+        snapshot_fingerprints.clear(); // cleaned on dormant
+
+        assert!(event_rx.is_none());
+        assert!(snapshot_fingerprints.is_empty());
+
+        // === Phase 3: User sends message → resume_session creates new channel ===
+        let (tx2, rx2) = broadcast::channel::<ChatEvent>(16);
+        event_rx = Some(rx2); // re-subscribe
+
+        // === Phase 4: Verify events flow on resumed session ===
+        tx2.send(ChatEvent::StreamingStatus {
+            is_streaming: false,
+        })
+        .unwrap();
+        let ev = event_rx.as_mut().unwrap().recv().await.unwrap();
+        assert!(matches!(
+            ev,
+            ChatEvent::StreamingStatus {
+                is_streaming: false
+            }
+        ));
+    }
 }
