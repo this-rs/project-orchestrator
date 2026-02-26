@@ -1133,6 +1133,40 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     }
 
     // ========================================================================
+    // CO_CHANGED computation
+    // ========================================================================
+
+    /// Compute CO_CHANGED relations for a project from TOUCHES history.
+    ///
+    /// Incremental: only processes commits since `last_co_change_computed_at`.
+    /// Defaults: min_count=3, max_relations=500.
+    pub async fn compute_co_changed(&self, project_id: uuid::Uuid) -> Result<i64> {
+        let start = std::time::Instant::now();
+
+        // Get project to read last_co_change_computed_at
+        let since = self
+            .neo4j()
+            .get_project(project_id)
+            .await?
+            .and_then(|p| p.last_co_change_computed_at);
+
+        let count = self
+            .neo4j()
+            .compute_co_changed(project_id, since, 3, 500)
+            .await?;
+
+        tracing::info!(
+            project_id = %project_id,
+            since = ?since,
+            relations = count,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "CO_CHANGED computation finished"
+        );
+
+        Ok(count)
+    }
+
+    // ========================================================================
     // Sync operations
     // ========================================================================
 

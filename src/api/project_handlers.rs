@@ -144,6 +144,7 @@ pub async fn create_project(
         created_at: chrono::Utc::now(),
         last_synced: None,
         analytics_computed_at: None,
+        last_co_change_computed_at: None,
     };
 
     state.orchestrator.create_project(&project).await?;

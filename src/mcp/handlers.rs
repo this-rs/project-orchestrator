@@ -168,6 +168,8 @@ impl ToolHandler {
             ("commit", "link_to_plan") => "link_commit_to_plan",
             ("commit", "get_task_commits") => "get_task_commits",
             ("commit", "get_plan_commits") => "get_plan_commits",
+            ("commit", "get_commit_files") => "get_commit_files",
+            ("commit", "get_file_history") => "get_file_history",
 
             // Note
             ("note", "list") => "list_notes",
@@ -1224,6 +1226,29 @@ impl ToolHandler {
             "get_plan_commits" => {
                 let plan_id = extract_id(args, "plan_id")?;
                 let result = http.get(&format!("/api/plans/{}/commits", plan_id)).await?;
+                Ok(Some(result))
+            }
+
+            "get_commit_files" => {
+                let sha = args
+                    .get("sha")
+                    .or_else(|| args.get("commit_sha"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("sha is required"))?;
+                let result = http.get(&format!("/api/commits/{}/files", sha)).await?;
+                Ok(Some(result))
+            }
+
+            "get_file_history" => {
+                let file_path = args
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
+                let mut query_params = vec![("path".to_string(), file_path.to_string())];
+                if let Some(limit) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query_params.push(("limit".to_string(), limit.to_string()));
+                }
+                let result = http.get_with_query("/api/files/history", &query_params).await?;
                 Ok(Some(result))
             }
 

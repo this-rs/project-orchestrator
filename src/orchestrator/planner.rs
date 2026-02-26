@@ -1791,6 +1791,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_synced: None,
             analytics_computed_at: None,
+            last_co_change_computed_at: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -2714,6 +2715,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_synced: None,
             analytics_computed_at: None,
+            last_co_change_computed_at: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -3036,6 +3038,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_synced: None,
             analytics_computed_at: None,
+            last_co_change_computed_at: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -3247,6 +3250,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_synced: None,
             analytics_computed_at: None,
+            last_co_change_computed_at: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();

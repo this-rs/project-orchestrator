@@ -825,6 +825,45 @@ pub trait GraphStore: Send + Sync {
     async fn delete_commit(&self, hash: &str) -> Result<()>;
 
     // ========================================================================
+    // TOUCHES operations (Commit → File)
+    // ========================================================================
+
+    /// Create TOUCHES relations between a Commit and its changed Files (batch UNWIND).
+    /// Files that don't exist as nodes are silently skipped.
+    async fn create_commit_touches(
+        &self,
+        commit_hash: &str,
+        files: &[FileChangedInfo],
+    ) -> Result<()>;
+
+    /// Get all files touched by a commit
+    async fn get_commit_files(&self, commit_hash: &str) -> Result<Vec<CommitFileInfo>>;
+
+    /// Get the commit history for a specific file
+    async fn get_file_history(
+        &self,
+        file_path: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<FileHistoryEntry>>;
+
+    // ========================================================================
+    // CO_CHANGED operations (File ↔ File)
+    // ========================================================================
+
+    /// Compute CO_CHANGED relations from TOUCHES history (incremental).
+    /// Returns the number of relations created/updated.
+    async fn compute_co_changed(
+        &self,
+        project_id: Uuid,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        min_count: i64,
+        max_relations: i64,
+    ) -> Result<i64>;
+
+    /// Update project last_co_change_computed_at timestamp
+    async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()>;
+
+    // ========================================================================
     // Release operations
     // ========================================================================
 

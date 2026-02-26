@@ -193,6 +193,7 @@ pub fn test_project() -> ProjectNode {
         created_at: chrono::Utc::now(),
         last_synced: None,
         analytics_computed_at: None,
+        last_co_change_computed_at: None,
     }
 }
 
@@ -207,6 +208,7 @@ pub fn test_project_named(name: &str) -> ProjectNode {
         created_at: chrono::Utc::now(),
         last_synced: None,
         analytics_computed_at: None,
+        last_co_change_computed_at: None,
     }
 }
 

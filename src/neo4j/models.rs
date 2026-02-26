@@ -21,6 +21,10 @@ pub struct ProjectNode {
     /// When GDS analytics (PageRank, Louvain, etc.) were last computed for this project.
     /// None if analytics have never been computed.
     pub analytics_computed_at: Option<DateTime<Utc>>,
+    /// When CO_CHANGED relations were last computed from TOUCHES history.
+    /// Used for incremental computation — only new commits since this date are processed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_co_change_computed_at: Option<DateTime<Utc>>,
 }
 
 // ============================================================================
@@ -403,6 +407,90 @@ pub struct CommitNode {
     pub message: String,
     pub author: String,
     pub timestamp: DateTime<Utc>,
+}
+
+/// Info about a file changed in a commit (for TOUCHES relations).
+///
+/// Supports two JSON input formats (backward compatible):
+/// - String: `"src/main.rs"` → `FileChangedInfo { path: "src/main.rs", additions: None, deletions: None }`
+/// - Object: `{ "path": "src/main.rs", "additions": 10, "deletions": 3 }`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChangedInfo {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<i64>,
+}
+
+impl From<String> for FileChangedInfo {
+    fn from(path: String) -> Self {
+        Self {
+            path,
+            additions: None,
+            deletions: None,
+        }
+    }
+}
+
+impl From<&str> for FileChangedInfo {
+    fn from(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            additions: None,
+            deletions: None,
+        }
+    }
+}
+
+/// Info about a file touched by a commit (returned by get_commit_files)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitFileInfo {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<i64>,
+}
+
+/// A commit in the history of a file (returned by get_file_history)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileHistoryEntry {
+    pub hash: String,
+    pub message: String,
+    pub author: String,
+    pub timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<i64>,
+}
+
+/// Deserializes a list of file changes that can be either strings or objects.
+/// This allows backward-compatible API: `["a.rs", "b.rs"]` or `[{"path": "a.rs", "additions": 10}]`
+pub fn deserialize_files_changed<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<FileChangedInfo>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FileEntry {
+        Simple(String),
+        Detailed(FileChangedInfo),
+    }
+
+    let opt: Option<Vec<FileEntry>> = Option::deserialize(deserializer)?;
+    Ok(opt.map(|entries| {
+        entries
+            .into_iter()
+            .map(|e| match e {
+                FileEntry::Simple(path) => FileChangedInfo::from(path),
+                FileEntry::Detailed(info) => info,
+            })
+            .collect()
+    }))
 }
 
 // ============================================================================

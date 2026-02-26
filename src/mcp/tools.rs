@@ -467,23 +467,25 @@ fn milestone_tool() -> ToolDefinition {
 fn commit_tool() -> ToolDefinition {
     ToolDefinition {
         name: "commit".to_string(),
-        description: "Register and link git commits. Actions: create, link_to_task, link_to_plan, get_task_commits, get_plan_commits".to_string(),
+        description: "Register and link git commits. Actions: create, link_to_task, link_to_plan, get_task_commits, get_plan_commits, get_commit_files, get_file_history".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["create", "link_to_task", "link_to_plan", "get_task_commits", "get_plan_commits"],
+                    "enum": ["create", "link_to_task", "link_to_plan", "get_task_commits", "get_plan_commits", "get_commit_files", "get_file_history"],
                     "description": "Operation to perform"
                 },
-                "sha": {"type": "string", "description": "Commit SHA (create/link_to_task/link_to_plan)"},
+                "sha": {"type": "string", "description": "Commit SHA (create/link_to_task/link_to_plan/get_commit_files)"},
                 "message": {"type": "string", "description": "Commit message (create)"},
                 "author": {"type": "string", "description": "Author name (create)"},
                 "files_changed": {"type": "array", "items": {"type": "string"}, "description": "Files changed (create)"},
                 "project_id": {"type": "string", "description": "Project UUID for incremental sync (create)"},
                 "task_id": {"type": "string", "description": "Task UUID (link_to_task/get_task_commits)"},
                 "plan_id": {"type": "string", "description": "Plan UUID (link_to_plan/get_plan_commits)"},
-                "commit_sha": {"type": "string", "description": "Alias for sha (link_to_task/link_to_plan)"}
+                "commit_sha": {"type": "string", "description": "Alias for sha (link_to_task/link_to_plan)"},
+                "file_path": {"type": "string", "description": "File path (get_file_history)"},
+                "limit": {"type": "integer", "description": "Max results (get_file_history)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

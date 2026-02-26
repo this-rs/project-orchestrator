@@ -267,6 +267,11 @@ impl Neo4jClient {
             // Release indexes
             "CREATE INDEX release_project IF NOT EXISTS FOR (r:Release) ON (r.project_id)",
             "CREATE INDEX release_version IF NOT EXISTS FOR (r:Release) ON (r.version)",
+            // Knowledge Fabric — TOUCHES relationship indexes (Commit→File)
+            "CREATE INDEX touches_file_path IF NOT EXISTS FOR ()-[r:TOUCHES]-() ON (r.file_path)",
+            // Knowledge Fabric — CO_CHANGED relationship indexes (File↔File)
+            "CREATE INDEX co_changed_count IF NOT EXISTS FOR ()-[r:CO_CHANGED]-() ON (r.count)",
+            "CREATE INDEX co_changed_project IF NOT EXISTS FOR ()-[r:CO_CHANGED]-() ON (r.project_id)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)

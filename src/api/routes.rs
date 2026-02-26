@@ -382,6 +382,12 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/plans/{plan_id}/commits",
             get(handlers::get_plan_commits).post(handlers::link_commit_to_plan),
         )
+        // TOUCHES — Commit ↔ File queries
+        .route(
+            "/api/commits/{commit_sha}/files",
+            get(handlers::get_commit_files),
+        )
+        .route("/api/files/history", get(handlers::get_file_history))
         // Webhooks (protected — /api prefix)
         .route("/api/wake", post(handlers::wake))
         // ================================================================

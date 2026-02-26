@@ -1061,6 +1061,49 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // TOUCHES operations (Commit → File)
+    // ========================================================================
+
+    async fn create_commit_touches(
+        &self,
+        commit_hash: &str,
+        files: &[FileChangedInfo],
+    ) -> anyhow::Result<()> {
+        self.create_commit_touches(commit_hash, files).await
+    }
+
+    async fn get_commit_files(&self, commit_hash: &str) -> anyhow::Result<Vec<CommitFileInfo>> {
+        self.get_commit_files(commit_hash).await
+    }
+
+    async fn get_file_history(
+        &self,
+        file_path: &str,
+        limit: Option<i64>,
+    ) -> anyhow::Result<Vec<FileHistoryEntry>> {
+        self.get_file_history(file_path, limit).await
+    }
+
+    // ========================================================================
+    // CO_CHANGED operations (File ↔ File)
+    // ========================================================================
+
+    async fn compute_co_changed(
+        &self,
+        project_id: Uuid,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        min_count: i64,
+        max_relations: i64,
+    ) -> anyhow::Result<i64> {
+        self.compute_co_changed(project_id, since, min_count, max_relations)
+            .await
+    }
+
+    async fn update_project_co_change_timestamp(&self, id: Uuid) -> anyhow::Result<()> {
+        self.update_project_co_change_timestamp(id).await
+    }
+
+    // ========================================================================
     // Release operations
     // ========================================================================
 

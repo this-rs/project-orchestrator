@@ -173,6 +173,21 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Update project last_co_change_computed_at timestamp
+    pub async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})
+            SET p.last_co_change_computed_at = datetime($now)
+            "#,
+        )
+        .param("id", id.to_string())
+        .param("now", chrono::Utc::now().to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Delete a project and all its data
     pub async fn delete_project(&self, id: Uuid) -> Result<()> {
         // Delete all files belonging to the project
@@ -231,6 +246,10 @@ impl Neo4jClient {
                 .and_then(|s| s.parse().ok()),
             analytics_computed_at: node
                 .get::<String>("analytics_computed_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            last_co_change_computed_at: node
+                .get::<String>("last_co_change_computed_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),
         })

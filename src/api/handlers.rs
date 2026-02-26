@@ -1174,8 +1174,10 @@ pub struct CreateCommitRequest {
     pub message: String,
     pub author: String,
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
-    /// Files changed in this commit (enables incremental sync)
-    pub files_changed: Option<Vec<String>>,
+    /// Files changed in this commit (enables incremental sync + TOUCHES relations).
+    /// Accepts either simple strings `["a.rs"]` or objects `[{"path": "a.rs", "additions": 10}]`.
+    #[serde(default, deserialize_with = "crate::neo4j::models::deserialize_files_changed")]
+    pub files_changed: Option<Vec<crate::neo4j::models::FileChangedInfo>>,
     /// Project UUID (enables incremental sync + analytics)
     pub project_id: Option<String>,
 }
@@ -1215,10 +1217,28 @@ pub async fn create_commit(
 
     let sync_triggered = !files_changed.is_empty() && project_id.is_some();
 
+    // Side-effect: Create TOUCHES relations (Commit→File) — synchronous for consistency
+    if !files_changed.is_empty() {
+        let commit_hash = commit.hash.clone();
+        if let Err(e) = state
+            .orchestrator
+            .neo4j()
+            .create_commit_touches(&commit_hash, &files_changed)
+            .await
+        {
+            tracing::warn!(
+                commit = %commit_hash, error = %e,
+                "Failed to create TOUCHES relations"
+            );
+        }
+    }
+
     if sync_triggered {
         let pid = project_id.unwrap();
         let orchestrator = state.orchestrator.clone();
-        let files_for_boost = files_changed.clone();
+        // Extract file paths for sync and boost operations
+        let file_paths: Vec<String> = files_changed.iter().map(|f| f.path.clone()).collect();
+        let paths_for_boost = file_paths.clone();
 
         // Resolve project slug for MeiliSearch indexing
         let project_slug = orchestrator
@@ -1232,8 +1252,8 @@ pub async fn create_commit(
         // Side-effect 1 & 2: Incremental sync + analytics debounce
         let orch2 = orchestrator.clone();
         tokio::spawn(async move {
-            for file_path in &files_changed {
-                let path = std::path::Path::new(file_path);
+            for file_path in &file_paths {
+                let path = std::path::Path::new(file_path.as_str());
                 if path.exists() {
                     if let Err(e) = orch2
                         .sync_file_for_project(path, Some(pid), project_slug.as_deref())
@@ -1251,10 +1271,10 @@ pub async fn create_commit(
 
         // Side-effect 3: Hebbian energy boost on notes linked to committed files
         let ar_config = orchestrator.auto_reinforcement_config().clone();
-        if ar_config.enabled && !files_for_boost.is_empty() {
+        if ar_config.enabled && !paths_for_boost.is_empty() {
             let neo4j = orchestrator.neo4j_arc();
             tokio::spawn(async move {
-                for file_path in &files_for_boost {
+                for file_path in &paths_for_boost {
                     match neo4j
                         .get_notes_for_entity(&crate::notes::EntityType::File, file_path)
                         .await
@@ -1338,6 +1358,43 @@ pub async fn get_plan_commits(
 ) -> Result<Json<Vec<CommitNode>>, AppError> {
     let commits = state.orchestrator.neo4j().get_plan_commits(plan_id).await?;
     Ok(Json(commits))
+}
+
+// ============================================================================
+// TOUCHES — Commit ↔ File queries
+// ============================================================================
+
+/// Get files touched by a commit (via TOUCHES relations)
+pub async fn get_commit_files(
+    State(state): State<OrchestratorState>,
+    Path(commit_sha): Path<String>,
+) -> Result<Json<Vec<crate::neo4j::models::CommitFileInfo>>, AppError> {
+    let files = state
+        .orchestrator
+        .neo4j()
+        .get_commit_files(&commit_sha)
+        .await?;
+    Ok(Json(files))
+}
+
+/// Query parameters for file history
+#[derive(Deserialize)]
+pub struct FileHistoryQuery {
+    pub path: String,
+    pub limit: Option<i64>,
+}
+
+/// Get commit history for a file (via TOUCHES relations)
+pub async fn get_file_history(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<FileHistoryQuery>,
+) -> Result<Json<Vec<crate::neo4j::models::FileHistoryEntry>>, AppError> {
+    let history = state
+        .orchestrator
+        .neo4j()
+        .get_file_history(&query.path, query.limit)
+        .await?;
+    Ok(Json(history))
 }
 
 // ============================================================================

@@ -3484,6 +3484,52 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
+    // TOUCHES operations (Commit → File) — mock stubs
+    // ========================================================================
+
+    async fn create_commit_touches(
+        &self,
+        _commit_hash: &str,
+        _files: &[FileChangedInfo],
+    ) -> Result<()> {
+        // Mock: no-op (TOUCHES relations not tracked in mock)
+        Ok(())
+    }
+
+    async fn get_commit_files(&self, _commit_hash: &str) -> Result<Vec<CommitFileInfo>> {
+        Ok(vec![])
+    }
+
+    async fn get_file_history(
+        &self,
+        _file_path: &str,
+        _limit: Option<i64>,
+    ) -> Result<Vec<FileHistoryEntry>> {
+        Ok(vec![])
+    }
+
+    // ========================================================================
+    // CO_CHANGED operations (File ↔ File) — mock stubs
+    // ========================================================================
+
+    async fn compute_co_changed(
+        &self,
+        _project_id: Uuid,
+        _since: Option<chrono::DateTime<chrono::Utc>>,
+        _min_count: i64,
+        _max_relations: i64,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()> {
+        if let Some(p) = self.projects.write().await.get_mut(&id) {
+            p.last_co_change_computed_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    // ========================================================================
     // Release operations
     // ========================================================================
 
