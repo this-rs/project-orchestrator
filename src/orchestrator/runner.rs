@@ -1485,6 +1485,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Populate SymbolTable from all parsed files
         import_ctx.populate_symbols(&parsed_files);
+
+        // Load language-specific config files (lazy, only when needed)
+        import_ctx.load_go_module_path(dir_path.to_str().unwrap_or(""));
+
         import_ctx.log_stats();
 
         // ── Store: Batch Neo4j (~10 queries total) ─────────────────
@@ -2901,6 +2905,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     )
                     .into_iter()
                     .collect(),
+                    "go" => Self::resolve_go_import_indexed(
+                        &import.path,
+                        ctx.go_module_path.as_deref(),
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3108,6 +3117,49 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         None
+    }
+
+    /// Resolve Go import using SuffixIndex and go.mod module path.
+    ///
+    /// Go imports are full package paths like `github.com/user/project/pkg/foo`.
+    /// If the import starts with the go.mod module path, we strip it and look up
+    /// the resulting directory in the SuffixIndex to find all `.go` files in that
+    /// package (excluding `_test.go`).
+    fn resolve_go_import_indexed(
+        import_path: &str,
+        go_module_path: Option<&str>,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let module_path = match go_module_path {
+            Some(mp) => mp,
+            None => return Vec::new(), // No go.mod — can't resolve
+        };
+
+        // Check if this is an internal import (starts with our module path)
+        if !import_path.starts_with(module_path) {
+            return Vec::new(); // External package — skip
+        }
+
+        // Strip the module path prefix to get the relative package directory
+        // e.g. "github.com/user/project/pkg/foo" → "pkg/foo"
+        let relative = &import_path[module_path.len()..];
+        let relative = relative.trim_start_matches('/');
+
+        if relative.is_empty() {
+            // Importing the root package — look for .go files at root
+            // This is rare but valid
+            return Vec::new();
+        }
+
+        // Look up all .go files in this directory
+        let go_files = index.get_files_in_dir(relative, "go");
+
+        // Filter out test files (_test.go)
+        go_files
+            .into_iter()
+            .filter(|f| !f.ends_with("_test.go"))
+            .map(|f| f.to_string())
+            .collect()
     }
 
     /// Resolve Python import using SuffixIndex.
@@ -6590,6 +6642,81 @@ mod tests {
             super::resolve_relative_path("src/a/b/c", "../../x"),
             "src/a/x"
         );
+    }
+
+    #[test]
+    fn test_resolve_go_import_indexed_internal_package() {
+        let paths = vec![
+            "pkg/foo/handler.go".to_string(),
+            "pkg/foo/handler_test.go".to_string(),
+            "pkg/foo/types.go".to_string(),
+            "pkg/bar/service.go".to_string(),
+            "cmd/main.go".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Internal import: github.com/user/project/pkg/foo → pkg/foo/*.go (sans _test.go)
+        let result = Orchestrator::resolve_go_import_indexed(
+            "github.com/user/project/pkg/foo",
+            Some("github.com/user/project"),
+            &index,
+        );
+        assert_eq!(result.len(), 2, "should resolve 2 .go files (not _test.go)");
+        assert!(result.contains(&"pkg/foo/handler.go".to_string()));
+        assert!(result.contains(&"pkg/foo/types.go".to_string()));
+        assert!(
+            !result.iter().any(|f| f.contains("_test.go")),
+            "test files should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_resolve_go_import_indexed_external_package() {
+        let paths = vec!["pkg/foo/handler.go".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // External import — should return empty
+        let result = Orchestrator::resolve_go_import_indexed(
+            "github.com/gin-gonic/gin",
+            Some("github.com/user/project"),
+            &index,
+        );
+        assert!(result.is_empty(), "external imports should be skipped");
+    }
+
+    #[test]
+    fn test_resolve_go_import_indexed_no_module() {
+        let paths = vec!["pkg/foo/handler.go".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // No go.mod module path — should return empty
+        let result = Orchestrator::resolve_go_import_indexed(
+            "github.com/user/project/pkg/foo",
+            None,
+            &index,
+        );
+        assert!(result.is_empty(), "no go.mod → no resolution");
+    }
+
+    #[test]
+    fn test_resolve_go_import_indexed_stdlib() {
+        let paths = vec!["internal/handler.go".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Standard library import — doesn't match our module path
+        let result = Orchestrator::resolve_go_import_indexed(
+            "fmt",
+            Some("github.com/user/project"),
+            &index,
+        );
+        assert!(result.is_empty(), "stdlib imports should be skipped");
+
+        let result = Orchestrator::resolve_go_import_indexed(
+            "net/http",
+            Some("github.com/user/project"),
+            &index,
+        );
+        assert!(result.is_empty(), "stdlib imports should be skipped");
     }
 
     #[test]
