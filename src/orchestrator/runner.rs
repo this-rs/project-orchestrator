@@ -79,6 +79,24 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
+/// Resolve a relative path (like `./foo` or `../bar`) against a base directory.
+/// Returns a clean path with `.` and `..` resolved, without filesystem access.
+fn resolve_relative_path(base_dir: &str, relative: &str) -> String {
+    let mut segments: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+
+    for part in relative.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+
+    segments.join("/")
+}
+
 // ============================================================================
 // Analytics Staleness
 // ============================================================================
@@ -1842,6 +1860,20 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         parsed: &ParsedFile,
         project_id: Option<Uuid>,
     ) -> Result<()> {
+        self.store_parsed_file_for_project_with_ctx(parsed, project_id, None)
+            .await
+    }
+
+    /// Store a parsed file in Neo4j with optional ImportResolutionContext.
+    ///
+    /// When ctx is provided, uses SuffixIndex for O(1) import resolution
+    /// instead of filesystem lookups.
+    async fn store_parsed_file_for_project_with_ctx(
+        &self,
+        parsed: &ParsedFile,
+        project_id: Option<Uuid>,
+        mut ctx: Option<&mut crate::resolver::ImportResolutionContext>,
+    ) -> Result<()> {
         // Store file node (path already normalized in sync_file_for_project)
         let file_node = FileNode {
             path: normalize_path(&parsed.path),
@@ -1880,8 +1912,15 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let mut symbol_rels: Vec<(String, String, Option<Uuid>)> = Vec::new();
         for import in &parsed.imports {
             // Resolve imports to file paths (language-aware)
-            let resolved_files =
-                self.resolve_imports_for_language(import, &parsed.path, &parsed.language);
+            let resolved_files = match ctx {
+                Some(ref mut c) => self.resolve_imports_for_language_with_ctx(
+                    import,
+                    &parsed.path,
+                    &parsed.language,
+                    Some(&mut *c),
+                ),
+                None => self.resolve_imports_for_language(import, &parsed.path, &parsed.language),
+            };
             for target_file in &resolved_files {
                 import_rels.push((
                     parsed.path.clone(),
@@ -2461,25 +2500,316 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         None
     }
 
-    /// Resolve import paths to file paths based on language
+    /// Resolve import paths to file paths based on language.
+    ///
+    /// When a resolution context is provided, uses SuffixIndex for O(1) lookups
+    /// and caches results. Falls back to filesystem-based resolution otherwise.
     fn resolve_imports_for_language(
         &self,
         import: &ImportNode,
         parsed_path: &str,
         language: &str,
     ) -> Vec<String> {
-        match language {
-            "rust" => self.resolve_rust_imports(&import.path, parsed_path),
-            "typescript" | "javascript" | "tsx" | "jsx" => self
-                .resolve_typescript_import(&import.path, parsed_path)
-                .into_iter()
-                .collect(),
-            "python" => self
-                .resolve_python_import(&import.path, parsed_path)
-                .into_iter()
-                .collect(),
-            _ => Vec::new(),
+        self.resolve_imports_for_language_with_ctx(import, parsed_path, language, None)
+    }
+
+    /// Resolve import paths using optional ImportResolutionContext.
+    fn resolve_imports_for_language_with_ctx(
+        &self,
+        import: &ImportNode,
+        parsed_path: &str,
+        language: &str,
+        ctx: Option<&mut crate::resolver::ImportResolutionContext>,
+    ) -> Vec<String> {
+        match ctx {
+            Some(ctx) => {
+                // Check cache first
+                if let Some(cached) = ctx.resolve_cache.get(parsed_path, &import.path) {
+                    return cached.into_iter().cloned().collect();
+                }
+
+                let result = match language {
+                    "rust" => Self::resolve_rust_imports_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
+                    "typescript" | "javascript" | "tsx" | "jsx" => {
+                        Self::resolve_typescript_import_indexed(
+                            &import.path,
+                            parsed_path,
+                            &ctx.suffix_index,
+                        )
+                        .into_iter()
+                        .collect()
+                    }
+                    "python" => Self::resolve_python_import_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    )
+                    .into_iter()
+                    .collect(),
+                    _ => Vec::new(),
+                };
+
+                // Cache the result (store first resolved path or None)
+                let cache_value = result.first().cloned();
+                ctx.resolve_cache.insert(
+                    parsed_path.to_string(),
+                    import.path.clone(),
+                    cache_value,
+                );
+
+                result
+            }
+            None => {
+                // Legacy fallback: filesystem-based resolution
+                match language {
+                    "rust" => self.resolve_rust_imports(&import.path, parsed_path),
+                    "typescript" | "javascript" | "tsx" | "jsx" => self
+                        .resolve_typescript_import(&import.path, parsed_path)
+                        .into_iter()
+                        .collect(),
+                    "python" => self
+                        .resolve_python_import(&import.path, parsed_path)
+                        .into_iter()
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            }
         }
+    }
+
+    // ========================================================================
+    // SuffixIndex-based resolvers (O(1) lookups, no filesystem access)
+    // ========================================================================
+
+    /// Resolve Rust imports using SuffixIndex (no filesystem access).
+    fn resolve_rust_imports_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let paths = Self::flatten_grouped_import(import_path);
+        let mut resolved = Vec::new();
+
+        for path in paths {
+            if let Some(file) = Self::resolve_single_rust_import_indexed(&path, source_file, index)
+            {
+                if !resolved.contains(&file) {
+                    resolved.push(file);
+                }
+            }
+        }
+
+        resolved
+    }
+
+    /// Resolve a single Rust import using SuffixIndex.
+    fn resolve_single_rust_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Option<String> {
+        let path: Vec<&str> = import_path.split("::").collect();
+        if path.is_empty() {
+            return None;
+        }
+
+        let first = path[0];
+
+        // External crates — skip
+        if !matches!(first, "crate" | "super" | "self") {
+            return None;
+        }
+
+        match first {
+            "crate" => {
+                if path.len() < 2 {
+                    return None;
+                }
+                // Try full path first (import might target a file directly)
+                // e.g., crate::neo4j::client → neo4j/client.rs
+                let full_path = path[1..].join("/");
+                let rs_suffix = format!("{}.rs", full_path);
+                if let Some(resolved) = index.get(&rs_suffix) {
+                    return Some(resolved.to_string());
+                }
+                let mod_suffix = format!("{}/mod.rs", full_path);
+                if let Some(resolved) = index.get(&mod_suffix) {
+                    return Some(resolved.to_string());
+                }
+                // Fallback: strip last segment (it's likely a type/function name)
+                // e.g., crate::neo4j::client::Client → neo4j/client.rs
+                let module_path = &path[1..path.len().saturating_sub(1)];
+                if !module_path.is_empty() {
+                    let suffix = module_path.join("/");
+                    let rs_suffix = format!("{}.rs", suffix);
+                    if let Some(resolved) = index.get(&rs_suffix) {
+                        return Some(resolved.to_string());
+                    }
+                    let mod_suffix = format!("{}/mod.rs", suffix);
+                    if let Some(resolved) = index.get(&mod_suffix) {
+                        return Some(resolved.to_string());
+                    }
+                }
+                None
+            }
+            "super" | "self" => {
+                // For super/self, we need the source file's directory context
+                let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir)?;
+                let mut segments: Vec<&str> = source_dir.split('/').collect();
+
+                let start = if first == "self" { 1 } else { 0 };
+                for &part in &path[start..] {
+                    if part == "super" {
+                        segments.pop()?;
+                    } else {
+                        segments.push(part);
+                    }
+                }
+
+                // Try full path first (import might target a file directly)
+                let suffix = segments.join("/");
+                let rs_suffix = format!("{}.rs", suffix);
+                if let Some(resolved) = index.get(&rs_suffix) {
+                    return Some(resolved.to_string());
+                }
+                let mod_suffix = format!("{}/mod.rs", suffix);
+                if let Some(resolved) = index.get(&mod_suffix) {
+                    return Some(resolved.to_string());
+                }
+
+                // Fallback: strip last segment (likely a type name)
+                if segments.len() > 1 {
+                    let try_without_last: Vec<&str> =
+                        segments[..segments.len().saturating_sub(1)].to_vec();
+                    let suffix = try_without_last.join("/");
+                    let rs_suffix = format!("{}.rs", suffix);
+                    if let Some(resolved) = index.get(&rs_suffix) {
+                        return Some(resolved.to_string());
+                    }
+                    let mod_suffix = format!("{}/mod.rs", suffix);
+                    if let Some(resolved) = index.get(&mod_suffix) {
+                        return Some(resolved.to_string());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve TypeScript/JavaScript import using SuffixIndex.
+    fn resolve_typescript_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Option<String> {
+        // Only resolve relative imports and @/ aliases
+        if !import_path.starts_with('.') && !import_path.starts_with('@') {
+            return None; // npm package — skip
+        }
+
+        if import_path.starts_with('.') {
+            // Relative import: resolve against source directory
+            let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            let target = resolve_relative_path(source_dir, import_path);
+
+            // Try extensions
+            let extensions = ["ts", "tsx", "js", "jsx"];
+            for ext in &extensions {
+                let with_ext = format!("{}.{}", target, ext);
+                if let Some(resolved) = index.get(&with_ext) {
+                    return Some(resolved.to_string());
+                }
+            }
+
+            // Try index files
+            let index_files = ["index.ts", "index.tsx", "index.js", "index.jsx"];
+            for idx in &index_files {
+                let index_path = format!("{}/{}", target, idx);
+                if let Some(resolved) = index.get(&index_path) {
+                    return Some(resolved.to_string());
+                }
+            }
+        } else if import_path.starts_with("@/") {
+            // @/ alias — try src/ prefix
+            let after_alias = &import_path[2..];
+            let target = format!("src/{}", after_alias);
+
+            let extensions = ["ts", "tsx", "js", "jsx"];
+            for ext in &extensions {
+                let with_ext = format!("{}.{}", target, ext);
+                if let Some(resolved) = index.get(&with_ext) {
+                    return Some(resolved.to_string());
+                }
+            }
+
+            let index_files = ["index.ts", "index.tsx", "index.js", "index.jsx"];
+            for idx in &index_files {
+                let index_path = format!("{}/{}", target, idx);
+                if let Some(resolved) = index.get(&index_path) {
+                    return Some(resolved.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Resolve Python import using SuffixIndex.
+    fn resolve_python_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Option<String> {
+        if import_path.starts_with('.') {
+            // Relative import
+            let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            let dots = import_path.chars().take_while(|c| *c == '.').count();
+            let module_part = &import_path[dots..];
+
+            // Navigate up for each extra dot
+            let mut segments: Vec<&str> = source_dir.split('/').collect();
+            for _ in 1..dots {
+                segments.pop();
+            }
+
+            if !module_part.is_empty() {
+                for part in module_part.split('.') {
+                    segments.push(part);
+                }
+            }
+
+            let suffix = segments.join("/");
+
+            // Try module.py
+            let py_suffix = format!("{}.py", suffix);
+            if let Some(resolved) = index.get(&py_suffix) {
+                return Some(resolved.to_string());
+            }
+            // Try module/__init__.py
+            let init_suffix = format!("{}/__init__.py", suffix);
+            if let Some(resolved) = index.get(&init_suffix) {
+                return Some(resolved.to_string());
+            }
+        } else {
+            // Absolute import — convert dots to path
+            let suffix = import_path.replace('.', "/");
+
+            let py_suffix = format!("{}.py", suffix);
+            if let Some(resolved) = index.get(&py_suffix) {
+                return Some(resolved.to_string());
+            }
+            let init_suffix = format!("{}/__init__.py", suffix);
+            if let Some(resolved) = index.get(&init_suffix) {
+                return Some(resolved.to_string());
+            }
+        }
+
+        None
     }
 
     // ========================================================================
@@ -5220,5 +5550,218 @@ mod tests {
             "Should backfill some commits"
         );
         assert!(result.elapsed_ms > 0 || result.commits_parsed > 0);
+    }
+
+    // =====================================================================
+    // SuffixIndex-based resolver tests
+    // =====================================================================
+
+    #[test]
+    fn test_resolve_rust_import_indexed_crate() {
+        let paths = vec![
+            "src/neo4j/client.rs".to_string(),
+            "src/neo4j/mod.rs".to_string(),
+            "src/parser/mod.rs".to_string(),
+            "src/parser/helpers.rs".to_string(),
+            "src/lib.rs".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // crate::neo4j::client → src/neo4j/client.rs
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "crate::neo4j::client",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, Some("src/neo4j/client.rs".to_string()));
+
+        // crate::parser::helpers → src/parser/helpers.rs
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "crate::parser::helpers",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, Some("src/parser/helpers.rs".to_string()));
+
+        // crate::parser (module) → src/parser/mod.rs
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "crate::parser",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, Some("src/parser/mod.rs".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_rust_import_indexed_crate_with_type() {
+        let paths = vec![
+            "src/neo4j/client.rs".to_string(),
+            "src/neo4j/models.rs".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // crate::neo4j::models::FunctionNode → src/neo4j/models.rs (strip type name)
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "crate::neo4j::models::FunctionNode",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, Some("src/neo4j/models.rs".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_rust_import_indexed_external_skip() {
+        let paths = vec!["src/main.rs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // External crate — should return None
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "serde::Serialize",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_typescript_import_indexed_relative() {
+        let paths = vec![
+            "src/components/Button.tsx".to_string(),
+            "src/components/index.ts".to_string(),
+            "src/utils/helpers.ts".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // ./Button from src/components/App.tsx
+        let result = Orchestrator::resolve_typescript_import_indexed(
+            "./Button",
+            "src/components/App.tsx",
+            &index,
+        );
+        assert_eq!(result, Some("src/components/Button.tsx".to_string()));
+
+        // ../utils/helpers from src/components/App.tsx
+        let result = Orchestrator::resolve_typescript_import_indexed(
+            "../utils/helpers",
+            "src/components/App.tsx",
+            &index,
+        );
+        assert_eq!(result, Some("src/utils/helpers.ts".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_typescript_import_indexed_alias() {
+        let paths = vec![
+            "src/components/Button.tsx".to_string(),
+            "src/utils/helpers.ts".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // @/components/Button
+        let result = Orchestrator::resolve_typescript_import_indexed(
+            "@/components/Button",
+            "src/pages/Home.tsx",
+            &index,
+        );
+        assert_eq!(result, Some("src/components/Button.tsx".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_typescript_import_indexed_npm_skip() {
+        let paths = vec!["src/main.ts".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // npm package — should return None
+        let result = Orchestrator::resolve_typescript_import_indexed(
+            "react",
+            "src/main.ts",
+            &index,
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_python_import_indexed_relative() {
+        let paths = vec![
+            "src/models/user.py".to_string(),
+            "src/models/__init__.py".to_string(),
+            "src/utils/helpers.py".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // .models from src/app.py (1 dot = same directory)
+        let result = Orchestrator::resolve_python_import_indexed(
+            ".models",
+            "src/app.py",
+            &index,
+        );
+        assert_eq!(result, Some("src/models/__init__.py".to_string()));
+
+        // .utils.helpers from src/app.py
+        let result = Orchestrator::resolve_python_import_indexed(
+            ".utils.helpers",
+            "src/app.py",
+            &index,
+        );
+        assert_eq!(result, Some("src/utils/helpers.py".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_python_import_indexed_absolute() {
+        let paths = vec![
+            "mypackage/models/user.py".to_string(),
+            "mypackage/__init__.py".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // mypackage.models.user
+        let result = Orchestrator::resolve_python_import_indexed(
+            "mypackage.models.user",
+            "mypackage/app.py",
+            &index,
+        );
+        assert_eq!(result, Some("mypackage/models/user.py".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_relative_path_helper() {
+        assert_eq!(
+            super::resolve_relative_path("src/components", "./Button"),
+            "src/components/Button"
+        );
+        assert_eq!(
+            super::resolve_relative_path("src/components", "../utils/helpers"),
+            "src/utils/helpers"
+        );
+        assert_eq!(
+            super::resolve_relative_path("src/a/b/c", "../../x"),
+            "src/a/x"
+        );
+    }
+
+    #[test]
+    fn test_import_resolution_context() {
+        let paths = vec![
+            "src/api/handlers.rs".to_string(),
+            "src/neo4j/client.rs".to_string(),
+        ];
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&paths);
+
+        // Cache miss
+        assert!(ctx.resolve_cache.get("src/main.rs", "crate::api::handlers").is_none());
+
+        // Insert + hit
+        ctx.resolve_cache.insert(
+            "src/main.rs".to_string(),
+            "crate::api::handlers".to_string(),
+            Some("src/api/handlers.rs".to_string()),
+        );
+        assert!(ctx.resolve_cache.get("src/main.rs", "crate::api::handlers").is_some());
+
+        // SuffixIndex works
+        assert_eq!(
+            ctx.suffix_index.get("handlers.rs"),
+            Some("src/api/handlers.rs")
+        );
     }
 }
