@@ -2944,6 +2944,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         &import.path,
                         &ctx.suffix_index,
                     ),
+                    "zig" => Self::resolve_zig_import_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3615,6 +3620,48 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let suffix_kts = format!("{}.kts", parts.join("/"));
         if let Some(resolved) = index.get(&suffix_kts) {
             return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Zig @import using SuffixIndex.
+    ///
+    /// Zig imports are simple: `@import("file.zig")` imports a file relative
+    /// to the source, or `@import("std")` / `@cImport(...)` for stdlib/C interop.
+    fn resolve_zig_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim().trim_matches('"');
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore standard library and C interop
+        if path == "std" || path == "builtin" || path.starts_with("@cImport") {
+            return Vec::new();
+        }
+
+        // Relative path: resolve from source file directory
+        if path.ends_with(".zig") {
+            let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            let candidate = if source_dir.is_empty() {
+                path.to_string()
+            } else {
+                format!("{}/{}", source_dir, path)
+            };
+
+            // Try direct relative resolution via suffix index
+            if let Some(resolved) = index.get(&candidate) {
+                return vec![resolved.to_string()];
+            }
+
+            // Fallback: try suffix-only lookup (basename)
+            if let Some(resolved) = index.get(path) {
+                return vec![resolved.to_string()];
+            }
         }
 
         Vec::new()
@@ -7685,6 +7732,53 @@ mod tests {
         assert!(result.is_empty());
 
         let result = Orchestrator::resolve_kotlin_import_indexed("android.os.Bundle", &index);
+        assert!(result.is_empty());
+    }
+
+    // ── Zig resolver tests ──────────────────────────────────────
+
+    #[test]
+    fn test_resolve_zig_import_local() {
+        let paths = vec![
+            "src/main.zig".to_string(),
+            "src/utils.zig".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_zig_import_indexed("utils.zig", "src/main.zig", &index);
+        assert_eq!(result, vec!["src/utils.zig"]);
+    }
+
+    #[test]
+    fn test_resolve_zig_import_subdirectory() {
+        let paths = vec![
+            "src/main.zig".to_string(),
+            "src/lib/parser.zig".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_zig_import_indexed("lib/parser.zig", "src/main.zig", &index);
+        assert_eq!(result, vec!["src/lib/parser.zig"]);
+    }
+
+    #[test]
+    fn test_resolve_zig_std_ignored() {
+        let paths = vec!["src/main.zig".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_zig_import_indexed("std", "src/main.zig", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_zig_import_indexed("builtin", "src/main.zig", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_zig_nonexistent() {
+        let paths = vec!["src/main.zig".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_zig_import_indexed("nonexistent.zig", "src/main.zig", &index);
         assert!(result.is_empty());
     }
 
