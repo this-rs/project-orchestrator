@@ -1216,10 +1216,7 @@ mod tests {
 
         let result = rx.recv().await;
         assert!(
-            matches!(
-                result,
-                Err(broadcast::error::RecvError::Closed)
-            ),
+            matches!(result, Err(broadcast::error::RecvError::Closed)),
             "Expected RecvError::Closed after sender is dropped, got: {:?}",
             result
         );
@@ -1250,7 +1247,10 @@ mod tests {
 
         // Phase 2: Simulate event_rx = None (dormant state)
         let mut event_rx: Option<broadcast::Receiver<ChatEvent>> = None;
-        assert!(event_rx.is_none(), "Should be None after dormant transition");
+        assert!(
+            event_rx.is_none(),
+            "Should be None after dormant transition"
+        );
 
         // Phase 3: Simulate resume_session() creating a new broadcast channel
         let (tx2, rx2) = broadcast::channel::<ChatEvent>(16);
@@ -1297,7 +1297,10 @@ mod tests {
             }
         };
 
-        assert_eq!(result, "user_message", "Should process user message while broadcast is dormant");
+        assert_eq!(
+            result, "user_message",
+            "Should process user message while broadcast is dormant"
+        );
     }
 
     /// Verify that snapshot_fingerprints can be safely cleared after dormant
@@ -1311,7 +1314,10 @@ mod tests {
 
         // Simulate dormant transition: clear fingerprints
         fingerprints.clear();
-        assert!(fingerprints.is_empty(), "Fingerprints should be cleared on dormant");
+        assert!(
+            fingerprints.is_empty(),
+            "Fingerprints should be cleared on dormant"
+        );
 
         // After re-subscribe, new events should NOT be deduped
         let new_fp = "tool_use:abc123".to_string();
@@ -1331,8 +1337,7 @@ mod tests {
         assert!(matches!(msg, WsChatClientMessage::UserMessage { content } if content == "hello"));
 
         // interrupt — should work even if dormant (no-op since no stream)
-        let msg: WsChatClientMessage =
-            serde_json::from_str(r#"{"type":"interrupt"}"#).unwrap();
+        let msg: WsChatClientMessage = serde_json::from_str(r#"{"type":"interrupt"}"#).unwrap();
         assert!(matches!(msg, WsChatClientMessage::Interrupt));
     }
 
@@ -1345,14 +1350,21 @@ mod tests {
         let mut event_rx: Option<broadcast::Receiver<ChatEvent>> = Some(rx1);
 
         // Send an event while active
-        tx1.send(ChatEvent::StreamingStatus { is_streaming: true }).unwrap();
+        tx1.send(ChatEvent::StreamingStatus { is_streaming: true })
+            .unwrap();
         let ev = event_rx.as_mut().unwrap().recv().await.unwrap();
-        assert!(matches!(ev, ChatEvent::StreamingStatus { is_streaming: true }));
+        assert!(matches!(
+            ev,
+            ChatEvent::StreamingStatus { is_streaming: true }
+        ));
 
         // === Phase 2: Idle cleanup (close_session drops tx) ===
         drop(tx1);
         let close_result = event_rx.as_mut().unwrap().recv().await;
-        assert!(matches!(close_result, Err(broadcast::error::RecvError::Closed)));
+        assert!(matches!(
+            close_result,
+            Err(broadcast::error::RecvError::Closed)
+        ));
 
         // Transition to dormant
         event_rx = None;
@@ -1368,8 +1380,16 @@ mod tests {
         event_rx = Some(rx2); // re-subscribe
 
         // === Phase 4: Verify events flow on resumed session ===
-        tx2.send(ChatEvent::StreamingStatus { is_streaming: false }).unwrap();
+        tx2.send(ChatEvent::StreamingStatus {
+            is_streaming: false,
+        })
+        .unwrap();
         let ev = event_rx.as_mut().unwrap().recv().await.unwrap();
-        assert!(matches!(ev, ChatEvent::StreamingStatus { is_streaming: false }));
+        assert!(matches!(
+            ev,
+            ChatEvent::StreamingStatus {
+                is_streaming: false
+            }
+        ));
     }
 }
