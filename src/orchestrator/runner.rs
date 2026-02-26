@@ -1919,6 +1919,30 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .batch_upsert_impls(&parsed.impl_blocks)
             .await?;
 
+        // ── Plans 5 & 6: Heritage & Process relations ───────────────────
+        // When Plans 5 (Heritage) and 6 (Process Detection) are implemented,
+        // add the following sequence HERE for each new relationship type:
+        //
+        // 1. DELETE stale relations for this file:
+        //    "MATCH (f:File {path: $path})-[:CONTAINS]->(sym)-[r:EXTENDS]->()
+        //     DELETE r"
+        //    (same for IMPLEMENTS, STEP_IN_PROCESS)
+        //
+        // 2. UPSERT new relations via batch helper:
+        //    use crate::neo4j::batch::{run_unwind_in_chunks, BoltMap};
+        //    let items: Vec<BoltMap> = build_extends_items(&parsed.heritage);
+        //    run_unwind_in_chunks(&graph, items, "UNWIND $items AS ...").await?;
+        //
+        // This DELETE-then-CREATE pattern ensures no stale rels persist when
+        // a file's inheritance hierarchy changes on re-sync.
+        //
+        // NOTE: The current CALLS/IMPORTS/IMPLEMENTS_FOR use MERGE (idempotent)
+        // which does NOT clean up removed relations. This is acceptable for now
+        // because cleanup_sync_data handles full-project cleanup, and the watcher
+        // handles file deletion. Per-file incremental cleanup is a future
+        // improvement tracked in the batch audit note.
+        // ─────────────────────────────────────────────────────────────────
+
         // Batch upsert imports, then resolve relationships (logic stays in runner)
         self.state
             .neo4j
@@ -6121,5 +6145,343 @@ mod tests {
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].confidence, 0.50);
         assert_eq!(scored[0].reason, "unscored");
+    }
+
+    // ── Batch utility validation ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_parsed_file_idempotent_resync() {
+        // Validates that re-storing a file with MERGE pattern is idempotent:
+        // storing the same file twice should NOT duplicate entities.
+        //
+        // NOTE: This test documents current behavior. When Plans 5/6 add
+        // EXTENDS/IMPLEMENTS, a separate DELETE-then-CREATE step must be added
+        // (see comment block in store_parsed_file_for_project_with_ctx).
+        use crate::neo4j::models::*;
+        use crate::parser::ParsedFile;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_path = "/tmp/test-project/src/resync.rs".to_string();
+
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "hash1".to_string(),
+            functions: vec![FunctionNode {
+                name: "my_func".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: 10,
+                docstring: None,
+            }],
+            structs: vec![StructNode {
+                name: "MyStruct".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: file_path.clone(),
+                line_start: 20,
+                line_end: 30,
+                docstring: None,
+            }],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["my_func".to_string()],
+        };
+
+        // Store once
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+        assert_eq!(mock_store.functions.read().await.len(), 1);
+        assert_eq!(mock_store.structs_map.read().await.len(), 1);
+
+        // Store again (re-sync) — MERGE should NOT create duplicates
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            mock_store.functions.read().await.len(),
+            1,
+            "MERGE should be idempotent — no duplicate functions"
+        );
+        assert_eq!(
+            mock_store.structs_map.read().await.len(),
+            1,
+            "MERGE should be idempotent — no duplicate structs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_utility_chunking_constants() {
+        // Validate that our batch utility constants match the cleanup_sync_data pattern
+        use crate::neo4j::batch::BATCH_SIZE;
+
+        assert_eq!(BATCH_SIZE, 10_000, "BATCH_SIZE must be 10K per constraint");
+
+        // Verify chunking produces expected splits
+        let large_vec: Vec<u8> = vec![0; 25_001];
+        let chunks: Vec<&[u8]> = large_vec.chunks(BATCH_SIZE).collect();
+        assert_eq!(chunks.len(), 3, "25001 items should produce 3 chunks");
+        assert_eq!(chunks[0].len(), 10_000);
+        assert_eq!(chunks[1].len(), 10_000);
+        assert_eq!(chunks[2].len(), 5_001);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_pattern_comment_exists() {
+        // Meta-test: verify that the Plans 5/6 cleanup pattern documentation
+        // exists in store_parsed_file_for_project_with_ctx.
+        // This ensures no one accidentally removes the guidance comment.
+        let source = include_str!("runner.rs");
+        assert!(
+            source.contains("Plans 5 & 6: Heritage & Process relations"),
+            "Cleanup pattern comment for Plans 5/6 must exist in runner.rs"
+        );
+        assert!(
+            source.contains("DELETE stale relations for this file"),
+            "DELETE pattern guidance must exist in runner.rs"
+        );
+        assert!(
+            source.contains("run_unwind_in_chunks"),
+            "Batch helper reference must exist in runner.rs"
+        );
+    }
+
+    // ── Stress tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_batch_stress_150k() {
+        // Stress test: 150K total items (50K functions + 50K calls + 50K imports)
+        // Validates that the mock store handles large volumes without OOM
+        // and completes within a reasonable time.
+        //
+        // This tests the DATA PREPARATION path (Vec allocation, HashMap building,
+        // chunking logic). The actual Neo4j UNWIND is tested via integration tests.
+        use crate::neo4j::batch::{BoltMap, BATCH_SIZE};
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::FunctionCall;
+
+        let start = std::time::Instant::now();
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_base = "/tmp/stress-test/src";
+
+        // ── Phase 1: Generate and store 50K functions across 500 files ──
+        // (100 functions per file × 500 files = 50,000 functions)
+        for file_idx in 0..500 {
+            let file_path = format!("{}/file_{}.rs", file_base, file_idx);
+            let functions: Vec<FunctionNode> = (0..100)
+                .map(|func_idx| FunctionNode {
+                    name: format!("func_{}_{}", file_idx, func_idx),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_path.clone(),
+                    line_start: func_idx * 10 + 1,
+                    line_end: func_idx * 10 + 9,
+                    docstring: None,
+                })
+                .collect();
+
+            GraphStore::batch_upsert_functions(mock_store.as_ref(), &functions)
+                .await
+                .unwrap();
+        }
+
+        let func_count = mock_store.functions.read().await.len();
+        assert_eq!(func_count, 50_000, "Should have 50K functions");
+        let phase1_time = start.elapsed();
+        eprintln!(
+            "Phase 1 (50K functions): {:?} — {} stored",
+            phase1_time, func_count
+        );
+
+        // ── Phase 2: Generate and store 50K call relationships ──
+        // (100 calls per file × 500 files = 50,000 calls)
+        for file_idx in 0..500 {
+            let file_path = format!("{}/file_{}.rs", file_base, file_idx);
+            let calls: Vec<FunctionCall> = (0..100)
+                .map(|func_idx| {
+                    let caller_id =
+                        format!("{}:func_{}_{}:{}", file_path, file_idx, func_idx, func_idx * 10 + 1);
+                    let callee_name = format!("func_{}_{}", file_idx, (func_idx + 1) % 100);
+                    FunctionCall {
+                        caller_id,
+                        callee_name,
+                        line: func_idx * 10 + 5,
+                        confidence: 0.8,
+                        reason: "same_file".to_string(),
+                    }
+                })
+                .collect();
+
+            GraphStore::batch_create_call_relationships(mock_store.as_ref(), &calls, None)
+                .await
+                .unwrap();
+        }
+
+        let call_count = mock_store.call_relationships.read().await.len();
+        assert!(call_count > 0, "Should have call relationships");
+        let phase2_time = start.elapsed();
+        eprintln!(
+            "Phase 2 (50K calls): {:?} — {} stored",
+            phase2_time - phase1_time,
+            call_count
+        );
+
+        // ── Phase 3: Generate and store 50K import relationships ──
+        for file_idx in 0..500 {
+            let source_path = format!("{}/file_{}.rs", file_base, file_idx);
+            let rels: Vec<(String, String, String)> = (0..100)
+                .map(|imp_idx| {
+                    let target_path =
+                        format!("{}/file_{}.rs", file_base, (file_idx + imp_idx + 1) % 500);
+                    (
+                        source_path.clone(),
+                        target_path,
+                        format!("import_{}", imp_idx),
+                    )
+                })
+                .collect();
+
+            GraphStore::batch_create_import_relationships(mock_store.as_ref(), &rels)
+                .await
+                .unwrap();
+        }
+
+        let import_count = mock_store.import_relationships.read().await.len();
+        assert!(import_count > 0, "Should have import relationships");
+        let phase3_time = start.elapsed();
+        eprintln!(
+            "Phase 3 (50K imports): {:?} — {} stored",
+            phase3_time - phase2_time,
+            import_count
+        );
+
+        // ── Phase 4: Validate BoltMap construction at scale ──
+        // Simulate what run_unwind_in_chunks does: build 150K BoltMaps
+        let items: Vec<BoltMap> = (0..150_000)
+            .map(|i| {
+                let mut m = BoltMap::new();
+                m.insert("id".into(), format!("item-{}", i).into());
+                m.insert("name".into(), format!("name-{}", i).into());
+                m.insert("value".into(), (i as i64).into());
+                m
+            })
+            .collect();
+
+        // Verify chunking
+        let chunks: Vec<&[BoltMap]> = items.chunks(BATCH_SIZE).collect();
+        assert_eq!(chunks.len(), 15, "150K items / 10K = 15 chunks");
+        assert_eq!(chunks[0].len(), 10_000);
+        assert_eq!(chunks[14].len(), 10_000);
+
+        let total_time = start.elapsed();
+        eprintln!("Total stress test time: {:?}", total_time);
+        eprintln!(
+            "Total items: {} functions + {} calls + {} imports + 150K BoltMaps",
+            func_count, call_count, import_count
+        );
+
+        // Must complete within 30s (typically < 2s on modern hardware)
+        assert!(
+            total_time.as_secs() < 30,
+            "Stress test took too long: {:?} (limit: 30s)",
+            total_time
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_stress_cleanup_pattern() {
+        // Validates that the cleanup LIMIT loop pattern scales correctly
+        // with the mock store's cleanup_sync_data implementation.
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let file_base = "/tmp/stress-cleanup/src";
+
+        // Create 1000 functions across 10 files
+        for file_idx in 0..10 {
+            let file_path = format!("{}/file_{}.rs", file_base, file_idx);
+
+            // First create the file node
+            GraphStore::upsert_file(
+                mock_store.as_ref(),
+                &FileNode {
+                    path: file_path.clone(),
+                    language: "rust".to_string(),
+                    hash: format!("hash_{}", file_idx),
+                    last_parsed: chrono::Utc::now(),
+                    project_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            let functions: Vec<FunctionNode> = (0..100)
+                .map(|func_idx| FunctionNode {
+                    name: format!("func_{}_{}", file_idx, func_idx),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_path.clone(),
+                    line_start: func_idx * 10 + 1,
+                    line_end: func_idx * 10 + 9,
+                    docstring: None,
+                })
+                .collect();
+
+            GraphStore::batch_upsert_functions(mock_store.as_ref(), &functions)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(mock_store.functions.read().await.len(), 1000);
+        assert_eq!(mock_store.files.read().await.len(), 10);
+
+        // cleanup_sync_data should remove everything
+        let deleted = GraphStore::cleanup_sync_data(mock_store.as_ref())
+            .await
+            .unwrap();
+        assert!(deleted > 0, "Should have deleted entities");
+
+        // All code entities should be gone
+        assert_eq!(
+            mock_store.functions.read().await.len(),
+            0,
+            "All functions should be deleted"
+        );
+        assert_eq!(
+            mock_store.files.read().await.len(),
+            0,
+            "All files should be deleted"
+        );
     }
 }

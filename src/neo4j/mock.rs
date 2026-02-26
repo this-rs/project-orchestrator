@@ -1533,6 +1533,7 @@ impl GraphStore for MockGraphStore {
 
     async fn cleanup_sync_data(&self) -> Result<i64> {
         let mut total = 0i64;
+        total += self.files.write().await.drain().count() as i64;
         total += self.functions.write().await.drain().count() as i64;
         total += self.structs_map.write().await.drain().count() as i64;
         total += self.traits_map.write().await.drain().count() as i64;

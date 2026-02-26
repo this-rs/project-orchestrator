@@ -1,6 +1,7 @@
 //! Neo4j client and models for the knowledge graph
 
 mod analytics;
+pub(crate) mod batch;
 mod chat;
 pub mod client;
 mod code;
