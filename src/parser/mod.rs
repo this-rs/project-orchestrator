@@ -723,6 +723,48 @@ class Standalone {
     }
 
     #[test]
+    fn test_parse_java_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+public class Animal {
+    String name;
+}
+
+public class Dog extends Animal {
+    String breed;
+}
+
+public class GuideDog extends Dog implements Serializable, Comparable<GuideDog> {
+    String handler;
+}
+
+public class Standalone {
+    int value;
+}
+"#;
+        let path = PathBuf::from("Test.java");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.structs.len(), 4);
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert!(guide.interfaces.len() >= 2, "expected at least 2 interfaces: {:?}", guide.interfaces);
+
+        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
     fn test_parse_typescript_file() {
         let mut parser = CodeParser::new().unwrap();
         let content = r#"
@@ -740,6 +782,189 @@ interface Config {
 
         let parsed = result.unwrap();
         assert_eq!(parsed.language, "typescript");
+    }
+
+    #[test]
+    fn test_parse_typescript_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal {
+    name: string;
+}
+
+class Dog extends Animal {
+    breed: string;
+}
+
+class GuideDog extends Dog implements Serializable, Comparable {
+    handler: string;
+}
+
+class Standalone {
+    value: number;
+}
+"#;
+        let path = PathBuf::from("test_inheritance.ts");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        assert_eq!(parsed.structs.len(), 4);
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert!(guide.interfaces.len() >= 2, "expected at least 2 interfaces: {:?}", guide.interfaces);
+
+        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_cpp_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal {
+public:
+    string name;
+};
+
+class Dog : public Animal {
+public:
+    string breed;
+};
+
+class GuideDog : public Dog, public Serializable {
+public:
+    string handler;
+};
+
+class Standalone {
+    int value;
+};
+"#;
+        let path = PathBuf::from("test_inheritance.cpp");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.interfaces.is_empty());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert_eq!(guide.interfaces.len(), 1, "expected 1 interface: {:?}", guide.interfaces);
+
+        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        assert!(standalone.parent_class.is_none());
+        assert!(standalone.interfaces.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ruby_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal
+  attr_accessor :name
+end
+
+class Dog < Animal
+  attr_accessor :breed
+end
+
+class Standalone
+  attr_accessor :value
+end
+"#;
+        let path = PathBuf::from("test_inheritance.rb");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+        assert!(animal.generics.is_empty(), "generics should be empty for Ruby classes");
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.generics.is_empty());
+
+        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        assert!(standalone.parent_class.is_none());
+    }
+
+    #[test]
+    fn test_parse_kotlin_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+open class Animal {
+    var name: String = ""
+}
+
+class Dog : Animal() {
+    var breed: String = ""
+}
+
+class GuideDog : Dog(), Serializable, Comparable<GuideDog> {
+    var handler: String = ""
+}
+
+class Standalone {
+    var value: Int = 0
+}
+"#;
+        let path = PathBuf::from("test_inheritance.kt");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+        assert!(dog.interfaces.is_empty());
+
+        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
+        assert!(guide.interfaces.len() >= 2, "expected at least 2 interfaces: {:?}", guide.interfaces);
+
+        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        assert!(standalone.parent_class.is_none());
+    }
+
+    #[test]
+    fn test_parse_swift_class_inheritance() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+class Animal {
+    var name: String = ""
+}
+
+class Dog: Animal {
+    var breed: String = ""
+}
+
+class Standalone {
+    var value: Int = 0
+}
+"#;
+        let path = PathBuf::from("test_inheritance.swift");
+        let parsed = parser.parse_file(&path, content).unwrap();
+
+        let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+        assert!(animal.parent_class.is_none());
+
+        let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
+
+        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        assert!(standalone.parent_class.is_none());
     }
 
     #[test]

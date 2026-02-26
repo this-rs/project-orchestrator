@@ -157,22 +157,32 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
     let name = get_field_text(node, "name", source)?;
     let docstring = get_ruby_doc(node, source);
 
-    // Extract superclass as generic
-    let generics: Vec<String> = node
+    // Extract superclass — Ruby has single inheritance only (class Foo < Bar)
+    // The superclass node text includes "< ClassName", strip the "<" prefix
+    let parent_class = node
         .child_by_field_name("superclass")
-        .and_then(|s| get_text(&s, source))
-        .map(|s| vec![s.to_string()])
-        .unwrap_or_default();
+        .and_then(|s| {
+            // Try to get the identifier child directly
+            s.children(&mut s.walk())
+                .find(|c| c.kind() == "constant" || c.kind() == "scope_resolution" || c.kind() == "identifier")
+                .and_then(|c| get_text(&c, source).map(|t| t.to_string()))
+                .or_else(|| {
+                    // Fallback: strip "< " from full text
+                    get_text(&s, source)
+                        .map(|t| t.trim_start_matches('<').trim().to_string())
+                })
+        })
+        .filter(|s| !s.is_empty());
 
     Some(StructNode {
         name,
         visibility: Visibility::Public,
-        generics,
+        generics: vec![],
         file_path: file_path.to_string(),
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
-        parent_class: None,
+        parent_class,
         interfaces: vec![],
     })
 }

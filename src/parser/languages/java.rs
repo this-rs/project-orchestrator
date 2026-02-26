@@ -88,6 +88,65 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
     let docstring = get_javadoc(node, source);
     let generics = extract_java_type_params(node, source);
 
+    // Extract parent class from superclass field or child node
+    let parent_class = node
+        .child_by_field_name("superclass")
+        .or_else(|| {
+            node.children(&mut node.walk())
+                .find(|c| c.kind() == "superclass")
+        })
+        .and_then(|sc| {
+            // superclass node contains a type_identifier child
+            sc.children(&mut sc.walk())
+                .find(|c| {
+                    c.kind() == "type_identifier"
+                        || c.kind() == "scoped_type_identifier"
+                        || c.kind() == "generic_type"
+                })
+                .and_then(|c| get_text(&c, source).map(|s| s.to_string()))
+                .or_else(|| {
+                    // Fallback: strip "extends " from full text
+                    get_text(&sc, source)
+                        .map(|s| s.trim_start_matches("extends").trim().to_string())
+                })
+        })
+        .filter(|s| !s.is_empty());
+
+    // Extract interfaces from super_interfaces / class_interface_clause
+    let interfaces: Vec<String> = node
+        .child_by_field_name("interfaces")
+        .or_else(|| {
+            node.children(&mut node.walk())
+                .find(|c| c.kind() == "super_interfaces" || c.kind() == "interfaces")
+        })
+        .map(|clause| {
+            clause
+                .children(&mut clause.walk())
+                .flat_map(|c| {
+                    if c.kind() == "type_list" || c.kind() == "interface_type_list" {
+                        c.children(&mut c.walk())
+                            .filter(|tc| {
+                                tc.kind() == "type_identifier"
+                                    || tc.kind() == "scoped_type_identifier"
+                                    || tc.kind() == "generic_type"
+                            })
+                            .filter_map(|tc| get_text(&tc, source).map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    } else if c.kind() == "type_identifier"
+                        || c.kind() == "scoped_type_identifier"
+                        || c.kind() == "generic_type"
+                    {
+                        get_text(&c, source)
+                            .map(|s| vec![s.to_string()])
+                            .unwrap_or_default()
+                    } else {
+                        vec![]
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(StructNode {
         name,
         visibility,
@@ -96,8 +155,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
-        parent_class: None,
-        interfaces: vec![],
+        parent_class,
+        interfaces,
     })
 }
 

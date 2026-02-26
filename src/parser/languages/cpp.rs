@@ -236,6 +236,35 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
     let docstring = get_cpp_doc(node, source);
     let generics = extract_template_params_from_parent(node, source);
 
+    // Extract base classes from base_class_clause
+    // C++ syntax: class Child : public Parent, private Mixin { ... }
+    // First base class → parent_class, rest → interfaces (mixins)
+    let base_classes: Vec<String> = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "base_class_clause")
+        .map(|clause| {
+            clause
+                .children(&mut clause.walk())
+                .filter_map(|c| {
+                    // Each base specifier may have access_specifier + type_identifier
+                    if c.kind() == "type_identifier" || c.kind() == "scoped_type_identifier"
+                        || c.kind() == "template_type"
+                    {
+                        get_text(&c, source).map(|s| s.to_string())
+                    } else if c.kind() == "base_class_specifier" || c.kind() == "access_specifier" {
+                        // base_class_specifier may contain type_identifier child
+                        None
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let parent_class = base_classes.first().cloned();
+    let interfaces: Vec<String> = base_classes.into_iter().skip(1).collect();
+
     Some(StructNode {
         name,
         visibility: Visibility::Public,
@@ -244,8 +273,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
-        parent_class: None,
-        interfaces: vec![],
+        parent_class,
+        interfaces,
     })
 }
 

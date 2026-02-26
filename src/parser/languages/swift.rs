@@ -128,11 +128,29 @@ fn extract_function(
     })
 }
 
+/// Extract heritage from Swift class/struct declarations.
+/// tree-sitter-swift places `inheritance_specifier` nodes as direct children
+/// of the class_declaration, without a wrapping `type_inheritance_clause`.
+fn extract_swift_heritage(node: &tree_sitter::Node, source: &str) -> (Option<String>, Vec<String>) {
+    let supertypes: Vec<String> = node
+        .children(&mut node.walk())
+        .filter(|c| c.kind() == "inheritance_specifier")
+        .filter_map(|c| get_text(&c, source).map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let parent_class = supertypes.first().cloned();
+    let interfaces: Vec<String> = supertypes.into_iter().skip(1).collect();
+    (parent_class, interfaces)
+}
+
 fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<StructNode> {
     let name = get_field_text(node, "name", source)?;
     let visibility = get_swift_visibility(node, source);
     let docstring = get_swift_doc(node, source);
     let generics = extract_swift_generics(node, source);
+
+    let (parent_class, interfaces) = extract_swift_heritage(node, source);
 
     Some(StructNode {
         name,
@@ -142,8 +160,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
-        parent_class: None,
-        interfaces: vec![],
+        parent_class,
+        interfaces,
     })
 }
 
@@ -152,6 +170,7 @@ fn extract_struct(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
     let visibility = get_swift_visibility(node, source);
     let docstring = get_swift_doc(node, source);
     let generics = extract_swift_generics(node, source);
+    let (parent_class, interfaces) = extract_swift_heritage(node, source);
 
     Some(StructNode {
         name,
@@ -161,8 +180,8 @@ fn extract_struct(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
-        parent_class: None,
-        interfaces: vec![],
+        parent_class,
+        interfaces,
     })
 }
 

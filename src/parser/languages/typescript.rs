@@ -147,6 +147,82 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
     let generics = extract_ts_type_parameters(node, source);
     let visibility = get_ts_visibility(node, source);
 
+    // Extract heritage: class_heritage contains extends_clause and/or implements_clause
+    let mut parent_class: Option<String> = None;
+    let mut interfaces: Vec<String> = Vec::new();
+
+    // Try class_heritage child (TS grammar) or direct extends/implements children
+    let heritage_nodes: Vec<tree_sitter::Node> = node
+        .children(&mut node.walk())
+        .filter(|c| {
+            matches!(
+                c.kind(),
+                "class_heritage" | "extends_clause" | "implements_clause"
+            )
+        })
+        .collect();
+
+    for heritage in &heritage_nodes {
+        match heritage.kind() {
+            "class_heritage" => {
+                // class_heritage contains extends_clause and/or implements_clause children
+                for clause in heritage.children(&mut heritage.walk()) {
+                    match clause.kind() {
+                        "extends_clause" => {
+                            // First type_identifier after "extends" keyword
+                            parent_class = clause
+                                .children(&mut clause.walk())
+                                .find(|c| {
+                                    c.kind() == "identifier"
+                                        || c.kind() == "type_identifier"
+                                        || c.kind() == "member_expression"
+                                        || c.kind() == "generic_type"
+                                        || c.kind() == "nested_identifier"
+                                })
+                                .and_then(|c| get_text(&c, source).map(|s| s.to_string()));
+                        }
+                        "implements_clause" => {
+                            interfaces = clause
+                                .children(&mut clause.walk())
+                                .filter(|c| {
+                                    c.kind() == "identifier"
+                                        || c.kind() == "type_identifier"
+                                        || c.kind() == "generic_type"
+                                        || c.kind() == "nested_identifier"
+                                })
+                                .filter_map(|c| get_text(&c, source).map(|s| s.to_string()))
+                                .collect();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "extends_clause" => {
+                parent_class = heritage
+                    .children(&mut heritage.walk())
+                    .find(|c| {
+                        c.kind() == "identifier"
+                            || c.kind() == "type_identifier"
+                            || c.kind() == "member_expression"
+                            || c.kind() == "generic_type"
+                    })
+                    .and_then(|c| get_text(&c, source).map(|s| s.to_string()));
+            }
+            "implements_clause" => {
+                interfaces = heritage
+                    .children(&mut heritage.walk())
+                    .filter(|c| {
+                        c.kind() == "identifier"
+                            || c.kind() == "type_identifier"
+                            || c.kind() == "generic_type"
+                    })
+                    .filter_map(|c| get_text(&c, source).map(|s| s.to_string()))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+
     Some(StructNode {
         name,
         visibility,
@@ -155,8 +231,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
-        parent_class: None,
-        interfaces: vec![],
+        parent_class,
+        interfaces,
     })
 }
 
