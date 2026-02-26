@@ -57,6 +57,9 @@ thiserror = "2.0"
 petgraph = "0.7"
 rustworkx-core = "0.16"
 
+# LRU cache (for resolver)
+lru = "0.12"
+
 # Utilities
 uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

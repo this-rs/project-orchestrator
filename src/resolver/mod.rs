@@ -6,8 +6,10 @@
 //! - `SymbolTable`: dual-index symbol resolution (by name and by file)
 //! - `ResolveCache`: LRU cache for resolved imports
 
+pub mod resolve_cache;
 pub mod suffix_index;
 pub mod symbol_table;
 
+pub use resolve_cache::ResolveCache;
 pub use suffix_index::SuffixIndex;
 pub use symbol_table::SymbolTable;
