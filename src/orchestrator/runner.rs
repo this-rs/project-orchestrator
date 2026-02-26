@@ -4888,4 +4888,147 @@ mod tests {
         let text = Orchestrator::build_function_embedding_text(&func);
         assert_eq!(text, "main()");
     }
+
+    // ================================================================
+    // Knowledge Fabric — git_log_touched_files parser + backfill tests
+    // ================================================================
+
+    #[test]
+    fn test_git_file_change_struct() {
+        let change = GitFileChange {
+            path: "src/main.rs".to_string(),
+            additions: Some(10),
+            deletions: Some(3),
+        };
+        assert_eq!(change.path, "src/main.rs");
+        assert_eq!(change.additions, Some(10));
+        assert_eq!(change.deletions, Some(3));
+    }
+
+    #[test]
+    fn test_git_file_change_binary() {
+        // Binary files have None for additions/deletions ("-\t-\tpath")
+        let change = GitFileChange {
+            path: "assets/logo.png".to_string(),
+            additions: None,
+            deletions: None,
+        };
+        assert!(change.additions.is_none());
+        assert!(change.deletions.is_none());
+    }
+
+    #[test]
+    fn test_git_commit_files_struct() {
+        let commit = GitCommitFiles {
+            hash: "abc123def456".to_string(),
+            message: "fix: resolve auth bug".to_string(),
+            author: "Test Author".to_string(),
+            timestamp: chrono::Utc::now(),
+            files: vec![
+                GitFileChange {
+                    path: "src/auth.rs".to_string(),
+                    additions: Some(5),
+                    deletions: Some(2),
+                },
+                GitFileChange {
+                    path: "src/tests.rs".to_string(),
+                    additions: Some(20),
+                    deletions: Some(0),
+                },
+            ],
+        };
+        assert_eq!(commit.hash, "abc123def456");
+        assert_eq!(commit.files.len(), 2);
+        assert_eq!(commit.files[0].additions, Some(5));
+        assert_eq!(commit.files[1].path, "src/tests.rs");
+    }
+
+    #[test]
+    fn test_backfill_result_struct() {
+        let result = BackfillResult {
+            commits_parsed: 100,
+            commits_backfilled: 95,
+            touches_created: 450,
+            elapsed_ms: 1234,
+        };
+        assert_eq!(result.commits_parsed, 100);
+        assert_eq!(result.commits_backfilled, 95);
+        assert_eq!(result.touches_created, 450);
+        assert_eq!(result.elapsed_ms, 1234);
+    }
+
+    #[test]
+    fn test_git_log_touched_files_on_this_repo() {
+        // This test runs on the actual project repo — should always work in CI
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let commits = Orchestrator::git_log_touched_files(&root, 5).unwrap();
+
+        // Should have at most 5 commits (max_commits=5)
+        assert!(
+            commits.len() <= 5,
+            "Expected <=5 commits, got {}",
+            commits.len()
+        );
+
+        // Each commit should have a non-empty hash and author
+        for c in &commits {
+            assert!(!c.hash.is_empty(), "Commit hash should not be empty");
+            assert!(!c.author.is_empty(), "Author should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_git_log_touched_files_has_file_stats() {
+        // Parse 3 commits from the actual repo and check file stats
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let commits = Orchestrator::git_log_touched_files(&root, 3).unwrap();
+
+        if !commits.is_empty() {
+            // At least one commit should have files
+            let has_files = commits.iter().any(|c| !c.files.is_empty());
+            assert!(has_files, "At least one commit should have touched files");
+
+            // Check that file paths are relative (no leading /)
+            for c in &commits {
+                for f in &c.files {
+                    assert!(
+                        !f.path.starts_with('/'),
+                        "git log should return relative paths, got: {}",
+                        f.path
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_git_log_touched_files_invalid_dir() {
+        let result = Orchestrator::git_log_touched_files(
+            std::path::Path::new("/tmp/nonexistent_dir_12345"),
+            5,
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_backfill_commit_touches_on_mock() {
+        let (orch, _rx) = orch_with_bus().await;
+        let project = test_project();
+        orch.create_project(&project).await.unwrap();
+
+        // Use the actual repo root so git log works
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = orch
+            .backfill_commit_touches(project.id, &root)
+            .await
+            .unwrap();
+
+        // Should parse at least a few commits
+        assert!(result.commits_parsed > 0, "Should parse some commits");
+        assert!(
+            result.commits_backfilled > 0,
+            "Should backfill some commits"
+        );
+        assert!(result.elapsed_ms > 0 || result.commits_parsed > 0);
+    }
 }

@@ -1485,4 +1485,433 @@ mod tests {
             "Linked note should appear in entity notes"
         );
     }
+
+    // ================================================================
+    // Knowledge Fabric — Handler Tests
+    // ================================================================
+
+    /// Create an authenticated DELETE request
+    fn auth_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/notes/needs-review — notes needing review (empty)
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_notes_needing_review_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/notes/needs-review"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_notes_needing_review_with_project_filter() {
+        let app = test_app().await;
+        let pid = uuid::Uuid::new_v4();
+        let uri = format!("/api/notes/needs-review?project_id={}", pid);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    // ----------------------------------------------------------------
+    // POST /api/notes/update-staleness — update staleness scores
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_update_staleness_scores() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notes/update-staleness")
+                    .header("authorization", test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["notes_updated"].is_number());
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/notes/context-knowledge — unified context knowledge
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_context_knowledge_valid() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/context-knowledge?entity_type=file&entity_id=src/main.rs",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_context_knowledge_missing_params() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/notes/context-knowledge"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_context_knowledge_invalid_entity_type() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/context-knowledge?entity_type=invalid&entity_id=abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_context_knowledge_with_optional_params() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/context-knowledge?entity_type=file&entity_id=src/main.rs&max_depth=5&min_score=0.5",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/notes/propagated-knowledge — enriched propagated knowledge
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_propagated_knowledge_valid() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/propagated-knowledge?entity_type=file&entity_id=src/main.rs",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_propagated_knowledge_missing_params() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/notes/propagated-knowledge"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_propagated_knowledge_invalid_entity_type() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/propagated-knowledge?entity_type=bogus&entity_id=abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_propagated_knowledge_with_relation_types() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/propagated-knowledge?entity_type=file&entity_id=src/main.rs&relation_types=IMPORTS,CO_CHANGED",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // POST /api/notes/update-energy — Hebbian energy decay
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_update_energy_scores() {
+        let app = test_app().await;
+        let body = serde_json::json!({"half_life": 90.0});
+        let resp = app
+            .oneshot(auth_post("/api/notes/update-energy", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["notes_updated"].is_number());
+        assert_eq!(json["half_life_days"], 90.0);
+    }
+
+    #[tokio::test]
+    async fn test_update_energy_scores_default_half_life() {
+        let app = test_app().await;
+        let body = serde_json::json!({});
+        let resp = app
+            .oneshot(auth_post("/api/notes/update-energy", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["half_life_days"], 90.0);
+    }
+
+    // ----------------------------------------------------------------
+    // POST /api/notes/neurons/reinforce — reinforce synapses
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_reinforce_neurons_valid() {
+        let app = test_app().await;
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+        let body = serde_json::json!({
+            "note_ids": [id1, id2],
+            "energy_boost": 0.3,
+            "synapse_boost": 0.1
+        });
+        let resp = app
+            .oneshot(auth_post("/api/notes/neurons/reinforce", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["neurons_boosted"], 2);
+        assert!(json["synapses_reinforced"].is_number());
+        assert_eq!(json["energy_boost"], 0.3);
+        assert_eq!(json["synapse_boost"], 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_neurons_defaults() {
+        let app = test_app().await;
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+        let body = serde_json::json!({
+            "note_ids": [id1, id2]
+        });
+        let resp = app
+            .oneshot(auth_post("/api/notes/neurons/reinforce", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["energy_boost"], 0.2);
+        assert_eq!(json["synapse_boost"], 0.05);
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_neurons_too_few_ids() {
+        let app = test_app().await;
+        let id1 = uuid::Uuid::new_v4();
+        let body = serde_json::json!({
+            "note_ids": [id1]
+        });
+        let resp = app
+            .oneshot(auth_post("/api/notes/neurons/reinforce", body))
+            .await
+            .unwrap();
+        // Should return 400 because at least 2 note_ids required
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_neurons_empty_ids() {
+        let app = test_app().await;
+        let body = serde_json::json!({
+            "note_ids": []
+        });
+        let resp = app
+            .oneshot(auth_post("/api/notes/neurons/reinforce", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ----------------------------------------------------------------
+    // POST /api/notes/neurons/decay — decay synapses
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_decay_synapses_default_params() {
+        let app = test_app().await;
+        let body = serde_json::json!({});
+        let resp = app
+            .oneshot(auth_post("/api/notes/neurons/decay", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["synapses_decayed"].is_number());
+        assert!(json["synapses_pruned"].is_number());
+        assert_eq!(json["decay_amount"], 0.01);
+        assert_eq!(json["prune_threshold"], 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_decay_synapses_custom_params() {
+        let app = test_app().await;
+        let body = serde_json::json!({
+            "decay_amount": 0.05,
+            "prune_threshold": 0.2
+        });
+        let resp = app
+            .oneshot(auth_post("/api/notes/neurons/decay", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["decay_amount"], 0.05);
+        assert_eq!(json["prune_threshold"], 0.2);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/notes/neurons/search — spreading activation search
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_search_neurons_with_query() {
+        let app = test_app().await;
+        // Local fastembed provider is initialized by default, so the
+        // activation engine is present. With mock GraphStore the results
+        // are empty but the request should succeed.
+        let resp = app
+            .oneshot(auth_get("/api/notes/neurons/search?query=authentication"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["results"].is_array());
+        assert!(json["metadata"]["total_activated"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_search_neurons_missing_query() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/notes/neurons/search"))
+            .await
+            .unwrap();
+        // query is required
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/admin/backfill-embeddings/status — embedding backfill status
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_backfill_embeddings_status() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/admin/backfill-embeddings/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        // Default state is "idle"
+        assert_eq!(json["status"], "idle");
+    }
+
+    // ----------------------------------------------------------------
+    // DELETE /api/admin/backfill-embeddings — cancel when not running
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_backfill_embeddings_when_idle() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_delete("/api/admin/backfill-embeddings"))
+            .await
+            .unwrap();
+        // Should fail because no backfill is running
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/admin/backfill-synapses/status — synapse backfill status
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_backfill_synapses_status() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/admin/backfill-synapses/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "idle");
+    }
+
+    // ----------------------------------------------------------------
+    // DELETE /api/admin/backfill-synapses — cancel when not running
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_backfill_synapses_when_idle() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_delete("/api/admin/backfill-synapses"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/notes/propagated — propagated notes with relation_types
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_propagated_notes_with_relation_types() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/propagated?entity_type=file&entity_id=src/main.rs&relation_types=IMPORTS,CO_CHANGED",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_propagated_notes_invalid_entity_type() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/propagated?entity_type=invalid&entity_id=abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

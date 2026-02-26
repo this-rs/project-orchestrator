@@ -3264,4 +3264,568 @@ mod tests {
         let result = state.validate_origin(Some("https://ffs.dev/"));
         assert_eq!(result.unwrap(), Some("https://ffs.dev".to_string()));
     }
+
+    // ================================================================
+    // Knowledge Fabric — Handler Tests
+    // ================================================================
+
+    /// Build a simple test router (no seeded data)
+    async fn test_app() -> axum::Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        create_router(state)
+    }
+
+    /// Create an authenticated POST request with JSON body
+    fn auth_post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// Create an authenticated DELETE request
+    fn auth_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Parse response body as JSON
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ----------------------------------------------------------------
+    // Decision semantic search
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_search_decisions_semantic_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/decisions/search-semantic?query=authentication",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_decisions_semantic_with_limit() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/decisions/search-semantic?query=test&limit=5",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // Decisions affecting
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_decisions_affecting_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/decisions/affecting?entity_type=File&entity_id=src/main.rs",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_decisions_affecting_with_status_filter() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/decisions/affecting?entity_type=File&entity_id=src/main.rs&status=accepted",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // Decision affects CRUD
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_decision_affects() {
+        let app = test_app().await;
+        let decision_id = uuid::Uuid::new_v4();
+        let uri = format!("/api/decisions/{}/affects", decision_id);
+        let body = serde_json::json!({
+            "entity_type": "File",
+            "entity_id": "src/lib.rs",
+            "impact_description": "Changes authentication flow"
+        });
+        let resp = app.oneshot(auth_post_json(&uri, body)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_add_decision_affects_without_description() {
+        let app = test_app().await;
+        let decision_id = uuid::Uuid::new_v4();
+        let uri = format!("/api/decisions/{}/affects", decision_id);
+        let body = serde_json::json!({
+            "entity_type": "Function",
+            "entity_id": "handle_request"
+        });
+        let resp = app.oneshot(auth_post_json(&uri, body)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_list_decision_affects_empty() {
+        let app = test_app().await;
+        let decision_id = uuid::Uuid::new_v4();
+        let uri = format!("/api/decisions/{}/affects", decision_id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_decision_affects_path() {
+        let app = test_app().await;
+        let decision_id = uuid::Uuid::new_v4();
+        let uri = format!("/api/decisions/{}/affects/Function/my_func", decision_id);
+        let resp = app.oneshot(auth_delete(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_remove_decision_affects_query_params() {
+        let app = test_app().await;
+        let decision_id = uuid::Uuid::new_v4();
+        let uri = format!(
+            "/api/decisions/{}/affects?entity_type=File&entity_id=src%2Flib.rs",
+            decision_id
+        );
+        let resp = app.oneshot(auth_delete(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Decision supersede
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_supersede_decision() {
+        let app = test_app().await;
+        let new_id = uuid::Uuid::new_v4();
+        let old_id = uuid::Uuid::new_v4();
+        let uri = format!("/api/decisions/{}/supersedes/{}", new_id, old_id);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("authorization", test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Decision timeline
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_decision_timeline_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/decisions/timeline"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_decision_timeline_with_task_filter() {
+        let app = test_app().await;
+        let task_id = uuid::Uuid::new_v4();
+        let uri = format!("/api/decisions/timeline?task_id={}", task_id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_decision_timeline_with_date_range() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/decisions/timeline?from=2024-01-01&to=2025-01-01",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // Commit files (TOUCHES)
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_commit_files_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/commits/abc123/files"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // File history
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_file_history_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/files/history?path=%2Fhome%2Fuser%2Fproject%2Fsrc%2Fmain.rs",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_history_with_limit() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/files/history?path=src%2Flib.rs&limit=5"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_history_missing_path() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/files/history")).await.unwrap();
+        // path is a required query param
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    // ----------------------------------------------------------------
+    // Co-change graph
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_co_change_graph_empty() {
+        let app = test_app().await;
+        let project_id = uuid::Uuid::new_v4();
+        let uri = format!("/api/projects/{}/co-changes", project_id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_co_change_graph_with_params() {
+        let app = test_app().await;
+        let project_id = uuid::Uuid::new_v4();
+        let uri = format!(
+            "/api/projects/{}/co-changes?min_count=5&limit=50",
+            project_id
+        );
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // File co-changers
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_file_co_changers_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/files/co-changers?path=src%2Flib.rs"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_co_changers_with_params() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/files/co-changers?path=src%2Flib.rs&min_count=2&limit=20",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_co_changers_missing_path() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/files/co-changers"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    // ----------------------------------------------------------------
+    // Backfill decision embeddings
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_backfill_decision_embeddings() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/backfill-decision-embeddings")
+                    .header("authorization", test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json["decisions_processed"].is_number());
+        assert!(json["embeddings_created"].is_number());
+    }
+
+    // ----------------------------------------------------------------
+    // Backfill discussed
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_backfill_discussed() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/backfill-discussed")
+                    .header("authorization", test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["sessions_processed"], 0);
+        assert_eq!(json["entities_found"], 0);
+        assert_eq!(json["relations_created"], 0);
+    }
+
+    // ----------------------------------------------------------------
+    // Request/Response serialization tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_search_decisions_semantic_query_deserialize() {
+        let json = r#"{"query":"auth flow","limit":5,"project_id":"e83b0663-9600-450d-9f63-234e857394df"}"#;
+        let q: SearchDecisionsSemanticQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.query, "auth flow");
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(
+            q.project_id,
+            Some("e83b0663-9600-450d-9f63-234e857394df".to_string())
+        );
+    }
+
+    #[test]
+    fn test_search_decisions_semantic_query_minimal() {
+        let json = r#"{"query":"test"}"#;
+        let q: SearchDecisionsSemanticQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.query, "test");
+        assert_eq!(q.limit, None);
+        assert_eq!(q.project_id, None);
+    }
+
+    #[test]
+    fn test_decisions_affecting_query_deserialize() {
+        let json = r#"{"entity_type":"File","entity_id":"src/main.rs","status":"accepted"}"#;
+        let q: DecisionsAffectingQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.entity_type, "File");
+        assert_eq!(q.entity_id, "src/main.rs");
+        assert_eq!(q.status, Some("accepted".to_string()));
+    }
+
+    #[test]
+    fn test_decisions_affecting_query_no_status() {
+        let json = r#"{"entity_type":"Function","entity_id":"handle_request"}"#;
+        let q: DecisionsAffectingQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.entity_type, "Function");
+        assert_eq!(q.status, None);
+    }
+
+    #[test]
+    fn test_add_affects_request_deserialize() {
+        let json = r#"{"entity_type":"File","entity_id":"src/lib.rs","impact_description":"Modifies auth"}"#;
+        let r: AddAffectsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.entity_type, "File");
+        assert_eq!(r.entity_id, "src/lib.rs");
+        assert_eq!(r.impact_description, Some("Modifies auth".to_string()));
+    }
+
+    #[test]
+    fn test_add_affects_request_no_description() {
+        let json = r#"{"entity_type":"Function","entity_id":"foo"}"#;
+        let r: AddAffectsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.impact_description, None);
+    }
+
+    #[test]
+    fn test_remove_affects_query_deserialize() {
+        let json = r#"{"entity_type":"File","entity_id":"src/lib.rs"}"#;
+        let q: RemoveAffectsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.entity_type, "File");
+        assert_eq!(q.entity_id, "src/lib.rs");
+    }
+
+    #[test]
+    fn test_decision_timeline_query_all_fields() {
+        let json = r#"{"task_id":"e83b0663-9600-450d-9f63-234e857394df","from":"2024-01-01","to":"2025-01-01"}"#;
+        let q: DecisionTimelineQuery = serde_json::from_str(json).unwrap();
+        assert!(q.task_id.is_some());
+        assert_eq!(q.from, Some("2024-01-01".to_string()));
+        assert_eq!(q.to, Some("2025-01-01".to_string()));
+    }
+
+    #[test]
+    fn test_decision_timeline_query_empty() {
+        let json = r#"{}"#;
+        let q: DecisionTimelineQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.task_id, None);
+        assert_eq!(q.from, None);
+        assert_eq!(q.to, None);
+    }
+
+    #[test]
+    fn test_file_history_query_deserialize() {
+        let json = r#"{"path":"src/main.rs","limit":10}"#;
+        let q: FileHistoryQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.path, "src/main.rs");
+        assert_eq!(q.limit, Some(10));
+    }
+
+    #[test]
+    fn test_file_history_query_no_limit() {
+        let json = r#"{"path":"src/main.rs"}"#;
+        let q: FileHistoryQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.path, "src/main.rs");
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn test_co_change_graph_query_defaults() {
+        let json = r#"{}"#;
+        let q: CoChangeGraphQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.min_count, None);
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn test_co_change_graph_query_with_values() {
+        let json = r#"{"min_count":5,"limit":50}"#;
+        let q: CoChangeGraphQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.min_count, Some(5));
+        assert_eq!(q.limit, Some(50));
+    }
+
+    #[test]
+    fn test_file_co_changers_query_full() {
+        let json = r#"{"path":"src/lib.rs","min_count":2,"limit":20}"#;
+        let q: FileCoChangersQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.path, "src/lib.rs");
+        assert_eq!(q.min_count, Some(2));
+        assert_eq!(q.limit, Some(20));
+    }
+
+    #[test]
+    fn test_file_co_changers_query_minimal() {
+        let json = r#"{"path":"src/lib.rs"}"#;
+        let q: FileCoChangersQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.path, "src/lib.rs");
+        assert_eq!(q.min_count, None);
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn test_fabric_project_request_deserialize() {
+        let json = r#"{"project_id":"e83b0663-9600-450d-9f63-234e857394df"}"#;
+        let r: FabricProjectRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            r.project_id.to_string(),
+            "e83b0663-9600-450d-9f63-234e857394df"
+        );
+    }
 }

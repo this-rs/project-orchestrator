@@ -3706,4 +3706,324 @@ mod tests {
         assert!(results[0]["similarity"].is_number());
         assert!(results[0]["snippet"].is_string());
     }
+
+    // ================================================================
+    // Knowledge Fabric — Structural Analytics & Risk Tests
+    // ================================================================
+
+    /// Parse response body as JSON
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/code/communities
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_communities_valid_project() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/communities?project_slug=analytics-proj",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        // May be empty or have communities depending on mock
+        assert!(json["communities"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_communities_project_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/communities?project_slug=nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_communities_with_min_size() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/communities?project_slug=analytics-proj&min_size=5",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/code/health
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_code_health_valid_project() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/health?project_slug=analytics-proj"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["god_functions"].is_array());
+        assert!(json["orphan_files"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_project_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/health?project_slug=nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_code_health_custom_threshold() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/health?project_slug=analytics-proj&god_function_threshold=5",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/code/node-importance
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_node_importance_not_in_mock() {
+        // Mock get_node_gds_metrics returns None for all nodes,
+        // so this should return 404
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/node-importance?project_slug=analytics-proj&node_path=src/main.rs",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_nonexistent_node() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/node-importance?project_slug=analytics-proj&node_path=nonexistent.rs",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_node_importance_project_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/node-importance?project_slug=nonexistent&node_path=src/main.rs",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/code/hotspots — Change hotspots (churn)
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_change_hotspots_valid() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/hotspots?project_slug=analytics-proj"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["hotspots"].is_array());
+        assert!(json["total_files"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_get_change_hotspots_project_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/code/hotspots?project_slug=nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_change_hotspots_with_limit() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/hotspots?project_slug=analytics-proj&limit=5",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/code/knowledge-gaps — Knowledge density
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_knowledge_gaps_valid() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/knowledge-gaps?project_slug=analytics-proj",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["knowledge_gaps"].is_array());
+        assert!(json["total_files"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_get_knowledge_gaps_project_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/knowledge-gaps?project_slug=nonexistent",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_knowledge_gaps_with_limit() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/knowledge-gaps?project_slug=analytics-proj&limit=10",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // GET /api/code/risk-assessment — Composite risk score
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_risk_assessment_valid() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/risk-assessment?project_slug=analytics-proj",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["risk_files"].is_array());
+        assert!(json["total_files"].is_number());
+        assert!(json["summary"]["avg_risk_score"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_get_risk_assessment_project_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/risk-assessment?project_slug=nonexistent",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_risk_assessment_with_limit() {
+        let (app, _pid) = test_app_with_analytics().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/risk-assessment?project_slug=analytics-proj&limit=10",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ----------------------------------------------------------------
+    // Deserialization tests for query structs
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_communities_query_deserialize() {
+        let json = r#"{"project_slug":"my-proj","min_size":3}"#;
+        let q: CommunitiesQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.project_slug, "my-proj");
+        assert_eq!(q.min_size, Some(3));
+    }
+
+    #[test]
+    fn test_communities_query_defaults() {
+        let json = r#"{"project_slug":"my-proj"}"#;
+        let q: CommunitiesQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.min_size, None);
+    }
+
+    #[test]
+    fn test_code_health_query_deserialize() {
+        let json = r#"{"project_slug":"my-proj","god_function_threshold":5}"#;
+        let q: CodeHealthQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.project_slug, "my-proj");
+        assert_eq!(q.god_function_threshold, Some(5));
+    }
+
+    #[test]
+    fn test_hotspots_query_deserialize() {
+        let json = r#"{"project_slug":"my-proj","limit":10}"#;
+        let q: HotspotsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.project_slug, "my-proj");
+        assert_eq!(q.limit, Some(10));
+    }
+
+    #[test]
+    fn test_knowledge_gaps_query_deserialize() {
+        let json = r#"{"project_slug":"my-proj","limit":15}"#;
+        let q: KnowledgeGapsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.project_slug, "my-proj");
+        assert_eq!(q.limit, Some(15));
+    }
+
+    #[test]
+    fn test_risk_assessment_query_deserialize() {
+        let json = r#"{"project_slug":"my-proj","limit":20}"#;
+        let q: RiskAssessmentQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.project_slug, "my-proj");
+        assert_eq!(q.limit, Some(20));
+    }
+
+    #[test]
+    fn test_node_importance_query_deserialize() {
+        let json = r#"{"project_slug":"my-proj","node_path":"src/main.rs","node_type":"file"}"#;
+        let q: NodeImportanceQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.project_slug, "my-proj");
+        assert_eq!(q.node_path, "src/main.rs");
+        assert_eq!(q.node_type, Some("file".to_string()));
+    }
 }
