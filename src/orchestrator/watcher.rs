@@ -35,6 +35,19 @@ const SYNC_DEBOUNCE_SECS: u64 = 3;
 use super::Orchestrator;
 use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType};
 
+/// Kind of file system event propagated through the watcher channel.
+///
+/// The `notify` crate provides fine-grained `EventKind` variants, but the
+/// watcher only needs to distinguish "file changed" from "file deleted" for
+/// its sync logic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WatchEventKind {
+    /// File was created or modified — needs (re-)sync.
+    Changed,
+    /// File was removed — needs cleanup from Neo4j + Meilisearch.
+    Deleted,
+}
+
 /// Project context resolved from a file path
 #[derive(Debug, Clone)]
 struct ProjectContext {
@@ -222,7 +235,7 @@ impl FileWatcher {
         }
 
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        let (event_tx, mut event_rx) = mpsc::channel::<PathBuf>(500);
+        let (event_tx, mut event_rx) = mpsc::channel::<(PathBuf, WatchEventKind)>(500);
         let (add_path_tx, mut add_path_rx) = mpsc::channel::<PathBuf>(32);
 
         self.stop_tx = Some(stop_tx);
@@ -240,8 +253,14 @@ impl FileWatcher {
             let mut watcher = match RecommendedWatcher::new(
                 move |res: Result<Event, notify::Error>| {
                     if let Ok(event) = res {
+                        let kind = match event.kind {
+                            notify::EventKind::Remove(_) => WatchEventKind::Deleted,
+                            _ => WatchEventKind::Changed,
+                        };
                         for path in event.paths {
-                            let _ = rt.block_on(async { event_tx_clone.send(path).await });
+                            let _ = rt.block_on(async {
+                                event_tx_clone.send((path, kind.clone())).await
+                            });
                         }
                     }
                 },
@@ -273,8 +292,12 @@ impl FileWatcher {
             // pending_files: project_id → (project_context, set of changed file paths)
             let mut pending_files: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> =
                 HashMap::new();
+            // pending_deletions: project_id → (project_context, set of deleted file paths)
+            let mut pending_deletions: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> =
+                HashMap::new();
             // Files with no project association
             let mut pending_orphans: HashSet<PathBuf> = HashSet::new();
+            let mut pending_orphan_deletions: HashSet<PathBuf> = HashSet::new();
             let mut has_pending = false;
 
             // Flush timer — starts far in the future, reset on each event
@@ -290,7 +313,9 @@ impl FileWatcher {
                         if has_pending {
                             flush_pending_files(
                                 &mut pending_files,
+                                &mut pending_deletions,
                                 &mut pending_orphans,
+                                &mut pending_orphan_deletions,
                                 &orchestrator,
                                 &project_map,
                             ).await;
@@ -318,32 +343,56 @@ impl FileWatcher {
                     }
 
                     // ── Collect file events into pending map ─────────────
-                    Some(path) = event_rx.recv() => {
-                        if should_sync_file(&path) && path.exists() {
-                            // Resolve which project this file belongs to
-                            if let Some(ctx) = resolve_project(&path, &project_map).await {
-                                pending_files
-                                    .entry(ctx.project_id)
-                                    .or_insert_with(|| (ctx, HashSet::new()))
-                                    .1
-                                    .insert(path);
-                            } else {
-                                pending_orphans.insert(path);
-                            }
-
-                            // Reset the debounce timer
-                            has_pending = true;
-                            flush_sleep.as_mut().reset(
-                                Instant::now() + Duration::from_secs(SYNC_DEBOUNCE_SECS)
-                            );
+                    Some((path, event_kind)) = event_rx.recv() => {
+                        if !should_sync_file(&path) {
+                            continue;
                         }
+
+                        match event_kind {
+                            WatchEventKind::Deleted => {
+                                // For deletions we do NOT check path.exists()
+                                // (the file is gone — that's the whole point)
+                                if let Some(ctx) = resolve_project(&path, &project_map).await {
+                                    pending_deletions
+                                        .entry(ctx.project_id)
+                                        .or_insert_with(|| (ctx, HashSet::new()))
+                                        .1
+                                        .insert(path);
+                                } else {
+                                    pending_orphan_deletions.insert(path);
+                                }
+                            }
+                            WatchEventKind::Changed => {
+                                // For changes we still need the file on disk
+                                if !path.exists() {
+                                    continue;
+                                }
+                                if let Some(ctx) = resolve_project(&path, &project_map).await {
+                                    pending_files
+                                        .entry(ctx.project_id)
+                                        .or_insert_with(|| (ctx, HashSet::new()))
+                                        .1
+                                        .insert(path);
+                                } else {
+                                    pending_orphans.insert(path);
+                                }
+                            }
+                        }
+
+                        // Reset the debounce timer
+                        has_pending = true;
+                        flush_sleep.as_mut().reset(
+                            Instant::now() + Duration::from_secs(SYNC_DEBOUNCE_SECS)
+                        );
                     }
 
                     // ── Flush after quiet period ─────────────────────────
                     _ = &mut flush_sleep, if has_pending => {
                         flush_pending_files(
                             &mut pending_files,
+                            &mut pending_deletions,
                             &mut pending_orphans,
+                            &mut pending_orphan_deletions,
                             &orchestrator,
                             &project_map,
                         ).await;
@@ -405,27 +454,36 @@ impl FileWatcher {
 /// - If < threshold → sync each file individually
 /// - Trigger the analytics debouncer once per project
 ///
-/// Orphan files (no project association) are synced individually.
+/// For pending deletions: remove each file from Neo4j and Meilisearch.
+///
+/// Orphan files (no project association) are synced/deleted individually.
 async fn flush_pending_files(
     pending_files: &mut HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)>,
+    pending_deletions: &mut HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)>,
     pending_orphans: &mut HashSet<PathBuf>,
+    pending_orphan_deletions: &mut HashSet<PathBuf>,
     orchestrator: &Arc<super::Orchestrator>,
     project_map: &Arc<RwLock<HashMap<PathBuf, ProjectContext>>>,
 ) {
     let batch = std::mem::take(pending_files);
+    let deletions = std::mem::take(pending_deletions);
     let orphans = std::mem::take(pending_orphans);
+    let orphan_deletions = std::mem::take(pending_orphan_deletions);
 
     let total_files: usize = batch.values().map(|(_, files)| files.len()).sum();
+    let total_deletions: usize = deletions.values().map(|(_, files)| files.len()).sum();
     let total_projects = batch.len();
 
-    if total_files > 0 {
+    if total_files > 0 || total_deletions > 0 {
         tracing::info!(
-            "Sync debounce: flushing {} files across {} project(s)",
+            "Sync debounce: flushing {} changed + {} deleted files across {} project(s)",
             total_files,
-            total_projects,
+            total_deletions,
+            total_projects.max(deletions.len()),
         );
     }
 
+    // ── Handle changed files ─────────────────────────────────────────
     for (pid, (ctx, files)) in batch {
         let file_count = files.len();
 
@@ -516,12 +574,85 @@ async fn flush_pending_files(
         orchestrator.analytics_debouncer().trigger(pid);
     }
 
+    // ── Handle deleted files ─────────────────────────────────────────
+    for (pid, (ctx, files)) in deletions {
+        let file_count = files.len();
+        tracing::info!(
+            "Deleting {} file(s) from graph for project '{}'",
+            file_count,
+            ctx.project_slug,
+        );
+
+        let mut deleted = 0usize;
+        let mut errors = 0usize;
+
+        for path in &files {
+            let path_str = super::runner::normalize_path(&path.to_string_lossy());
+
+            // Remove from Neo4j (File node + all children symbols + relationships)
+            if let Err(e) = orchestrator.neo4j().delete_file(&path_str).await {
+                tracing::warn!(
+                    "Failed to delete {} from Neo4j: {}",
+                    path_str,
+                    e
+                );
+                errors += 1;
+                continue;
+            }
+
+            // Remove from Meilisearch search index
+            if let Err(e) = orchestrator.meili().delete_code(&path_str).await {
+                tracing::warn!(
+                    "Failed to delete {} from Meilisearch: {}",
+                    path_str,
+                    e
+                );
+                // Non-fatal: Neo4j is source of truth, Meili is secondary index
+            }
+
+            deleted += 1;
+        }
+
+        if deleted > 0 || errors > 0 {
+            tracing::info!(
+                "Deletion complete for '{}': {} deleted, {} errors",
+                ctx.project_slug,
+                deleted,
+                errors,
+            );
+        }
+
+        // Trigger analytics debouncer (graph changed)
+        orchestrator.analytics_debouncer().trigger(pid);
+    }
+
     // Sync orphan files (no project association) individually
     if !orphans.is_empty() {
         tracing::debug!("Syncing {} orphan file(s) (no project)", orphans.len());
         for path in &orphans {
             if let Err(e) = orchestrator.sync_file_for_project(path, None, None).await {
                 tracing::warn!("Failed to sync orphan {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    // Delete orphan files (no project association) individually
+    if !orphan_deletions.is_empty() {
+        tracing::debug!(
+            "Deleting {} orphan file(s) from graph (no project)",
+            orphan_deletions.len()
+        );
+        for path in &orphan_deletions {
+            let path_str = super::runner::normalize_path(&path.to_string_lossy());
+            if let Err(e) = orchestrator.neo4j().delete_file(&path_str).await {
+                tracing::warn!("Failed to delete orphan {} from Neo4j: {}", path_str, e);
+            }
+            if let Err(e) = orchestrator.meili().delete_code(&path_str).await {
+                tracing::warn!(
+                    "Failed to delete orphan {} from Meilisearch: {}",
+                    path_str,
+                    e
+                );
             }
         }
     }
@@ -1575,5 +1706,336 @@ mod tests {
         let batch = std::mem::take(&mut pending);
         assert!(pending.is_empty(), "Original should be empty after take");
         assert_eq!(batch.len(), 1, "Taken batch should contain the data");
+    }
+
+    // ── WatchEventKind tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_watch_event_kind_clone_and_eq() {
+        let changed = WatchEventKind::Changed;
+        let deleted = WatchEventKind::Deleted;
+
+        assert_eq!(changed.clone(), WatchEventKind::Changed);
+        assert_eq!(deleted.clone(), WatchEventKind::Deleted);
+        assert_ne!(changed, deleted);
+    }
+
+    #[test]
+    fn test_watch_event_kind_from_notify_remove() {
+        // Simulate the mapping logic used in the notify callback
+        use notify::EventKind;
+
+        let remove_kinds = [
+            EventKind::Remove(notify::event::RemoveKind::File),
+            EventKind::Remove(notify::event::RemoveKind::Folder),
+            EventKind::Remove(notify::event::RemoveKind::Any),
+            EventKind::Remove(notify::event::RemoveKind::Other),
+        ];
+
+        for kind in &remove_kinds {
+            let mapped = match kind {
+                EventKind::Remove(_) => WatchEventKind::Deleted,
+                _ => WatchEventKind::Changed,
+            };
+            assert_eq!(
+                mapped,
+                WatchEventKind::Deleted,
+                "Remove({:?}) should map to Deleted",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn test_watch_event_kind_from_notify_non_remove() {
+        // All non-Remove event kinds should map to Changed
+        use notify::EventKind;
+
+        let non_remove_kinds = [
+            EventKind::Create(notify::event::CreateKind::File),
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            EventKind::Access(notify::event::AccessKind::Close(
+                notify::event::AccessMode::Write,
+            )),
+            EventKind::Any,
+            EventKind::Other,
+        ];
+
+        for kind in &non_remove_kinds {
+            let mapped = match kind {
+                EventKind::Remove(_) => WatchEventKind::Deleted,
+                _ => WatchEventKind::Changed,
+            };
+            assert_eq!(
+                mapped,
+                WatchEventKind::Changed,
+                "{:?} should map to Changed",
+                kind
+            );
+        }
+    }
+
+    // ── Deletion event routing tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_deletion_event_routes_to_pending_deletions() {
+        // Simulate the recv loop routing logic for Deleted events
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "del-proj".to_string(),
+        };
+
+        let mut pending_files: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> = HashMap::new();
+        let mut pending_deletions: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> =
+            HashMap::new();
+
+        let path = PathBuf::from("/project/src/removed_file.rs");
+        let event_kind = WatchEventKind::Deleted;
+
+        // Simulate the routing logic
+        match event_kind {
+            WatchEventKind::Deleted => {
+                pending_deletions
+                    .entry(pid)
+                    .or_insert_with(|| (ctx.clone(), HashSet::new()))
+                    .1
+                    .insert(path.clone());
+            }
+            WatchEventKind::Changed => {
+                pending_files
+                    .entry(pid)
+                    .or_insert_with(|| (ctx.clone(), HashSet::new()))
+                    .1
+                    .insert(path.clone());
+            }
+        }
+
+        assert!(
+            pending_files.is_empty(),
+            "Deleted event should NOT go to pending_files"
+        );
+        assert_eq!(
+            pending_deletions.len(),
+            1,
+            "Deleted event should go to pending_deletions"
+        );
+        assert!(pending_deletions[&pid].1.contains(&path));
+    }
+
+    #[tokio::test]
+    async fn test_changed_event_routes_to_pending_files() {
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "chg-proj".to_string(),
+        };
+
+        let mut pending_files: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> = HashMap::new();
+        let mut pending_deletions: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> =
+            HashMap::new();
+
+        let path = PathBuf::from("/project/src/modified_file.rs");
+        let event_kind = WatchEventKind::Changed;
+
+        match event_kind {
+            WatchEventKind::Deleted => {
+                pending_deletions
+                    .entry(pid)
+                    .or_insert_with(|| (ctx.clone(), HashSet::new()))
+                    .1
+                    .insert(path.clone());
+            }
+            WatchEventKind::Changed => {
+                pending_files
+                    .entry(pid)
+                    .or_insert_with(|| (ctx.clone(), HashSet::new()))
+                    .1
+                    .insert(path.clone());
+            }
+        }
+
+        assert!(
+            pending_deletions.is_empty(),
+            "Changed event should NOT go to pending_deletions"
+        );
+        assert_eq!(
+            pending_files.len(),
+            1,
+            "Changed event should go to pending_files"
+        );
+        assert!(pending_files[&pid].1.contains(&path));
+    }
+
+    #[tokio::test]
+    async fn test_mixed_events_route_correctly() {
+        // Mix of changed and deleted events for the same project
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "mix-proj".to_string(),
+        };
+
+        let mut pending_files: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> = HashMap::new();
+        let mut pending_deletions: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> =
+            HashMap::new();
+
+        let events: Vec<(PathBuf, WatchEventKind)> = vec![
+            (
+                PathBuf::from("/project/src/a.rs"),
+                WatchEventKind::Changed,
+            ),
+            (
+                PathBuf::from("/project/src/b.rs"),
+                WatchEventKind::Deleted,
+            ),
+            (
+                PathBuf::from("/project/src/c.rs"),
+                WatchEventKind::Changed,
+            ),
+            (
+                PathBuf::from("/project/src/d.rs"),
+                WatchEventKind::Deleted,
+            ),
+            (
+                PathBuf::from("/project/src/e.rs"),
+                WatchEventKind::Changed,
+            ),
+        ];
+
+        for (path, kind) in events {
+            match kind {
+                WatchEventKind::Deleted => {
+                    pending_deletions
+                        .entry(pid)
+                        .or_insert_with(|| (ctx.clone(), HashSet::new()))
+                        .1
+                        .insert(path);
+                }
+                WatchEventKind::Changed => {
+                    pending_files
+                        .entry(pid)
+                        .or_insert_with(|| (ctx.clone(), HashSet::new()))
+                        .1
+                        .insert(path);
+                }
+            }
+        }
+
+        assert_eq!(
+            pending_files[&pid].1.len(),
+            3,
+            "Should have 3 changed files"
+        );
+        assert_eq!(
+            pending_deletions[&pid].1.len(),
+            2,
+            "Should have 2 deleted files"
+        );
+    }
+
+    #[test]
+    fn test_pending_deletions_dedup_same_path() {
+        // Same deleted file path inserted multiple times → HashSet deduplicates
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "dup-del".to_string(),
+        };
+
+        let mut pending_deletions: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> =
+            HashMap::new();
+        let entry = pending_deletions
+            .entry(pid)
+            .or_insert_with(|| (ctx, HashSet::new()));
+
+        let path = PathBuf::from("/tmp/src/removed.rs");
+        entry.1.insert(path.clone());
+        entry.1.insert(path.clone());
+        entry.1.insert(path.clone());
+
+        assert_eq!(
+            entry.1.len(),
+            1,
+            "Same deletion path should be deduped by HashSet"
+        );
+    }
+
+    #[test]
+    fn test_pending_orphan_deletions_collection() {
+        // Deleted files with no project association go to orphan_deletions set
+        let mut orphan_deletions: HashSet<PathBuf> = HashSet::new();
+
+        orphan_deletions.insert(PathBuf::from("/tmp/untracked/removed1.rs"));
+        orphan_deletions.insert(PathBuf::from("/tmp/untracked/removed2.rs"));
+        orphan_deletions.insert(PathBuf::from("/tmp/untracked/removed1.rs")); // dupe
+
+        assert_eq!(orphan_deletions.len(), 2, "Orphan deletions should be deduped");
+    }
+
+    #[test]
+    fn test_mem_take_clears_pending_deletions() {
+        // std::mem::take on deletions map works the same as on files map
+        let mut pending_deletions: HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)> =
+            HashMap::new();
+        let pid = Uuid::new_v4();
+        let ctx = ProjectContext {
+            project_id: pid,
+            project_slug: "take-del".to_string(),
+        };
+        pending_deletions.insert(pid, (ctx, HashSet::from([PathBuf::from("/gone.rs")])));
+
+        let batch = std::mem::take(&mut pending_deletions);
+        assert!(
+            pending_deletions.is_empty(),
+            "Deletions should be empty after take"
+        );
+        assert_eq!(batch.len(), 1, "Taken deletions should contain the data");
+    }
+
+    // ── Channel type tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_event_channel_sends_tuple() {
+        // Verify the channel now transports (PathBuf, WatchEventKind)
+        let (tx, mut rx) = mpsc::channel::<(PathBuf, WatchEventKind)>(10);
+
+        let path = PathBuf::from("/project/src/main.rs");
+        tx.send((path.clone(), WatchEventKind::Changed))
+            .await
+            .unwrap();
+        tx.send((path.clone(), WatchEventKind::Deleted))
+            .await
+            .unwrap();
+
+        let (p1, k1) = rx.recv().await.unwrap();
+        assert_eq!(p1, path);
+        assert_eq!(k1, WatchEventKind::Changed);
+
+        let (p2, k2) = rx.recv().await.unwrap();
+        assert_eq!(p2, path);
+        assert_eq!(k2, WatchEventKind::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_deleted_file_not_checked_for_existence() {
+        // Key bug fix: deleted files should NOT be filtered by path.exists()
+        // Simulate the old vs new logic
+        let path = PathBuf::from("/nonexistent/deleted/file.rs");
+
+        // Old logic (broken): path.exists() would filter this out
+        assert!(!path.exists(), "Deleted file should not exist on disk");
+
+        // New logic: WatchEventKind::Deleted skips the exists() check
+        // Just verify should_sync_file passes for the extension
+        assert!(
+            should_sync_file(&path),
+            "should_sync_file should pass for .rs extension regardless of existence"
+        );
     }
 }

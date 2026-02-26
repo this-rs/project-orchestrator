@@ -30,7 +30,7 @@ use super::context::ContextBuilder;
 /// - Resolves `.` and `..`
 /// - Makes relative paths absolute using current_dir
 /// - Returns the path as a String
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     let expanded = if let Some(rest) = path.strip_prefix('~') {
         if let Some(home) = dirs::home_dir() {
             home.join(rest.trim_start_matches('/'))
