@@ -2931,6 +2931,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         &import.path,
                         &ctx.suffix_index,
                     ),
+                    "ruby" => Self::resolve_ruby_import_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3408,6 +3413,66 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let dir_files = index.get_files_in_dir(&dir, "cs");
         if !dir_files.is_empty() {
             return dir_files.into_iter().map(|f| f.to_string()).collect();
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Ruby require/require_relative using SuffixIndex.
+    ///
+    /// - Paths starting with `.` or `..` → resolve relative to source file + `.rb`
+    /// - Other paths → append `.rb` and lookup via SuffixIndex
+    /// - System gems (not found in index) naturally return empty
+    fn resolve_ruby_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ensure .rb extension
+        let with_ext = if path.ends_with(".rb") {
+            path.to_string()
+        } else {
+            format!("{}.rb", path)
+        };
+
+        // Relative require (require_relative or path starting with ./)
+        if path.starts_with('.') {
+            let source_dir = source_file
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
+
+            // Normalize: strip leading ./ and resolve ../
+            let rel_path = with_ext
+                .strip_prefix("./")
+                .unwrap_or(&with_ext);
+
+            let candidate = if source_dir.is_empty() {
+                rel_path.to_string()
+            } else {
+                format!("{}/{}", source_dir, rel_path)
+            };
+
+            if let Some(resolved) = index.get(&candidate) {
+                return vec![resolved.to_string()];
+            }
+            return Vec::new();
+        }
+
+        // Absolute require: try suffix index directly
+        if let Some(resolved) = index.get(&with_ext) {
+            return vec![resolved.to_string()];
+        }
+
+        // Try with lib/ prefix (common Ruby project layout)
+        let lib_path = format!("lib/{}", with_ext);
+        if let Some(resolved) = index.get(&lib_path) {
+            return vec![resolved.to_string()];
         }
 
         Vec::new()
@@ -7311,6 +7376,70 @@ mod tests {
 
         let result = Orchestrator::resolve_csharp_import_indexed("Missing.Namespace", &index);
         assert!(result.is_empty());
+    }
+
+    // ── Ruby resolver tests ──────────────────────────────────────
+
+    #[test]
+    fn test_resolve_ruby_require_simple() {
+        let paths = vec![
+            "lib/models/user.rb".to_string(),
+            "lib/utils.rb".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // require 'models/user' → lib/models/user.rb (lib/ prefix fallback)
+        let result = Orchestrator::resolve_ruby_import_indexed(
+            "models/user",
+            "app/main.rb",
+            &index,
+        );
+        assert_eq!(result, vec!["lib/models/user.rb"]);
+    }
+
+    #[test]
+    fn test_resolve_ruby_require_relative() {
+        let paths = vec![
+            "app/models/user.rb".to_string(),
+            "app/models/helper.rb".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // require_relative './helper' from app/models/user.rb
+        let result = Orchestrator::resolve_ruby_import_indexed(
+            "./helper",
+            "app/models/user.rb",
+            &index,
+        );
+        assert_eq!(result, vec!["app/models/helper.rb"]);
+    }
+
+    #[test]
+    fn test_resolve_ruby_require_gem_ignored() {
+        let paths = vec!["lib/app.rb".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // System gem — not in project index
+        let result = Orchestrator::resolve_ruby_import_indexed(
+            "json",
+            "lib/app.rb",
+            &index,
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_ruby_require_with_rb_extension() {
+        let paths = vec!["lib/config.rb".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // require 'config.rb' (explicit extension)
+        let result = Orchestrator::resolve_ruby_import_indexed(
+            "config.rb",
+            "app/main.rb",
+            &index,
+        );
+        assert_eq!(result, vec!["lib/config.rb"]);
     }
 
     #[test]
