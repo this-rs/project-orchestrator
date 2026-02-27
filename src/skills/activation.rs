@@ -754,7 +754,7 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::notes::models::{NoteImportance, NoteScope, NoteStatus, NoteType};
-    use crate::skills::models::{SkillNode, SkillTrigger};
+    use crate::skills::models::{SkillNode, SkillTrigger, SkillStatus};
     use chrono::Utc;
 
     fn make_test_note(
@@ -1487,5 +1487,439 @@ mod tests {
         assert_eq!(config.max_context_chars, 3200);
         assert!((config.min_note_energy - 0.1).abs() < f64::EPSILON);
         assert!((config.merge_threshold - 0.1).abs() < f64::EPSILON);
+    }
+
+    // =========================================================================
+    // E2E integration tests: activate_for_hook with mock store
+    // =========================================================================
+
+    /// Helper to build a mock store with a skill, notes, and McpAction triggers.
+    async fn setup_mcp_skill_store(
+        project_id: Uuid,
+        skill_name: &str,
+        triggers: Vec<SkillTrigger>,
+        notes: Vec<Note>,
+    ) -> crate::neo4j::mock::MockGraphStore {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+
+        // Create a project first (mock requires it for create_skill)
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-project".to_string(),
+            slug: "test-project".to_string(),
+            description: Some("Test project".to_string()),
+            root_path: "/tmp/test-project".to_string(),
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Create skill
+        let mut skill = SkillNode::new(project_id, skill_name);
+        skill.status = SkillStatus::Active;
+        skill.trigger_patterns = triggers;
+        skill.energy = 0.8;
+        let skill_id = skill.id;
+        store.create_skill(&skill).await.unwrap();
+
+        // Create notes and link as skill members
+        for note in &notes {
+            store.create_note(note).await.unwrap();
+            store
+                .add_skill_member(skill_id, "note", note.id)
+                .await
+                .unwrap();
+        }
+
+        store
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_task_create_triggers_skill() {
+        let project_id = Uuid::new_v4();
+
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "⚠️ task(action: \"create\") requires plan_id. Without it you get a 400 error.",
+            NoteType::Gotcha,
+            NoteImportance::High,
+            0.8,
+        );
+
+        let triggers = vec![SkillTrigger::mcp_action("task", 0.7)];
+
+        let store = setup_mcp_skill_store(project_id, "MCP Task Usage", triggers, vec![note]).await;
+
+        let config = HookActivationConfig::default();
+        let tool_input = serde_json::json!({
+            "action": "create",
+            "title": "my task"
+        });
+
+        let result = activate_for_hook(
+            &store,
+            project_id,
+            "mcp__project-orchestrator__task",
+            &tool_input,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_some(), "Should match the MCP Task Usage skill");
+        let outcome = result.unwrap();
+        assert!(
+            outcome.response.context.contains("plan_id"),
+            "Context should mention plan_id, got: {}",
+            outcome.response.context
+        );
+        assert_eq!(outcome.response.skill_name, "MCP Task Usage");
+        assert!(outcome.response.confidence >= 0.5);
+        assert_eq!(outcome.response.notes_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_note_search_triggers_skill() {
+        let project_id = Uuid::new_v4();
+
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "note(action: \"search_semantic\") uses vector similarity. Prefer over search for natural language queries.",
+            NoteType::Guideline,
+            NoteImportance::High,
+            0.8,
+        );
+
+        let triggers = vec![SkillTrigger::mcp_action("note:search_semantic", 0.75)];
+
+        let store =
+            setup_mcp_skill_store(project_id, "MCP Note Search", triggers, vec![note]).await;
+
+        let config = HookActivationConfig::default();
+        let tool_input = serde_json::json!({
+            "action": "search_semantic",
+            "query": "neo4j batch processing"
+        });
+
+        let result = activate_for_hook(
+            &store,
+            project_id,
+            "mcp__project-orchestrator__note",
+            &tool_input,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_some(), "Should match MCP Note Search skill");
+        let outcome = result.unwrap();
+        assert!(outcome.response.context.contains("search_semantic"));
+        assert_eq!(outcome.response.skill_name, "MCP Note Search");
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_code_analyze_impact_triggers_skill() {
+        let project_id = Uuid::new_v4();
+
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "code(action: \"analyze_impact\") requires ABSOLUTE paths. Relative paths like 'src/main.rs' will fail. Always use full path: '/Users/.../src/main.rs'.",
+            NoteType::Gotcha,
+            NoteImportance::High,
+            0.9,
+        );
+
+        let triggers = vec![SkillTrigger::mcp_action("code:analyze_impact", 0.8)];
+
+        let store =
+            setup_mcp_skill_store(project_id, "MCP Code Impact", triggers, vec![note]).await;
+
+        let config = HookActivationConfig::default();
+        let tool_input = serde_json::json!({
+            "action": "analyze_impact",
+            "target": "src/relative/path.rs"
+        });
+
+        let result = activate_for_hook(
+            &store,
+            project_id,
+            "mcp__project-orchestrator__code",
+            &tool_input,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_some(), "Should match MCP Code Impact skill");
+        let outcome = result.unwrap();
+        assert!(
+            outcome.response.context.contains("ABSOLUTE"),
+            "Context should warn about absolute paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_no_skill_match_returns_none() {
+        let project_id = Uuid::new_v4();
+
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "Some note about task usage",
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+        );
+
+        // Skill only triggers on "task" actions
+        let triggers = vec![SkillTrigger::mcp_action("task", 0.7)];
+
+        let store =
+            setup_mcp_skill_store(project_id, "MCP Task Skill", triggers, vec![note]).await;
+
+        let config = HookActivationConfig::default();
+
+        // Call with "commit" tool → should NOT match "task" trigger
+        let tool_input = serde_json::json!({
+            "action": "create",
+            "sha": "abc123"
+        });
+
+        let result = activate_for_hook(
+            &store,
+            project_id,
+            "mcp__project-orchestrator__commit",
+            &tool_input,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_none(), "commit tool should not match task trigger");
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_specific_action_doesnt_match_different_action() {
+        let project_id = Uuid::new_v4();
+
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "Guideline for note creation",
+            NoteType::Guideline,
+            NoteImportance::High,
+            0.8,
+        );
+
+        // Only triggers on note:create, not note:search_semantic
+        let triggers = vec![SkillTrigger::mcp_action("note:create", 0.75)];
+
+        let store =
+            setup_mcp_skill_store(project_id, "MCP Note Create", triggers, vec![note]).await;
+
+        let config = HookActivationConfig::default();
+        let tool_input = serde_json::json!({
+            "action": "search_semantic",
+            "query": "test query"
+        });
+
+        let result = activate_for_hook(
+            &store,
+            project_id,
+            "mcp__project-orchestrator__note",
+            &tool_input,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "note:create trigger should NOT match note search_semantic action"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_low_energy_notes_excluded() {
+        let project_id = Uuid::new_v4();
+
+        // Note with very low energy — should be filtered out
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "Dead note content",
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.01, // Below min_note_energy (0.1)
+        );
+
+        let triggers = vec![SkillTrigger::mcp_action("task", 0.7)];
+
+        let store =
+            setup_mcp_skill_store(project_id, "MCP Task Skill", triggers, vec![note]).await;
+
+        let config = HookActivationConfig::default();
+        let tool_input = serde_json::json!({
+            "action": "create",
+            "title": "test"
+        });
+
+        let result = activate_for_hook(
+            &store,
+            project_id,
+            "mcp__project-orchestrator__task",
+            &tool_input,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // The skill matches but all notes are below energy threshold
+        // Result may still be Some (with 0 notes) or None depending on implementation
+        if let Some(outcome) = result {
+            assert_eq!(
+                outcome.response.notes_count, 0,
+                "Low energy notes should be filtered out"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_multiple_notes_assembled() {
+        let project_id = Uuid::new_v4();
+
+        let notes = vec![
+            make_test_note(
+                Uuid::new_v4(),
+                "task(action: \"create\") requires plan_id mandatory",
+                NoteType::Gotcha,
+                NoteImportance::High,
+                0.9,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "step(action: \"create\") requires task_id mandatory",
+                NoteType::Gotcha,
+                NoteImportance::High,
+                0.8,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Always use UUID format, not slugs, for entity IDs",
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.7,
+            ),
+        ];
+
+        let triggers = vec![SkillTrigger::mcp_action("task", 0.7)];
+
+        let store =
+            setup_mcp_skill_store(project_id, "MCP Usage Patterns", triggers, notes).await;
+
+        let config = HookActivationConfig::default();
+        let tool_input = serde_json::json!({
+            "action": "create",
+            "title": "test task"
+        });
+
+        let result = activate_for_hook(
+            &store,
+            project_id,
+            "mcp__project-orchestrator__task",
+            &tool_input,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_some(), "Should match with multiple notes");
+        let outcome = result.unwrap();
+        assert_eq!(outcome.response.notes_count, 3, "All 3 notes above energy threshold");
+        assert!(outcome.response.context.contains("plan_id"));
+        assert!(outcome.response.context.len() <= 3200, "Context within budget");
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_performance_under_50ms() {
+        let project_id = Uuid::new_v4();
+
+        // Create 20 notes to simulate a real skill with substantial content
+        let notes: Vec<Note> = (0..20)
+            .map(|i| {
+                make_test_note(
+                    Uuid::new_v4(),
+                    &format!("Guideline #{}: Always check parameters before calling MCP tools. Validate UUIDs, check required fields, and ensure paths are absolute.", i),
+                    NoteType::Guideline,
+                    NoteImportance::Medium,
+                    0.5 + (i as f64) * 0.02,
+                )
+            })
+            .collect();
+
+        let triggers = vec![
+            SkillTrigger::mcp_action("task", 0.7),
+            SkillTrigger::mcp_action("note", 0.65),
+            SkillTrigger::regex("neo4j|cypher", 0.6),
+            SkillTrigger::file_glob("src/skills/**", 0.55),
+        ];
+
+        let store =
+            setup_mcp_skill_store(project_id, "MCP Usage Patterns", triggers, notes).await;
+
+        let config = HookActivationConfig::default();
+        let tool_input = serde_json::json!({
+            "action": "create",
+            "title": "test task for perf"
+        });
+
+        // Run 100 activations and check wall time
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let _result = activate_for_hook(
+                &store,
+                project_id,
+                "mcp__project-orchestrator__task",
+                &tool_input,
+                &config,
+            )
+            .await
+            .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let per_call_ms = elapsed.as_millis() as f64 / 100.0;
+
+        assert!(
+            per_call_ms < 50.0,
+            "Average call should be < 50ms, got {:.2}ms",
+            per_call_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn test_e2e_mcp_no_project_skills_returns_none() {
+        // Empty store — no skills registered
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let config = HookActivationConfig::default();
+        let tool_input = serde_json::json!({
+            "action": "create",
+            "title": "test"
+        });
+
+        let result = activate_for_hook(
+            &store,
+            project_id,
+            "mcp__project-orchestrator__task",
+            &tool_input,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "No skills in project → should return None gracefully"
+        );
     }
 }
