@@ -33,6 +33,7 @@ pub enum SupportedLanguage {
     CSharp,
     Scala,
     Zig,
+    Hcl,
 }
 
 impl SupportedLanguage {
@@ -55,6 +56,7 @@ impl SupportedLanguage {
             "cs" => Some(Self::CSharp),
             "scala" | "sc" => Some(Self::Scala),
             "zig" => Some(Self::Zig),
+            "tf" | "tfvars" => Some(Self::Hcl),
             _ => None,
         }
     }
@@ -77,6 +79,7 @@ impl SupportedLanguage {
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::Scala => tree_sitter_scala::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
+            Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
         }
     }
 
@@ -98,6 +101,7 @@ impl SupportedLanguage {
             Self::CSharp => "csharp",
             Self::Scala => "scala",
             Self::Zig => "zig",
+            Self::Hcl => "hcl",
         }
     }
 
@@ -119,6 +123,7 @@ impl SupportedLanguage {
             Self::CSharp,
             Self::Scala,
             Self::Zig,
+            Self::Hcl,
         ]
     }
 }
@@ -231,6 +236,9 @@ impl CodeParser {
             }
             SupportedLanguage::Zig => {
                 languages::zig::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Hcl => {
+                languages::hcl::extract(&root, content, &path_str, &mut parsed)?;
             }
         }
 
@@ -536,6 +544,18 @@ mod tests {
     }
 
     #[test]
+    fn test_from_extension_hcl() {
+        assert_eq!(
+            SupportedLanguage::from_extension("tf"),
+            Some(SupportedLanguage::Hcl)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("tfvars"),
+            Some(SupportedLanguage::Hcl)
+        );
+    }
+
+    #[test]
     fn test_from_extension_case_insensitive() {
         assert_eq!(
             SupportedLanguage::from_extension("RS"),
@@ -577,12 +597,13 @@ mod tests {
         assert_eq!(SupportedLanguage::CSharp.as_str(), "csharp");
         assert_eq!(SupportedLanguage::Scala.as_str(), "scala");
         assert_eq!(SupportedLanguage::Zig.as_str(), "zig");
+        assert_eq!(SupportedLanguage::Hcl.as_str(), "hcl");
     }
 
     #[test]
-    fn test_all_returns_12_languages() {
+    fn test_all_returns_16_languages() {
         let all = SupportedLanguage::all();
-        assert_eq!(all.len(), 15);
+        assert_eq!(all.len(), 16);
     }
 
     #[test]
@@ -603,6 +624,7 @@ mod tests {
         assert!(all.contains(&SupportedLanguage::CSharp));
         assert!(all.contains(&SupportedLanguage::Scala));
         assert!(all.contains(&SupportedLanguage::Zig));
+        assert!(all.contains(&SupportedLanguage::Hcl));
     }
 
     // =========================================================================
@@ -1182,6 +1204,255 @@ type Config struct {
 
         let parsed = result.unwrap();
         assert_eq!(parsed.language, "go");
+    }
+
+    #[test]
+    fn test_parse_hcl_resource_and_data() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
+}
+
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.main.id
+}
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+}
+"#;
+        let path = PathBuf::from("main.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "hcl");
+
+        // 2 resources → StructNode
+        assert!(parsed.structs.iter().any(|s| s.name == "aws_vpc.main"));
+        assert!(parsed.structs.iter().any(|s| s.name == "aws_instance.web"));
+        // 1 data source → StructNode
+        assert!(parsed.structs.iter().any(|s| s.name == "data.aws_ami.ubuntu"));
+
+        // Symbols should also contain the struct names
+        assert!(parsed.symbols.contains(&"aws_vpc.main".to_string()));
+        assert!(parsed.symbols.contains(&"aws_instance.web".to_string()));
+        assert!(parsed.symbols.contains(&"data.aws_ami.ubuntu".to_string()));
+
+        // __same_dir__ implicit import
+        assert!(parsed.imports.iter().any(|i| i.path == "__same_dir__"));
+    }
+
+    #[test]
+    fn test_parse_hcl_variable_and_output() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "region" {
+  type    = string
+  default = "eu-west-1"
+}
+
+output "instance_ip" {
+  value = aws_instance.web.public_ip
+}
+"#;
+        let path = PathBuf::from("variables.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.symbols.contains(&"var.vpc_cidr".to_string()));
+        assert!(parsed.symbols.contains(&"var.region".to_string()));
+        assert!(parsed.symbols.contains(&"output.instance_ip".to_string()));
+    }
+
+    #[test]
+    fn test_parse_hcl_locals() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+locals {
+  env    = "prod"
+  region = "eu-west-1"
+  name   = "my-app"
+}
+"#;
+        let path = PathBuf::from("locals.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.symbols.contains(&"local.env".to_string()));
+        assert!(parsed.symbols.contains(&"local.region".to_string()));
+        assert!(parsed.symbols.contains(&"local.name".to_string()));
+    }
+
+    #[test]
+    fn test_parse_hcl_module() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+module "vpc" {
+  source = "./modules/vpc"
+  cidr   = var.vpc_cidr
+}
+
+module "database" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "5.0.0"
+}
+"#;
+        let path = PathBuf::from("modules.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        // Module symbols
+        assert!(parsed.symbols.contains(&"module.vpc".to_string()));
+        assert!(parsed.symbols.contains(&"module.database".to_string()));
+
+        // Module source imports (+ __same_dir__)
+        assert!(parsed.imports.iter().any(|i| i.path == "./modules/vpc" && i.alias == Some("vpc".to_string())));
+        assert!(parsed.imports.iter().any(|i| i.path == "terraform-aws-modules/rds/aws"));
+        assert!(parsed.imports.iter().any(|i| i.path == "__same_dir__"));
+    }
+
+    #[test]
+    fn test_parse_hcl_provider() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+provider "aws" {
+  region = "eu-west-1"
+}
+
+provider "google" {
+  project = "my-project"
+}
+"#;
+        let path = PathBuf::from("providers.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.symbols.contains(&"provider.aws".to_string()));
+        assert!(parsed.symbols.contains(&"provider.google".to_string()));
+    }
+
+    #[test]
+    fn test_parse_hcl_references() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.main.id
+}
+
+output "ip" {
+  value = aws_instance.web.public_ip
+}
+"#;
+        let path = PathBuf::from("refs.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        // aws_subnet.main reference from aws_instance.web (data.aws_ami is internal scope → filtered)
+        assert!(
+            parsed.function_calls.iter().any(|c| c.callee_name == "aws_subnet.main" && c.reason == "hcl-reference"),
+            "Expected aws_subnet.main reference, got: {:?}",
+            parsed.function_calls.iter().map(|c| &c.callee_name).collect::<Vec<_>>()
+        );
+        // aws_instance.web reference from output
+        assert!(
+            parsed.function_calls.iter().any(|c| c.callee_name == "aws_instance.web" && c.reason == "hcl-reference"),
+            "Expected aws_instance.web reference, got: {:?}",
+            parsed.function_calls.iter().map(|c| &c.callee_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_parse_hcl_complete_terraform() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+locals {
+  env    = "prod"
+  region = "eu-west-1"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+}
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+}
+
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.main.id
+}
+
+output "instance_ip" {
+  value = aws_instance.web.public_ip
+}
+
+module "vpc" {
+  source = "./modules/vpc"
+  cidr   = var.vpc_cidr
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+"#;
+        let path = PathBuf::from("complete.tf");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "hcl");
+
+        // 2 resources + 1 data source = 3 structs
+        assert_eq!(parsed.structs.len(), 3, "Expected 3 structs, got: {:?}", parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>());
+
+        // symbols: 2 resources + 1 data + 1 variable + 2 locals + 1 output + 1 module + 1 provider = 9
+        assert_eq!(parsed.symbols.len(), 9, "Expected 9 symbols, got: {:?}", parsed.symbols);
+
+        // imports: 1 module source + 1 __same_dir__ = 2
+        assert_eq!(parsed.imports.len(), 2, "Expected 2 imports, got: {:?}", parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>());
+
+        // references: aws_subnet.main + aws_instance.web (data.aws_ami is filtered as internal scope)
+        assert!(parsed.function_calls.len() >= 2, "Expected >= 2 references, got: {:?}", parsed.function_calls.iter().map(|c| &c.callee_name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_parse_hcl_tfvars_extension() {
+        let mut parser = CodeParser::new().unwrap();
+        let content = r#"
+vpc_cidr = "10.0.0.0/16"
+region   = "eu-west-1"
+"#;
+        let path = PathBuf::from("terraform.tfvars");
+        let result = parser.parse_file(&path, content);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.language, "hcl");
+        // tfvars has no blocks, just top-level attributes — we only expect __same_dir__
+        assert!(parsed.imports.iter().any(|i| i.path == "__same_dir__"));
     }
 
     #[test]
