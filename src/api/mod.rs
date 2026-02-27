@@ -4,6 +4,7 @@ pub mod auth_handlers;
 pub mod chat_handlers;
 pub mod code_handlers;
 pub mod handlers;
+pub mod hook_handlers;
 pub mod note_handlers;
 pub mod project_handlers;
 pub mod query;

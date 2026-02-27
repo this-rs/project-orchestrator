@@ -7,6 +7,7 @@ use super::auth_handlers;
 use super::chat_handlers;
 use super::code_handlers;
 use super::handlers::{self, OrchestratorState};
+use super::hook_handlers;
 use super::note_handlers;
 use super::project_handlers;
 use super::skill_handlers;
@@ -170,6 +171,14 @@ fn public_routes() -> Router<OrchestratorState> {
         .route("/hooks/wake", post(handlers::wake))
         // DEPRECATED: Use NATS for inter-process events. Kept for backward compatibility.
         .route("/internal/events", post(handlers::receive_event))
+        // ================================================================
+        // Hook activation (public — called from Claude Code hooks, rate limited)
+        // ================================================================
+        .route(
+            "/api/hooks/activate",
+            post(hook_handlers::activate_hook),
+        )
+        .route("/api/hooks/health", get(hook_handlers::hooks_health))
 }
 
 // ============================================================================
