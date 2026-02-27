@@ -122,6 +122,11 @@ pub struct MockGraphStore {
     pub file_embeddings: RwLock<HashMap<String, (Vec<f32>, String)>>,
     /// Function embeddings ("file_path::func_name" -> (embedding, model_name))
     pub function_embeddings: RwLock<HashMap<String, (Vec<f32>, String)>>,
+
+    // Skill stores
+    pub skills: RwLock<HashMap<Uuid, crate::skills::SkillNode>>,
+    /// skill_id -> Vec<(entity_type, entity_id)>
+    pub skill_members: RwLock<HashMap<Uuid, Vec<(String, Uuid)>>>,
 }
 
 #[allow(dead_code)]
@@ -194,6 +199,8 @@ impl MockGraphStore {
             note_synapses: RwLock::new(HashMap::new()),
             file_embeddings: RwLock::new(HashMap::new()),
             function_embeddings: RwLock::new(HashMap::new()),
+            skills: RwLock::new(HashMap::new()),
+            skill_members: RwLock::new(HashMap::new()),
         }
     }
 
@@ -6764,6 +6771,191 @@ impl GraphStore for MockGraphStore {
 
     async fn health_check(&self) -> anyhow::Result<bool> {
         Ok(true)
+    }
+
+    // ========================================================================
+    // Skill operations (Neural Skills)
+    // ========================================================================
+
+    async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        self.skills.write().await.insert(skill.id, skill.clone());
+        Ok(())
+    }
+
+    async fn get_skill(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::skills::SkillNode>> {
+        Ok(self.skills.read().await.get(&id).cloned())
+    }
+
+    async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        let mut store = self.skills.write().await;
+        if store.contains_key(&skill.id) {
+            store.insert(skill.id, skill.clone());
+            Ok(())
+        } else {
+            anyhow::bail!("Skill not found: {}", skill.id)
+        }
+    }
+
+    async fn delete_skill(&self, id: Uuid) -> anyhow::Result<bool> {
+        let existed = self.skills.write().await.remove(&id).is_some();
+        if existed {
+            self.skill_members.write().await.remove(&id);
+        }
+        Ok(existed)
+    }
+
+    async fn list_skills(
+        &self,
+        project_id: Uuid,
+        status: Option<crate::skills::SkillStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::skills::SkillNode>, usize)> {
+        let store = self.skills.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|s| s.project_id == project_id)
+            .filter(|s| status.map_or(true, |st| s.status == st))
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn get_skill_members(
+        &self,
+        skill_id: Uuid,
+    ) -> anyhow::Result<(Vec<crate::notes::Note>, Vec<DecisionNode>)> {
+        let members = self.skill_members.read().await;
+        let entries = members.get(&skill_id).cloned().unwrap_or_default();
+        let notes_store = self.notes.read().await;
+        let decisions_store = self.decisions.read().await;
+        let mut notes = Vec::new();
+        let mut decisions = Vec::new();
+        for (entity_type, entity_id) in &entries {
+            match entity_type.as_str() {
+                "note" => {
+                    if let Some(n) = notes_store.get(entity_id) {
+                        notes.push(n.clone());
+                    }
+                }
+                "decision" => {
+                    if let Some(d) = decisions_store.get(entity_id) {
+                        decisions.push(d.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((notes, decisions))
+    }
+
+    async fn add_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let entry = (entity_type.to_string(), entity_id);
+        let mut members = self.skill_members.write().await;
+        let list = members.entry(skill_id).or_default();
+        if !list.contains(&entry) {
+            list.push(entry);
+        }
+        Ok(())
+    }
+
+    async fn remove_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let entry = (entity_type.to_string(), entity_id);
+        let mut members = self.skill_members.write().await;
+        if let Some(list) = members.get_mut(&skill_id) {
+            let len_before = list.len();
+            list.retain(|e| e != &entry);
+            Ok(list.len() < len_before)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn get_skills_for_note(
+        &self,
+        note_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        let members = self.skill_members.read().await;
+        let skills_store = self.skills.read().await;
+        let mut result = Vec::new();
+        for (skill_id, entries) in members.iter() {
+            if entries
+                .iter()
+                .any(|(t, id)| t == "note" && *id == note_id)
+            {
+                if let Some(s) = skills_store.get(skill_id) {
+                    result.push(s.clone());
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_skills_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        let store = self.skills.read().await;
+        Ok(store
+            .values()
+            .filter(|s| s.project_id == project_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn activate_skill(
+        &self,
+        skill_id: Uuid,
+        _query: &str,
+    ) -> anyhow::Result<crate::skills::ActivatedSkillContext> {
+        let skill = self
+            .get_skill(skill_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_id))?;
+        Ok(crate::skills::ActivatedSkillContext {
+            skill,
+            activated_notes: vec![],
+            relevant_decisions: vec![],
+            context_text: String::new(),
+            confidence: 1.0,
+        })
+    }
+
+    async fn match_skills_by_trigger(
+        &self,
+        project_id: Uuid,
+        _input: &str,
+    ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
+        // Mock: return all active/emerging skills for the project
+        let store = self.skills.read().await;
+        Ok(store
+            .values()
+            .filter(|s| {
+                s.project_id == project_id
+                    && matches!(
+                        s.status,
+                        crate::skills::SkillStatus::Active
+                            | crate::skills::SkillStatus::Emerging
+                    )
+            })
+            .map(|s| (s.clone(), 1.0))
+            .collect())
     }
 }
 

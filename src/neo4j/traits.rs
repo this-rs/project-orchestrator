@@ -13,6 +13,7 @@ use crate::notes::{
 };
 use crate::parser::FunctionCall;
 use crate::plan::models::{TaskDetails, UpdateTaskRequest};
+use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus};
 use anyhow::Result;
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -1866,6 +1867,89 @@ pub trait GraphStore: Send + Sync {
     /// Delete all Process nodes and their STEP_IN_PROCESS relationships for a project.
     /// Returns the number of deleted entities.
     async fn delete_project_processes(&self, project_id: Uuid) -> Result<u64>;
+
+    // ========================================================================
+    // Skill operations (Neural Skills)
+    // ========================================================================
+
+    /// Create a new skill node with its BELONGS_TO relationship to project.
+    async fn create_skill(&self, skill: &SkillNode) -> Result<()>;
+
+    /// Get a skill by ID.
+    async fn get_skill(&self, id: Uuid) -> Result<Option<SkillNode>>;
+
+    /// Update a skill node (replaces all mutable fields).
+    async fn update_skill(&self, skill: &SkillNode) -> Result<()>;
+
+    /// Delete a skill and all its relationships (CONTAINS, COVERS, BELONGS_TO).
+    /// Returns true if the skill existed and was deleted.
+    async fn delete_skill(&self, id: Uuid) -> Result<bool>;
+
+    /// List skills for a project with optional status filter and pagination.
+    /// Returns (skills, total_count).
+    async fn list_skills(
+        &self,
+        project_id: Uuid,
+        status: Option<SkillStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<SkillNode>, usize)>;
+
+    // ========================================================================
+    // Skill membership operations
+    // ========================================================================
+
+    /// Get all member notes and decisions for a skill.
+    async fn get_skill_members(
+        &self,
+        skill_id: Uuid,
+    ) -> Result<(Vec<Note>, Vec<DecisionNode>)>;
+
+    /// Add a note or decision as a member of a skill.
+    /// `entity_type` must be "note" or "decision".
+    /// Uses MERGE for idempotence — calling twice is safe.
+    async fn add_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> Result<()>;
+
+    /// Remove a member (note or decision) from a skill.
+    /// Returns true if the relationship existed and was removed.
+    async fn remove_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> Result<bool>;
+
+    // ========================================================================
+    // Skill query & activation operations
+    // ========================================================================
+
+    /// Get all skills that contain a given note as member.
+    async fn get_skills_for_note(&self, note_id: Uuid) -> Result<Vec<SkillNode>>;
+
+    /// Get all skills belonging to a project (convenience for list without pagination).
+    async fn get_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>>;
+
+    /// Activate a skill: collect member notes (above min energy) and relevant
+    /// decisions, assemble context text. Returns the full activation payload.
+    async fn activate_skill(
+        &self,
+        skill_id: Uuid,
+        query: &str,
+    ) -> Result<ActivatedSkillContext>;
+
+    /// Match skills by evaluating trigger patterns against an input string.
+    /// Returns matching skills with their confidence scores, sorted descending.
+    /// Only matches Active/Emerging skills with reliable triggers.
+    async fn match_skills_by_trigger(
+        &self,
+        project_id: Uuid,
+        input: &str,
+    ) -> Result<Vec<(SkillNode, f64)>>;
 
     // ========================================================================
     // Health check
