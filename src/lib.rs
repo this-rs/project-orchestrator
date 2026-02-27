@@ -23,6 +23,7 @@ pub mod parser;
 pub mod plan;
 pub mod resolver;
 pub mod setup_claude;
+pub mod skills;
 pub mod update;
 
 #[cfg(test)]
