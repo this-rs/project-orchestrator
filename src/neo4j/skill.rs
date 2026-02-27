@@ -292,22 +292,24 @@ impl Neo4jClient {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<SkillNode>, usize)> {
-        // Build filter clause
-        let status_filter = match &status {
-            Some(s) => format!("AND s.status = '{}'", s),
-            None => String::new(),
-        };
+        // Use parameterized query to avoid Cypher injection
+        let status_str = status.as_ref().map(|s| s.to_string());
 
         // Count query
-        let count_cypher = format!(
-            r#"
-            MATCH (s:Skill {{project_id: $project_id}})
-            WHERE true {}
+        let count_cypher = r#"
+            MATCH (s:Skill {project_id: $project_id})
+            WHERE ($status IS NULL OR s.status = $status)
             RETURN count(s) AS total
-            "#,
-            status_filter
-        );
-        let count_q = query(&count_cypher).param("project_id", project_id.to_string());
+            "#;
+        let count_q = query(count_cypher)
+            .param("project_id", project_id.to_string())
+            .param(
+                "status",
+                status_str
+                    .clone()
+                    .map(neo4rs::BoltType::from)
+                    .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
+            );
         let mut count_result = self.graph.execute(count_q).await?;
         let total: usize = if let Some(row) = count_result.next().await? {
             row.get::<i64>("total").unwrap_or(0) as usize
@@ -320,19 +322,22 @@ impl Neo4jClient {
         }
 
         // Data query
-        let data_cypher = format!(
-            r#"
-            MATCH (s:Skill {{project_id: $project_id}})
-            WHERE true {}
+        let data_cypher = r#"
+            MATCH (s:Skill {project_id: $project_id})
+            WHERE ($status IS NULL OR s.status = $status)
             RETURN s
             ORDER BY s.energy DESC, s.name ASC
             SKIP $offset
             LIMIT $limit
-            "#,
-            status_filter
-        );
-        let data_q = query(&data_cypher)
+            "#;
+        let data_q = query(data_cypher)
             .param("project_id", project_id.to_string())
+            .param(
+                "status",
+                status_str
+                    .map(neo4rs::BoltType::from)
+                    .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
+            )
             .param("offset", offset as i64)
             .param("limit", limit as i64);
 

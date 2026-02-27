@@ -386,7 +386,15 @@ fn evaluate_regex_quality(
     skill_notes: &[Note],
     all_project_notes: &[Note],
 ) -> Option<f64> {
-    let regex = regex::Regex::new(&format!("(?i){}", pattern)).ok()?;
+    // Reject overly long patterns and limit regex compilation size
+    if pattern.len() > 500 {
+        return Some(0.0);
+    }
+    let regex = regex::RegexBuilder::new(&format!("(?i){}", pattern))
+        .size_limit(10_000)
+        .dfa_size_limit(10_000)
+        .build()
+        .ok()?;
 
     let total_skill = skill_notes.len();
     if total_skill == 0 {
@@ -417,8 +425,15 @@ fn note_matches_regex(note: &Note, regex: &regex::Regex) -> bool {
         }
     }
     // Check content (first 500 chars for performance)
-    let content_prefix = if note.content.len() > 500 {
-        &note.content[..500]
+    // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries
+    let content_prefix = if note.content.chars().count() > 500 {
+        let end = note
+            .content
+            .char_indices()
+            .nth(500)
+            .map(|(i, _)| i)
+            .unwrap_or(note.content.len());
+        &note.content[..end]
     } else {
         &note.content
     };

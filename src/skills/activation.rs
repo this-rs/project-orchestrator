@@ -18,7 +18,7 @@
 //!   avoiding per-trigger Neo4j round-trips.
 //! - **Context budget**: 3200 chars max (~800 tokens) to prevent additionalContext flooding.
 
-use regex::Regex;
+use regex::RegexBuilder;
 use uuid::Uuid;
 
 use std::sync::Arc;
@@ -423,7 +423,15 @@ pub fn evaluate_skill_match(
 /// - 1.0 if the regex matches the input
 /// - 0.0 if no match or regex compilation fails
 fn match_regex_trigger(trigger_pattern: &str, input: &str) -> f64 {
-    match Regex::new(trigger_pattern) {
+    // Reject overly long patterns to prevent compilation DoS
+    if trigger_pattern.len() > 500 {
+        return 0.0;
+    }
+    match RegexBuilder::new(trigger_pattern)
+        .size_limit(10_000)
+        .dfa_size_limit(10_000)
+        .build()
+    {
         Ok(re) => {
             if re.is_match(input) {
                 1.0
@@ -661,15 +669,22 @@ fn importance_badge(importance: &str) -> &'static str {
 }
 
 /// Truncate content to max_chars, taking only the first line or truncating.
+/// Uses char_indices to avoid panicking on multi-byte UTF-8 boundaries.
 fn truncate_content(content: &str, max_chars: usize) -> String {
     // Take first line
     let first_line = content.lines().next().unwrap_or(content);
     let clean = first_line.trim();
 
-    if clean.len() <= max_chars {
+    if clean.chars().count() <= max_chars {
         clean.to_string()
     } else {
-        format!("{}...", &clean[..max_chars.saturating_sub(3)])
+        let trunc_len = max_chars.saturating_sub(3);
+        let end = clean
+            .char_indices()
+            .nth(trunc_len)
+            .map(|(i, _)| i)
+            .unwrap_or(clean.len());
+        format!("{}...", &clean[..end])
     }
 }
 

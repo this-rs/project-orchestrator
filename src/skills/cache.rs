@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -66,9 +66,18 @@ impl CachedSkill {
             .iter()
             .filter_map(|trigger| {
                 let compiled = match trigger.pattern_type {
-                    TriggerType::Regex => Regex::new(&trigger.pattern_value)
-                        .ok()
-                        .map(CompiledTrigger::Regex),
+                    TriggerType::Regex => {
+                        if trigger.pattern_value.len() > 500 {
+                            None
+                        } else {
+                            RegexBuilder::new(&trigger.pattern_value)
+                                .size_limit(10_000)
+                                .dfa_size_limit(10_000)
+                                .build()
+                                .ok()
+                                .map(CompiledTrigger::Regex)
+                        }
+                    }
                     TriggerType::FileGlob => glob::Pattern::new(&trigger.pattern_value)
                         .ok()
                         .map(CompiledTrigger::FileGlob),

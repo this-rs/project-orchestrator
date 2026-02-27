@@ -119,13 +119,19 @@ fn format_section(heading: &str, notes: &[&Note]) -> String {
 }
 
 /// Truncate content to max_chars, appending "..." if truncated.
+/// Uses char_indices to avoid panicking on multi-byte UTF-8 boundaries.
 fn truncate_content(content: &str, max_chars: usize) -> String {
     // Take the first line or max_chars, whichever is shorter
     let first_line = content.lines().next().unwrap_or(content);
-    if first_line.len() <= max_chars {
+    if first_line.chars().count() <= max_chars {
         first_line.to_string()
     } else {
-        format!("{}...", &first_line[..max_chars])
+        let end = first_line
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(first_line.len());
+        format!("{}...", &first_line[..end])
     }
 }
 
