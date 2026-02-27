@@ -459,4 +459,50 @@ mod tests {
         let is_miss = buffer.record_activation(project_b, skill_id, "neo4j", None);
         assert!(!is_miss, "Different projects should be isolated");
     }
+
+    #[test]
+    fn test_five_activations_four_misses_triggers_penalty() {
+        // Spec scenario: 5 activations where 4 are followed by re-search on
+        // the same pattern → hit_rate = 1/5 = 0.2 → penalty candidate.
+        // Using min_activations_for_penalty = 5 to match this scenario.
+        let buffer = ActivationBuffer::new(FeedbackConfig {
+            max_buffer_size: 100,
+            miss_window_secs: 60,
+            min_activations_for_penalty: 5,
+            penalty_hit_rate_threshold: 0.3,
+            energy_penalty: 0.05,
+        });
+        let project_id = Uuid::new_v4();
+        let skill_id = Uuid::new_v4();
+
+        // Activation 1: "neo4j" → no miss (first time)
+        buffer.record_activation(project_id, skill_id, "neo4j", None);
+        // Activation 2: "neo4j" again → miss #1 (re-search = context wasn't helpful)
+        buffer.record_activation(project_id, skill_id, "neo4j", None);
+        // Activation 3: "neo4j" again → miss #2
+        buffer.record_activation(project_id, skill_id, "neo4j", None);
+        // Activation 4: "neo4j" again → miss #3
+        buffer.record_activation(project_id, skill_id, "neo4j", None);
+        // Activation 5: "neo4j" again → miss #4
+        buffer.record_activation(project_id, skill_id, "neo4j", None);
+
+        // Verify hit rate: 4 misses out of 5 → hit_rate = 1/5 = 0.2
+        let (hit_rate, total) = buffer.get_skill_hit_rate(skill_id).unwrap();
+        assert_eq!(total, 5);
+        assert!(
+            (hit_rate - 0.2).abs() < 0.01,
+            "Expected hit_rate ~0.2, got {}",
+            hit_rate
+        );
+
+        // Verify penalty candidate is produced (hit_rate 0.2 < 0.3 threshold)
+        let candidates = buffer.get_penalty_candidates();
+        assert_eq!(candidates.len(), 1, "Should produce exactly 1 penalty candidate");
+        assert_eq!(candidates[0].0, skill_id);
+        assert!(
+            candidates[0].1 < 0.3,
+            "Hit rate {} should be below 0.3 threshold",
+            candidates[0].1
+        );
+    }
 }

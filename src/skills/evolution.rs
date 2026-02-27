@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+use crate::notes::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::skills::detection::{jaccard_similarity, SkillCandidate};
 use crate::skills::models::SkillNode;
 
@@ -270,6 +271,40 @@ pub fn analyze_evolution(
 // Evolution Execution (applies changes to graph store)
 // ============================================================================
 
+/// Create an observation note to trace an evolution event.
+async fn trace_evolution_note(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    content: String,
+) {
+    let note = Note {
+        id: Uuid::new_v4(),
+        project_id: Some(project_id),
+        note_type: NoteType::Observation,
+        status: NoteStatus::Active,
+        importance: NoteImportance::Low,
+        scope: NoteScope::Project,
+        content,
+        tags: vec!["skill-evolution".to_string(), "auto-generated".to_string()],
+        anchors: vec![],
+        created_at: Utc::now(),
+        created_by: "skill-evolution".to_string(),
+        last_confirmed_at: None,
+        last_confirmed_by: None,
+        staleness_score: 0.0,
+        energy: 0.5, // Moderate initial energy — not critical knowledge
+        last_activated: Some(Utc::now()),
+        supersedes: None,
+        superseded_by: None,
+        changes: vec![],
+        assertion_rule: None,
+        last_assertion_result: None,
+    };
+    if let Err(e) = graph_store.create_note(&note).await {
+        warn!(error = %e, "Failed to create evolution observation note");
+    }
+}
+
 /// Execute evolution actions on the graph store.
 ///
 /// For each `SkillEvolution`:
@@ -327,12 +362,32 @@ pub async fn execute_evolution(
                 }
 
                 if !notes_to_add.is_empty() {
+                    trace_evolution_note(
+                        graph_store,
+                        project_id,
+                        format!(
+                            "Skill {} grew: +{} notes added",
+                            skill_id,
+                            notes_to_add.len()
+                        ),
+                    )
+                    .await;
                     result.grown.push(GrowEvent {
                         skill_id: *skill_id,
                         notes_added: notes_to_add.len(),
                     });
                 }
                 if !notes_to_remove.is_empty() {
+                    trace_evolution_note(
+                        graph_store,
+                        project_id,
+                        format!(
+                            "Skill {} shrunk: -{} notes removed",
+                            skill_id,
+                            notes_to_remove.len()
+                        ),
+                    )
+                    .await;
                     result.shrunk.push(ShrinkEvent {
                         skill_id: *skill_id,
                         notes_removed: notes_to_remove.len(),
@@ -399,6 +454,16 @@ pub async fn execute_evolution(
                             ),
                         });
 
+                        trace_evolution_note(
+                            graph_store,
+                            project_id,
+                            format!(
+                                "Skill merge: {} absorbed into survivor {}",
+                                absorbed.id, survivor_id
+                            ),
+                        )
+                        .await;
+
                         info!(
                             survivor = %survivor_id,
                             absorbed = %absorbed.id,
@@ -461,6 +526,17 @@ pub async fn execute_evolution(
                     new_skill_ids,
                 });
 
+                trace_evolution_note(
+                    graph_store,
+                    project_id,
+                    format!(
+                        "Skill {} split into {} sub-clusters",
+                        skill_id,
+                        candidates.len()
+                    ),
+                )
+                .await;
+
                 info!(original = %skill_id, "Split skill into sub-clusters");
             }
 
@@ -495,6 +571,15 @@ pub async fn execute_evolution(
                         skill.status = crate::skills::SkillStatus::Archived;
                         skill.updated_at = Utc::now();
                         graph_store.update_skill(&skill).await?;
+                        trace_evolution_note(
+                            graph_store,
+                            project_id,
+                            format!(
+                                "Skill {} ({}) orphaned and archived — no matching cluster",
+                                skill_id, skill.name
+                            ),
+                        )
+                        .await;
                         warn!(skill_id = %skill_id, name = %skill.name, "Orphaned skill archived — no matching cluster");
                     }
                 }
@@ -696,5 +781,69 @@ mod tests {
             .filter(|e| matches!(e, SkillEvolution::Stable { .. }))
             .count();
         assert_eq!(stable_count, 2, "Expected 2 stable evolutions");
+    }
+
+    #[test]
+    fn test_evolution_split_one_skill_into_two_clusters() {
+        let skill_id = Uuid::new_v4();
+        // Skill has 6 members that will split into 2 distinct clusters
+        let existing = vec![(
+            skill_id,
+            vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "x".into(),
+                "y".into(),
+                "z".into(),
+            ],
+        )];
+
+        // Two new clusters, each overlapping >= 0.5 with the original
+        // but each representing a sub-cluster
+        // Candidate 0: {a, b, c, x} → Jaccard vs {a,b,c,x,y,z} = 4/6 = 0.67 (≥ 0.5)
+        // Candidate 1: {x, y, z, a} → Jaccard vs {a,b,c,x,y,z} = 4/6 = 0.67 (≥ 0.5)
+        let candidates = vec![
+            make_candidate(0, vec!["a", "b", "c", "x"]),
+            make_candidate(1, vec!["x", "y", "z", "a"]),
+        ];
+
+        // Use a low threshold (0.5) so both candidates match the single skill
+        let evolutions = analyze_evolution(&existing, &candidates, 0.5);
+
+        let split_count = evolutions
+            .iter()
+            .filter(|e| matches!(e, SkillEvolution::Split { .. }))
+            .count();
+        assert_eq!(
+            split_count, 1,
+            "Expected 1 split, got evolutions: {:?}",
+            evolutions
+                .iter()
+                .map(|e| match e {
+                    SkillEvolution::Stable { skill_id, .. } => format!("Stable({})", skill_id),
+                    SkillEvolution::Merge { skill_ids, .. } => format!("Merge({:?})", skill_ids),
+                    SkillEvolution::Split { skill_id, .. } => format!("Split({})", skill_id),
+                    SkillEvolution::New { .. } => "New".to_string(),
+                    SkillEvolution::Orphan { skill_id } => format!("Orphan({})", skill_id),
+                })
+                .collect::<Vec<_>>()
+        );
+
+        // Verify the split details
+        match &evolutions
+            .iter()
+            .find(|e| matches!(e, SkillEvolution::Split { .. }))
+            .unwrap()
+        {
+            SkillEvolution::Split {
+                skill_id: sid,
+                candidates: split_candidates,
+            } => {
+                assert_eq!(*sid, skill_id);
+                assert_eq!(split_candidates.len(), 2);
+            }
+            _ => unreachable!(),
+        }
     }
 }

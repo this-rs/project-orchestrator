@@ -65,8 +65,11 @@ pub struct SkillMaintenanceConfig {
     /// Minimum new synapses from backfill to trigger re-detection (default: 50)
     pub backfill_recluster_threshold: usize,
 
-    // --- Scheduler (optional) ---
-    /// Whether automatic maintenance is enabled (default: false)
+    // --- Scheduler (optional, reserved for future background timer) ---
+    /// Whether automatic background maintenance is enabled (default: false).
+    /// When false, maintenance must be triggered manually via the REST API
+    /// (POST /api/admin/skill-maintenance) or MCP admin tool (maintain_skills).
+    /// Background timer integration is planned for a future release.
     pub enabled: bool,
 }
 
