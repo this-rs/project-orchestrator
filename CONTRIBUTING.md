@@ -47,7 +47,7 @@ Thank you for your interest in contributing to Project Orchestrator! This docume
 - Ensure all tests pass before submitting a PR: `cargo test`
 - **Unit tests** use mock backends (`MockGraphStore`, `MockSearchStore`) — no external services needed
 - **Integration tests** require Neo4j and Meilisearch running
-- Current test count: **752 tests** (unit + integration)
+- Current test count: **1992 tests** (unit + integration)
 
 ### Commit Messages
 
@@ -107,10 +107,10 @@ src/
 ├── chat/          # Chat system: WebSocket, sessions, Claude integration
 ├── config/        # YAML configuration system with env var overrides
 ├── events/        # Event bus: CRUD notifications via WebSocket + NATS inter-process sync
-├── mcp/           # MCP server and tool definitions (145 tools)
+├── mcp/           # MCP server and tool definitions (19 mega-tools)
 ├── neo4j/         # Neo4j client, models, GraphStore trait + mock
 ├── meilisearch/   # Search client, SearchStore trait + mock
-├── parser/        # Tree-sitter code parsing (12 languages)
+├── parser/        # Tree-sitter code parsing (16 languages)
 ├── plan/          # Plan and task management
 ├── notes/         # Knowledge notes system
 ├── orchestrator/  # Core orchestration logic
@@ -123,7 +123,7 @@ tests/
 └── parser_tests.rs      # Parser unit tests
 ```
 
-> **Note:** The project has 752 tests total, including unit tests with mock backends (no external services required).
+> **Note:** The project has 1992 tests total, including unit tests with mock backends (no external services required).
 
 ## Adding New Features
 

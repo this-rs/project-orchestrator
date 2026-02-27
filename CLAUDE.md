@@ -28,7 +28,7 @@ For user-facing documentation, see the `docs/` folder:
 - Meilisearch for semantic search across code and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
-- MCP server for Claude Code integration (145 tools)
+- MCP server for Claude Code integration (19 mega-tools)
 - File watcher for auto-syncing changes
 - Authentication system: Google OAuth2, generic OIDC, password login + JWT, deny-by-default middleware
 - Chat WebSocket for real-time conversational AI (migrated from SSE)
@@ -39,7 +39,7 @@ For user-facing documentation, see the `docs/` folder:
 
 ```bash
 cargo build --release          # Build release binary
-cargo test                     # Run all tests (752 total, mock backends)
+cargo test                     # Run all tests (1992 total, mock backends)
 cargo clippy                   # Lint
 cargo fmt                      # Format
 ```
@@ -109,122 +109,31 @@ Or use command-line arguments:
 }
 ```
 
-### Available MCP Tools
+### Available MCP Mega-Tools
 
-The MCP server exposes 145 tools organized by category:
+The MCP server exposes **19 mega-tools**, each with an `action` parameter to select the operation:
 
-**Project Management (8 tools)**
-- `list_projects` - List all registered projects
-- `get_project` - Get project details by slug
-- `register_project` - Register a new project
-- `sync_project` - Sync project files to knowledge graph
-- `search_code` - Semantic search across code
-- `get_project_stats` - Get project statistics
-- `get_roadmap` - Get project roadmap with milestones/releases
-- `unregister_project` - Remove a project
-
-**Plan Management (12 tools)**
-- `list_plans` - List all plans with filtering
-- `create_plan` - Create a new plan
-- `get_plan` - Get plan details
-- `update_plan` - Update plan status/details
-- `link_plan_to_project` - Associate plan with project
-- `get_plan_context` - Get rich context for agent work
-- `get_dependency_graph` - Get task dependency visualization
-- `get_critical_path` - Find longest dependency chain
-- `add_constraint` - Add plan constraint
-- `list_constraints` - List plan constraints
-- `remove_constraint` - Remove a constraint
-- `generate_prompt` - Generate agent prompt with context
-
-**Task Management (16 tools)**
-- `list_tasks` - List tasks with filtering
-- `create_task` - Create a new task
-- `get_task` - Get task details
-- `update_task` - Update task
-- `get_next_task` - Get next available task
-- `add_task_dependencies` - Add dependencies to task
-- `remove_task_dependency` - Remove a dependency
-- `get_task_blockers` - Get blocking tasks
-- `get_blocked_tasks` - Get tasks blocked by this one
-- `create_step` - Add step to task
-- `list_steps` - List task steps
-- `update_step` - Update step status
-- `get_step_progress` - Get step completion progress
-- `record_decision` - Record a decision
-- `list_decisions` - List decisions for a task
-- `assign_task` - Assign task to agent
-
-**Commit Tracking (5 tools)**
-- `create_commit` - Register a commit
-- `link_commit_to_task` - Link commit to task
-- `link_commit_to_plan` - Link commit to plan
-- `get_task_commits` - Get commits for task
-- `get_plan_commits` - Get commits for plan
-
-**Release Management (6 tools)**
-- `create_release` - Create a release
-- `list_releases` - List project releases
-- `get_release` - Get release details
-- `update_release` - Update release
-- `add_task_to_release` - Add task to release
-- `add_commit_to_release` - Add commit to release
-
-**Milestone Management (6 tools)**
-- `create_milestone` - Create a milestone
-- `list_milestones` - List project milestones
-- `get_milestone` - Get milestone details
-- `update_milestone` - Update milestone
-- `add_task_to_milestone` - Add task to milestone
-- `get_milestone_progress` - Get completion progress
-
-**Code Exploration (9 tools)**
-- `get_file_symbols` - Get symbols in a file
-- `find_symbol_references` - Find references to a symbol
-- `get_file_dependencies` - Get file imports/dependents
-- `get_call_graph` - Get function call graph
-- `analyze_impact` - Analyze change impact
-- `get_codebase_overview` - Get architecture overview
-- `find_similar_code` - Find similar code snippets
-- `find_trait_implementations` - Find trait implementations
-- `get_type_traits` - Get traits for a type
-
-**Workspace Management (9 tools)**
-- `list_workspaces` - List all workspaces
-- `create_workspace` - Create workspace to group projects
-- `get_workspace` - Get workspace details
-- `update_workspace` - Update workspace
-- `delete_workspace` - Delete workspace
-- `get_workspace_overview` - Overview with projects, milestones, resources
-- `list_workspace_projects` - List projects in workspace
-- `add_project_to_workspace` - Add project to workspace
-- `remove_project_from_workspace` - Remove project from workspace
-
-**Workspace Milestones (7 tools)**
-- `list_workspace_milestones` - List cross-project milestones
-- `create_workspace_milestone` - Create cross-project milestone
-- `get_workspace_milestone` - Get milestone details
-- `update_workspace_milestone` - Update milestone
-- `delete_workspace_milestone` - Delete milestone
-- `add_task_to_workspace_milestone` - Add task from any project
-- `get_workspace_milestone_progress` - Get completion progress
-
-**Resources (5 tools)**
-- `list_resources` - List shared resources (API contracts, schemas)
-- `create_resource` - Create resource reference
-- `get_resource` - Get resource details
-- `delete_resource` - Delete resource
-- `link_resource_to_project` - Link resource (implements/uses)
-
-**Components & Topology (8 tools)**
-- `list_components` - List workspace components
-- `create_component` - Create component (Service, Database, etc.)
-- `get_component` - Get component details
-- `delete_component` - Delete component
-- `add_component_dependency` - Add component dependency
-- `remove_component_dependency` - Remove dependency
-- `map_component_to_project` - Map component to project
-- `get_workspace_topology` - Get full topology graph
+| Mega-Tool | Actions | Description |
+|-----------|---------|-------------|
+| `project` | 8 | Project CRUD, sync, roadmap |
+| `plan` | 10 | Plan lifecycle, dependency graph, critical path |
+| `task` | 13 | Task CRUD, dependencies, blockers, context, prompt |
+| `step` | 6 | Step CRUD, progress tracking |
+| `decision` | 12 | Decisions, semantic search, affects tracking, timeline |
+| `constraint` | 5 | Plan constraints (performance, security, style) |
+| `release` | 8 | Release management with tasks and commits |
+| `milestone` | 9 | Milestones with progress and plan linking |
+| `commit` | 7 | Git commit tracking, file history |
+| `note` | 20 | Knowledge notes, semantic search, propagation |
+| `workspace` | 10 | Multi-project workspaces, topology |
+| `workspace_milestone` | 10 | Cross-project milestones |
+| `resource` | 6 | Shared API contracts, schemas |
+| `component` | 8 | Service topology and dependencies |
+| `chat` | 7 | Chat sessions, messages, delegation |
+| `feature_graph` | 6 | Feature graphs, auto-build from code |
+| `code` | 30 | Code search, call graphs, impact analysis, communities, health, processes |
+| `admin` | 23 | Sync, watch, Knowledge Fabric, neural maintenance |
+| `skill` | 12 | Neural skills detection, activation, export/import |
 
 ### Debug Logging
 
@@ -259,7 +168,7 @@ docs/
 │   └── cursor.md            # Cursor IDE setup
 ├── api/
 │   ├── reference.md         # REST API documentation
-│   └── mcp-tools.md         # MCP tools reference (145 tools)
+│   └── mcp-tools.md         # MCP tools reference (19 mega-tools)
 └── guides/
     ├── getting-started.md   # Tutorial for new users
     ├── multi-agent-workflow.md # Multi-agent coordination
@@ -295,7 +204,7 @@ src/
 ├── mcp/
 │   ├── mod.rs           # MCP module exports
 │   ├── protocol.rs      # JSON-RPC 2.0 types
-│   ├── tools.rs         # Tool definitions (145 tools)
+│   ├── tools.rs         # Mega-tool definitions (19 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
 ├── neo4j/
@@ -319,7 +228,7 @@ src/
 ├── parser/
 │   ├── mod.rs           # CodeParser, SupportedLanguage, dispatch
 │   ├── helpers.rs       # Shared utility functions
-│   └── languages/       # Per-language extractors (12 languages)
+│   └── languages/       # Per-language extractors (16 languages)
 ├── plan/
 │   ├── manager.rs       # Plan/Task CRUD operations
 │   └── models.rs        # Plan/Task/Decision types
@@ -338,7 +247,7 @@ src/
 tests/
 ├── api_tests.rs         # HTTP API tests (29)
 ├── integration_tests.rs # Database tests (8)
-└── parser_tests.rs      # Parser tests (33)
+└── parser_tests.rs      # Parser tests (48)
 ```
 
 ## Key APIs
@@ -606,7 +515,7 @@ event: error             → {"message": "..."}
 2. **Error handling**: Use `anyhow::Result` and `AppError` for HTTP errors
 3. **State**: `ServerState` contains `orchestrator`, `watcher`, and `chat_manager`
 4. **Tests**: All API tests require the server running on port 8080
-5. **File extensions**: Parser supports 12 languages:
+5. **File extensions**: Parser supports 16 languages:
    - Rust: `.rs`
    - TypeScript/JavaScript: `.ts`, `.tsx`, `.js`, `.jsx`
    - Python: `.py`
@@ -619,6 +528,10 @@ event: error             → {"message": "..."}
    - Kotlin: `.kt`, `.kts`
    - Swift: `.swift`
    - Bash: `.sh`, `.bash`
+   - C#: `.cs`
+   - Scala: `.scala`
+   - Zig: `.zig`
+   - HCL/Terraform: `.tf`, `.tfvars`
 
 ## Testing
 
@@ -695,6 +608,18 @@ Note nodes have:
 - `importance`: critical, high, medium, low
 - `staleness_score`: 0.0 - 1.0 (auto-calculated based on time decay)
 - `scope_type`, `scope_path`: hierarchical scope (project, module, file, function)
+
+### Knowledge Fabric (multi-layer graph)
+- `(Commit)-[:TOUCHES {additions, deletions}]->(File)` - Commit modifies a file
+- `(File)-[:CO_CHANGED {weight, count}]->(File)` - Files frequently modified together
+- `(Note)-[:SYNAPSE {weight}]->(Note)` - Neural connections between notes (spreading activation)
+- `(Decision)-[:AFFECTS]->(File|Function)` - Architectural decision impacts code
+- `(ChatSession)-[:DISCUSSED]->(File|Function)` - Files discussed in a conversation
+
+### Neural Skills
+- `(Skill)-[:HAS_MEMBER]->(Note|Decision)` - Skill contains knowledge members
+- Skills are emergent knowledge clusters with energy, cohesion, and trigger patterns
+- Spreading activation reinforces SYNAPSE weights between co-activated notes
 
 ## Meilisearch Indexing
 
