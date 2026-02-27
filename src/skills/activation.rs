@@ -410,6 +410,15 @@ pub fn evaluate_skill_match(
                     false
                 }
             }
+            TriggerType::McpAction => {
+                // McpAction matches the extracted MCP pattern ("mega_tool action ...")
+                // via prefix check on "mega_tool" or "mega_tool action" (colon → space)
+                if let Some(pat) = pattern {
+                    match_mcp_action_trigger(&trigger.pattern_value, pat)
+                } else {
+                    false
+                }
+            }
             TriggerType::Semantic => {
                 // Semantic matching skipped in hot path
                 // (FastEmbed ~20-50ms = 10-25% of 200ms budget)
@@ -457,6 +466,52 @@ fn match_file_glob_trigger(trigger_pattern: &str, file_path: &str) -> bool {
         Ok(pat) => pat.matches(file_path),
         Err(_) => false,
     }
+}
+
+/// Match an MCP action trigger against an extracted MCP pattern.
+///
+/// The trigger pattern_value is either:
+/// - `"mega_tool"` → matches any action of that tool (e.g., `"note"` matches `"note create ..."`)
+/// - `"mega_tool:action"` → matches a specific action (e.g., `"note:create"` matches `"note create ..."`)
+///
+/// The input pattern (from `extract_mcp_pattern`) is space-separated: `"mega_tool action key1 key2"`.
+pub fn match_mcp_action_trigger(trigger_pattern: &str, input: &str) -> bool {
+    // Split trigger: "note:create" → ("note", Some("create"))
+    let (trigger_tool, trigger_action) = match trigger_pattern.split_once(':') {
+        Some((tool, action)) => (tool.trim(), Some(action.trim())),
+        None => (trigger_pattern.trim(), None),
+    };
+
+    if trigger_tool.is_empty() {
+        return false;
+    }
+
+    // Split input: "note create Always use parameterized queries" → ["note", "create", ...]
+    let mut parts = input.split_whitespace();
+    let input_tool = match parts.next() {
+        Some(t) => t,
+        None => return false,
+    };
+
+    // Tool name must match (case-insensitive)
+    if !input_tool.eq_ignore_ascii_case(trigger_tool) {
+        return false;
+    }
+
+    // If trigger specifies an action, it must also match
+    if let Some(action) = trigger_action {
+        if !action.is_empty() {
+            let input_action = match parts.next() {
+                Some(a) => a,
+                None => return false,
+            };
+            if !input_action.eq_ignore_ascii_case(action) {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 // ============================================================================
@@ -1348,6 +1403,79 @@ mod tests {
         // Both within budget (use chars count for consistency)
         assert!(context_with_decisions.chars().count() <= 3200);
         assert!(context_without_decisions.chars().count() <= 3200);
+    }
+
+    // --- McpAction trigger matching ---
+
+    #[test]
+    fn test_mcp_action_trigger_tool_only_matches() {
+        // Trigger "note" matches any input starting with "note"
+        assert!(match_mcp_action_trigger("note", "note create Always use parameterized queries"));
+        assert!(match_mcp_action_trigger("note", "note search some query"));
+        assert!(match_mcp_action_trigger("task", "task get_next plan_id=abc"));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_tool_and_action_matches() {
+        // Trigger "note:create" matches input "note create ..."
+        assert!(match_mcp_action_trigger("note:create", "note create Always use parameterized queries"));
+        assert!(match_mcp_action_trigger("task:update", "task update status=completed"));
+        assert!(match_mcp_action_trigger("code:analyze_impact", "code analyze_impact /src/main.rs"));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_case_insensitive() {
+        assert!(match_mcp_action_trigger("Note", "note create foo"));
+        assert!(match_mcp_action_trigger("note:CREATE", "note create foo"));
+        assert!(match_mcp_action_trigger("NOTE:Create", "note create foo"));
+        assert!(match_mcp_action_trigger("task", "TASK update bar"));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_no_match_different_tool() {
+        assert!(!match_mcp_action_trigger("note", "task create something"));
+        assert!(!match_mcp_action_trigger("commit", "note create something"));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_no_match_different_action() {
+        // Trigger "note:create" should NOT match "note search ..."
+        assert!(!match_mcp_action_trigger("note:create", "note search foo"));
+        assert!(!match_mcp_action_trigger("task:update", "task create bar"));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_tool_only_no_action_in_input() {
+        // Trigger "note" (tool-only) should match even input with only tool name
+        assert!(match_mcp_action_trigger("note", "note"));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_tool_action_but_input_has_no_action() {
+        // Trigger "note:create" but input is just "note" → no match
+        assert!(!match_mcp_action_trigger("note:create", "note"));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_empty_inputs() {
+        assert!(!match_mcp_action_trigger("", "note create"));
+        assert!(!match_mcp_action_trigger("note", ""));
+        assert!(!match_mcp_action_trigger("", ""));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_whitespace_handling() {
+        // Trigger with spaces around colon
+        assert!(match_mcp_action_trigger(" note : create ", "note create foo"));
+        // Input with extra whitespace
+        assert!(match_mcp_action_trigger("note:create", "  note   create   foo  "));
+    }
+
+    #[test]
+    fn test_mcp_action_trigger_empty_action_after_colon() {
+        // "note:" — empty action means tool-only match
+        assert!(match_mcp_action_trigger("note:", "note create foo"));
+        assert!(match_mcp_action_trigger("note:", "note"));
     }
 
     // --- Config defaults ---

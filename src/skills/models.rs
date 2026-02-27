@@ -109,6 +109,9 @@ pub enum TriggerType {
     FileGlob,
     /// Semantic vector centroid (embedding cosine similarity)
     Semantic,
+    /// MCP mega-tool action pattern (e.g., `note`, `note:create`, `task:create`)
+    /// Matches against the extracted MCP pattern via prefix check.
+    McpAction,
 }
 
 impl fmt::Display for TriggerType {
@@ -117,6 +120,7 @@ impl fmt::Display for TriggerType {
             Self::Regex => write!(f, "regex"),
             Self::FileGlob => write!(f, "file_glob"),
             Self::Semantic => write!(f, "semantic"),
+            Self::McpAction => write!(f, "mcp_action"),
         }
     }
 }
@@ -129,6 +133,7 @@ impl FromStr for TriggerType {
             "regex" => Ok(Self::Regex),
             "fileglob" | "glob" => Ok(Self::FileGlob),
             "semantic" => Ok(Self::Semantic),
+            "mcpaction" | "mcp" => Ok(Self::McpAction),
             _ => Err(format!("Unknown trigger type: {}", s)),
         }
     }
@@ -151,6 +156,7 @@ pub struct SkillTrigger {
     /// - Regex: a regular expression string
     /// - FileGlob: a glob pattern (e.g., `src/api/**`)
     /// - Semantic: JSON-encoded embedding vector centroid
+    /// - McpAction: `mega_tool` or `mega_tool:action` (e.g., `note`, `note:create`)
     pub pattern_value: String,
     /// Minimum confidence score for this trigger to fire (0.0-1.0)
     #[serde(default = "default_confidence_threshold")]
@@ -191,6 +197,20 @@ impl SkillTrigger {
         Self {
             pattern_type: TriggerType::Semantic,
             pattern_value: embedding_json.into(),
+            confidence_threshold: confidence.clamp(0.0, 1.0),
+            quality_score: None,
+        }
+    }
+
+    /// Create a new McpAction trigger.
+    ///
+    /// `pattern` is either:
+    /// - `"mega_tool"` to match any action of that tool (e.g., `"note"`)
+    /// - `"mega_tool:action"` to match a specific action (e.g., `"note:create"`)
+    pub fn mcp_action(pattern: impl Into<String>, confidence: f64) -> Self {
+        Self {
+            pattern_type: TriggerType::McpAction,
+            pattern_value: pattern.into(),
             confidence_threshold: confidence.clamp(0.0, 1.0),
             quality_score: None,
         }

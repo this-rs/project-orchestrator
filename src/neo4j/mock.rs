@@ -7033,6 +7033,12 @@ impl GraphStore for MockGraphStore {
                         // Semantic triggers can't be evaluated in mock
                         false
                     }
+                    crate::skills::TriggerType::McpAction => {
+                        crate::skills::activation::match_mcp_action_trigger(
+                            &trigger.pattern_value,
+                            input,
+                        )
+                    }
                 };
                 if matched {
                     let c = trigger.confidence_threshold;

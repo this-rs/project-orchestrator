@@ -48,6 +48,8 @@ pub enum CompiledTrigger {
     FileGlob(glob::Pattern),
     /// Semantic vector — not compiled, just stored for potential future use.
     Semantic(String),
+    /// MCP action pattern — stored as-is for prefix matching (no compilation needed).
+    McpAction(String),
 }
 
 /// A skill with its triggers pre-compiled for fast matching.
@@ -83,6 +85,9 @@ impl CachedSkill {
                     TriggerType::FileGlob => glob::Pattern::new(&trigger.pattern_value)
                         .ok()
                         .map(CompiledTrigger::FileGlob),
+                    TriggerType::McpAction => {
+                        Some(CompiledTrigger::McpAction(trigger.pattern_value.clone()))
+                    }
                     TriggerType::Semantic => {
                         Some(CompiledTrigger::Semantic(trigger.pattern_value.clone()))
                     }
@@ -302,6 +307,12 @@ pub fn evaluate_cached_skill(
                 let target = file_context.or(pattern);
                 target.is_some_and(|file| glob_pat.matches(file))
             }
+            CompiledTrigger::McpAction(mcp_pattern) => {
+                // Delegate to the same matching logic as activation.rs
+                pattern.is_some_and(|pat| {
+                    crate::skills::activation::match_mcp_action_trigger(mcp_pattern, pat)
+                })
+            }
             CompiledTrigger::Semantic(_) => {
                 // Semantic matching skipped in hot path
                 false
@@ -336,6 +347,7 @@ mod tests {
                 TriggerType::Regex => SkillTrigger::regex(val, 0.5),
                 TriggerType::FileGlob => SkillTrigger::file_glob(val, 0.5),
                 TriggerType::Semantic => SkillTrigger::semantic(val, 0.5),
+                TriggerType::McpAction => SkillTrigger::mcp_action(val, 0.5),
             })
             .collect();
         skill
