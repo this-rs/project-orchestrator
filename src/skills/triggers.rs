@@ -1,8 +1,9 @@
 //! Trigger Pattern Generation — Auto-generate SkillTrigger patterns from note analysis.
 //!
-//! Three types of triggers are generated:
+//! Four types of triggers are generated:
 //! - **FileGlob**: From file paths linked to member notes (via LINKED_TO anchors)
 //! - **Regex**: From frequent tags and content keywords
+//! - **McpAction**: From MCP-related tags (auto-detected from `mcp-usage` tagged notes)
 //! - **Semantic**: From embedding centroid of member notes (if available)
 
 use crate::notes::{EntityType, Note};
@@ -298,6 +299,96 @@ fn regex_escape(s: &str) -> String {
 }
 
 // ============================================================================
+// MCP Action Triggers
+// ============================================================================
+
+/// Known MCP mega-tool names that can appear in tags.
+const MCP_MEGA_TOOLS: &[&str] = &[
+    "project",
+    "plan",
+    "task",
+    "step",
+    "decision",
+    "constraint",
+    "release",
+    "milestone",
+    "commit",
+    "note",
+    "workspace",
+    "workspace_milestone",
+    "resource",
+    "component",
+    "chat",
+    "feature_graph",
+    "code",
+    "admin",
+    "skill",
+];
+
+/// Generate McpAction triggers from notes tagged with MCP-related tags.
+///
+/// Heuristic:
+/// 1. Check if ≥30% of notes have an "mcp-usage" tag (indicating this skill is MCP-related)
+/// 2. Scan tags for mega-tool names (e.g., "task", "note", "code")
+/// 3. Generate one McpAction trigger per mega-tool found in ≥2 notes
+///
+/// Returns empty vec if the skill's notes don't appear MCP-related.
+pub fn generate_mcp_action_triggers(notes: &[Note]) -> Vec<SkillTrigger> {
+    if notes.is_empty() {
+        return Vec::new();
+    }
+
+    let total = notes.len() as f64;
+
+    // Check if this cluster is MCP-related (≥30% of notes have mcp-usage tag)
+    let mcp_tagged = notes
+        .iter()
+        .filter(|n| n.tags.iter().any(|t| t == "mcp-usage"))
+        .count() as f64;
+
+    if mcp_tagged / total < 0.3 {
+        return Vec::new();
+    }
+
+    // Count mega-tool names in tags
+    let mut tool_freq: HashMap<&str, usize> = HashMap::new();
+    for note in notes {
+        let mut seen = HashSet::new();
+        for tag in &note.tags {
+            let tag_lower = tag.to_lowercase();
+            for tool in MCP_MEGA_TOOLS {
+                if tag_lower == *tool && seen.insert(*tool) {
+                    *tool_freq.entry(tool).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // Generate triggers for tools appearing in ≥2 notes (or ≥1 if few notes)
+    let min_freq = if notes.len() <= 3 { 1 } else { 2 };
+    let mut triggers = Vec::new();
+
+    for (tool, count) in &tool_freq {
+        if *count >= min_freq {
+            // Confidence based on coverage within the cluster
+            let coverage = *count as f64 / total;
+            let confidence = (0.5 + coverage * 0.3).min(0.85);
+            triggers.push(SkillTrigger::mcp_action(tool.to_string(), confidence));
+        }
+    }
+
+    // Sort by confidence descending and cap at 5
+    triggers.sort_by(|a, b| {
+        b.confidence_threshold
+            .partial_cmp(&a.confidence_threshold)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    triggers.truncate(5);
+
+    triggers
+}
+
+// ============================================================================
 // Semantic Triggers
 // ============================================================================
 
@@ -385,7 +476,8 @@ pub fn evaluate_trigger_quality(
         TriggerType::FileGlob => {
             evaluate_file_glob_quality(&trigger.pattern_value, skill_notes, all_project_notes)
         }
-        TriggerType::Semantic => None, // Semantic triggers are evaluated at activation time
+        TriggerType::McpAction => None, // McpAction triggers are simple prefix match, no quality metric
+        TriggerType::Semantic => None,  // Semantic triggers are evaluated at activation time
     }
 }
 
@@ -527,12 +619,13 @@ fn compute_f1(true_positives: usize, all_positives: usize, total_relevant: usize
 /// Result of trigger generation for a skill.
 #[derive(Debug, Clone)]
 pub struct TriggerGenerationResult {
-    /// Generated triggers (FileGlob, Regex, Semantic)
+    /// Generated triggers (FileGlob, Regex, Semantic, McpAction)
     pub triggers: Vec<SkillTrigger>,
     /// Summary statistics
     pub file_glob_count: usize,
     pub regex_count: usize,
     pub semantic_count: usize,
+    pub mcp_action_count: usize,
 }
 
 /// Generate all trigger patterns for a skill from its member notes.
@@ -564,7 +657,12 @@ pub fn generate_all_triggers(
     let regex_count = regex_triggers.len();
     all_triggers.extend(regex_triggers);
 
-    // 3. Semantic from embeddings (optional) — quality is None (evaluated at activation)
+    // 3. McpAction from mcp-usage tagged notes
+    let mut mcp_triggers = generate_mcp_action_triggers(skill_notes);
+    let mcp_action_count = mcp_triggers.len();
+    all_triggers.append(&mut mcp_triggers);
+
+    // 4. Semantic from embeddings (optional) — quality is None (evaluated at activation)
     let semantic_count;
     if let Some(semantic) = generate_semantic_trigger(embeddings, 0.75) {
         semantic_count = 1;
@@ -578,6 +676,7 @@ pub fn generate_all_triggers(
         file_glob_count,
         regex_count,
         semantic_count,
+        mcp_action_count,
     }
 }
 
@@ -1042,5 +1141,210 @@ mod tests {
         let paths: Vec<&str> = vec![];
         let globs = find_common_glob_patterns(&paths);
         assert!(globs.is_empty());
+    }
+
+    // ================================================================
+    // MCP Action trigger generation tests
+    // ================================================================
+
+    fn make_mcp_note(tags: Vec<&str>, content: &str) -> Note {
+        make_note_with_anchors(tags, content, vec![])
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_empty_notes() {
+        let triggers = generate_mcp_action_triggers(&[]);
+        assert!(
+            triggers.is_empty(),
+            "Empty notes should produce no triggers"
+        );
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_no_mcp_usage_tag() {
+        // Notes without "mcp-usage" tag → no triggers (threshold 30% not met)
+        let notes = vec![
+            make_mcp_note(vec!["note", "api"], "Some note about API"),
+            make_mcp_note(vec!["task", "refactor"], "Some note about tasks"),
+        ];
+        let triggers = generate_mcp_action_triggers(&notes);
+        assert!(triggers.is_empty(), "No mcp-usage tag → no triggers");
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_below_threshold() {
+        // Only 1/5 = 20% have mcp-usage → below 30% threshold
+        let notes = vec![
+            make_mcp_note(vec!["mcp-usage", "note"], "MCP note guide"),
+            make_mcp_note(vec!["api"], "API handler"),
+            make_mcp_note(vec!["refactor"], "Refactor"),
+            make_mcp_note(vec!["test"], "Test"),
+            make_mcp_note(vec!["docs"], "Docs"),
+        ];
+        let triggers = generate_mcp_action_triggers(&notes);
+        assert!(triggers.is_empty(), "20% mcp-usage is below 30% threshold");
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_meets_threshold() {
+        // 3/5 = 60% have mcp-usage → above 30% threshold
+        // "note" appears in 2 notes → meets min_freq=2
+        let notes = vec![
+            make_mcp_note(vec!["mcp-usage", "note"], "Note usage guide 1"),
+            make_mcp_note(vec!["mcp-usage", "note"], "Note usage guide 2"),
+            make_mcp_note(vec!["mcp-usage", "task"], "Task usage guide"),
+            make_mcp_note(vec!["api"], "Unrelated"),
+            make_mcp_note(vec!["refactor"], "Unrelated 2"),
+        ];
+        let triggers = generate_mcp_action_triggers(&notes);
+        assert!(
+            !triggers.is_empty(),
+            "60% mcp-usage should generate triggers"
+        );
+
+        // "note" appears 2 times → should have a trigger
+        let note_trigger = triggers.iter().find(|t| t.pattern_value == "note");
+        assert!(
+            note_trigger.is_some(),
+            "Expected trigger for 'note' mega-tool"
+        );
+
+        // "task" appears only 1 time and there are 5 notes → min_freq=2, so no trigger for task
+        let task_trigger = triggers.iter().find(|t| t.pattern_value == "task");
+        assert!(
+            task_trigger.is_none(),
+            "task appears only once with 5 notes (min_freq=2)"
+        );
+
+        // All triggers should be McpAction type
+        assert!(triggers
+            .iter()
+            .all(|t| t.pattern_type == TriggerType::McpAction));
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_small_cluster_min_freq_1() {
+        // With ≤3 notes, min_freq drops to 1
+        let notes = vec![
+            make_mcp_note(vec!["mcp-usage", "note"], "Note guide"),
+            make_mcp_note(vec!["mcp-usage", "commit"], "Commit guide"),
+        ];
+        let triggers = generate_mcp_action_triggers(&notes);
+        assert_eq!(
+            triggers.len(),
+            2,
+            "With 2 notes, min_freq=1, both tools should trigger"
+        );
+
+        let tools: Vec<&str> = triggers.iter().map(|t| t.pattern_value.as_str()).collect();
+        assert!(tools.contains(&"note"), "Expected 'note' trigger");
+        assert!(tools.contains(&"commit"), "Expected 'commit' trigger");
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_caps_at_5() {
+        // Create notes with many different mega-tool tags, all mcp-usage
+        let notes = vec![
+            make_mcp_note(
+                vec![
+                    "mcp-usage",
+                    "note",
+                    "task",
+                    "plan",
+                    "step",
+                    "commit",
+                    "decision",
+                    "release",
+                ],
+                "Multi-tool note 1",
+            ),
+            make_mcp_note(
+                vec![
+                    "mcp-usage",
+                    "note",
+                    "task",
+                    "plan",
+                    "step",
+                    "commit",
+                    "decision",
+                    "release",
+                ],
+                "Multi-tool note 2",
+            ),
+            make_mcp_note(
+                vec![
+                    "mcp-usage",
+                    "note",
+                    "task",
+                    "plan",
+                    "step",
+                    "commit",
+                    "decision",
+                    "milestone",
+                ],
+                "Multi-tool note 3",
+            ),
+        ];
+        let triggers = generate_mcp_action_triggers(&notes);
+        assert!(
+            triggers.len() <= 5,
+            "Should cap at 5 triggers, got {}",
+            triggers.len()
+        );
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_confidence_range() {
+        let notes = vec![
+            make_mcp_note(vec!["mcp-usage", "note"], "Guide 1"),
+            make_mcp_note(vec!["mcp-usage", "note"], "Guide 2"),
+            make_mcp_note(vec!["mcp-usage", "note"], "Guide 3"),
+        ];
+        let triggers = generate_mcp_action_triggers(&notes);
+        for trigger in &triggers {
+            assert!(
+                trigger.confidence_threshold >= 0.5 && trigger.confidence_threshold <= 0.85,
+                "Confidence {} should be in [0.5, 0.85]",
+                trigger.confidence_threshold
+            );
+        }
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_ignores_non_mega_tool_tags() {
+        // Tags that aren't in MCP_MEGA_TOOLS should be ignored
+        let notes = vec![
+            make_mcp_note(
+                vec!["mcp-usage", "custom-tag", "api-handler"],
+                "Custom tool guide",
+            ),
+            make_mcp_note(vec!["mcp-usage", "random", "stuff"], "Random guide"),
+        ];
+        let triggers = generate_mcp_action_triggers(&notes);
+        assert!(
+            triggers.is_empty(),
+            "Non mega-tool tags should not generate triggers"
+        );
+    }
+
+    #[test]
+    fn test_mcp_action_triggers_sorted_by_confidence_desc() {
+        // Notes where "note" has higher coverage than "task"
+        let notes = vec![
+            make_mcp_note(vec!["mcp-usage", "note"], "Note guide 1"),
+            make_mcp_note(vec!["mcp-usage", "note"], "Note guide 2"),
+            make_mcp_note(vec!["mcp-usage", "note", "task"], "Note+Task guide"),
+            make_mcp_note(vec!["mcp-usage", "task"], "Task guide"),
+        ];
+        let triggers = generate_mcp_action_triggers(&notes);
+        assert!(triggers.len() >= 2, "Expected at least 2 triggers");
+
+        // Verify sorted by confidence descending
+        for i in 1..triggers.len() {
+            assert!(
+                triggers[i - 1].confidence_threshold >= triggers[i].confidence_threshold,
+                "Triggers should be sorted by confidence descending"
+            );
+        }
     }
 }

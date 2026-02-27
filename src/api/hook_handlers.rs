@@ -377,6 +377,188 @@ pub async fn session_context(
 }
 
 // ============================================================================
+// Resolve Project (path → project_id)
+// ============================================================================
+
+/// Cache entry for project resolution: maps a path to its resolved project.
+/// Uses a simple TTL-based cache to avoid repeated Neo4j lookups.
+struct ResolvedProject {
+    project_id: Uuid,
+    slug: String,
+    root_path: String,
+}
+
+/// Global cache for resolve-project endpoint.
+/// Key: canonical prefix path (the resolved root_path of the matched project).
+/// Value: ResolvedProject with TTL.
+///
+/// We cache the full project list (expanded root_paths) with a short TTL
+/// rather than individual path lookups, because:
+/// 1. Project count is small (typically <20)
+/// 2. Avoids cache key explosion (infinite distinct file paths)
+/// 3. A single cache entry covers all files under a root_path
+type ResolveCache = Option<(Vec<ResolvedProject>, Instant)>;
+
+static RESOLVE_CACHE: LazyLock<Mutex<ResolveCache>> = LazyLock::new(|| Mutex::new(None));
+
+/// TTL for the resolve-project cache (5 minutes).
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Query parameters for GET /api/hooks/resolve-project
+#[derive(Debug, Deserialize)]
+pub struct ResolveProjectQuery {
+    /// File path or directory path to resolve to a project
+    pub path: String,
+}
+
+/// GET /api/hooks/resolve-project
+///
+/// Resolves a file/directory path to the project that contains it.
+/// Uses longest-prefix matching on project root_paths.
+///
+/// Public endpoint (no JWT required) — same as other hook endpoints.
+///
+/// Returns:
+/// - 200 with { project_id, slug, root_path } if a project matches
+/// - 404 if no project's root_path is a prefix of the given path
+/// - 400 if path is empty
+pub async fn resolve_project(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ResolveProjectQuery>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let input_path = query.path.trim();
+    if input_path.is_empty() {
+        return Err(AppError::BadRequest(
+            "path parameter is required".to_string(),
+        ));
+    }
+
+    // Normalize the input path (expand ~ if present)
+    let normalized_input = crate::expand_tilde(input_path);
+
+    // Try the cache first
+    {
+        let cache = RESOLVE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ref entries, ref cached_at)) = *cache {
+            if cached_at.elapsed() < RESOLVE_CACHE_TTL {
+                if let Some(matched) = find_longest_prefix_match(entries, &normalized_input) {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "project_id": matched.project_id,
+                            "slug": matched.slug,
+                            "root_path": matched.root_path,
+                        })),
+                    ));
+                }
+                // Cache is valid but no match — still return 404 without hitting Neo4j
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "No project found for path",
+                        "path": input_path,
+                    })),
+                ));
+            }
+        }
+    }
+
+    // Cache miss or expired — fetch all projects from Neo4j
+    let projects = state
+        .orchestrator
+        .neo4j()
+        .list_projects()
+        .await
+        .map_err(AppError::Internal)?;
+
+    // Build resolved entries with expanded paths
+    let now = Instant::now();
+    let entries: Vec<ResolvedProject> = projects
+        .iter()
+        .map(|p| {
+            let expanded = crate::expand_tilde(&p.root_path);
+            // Ensure root_path ends with / for correct prefix matching
+            let normalized = if expanded.ends_with('/') {
+                expanded
+            } else {
+                format!("{}/", expanded)
+            };
+            ResolvedProject {
+                project_id: p.id,
+                slug: p.slug.clone(),
+                root_path: normalized,
+            }
+        })
+        .collect();
+
+    // Find the longest prefix match
+    let result = find_longest_prefix_match(&entries, &normalized_input);
+
+    // Update cache
+    {
+        let mut cache = RESOLVE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = Some((entries, now));
+    }
+
+    match result {
+        Some(matched) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "project_id": matched.project_id,
+                "slug": matched.slug,
+                "root_path": matched.root_path,
+            })),
+        )),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "No project found for path",
+                "path": input_path,
+            })),
+        )),
+    }
+}
+
+/// A lightweight struct returned from find_longest_prefix_match
+/// to avoid lifetime issues with the cache lock.
+struct MatchedProject {
+    project_id: Uuid,
+    slug: String,
+    root_path: String,
+}
+
+/// Find the project whose root_path is the longest prefix of the given path.
+///
+/// Example: if projects have root_paths `/a/b/` and `/a/b/c/`,
+/// and the input is `/a/b/c/d/file.rs`, the match is `/a/b/c/`.
+fn find_longest_prefix_match(entries: &[ResolvedProject], path: &str) -> Option<MatchedProject> {
+    // Normalize input: ensure it can be compared with trailing-slash root_paths
+    // For a file path like /a/b/c/file.rs, we check if it starts with /a/b/c/
+    // For a dir path like /a/b/c/, it naturally starts with /a/b/c/
+    let check_path = if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/", path)
+    };
+
+    let mut best: Option<&ResolvedProject> = None;
+    let mut best_len = 0;
+
+    for entry in entries {
+        if check_path.starts_with(&entry.root_path) && entry.root_path.len() > best_len {
+            best_len = entry.root_path.len();
+            best = Some(entry);
+        }
+    }
+
+    best.map(|b| MatchedProject {
+        project_id: b.project_id,
+        slug: b.slug.clone(),
+        root_path: b.root_path.clone(),
+    })
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -828,5 +1010,163 @@ mod tests {
         let json = r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5"}"#;
         let result: Result<InstallHooksRequest, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    // ================================================================
+    // Resolve Project tests
+    // ================================================================
+
+    fn make_entry(id: &str, slug: &str, root: &str) -> ResolvedProject {
+        ResolvedProject {
+            project_id: Uuid::parse_str(id).unwrap(),
+            slug: slug.to_string(),
+            root_path: if root.ends_with('/') {
+                root.to_string()
+            } else {
+                format!("{}/", root)
+            },
+        }
+    }
+
+    #[test]
+    fn test_resolve_project_query_deserialize() {
+        let query: ResolveProjectQuery =
+            serde_json::from_str(r#"{"path":"/Users/foo/projects/bar/src/main.rs"}"#).unwrap();
+        assert_eq!(query.path, "/Users/foo/projects/bar/src/main.rs");
+    }
+
+    #[test]
+    fn test_resolve_project_query_missing_path() {
+        let result: Result<ResolveProjectQuery, _> = serde_json::from_str(r#"{}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_longest_prefix_match_single_project() {
+        let entries = vec![make_entry(
+            "00000000-0000-0000-0000-000000000001",
+            "my-project",
+            "/Users/dev/projects/my-project",
+        )];
+
+        let result =
+            find_longest_prefix_match(&entries, "/Users/dev/projects/my-project/src/main.rs");
+        assert!(result.is_some());
+        let matched = result.unwrap();
+        assert_eq!(matched.slug, "my-project");
+    }
+
+    #[test]
+    fn test_longest_prefix_match_no_match() {
+        let entries = vec![make_entry(
+            "00000000-0000-0000-0000-000000000001",
+            "my-project",
+            "/Users/dev/projects/my-project",
+        )];
+
+        let result = find_longest_prefix_match(&entries, "/Users/dev/other-dir/something.rs");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_longest_prefix_match_picks_longest() {
+        let entries = vec![
+            make_entry(
+                "00000000-0000-0000-0000-000000000001",
+                "workspace",
+                "/Users/dev/workspace",
+            ),
+            make_entry(
+                "00000000-0000-0000-0000-000000000002",
+                "sub-project",
+                "/Users/dev/workspace/packages/sub-project",
+            ),
+        ];
+
+        // File in sub-project → should match sub-project (longer prefix), not workspace
+        let result = find_longest_prefix_match(
+            &entries,
+            "/Users/dev/workspace/packages/sub-project/src/lib.rs",
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().slug, "sub-project");
+
+        // File in workspace root → should match workspace
+        let result = find_longest_prefix_match(&entries, "/Users/dev/workspace/README.md");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().slug, "workspace");
+    }
+
+    #[test]
+    fn test_longest_prefix_match_exact_root_path() {
+        let entries = vec![make_entry(
+            "00000000-0000-0000-0000-000000000001",
+            "my-project",
+            "/Users/dev/my-project",
+        )];
+
+        // Passing the root_path itself (as directory) should match
+        let result = find_longest_prefix_match(&entries, "/Users/dev/my-project");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().slug, "my-project");
+
+        // With trailing slash
+        let result = find_longest_prefix_match(&entries, "/Users/dev/my-project/");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().slug, "my-project");
+    }
+
+    #[test]
+    fn test_longest_prefix_match_no_false_positive_on_similar_names() {
+        let entries = vec![make_entry(
+            "00000000-0000-0000-0000-000000000001",
+            "foo",
+            "/Users/dev/foo",
+        )];
+
+        // /Users/dev/foobar should NOT match /Users/dev/foo/
+        // because the trailing / in root_path prevents false positives
+        let result = find_longest_prefix_match(&entries, "/Users/dev/foobar/src/main.rs");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_longest_prefix_match_multiple_projects() {
+        let entries = vec![
+            make_entry(
+                "00000000-0000-0000-0000-000000000001",
+                "alpha",
+                "/Users/dev/alpha",
+            ),
+            make_entry(
+                "00000000-0000-0000-0000-000000000002",
+                "beta",
+                "/Users/dev/beta",
+            ),
+            make_entry(
+                "00000000-0000-0000-0000-000000000003",
+                "gamma",
+                "/opt/projects/gamma",
+            ),
+        ];
+
+        let r = find_longest_prefix_match(&entries, "/Users/dev/alpha/src/lib.rs");
+        assert_eq!(r.unwrap().slug, "alpha");
+
+        let r = find_longest_prefix_match(&entries, "/Users/dev/beta/tests/test.rs");
+        assert_eq!(r.unwrap().slug, "beta");
+
+        let r = find_longest_prefix_match(&entries, "/opt/projects/gamma/main.py");
+        assert_eq!(r.unwrap().slug, "gamma");
+
+        let r = find_longest_prefix_match(&entries, "/completely/different/path");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn test_longest_prefix_match_empty_entries() {
+        let entries: Vec<ResolvedProject> = vec![];
+        let result = find_longest_prefix_match(&entries, "/some/path");
+        assert!(result.is_none());
     }
 }

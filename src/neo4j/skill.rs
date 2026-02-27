@@ -857,6 +857,16 @@ impl Neo4jClient {
                             Err(_) => 0.0,
                         }
                     }
+                    crate::skills::TriggerType::McpAction => {
+                        if crate::skills::activation::match_mcp_action_trigger(
+                            &trigger.pattern_value,
+                            input,
+                        ) {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
                     crate::skills::TriggerType::Semantic => {
                         // Semantic matching requires embedding provider — skip in graph layer
                         // This will be handled by the skill manager/orchestrator layer

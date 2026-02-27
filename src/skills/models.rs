@@ -109,6 +109,9 @@ pub enum TriggerType {
     FileGlob,
     /// Semantic vector centroid (embedding cosine similarity)
     Semantic,
+    /// MCP mega-tool action pattern (e.g., `note`, `note:create`, `task:create`)
+    /// Matches against the extracted MCP pattern via prefix check.
+    McpAction,
 }
 
 impl fmt::Display for TriggerType {
@@ -117,6 +120,7 @@ impl fmt::Display for TriggerType {
             Self::Regex => write!(f, "regex"),
             Self::FileGlob => write!(f, "file_glob"),
             Self::Semantic => write!(f, "semantic"),
+            Self::McpAction => write!(f, "mcp_action"),
         }
     }
 }
@@ -129,6 +133,7 @@ impl FromStr for TriggerType {
             "regex" => Ok(Self::Regex),
             "fileglob" | "glob" => Ok(Self::FileGlob),
             "semantic" => Ok(Self::Semantic),
+            "mcpaction" | "mcp" => Ok(Self::McpAction),
             _ => Err(format!("Unknown trigger type: {}", s)),
         }
     }
@@ -151,6 +156,7 @@ pub struct SkillTrigger {
     /// - Regex: a regular expression string
     /// - FileGlob: a glob pattern (e.g., `src/api/**`)
     /// - Semantic: JSON-encoded embedding vector centroid
+    /// - McpAction: `mega_tool` or `mega_tool:action` (e.g., `note`, `note:create`)
     pub pattern_value: String,
     /// Minimum confidence score for this trigger to fire (0.0-1.0)
     #[serde(default = "default_confidence_threshold")]
@@ -191,6 +197,20 @@ impl SkillTrigger {
         Self {
             pattern_type: TriggerType::Semantic,
             pattern_value: embedding_json.into(),
+            confidence_threshold: confidence.clamp(0.0, 1.0),
+            quality_score: None,
+        }
+    }
+
+    /// Create a new McpAction trigger.
+    ///
+    /// `pattern` is either:
+    /// - `"mega_tool"` to match any action of that tool (e.g., `"note"`)
+    /// - `"mega_tool:action"` to match a specific action (e.g., `"note:create"`)
+    pub fn mcp_action(pattern: impl Into<String>, confidence: f64) -> Self {
+        Self {
+            pattern_type: TriggerType::McpAction,
+            pattern_value: pattern.into(),
             confidence_threshold: confidence.clamp(0.0, 1.0),
             quality_score: None,
         }
@@ -705,6 +725,7 @@ mod tests {
             (TriggerType::Regex, "regex"),
             (TriggerType::FileGlob, "file_glob"),
             (TriggerType::Semantic, "semantic"),
+            (TriggerType::McpAction, "mcp_action"),
         ];
 
         for (tt, expected) in types {
@@ -729,6 +750,14 @@ mod tests {
             TriggerType::from_str("semantic").unwrap(),
             TriggerType::Semantic
         );
+        assert_eq!(
+            TriggerType::from_str("mcpaction").unwrap(),
+            TriggerType::McpAction
+        );
+        assert_eq!(
+            TriggerType::from_str("mcp").unwrap(),
+            TriggerType::McpAction
+        );
     }
 
     #[test]
@@ -737,6 +766,7 @@ mod tests {
             TriggerType::Regex,
             TriggerType::FileGlob,
             TriggerType::Semantic,
+            TriggerType::McpAction,
         ] {
             let json = serde_json::to_string(&tt).unwrap();
             let deserialized: TriggerType = serde_json::from_str(&json).unwrap();
@@ -760,6 +790,11 @@ mod tests {
 
         let semantic = SkillTrigger::semantic("[0.1, 0.2, 0.3]", 0.75);
         assert_eq!(semantic.pattern_type, TriggerType::Semantic);
+
+        let mcp = SkillTrigger::mcp_action("note:create", 0.7);
+        assert_eq!(mcp.pattern_type, TriggerType::McpAction);
+        assert_eq!(mcp.pattern_value, "note:create");
+        assert_eq!(mcp.confidence_threshold, 0.7);
     }
 
     #[test]

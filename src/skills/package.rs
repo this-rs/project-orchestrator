@@ -239,6 +239,16 @@ pub fn validate_package(package: &SkillPackage) -> Result<(), Vec<PackageValidat
                     });
                 }
             }
+            TriggerType::McpAction => {
+                // McpAction patterns: "mega_tool" or "mega_tool:action"
+                let trimmed = trigger.pattern_value.trim();
+                if trimmed.is_empty() {
+                    errors.push(PackageValidationError {
+                        field: format!("skill.trigger_patterns[{}]", i),
+                        message: "McpAction pattern must not be empty".to_string(),
+                    });
+                }
+            }
             TriggerType::Semantic => {
                 // Semantic triggers are opaque embedding vectors — no validation needed
             }

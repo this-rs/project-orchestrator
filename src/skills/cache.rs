@@ -48,6 +48,8 @@ pub enum CompiledTrigger {
     FileGlob(glob::Pattern),
     /// Semantic vector — not compiled, just stored for potential future use.
     Semantic(String),
+    /// MCP action pattern — stored as-is for prefix matching (no compilation needed).
+    McpAction(String),
 }
 
 /// A skill with its triggers pre-compiled for fast matching.
@@ -83,6 +85,9 @@ impl CachedSkill {
                     TriggerType::FileGlob => glob::Pattern::new(&trigger.pattern_value)
                         .ok()
                         .map(CompiledTrigger::FileGlob),
+                    TriggerType::McpAction => {
+                        Some(CompiledTrigger::McpAction(trigger.pattern_value.clone()))
+                    }
                     TriggerType::Semantic => {
                         Some(CompiledTrigger::Semantic(trigger.pattern_value.clone()))
                     }
@@ -302,6 +307,12 @@ pub fn evaluate_cached_skill(
                 let target = file_context.or(pattern);
                 target.is_some_and(|file| glob_pat.matches(file))
             }
+            CompiledTrigger::McpAction(mcp_pattern) => {
+                // Delegate to the same matching logic as activation.rs
+                pattern.is_some_and(|pat| {
+                    crate::skills::activation::match_mcp_action_trigger(mcp_pattern, pat)
+                })
+            }
             CompiledTrigger::Semantic(_) => {
                 // Semantic matching skipped in hot path
                 false
@@ -336,6 +347,7 @@ mod tests {
                 TriggerType::Regex => SkillTrigger::regex(val, 0.5),
                 TriggerType::FileGlob => SkillTrigger::file_glob(val, 0.5),
                 TriggerType::Semantic => SkillTrigger::semantic(val, 0.5),
+                TriggerType::McpAction => SkillTrigger::mcp_action(val, 0.5),
             })
             .collect();
         skill
@@ -574,6 +586,62 @@ mod tests {
         let confidence =
             evaluate_cached_skill(&cached, Some("neo4j_query"), Some("src/api/test.rs"));
         assert!(confidence > 0.0, "Should match via regex");
+    }
+
+    #[test]
+    fn test_compiled_trigger_mcp_action() {
+        let skill = make_test_skill("MCP", vec![(TriggerType::McpAction, "note:create")]);
+        let cached = CachedSkill::from_skill(skill);
+
+        assert_eq!(cached.compiled_triggers.len(), 1);
+        assert!(matches!(
+            &cached.compiled_triggers[0].0,
+            CompiledTrigger::McpAction(p) if p == "note:create"
+        ));
+    }
+
+    #[test]
+    fn test_evaluate_cached_skill_mcp_action_match() {
+        let skill = make_test_skill("MCP Note", vec![(TriggerType::McpAction, "note")]);
+        let cached = CachedSkill::from_skill(skill);
+
+        // Tool-only trigger matches any note action
+        let confidence = evaluate_cached_skill(&cached, Some("note create test content"), None);
+        assert!(
+            confidence > 0.0,
+            "McpAction 'note' should match 'note create ...'"
+        );
+        assert!((confidence - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_evaluate_cached_skill_mcp_action_specific_match() {
+        let skill = make_test_skill(
+            "MCP Note Create",
+            vec![(TriggerType::McpAction, "note:create")],
+        );
+        let cached = CachedSkill::from_skill(skill);
+
+        let confidence = evaluate_cached_skill(&cached, Some("note create test content"), None);
+        assert!(confidence > 0.0, "McpAction 'note:create' should match");
+
+        let no_match = evaluate_cached_skill(&cached, Some("note search query"), None);
+        assert!(
+            (no_match - 0.0).abs() < f64::EPSILON,
+            "McpAction 'note:create' should NOT match 'note search'"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_cached_skill_mcp_action_no_match() {
+        let skill = make_test_skill("MCP Task", vec![(TriggerType::McpAction, "task")]);
+        let cached = CachedSkill::from_skill(skill);
+
+        let confidence = evaluate_cached_skill(&cached, Some("note create foo"), None);
+        assert!(
+            (confidence - 0.0).abs() < f64::EPSILON,
+            "McpAction 'task' should not match 'note create'"
+        );
     }
 
     #[test]

@@ -180,6 +180,10 @@ fn public_routes() -> Router<OrchestratorState> {
             "/api/hooks/session-context",
             get(hook_handlers::session_context),
         )
+        .route(
+            "/api/hooks/resolve-project",
+            get(hook_handlers::resolve_project),
+        )
 }
 
 // ============================================================================

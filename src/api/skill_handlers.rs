@@ -69,6 +69,15 @@ fn validate_trigger_patterns(triggers: &[SkillTrigger]) -> Result<(), String> {
                     ));
                 }
             }
+            TriggerType::McpAction => {
+                // McpAction patterns are simple strings — validate non-empty
+                if trigger.pattern_value.trim().is_empty() {
+                    return Err(format!(
+                        "trigger_patterns[{}]: mcp_action pattern must not be empty",
+                        i
+                    ));
+                }
+            }
             TriggerType::Semantic => {
                 // Semantic triggers contain embedding vectors — no compile-time validation needed
             }
