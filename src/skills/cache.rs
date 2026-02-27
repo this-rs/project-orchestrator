@@ -589,6 +589,62 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_trigger_mcp_action() {
+        let skill = make_test_skill("MCP", vec![(TriggerType::McpAction, "note:create")]);
+        let cached = CachedSkill::from_skill(skill);
+
+        assert_eq!(cached.compiled_triggers.len(), 1);
+        assert!(matches!(
+            &cached.compiled_triggers[0].0,
+            CompiledTrigger::McpAction(p) if p == "note:create"
+        ));
+    }
+
+    #[test]
+    fn test_evaluate_cached_skill_mcp_action_match() {
+        let skill = make_test_skill("MCP Note", vec![(TriggerType::McpAction, "note")]);
+        let cached = CachedSkill::from_skill(skill);
+
+        // Tool-only trigger matches any note action
+        let confidence = evaluate_cached_skill(&cached, Some("note create test content"), None);
+        assert!(
+            confidence > 0.0,
+            "McpAction 'note' should match 'note create ...'"
+        );
+        assert!((confidence - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_evaluate_cached_skill_mcp_action_specific_match() {
+        let skill = make_test_skill(
+            "MCP Note Create",
+            vec![(TriggerType::McpAction, "note:create")],
+        );
+        let cached = CachedSkill::from_skill(skill);
+
+        let confidence = evaluate_cached_skill(&cached, Some("note create test content"), None);
+        assert!(confidence > 0.0, "McpAction 'note:create' should match");
+
+        let no_match = evaluate_cached_skill(&cached, Some("note search query"), None);
+        assert!(
+            (no_match - 0.0).abs() < f64::EPSILON,
+            "McpAction 'note:create' should NOT match 'note search'"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_cached_skill_mcp_action_no_match() {
+        let skill = make_test_skill("MCP Task", vec![(TriggerType::McpAction, "task")]);
+        let cached = CachedSkill::from_skill(skill);
+
+        let confidence = evaluate_cached_skill(&cached, Some("note create foo"), None);
+        assert!(
+            (confidence - 0.0).abs() < f64::EPSILON,
+            "McpAction 'task' should not match 'note create'"
+        );
+    }
+
+    #[test]
     fn test_evaluate_cached_skill_semantic_skipped() {
         let skill = make_test_skill("Semantic", vec![(TriggerType::Semantic, "[0.1, 0.2]")]);
         let cached = CachedSkill::from_skill(skill);

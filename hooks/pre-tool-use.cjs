@@ -42,7 +42,10 @@ const MAX_GLOBAL = 10;             // Max total injections per session
 const PPID = process.ppid;         // Claude Code parent process PID
 const CACHE_FILE = path.join(require('os').tmpdir(), `po-hook-cache-${PPID}.json`);
 
-// Tools that trigger skill activation
+// Tools that trigger skill activation.
+// Note: NotebookEdit is intentionally excluded — low-frequency tool, not worth
+// the activation overhead. The Rust extract_pattern handles it as a fallback
+// for direct API testing, but the CJS hook filters it out.
 const ACTIVATABLE_TOOLS = new Set(['Grep', 'Glob', 'Read', 'Bash', 'Edit', 'Write']);
 const MCP_TOOL_PREFIX = 'mcp__';
 
@@ -234,6 +237,14 @@ function extractFilePath(toolName, toolInput) {
  */
 function getResolveProject(port, filePath) {
   return new Promise((resolve) => {
+    let resolved = false;
+    const done = (value) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeoutId);
+      resolve(value);
+    };
+
     const encodedPath = encodeURIComponent(filePath);
     const req = http.request(
       {
@@ -241,44 +252,35 @@ function getResolveProject(port, filePath) {
         port: port,
         path: `/api/hooks/resolve-project?path=${encodedPath}`,
         method: 'GET',
-        timeout: 50,
       },
       (res) => {
         if (res.statusCode !== 200) {
-          clearTimeout(timeoutId);
           debug(`resolve-project returned ${res.statusCode}`);
-          resolve(null);
+          done(null);
           return;
         }
 
         let body = '';
         res.on('data', (chunk) => { body += chunk; });
         res.on('end', () => {
-          clearTimeout(timeoutId);
           try {
-            resolve(JSON.parse(body));
+            done(JSON.parse(body));
           } catch (_) {
-            resolve(null);
+            done(null);
           }
         });
       }
     );
 
     req.on('error', (err) => {
-      clearTimeout(timeoutId);
       debug(`resolve-project error: ${err.message}`);
-      resolve(null);
-    });
-
-    req.on('timeout', () => {
-      debug('resolve-project socket timeout');
-      req.destroy();
+      done(null);
     });
 
     const timeoutId = setTimeout(() => {
       debug('resolve-project timeout');
       req.destroy();
-      resolve(null);
+      done(null);
     }, 50);
 
     req.end();
@@ -291,6 +293,14 @@ function getResolveProject(port, filePath) {
  */
 function postActivate(port, payload) {
   return new Promise((resolve) => {
+    let resolved = false;
+    const done = (value) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeoutId);
+      resolve(value);
+    };
+
     const data = JSON.stringify(payload);
 
     const req = http.request(
@@ -303,22 +313,19 @@ function postActivate(port, payload) {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(data),
         },
-        timeout: HOOK_TIMEOUT_MS,
       },
       (res) => {
         // 204 No Content → no skill matched
         if (res.statusCode === 204) {
-          clearTimeout(timeoutId);
           debug('204 No Content — no skill matched');
-          resolve(null);
+          done(null);
           return;
         }
 
         // Non-200 → error
         if (res.statusCode !== 200) {
-          clearTimeout(timeoutId);
           debug(`Server returned ${res.statusCode}`);
-          resolve(null);
+          done(null);
           return;
         }
 
@@ -326,34 +333,25 @@ function postActivate(port, payload) {
         let body = '';
         res.on('data', (chunk) => { body += chunk; });
         res.on('end', () => {
-          clearTimeout(timeoutId);
           try {
-            resolve(JSON.parse(body));
+            done(JSON.parse(body));
           } catch (_) {
             debug('Failed to parse response JSON');
-            resolve(null);
+            done(null);
           }
         });
       }
     );
 
     req.on('error', (err) => {
-      clearTimeout(timeoutId);
       debug(`Request error: ${err.message}`);
-      resolve(null);
+      done(null);
     });
 
-    req.on('timeout', () => {
-      debug('Socket timeout');
-      req.destroy();
-      // resolve(null) will be called by the error handler
-    });
-
-    // Schedule timeout AFTER req is created (avoid TDZ)
     const timeoutId = setTimeout(() => {
       debug('Request timeout');
       req.destroy();
-      resolve(null);
+      done(null);
     }, HOOK_TIMEOUT_MS);
 
     req.write(data);

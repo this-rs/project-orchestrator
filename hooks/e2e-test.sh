@@ -152,7 +152,7 @@ fi
 
 # --- Scenario 6: Performance test ---
 echo ""
-echo "--- Scenario 6: Performance (10 concurrent calls) ---"
+echo "--- Scenario 6: Performance (10 sequential calls, < 50ms each) ---"
 PERF_PASS=true
 for i in $(seq 1 10); do
     TIME=$(curl -s -o /dev/null -w "%{time_total}" -X POST "$BASE/api/hooks/activate" \

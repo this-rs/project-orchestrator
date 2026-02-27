@@ -725,6 +725,7 @@ mod tests {
             (TriggerType::Regex, "regex"),
             (TriggerType::FileGlob, "file_glob"),
             (TriggerType::Semantic, "semantic"),
+            (TriggerType::McpAction, "mcp_action"),
         ];
 
         for (tt, expected) in types {
@@ -749,6 +750,14 @@ mod tests {
             TriggerType::from_str("semantic").unwrap(),
             TriggerType::Semantic
         );
+        assert_eq!(
+            TriggerType::from_str("mcpaction").unwrap(),
+            TriggerType::McpAction
+        );
+        assert_eq!(
+            TriggerType::from_str("mcp").unwrap(),
+            TriggerType::McpAction
+        );
     }
 
     #[test]
@@ -757,6 +766,7 @@ mod tests {
             TriggerType::Regex,
             TriggerType::FileGlob,
             TriggerType::Semantic,
+            TriggerType::McpAction,
         ] {
             let json = serde_json::to_string(&tt).unwrap();
             let deserialized: TriggerType = serde_json::from_str(&json).unwrap();
@@ -780,6 +790,11 @@ mod tests {
 
         let semantic = SkillTrigger::semantic("[0.1, 0.2, 0.3]", 0.75);
         assert_eq!(semantic.pattern_type, TriggerType::Semantic);
+
+        let mcp = SkillTrigger::mcp_action("note:create", 0.7);
+        assert_eq!(mcp.pattern_type, TriggerType::McpAction);
+        assert_eq!(mcp.pattern_value, "note:create");
+        assert_eq!(mcp.confidence_threshold, 0.7);
     }
 
     #[test]
