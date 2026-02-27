@@ -1,7 +1,7 @@
 //! Portable Skill Package format
 //!
 //! Defines the `SkillPackage` format for exporting and importing skills
-//! across projects. The format is self-contained, versionned, and strips
+//! across projects. The format is self-contained, versioned, and strips
 //! all internal IDs (they are regenerated on import).
 //!
 //! # Format: `po-skill/v1`
