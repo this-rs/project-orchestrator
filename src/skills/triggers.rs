@@ -343,6 +343,131 @@ pub fn generate_semantic_trigger(
 }
 
 // ============================================================================
+// Quality Evaluation
+// ============================================================================
+
+/// Evaluate the quality (F1 score) of a trigger pattern.
+///
+/// - **Precision** = skill_notes_matching / all_notes_matching
+///   (Low precision means the trigger is too broad — matches many non-member notes)
+/// - **Recall** = skill_notes_matching / total_skill_notes
+///   (Low recall means the trigger is too narrow — misses many member notes)
+/// - **F1** = 2 × (P × R) / (P + R)
+///
+/// For FileGlob triggers, matching is done against note anchors' file paths.
+/// For Regex triggers, matching is done against note tags and content.
+/// Semantic triggers always get quality_score = None (evaluated at activation time).
+pub fn evaluate_trigger_quality(
+    trigger: &SkillTrigger,
+    skill_notes: &[Note],
+    all_project_notes: &[Note],
+) -> Option<f64> {
+    match trigger.pattern_type {
+        TriggerType::Regex => evaluate_regex_quality(&trigger.pattern_value, skill_notes, all_project_notes),
+        TriggerType::FileGlob => evaluate_file_glob_quality(&trigger.pattern_value, skill_notes, all_project_notes),
+        TriggerType::Semantic => None, // Semantic triggers are evaluated at activation time
+    }
+}
+
+/// Evaluate regex trigger quality against note tags and content.
+fn evaluate_regex_quality(
+    pattern: &str,
+    skill_notes: &[Note],
+    all_project_notes: &[Note],
+) -> Option<f64> {
+    let regex = regex::Regex::new(&format!("(?i){}", pattern)).ok()?;
+
+    let total_skill = skill_notes.len();
+    if total_skill == 0 {
+        return Some(0.0);
+    }
+
+    // Count how many skill notes match
+    let skill_matches = skill_notes
+        .iter()
+        .filter(|n| note_matches_regex(n, &regex))
+        .count();
+
+    // Count how many project notes match (including skill notes)
+    let all_matches = all_project_notes
+        .iter()
+        .filter(|n| note_matches_regex(n, &regex))
+        .count();
+
+    compute_f1(skill_matches, all_matches, total_skill)
+}
+
+/// Check if a note matches a regex pattern (checks tags and content).
+fn note_matches_regex(note: &Note, regex: &regex::Regex) -> bool {
+    // Check tags
+    for tag in &note.tags {
+        if regex.is_match(tag) {
+            return true;
+        }
+    }
+    // Check content (first 500 chars for performance)
+    let content_prefix = if note.content.len() > 500 {
+        &note.content[..500]
+    } else {
+        &note.content
+    };
+    regex.is_match(content_prefix)
+}
+
+/// Evaluate file glob trigger quality against note file anchors.
+fn evaluate_file_glob_quality(
+    pattern: &str,
+    skill_notes: &[Note],
+    all_project_notes: &[Note],
+) -> Option<f64> {
+    let glob = glob::Pattern::new(pattern).ok()?;
+
+    let total_skill = skill_notes.len();
+    if total_skill == 0 {
+        return Some(0.0);
+    }
+
+    // Count skill notes with at least one matching file anchor
+    let skill_matches = skill_notes
+        .iter()
+        .filter(|n| note_matches_glob(n, &glob))
+        .count();
+
+    // Count all project notes with at least one matching file anchor
+    let all_matches = all_project_notes
+        .iter()
+        .filter(|n| note_matches_glob(n, &glob))
+        .count();
+
+    compute_f1(skill_matches, all_matches, total_skill)
+}
+
+/// Check if a note has any file anchor matching a glob pattern.
+fn note_matches_glob(note: &Note, glob: &glob::Pattern) -> bool {
+    note.anchors
+        .iter()
+        .any(|a| a.entity_type == crate::notes::EntityType::File && glob.matches(&a.entity_id))
+}
+
+/// Compute F1 score from match counts.
+/// precision = true_positives / all_positives
+/// recall = true_positives / total_relevant
+fn compute_f1(true_positives: usize, all_positives: usize, total_relevant: usize) -> Option<f64> {
+    if all_positives == 0 || total_relevant == 0 {
+        return Some(0.0);
+    }
+
+    let precision = true_positives as f64 / all_positives as f64;
+    let recall = true_positives as f64 / total_relevant as f64;
+
+    if precision + recall == 0.0 {
+        Some(0.0)
+    } else {
+        Some(2.0 * precision * recall / (precision + recall))
+    }
+}
+
+// ============================================================================
 // Orchestrator
 // ============================================================================
 
@@ -360,24 +485,33 @@ pub struct TriggerGenerationResult {
 /// Generate all trigger patterns for a skill from its member notes.
 ///
 /// Combines FileGlob, Regex, and optionally Semantic triggers.
+/// Evaluates quality (F1) for each trigger against the full project notes.
 /// `embeddings` can be empty if no embedding provider is available.
+/// `all_project_notes` is needed for quality evaluation (precision/recall).
 pub fn generate_all_triggers(
-    notes: &[Note],
+    skill_notes: &[Note],
+    all_project_notes: &[Note],
     embeddings: &HashMap<String, Vec<f64>>,
 ) -> TriggerGenerationResult {
     let mut all_triggers = Vec::new();
 
     // 1. FileGlob from file anchors
-    let file_globs = generate_file_glob_triggers(notes);
+    let mut file_globs = generate_file_glob_triggers(skill_notes);
+    for trigger in &mut file_globs {
+        trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
+    }
     let file_glob_count = file_globs.len();
     all_triggers.extend(file_globs);
 
     // 2. Regex from tags and content
-    let regex_triggers = generate_regex_triggers(notes);
+    let mut regex_triggers = generate_regex_triggers(skill_notes);
+    for trigger in &mut regex_triggers {
+        trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
+    }
     let regex_count = regex_triggers.len();
     all_triggers.extend(regex_triggers);
 
-    // 3. Semantic from embeddings (optional)
+    // 3. Semantic from embeddings (optional) — quality is None (evaluated at activation)
     let semantic_count;
     if let Some(semantic) = generate_semantic_trigger(embeddings, 0.75) {
         semantic_count = 1;
@@ -637,7 +771,7 @@ mod tests {
         ];
 
         let embeddings = HashMap::new(); // No embeddings
-        let result = generate_all_triggers(&notes, &embeddings);
+        let result = generate_all_triggers(&notes, &notes, &embeddings);
 
         assert!(
             result.file_glob_count >= 1,
@@ -666,8 +800,136 @@ mod tests {
         embeddings.insert("note-1".to_string(), vec![1.0, 0.0]);
         embeddings.insert("note-2".to_string(), vec![0.0, 1.0]);
 
-        let result = generate_all_triggers(&notes, &embeddings);
+        let result = generate_all_triggers(&notes, &notes, &embeddings);
         assert_eq!(result.semantic_count, 1);
+    }
+
+    // ================================================================
+    // Quality evaluation tests
+    // ================================================================
+
+    #[test]
+    fn test_regex_quality_high_precision_recall() {
+        // Skill notes all have "neo4j" tag, no other project notes match
+        let skill_notes = vec![
+            make_note_with_anchors(vec!["neo4j"], "Neo4j query", vec![]),
+            make_note_with_anchors(vec!["neo4j"], "Neo4j index", vec![]),
+            make_note_with_anchors(vec!["neo4j"], "Neo4j driver", vec![]),
+        ];
+        // All project notes = skill notes only
+        let all_notes = skill_notes.clone();
+
+        let trigger = SkillTrigger::regex("neo4j", 0.7);
+        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
+
+        // P=3/3=1.0, R=3/3=1.0, F1=1.0
+        assert!(quality.is_some());
+        assert!(quality.unwrap() > 0.9, "Expected high F1, got {:?}", quality);
+    }
+
+    #[test]
+    fn test_regex_quality_too_broad() {
+        // Trigger "api" matches 80% of all project notes → low precision
+        let skill_notes = vec![
+            make_note_with_anchors(vec!["api"], "Skill API note", vec![]),
+            make_note_with_anchors(vec!["api"], "Skill API auth", vec![]),
+        ];
+        let mut all_notes = skill_notes.clone();
+        // Add 8 more non-skill notes that also match "api"
+        for i in 0..8 {
+            all_notes.push(make_note_with_anchors(
+                vec!["api"],
+                &format!("Other API note {}", i),
+                vec![],
+            ));
+        }
+
+        let trigger = SkillTrigger::regex("api", 0.7);
+        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
+
+        // P=2/10=0.2, R=2/2=1.0, F1=2*(0.2*1.0)/(0.2+1.0)=0.333
+        assert!(quality.is_some());
+        assert!(
+            quality.unwrap() < 0.4,
+            "Expected low F1 for broad trigger, got {:?}",
+            quality
+        );
+    }
+
+    #[test]
+    fn test_regex_quality_too_narrow() {
+        // Trigger "obscure_term" matches only 1 of 5 skill notes → low recall
+        let skill_notes = vec![
+            make_note_with_anchors(vec!["obscure_term"], "Matches", vec![]),
+            make_note_with_anchors(vec!["other"], "No match", vec![]),
+            make_note_with_anchors(vec!["other"], "No match 2", vec![]),
+            make_note_with_anchors(vec!["other"], "No match 3", vec![]),
+            make_note_with_anchors(vec!["other"], "No match 4", vec![]),
+        ];
+        let all_notes = skill_notes.clone();
+
+        let trigger = SkillTrigger::regex("obscure_term", 0.7);
+        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
+
+        // P=1/1=1.0, R=1/5=0.2, F1=2*(1.0*0.2)/(1.0+0.2)=0.333
+        assert!(quality.is_some());
+        assert!(
+            quality.unwrap() < 0.4,
+            "Expected low F1 for narrow trigger, got {:?}",
+            quality
+        );
+    }
+
+    #[test]
+    fn test_file_glob_quality() {
+        let skill_notes = vec![
+            make_note_with_anchors(vec![], "A", vec![file_anchor("src/api/auth.rs")]),
+            make_note_with_anchors(vec![], "B", vec![file_anchor("src/api/routes.rs")]),
+        ];
+        let mut all_notes = skill_notes.clone();
+        // Non-skill note in different directory
+        all_notes.push(make_note_with_anchors(
+            vec![],
+            "C",
+            vec![file_anchor("src/graph/algo.rs")],
+        ));
+
+        let trigger = SkillTrigger::file_glob("src/api/**", 0.7);
+        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
+
+        // P=2/2=1.0, R=2/2=1.0, F1=1.0
+        assert!(quality.is_some());
+        assert!(quality.unwrap() > 0.9, "Expected high F1, got {:?}", quality);
+    }
+
+    #[test]
+    fn test_semantic_trigger_no_quality() {
+        let trigger = SkillTrigger::semantic("[0.1, 0.2]", 0.75);
+        let quality = evaluate_trigger_quality(&trigger, &[], &[]);
+        assert!(quality.is_none(), "Semantic triggers should have no quality score");
+    }
+
+    #[test]
+    fn test_generate_all_triggers_sets_quality() {
+        let skill_notes = vec![
+            make_note_with_anchors(vec!["neo4j", "cypher"], "Neo4j queries", vec![]),
+            make_note_with_anchors(vec!["neo4j"], "Neo4j driver", vec![]),
+            make_note_with_anchors(vec!["neo4j", "index"], "Neo4j indexing", vec![]),
+        ];
+        let all_notes = skill_notes.clone();
+        let embeddings = HashMap::new();
+
+        let result = generate_all_triggers(&skill_notes, &all_notes, &embeddings);
+
+        // Regex triggers should have quality scores set
+        for trigger in &result.triggers {
+            if trigger.pattern_type == TriggerType::Regex {
+                assert!(
+                    trigger.quality_score.is_some(),
+                    "Regex trigger should have quality_score set"
+                );
+            }
+        }
     }
 
     // ================================================================
