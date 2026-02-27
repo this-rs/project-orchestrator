@@ -23,6 +23,7 @@
 //! - Triggers (Regex/FileGlob) match tool inputs to activate skills
 //! - Hook activation injects relevant notes into Claude Code context
 
+pub mod activation;
 pub mod detection;
 pub mod hook_extractor;
 pub mod models;
@@ -30,6 +31,7 @@ pub mod naming;
 pub mod templates;
 pub mod triggers;
 
+pub use activation::*;
 pub use detection::*;
 pub use hook_extractor::*;
 pub use models::*;
