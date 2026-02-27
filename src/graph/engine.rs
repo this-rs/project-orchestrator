@@ -261,7 +261,11 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
 
         // 4. Persist: delete old processes, then upsert new ones
         if let Err(e) = self.store.delete_project_processes(project_id).await {
-            tracing::warn!("Failed to delete old processes for project {}: {}", project_id, e);
+            tracing::warn!(
+                "Failed to delete old processes for project {}: {}",
+                project_id,
+                e
+            );
         }
 
         let process_nodes: Vec<ProcessNode> = processes

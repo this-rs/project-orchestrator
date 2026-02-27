@@ -1763,10 +1763,14 @@ impl Neo4jClient {
         )
         .param("items", items.clone());
 
-        let mut resolved: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut resolved: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         if let Ok(mut result) = self.graph.execute(q).await {
             while let Ok(Some(row)) = result.next().await {
-                if let (Ok(name), Ok(file)) = (row.get::<String>("resolved"), row.get::<String>("resolved_file")) {
+                if let (Ok(name), Ok(file)) = (
+                    row.get::<String>("resolved"),
+                    row.get::<String>("resolved_file"),
+                ) {
                     resolved.insert((name, file));
                 }
             }

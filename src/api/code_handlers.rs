@@ -1870,9 +1870,7 @@ pub async fn detect_processes(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let processes = state
         .orchestrator
@@ -2089,9 +2087,7 @@ pub async fn enrich_communities(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     // Run file graph analysis which includes enrichment
     let analytics = state

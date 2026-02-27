@@ -2798,9 +2798,7 @@ impl ToolHandler {
             "detect_processes" => {
                 let project_slug = extract_string(args, "project_slug")?;
                 let body = serde_json::json!({"project_slug": project_slug});
-                let result = http
-                    .post("/api/code/processes/detect", &body)
-                    .await?;
+                let result = http.post("/api/code/processes/detect", &body).await?;
                 Ok(Some(result))
             }
 
@@ -2866,9 +2864,7 @@ impl ToolHandler {
             "enrich_communities" => {
                 let project_slug = extract_string(args, "project_slug")?;
                 let body = serde_json::json!({"project_slug": project_slug});
-                let result = http
-                    .post("/api/code/communities/enrich", &body)
-                    .await?;
+                let result = http.post("/api/code/communities/enrich", &body).await?;
                 Ok(Some(result))
             }
 
