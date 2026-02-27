@@ -24,12 +24,14 @@
 //! - Hook activation injects relevant notes into Claude Code context
 
 pub mod detection;
+pub mod hook_extractor;
 pub mod models;
 pub mod naming;
 pub mod templates;
 pub mod triggers;
 
 pub use detection::*;
+pub use hook_extractor::*;
 pub use models::*;
 pub use templates::*;
 pub use triggers::*;
