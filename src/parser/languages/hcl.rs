@@ -136,6 +136,7 @@ fn get_block_labels(node: &tree_sitter::Node, source: &str) -> Vec<String> {
 ///
 /// In tree-sitter-hcl, a block's children are:
 ///   identifier + string_lit[] + block_start + body + block_end
+#[allow(clippy::manual_find)] // cursor lifetime prevents .find()
 fn get_block_body<'a>(node: &'a tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
