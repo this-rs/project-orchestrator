@@ -2,7 +2,7 @@
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
-use crate::skills::{SkillNode, SkillStatus, SkillTrigger};
+use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus, SkillTrigger};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -68,6 +68,12 @@ pub struct AddMemberBody {
 pub struct SkillMembersResponse {
     pub notes: Vec<crate::notes::Note>,
     pub decisions: Vec<crate::neo4j::models::DecisionNode>,
+}
+
+/// Request body for activating a skill
+#[derive(Debug, Deserialize)]
+pub struct ActivateSkillBody {
+    pub query: String,
 }
 
 // ============================================================================
@@ -310,4 +316,30 @@ pub async fn remove_skill_member(
             entity_id, entity_type, skill_id
         )))
     }
+}
+
+// ============================================================================
+// Handlers — Activation
+// ============================================================================
+
+/// Activate a skill — retrieve enriched context from its members
+///
+/// POST /api/skills/:id/activate
+pub async fn activate_skill(
+    State(state): State<OrchestratorState>,
+    Path(skill_id): Path<Uuid>,
+    Json(body): Json<ActivateSkillBody>,
+) -> Result<Json<ActivatedSkillContext>, AppError> {
+    if body.query.trim().is_empty() {
+        return Err(AppError::BadRequest("query cannot be empty".to_string()));
+    }
+
+    let context = state
+        .orchestrator
+        .neo4j()
+        .activate_skill(skill_id, &body.query)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(context))
 }

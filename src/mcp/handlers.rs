@@ -61,6 +61,7 @@ impl ToolHandler {
             "feature_graph",
             "code",
             "admin",
+            "skill",
         ];
 
         if !mega_tools.contains(&name) {
@@ -289,6 +290,17 @@ impl ToolHandler {
             ("code", "get_hotspots") => "get_hotspots",
             ("code", "get_knowledge_gaps") => "get_knowledge_gaps",
             ("code", "get_risk_assessment") => "get_risk_assessment",
+
+            // Skill
+            ("skill", "list") => "list_skills",
+            ("skill", "create") => "create_skill",
+            ("skill", "get") => "get_skill",
+            ("skill", "update") => "update_skill",
+            ("skill", "delete") => "delete_skill",
+            ("skill", "get_members") => "get_skill_members",
+            ("skill", "add_member") => "add_skill_member",
+            ("skill", "remove_member") => "remove_skill_member",
+            ("skill", "activate") => "activate_skill",
 
             // Admin
             ("admin", "sync_directory") => "sync_directory",
@@ -2973,6 +2985,136 @@ impl ToolHandler {
             "migrate_calls_confidence" => {
                 let result = http
                     .post("/api/admin/migrate-calls-confidence", &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            // ── P10: Skills (9 tools) ──────────────────────────────────
+
+            "list_skills" => {
+                let project_id = extract_id(args, "project_id")?;
+                let mut query = vec![("project_id".to_string(), project_id)];
+                if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let result = http.get_with_query("/api/skills", &query).await?;
+                Ok(Some(result))
+            }
+
+            "create_skill" => {
+                let result = http.post("/api/skills", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_skill" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let result = http.get(&format!("/api/skills/{}", skill_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_skill" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("name") {
+                    body.insert("name".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("status") {
+                    body.insert("status".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("tags") {
+                    body.insert("tags".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("trigger_patterns") {
+                    body.insert("trigger_patterns".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("context_template") {
+                    body.insert("context_template".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("energy") {
+                    body.insert("energy".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("cohesion") {
+                    body.insert("cohesion".to_string(), v.clone());
+                }
+                let result = http
+                    .put(
+                        &format!("/api/skills/{}", skill_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "delete_skill" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let result = http
+                    .delete(&format!("/api/skills/{}", skill_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
+            }
+
+            "get_skill_members" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let result = http
+                    .get(&format!("/api/skills/{}/members", skill_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "add_skill_member" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_id(args, "entity_id")?;
+                let body = json!({
+                    "entity_type": entity_type,
+                    "entity_id": entity_id
+                });
+                let result = http
+                    .post(&format!("/api/skills/{}/members", skill_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_skill_member" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let entity_type = extract_string(args, "entity_type")?;
+                let entity_id = extract_id(args, "entity_id")?;
+                let result = http
+                    .delete(&format!(
+                        "/api/skills/{}/members/{}/{}",
+                        skill_id, entity_type, entity_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "activate_skill" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let query = extract_string(args, "query")?;
+                let body = json!({"query": query});
+                let result = http
+                    .post(&format!("/api/skills/{}/activate", skill_id), &body)
                     .await?;
                 Ok(Some(result))
             }

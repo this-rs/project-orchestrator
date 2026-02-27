@@ -1,6 +1,6 @@
 //! MCP Tool definitions — Mega-tools architecture
 //!
-//! Instead of 160 individual tools, we expose ~18 mega-tools with an `action` parameter.
+//! Instead of 160 individual tools, we expose ~19 mega-tools with an `action` parameter.
 //! Each mega-tool groups all operations for a domain (e.g., project, plan, task).
 //! The `action` parameter selects the specific operation; additional parameters vary by action.
 //!
@@ -30,6 +30,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         feature_graph_tool(),
         code_tool(),
         admin_tool(),
+        skill_tool(),
     ]
 }
 
@@ -239,6 +240,17 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "get_hotspots" => Some(("code", "get_hotspots")),
         "get_knowledge_gaps" => Some(("code", "get_knowledge_gaps")),
         "get_risk_assessment" => Some(("code", "get_risk_assessment")),
+
+        // Skill
+        "list_skills" => Some(("skill", "list")),
+        "create_skill" => Some(("skill", "create")),
+        "get_skill" => Some(("skill", "get")),
+        "update_skill" => Some(("skill", "update")),
+        "delete_skill" => Some(("skill", "delete")),
+        "get_skill_members" => Some(("skill", "get_members")),
+        "add_skill_member" => Some(("skill", "add_member")),
+        "remove_skill_member" => Some(("skill", "remove_member")),
+        "activate_skill" => Some(("skill", "activate")),
 
         // Admin
         "sync_directory" => Some(("admin", "sync_directory")),
@@ -801,6 +813,43 @@ fn admin_tool() -> ToolDefinition {
     }
 }
 
+fn skill_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "skill".to_string(),
+        description: "Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate"],
+                    "description": "Operation to perform"
+                },
+                "skill_id": {"type": "string", "description": "Skill UUID (get/update/delete/get_members/add_member/remove_member/activate)"},
+                "project_id": {"type": "string", "description": "Project UUID (list/create)"},
+                "name": {"type": "string", "description": "Skill name (create/update)"},
+                "description": {"type": "string", "description": "Skill description (create/update)"},
+                "status": {"type": "string", "description": "Status (update): emerging, active, dormant, archived, imported"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags (create/update)"},
+                "trigger_patterns": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Trigger patterns (create/update): [{\"pattern_type\": \"Regex\"|\"FileGlob\"|\"Semantic\", \"pattern_value\": \"...\", \"confidence_threshold\": 0.7}]"
+                },
+                "context_template": {"type": "string", "description": "Context template (create/update)"},
+                "energy": {"type": "number", "description": "Energy 0-1 (update)"},
+                "cohesion": {"type": "number", "description": "Cohesion 0-1 (update)"},
+                "entity_type": {"type": "string", "description": "Member entity type: 'note' or 'decision' (add_member/remove_member)"},
+                "entity_id": {"type": "string", "description": "Member entity UUID (add_member/remove_member)"},
+                "query": {"type": "string", "description": "Activation query (activate)"},
+                "limit": {"type": "integer", "description": "Max items (list)"},
+                "offset": {"type": "integer", "description": "Skip items (list)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,8 +859,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            18,
-            "Expected 18 mega-tools, got {}",
+            19,
+            "Expected 19 mega-tools, got {}",
             tools.len()
         );
     }
@@ -1077,6 +1126,7 @@ mod tests {
             "feature_graph",
             "code",
             "admin",
+            "skill",
         ];
         for name in &mega_names {
             assert!(

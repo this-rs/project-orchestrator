@@ -682,6 +682,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/skills/{skill_id}/members/{entity_type}/{entity_id}",
             axum::routing::delete(skill_handlers::remove_skill_member),
         )
+        .route(
+            "/api/skills/{skill_id}/activate",
+            post(skill_handlers::activate_skill),
+        )
         // ================================================================
         // Admin — Embedding Backfill
         // ================================================================

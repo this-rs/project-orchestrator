@@ -12,7 +12,7 @@ pub const BASE_SYSTEM_PROMPT: &str = r#"# Agent de développement — Project Or
 ## 1. Identité & rôle
 
 Tu es un agent de développement autonome intégré au **Project Orchestrator**.
-Tu disposes de **18 mega-tools MCP** couvrant le cycle de vie complet d'un projet : planification, exécution, suivi, exploration de code, gestion des connaissances.
+Tu disposes de **19 mega-tools MCP** couvrant le cycle de vie complet d'un projet : planification, exécution, suivi, exploration de code, gestion des connaissances, skills neuronaux.
 
 **IMPORTANT — Directive MCP-first :**
 Tu utilises **EXCLUSIVEMENT les outils MCP du Project Orchestrator** pour organiser ton travail.
@@ -32,7 +32,7 @@ Chaque outil a un paramètre `action` qui détermine l'opération :
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-Les 18 mega-tools : `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `admin`
+Les 19 mega-tools : `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `admin`, `skill`
 
 ## 3. Modèle de données
 
@@ -472,7 +472,7 @@ pub struct ToolGroup {
     pub tools: &'static [ToolRef],
 }
 
-/// Static catalog of all 18 MCP mega-tools organized into semantic groups.
+/// Static catalog of all 19 MCP mega-tools organized into semantic groups.
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
@@ -636,6 +636,19 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             },
         ],
     },
+    // ── Neural Skills ─────────────────────────────────────────────
+    ToolGroup {
+        name: "neural_skills",
+        description: "Skills neuronaux émergents (clusters de connaissances), activation contextuelle, trigger matching",
+        keywords: &[
+            "skill", "neural", "cluster", "activation", "trigger",
+            "émergent", "compétence", "knowledge cluster", "context",
+        ],
+        tools: &[ToolRef {
+            name: "skill",
+            description: "Manage neural skills (list/create/get/update/delete/get_members/add_member/remove_member/activate)",
+        }],
+    },
     // ── Admin & Sync ────────────────────────────────────────────────
     ToolGroup {
         name: "sync_admin",
@@ -653,7 +666,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 18 mega-tools).
+/// Must match the MCP tools.rs count (currently 19 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -1689,7 +1702,7 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "create""#));
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "link_to_entity""#));
         // Mega-tools section
-        assert!(BASE_SYSTEM_PROMPT.contains("18 mega-tools"));
+        assert!(BASE_SYSTEM_PROMPT.contains("19 mega-tools"));
         assert!(BASE_SYSTEM_PROMPT.contains("Mega-tools"));
     }
 
@@ -2153,11 +2166,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_18_mega_tools() {
+    fn test_tool_groups_cover_all_19_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 18,
-            "TOOL_GROUPS must cover exactly 18 unique mega-tools (got {}). \
+            count, 19,
+            "TOOL_GROUPS must cover exactly 19 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -2207,7 +2220,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 10, "Expected 10 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 11, "Expected 11 tool groups");
     }
 
     #[test]
