@@ -271,6 +271,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "backfill_synapses" => Some(("admin", "backfill_synapses")),
         "backfill_decision_embeddings" => Some(("admin", "backfill_decision_embeddings")),
         "detect_skills" => Some(("admin", "detect_skills")),
+        "maintain_skills" => Some(("admin", "maintain_skills")),
 
         _ => None,
     }
@@ -795,7 +796,7 @@ fn admin_tool() -> ToolDefinition {
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "detect_skills", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "detect_skills", "maintain_skills", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
@@ -809,7 +810,8 @@ fn admin_tool() -> ToolDefinition {
                 "min_strength": {"type": "number", "description": "Min strength filter (search_neurons)"},
                 "decay_amount": {"type": "number", "description": "Amount to subtract from each synapse weight (decay_synapses, default 0.01)"},
                 "prune_threshold": {"type": "number", "description": "Prune synapses below this weight (decay_synapses, default 0.1)"},
-                "limit": {"type": "integer", "description": "Max items (search_neurons)"}
+                "limit": {"type": "integer", "description": "Max items (search_neurons)"},
+                "level": {"type": "string", "enum": ["hourly", "daily", "weekly", "full"], "description": "Maintenance level (maintain_skills, default: daily)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

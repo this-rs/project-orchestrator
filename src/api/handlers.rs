@@ -1986,6 +1986,102 @@ pub async fn detect_skills(
 }
 
 // ============================================================================
+// Skill Maintenance
+// ============================================================================
+
+/// Request to run skill maintenance
+#[derive(Deserialize)]
+pub struct SkillMaintenanceRequest {
+    pub project_id: Uuid,
+    #[serde(default = "default_maintenance_level")]
+    pub level: String,
+}
+
+fn default_maintenance_level() -> String {
+    "daily".to_string()
+}
+
+/// Run skill maintenance for a project
+pub async fn skill_maintenance(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<SkillMaintenanceRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    // Verify project exists
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let config = crate::skills::maintenance::SkillMaintenanceConfig::default();
+    let start = std::time::Instant::now();
+
+    let result = match body.level.as_str() {
+        "hourly" => {
+            crate::skills::maintenance::run_hourly_maintenance(
+                state.orchestrator.neo4j(),
+                project_id,
+                &config,
+            )
+            .await
+        }
+        "daily" => {
+            crate::skills::maintenance::run_daily_maintenance(
+                state.orchestrator.neo4j(),
+                project_id,
+                &config,
+            )
+            .await
+        }
+        "weekly" => {
+            crate::skills::maintenance::run_weekly_maintenance(
+                state.orchestrator.neo4j(),
+                project_id,
+                &config,
+            )
+            .await
+        }
+        "full" => {
+            crate::skills::maintenance::run_full_maintenance(
+                state.orchestrator.neo4j(),
+                project_id,
+                &config,
+            )
+            .await
+        }
+        _ => {
+            return Err(AppError::BadRequest(format!(
+                "Invalid maintenance level: '{}'. Expected: hourly, daily, weekly, full",
+                body.level
+            )));
+        }
+    }
+    .map_err(AppError::Internal)?;
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    // Invalidate hook activation cache after maintenance
+    super::hook_handlers::skill_cache()
+        .invalidate_project(&project_id)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "level": result.level,
+        "lifecycle": result.lifecycle,
+        "synapses_decayed": result.synapses_decayed,
+        "synapses_pruned": result.synapses_pruned,
+        "evolution": result.evolution,
+        "skills_detected": result.skills_detected,
+        "warnings": result.warnings,
+        "elapsed_ms": elapsed_ms,
+    })))
+}
+
+// ============================================================================
 // Releases
 // ============================================================================
 

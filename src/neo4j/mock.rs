@@ -6943,6 +6943,7 @@ impl GraphStore for MockGraphStore {
         _input: &str,
     ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
         // Mock: return all active/emerging skills for the project
+        // Emerging skills get a 0.8x confidence penalty (consistent with Neo4j impl)
         let store = self.skills.read().await;
         Ok(store
             .values()
@@ -6953,7 +6954,14 @@ impl GraphStore for MockGraphStore {
                         crate::skills::SkillStatus::Active | crate::skills::SkillStatus::Emerging
                     )
             })
-            .map(|s| (s.clone(), 1.0))
+            .map(|s| {
+                let confidence = if s.status == crate::skills::SkillStatus::Emerging {
+                    0.8
+                } else {
+                    1.0
+                };
+                (s.clone(), confidence)
+            })
             .collect())
     }
 

@@ -801,7 +801,13 @@ impl Neo4jClient {
             }
 
             if best_confidence > 0.0 {
-                matches.push((skill, best_confidence));
+                // Apply confidence penalty for Emerging skills (unproven)
+                let adjusted_confidence = if skill.status == crate::skills::SkillStatus::Emerging {
+                    best_confidence * 0.8
+                } else {
+                    best_confidence
+                };
+                matches.push((skill, adjusted_confidence));
             }
         }
 
