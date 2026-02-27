@@ -70,6 +70,35 @@ impl FromStr for SkillStatus {
     }
 }
 
+impl SkillStatus {
+    /// Returns true if transitioning from `self` to `to` is a valid lifecycle transition.
+    ///
+    /// Valid transitions:
+    /// - Emerging → Active, Dormant, Archived
+    /// - Active → Dormant, Archived
+    /// - Dormant → Active, Archived
+    /// - Archived → (terminal state, no outgoing transitions)
+    /// - Imported → Active, Archived
+    /// - Same status → always valid (no-op)
+    pub fn can_transition_to(self, to: Self) -> bool {
+        if self == to {
+            return true;
+        }
+        matches!(
+            (self, to),
+            (Self::Emerging, Self::Active)
+                | (Self::Emerging, Self::Dormant)
+                | (Self::Emerging, Self::Archived)
+                | (Self::Active, Self::Dormant)
+                | (Self::Active, Self::Archived)
+                | (Self::Dormant, Self::Active)
+                | (Self::Dormant, Self::Archived)
+                | (Self::Imported, Self::Active)
+                | (Self::Imported, Self::Archived)
+        )
+    }
+}
+
 /// Type of trigger pattern for matching tool inputs to skills.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -603,6 +632,55 @@ mod tests {
     #[test]
     fn test_skill_status_parse_error() {
         assert!(SkillStatus::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_skill_status_valid_transitions() {
+        // Same-state is always valid
+        for status in [
+            SkillStatus::Emerging,
+            SkillStatus::Active,
+            SkillStatus::Dormant,
+            SkillStatus::Archived,
+            SkillStatus::Imported,
+        ] {
+            assert!(
+                status.can_transition_to(status),
+                "{status} → {status} should be valid"
+            );
+        }
+
+        // Valid forward transitions
+        assert!(SkillStatus::Emerging.can_transition_to(SkillStatus::Active));
+        assert!(SkillStatus::Emerging.can_transition_to(SkillStatus::Dormant));
+        assert!(SkillStatus::Emerging.can_transition_to(SkillStatus::Archived));
+        assert!(SkillStatus::Active.can_transition_to(SkillStatus::Dormant));
+        assert!(SkillStatus::Active.can_transition_to(SkillStatus::Archived));
+        assert!(SkillStatus::Dormant.can_transition_to(SkillStatus::Active));
+        assert!(SkillStatus::Dormant.can_transition_to(SkillStatus::Archived));
+        assert!(SkillStatus::Imported.can_transition_to(SkillStatus::Active));
+        assert!(SkillStatus::Imported.can_transition_to(SkillStatus::Archived));
+    }
+
+    #[test]
+    fn test_skill_status_invalid_transitions() {
+        // Archived is terminal
+        assert!(!SkillStatus::Archived.can_transition_to(SkillStatus::Active));
+        assert!(!SkillStatus::Archived.can_transition_to(SkillStatus::Emerging));
+        assert!(!SkillStatus::Archived.can_transition_to(SkillStatus::Dormant));
+        assert!(!SkillStatus::Archived.can_transition_to(SkillStatus::Imported));
+
+        // Can't go back to Emerging
+        assert!(!SkillStatus::Active.can_transition_to(SkillStatus::Emerging));
+        assert!(!SkillStatus::Dormant.can_transition_to(SkillStatus::Emerging));
+
+        // Can't become Imported after creation
+        assert!(!SkillStatus::Active.can_transition_to(SkillStatus::Imported));
+        assert!(!SkillStatus::Emerging.can_transition_to(SkillStatus::Imported));
+
+        // Imported can't go to Dormant/Emerging
+        assert!(!SkillStatus::Imported.can_transition_to(SkillStatus::Dormant));
+        assert!(!SkillStatus::Imported.can_transition_to(SkillStatus::Emerging));
     }
 
     #[test]

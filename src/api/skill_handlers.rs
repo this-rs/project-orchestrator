@@ -5,6 +5,7 @@ use super::hook_handlers::skill_cache;
 use super::{PaginatedResponse, PaginationParams};
 use crate::skills::{
     ActivatedSkillContext, ConflictStrategy, ImportResult, SkillNode, SkillStatus, SkillTrigger,
+    TriggerType, MAX_TRIGGER_PATTERN_LEN, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -14,6 +15,123 @@ use axum::{
 use chrono::Utc;
 use serde::Deserialize;
 use uuid::Uuid;
+
+// ============================================================================
+// Validation constants
+// ============================================================================
+
+const MAX_NAME_LEN: usize = 200;
+const MAX_DESCRIPTION_LEN: usize = 5000;
+const MAX_TAG_LEN: usize = 100;
+const MAX_TAGS_COUNT: usize = 50;
+const MAX_CONTEXT_TEMPLATE_LEN: usize = 50_000;
+
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
+/// Validate trigger patterns: compile regexes with size limits, validate globs.
+fn validate_trigger_patterns(triggers: &[SkillTrigger]) -> Result<(), String> {
+    for (i, trigger) in triggers.iter().enumerate() {
+        if trigger.pattern_value.len() > MAX_TRIGGER_PATTERN_LEN {
+            return Err(format!(
+                "trigger_patterns[{}]: pattern too long ({} > {} chars)",
+                i,
+                trigger.pattern_value.len(),
+                MAX_TRIGGER_PATTERN_LEN
+            ));
+        }
+        if !(0.0..=1.0).contains(&trigger.confidence_threshold) {
+            return Err(format!(
+                "trigger_patterns[{}]: confidence_threshold must be 0.0-1.0, got {}",
+                i, trigger.confidence_threshold
+            ));
+        }
+        match trigger.pattern_type {
+            TriggerType::Regex => {
+                if let Err(e) = regex::RegexBuilder::new(&trigger.pattern_value)
+                    .case_insensitive(true)
+                    .size_limit(REGEX_SIZE_LIMIT)
+                    .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+                    .build()
+                {
+                    return Err(format!(
+                        "trigger_patterns[{}]: invalid regex '{}': {}",
+                        i, trigger.pattern_value, e
+                    ));
+                }
+            }
+            TriggerType::FileGlob => {
+                if let Err(e) = glob::Pattern::new(&trigger.pattern_value) {
+                    return Err(format!(
+                        "trigger_patterns[{}]: invalid glob '{}': {}",
+                        i, trigger.pattern_value, e
+                    ));
+                }
+            }
+            TriggerType::Semantic => {
+                // Semantic triggers contain embedding vectors — no compile-time validation needed
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate input length limits for skill fields.
+fn validate_input_limits(
+    name: Option<&str>,
+    description: Option<&str>,
+    tags: Option<&[String]>,
+    context_template: Option<&str>,
+) -> Result<(), String> {
+    if let Some(name) = name {
+        if name.len() > MAX_NAME_LEN {
+            return Err(format!(
+                "name too long ({} > {} chars)",
+                name.len(),
+                MAX_NAME_LEN
+            ));
+        }
+    }
+    if let Some(desc) = description {
+        if desc.len() > MAX_DESCRIPTION_LEN {
+            return Err(format!(
+                "description too long ({} > {} chars)",
+                desc.len(),
+                MAX_DESCRIPTION_LEN
+            ));
+        }
+    }
+    if let Some(tags) = tags {
+        if tags.len() > MAX_TAGS_COUNT {
+            return Err(format!(
+                "too many tags ({} > {})",
+                tags.len(),
+                MAX_TAGS_COUNT
+            ));
+        }
+        for (i, tag) in tags.iter().enumerate() {
+            if tag.len() > MAX_TAG_LEN {
+                return Err(format!(
+                    "tags[{}] too long ({} > {} chars)",
+                    i,
+                    tag.len(),
+                    MAX_TAG_LEN
+                ));
+            }
+        }
+    }
+    if let Some(tpl) = context_template {
+        if tpl.len() > MAX_CONTEXT_TEMPLATE_LEN {
+            return Err(format!(
+                "context_template too long ({} > {} chars)",
+                tpl.len(),
+                MAX_CONTEXT_TEMPLATE_LEN
+            ));
+        }
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Query Parameters
@@ -111,10 +229,10 @@ pub async fn list_skills(
 ) -> Result<Json<PaginatedResponse<SkillNode>>, AppError> {
     query.pagination.validate().map_err(AppError::BadRequest)?;
 
-    let status_filter = query
-        .status
-        .as_ref()
-        .and_then(|s| s.parse::<SkillStatus>().ok());
+    let status_filter = match &query.status {
+        Some(s) => Some(s.parse::<SkillStatus>().map_err(AppError::BadRequest)?),
+        None => None,
+    };
 
     let limit = query.pagination.validated_limit();
     let offset = query.pagination.offset;
@@ -138,6 +256,20 @@ pub async fn create_skill(
 ) -> Result<(StatusCode, Json<SkillNode>), AppError> {
     if body.name.trim().is_empty() {
         return Err(AppError::BadRequest("name cannot be empty".to_string()));
+    }
+
+    // Validate input limits
+    validate_input_limits(
+        Some(&body.name),
+        body.description.as_deref(),
+        body.tags.as_deref(),
+        body.context_template.as_deref(),
+    )
+    .map_err(AppError::BadRequest)?;
+
+    // Validate trigger patterns
+    if let Some(ref triggers) = body.trigger_patterns {
+        validate_trigger_patterns(triggers).map_err(AppError::BadRequest)?;
     }
 
     let mut skill = SkillNode::new(body.project_id, body.name);
@@ -199,6 +331,20 @@ pub async fn update_skill(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Skill {} not found", skill_id)))?;
 
+    // Validate input limits
+    validate_input_limits(
+        body.name.as_deref(),
+        body.description.as_deref(),
+        body.tags.as_deref(),
+        body.context_template.as_deref(),
+    )
+    .map_err(AppError::BadRequest)?;
+
+    // Validate trigger patterns
+    if let Some(ref triggers) = body.trigger_patterns {
+        validate_trigger_patterns(triggers).map_err(AppError::BadRequest)?;
+    }
+
     // Apply updates
     if let Some(name) = body.name {
         if name.trim().is_empty() {
@@ -210,9 +356,16 @@ pub async fn update_skill(
         skill.description = description;
     }
     if let Some(status_str) = body.status {
-        skill.status = status_str
+        let new_status: SkillStatus = status_str
             .parse()
             .map_err(|e: String| AppError::BadRequest(e))?;
+        if !skill.status.can_transition_to(new_status) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid status transition: {} → {}",
+                skill.status, new_status
+            )));
+        }
+        skill.status = new_status;
     }
     if let Some(tags) = body.tags {
         skill.tags = tags;
@@ -495,4 +648,132 @@ pub async fn get_skill_health(
     let health = crate::skills::validation::compute_health(&skill, Utc::now());
 
     Ok(Json(health))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_trigger_patterns_valid_regex() {
+        let triggers = vec![SkillTrigger::regex("neo4j|cypher", 0.6)];
+        assert!(validate_trigger_patterns(&triggers).is_ok());
+    }
+
+    #[test]
+    fn test_validate_trigger_patterns_invalid_regex() {
+        let triggers = vec![SkillTrigger::regex("[invalid", 0.6)];
+        let result = validate_trigger_patterns(&triggers);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid regex"));
+    }
+
+    #[test]
+    fn test_validate_trigger_patterns_catastrophic_regex() {
+        // Regex that would cause exponential backtracking / exceed size limits
+        let evil = "(a+)+$".repeat(100);
+        let triggers = vec![SkillTrigger::regex(evil, 0.6)];
+        let result = validate_trigger_patterns(&triggers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_trigger_patterns_valid_glob() {
+        let triggers = vec![SkillTrigger::file_glob("src/neo4j/**", 0.8)];
+        assert!(validate_trigger_patterns(&triggers).is_ok());
+    }
+
+    #[test]
+    fn test_validate_trigger_patterns_invalid_glob() {
+        let triggers = vec![SkillTrigger::file_glob("[invalid", 0.8)];
+        let result = validate_trigger_patterns(&triggers);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid glob"));
+    }
+
+    #[test]
+    fn test_validate_trigger_patterns_too_long() {
+        let long_pattern = "a".repeat(MAX_TRIGGER_PATTERN_LEN + 1);
+        let triggers = vec![SkillTrigger::regex(long_pattern, 0.6)];
+        let result = validate_trigger_patterns(&triggers);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("pattern too long"));
+    }
+
+    #[test]
+    fn test_validate_trigger_patterns_bad_confidence() {
+        let triggers = vec![SkillTrigger::regex("test", 1.5)];
+        let result = validate_trigger_patterns(&triggers);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("confidence_threshold"));
+    }
+
+    #[test]
+    fn test_validate_trigger_patterns_semantic_always_valid() {
+        let triggers = vec![SkillTrigger::semantic("[0.1, 0.2]", 0.7)];
+        assert!(validate_trigger_patterns(&triggers).is_ok());
+    }
+
+    #[test]
+    fn test_validate_input_limits_name_too_long() {
+        let name = "a".repeat(MAX_NAME_LEN + 1);
+        let result = validate_input_limits(Some(&name), None, None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("name too long"));
+    }
+
+    #[test]
+    fn test_validate_input_limits_description_too_long() {
+        let desc = "a".repeat(MAX_DESCRIPTION_LEN + 1);
+        let result = validate_input_limits(None, Some(&desc), None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("description too long"));
+    }
+
+    #[test]
+    fn test_validate_input_limits_too_many_tags() {
+        let tags: Vec<String> = (0..MAX_TAGS_COUNT + 1)
+            .map(|i| format!("tag{}", i))
+            .collect();
+        let result = validate_input_limits(None, None, Some(&tags), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too many tags"));
+    }
+
+    #[test]
+    fn test_validate_input_limits_tag_too_long() {
+        let tags = vec!["a".repeat(MAX_TAG_LEN + 1)];
+        let result = validate_input_limits(None, None, Some(&tags), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("tags[0] too long"));
+    }
+
+    #[test]
+    fn test_validate_input_limits_context_template_too_long() {
+        let tpl = "a".repeat(MAX_CONTEXT_TEMPLATE_LEN + 1);
+        let result = validate_input_limits(None, None, None, Some(&tpl));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("context_template too long"));
+    }
+
+    #[test]
+    fn test_validate_input_limits_all_valid() {
+        let tags = vec!["tag1".to_string(), "tag2".to_string()];
+        let result = validate_input_limits(
+            Some("Valid Name"),
+            Some("Valid description"),
+            Some(&tags),
+            Some("Valid template"),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_input_limits_none_values() {
+        assert!(validate_input_limits(None, None, None, None).is_ok());
+    }
 }
