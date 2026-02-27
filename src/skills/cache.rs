@@ -295,10 +295,10 @@ pub fn evaluate_cached_skill(
 
     for (trigger, threshold) in &cached_skill.compiled_triggers {
         let matched = match trigger {
-            CompiledTrigger::Regex(re) => pattern.map_or(false, |pat| re.is_match(pat)),
+            CompiledTrigger::Regex(re) => pattern.is_some_and(|pat| re.is_match(pat)),
             CompiledTrigger::FileGlob(glob_pat) => {
                 // FileGlob only matches against file context, not pattern text
-                file_context.map_or(false, |file| glob_pat.matches(file))
+                file_context.is_some_and(|file| glob_pat.matches(file))
             }
             CompiledTrigger::Semantic(_) => {
                 // Semantic matching skipped in hot path
