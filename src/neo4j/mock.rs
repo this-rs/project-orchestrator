@@ -6818,7 +6818,13 @@ impl GraphStore for MockGraphStore {
             .filter(|s| status.is_none_or(|st| s.status == st))
             .cloned()
             .collect();
-        filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        // Sort by energy DESC, name ASC (consistent with Neo4j query)
+        filtered.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         let total = filtered.len();
         let page = filtered.into_iter().skip(offset).take(limit).collect();
         Ok((page, total))

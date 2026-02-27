@@ -3101,6 +3101,13 @@ impl ToolHandler {
                 let skill_id = extract_id(args, "skill_id")?;
                 let entity_type = extract_string(args, "entity_type")?;
                 let entity_id = extract_id(args, "entity_id")?;
+                // Validate entity_type (defense-in-depth, also validated server-side)
+                if entity_type != "note" && entity_type != "decision" {
+                    return Err(anyhow!(
+                        "Invalid entity_type '{}': expected 'note' or 'decision'",
+                        entity_type
+                    ));
+                }
                 let body = json!({
                     "entity_type": entity_type,
                     "entity_id": entity_id
@@ -3119,6 +3126,13 @@ impl ToolHandler {
                 let skill_id = extract_id(args, "skill_id")?;
                 let entity_type = extract_string(args, "entity_type")?;
                 let entity_id = extract_id(args, "entity_id")?;
+                // Validate entity_type to prevent URL path injection
+                if entity_type != "note" && entity_type != "decision" {
+                    return Err(anyhow!(
+                        "Invalid entity_type '{}': expected 'note' or 'decision'",
+                        entity_type
+                    ));
+                }
                 let result = http
                     .delete(&format!(
                         "/api/skills/{}/members/{}/{}",

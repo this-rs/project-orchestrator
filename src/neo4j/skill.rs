@@ -10,6 +10,7 @@ use crate::notes::Note;
 use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus, SkillTrigger};
 use anyhow::{Context, Result};
 use neo4rs::query;
+use regex::RegexBuilder;
 use uuid::Uuid;
 
 impl Neo4jClient {
@@ -79,7 +80,11 @@ impl Neo4jClient {
     // CRUD operations
     // ========================================================================
 
-    /// Create a new skill node and link it to its project.
+    /// Create a new skill node and link it to its project atomically.
+    ///
+    /// Uses a single Cypher query to CREATE the skill and MERGE the
+    /// BELONGS_TO relationship, preventing orphaned nodes if the
+    /// relationship step were to fail in a two-step approach.
     pub async fn create_skill(&self, skill: &SkillNode) -> Result<()> {
         let trigger_json = serde_json::to_string(&skill.trigger_patterns)?;
 
@@ -109,6 +114,11 @@ impl Neo4jClient {
                 created_at: datetime($created_at),
                 updated_at: datetime($updated_at)
             })
+            WITH s
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
+                MERGE (s)-[:BELONGS_TO]->(p)
+            )
             "#,
         )
         .param("id", skill.id.to_string())
@@ -154,22 +164,6 @@ impl Neo4jClient {
             .await
             .context("Failed to create Skill node")?;
 
-        // Link to project
-        let link_q = query(
-            r#"
-            MATCH (s:Skill {id: $skill_id})
-            MATCH (p:Project {id: $project_id})
-            MERGE (s)-[:BELONGS_TO]->(p)
-            "#,
-        )
-        .param("skill_id", skill.id.to_string())
-        .param("project_id", skill.project_id.to_string());
-
-        self.graph
-            .run(link_q)
-            .await
-            .context("Failed to link Skill to Project")?;
-
         Ok(())
     }
 
@@ -193,6 +187,8 @@ impl Neo4jClient {
     }
 
     /// Update a skill node (replaces all mutable fields).
+    ///
+    /// Returns an error if the skill does not exist (consistent with mock behavior).
     pub async fn update_skill(&self, skill: &SkillNode) -> Result<()> {
         let trigger_json = serde_json::to_string(&skill.trigger_patterns)?;
 
@@ -218,6 +214,7 @@ impl Neo4jClient {
                 s.is_validated = $is_validated,
                 s.tags = $tags,
                 s.updated_at = datetime($updated_at)
+            RETURN s.id AS updated_id
             "#,
         )
         .param("id", skill.id.to_string())
@@ -256,32 +253,59 @@ impl Neo4jClient {
         .param("tags", skill.tags.clone())
         .param("updated_at", skill.updated_at.to_rfc3339());
 
-        self.graph
-            .run(q)
+        let mut result = self
+            .graph
+            .execute(q)
             .await
             .context("Failed to update Skill node")?;
+
+        if result.next().await?.is_none() {
+            anyhow::bail!("Skill not found: {}", skill.id);
+        }
 
         Ok(())
     }
 
     /// Delete a skill and all its relationships.
+    ///
+    /// Uses a two-step approach: first check existence, then delete.
+    /// After DETACH DELETE, the node is gone so RETURN count() would always be 0.
     pub async fn delete_skill(&self, id: Uuid) -> Result<bool> {
-        let q = query(
+        // Step 1: Check if skill exists
+        let check_q = query(
             r#"
             MATCH (s:Skill {id: $id})
-            DETACH DELETE s
             RETURN count(s) AS cnt
             "#,
         )
         .param("id", id.to_string());
 
-        let mut result = self.graph.execute(q).await?;
-        if let Some(row) = result.next().await? {
-            let cnt: i64 = row.get("cnt").unwrap_or(0);
-            Ok(cnt > 0)
+        let mut check_result = self.graph.execute(check_q).await?;
+        let exists = if let Some(row) = check_result.next().await? {
+            row.get::<i64>("cnt").unwrap_or(0) > 0
         } else {
-            Ok(false)
+            false
+        };
+
+        if !exists {
+            return Ok(false);
         }
+
+        // Step 2: Delete the skill and all its relationships
+        let delete_q = query(
+            r#"
+            MATCH (s:Skill {id: $id})
+            DETACH DELETE s
+            "#,
+        )
+        .param("id", id.to_string());
+
+        self.graph
+            .run(delete_q)
+            .await
+            .context("Failed to delete Skill node")?;
+
+        Ok(true)
     }
 
     /// List skills for a project with optional status filter and pagination.
@@ -445,28 +469,27 @@ impl Neo4jClient {
     }
 
     /// Remove a member from a skill.
+    ///
+    /// Uses a two-step approach: first check if the relationship exists,
+    /// then delete it and update counters. After DELETE r, the relationship
+    /// is gone so RETURN count(r) would always be 0.
     pub async fn remove_skill_member(
         &self,
         skill_id: Uuid,
         entity_type: &str,
         entity_id: Uuid,
     ) -> Result<bool> {
-        let cypher = match entity_type {
+        // Step 1: Check if the relationship exists
+        let check_cypher = match entity_type {
             "note" => {
                 r#"
                 MATCH (n:Note {id: $entity_id})-[r:MEMBER_OF]->(s:Skill {id: $skill_id})
-                DELETE r
-                SET s.note_count = size([(x)-[:MEMBER_OF]->(s) WHERE x:Note | x]),
-                    s.updated_at = datetime()
                 RETURN count(r) AS cnt
                 "#
             }
             "decision" => {
                 r#"
                 MATCH (d:Decision {id: $entity_id})-[r:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
-                DELETE r
-                SET s.decision_count = size([(x)-[:MEMBER_OF_SKILL]->(s) WHERE x:Decision | x]),
-                    s.updated_at = datetime()
                 RETURN count(r) AS cnt
                 "#
             }
@@ -475,17 +498,54 @@ impl Neo4jClient {
             }
         };
 
-        let q = query(cypher)
+        let check_q = query(check_cypher)
             .param("skill_id", skill_id.to_string())
             .param("entity_id", entity_id.to_string());
 
-        let mut result = self.graph.execute(q).await?;
-        if let Some(row) = result.next().await? {
-            let cnt: i64 = row.get("cnt").unwrap_or(0);
-            Ok(cnt > 0)
+        let mut check_result = self.graph.execute(check_q).await?;
+        let exists = if let Some(row) = check_result.next().await? {
+            row.get::<i64>("cnt").unwrap_or(0) > 0
         } else {
-            Ok(false)
+            false
+        };
+
+        if !exists {
+            return Ok(false);
         }
+
+        // Step 2: Delete the relationship and update counters
+        let delete_cypher = match entity_type {
+            "note" => {
+                r#"
+                MATCH (n:Note {id: $entity_id})-[r:MEMBER_OF]->(s:Skill {id: $skill_id})
+                DELETE r
+                SET s.note_count = size([(x)-[:MEMBER_OF]->(s) WHERE x:Note | x]),
+                    s.updated_at = datetime()
+                "#
+            }
+            "decision" => {
+                r#"
+                MATCH (d:Decision {id: $entity_id})-[r:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
+                DELETE r
+                SET s.decision_count = size([(x)-[:MEMBER_OF_SKILL]->(s) WHERE x:Decision | x]),
+                    s.updated_at = datetime()
+                "#
+            }
+            _ => unreachable!(), // Already validated above
+        };
+
+        let delete_q = query(delete_cypher)
+            .param("skill_id", skill_id.to_string())
+            .param("entity_id", entity_id.to_string());
+
+        self.graph.run(delete_q).await.with_context(|| {
+            format!(
+                "Failed to remove {} {} from skill {}",
+                entity_type, entity_id, skill_id
+            )
+        })?;
+
+        Ok(true)
     }
 
     // ========================================================================
@@ -693,15 +753,27 @@ impl Neo4jClient {
 
                 let confidence = match trigger.pattern_type {
                     crate::skills::TriggerType::Regex => {
-                        match regex::Regex::new(&trigger.pattern_value) {
-                            Ok(re) => {
-                                if re.is_match(input) {
-                                    1.0
-                                } else {
-                                    0.0
+                        // Use RegexBuilder with size limits (ReDoS protection)
+                        // and case-insensitive matching (consistent with activation.rs
+                        // and triggers.rs quality evaluation)
+                        if trigger.pattern_value.len() > 500 {
+                            0.0
+                        } else {
+                            match RegexBuilder::new(&trigger.pattern_value)
+                                .case_insensitive(true)
+                                .size_limit(10_000)
+                                .dfa_size_limit(10_000)
+                                .build()
+                            {
+                                Ok(re) => {
+                                    if re.is_match(input) {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
                                 }
+                                Err(_) => 0.0,
                             }
-                            Err(_) => 0.0,
                         }
                     }
                     crate::skills::TriggerType::FileGlob => {

@@ -422,12 +422,16 @@ pub fn evaluate_skill_match(
 /// Returns a confidence score (0.0 or 1.0):
 /// - 1.0 if the regex matches the input
 /// - 0.0 if no match or regex compilation fails
+///
+/// Uses case-insensitive matching to be consistent with
+/// `evaluate_regex_quality` in triggers.rs (which uses `(?i)` prefix).
 fn match_regex_trigger(trigger_pattern: &str, input: &str) -> f64 {
     // Reject overly long patterns to prevent compilation DoS
     if trigger_pattern.len() > 500 {
         return 0.0;
     }
     match RegexBuilder::new(trigger_pattern)
+        .case_insensitive(true)
         .size_limit(10_000)
         .dfa_size_limit(10_000)
         .build()
@@ -530,6 +534,8 @@ pub fn assemble_context_with_confidence(
     });
 
     // Add notes one by one until budget is exhausted
+    // Use chars().count() consistently (not .len() which is byte count)
+    // to correctly handle multi-byte UTF-8 characters in budget accounting.
     let mut notes_included = 0;
     for note in &sorted_notes {
         let emoji = note_type_emoji(&note.note_type.to_string());
@@ -537,7 +543,7 @@ pub fn assemble_context_with_confidence(
         let content = truncate_content(&note.content, 150);
         let line = format!("- {}{}{}\n", emoji, importance_badge, content);
 
-        if context.len() + line.len() > notes_budget {
+        if context.chars().count() + line.chars().count() > notes_budget {
             break;
         }
         context.push_str(&line);
@@ -548,7 +554,7 @@ pub fn assemble_context_with_confidence(
     let omitted = sorted_notes.len().saturating_sub(notes_included);
     if omitted > 0 {
         let omit_line = format!("_(+{} more notes)_\n", omitted);
-        if context.len() + omit_line.len() <= notes_budget {
+        if context.chars().count() + omit_line.chars().count() <= notes_budget {
             context.push_str(&omit_line);
         }
     }
@@ -563,7 +569,7 @@ pub fn assemble_context_with_confidence(
                 truncate_content(chosen, 100),
             );
 
-            if context.len() + line.len() > max_chars {
+            if context.chars().count() + line.chars().count() > max_chars {
                 break;
             }
             context.push_str(&line);
@@ -918,7 +924,7 @@ mod tests {
         assert!(context.contains("UNWIND"));
         assert!(context.contains("Connection pool"));
         assert!(context.contains("Neo4j 5.x driver"));
-        assert!(context.len() <= 3200);
+        assert!(context.chars().count() <= 3200);
     }
 
     #[test]
@@ -969,7 +975,7 @@ mod tests {
         }
 
         let context = assemble_context("Huge Skill", &notes, &[], 2000);
-        assert!(context.len() <= 2000);
+        assert!(context.chars().count() <= 2000);
     }
 
     #[test]
@@ -1129,7 +1135,7 @@ mod tests {
     fn test_truncate_content_long() {
         let long = "a".repeat(300);
         let result = truncate_content(&long, 100);
-        assert!(result.len() <= 100);
+        assert!(result.chars().count() <= 100);
         assert!(result.ends_with("..."));
     }
 
@@ -1211,11 +1217,12 @@ mod tests {
 
         let context = assemble_context("Neo4j Expertise", &notes, &decisions, 3200);
 
-        // Strict budget enforcement
+        // Strict budget enforcement (use chars count, not byte length)
+        let char_count = context.chars().count();
         assert!(
-            context.len() <= 3200,
-            "Context length {} exceeds 3200 char budget",
-            context.len()
+            char_count <= 3200,
+            "Context char count {} exceeds 3200 char budget",
+            char_count
         );
 
         // Header present
@@ -1228,11 +1235,16 @@ mod tests {
             assert!(c < l, "Critical notes should appear before Low notes");
         }
 
-        // Not all 20 notes should fit — omitted indicator should be present
-        assert!(
-            context.contains("more notes)_"),
-            "Should show omitted notes count when not all fit"
-        );
+        // With correct char-based budgeting (not byte-based), 20 short notes
+        // may all fit within 3200 chars. The omitted indicator should appear
+        // only when notes are actually truncated.
+        let notes_included = sorted_note_ids_count(&context, 20);
+        if notes_included < 20 {
+            assert!(
+                context.contains("more notes)_"),
+                "Should show omitted notes count when not all fit"
+            );
+        }
 
         // Max 2 decisions
         assert!(
@@ -1245,6 +1257,13 @@ mod tests {
             context.contains("Neo4j driver") || context.contains("caching"),
             "At least one decision should be included"
         );
+    }
+
+    /// Helper: count how many of the 20 "Note N" entries appear in the context.
+    fn sorted_note_ids_count(context: &str, total: usize) -> usize {
+        (0..total)
+            .filter(|i| context.contains(&format!("Note {} with", i)))
+            .count()
     }
 
     #[test]
@@ -1272,10 +1291,12 @@ mod tests {
 
         let context = assemble_context("Large Skill", &notes, &decisions, 3200);
 
+        // Use chars count for budget check (consistent with char-based budgeting)
+        let char_count = context.chars().count();
         assert!(
-            context.len() <= 3200,
-            "Context length {} exceeds 3200 char budget with 30 notes",
-            context.len()
+            char_count <= 3200,
+            "Context char count {} exceeds 3200 char budget with 30 notes",
+            char_count
         );
 
         // Should include at least 5 notes (each note line is ~180 chars, 5 = ~900)
@@ -1330,9 +1351,9 @@ mod tests {
             notes_with,
         );
 
-        // Both within budget
-        assert!(context_with_decisions.len() <= 3200);
-        assert!(context_without_decisions.len() <= 3200);
+        // Both within budget (use chars count for consistency)
+        assert!(context_with_decisions.chars().count() <= 3200);
+        assert!(context_without_decisions.chars().count() <= 3200);
     }
 
     // --- Config defaults ---

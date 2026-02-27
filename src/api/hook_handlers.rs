@@ -82,6 +82,10 @@ impl RateLimiter {
         entries.retain(|_, (_, window_start)| {
             now.duration_since(*window_start) < self.window_duration * 2
         });
+        // Shrink the map if it has grown too large (safety cap)
+        if entries.capacity() > 1024 && entries.len() < 256 {
+            entries.shrink_to(256);
+        }
     }
 }
 
@@ -277,21 +281,36 @@ pub async fn session_context(
     {
         Ok((plans, _)) => {
             if let Some(plan) = plans.first() {
-                // Calculate plan progress: completed tasks / total tasks
-                let progress = match neo4j.get_plan_tasks(plan.id).await {
+                // Fetch tasks ONCE (avoid duplicate DB call)
+                let (progress, task_json) = match neo4j.get_plan_tasks(plan.id).await {
                     Ok(tasks) => {
                         let total = tasks.len();
                         let completed = tasks
                             .iter()
                             .filter(|t| t.status == crate::neo4j::models::TaskStatus::Completed)
                             .count();
-                        if total > 0 {
+                        let progress_str = if total > 0 {
                             Some(format!("{}/{} tasks", completed, total))
                         } else {
                             None
-                        }
+                        };
+
+                        // Find the current in-progress task
+                        let in_progress_task = tasks
+                            .into_iter()
+                            .find(|t| t.status == crate::neo4j::models::TaskStatus::InProgress)
+                            .map(|t| {
+                                serde_json::json!({
+                                    "title": t.title.unwrap_or_default(),
+                                    "status": t.status,
+                                    "priority": t.priority,
+                                    "tags": t.tags,
+                                })
+                            });
+
+                        (progress_str, in_progress_task)
                     }
-                    Err(_) => None,
+                    Err(_) => (None, None),
                 };
 
                 let plan_json = serde_json::json!({
@@ -300,22 +319,6 @@ pub async fn session_context(
                     "progress": progress,
                     "priority": plan.priority,
                 });
-
-                // Find the current in-progress task within this plan
-                let task_json = match neo4j.get_plan_tasks(plan.id).await {
-                    Ok(tasks) => tasks
-                        .into_iter()
-                        .find(|t| t.status == crate::neo4j::models::TaskStatus::InProgress)
-                        .map(|t| {
-                            serde_json::json!({
-                                "title": t.title.unwrap_or_default(),
-                                "status": t.status,
-                                "priority": t.priority,
-                                "tags": t.tags,
-                            })
-                        }),
-                    Err(_) => None,
-                };
 
                 (Some(plan_json), task_json)
             } else {
@@ -348,7 +351,7 @@ pub async fn session_context(
             .into_iter()
             .map(|n| {
                 serde_json::json!({
-                    "content": n.content,
+                    "content": truncate_str(&n.content, 500),
                     "note_type": n.note_type,
                     "importance": n.importance,
                     "tags": n.tags,
@@ -386,32 +389,18 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 /// Extract client IP from request headers.
 ///
-/// Checks (in order):
-/// 1. X-Forwarded-For (first IP in chain)
-/// 2. X-Real-IP
-/// 3. Falls back to 127.0.0.1
-fn extract_client_ip(headers: &HeaderMap) -> IpAddr {
-    // X-Forwarded-For: client, proxy1, proxy2
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(value) = xff.to_str() {
-            if let Some(first_ip) = value.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                    return ip;
-                }
-            }
-        }
-    }
-
-    // X-Real-IP
-    if let Some(xri) = headers.get("x-real-ip") {
-        if let Ok(value) = xri.to_str() {
-            if let Ok(ip) = value.trim().parse::<IpAddr>() {
-                return ip;
-            }
-        }
-    }
-
-    // Fallback
+/// **Security**: Does NOT trust X-Forwarded-For or X-Real-IP headers
+/// because PO runs as a localhost service without a reverse proxy.
+/// These headers can be trivially spoofed by any client to bypass
+/// the rate limiter. Always returns localhost for consistent rate limiting.
+///
+/// If PO is ever deployed behind a trusted reverse proxy, this function
+/// should be updated to read the IP from the proxy's header, but only
+/// after configuring the trusted proxy IP list.
+fn extract_client_ip(_headers: &HeaderMap) -> IpAddr {
+    // PO is a localhost service — the "client" is always local.
+    // Trusting X-Forwarded-For without a known reverse proxy
+    // allows trivial rate limiter bypass via header spoofing.
     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 }
 
@@ -456,8 +445,32 @@ pub async fn install_hooks(
     Json(body): Json<InstallHooksRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project_id = body.project_id;
-    let cwd = std::path::PathBuf::from(&body.cwd);
     let port = body.port;
+
+    // Canonicalize cwd to prevent path traversal attacks (e.g., "../../etc")
+    let raw_cwd = std::path::PathBuf::from(&body.cwd);
+    if !raw_cwd.is_dir() {
+        return Err(AppError::BadRequest(format!(
+            "Directory does not exist: {}",
+            raw_cwd.display()
+        )));
+    }
+    let cwd = raw_cwd.canonicalize().map_err(|e| {
+        AppError::BadRequest(format!(
+            "Cannot resolve directory path '{}': {}",
+            raw_cwd.display(),
+            e
+        ))
+    })?;
+
+    // Safety check: reject system directories
+    let cwd_str = cwd.to_string_lossy();
+    if cwd_str == "/" || cwd_str.starts_with("/etc") || cwd_str.starts_with("/usr") {
+        return Err(AppError::BadRequest(format!(
+            "Refusing to install hooks in system directory: {}",
+            cwd.display()
+        )));
+    }
 
     // Verify project exists
     state
@@ -467,14 +480,6 @@ pub async fn install_hooks(
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
-
-    // Verify cwd exists
-    if !cwd.is_dir() {
-        return Err(AppError::BadRequest(format!(
-            "Directory does not exist: {}",
-            cwd.display()
-        )));
-    }
 
     // Resolve ~/.claude/hooks/
     let home = std::env::var("HOME")
@@ -629,47 +634,32 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_client_ip_xff() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-    }
-
-    #[test]
-    fn test_extract_client_ip_xri() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "10.0.0.5".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
-    }
-
-    #[test]
-    fn test_extract_client_ip_xff_priority() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        headers.insert("x-real-ip", "5.6.7.8".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))); // XFF takes priority
-    }
-
-    #[test]
-    fn test_extract_client_ip_fallback() {
+    fn test_extract_client_ip_always_localhost() {
+        // Security: PO is a localhost service, so we never trust proxy headers.
+        // This prevents rate limiter bypass via X-Forwarded-For spoofing.
         let headers = HeaderMap::new();
         let ip = extract_client_ip(&headers);
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     #[test]
-    fn test_extract_client_ip_invalid_xff() {
+    fn test_extract_client_ip_ignores_xff() {
+        // X-Forwarded-For headers should be ignored (security: spoofable)
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
 
         let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST)); // fallback
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST)); // Always localhost
+    }
+
+    #[test]
+    fn test_extract_client_ip_ignores_xri() {
+        // X-Real-IP headers should be ignored (security: spoofable)
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "10.0.0.5".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST)); // Always localhost
     }
 
     // ================================================================
