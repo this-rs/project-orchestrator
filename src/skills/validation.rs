@@ -171,7 +171,8 @@ fn assess_health(
                     ),
                 );
             }
-            if days > IMPORT_PROBATION_DAYS && skill.activation_count < IMPORT_VALIDATION_ACTIVATIONS
+            if days > IMPORT_PROBATION_DAYS
+                && skill.activation_count < IMPORT_VALIDATION_ACTIVATIONS
             {
                 return (
                     HealthRecommendation::AtRisk,
@@ -201,7 +202,9 @@ fn assess_health(
                 HealthRecommendation::NeedsAttention,
                 format!(
                     "Imported skill in probation ({} days remaining). No activations yet.",
-                    days_since_import.map(|d| (IMPORT_PROBATION_DAYS - d).max(0)).unwrap_or(0),
+                    days_since_import
+                        .map(|d| (IMPORT_PROBATION_DAYS - d).max(0))
+                        .unwrap_or(0),
                 ),
             );
         }

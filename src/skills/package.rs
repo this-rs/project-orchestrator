@@ -351,9 +351,7 @@ mod tests {
         let mut package = make_valid_package();
         package.skill.trigger_patterns = vec![SkillTrigger::regex("[invalid(", 0.7)];
         let errors = validate_package(&package).unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|e| e.field.contains("trigger_patterns")));
+        assert!(errors.iter().any(|e| e.field.contains("trigger_patterns")));
     }
 
     #[test]
@@ -361,9 +359,7 @@ mod tests {
         let mut package = make_valid_package();
         package.skill.trigger_patterns = vec![SkillTrigger::file_glob("[invalid", 0.8)];
         let errors = validate_package(&package).unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|e| e.field.contains("trigger_patterns")));
+        assert!(errors.iter().any(|e| e.field.contains("trigger_patterns")));
     }
 
     #[test]
@@ -394,14 +390,17 @@ mod tests {
         package.skill.name = "".to_string();
         package.notes.clear();
         let errors = validate_package(&package).unwrap_err();
-        assert!(errors.len() >= 3, "Expected 3+ errors, got {}", errors.len());
+        assert!(
+            errors.len() >= 3,
+            "Expected 3+ errors, got {}",
+            errors.len()
+        );
     }
 
     #[test]
     fn test_semantic_trigger_always_valid() {
         let mut package = make_valid_package();
-        package.skill.trigger_patterns =
-            vec![SkillTrigger::semantic("[0.1, 0.2, 0.3]", 0.7)];
+        package.skill.trigger_patterns = vec![SkillTrigger::semantic("[0.1, 0.2, 0.3]", 0.7)];
         assert!(validate_package(&package).is_ok());
     }
 }

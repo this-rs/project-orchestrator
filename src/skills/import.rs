@@ -131,12 +131,8 @@ pub async fn import_skill(
     })?;
 
     // 2. Check for name conflicts
-    let existing_skill = find_skill_by_name(
-        graph_store,
-        target_project_id,
-        &package.skill.name,
-    )
-    .await?;
+    let existing_skill =
+        find_skill_by_name(graph_store, target_project_id, &package.skill.name).await?;
 
     let (skill_id, was_merged, conflict) = match existing_skill {
         Some(existing) => {
@@ -322,7 +318,7 @@ fn create_imported_skill(package: &SkillPackage, project_id: Uuid) -> SkillNode 
         energy: 0.0, // must prove itself
         cohesion: package.skill.cohesion,
         coverage: 0,
-        note_count: 0,   // updated after import
+        note_count: 0, // updated after import
         decision_count: 0,
         activation_count: 0,
         hit_rate: 0.0,
@@ -415,10 +411,7 @@ fn decision_to_note(
         importance: NoteImportance::High,
         scope: NoteScope::Project,
         content,
-        tags: vec![
-            "imported".to_string(),
-            "imported_decision".to_string(),
-        ],
+        tags: vec!["imported".to_string(), "imported_decision".to_string()],
         anchors: vec![],
         created_at: now,
         created_by: IMPORT_CREATOR.to_string(),
@@ -439,10 +432,7 @@ fn decision_to_note(
 ///
 /// For N notes, creates N×(N-1)/2 pairs with weight `IMPORT_SYNAPSE_WEIGHT`.
 /// Uses the existing `create_synapses` method which handles MERGE idempotence.
-async fn create_import_synapses(
-    graph_store: &dyn GraphStore,
-    note_ids: &[Uuid],
-) -> Result<usize> {
+async fn create_import_synapses(graph_store: &dyn GraphStore, note_ids: &[Uuid]) -> Result<usize> {
     if note_ids.len() < 2 {
         return Ok(0);
     }
@@ -539,10 +529,7 @@ mod tests {
         assert_eq!(result.decisions_imported, 1);
         assert!(result.synapses_created > 0);
         assert!(!result.was_merged);
-        assert_eq!(
-            result.source_project,
-            Some("source-project".to_string())
-        );
+        assert_eq!(result.source_project, Some("source-project".to_string()));
         assert!(result.conflict.is_none());
 
         // Verify the skill was created
@@ -598,10 +585,7 @@ mod tests {
         let package = make_test_package();
         let result = import_skill(&package, project_id, &store, ConflictStrategy::Skip).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("already exists"));
+        assert!(result.unwrap_err().to_string().contains("already exists"));
     }
 
     #[tokio::test]
