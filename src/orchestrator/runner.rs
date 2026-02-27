@@ -3199,6 +3199,17 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             (false, path)
         };
 
+        // Ignore Java stdlib
+        if path.starts_with("java.")
+            || path.starts_with("javax.")
+            || path.starts_with("org.w3c.")
+            || path.starts_with("org.xml.")
+            || path.starts_with("sun.")
+            || path.starts_with("com.sun.")
+        {
+            return Vec::new();
+        }
+
         // Check for wildcard imports (com.example.*)
         if let Some(package) = path.strip_suffix(".*") {
             let dir = package.replace('.', "/");
@@ -3439,7 +3450,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             let candidate = if source_dir.is_empty() {
                 rel_path.to_string()
             } else {
-                format!("{}/{}", source_dir, rel_path)
+                resolve_relative_path(source_dir, rel_path)
             };
 
             if let Some(resolved) = index.get(&candidate) {
@@ -3481,7 +3492,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         // Ignore Scala/Java stdlib
-        if path.starts_with("scala.") || path.starts_with("java.") {
+        if path.starts_with("scala.") || path.starts_with("java.") || path.starts_with("javax.") {
             return Vec::new();
         }
 
@@ -3618,7 +3629,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             let candidate = if source_dir.is_empty() {
                 path.to_string()
             } else {
-                format!("{}/{}", source_dir, path)
+                resolve_relative_path(source_dir, path)
             };
 
             // Try direct relative resolution via suffix index
@@ -3785,7 +3796,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let candidate = if source_dir.is_empty() {
             clean_path.to_string()
         } else {
-            format!("{}/{}", source_dir, clean_path)
+            resolve_relative_path(source_dir, clean_path)
         };
 
         // Try relative resolution
@@ -3819,6 +3830,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             // Navigate up for each extra dot
             let mut segments: Vec<&str> = source_dir.split('/').collect();
             for _ in 1..dots {
+                if segments.is_empty() {
+                    break;
+                }
                 segments.pop();
             }
 

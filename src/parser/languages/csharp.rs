@@ -232,6 +232,9 @@ fn extract_using(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         return None;
     }
 
+    // Handle: global using System.Linq;
+    let raw = raw.strip_prefix("global ").unwrap_or(raw);
+
     // Handle: using static System.Math;
     let raw = raw.strip_prefix("static ").unwrap_or(raw);
 

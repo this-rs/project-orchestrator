@@ -1034,6 +1034,17 @@ mod tests {
             "get_code_health",
             "get_node_importance",
             "plan_implementation",
+            "detect_processes",
+            "get_class_hierarchy",
+            "find_subclasses",
+            "find_interface_implementors",
+            "list_processes",
+            "get_process",
+            "get_entry_points",
+            "enrich_communities",
+            "get_hotspots",
+            "get_knowledge_gaps",
+            "get_risk_assessment",
         ];
 
         for name in &old_names {

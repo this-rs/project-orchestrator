@@ -386,7 +386,7 @@ pub async fn get_call_graph(
     State(state): State<OrchestratorState>,
     Query(query): Query<CallGraphQuery>,
 ) -> Result<Json<CallGraphNode>, AppError> {
-    let depth = query.depth.unwrap_or(2);
+    let depth = query.depth.unwrap_or(2).clamp(1, 20);
     let direction = query.direction.as_deref().unwrap_or("both");
 
     let project_id = if let Some(ref slug) = query.project_slug {
@@ -1917,7 +1917,7 @@ pub async fn get_class_hierarchy(
     State(state): State<OrchestratorState>,
     Query(params): Query<ClassHierarchyQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let max_depth = params.max_depth.unwrap_or(10).min(20);
+    let max_depth = params.max_depth.unwrap_or(10).clamp(1, 20);
     let hierarchy = state
         .orchestrator
         .neo4j()

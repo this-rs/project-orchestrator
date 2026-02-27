@@ -239,11 +239,21 @@ fn extract_enum(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opti
 
 fn extract_import(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<ImportNode> {
     let text = get_text(node, source)?;
-    let path = text.trim_start_matches("import ").trim().to_string();
+    let raw = text.trim_start_matches("import ").trim();
+
+    if raw.is_empty() {
+        return None;
+    }
+
+    let (path, alias) = if let Some((p, a)) = raw.split_once(" as ") {
+        (p.trim().to_string(), Some(a.trim().to_string()))
+    } else {
+        (raw.to_string(), None)
+    };
 
     Some(ImportNode {
         path,
-        alias: None,
+        alias,
         items: vec![],
         file_path: file_path.to_string(),
         line: node.start_position().row as u32 + 1,

@@ -1596,6 +1596,9 @@ impl Neo4jClient {
     /// Batch create CALLS relationships using UNWIND — 2-phase strategy:
     /// Phase 1: same-file callee match (most common, O(1) via index)
     /// Phase 2: project-scoped fallback for unresolved calls
+    ///
+    /// Both phases are chunked (BATCH_SIZE items per query) to avoid Neo4j OOM/timeout
+    /// on large projects (50K+ calls).
     pub async fn batch_create_call_relationships(
         &self,
         calls: &[crate::parser::FunctionCall],
@@ -1605,6 +1608,7 @@ impl Neo4jClient {
             return Ok(());
         }
 
+        use crate::neo4j::batch::BATCH_SIZE;
         // Double protection: filter out built-in calls at insertion level
         // (primary filter is in the parser, this catches any remaining)
         use crate::parser::noise_filter;
@@ -1635,8 +1639,8 @@ impl Neo4jClient {
             .collect();
 
         // Phase 1: same-file match with CALL {} subquery for per-row LIMIT 1
-        let q = query(
-            r#"
+        // Chunked to avoid OOM on large call arrays (50K+ items)
+        let phase1_cypher = r#"
             UNWIND $items AS call
             CALL {
                 WITH call
@@ -1649,20 +1653,21 @@ impl Neo4jClient {
                 RETURN caller.id AS resolved_caller, callee.name AS resolved_callee
             }
             RETURN resolved_caller, resolved_callee
-            "#,
-        )
-        .param("items", items.clone());
+            "#;
 
         let mut resolved: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
         // Phase 1 failure is not fatal — Phase 2 will try all calls
-        if let Ok(mut result) = self.graph.execute(q).await {
-            while let Ok(Some(row)) = result.next().await {
-                if let (Ok(caller), Ok(callee)) = (
-                    row.get::<String>("resolved_caller"),
-                    row.get::<String>("resolved_callee"),
-                ) {
-                    resolved.insert((caller, callee));
+        for chunk in items.chunks(BATCH_SIZE) {
+            let q = query(phase1_cypher).param("items", chunk.to_vec());
+            if let Ok(mut result) = self.graph.execute(q).await {
+                while let Ok(Some(row)) = result.next().await {
+                    if let (Ok(caller), Ok(callee)) = (
+                        row.get::<String>("resolved_caller"),
+                        row.get::<String>("resolved_callee"),
+                    ) {
+                        resolved.insert((caller, callee));
+                    }
                 }
             }
         }
@@ -1684,41 +1689,47 @@ impl Neo4jClient {
             .collect();
 
         if !unresolved.is_empty() {
-            let q = match project_id {
-                Some(pid) => query(
-                    r#"
-                    UNWIND $items AS call
-                    CALL {
-                        WITH call
-                        MATCH (caller:Function {id: call.caller_id})
-                        MATCH (callee:Function {name: call.callee_name, project_id: $project_id})
-                        WHERE callee.id <> call.caller_id
-                        WITH caller, callee, call LIMIT 1
-                        MERGE (caller)-[r:CALLS]->(callee)
-                        SET r.confidence = call.confidence, r.reason = call.reason
+            match project_id {
+                Some(pid) => {
+                    let cypher = r#"
+                        UNWIND $items AS call
+                        CALL {
+                            WITH call
+                            MATCH (caller:Function {id: call.caller_id})
+                            MATCH (callee:Function {name: call.callee_name, project_id: $project_id})
+                            WHERE callee.id <> call.caller_id
+                            WITH caller, callee, call LIMIT 1
+                            MERGE (caller)-[r:CALLS]->(callee)
+                            SET r.confidence = call.confidence, r.reason = call.reason
+                        }
+                        "#;
+                    let pid_str = pid.to_string();
+                    for chunk in unresolved.chunks(BATCH_SIZE) {
+                        let q = query(cypher)
+                            .param("items", chunk.to_vec())
+                            .param("project_id", pid_str.clone());
+                        let _ = self.graph.run(q).await;
                     }
-                    "#,
-                )
-                .param("items", unresolved)
-                .param("project_id", pid.to_string()),
-                None => query(
-                    r#"
-                    UNWIND $items AS call
-                    CALL {
-                        WITH call
-                        MATCH (caller:Function {id: call.caller_id})
-                        MATCH (callee:Function {name: call.callee_name})
-                        WHERE callee.id <> call.caller_id
-                        WITH caller, callee, call LIMIT 1
-                        MERGE (caller)-[r:CALLS]->(callee)
-                        SET r.confidence = call.confidence, r.reason = call.reason
+                }
+                None => {
+                    let cypher = r#"
+                        UNWIND $items AS call
+                        CALL {
+                            WITH call
+                            MATCH (caller:Function {id: call.caller_id})
+                            MATCH (callee:Function {name: call.callee_name})
+                            WHERE callee.id <> call.caller_id
+                            WITH caller, callee, call LIMIT 1
+                            MERGE (caller)-[r:CALLS]->(callee)
+                            SET r.confidence = call.confidence, r.reason = call.reason
+                        }
+                        "#;
+                    for chunk in unresolved.chunks(BATCH_SIZE) {
+                        let q = query(cypher).param("items", chunk.to_vec());
+                        let _ = self.graph.run(q).await;
                     }
-                    "#,
-                )
-                .param("items", unresolved),
-            };
-
-            let _ = self.graph.run(q).await;
+                }
+            }
         }
 
         Ok(())
@@ -1726,6 +1737,8 @@ impl Neo4jClient {
 
     /// Batch create EXTENDS relationships (class inheritance).
     /// Two-phase: 1) same-file match, 2) project-scoped fallback.
+    ///
+    /// Both phases are chunked (BATCH_SIZE items per query) to avoid Neo4j OOM/timeout.
     pub async fn batch_create_extends_relationships(
         &self,
         rels: &[(String, String, String, String)],
@@ -1733,6 +1746,8 @@ impl Neo4jClient {
         if rels.is_empty() {
             return Ok(());
         }
+
+        use crate::neo4j::batch::BATCH_SIZE;
 
         let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = rels
             .iter()
@@ -1746,9 +1761,8 @@ impl Neo4jClient {
             })
             .collect();
 
-        // Phase 1: same-file match
-        let q = query(
-            r#"
+        // Phase 1: same-file match — chunked to avoid OOM on large arrays
+        let phase1_cypher = r#"
             UNWIND $items AS rel
             CALL {
                 WITH rel
@@ -1759,24 +1773,25 @@ impl Neo4jClient {
                 RETURN child.name AS resolved, child.file_path AS resolved_file
             }
             RETURN resolved, resolved_file
-            "#,
-        )
-        .param("items", items.clone());
+            "#;
 
         let mut resolved: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
-        if let Ok(mut result) = self.graph.execute(q).await {
-            while let Ok(Some(row)) = result.next().await {
-                if let (Ok(name), Ok(file)) = (
-                    row.get::<String>("resolved"),
-                    row.get::<String>("resolved_file"),
-                ) {
-                    resolved.insert((name, file));
+        for chunk in items.chunks(BATCH_SIZE) {
+            let q = query(phase1_cypher).param("items", chunk.to_vec());
+            if let Ok(mut result) = self.graph.execute(q).await {
+                while let Ok(Some(row)) = result.next().await {
+                    if let (Ok(name), Ok(file)) = (
+                        row.get::<String>("resolved"),
+                        row.get::<String>("resolved_file"),
+                    ) {
+                        resolved.insert((name, file));
+                    }
                 }
             }
         }
 
-        // Phase 2: project-scoped fallback for unresolved
+        // Phase 2: project-scoped fallback for unresolved — also chunked
         let unresolved: Vec<_> = items
             .into_iter()
             .filter(|m| {
@@ -1793,8 +1808,7 @@ impl Neo4jClient {
             .collect();
 
         if !unresolved.is_empty() {
-            let q = query(
-                r#"
+            let phase2_cypher = r#"
                 UNWIND $items AS rel
                 CALL {
                     WITH rel
@@ -1804,10 +1818,11 @@ impl Neo4jClient {
                     WITH child, parent LIMIT 1
                     MERGE (child)-[:EXTENDS]->(parent)
                 }
-                "#,
-            )
-            .param("items", unresolved);
-            let _ = self.graph.run(q).await;
+                "#;
+            for chunk in unresolved.chunks(BATCH_SIZE) {
+                let q = query(phase2_cypher).param("items", chunk.to_vec());
+                let _ = self.graph.run(q).await;
+            }
         }
 
         Ok(())
@@ -1815,6 +1830,8 @@ impl Neo4jClient {
 
     /// Batch create IMPLEMENTS relationships (interface/protocol implementation).
     /// Matches against Trait nodes (interfaces stored as Trait in Java, TS, PHP, Kotlin, Swift).
+    ///
+    /// Chunked (BATCH_SIZE items per query) to avoid Neo4j OOM/timeout.
     pub async fn batch_create_implements_relationships(
         &self,
         rels: &[(String, String, String, String)],
@@ -1822,6 +1839,8 @@ impl Neo4jClient {
         if rels.is_empty() {
             return Ok(());
         }
+
+        use crate::neo4j::batch::run_unwind_in_chunks;
 
         let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = rels
             .iter()
@@ -1835,7 +1854,9 @@ impl Neo4jClient {
             })
             .collect();
 
-        let q = query(
+        if let Err(e) = run_unwind_in_chunks(
+            &self.graph,
+            items,
             r#"
             UNWIND $items AS rel
             CALL {
@@ -1847,9 +1868,10 @@ impl Neo4jClient {
             }
             "#,
         )
-        .param("items", items);
-
-        let _ = self.graph.run(q).await;
+        .await
+        {
+            tracing::warn!("batch_create_implements_relationships failed: {}", e);
+        }
         Ok(())
     }
 
@@ -2304,8 +2326,9 @@ impl Neo4jClient {
     ) -> Result<serde_json::Value> {
         // Parents (traverse EXTENDS upward)
         let q_parents = query(
-            r#"
-            MATCH path = (child)-[:EXTENDS*1..10]->(ancestor)
+            &format!(
+                r#"
+            MATCH path = (child)-[:EXTENDS*1..{}]->(ancestor)
             WHERE child.name = $type_name
             WITH ancestor, length(path) AS depth
             WHERE depth <= $max_depth
@@ -2314,6 +2337,8 @@ impl Neo4jClient {
                    depth
             ORDER BY depth ASC
             "#,
+                max_depth
+            ),
         )
         .param("type_name", type_name)
         .param("max_depth", max_depth as i64);
@@ -2333,8 +2358,9 @@ impl Neo4jClient {
 
         // Children (traverse EXTENDS downward — reverse direction)
         let q_children = query(
-            r#"
-            MATCH path = (descendant)-[:EXTENDS*1..10]->(parent)
+            &format!(
+                r#"
+            MATCH path = (descendant)-[:EXTENDS*1..{}]->(parent)
             WHERE parent.name = $type_name
             WITH descendant, length(path) AS depth
             WHERE depth <= $max_depth
@@ -2343,6 +2369,8 @@ impl Neo4jClient {
                    depth
             ORDER BY depth ASC
             "#,
+                max_depth
+            ),
         )
         .param("type_name", type_name)
         .param("max_depth", max_depth as i64);
