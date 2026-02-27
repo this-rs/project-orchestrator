@@ -25,6 +25,7 @@
 
 pub mod detection;
 pub mod models;
+pub mod naming;
 
 pub use detection::*;
 pub use models::*;
