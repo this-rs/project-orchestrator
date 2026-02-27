@@ -35,6 +35,13 @@ const CONFIG_FILENAME = '.po-config';
 const DEFAULT_PORT = 6600;
 const DEBUG = process.env.PO_HOOK_DEBUG === '1';
 
+// Cache & throttle settings
+const CACHE_TTL_MS = 30000;        // 30s TTL for cached responses
+const MAX_PER_SKILL = 3;           // Max injections per skill per session
+const MAX_GLOBAL = 10;             // Max total injections per session
+const PPID = process.ppid;         // Claude Code parent process PID
+const CACHE_FILE = path.join(require('os').tmpdir(), `po-hook-cache-${PPID}.json`);
+
 // Tools that trigger skill activation
 const ACTIVATABLE_TOOLS = new Set(['Grep', 'Glob', 'Read', 'Bash', 'Edit', 'Write']);
 
@@ -77,6 +84,106 @@ function findConfig(startDir) {
   }
 
   return null;
+}
+
+// ============================================================================
+// Cache & Throttle
+// ============================================================================
+
+/**
+ * Read the cache file. Returns cache object or a fresh one.
+ * Cache structure:
+ * {
+ *   ppid: number,                   // Parent PID (session identifier)
+ *   entries: {                      // Keyed by skill_id
+ *     [skill_id]: {
+ *       context: string,            // Cached context
+ *       timestamp: number,          // Date.now() when cached
+ *       count: number,              // Injection count for this skill
+ *     }
+ *   },
+ *   global_count: number,           // Total injections this session
+ * }
+ */
+function readCache() {
+  try {
+    const raw = fs.readFileSync(CACHE_FILE, 'utf-8');
+    const cache = JSON.parse(raw);
+    // If ppid changed, this is a new session — start fresh
+    if (cache.ppid !== PPID) {
+      debug(`Session changed (cache ppid=${cache.ppid}, current=${PPID}), resetting cache`);
+      return freshCache();
+    }
+    return cache;
+  } catch (_) {
+    return freshCache();
+  }
+}
+
+function freshCache() {
+  return { ppid: PPID, entries: {}, global_count: 0 };
+}
+
+function writeCache(cache) {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(cache), 'utf-8');
+  } catch (e) {
+    debug(`Failed to write cache: ${e.message}`);
+  }
+}
+
+/**
+ * Check if we have a valid cached response for this skill.
+ * Returns the cached context string, or null if miss/expired.
+ */
+function getCachedContext(cache, skillId) {
+  const entry = cache.entries[skillId];
+  if (!entry) return null;
+
+  const age = Date.now() - entry.timestamp;
+  if (age > CACHE_TTL_MS) {
+    debug(`Cache expired for skill ${skillId} (age=${age}ms)`);
+    delete cache.entries[skillId];
+    return null;
+  }
+
+  debug(`Cache hit for skill ${skillId} (age=${age}ms)`);
+  return entry.context;
+}
+
+/**
+ * Check if throttle limits have been reached.
+ * Returns true if the hook should be suppressed.
+ */
+function isThrottled(cache, skillId) {
+  // Global limit
+  if (cache.global_count >= MAX_GLOBAL) {
+    debug(`Global throttle reached (${cache.global_count}/${MAX_GLOBAL})`);
+    return true;
+  }
+
+  // Per-skill limit
+  const entry = cache.entries[skillId];
+  if (entry && entry.count >= MAX_PER_SKILL) {
+    debug(`Per-skill throttle reached for ${skillId} (${entry.count}/${MAX_PER_SKILL})`);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Record a successful injection in the cache.
+ */
+function recordInjection(cache, skillId, context) {
+  const entry = cache.entries[skillId] || { context: '', timestamp: 0, count: 0 };
+  entry.context = context;
+  entry.timestamp = Date.now();
+  entry.count += 1;
+  cache.entries[skillId] = entry;
+  cache.global_count += 1;
+  writeCache(cache);
+  debug(`Recorded injection: skill=${skillId} count=${entry.count} global=${cache.global_count}`);
 }
 
 // ============================================================================
@@ -227,7 +334,20 @@ async function main() {
 
   const port = config.port || DEFAULT_PORT;
 
-  // 5. Call the PO server
+  // 5. Load cache & check throttle
+  const cache = readCache();
+
+  // Use a synthetic skill key for cache lookup (will be replaced by real skill_id from response)
+  // For throttle pre-check, we use a generic key based on tool+pattern
+  const patternKey = (toolInput && (toolInput.pattern || toolInput.file_path || '')) || '';
+
+  // Check global throttle before making any server call
+  if (cache.global_count >= MAX_GLOBAL) {
+    debug(`Global throttle: ${cache.global_count}/${MAX_GLOBAL} — suppressing`);
+    return;
+  }
+
+  // 6. Call the PO server
   const payload = {
     project_id: config.project_id,
     tool_name: toolName,
@@ -242,7 +362,32 @@ async function main() {
     return;
   }
 
-  // 6. Output the hook response (stdout only)
+  // 7. Check per-skill throttle and cache
+  const skillId = response.skill_id || response.skill_name || 'unknown';
+
+  // Check if this skill is throttled
+  if (isThrottled(cache, skillId)) {
+    debug(`Skill ${skillId} throttled — suppressing output`);
+    return;
+  }
+
+  // Check if we have a recent cached response for this skill
+  const cachedCtx = getCachedContext(cache, skillId);
+  if (cachedCtx) {
+    // Use cached context instead of server response (saves token budget)
+    const output = {
+      hookSpecificOutput: {
+        additionalContext: cachedCtx,
+      },
+    };
+    process.stdout.write(JSON.stringify(output) + '\n');
+    // Record the injection (counts toward throttle limits)
+    recordInjection(cache, skillId, cachedCtx);
+    debug(`Injected cached context for skill: ${skillId}`);
+    return;
+  }
+
+  // 8. Output the hook response (stdout only)
   const output = {
     hookSpecificOutput: {
       additionalContext: response.context,
@@ -250,7 +395,10 @@ async function main() {
   };
 
   process.stdout.write(JSON.stringify(output) + '\n');
-  debug(`Injected ${response.context.length} chars from skill: ${response.skill_name}`);
+
+  // Record the injection in cache
+  recordInjection(cache, skillId, response.context);
+  debug(`Injected ${response.context.length} chars from skill: ${skillId}`);
 }
 
 // Global error handler — NEVER block the agent

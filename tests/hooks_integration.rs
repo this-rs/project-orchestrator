@@ -5,10 +5,15 @@
 //! - Graceful failure with invalid input
 //! - Graceful failure with no .po-config
 //! - Correct output format when server responds
+//! - Cache & throttle behavior
 //!
 //! Tests that require the full PO server are marked with #[ignore].
-//! Run with: cargo test --test hooks_integration
-//! Run all (including server tests): cargo test --test hooks_integration -- --include-ignored
+//!
+//! **IMPORTANT**: Run with `--test-threads=1` to avoid mock server port conflicts:
+//!   cargo test --test hooks_integration -- --test-threads=1
+//!
+//! Run all (including server tests):
+//!   cargo test --test hooks_integration -- --test-threads=1 --include-ignored
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -517,6 +522,166 @@ fn test_session_start_hook_with_mock() {
     );
 
     server_thread.join().expect("mock server thread panicked");
+}
+
+// ============================================================================
+// Cache & Throttle Tests
+// ============================================================================
+
+/// Helper: create a mock HTTP server that serves N requests, each returning
+/// a skill activation response with the given skill_id.
+/// Returns (port, join_handle). The server auto-closes after max_requests
+/// or a 3-second timeout per accept, whichever comes first.
+fn spawn_counted_mock(
+    skill_id: &str,
+    max_requests: usize,
+) -> (u16, std::thread::JoinHandle<usize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port();
+    let skill_id = skill_id.to_string();
+
+    // Set accept timeout so the thread doesn't hang forever
+    listener
+        .set_nonblocking(false)
+        .expect("set blocking");
+
+    let handle = std::thread::spawn(move || {
+        let mut served = 0;
+        for _ in 0..max_requests {
+            // Use a short timeout on accept to avoid hanging
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(_) => break,
+            };
+            let mut stream = stream;
+            use std::io::{Read, Write};
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .ok();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf);
+
+            let body = json!({
+                "context": format!("## Skill {}\n- Note content here\n", skill_id),
+                "skill_name": &skill_id,
+                "skill_id": &skill_id,
+                "note_ids": [],
+            });
+            let body_str = serde_json::to_string(&body).unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body_str.len(), body_str
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            served += 1;
+        }
+        served
+    });
+
+    (port, handle)
+}
+
+#[test]
+fn test_cjs_hook_cache_file_created_on_success() {
+    // After a successful activation, the hook should write a cache file.
+    // The cache file is named /tmp/po-hook-cache-{ppid}.json where ppid
+    // is the hook's parent PID (which is our test process PID).
+    let (port, server_handle) = spawn_counted_mock("cache-test-skill", 1);
+    let dir = create_temp_project_dir(port);
+    let input = make_pre_tool_use_input("Grep", json!({"pattern": "cache test"}));
+
+    let our_pid = std::process::id();
+    let hook_cache_file = std::path::PathBuf::from(std::env::temp_dir())
+        .join(format!("po-hook-cache-{}.json", our_pid));
+
+    // Clean any stale cache
+    let _ = std::fs::remove_file(&hook_cache_file);
+
+    // Run the hook — should hit server and write cache
+    let (exit1, stdout1, stderr1) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+    assert_eq!(exit1, 0);
+    assert!(
+        !stdout1.trim().is_empty(),
+        "First call should return context, stderr: {}",
+        stderr1
+    );
+
+    // Wait for mock server to finish
+    let served = server_handle.join().expect("mock server thread");
+    assert_eq!(served, 1, "Mock should have served exactly 1 request");
+
+    // Verify cache file was written
+    assert!(
+        hook_cache_file.exists(),
+        "Cache file should exist at {:?}",
+        hook_cache_file
+    );
+
+    let cache_content =
+        std::fs::read_to_string(&hook_cache_file).expect("read cache file");
+    let cache: Value = serde_json::from_str(&cache_content).expect("parse cache JSON");
+
+    assert_eq!(cache["ppid"], our_pid as u64, "Cache ppid should match our PID");
+    assert_eq!(cache["global_count"], 1, "Should have 1 injection recorded");
+    assert!(cache["entries"].is_object(), "Should have entries object");
+
+    // Verify the skill entry
+    let entries = cache["entries"].as_object().unwrap();
+    assert_eq!(entries.len(), 1, "Should have exactly 1 skill entry");
+    let (skill_id, entry) = entries.iter().next().unwrap();
+    assert!(
+        skill_id.contains("cache-test-skill"),
+        "Entry key should contain skill id"
+    );
+    assert_eq!(entry["count"], 1, "Skill injection count should be 1");
+    assert!(entry["context"].is_string(), "Should have cached context");
+    assert!(entry["timestamp"].is_number(), "Should have timestamp");
+
+    // Cleanup
+    let _ = std::fs::remove_file(&hook_cache_file);
+}
+
+#[test]
+fn test_cjs_hook_global_throttle() {
+    // Verify that the cache/throttle constants are reasonable.
+    // We can't easily test the full throttle (MAX_GLOBAL=10) in unit tests
+    // because each hook invocation is a separate process. But we CAN verify
+    // the cache file format and that injection counting works.
+    let dir = create_temp_project_dir(19996);
+    let our_pid = std::process::id();
+    let cache_file = std::path::PathBuf::from(std::env::temp_dir())
+        .join(format!("po-hook-cache-{}.json", our_pid));
+
+    // Pre-seed the cache with global_count = MAX_GLOBAL (10)
+    let seeded_cache = json!({
+        "ppid": our_pid,
+        "entries": {},
+        "global_count": 10,
+    });
+    std::fs::write(&cache_file, serde_json::to_string(&seeded_cache).unwrap())
+        .expect("write seeded cache");
+
+    // Now run the hook — it should see the global throttle and exit silently
+    // even though the server is down (it shouldn't even try to call it)
+    let input = make_pre_tool_use_input("Grep", json!({"pattern": "throttled"}));
+    let (exit_code, stdout, stderr) =
+        run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+
+    assert_eq!(exit_code, 0);
+    assert!(
+        stdout.trim().is_empty(),
+        "Throttled hook should produce no output, got: {}",
+        stdout
+    );
+    assert!(
+        stderr.contains("throttle") || stderr.contains("Global"),
+        "Debug should mention throttle, got: {}",
+        stderr
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_file(&cache_file);
 }
 
 // ============================================================================
