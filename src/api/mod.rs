@@ -8,6 +8,7 @@ pub mod note_handlers;
 pub mod project_handlers;
 pub mod query;
 pub mod routes;
+pub mod skill_handlers;
 pub mod workspace_handlers;
 pub mod ws_auth;
 pub mod ws_chat_handler;

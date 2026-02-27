@@ -9,6 +9,7 @@ use super::code_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::note_handlers;
 use super::project_handlers;
+use super::skill_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
 use super::ws_handlers;
@@ -659,6 +660,27 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/entities/{entity_type}/{entity_id}/notes",
             get(note_handlers::get_entity_notes),
+        )
+        // ================================================================
+        // Skills (Neural Skills)
+        // ================================================================
+        .route(
+            "/api/skills",
+            get(skill_handlers::list_skills).post(skill_handlers::create_skill),
+        )
+        .route(
+            "/api/skills/{skill_id}",
+            get(skill_handlers::get_skill)
+                .put(skill_handlers::update_skill)
+                .delete(skill_handlers::delete_skill),
+        )
+        .route(
+            "/api/skills/{skill_id}/members",
+            get(skill_handlers::get_skill_members).post(skill_handlers::add_skill_member),
+        )
+        .route(
+            "/api/skills/{skill_id}/members/{entity_type}/{entity_id}",
+            axum::routing::delete(skill_handlers::remove_skill_member),
         )
         // ================================================================
         // Admin — Embedding Backfill
