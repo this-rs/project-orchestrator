@@ -359,24 +359,21 @@ pub async fn activate_skill(
         return Err(AppError::BadRequest("query cannot be empty".to_string()));
     }
 
-    // Pre-check existence to return 404 instead of 500 for missing skills
-    let skill = state
-        .orchestrator
-        .neo4j()
-        .get_skill(skill_id)
-        .await
-        .map_err(AppError::Internal)?;
-
-    if skill.is_none() {
-        return Err(AppError::NotFound(format!("Skill {} not found", skill_id)));
-    }
-
+    // activate_skill already does get_skill internally — no need for pre-fetch.
+    // The error message from activate_skill("Skill not found: <id>") is sufficient.
     let context = state
         .orchestrator
         .neo4j()
         .activate_skill(skill_id, &body.query)
         .await
-        .map_err(AppError::Internal)?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                AppError::NotFound(format!("Skill {} not found", skill_id))
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
 
     Ok(Json(context))
 }

@@ -333,16 +333,22 @@ pub async fn execute_evolution(
                 // Add new members
                 for note_id_str in notes_to_add {
                     if let Ok(uuid) = Uuid::parse_str(note_id_str) {
-                        let _ = graph_store.add_skill_member(*skill_id, "note", uuid).await;
+                        if let Err(e) = graph_store.add_skill_member(*skill_id, "note", uuid).await
+                        {
+                            warn!(skill_id = %skill_id, note_id = %uuid, error = %e, "Failed to add member during grow");
+                        }
                     }
                 }
 
                 // Remove departed members
                 for note_id_str in notes_to_remove {
                     if let Ok(uuid) = Uuid::parse_str(note_id_str) {
-                        let _ = graph_store
+                        if let Err(e) = graph_store
                             .remove_skill_member(*skill_id, "note", uuid)
-                            .await;
+                            .await
+                        {
+                            warn!(skill_id = %skill_id, note_id = %uuid, error = %e, "Failed to remove member during shrink");
+                        }
                     }
                 }
 
@@ -429,14 +435,20 @@ pub async fn execute_evolution(
                             jaccard_similarity(&candidate.member_note_ids, &absorbed_member_ids);
 
                         for note in &notes {
-                            let _ = graph_store
+                            if let Err(e) = graph_store
                                 .add_skill_member(survivor_id, "note", note.id)
-                                .await;
+                                .await
+                            {
+                                warn!(survivor = %survivor_id, note_id = %note.id, error = %e, "Failed to transfer note during merge");
+                            }
                         }
                         for decision in &decisions {
-                            let _ = graph_store
+                            if let Err(e) = graph_store
                                 .add_skill_member(survivor_id, "decision", decision.id)
-                                .await;
+                                .await
+                            {
+                                warn!(survivor = %survivor_id, decision_id = %decision.id, error = %e, "Failed to transfer decision during merge");
+                            }
                         }
 
                         // Archive the absorbed skill
@@ -504,7 +516,11 @@ pub async fn execute_evolution(
                     graph_store.create_skill(&new_skill).await?;
 
                     for note in &member_notes {
-                        let _ = graph_store.add_skill_member(new_id, "note", note.id).await;
+                        if let Err(e) =
+                            graph_store.add_skill_member(new_id, "note", note.id).await
+                        {
+                            warn!(skill_id = %new_id, note_id = %note.id, error = %e, "Failed to add member during split");
+                        }
                     }
 
                     new_skill_ids.push(new_id);
@@ -555,7 +571,9 @@ pub async fn execute_evolution(
                 graph_store.create_skill(&new_skill).await?;
 
                 for note in &member_notes {
-                    let _ = graph_store.add_skill_member(new_id, "note", note.id).await;
+                    if let Err(e) = graph_store.add_skill_member(new_id, "note", note.id).await {
+                        warn!(skill_id = %new_id, note_id = %note.id, error = %e, "Failed to add member to new skill");
+                    }
                 }
 
                 debug!(skill_id = %new_id, members = member_notes.len(), "Created new skill from unmatched cluster");

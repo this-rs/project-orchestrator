@@ -197,11 +197,6 @@ function recordInjection(cache, skillId, context) {
 function postActivate(port, payload) {
   return new Promise((resolve) => {
     const data = JSON.stringify(payload);
-    const timeoutId = setTimeout(() => {
-      debug('Request timeout');
-      req.destroy();
-      resolve(null);
-    }, HOOK_TIMEOUT_MS);
 
     const req = http.request(
       {
@@ -258,6 +253,13 @@ function postActivate(port, payload) {
       req.destroy();
       // resolve(null) will be called by the error handler
     });
+
+    // Schedule timeout AFTER req is created (avoid TDZ)
+    const timeoutId = setTimeout(() => {
+      debug('Request timeout');
+      req.destroy();
+      resolve(null);
+    }, HOOK_TIMEOUT_MS);
 
     req.write(data);
     req.end();
@@ -337,10 +339,6 @@ async function main() {
   // 5. Load cache & check throttle
   const cache = readCache();
 
-  // Use a synthetic skill key for cache lookup (will be replaced by real skill_id from response)
-  // For throttle pre-check, we use a generic key based on tool+pattern
-  const patternKey = (toolInput && (toolInput.pattern || toolInput.file_path || '')) || '';
-
   // Check global throttle before making any server call
   if (cache.global_count >= MAX_GLOBAL) {
     debug(`Global throttle: ${cache.global_count}/${MAX_GLOBAL} — suppressing`);
@@ -381,8 +379,8 @@ async function main() {
       },
     };
     process.stdout.write(JSON.stringify(output) + '\n');
-    // Record the injection (counts toward throttle limits)
-    recordInjection(cache, skillId, cachedCtx);
+    // Cache hits do NOT count toward throttle limits — only fresh server
+    // responses should increment counters to prevent premature throttling.
     debug(`Injected cached context for skill: ${skillId}`);
     return;
   }

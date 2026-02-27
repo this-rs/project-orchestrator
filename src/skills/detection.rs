@@ -122,7 +122,8 @@ pub fn cluster_to_skill(
         0.5 // default if no notes
     };
 
-    // Coverage = number of notes in this cluster (i64 field in SkillNode)
+    // note_count = actual member count, coverage = cluster size (note count)
+    let note_count = notes.len() as i64;
     let coverage = candidate.size as i64;
 
     // Collect all unique tags from member notes
@@ -133,6 +134,7 @@ pub fn cluster_to_skill(
     let mut skill = crate::skills::SkillNode::new(project_id, name);
     skill.energy = energy;
     skill.cohesion = candidate.cohesion;
+    skill.note_count = note_count;
     skill.coverage = coverage;
     skill.tags = all_tags;
     // Description summarizing the cluster
@@ -595,13 +597,22 @@ pub async fn detect_skills_pipeline(
     // Step 7: Generate triggers and templates for each skill
     // Fetch all project notes for quality evaluation
     let all_project_notes = {
+        let max_notes = 5000;
         let filters = crate::notes::NoteFilters {
-            limit: Some(1000),
+            limit: Some(max_notes),
             ..Default::default()
         };
         let (notes, _) = graph_store
             .list_notes(Some(project_id), None, &filters)
             .await?;
+        if notes.len() >= max_notes as usize {
+            tracing::warn!(
+                project_id = %project_id,
+                count = notes.len(),
+                "Project has ≥{} notes — trigger quality evaluation may be incomplete",
+                max_notes
+            );
+        }
         notes
     };
 

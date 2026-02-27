@@ -44,3 +44,17 @@ pub use lifecycle::*;
 pub use models::*;
 pub use templates::*;
 pub use triggers::*;
+
+// ============================================================================
+// Shared constants for trigger compilation
+// ============================================================================
+
+/// Maximum pattern length before rejecting a trigger (bytes).
+pub const MAX_TRIGGER_PATTERN_LEN: usize = 500;
+
+/// Regex compiled-program size limit (bytes). Applied consistently in both
+/// trigger quality evaluation (triggers.rs) and cache compilation (cache.rs).
+pub const REGEX_SIZE_LIMIT: usize = 10_000;
+
+/// Regex DFA size limit (bytes).
+pub const REGEX_DFA_SIZE_LIMIT: usize = 10_000;

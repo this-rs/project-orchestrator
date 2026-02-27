@@ -171,6 +171,7 @@ const RG_FLAGS_WITH_VALUES: &[&str] = &[
 
 /// Known grep flags that take a value argument.
 /// Note: `-r` in grep means --recursive (no value), unlike rg where it means --replace.
+/// Note: `-e`/`--regexp` are NOT here — they are pattern-specifying flags handled specially.
 const GREP_FLAGS_WITH_VALUES: &[&str] = &[
     "--include",
     "--exclude",
@@ -187,9 +188,12 @@ const GREP_FLAGS_WITH_VALUES: &[&str] = &[
     "--color",
     "--file",
     "-f",
-    "-e",
-    "--regexp",
 ];
+
+/// Flags that specify the search pattern explicitly.
+/// When encountered, the next token IS the pattern (e.g., `grep -e "pattern" file`).
+/// Both rg and grep support these.
+const PATTERN_FLAGS: &[&str] = &["-e", "--regexp"];
 
 /// Extract a search pattern from a Bash command.
 ///
@@ -239,14 +243,40 @@ fn extract_rg_grep_pattern(
     let tool_pos = tokens.iter().position(|t| t == tool)?;
 
     let mut skip_next = false;
+    let mut return_next_as_pattern = false;
     for token in &tokens[tool_pos + 1..] {
         if skip_next {
             skip_next = false;
             continue;
         }
 
+        // Previous token was -e/--regexp → this token IS the pattern
+        if return_next_as_pattern {
+            let pattern = token.trim_matches(|c| c == '\'' || c == '"');
+            if !pattern.is_empty() {
+                return Some(pattern.to_string());
+            }
+            return_next_as_pattern = false;
+            continue;
+        }
+
         // Long flag with = (e.g., --type=rust) — skip entirely
+        // But handle --regexp=pattern specially
         if token.starts_with("--") && token.contains('=') {
+            if token.starts_with("--regexp=") {
+                let pattern = token
+                    .trim_start_matches("--regexp=")
+                    .trim_matches(|c| c == '\'' || c == '"');
+                if !pattern.is_empty() {
+                    return Some(pattern.to_string());
+                }
+            }
+            continue;
+        }
+
+        // -e/--regexp: next token is the search pattern
+        if PATTERN_FLAGS.contains(&token.as_str()) {
+            return_next_as_pattern = true;
             continue;
         }
 
@@ -309,33 +339,40 @@ fn tokenize_command(command: &str) -> Vec<String> {
 /// Extract file context from a Bash command.
 ///
 /// Tries to find the directory/file being operated on in search commands.
+/// Uses `tokenize_command` for proper handling of quoted paths.
 fn extract_bash_file_context(tool_input: &serde_json::Value) -> Option<String> {
     let command = tool_input.get("command").and_then(|v| v.as_str())?;
 
     // For rg/grep commands, try to extract the path argument (last arg that looks like a path)
     // rg pattern path/ or grep -r pattern path/
     if command.contains("rg ") || command.contains("grep ") {
-        // Split by whitespace and find the last argument that looks like a path
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        for part in parts.iter().rev() {
-            // Skip flags and quoted strings
-            if part.starts_with('-') {
+        let tokens = tokenize_command(command);
+        for token in tokens.iter().rev() {
+            let clean = token.trim_matches(|c| c == '\'' || c == '"');
+            // Skip flags
+            if clean.starts_with('-') {
                 continue;
             }
             // If it looks like a path (contains / or starts with src, lib, etc.)
-            if part.contains('/') || part.starts_with("src") || part.starts_with("lib") {
-                return Some(part.to_string());
+            if clean.contains('/') || clean.starts_with("src") || clean.starts_with("lib") {
+                return Some(clean.to_string());
             }
         }
     }
 
     // For `cat`, `head`, `tail` commands, extract the file path
-    if command.starts_with("cat ") || command.starts_with("head ") || command.starts_with("tail ") {
-        let parts: Vec<&str> = command.split_whitespace().collect();
+    if command.starts_with("cat ") || command.starts_with("head ") || command.starts_with("tail ")
+    {
+        let tokens = tokenize_command(command);
         // Last non-flag argument
-        for part in parts.iter().rev() {
-            if !part.starts_with('-') && *part != "cat" && *part != "head" && *part != "tail" {
-                return Some(part.to_string());
+        for token in tokens.iter().rev() {
+            let clean = token.trim_matches(|c| c == '\'' || c == '"');
+            if !clean.starts_with('-')
+                && clean != "cat"
+                && clean != "head"
+                && clean != "tail"
+            {
+                return Some(clean.to_string());
             }
         }
     }
@@ -484,6 +521,43 @@ mod tests {
         assert_eq!(
             extract_pattern("Bash", &input),
             Some("skills::detection".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_pattern_bash_grep_with_e_flag() {
+        // grep -e "pattern" means pattern IS the search regex
+        let input = json!({"command": "grep -r -e 'my_pattern' src/"});
+        assert_eq!(
+            extract_pattern("Bash", &input),
+            Some("my_pattern".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_pattern_bash_grep_with_regexp_flag() {
+        let input = json!({"command": "grep --regexp 'search_term' file.rs"});
+        assert_eq!(
+            extract_pattern("Bash", &input),
+            Some("search_term".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_pattern_bash_grep_with_regexp_equals() {
+        let input = json!({"command": "grep --regexp=search_term file.rs"});
+        assert_eq!(
+            extract_pattern("Bash", &input),
+            Some("search_term".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_pattern_bash_rg_with_e_flag() {
+        let input = json!({"command": "rg -e 'pattern' src/"});
+        assert_eq!(
+            extract_pattern("Bash", &input),
+            Some("pattern".to_string())
         );
     }
 

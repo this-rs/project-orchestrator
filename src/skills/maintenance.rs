@@ -236,7 +236,9 @@ pub async fn run_weekly_maintenance(
     };
 
     // Step 4: Evolve existing skills based on new clusters
-    if !detection_candidates.is_empty() && !existing_members.is_empty() {
+    // Also handle first-run: when no existing skills but candidates detected,
+    // analyze_evolution will classify all candidates as New (which is correct).
+    if !detection_candidates.is_empty() {
         let evolutions = analyze_evolution(
             &existing_members,
             &detection_candidates,

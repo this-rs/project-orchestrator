@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::skills::models::{SkillNode, TriggerType};
+use crate::skills::{MAX_TRIGGER_PATTERN_LEN, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 
 // ============================================================================
 // Configuration
@@ -67,12 +68,13 @@ impl CachedSkill {
             .filter_map(|trigger| {
                 let compiled = match trigger.pattern_type {
                     TriggerType::Regex => {
-                        if trigger.pattern_value.len() > 500 {
+                        if trigger.pattern_value.len() > MAX_TRIGGER_PATTERN_LEN {
                             None
                         } else {
                             RegexBuilder::new(&trigger.pattern_value)
-                                .size_limit(10_000)
-                                .dfa_size_limit(10_000)
+                                .case_insensitive(true)
+                                .size_limit(REGEX_SIZE_LIMIT)
+                                .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
                                 .build()
                                 .ok()
                                 .map(CompiledTrigger::Regex)
@@ -291,38 +293,26 @@ pub fn evaluate_cached_skill(
 ) -> f64 {
     let mut max_confidence = 0.0_f64;
 
-    for (trigger, _threshold) in &cached_skill.compiled_triggers {
-        let confidence = match trigger {
+    for (trigger, threshold) in &cached_skill.compiled_triggers {
+        let matched = match trigger {
             CompiledTrigger::Regex(re) => {
-                if let Some(pat) = pattern {
-                    if re.is_match(pat) {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                }
+                pattern.map_or(false, |pat| re.is_match(pat))
             }
             CompiledTrigger::FileGlob(glob_pat) => {
-                let target = file_context.or(pattern);
-                if let Some(file) = target {
-                    if glob_pat.matches(file) {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                }
+                // FileGlob only matches against file context, not pattern text
+                file_context.map_or(false, |file| glob_pat.matches(file))
             }
             CompiledTrigger::Semantic(_) => {
                 // Semantic matching skipped in hot path
-                0.0
+                false
             }
         };
 
-        max_confidence = max_confidence.max(confidence);
+        if matched {
+            // Use the trigger's confidence_threshold as the match confidence.
+            // Higher-confidence triggers produce higher scores when they match.
+            max_confidence = max_confidence.max(*threshold);
+        }
     }
 
     max_confidence
@@ -516,7 +506,19 @@ mod tests {
         let cached = CachedSkill::from_skill(skill);
 
         let confidence = evaluate_cached_skill(&cached, Some("neo4j_client"), None);
-        assert!((confidence - 1.0).abs() < f64::EPSILON);
+        // Returns the trigger's confidence_threshold (0.5 in test helper)
+        assert!(confidence > 0.0, "Should match, got {}", confidence);
+        assert!((confidence - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_evaluate_cached_skill_regex_case_insensitive() {
+        let skill = make_test_skill("Neo4j", vec![(TriggerType::Regex, "neo4j|cypher")]);
+        let cached = CachedSkill::from_skill(skill);
+
+        // Should match case-insensitively
+        let confidence = evaluate_cached_skill(&cached, Some("Neo4j_Client"), None);
+        assert!(confidence > 0.0, "Case-insensitive match should work");
     }
 
     #[test]
@@ -534,7 +536,18 @@ mod tests {
         let cached = CachedSkill::from_skill(skill);
 
         let confidence = evaluate_cached_skill(&cached, None, Some("src/api/handlers.rs"));
-        assert!((confidence - 1.0).abs() < f64::EPSILON);
+        assert!(confidence > 0.0, "FileGlob should match, got {}", confidence);
+        assert!((confidence - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_evaluate_cached_skill_file_glob_only_matches_file_context() {
+        let skill = make_test_skill("API", vec![(TriggerType::FileGlob, "src/api/**")]);
+        let cached = CachedSkill::from_skill(skill);
+
+        // FileGlob should NOT fall back to pattern when file_context is None
+        let confidence = evaluate_cached_skill(&cached, Some("src/api/test.rs"), None);
+        assert!((confidence - 0.0).abs() < f64::EPSILON, "FileGlob should not match pattern text");
     }
 
     #[test]
@@ -551,7 +564,7 @@ mod tests {
         // Regex matches, glob doesn't
         let confidence =
             evaluate_cached_skill(&cached, Some("neo4j_query"), Some("src/api/test.rs"));
-        assert!((confidence - 1.0).abs() < f64::EPSILON);
+        assert!(confidence > 0.0, "Should match via regex");
     }
 
     #[test]

@@ -7,10 +7,14 @@ use super::client::Neo4jClient;
 use super::models::DecisionNode;
 use crate::neurons::activation::{ActivatedNote, ActivationSource};
 use crate::notes::Note;
-use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus, SkillTrigger};
+use crate::skills::{
+    ActivatedSkillContext, SkillNode, SkillStatus, SkillTrigger, MAX_TRIGGER_PATTERN_LEN,
+    REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT,
+};
 use anyhow::{Context, Result};
 use neo4rs::query;
 use regex::RegexBuilder;
+use tracing::warn;
 use uuid::Uuid;
 
 impl Neo4jClient {
@@ -65,14 +69,20 @@ impl Neo4jClient {
                 .and_then(|s| s.parse().ok()),
             is_validated: node.get("is_validated").unwrap_or(false),
             tags,
-            created_at: node
-                .get::<String>("created_at")?
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            updated_at: node
-                .get::<String>("updated_at")?
-                .parse()
-                .unwrap_or_else(|_| chrono::Utc::now()),
+            created_at: {
+                let raw = node.get::<String>("created_at")?;
+                raw.parse().unwrap_or_else(|e| {
+                    warn!(raw = %raw, error = %e, "Failed to parse Skill created_at, using now()");
+                    chrono::Utc::now()
+                })
+            },
+            updated_at: {
+                let raw = node.get::<String>("updated_at")?;
+                raw.parse().unwrap_or_else(|e| {
+                    warn!(raw = %raw, error = %e, "Failed to parse Skill updated_at, using now()");
+                    chrono::Utc::now()
+                })
+            },
         })
     }
 
@@ -115,10 +125,8 @@ impl Neo4jClient {
                 updated_at: datetime($updated_at)
             })
             WITH s
-            OPTIONAL MATCH (p:Project {id: $project_id})
-            FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
-                MERGE (s)-[:BELONGS_TO]->(p)
-            )
+            MATCH (p:Project {id: $project_id})
+            MERGE (s)-[:BELONGS_TO]->(p)
             "#,
         )
         .param("id", skill.id.to_string())
@@ -754,15 +762,15 @@ impl Neo4jClient {
                 let confidence = match trigger.pattern_type {
                     crate::skills::TriggerType::Regex => {
                         // Use RegexBuilder with size limits (ReDoS protection)
-                        // and case-insensitive matching (consistent with activation.rs
-                        // and triggers.rs quality evaluation)
-                        if trigger.pattern_value.len() > 500 {
+                        // and case-insensitive matching (consistent with activation.rs,
+                        // cache.rs, and triggers.rs quality evaluation)
+                        if trigger.pattern_value.len() > MAX_TRIGGER_PATTERN_LEN {
                             0.0
                         } else {
                             match RegexBuilder::new(&trigger.pattern_value)
                                 .case_insensitive(true)
-                                .size_limit(10_000)
-                                .dfa_size_limit(10_000)
+                                .size_limit(REGEX_SIZE_LIMIT)
+                                .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
                                 .build()
                             {
                                 Ok(re) => {

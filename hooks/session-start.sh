@@ -105,6 +105,11 @@ if [ -z "$PROJECT_ID" ]; then
     exit 0
 fi
 
+# Validate PORT is a number (prevent injection in curl URL)
+case "$PORT" in
+    ''|*[!0-9]*) debug "Invalid port: $PORT"; exit 0 ;;
+esac
+
 debug "Project: $PROJECT_ID, Port: $PORT"
 
 # ============================================================================

@@ -143,8 +143,10 @@ pub async fn activate_for_hook(
         let (skill1, conf1) = matches.remove(0);
         let (skill2, _conf2) = matches.remove(0);
 
-        let (notes1, decisions1) = graph_store.get_skill_members(skill1.id).await?;
-        let (notes2, decisions2) = graph_store.get_skill_members(skill2.id).await?;
+        let ((notes1, decisions1), (notes2, decisions2)) = tokio::try_join!(
+            graph_store.get_skill_members(skill1.id),
+            graph_store.get_skill_members(skill2.id),
+        )?;
 
         // Merge notes, dedup by id
         let mut all_notes = notes1;
@@ -293,8 +295,10 @@ pub async fn activate_for_hook_cached(
         let (skill1, conf1) = matches.remove(0);
         let (skill2, _conf2) = matches.remove(0);
 
-        let (notes1, decisions1) = graph_store.get_skill_members(skill1.id).await?;
-        let (notes2, decisions2) = graph_store.get_skill_members(skill2.id).await?;
+        let ((notes1, decisions1), (notes2, decisions2)) = tokio::try_join!(
+            graph_store.get_skill_members(skill1.id),
+            graph_store.get_skill_members(skill2.id),
+        )?;
 
         let mut all_notes = notes1;
         for note in notes2 {

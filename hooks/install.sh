@@ -335,8 +335,8 @@ main() {
         exit 1
     fi
 
-    # Validate project ID looks like a UUID (basic check)
-    if ! echo "$PROJECT_ID" | grep -qE '^[0-9a-fA-F-]{8,}$'; then
+    # Validate project ID looks like a UUID (8-4-4-4-12 hex format)
+    if ! echo "$PROJECT_ID" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
         warn "Project ID doesn't look like a UUID: $PROJECT_ID"
         warn "Proceeding anyway — verify this is correct"
     fi

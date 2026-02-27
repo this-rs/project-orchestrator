@@ -2,7 +2,7 @@
 //!
 //! Provides the `/api/hooks/activate` endpoint that Claude Code hooks call
 //! to get contextual knowledge injection. This endpoint is PUBLIC (no JWT)
-//! but rate-limited per IP (100 requests/minute).
+//! but rate-limited per IP (500 requests/minute).
 //!
 //! Also provides `/api/hooks/session-context` for session-start hooks to
 //! inject active skills, current plan/task, and critical notes.
@@ -89,9 +89,13 @@ impl RateLimiter {
     }
 }
 
-/// Global rate limiter for the hooks endpoint: 100 requests per minute per IP.
+/// Global rate limiter for the hooks endpoint: 500 requests per minute per IP.
+///
+/// Generous limit because: (1) all sessions share localhost IP via extract_client_ip,
+/// (2) each Claude Code turn can fire 5-10 tool calls, and (3) automated agent
+/// mode can sustain high throughput. 500/min ≈ 8/sec handles concurrent sessions.
 static HOOK_RATE_LIMITER: LazyLock<RateLimiter> =
-    LazyLock::new(|| RateLimiter::new(100, Duration::from_secs(60)));
+    LazyLock::new(|| RateLimiter::new(500, Duration::from_secs(60)));
 
 /// Request counter for periodic cleanup.
 static REQUEST_COUNTER: LazyLock<Mutex<u64>> = LazyLock::new(|| Mutex::new(0));
@@ -115,7 +119,7 @@ pub fn skill_cache() -> &'static SkillCache {
 /// Receives tool input from PreToolUse hooks, matches against skill triggers,
 /// and returns contextual knowledge for injection.
 ///
-/// Public endpoint (no JWT required) — rate limited to 100 req/min per IP.
+/// Public endpoint (no JWT required) — rate limited to 500 req/min per IP.
 ///
 /// Returns:
 /// - 200 with HookActivateResponse if a skill matched
@@ -133,7 +137,7 @@ pub async fn activate_hook(
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
-                "error": "Rate limit exceeded. Max 100 requests per minute."
+                "error": "Rate limit exceeded. Max 500 requests per minute."
             })),
         ));
     }
@@ -207,7 +211,7 @@ pub async fn hooks_health(State(_state): State<OrchestratorState>) -> Json<serde
         "status": "ok",
         "rate_limiter": {
             "tracked_ips": entries_count,
-            "max_requests_per_minute": 100,
+            "max_requests_per_minute": 500,
         },
         "cache": {
             "active_entries": cache_stats.active_entries,

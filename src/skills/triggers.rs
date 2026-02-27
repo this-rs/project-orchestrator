@@ -392,15 +392,24 @@ fn evaluate_regex_quality(
     skill_notes: &[Note],
     all_project_notes: &[Note],
 ) -> Option<f64> {
+    use crate::skills::{MAX_TRIGGER_PATTERN_LEN, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
+
     // Reject overly long patterns and limit regex compilation size
-    if pattern.len() > 500 {
+    if pattern.len() > MAX_TRIGGER_PATTERN_LEN {
         return Some(0.0);
     }
-    let regex = regex::RegexBuilder::new(&format!("(?i){}", pattern))
-        .size_limit(10_000)
-        .dfa_size_limit(10_000)
+    let regex = match regex::RegexBuilder::new(&format!("(?i){}", pattern))
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
         .build()
-        .ok()?;
+    {
+        Ok(re) => re,
+        Err(_) => {
+            // Uncompilable pattern = low quality (not reliable), NOT None
+            // None would be treated as "unknown quality" → reliable by default
+            return Some(0.0);
+        }
+    };
 
     let total_skill = skill_notes.len();
     if total_skill == 0 {
