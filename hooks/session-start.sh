@@ -129,6 +129,18 @@ debug "Response received (${#RESPONSE} bytes)"
 node -e '
     "use strict";
 
+    function relativeTime(isoDate) {
+        if (!isoDate) return null;
+        const diff = Date.now() - new Date(isoDate).getTime();
+        const mins = Math.floor(diff / 60000);
+        if (mins < 1) return "just now";
+        if (mins < 60) return mins + "m ago";
+        const hours = Math.floor(mins / 60);
+        if (hours < 24) return hours + "h ago";
+        const days = Math.floor(hours / 24);
+        return days + "d ago";
+    }
+
     const resp = JSON.parse(process.argv[1]);
     if (!resp || resp.error) process.exit(0);
 
@@ -136,12 +148,17 @@ node -e '
 
     // Active Skills
     if (resp.active_skills && resp.active_skills.length > 0) {
-        ctx += "## Active Skills\n";
+        ctx += "## Neural Skills (" + resp.active_skills.length + " active)\n";
         for (const s of resp.active_skills) {
             const energy = Math.round(s.energy * 100);
-            ctx += "- **" + s.name + "** (" + energy + "% energy)";
-            if (s.description) ctx += " — " + s.description;
+            ctx += "- **" + s.name + "** (" + s.note_count + " notes, " + energy + "% energy)";
+            if (s.activation_count > 0) {
+                const ago = relativeTime(s.last_activated);
+                ctx += " — " + s.activation_count + " activations";
+                if (ago) ctx += ", last " + ago;
+            }
             ctx += "\n";
+            if (s.description) ctx += "  " + s.description + "\n";
         }
         ctx += "\n";
     }
@@ -166,7 +183,6 @@ node -e '
         ctx += "## Critical Notes\n";
         for (const n of resp.critical_notes) {
             const tag = n.note_type ? "[" + n.note_type + "] " : "";
-            // Extract first line or truncate to 200 chars
             let content = n.content || "";
             const firstLine = content.split("\n")[0];
             content = firstLine.length > 200

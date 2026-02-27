@@ -173,11 +173,12 @@ pub async fn activate_for_hook(
             .collect();
 
         let merged_name = format!("{} + {}", skill1.name, skill2.name);
-        let context = assemble_context(
+        let context = assemble_context_with_confidence(
             &merged_name,
             &active_notes,
             &all_decisions,
             config.max_context_chars,
+            Some(conf1),
         );
 
         let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
@@ -203,11 +204,12 @@ pub async fn activate_for_hook(
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
-        let context = assemble_context(
+        let context = assemble_context_with_confidence(
             &skill.name,
             &active_notes,
             &decisions,
             config.max_context_chars,
+            Some(confidence),
         );
 
         let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
@@ -322,11 +324,12 @@ pub async fn activate_for_hook_cached(
             .collect();
 
         let merged_name = format!("{} + {}", skill1.name, skill2.name);
-        let context = assemble_context(
+        let context = assemble_context_with_confidence(
             &merged_name,
             &active_notes,
             &all_decisions,
             config.max_context_chars,
+            Some(conf1),
         );
 
         let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
@@ -351,11 +354,12 @@ pub async fn activate_for_hook_cached(
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
-        let context = assemble_context(
+        let context = assemble_context_with_confidence(
             &skill.name,
             &active_notes,
             &decisions,
             config.max_context_chars,
+            Some(confidence),
         );
 
         let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
@@ -481,7 +485,25 @@ pub fn assemble_context(
     decisions: &[DecisionNode],
     max_chars: usize,
 ) -> String {
-    let header = format!("## \u{1f4a1} {}\n", skill_name);
+    assemble_context_with_confidence(skill_name, notes, decisions, max_chars, None)
+}
+
+/// Assemble context with optional confidence score in the header.
+pub fn assemble_context_with_confidence(
+    skill_name: &str,
+    notes: &[Note],
+    decisions: &[DecisionNode],
+    max_chars: usize,
+    confidence: Option<f64>,
+) -> String {
+    let header = match confidence {
+        Some(conf) => format!(
+            "## \u{1f9e0} Skill \"{}\" (confidence {}%)\n",
+            skill_name,
+            (conf * 100.0).round() as u32
+        ),
+        None => format!("## \u{1f4a1} {}\n", skill_name),
+    };
     let mut context = header;
 
     // Reserve budget for decisions if any exist
@@ -928,6 +950,75 @@ mod tests {
         assert!(context.contains("\u{1f4cb}")); // 📋 for guideline
         assert!(context.contains("\u{1f504}")); // 🔄 for pattern
         assert!(context.contains("\u{1f4a1}")); // 💡 for tip
+    }
+
+    // --- Confidence header ---
+
+    #[test]
+    fn test_assemble_context_with_confidence_header() {
+        let notes = vec![
+            make_test_note(Uuid::new_v4(), "Always use UNWIND for batch operations", NoteType::Guideline, NoteImportance::High, 0.8),
+        ];
+
+        let decisions = vec![
+            make_test_decision(Uuid::new_v4(), "Use Neo4j 5.x driver", "neo4j-rust-driver 0.8"),
+        ];
+
+        // With confidence → 🧠 header with percentage
+        let context = assemble_context_with_confidence("Neo4j Perf", &notes, &decisions, 3200, Some(0.85));
+        assert!(
+            context.starts_with("## \u{1f9e0} Skill \"Neo4j Perf\" (confidence 85%)"),
+            "Expected confidence header, got: {}",
+            context.lines().next().unwrap_or("")
+        );
+        assert!(context.contains("UNWIND"));
+        assert!(context.contains("Neo4j 5.x driver"));
+    }
+
+    #[test]
+    fn test_assemble_context_with_confidence_none() {
+        let notes = vec![
+            make_test_note(Uuid::new_v4(), "A note", NoteType::Tip, NoteImportance::Medium, 0.5),
+        ];
+
+        // Without confidence → 💡 header (same as assemble_context)
+        let context = assemble_context_with_confidence("Test Skill", &notes, &[], 3200, None);
+        assert!(
+            context.starts_with("## \u{1f4a1} Test Skill"),
+            "Expected default header without confidence, got: {}",
+            context.lines().next().unwrap_or("")
+        );
+    }
+
+    #[test]
+    fn test_assemble_context_with_confidence_rounding() {
+        let notes = vec![
+            make_test_note(Uuid::new_v4(), "Content", NoteType::Context, NoteImportance::Medium, 0.5),
+        ];
+
+        // Confidence 0.666 → should round to 67%
+        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666));
+        assert!(
+            context.contains("confidence 67%"),
+            "Expected confidence 67%, got: {}",
+            context.lines().next().unwrap_or("")
+        );
+
+        // Confidence 1.0 → 100%
+        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(1.0));
+        assert!(
+            context.contains("confidence 100%"),
+            "Expected confidence 100%, got: {}",
+            context.lines().next().unwrap_or("")
+        );
+
+        // Confidence 0.0 → 0%
+        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.0));
+        assert!(
+            context.contains("confidence 0%"),
+            "Expected confidence 0%, got: {}",
+            context.lines().next().unwrap_or("")
+        );
     }
 
     // --- Truncation ---

@@ -268,9 +268,11 @@ pub async fn session_context(
             .map(|s| {
                 serde_json::json!({
                     "name": s.name,
-                    "description": s.description,
+                    "description": truncate_str(&s.description, 80),
                     "energy": s.energy,
                     "note_count": s.note_count,
+                    "activation_count": s.activation_count,
+                    "last_activated": s.last_activated,
                 })
             })
             .collect::<Vec<_>>(),
@@ -393,6 +395,16 @@ pub async fn session_context(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Truncate a string to `max_len` characters, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    }
+}
 
 /// Extract client IP from request headers.
 ///
