@@ -473,7 +473,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Code Exploration & Analytics ────────────────────────────────
     ToolGroup {
         name: "code_exploration",
-        description: "Recherche sémantique, graphe d'appels, impact, analytics GDS, hotspots, risk",
+        description: "Recherche sémantique, graphe d'appels, impact, analytics GDS, heritage, process, community, risk",
         keywords: &[
             "code", "fonction", "struct", "fichier", "import", "appel",
             "architecture", "symbole", "trait", "impl", "référence",
@@ -481,10 +481,14 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             "pagerank", "GDS", "plan_implementation",
             "risque", "hotspot", "churn", "health", "knowledge-gap",
             "risk-assessment", "density",
+            "héritage", "extends", "implements", "interface", "class",
+            "subclass", "hierarchy", "sous-classe",
+            "process", "entry point", "processus", "workflow",
+            "co-change", "co_change", "cohesion", "enrichment",
         ],
         tools: &[ToolRef {
             name: "code",
-            description: "Explore code (search/find_references/get_call_graph/analyze_impact/get_architecture/get_communities/get_health/get_node_importance/plan_implementation) — get_health includes hotspots, knowledge_gaps, risk_assessment, neural_metrics; analyze_impact includes affecting_decisions",
+            description: "Explore code (search/search_project/search_workspace/get_file_symbols/find_references/get_file_dependencies/get_call_graph/analyze_impact/get_architecture/find_similar/find_trait_implementations/find_type_traits/get_impl_blocks/get_communities/get_health/get_node_importance/plan_implementation/get_co_change_graph/get_file_co_changers/detect_processes/get_class_hierarchy/find_subclasses/find_interface_implementors/list_processes/get_process/get_entry_points/enrich_communities/get_hotspots/get_knowledge_gaps/get_risk_assessment)",
         }],
     },
     // ── Knowledge / Notes ───────────────────────────────────────────
@@ -498,7 +502,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         ],
         tools: &[ToolRef {
             name: "note",
-            description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/get_context/get_context_knowledge/get_propagated/get_entity/get_needing_review)",
+            description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/unlink_from_entity/get_context/get_context_knowledge/get_propagated/get_propagated_knowledge/get_entity/get_needing_review/list_project)",
         }],
     },
     // ── Git Tracking ────────────────────────────────────────────────
@@ -557,15 +561,16 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Chat & Feature Graphs ───────────────────────────────────────
     ToolGroup {
         name: "chat_features",
-        description: "Sessions de conversation et feature graphs",
+        description: "Sessions de conversation, feature graphs, discussed entities",
         keywords: &[
             "chat", "session", "conversation", "message", "feature",
             "graphe", "sous-graphe", "auto-build",
+            "discussed", "session entities",
         ],
         tools: &[
             ToolRef {
                 name: "chat",
-                description: "Manage chat sessions (list_sessions/get_session/delete_session/send_message/list_messages)",
+                description: "Manage chat sessions (list_sessions/get_session/delete_session/send_message/list_messages/add_discussed/get_session_entities)",
             },
             ToolRef {
                 name: "feature_graph",
@@ -584,7 +589,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         ],
         tools: &[ToolRef {
             name: "admin",
-            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/update_fabric_scores/bootstrap_knowledge_fabric)",
+            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric)",
         }],
     },
 ];
