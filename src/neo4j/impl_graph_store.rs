@@ -2351,6 +2351,10 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn remove_all_skill_members(&self, skill_id: uuid::Uuid) -> anyhow::Result<i64> {
+        self.remove_all_skill_members(skill_id).await
+    }
+
     async fn get_skills_for_note(
         &self,
         note_id: uuid::Uuid,

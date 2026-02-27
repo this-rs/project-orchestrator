@@ -381,6 +381,8 @@ pub async fn activate_for_hook_cached(
 /// Evaluate how well a skill's triggers match the given pattern and file context.
 ///
 /// Returns the highest confidence score across all reliable triggers.
+/// When a trigger matches, its `confidence_threshold` is used as the score
+/// (consistent with the cached path in `cache::evaluate_cached_skill`).
 /// Semantic triggers are skipped in the hot path (per architectural decision).
 pub fn evaluate_skill_match(
     skill: &SkillNode,
@@ -390,12 +392,12 @@ pub fn evaluate_skill_match(
     let mut max_confidence = 0.0_f64;
 
     for trigger in skill.reliable_triggers() {
-        let confidence = match trigger.pattern_type {
+        let matched = match trigger.pattern_type {
             TriggerType::Regex => {
                 if let Some(pat) = pattern {
                     match_regex_trigger(&trigger.pattern_value, pat)
                 } else {
-                    0.0
+                    false
                 }
             }
             TriggerType::FileGlob => {
@@ -405,17 +407,21 @@ pub fn evaluate_skill_match(
                 if let Some(file) = target {
                     match_file_glob_trigger(&trigger.pattern_value, file)
                 } else {
-                    0.0
+                    false
                 }
             }
             TriggerType::Semantic => {
                 // Semantic matching skipped in hot path
                 // (FastEmbed ~20-50ms = 10-25% of 200ms budget)
-                0.0
+                false
             }
         };
 
-        max_confidence = max_confidence.max(confidence);
+        if matched {
+            // Use the trigger's confidence_threshold as the match confidence,
+            // consistent with the cached path (cache.rs evaluate_cached_skill).
+            max_confidence = max_confidence.max(trigger.confidence_threshold);
+        }
     }
 
     max_confidence
@@ -423,16 +429,14 @@ pub fn evaluate_skill_match(
 
 /// Match a regex trigger pattern against an input string.
 ///
-/// Returns a confidence score (0.0 or 1.0):
-/// - 1.0 if the regex matches the input
-/// - 0.0 if no match or regex compilation fails
+/// Returns true if the regex matches the input, false otherwise.
 ///
 /// Uses case-insensitive matching to be consistent with
 /// `evaluate_regex_quality` in triggers.rs (which uses `(?i)` prefix).
-fn match_regex_trigger(trigger_pattern: &str, input: &str) -> f64 {
+fn match_regex_trigger(trigger_pattern: &str, input: &str) -> bool {
     // Reject overly long patterns to prevent compilation DoS
     if trigger_pattern.len() > 500 {
-        return 0.0;
+        return false;
     }
     match RegexBuilder::new(trigger_pattern)
         .case_insensitive(true)
@@ -440,32 +444,18 @@ fn match_regex_trigger(trigger_pattern: &str, input: &str) -> f64 {
         .dfa_size_limit(10_000)
         .build()
     {
-        Ok(re) => {
-            if re.is_match(input) {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        Err(_) => 0.0,
+        Ok(re) => re.is_match(input),
+        Err(_) => false,
     }
 }
 
 /// Match a file glob trigger pattern against a file path.
 ///
-/// Returns a confidence score:
-/// - 1.0 if the glob matches
-/// - 0.0 if no match or invalid glob
-fn match_file_glob_trigger(trigger_pattern: &str, file_path: &str) -> f64 {
+/// Returns true if the glob matches, false otherwise.
+fn match_file_glob_trigger(trigger_pattern: &str, file_path: &str) -> bool {
     match glob::Pattern::new(trigger_pattern) {
-        Ok(pat) => {
-            if pat.matches(file_path) {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        Err(_) => 0.0,
+        Ok(pat) => pat.matches(file_path),
+        Err(_) => false,
     }
 }
 
@@ -763,43 +753,43 @@ mod tests {
 
     #[test]
     fn test_match_regex_trigger_matches() {
-        assert!((match_regex_trigger("neo4j|cypher", "neo4j_client") - 1.0).abs() < f64::EPSILON);
-        assert!((match_regex_trigger("neo4j|cypher", "cypher_query") - 1.0).abs() < f64::EPSILON);
+        assert!(match_regex_trigger("neo4j|cypher", "neo4j_client"));
+        assert!(match_regex_trigger("neo4j|cypher", "cypher_query"));
     }
 
     #[test]
     fn test_match_regex_trigger_no_match() {
-        assert!((match_regex_trigger("neo4j|cypher", "api_handler") - 0.0).abs() < f64::EPSILON);
+        assert!(!match_regex_trigger("neo4j|cypher", "api_handler"));
     }
 
     #[test]
     fn test_match_regex_trigger_invalid_regex() {
-        assert!((match_regex_trigger("[invalid", "test") - 0.0).abs() < f64::EPSILON);
+        assert!(!match_regex_trigger("[invalid", "test"));
     }
 
     #[test]
     fn test_match_file_glob_trigger_matches() {
-        assert!(
-            (match_file_glob_trigger("src/neo4j/**", "src/neo4j/client.rs") - 1.0).abs()
-                < f64::EPSILON
-        );
-        assert!(
-            (match_file_glob_trigger("src/neo4j/*", "src/neo4j/client.rs") - 1.0).abs()
-                < f64::EPSILON
-        );
+        assert!(match_file_glob_trigger(
+            "src/neo4j/**",
+            "src/neo4j/client.rs"
+        ));
+        assert!(match_file_glob_trigger(
+            "src/neo4j/*",
+            "src/neo4j/client.rs"
+        ));
     }
 
     #[test]
     fn test_match_file_glob_trigger_no_match() {
-        assert!(
-            (match_file_glob_trigger("src/neo4j/**", "src/api/handlers.rs") - 0.0).abs()
-                < f64::EPSILON
-        );
+        assert!(!match_file_glob_trigger(
+            "src/neo4j/**",
+            "src/api/handlers.rs"
+        ));
     }
 
     #[test]
     fn test_match_file_glob_trigger_invalid_glob() {
-        assert!((match_file_glob_trigger("[invalid", "test") - 0.0).abs() < f64::EPSILON);
+        assert!(!match_file_glob_trigger("[invalid", "test"));
     }
 
     // --- Skill match evaluation ---
@@ -810,7 +800,7 @@ mod tests {
         skill.trigger_patterns = vec![SkillTrigger::regex("neo4j|cypher|UNWIND", 0.6)];
 
         let confidence = evaluate_skill_match(&skill, Some("neo4j_client"), None);
-        assert!((confidence - 1.0).abs() < f64::EPSILON);
+        assert!((confidence - 0.6).abs() < f64::EPSILON); // returns trigger's confidence_threshold
     }
 
     #[test]
@@ -828,7 +818,7 @@ mod tests {
         skill.trigger_patterns = vec![SkillTrigger::file_glob("src/neo4j/**", 0.8)];
 
         let confidence = evaluate_skill_match(&skill, None, Some("src/neo4j/client.rs"));
-        assert!((confidence - 1.0).abs() < f64::EPSILON);
+        assert!((confidence - 0.8).abs() < f64::EPSILON); // returns trigger's confidence_threshold
     }
 
     #[test]
@@ -838,7 +828,7 @@ mod tests {
 
         // file_context is None, but pattern is a file path (from Read tool)
         let confidence = evaluate_skill_match(&skill, Some("src/neo4j/client.rs"), None);
-        assert!((confidence - 1.0).abs() < f64::EPSILON);
+        assert!((confidence - 0.8).abs() < f64::EPSILON); // returns trigger's confidence_threshold
     }
 
     #[test]
@@ -851,7 +841,7 @@ mod tests {
 
         let confidence =
             evaluate_skill_match(&skill, Some("neo4j_client"), Some("src/skills/test.rs"));
-        assert!((confidence - 1.0).abs() < f64::EPSILON); // regex matched
+        assert!((confidence - 0.6).abs() < f64::EPSILON); // regex matched with its threshold
     }
 
     #[test]
@@ -892,7 +882,7 @@ mod tests {
         // The function itself doesn't filter by status — that's done by the caller
         // using `is_matchable()`. But let's confirm the trigger still evaluates.
         let confidence = evaluate_skill_match(&skill, Some("neo4j"), None);
-        assert!((confidence - 1.0).abs() < f64::EPSILON);
+        assert!((confidence - 0.5).abs() < f64::EPSILON); // returns trigger's confidence_threshold
     }
 
     // --- Context assembly ---

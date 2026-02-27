@@ -297,8 +297,10 @@ pub fn evaluate_cached_skill(
         let matched = match trigger {
             CompiledTrigger::Regex(re) => pattern.is_some_and(|pat| re.is_match(pat)),
             CompiledTrigger::FileGlob(glob_pat) => {
-                // FileGlob only matches against file context, not pattern text
-                file_context.is_some_and(|file| glob_pat.matches(file))
+                // FileGlob matches against file_context (primary) or pattern
+                // (fallback), consistent with uncached path in activation.rs
+                let target = file_context.or(pattern);
+                target.is_some_and(|file| glob_pat.matches(file))
             }
             CompiledTrigger::Semantic(_) => {
                 // Semantic matching skipped in hot path
@@ -543,15 +545,17 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_cached_skill_file_glob_only_matches_file_context() {
+    fn test_evaluate_cached_skill_file_glob_falls_back_to_pattern() {
         let skill = make_test_skill("API", vec![(TriggerType::FileGlob, "src/api/**")]);
         let cached = CachedSkill::from_skill(skill);
 
-        // FileGlob should NOT fall back to pattern when file_context is None
+        // FileGlob falls back to pattern when file_context is None,
+        // consistent with uncached path in activation.rs
         let confidence = evaluate_cached_skill(&cached, Some("src/api/test.rs"), None);
         assert!(
-            (confidence - 0.0).abs() < f64::EPSILON,
-            "FileGlob should not match pattern text"
+            confidence > 0.0,
+            "FileGlob should match via pattern fallback, got {}",
+            confidence
         );
     }
 

@@ -92,14 +92,16 @@ impl Neo4jClient {
 
     /// Create a new skill node and link it to its project atomically.
     ///
-    /// Uses a single Cypher query to CREATE the skill and MERGE the
-    /// BELONGS_TO relationship, preventing orphaned nodes if the
-    /// relationship step were to fail in a two-step approach.
+    /// Uses a single Cypher query that first MATCHes the project, then
+    /// CREATEs the skill and the BELONGS_TO relationship. If the project
+    /// does not exist, the MATCH produces zero rows and nothing is created,
+    /// preventing orphaned Skill nodes.
     pub async fn create_skill(&self, skill: &SkillNode) -> Result<()> {
         let trigger_json = serde_json::to_string(&skill.trigger_patterns)?;
 
         let q = query(
             r#"
+            MATCH (p:Project {id: $project_id})
             CREATE (s:Skill {
                 id: $id,
                 project_id: $project_id,
@@ -124,9 +126,8 @@ impl Neo4jClient {
                 created_at: datetime($created_at),
                 updated_at: datetime($updated_at)
             })
-            WITH s
-            MATCH (p:Project {id: $project_id})
-            MERGE (s)-[:BELONGS_TO]->(p)
+            CREATE (s)-[:BELONGS_TO]->(p)
+            RETURN s.id AS created_id
             "#,
         )
         .param("id", skill.id.to_string())
@@ -167,10 +168,18 @@ impl Neo4jClient {
         .param("created_at", skill.created_at.to_rfc3339())
         .param("updated_at", skill.updated_at.to_rfc3339());
 
-        self.graph
-            .run(q)
+        let mut result = self
+            .graph
+            .execute(q)
             .await
             .context("Failed to create Skill node")?;
+
+        if result.next().await?.is_none() {
+            anyhow::bail!(
+                "Cannot create skill: project {} does not exist",
+                skill.project_id
+            );
+        }
 
         Ok(())
     }
@@ -276,44 +285,31 @@ impl Neo4jClient {
 
     /// Delete a skill and all its relationships.
     ///
-    /// Uses a two-step approach: first check existence, then delete.
-    /// After DETACH DELETE, the node is gone so RETURN count() would always be 0.
+    /// Uses a single atomic query: OPTIONAL MATCH the skill, capture whether
+    /// it existed, then DETACH DELETE. Returns true if the skill was found
+    /// and deleted, false if it did not exist.
     pub async fn delete_skill(&self, id: Uuid) -> Result<bool> {
-        // Step 1: Check if skill exists
-        let check_q = query(
+        let q = query(
             r#"
-            MATCH (s:Skill {id: $id})
-            RETURN count(s) AS cnt
-            "#,
-        )
-        .param("id", id.to_string());
-
-        let mut check_result = self.graph.execute(check_q).await?;
-        let exists = if let Some(row) = check_result.next().await? {
-            row.get::<i64>("cnt").unwrap_or(0) > 0
-        } else {
-            false
-        };
-
-        if !exists {
-            return Ok(false);
-        }
-
-        // Step 2: Delete the skill and all its relationships
-        let delete_q = query(
-            r#"
-            MATCH (s:Skill {id: $id})
+            OPTIONAL MATCH (s:Skill {id: $id})
+            WITH s, CASE WHEN s IS NOT NULL THEN true ELSE false END AS existed
             DETACH DELETE s
+            RETURN existed
             "#,
         )
         .param("id", id.to_string());
 
-        self.graph
-            .run(delete_q)
+        let mut result = self
+            .graph
+            .execute(q)
             .await
             .context("Failed to delete Skill node")?;
 
-        Ok(true)
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<bool>("existed").unwrap_or(false))
+        } else {
+            Ok(false)
+        }
     }
 
     /// List skills for a project with optional status filter and pagination.
@@ -431,7 +427,9 @@ impl Neo4jClient {
     }
 
     /// Add a note or decision as a member of a skill.
-    /// Uses MERGE for idempotence.
+    ///
+    /// Uses MERGE for idempotence. Returns an error if the skill or entity
+    /// does not exist (the MATCH produces zero rows, so RETURN yields nothing).
     pub async fn add_skill_member(
         &self,
         skill_id: Uuid,
@@ -444,8 +442,10 @@ impl Neo4jClient {
                 MATCH (s:Skill {id: $skill_id})
                 MATCH (n:Note {id: $entity_id})
                 MERGE (n)-[:MEMBER_OF]->(s)
+                WITH s
                 SET s.note_count = size([(x)-[:MEMBER_OF]->(s) WHERE x:Note | x]),
                     s.updated_at = datetime()
+                RETURN s.id AS skill_id
                 "#
             }
             "decision" => {
@@ -453,8 +453,10 @@ impl Neo4jClient {
                 MATCH (s:Skill {id: $skill_id})
                 MATCH (d:Decision {id: $entity_id})
                 MERGE (d)-[:MEMBER_OF_SKILL]->(s)
+                WITH s
                 SET s.decision_count = size([(x)-[:MEMBER_OF_SKILL]->(s) WHERE x:Decision | x]),
                     s.updated_at = datetime()
+                RETURN s.id AS skill_id
                 "#
             }
             _ => {
@@ -466,39 +468,59 @@ impl Neo4jClient {
             .param("skill_id", skill_id.to_string())
             .param("entity_id", entity_id.to_string());
 
-        self.graph.run(q).await.with_context(|| {
+        let mut result = self.graph.execute(q).await.with_context(|| {
             format!(
                 "Failed to add {} {} to skill {}",
                 entity_type, entity_id, skill_id
             )
         })?;
 
+        if result.next().await?.is_none() {
+            anyhow::bail!(
+                "Cannot add member: skill {} or {} {} not found",
+                skill_id,
+                entity_type,
+                entity_id
+            );
+        }
+
         Ok(())
     }
 
     /// Remove a member from a skill.
     ///
-    /// Uses a two-step approach: first check if the relationship exists,
-    /// then delete it and update counters. After DELETE r, the relationship
-    /// is gone so RETURN count(r) would always be 0.
+    /// Uses a single atomic query: OPTIONAL MATCH the relationship, delete it
+    /// if found, then recount members with a WITH barrier to ensure the count
+    /// is computed after the deletion. Returns whether the relationship existed.
     pub async fn remove_skill_member(
         &self,
         skill_id: Uuid,
         entity_type: &str,
         entity_id: Uuid,
     ) -> Result<bool> {
-        // Step 1: Check if the relationship exists
-        let check_cypher = match entity_type {
+        let cypher = match entity_type {
             "note" => {
                 r#"
-                MATCH (n:Note {id: $entity_id})-[r:MEMBER_OF]->(s:Skill {id: $skill_id})
-                RETURN count(r) AS cnt
+                MATCH (s:Skill {id: $skill_id})
+                OPTIONAL MATCH (n:Note {id: $entity_id})-[r:MEMBER_OF]->(s)
+                WITH s, r, CASE WHEN r IS NOT NULL THEN true ELSE false END AS existed
+                DELETE r
+                WITH s, existed
+                SET s.note_count = size([(x)-[:MEMBER_OF]->(s) WHERE x:Note | x]),
+                    s.updated_at = datetime()
+                RETURN existed
                 "#
             }
             "decision" => {
                 r#"
-                MATCH (d:Decision {id: $entity_id})-[r:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
-                RETURN count(r) AS cnt
+                MATCH (s:Skill {id: $skill_id})
+                OPTIONAL MATCH (d:Decision {id: $entity_id})-[r:MEMBER_OF_SKILL]->(s)
+                WITH s, r, CASE WHEN r IS NOT NULL THEN true ELSE false END AS existed
+                DELETE r
+                WITH s, existed
+                SET s.decision_count = size([(x)-[:MEMBER_OF_SKILL]->(s) WHERE x:Decision | x]),
+                    s.updated_at = datetime()
+                RETURN existed
                 "#
             }
             _ => {
@@ -506,59 +528,60 @@ impl Neo4jClient {
             }
         };
 
-        let check_q = query(check_cypher)
+        let q = query(cypher)
             .param("skill_id", skill_id.to_string())
             .param("entity_id", entity_id.to_string());
 
-        let mut check_result = self.graph.execute(check_q).await?;
-        let exists = if let Some(row) = check_result.next().await? {
-            row.get::<i64>("cnt").unwrap_or(0) > 0
-        } else {
-            false
-        };
-
-        if !exists {
-            return Ok(false);
-        }
-
-        // Step 2: Delete the relationship and update counters
-        let delete_cypher = match entity_type {
-            "note" => {
-                r#"
-                MATCH (n:Note {id: $entity_id})-[r:MEMBER_OF]->(s:Skill {id: $skill_id})
-                DELETE r
-                SET s.note_count = size([(x)-[:MEMBER_OF]->(s) WHERE x:Note | x]),
-                    s.updated_at = datetime()
-                "#
-            }
-            "decision" => {
-                r#"
-                MATCH (d:Decision {id: $entity_id})-[r:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
-                DELETE r
-                SET s.decision_count = size([(x)-[:MEMBER_OF_SKILL]->(s) WHERE x:Decision | x]),
-                    s.updated_at = datetime()
-                "#
-            }
-            _ => unreachable!(), // Already validated above
-        };
-
-        let delete_q = query(delete_cypher)
-            .param("skill_id", skill_id.to_string())
-            .param("entity_id", entity_id.to_string());
-
-        self.graph.run(delete_q).await.with_context(|| {
+        let mut result = self.graph.execute(q).await.with_context(|| {
             format!(
                 "Failed to remove {} {} from skill {}",
                 entity_type, entity_id, skill_id
             )
         })?;
 
-        Ok(true)
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<bool>("existed").unwrap_or(false))
+        } else {
+            Ok(false)
+        }
     }
 
     // ========================================================================
     // Query operations
     // ========================================================================
+
+    /// Remove all members (notes and decisions) from a skill.
+    ///
+    /// Deletes all MEMBER_OF and MEMBER_OF_SKILL relationships pointing to
+    /// this skill. Resets note_count and decision_count to 0.
+    /// Returns the number of relationships removed.
+    pub async fn remove_all_skill_members(&self, skill_id: Uuid) -> Result<i64> {
+        let q = query(
+            r#"
+            MATCH (s:Skill {id: $skill_id})
+            OPTIONAL MATCH (n)-[r:MEMBER_OF|MEMBER_OF_SKILL]->(s)
+            WITH s, collect(r) AS rels
+            FOREACH (r IN rels | DELETE r)
+            SET s.note_count = 0,
+                s.decision_count = 0,
+                s.updated_at = datetime()
+            RETURN size(rels) AS removed
+            "#,
+        )
+        .param("skill_id", skill_id.to_string());
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("Failed to remove all skill members")?;
+
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("removed").unwrap_or(0))
+        } else {
+            Ok(0)
+        }
+    }
 
     /// Get all skills that contain a given note as member.
     pub async fn get_skills_for_note(&self, note_id: Uuid) -> Result<Vec<SkillNode>> {

@@ -451,6 +451,11 @@ pub async fn execute_evolution(
                             }
                         }
 
+                        // Clean up absorbed skill's member relationships before archiving
+                        if let Err(e) = graph_store.remove_all_skill_members(absorbed.id).await {
+                            warn!(absorbed = %absorbed.id, error = %e, "Failed to remove members from absorbed skill during merge");
+                        }
+
                         // Archive the absorbed skill
                         let mut archived = absorbed.clone();
                         archived.status = crate::skills::SkillStatus::Archived;
@@ -526,6 +531,26 @@ pub async fn execute_evolution(
                     debug!(new_skill_id = %new_id, members = member_notes.len(), "Created split skill");
                 }
 
+                // Transfer decisions from original skill to new sub-skills
+                if let Ok((_, decisions)) = graph_store.get_skill_members(*skill_id).await {
+                    for decision in &decisions {
+                        // Add decision to all new sub-skills (they share the lineage)
+                        for &new_id in &new_skill_ids {
+                            if let Err(e) = graph_store
+                                .add_skill_member(new_id, "decision", decision.id)
+                                .await
+                            {
+                                warn!(skill_id = %new_id, decision_id = %decision.id, error = %e, "Failed to transfer decision during split");
+                            }
+                        }
+                    }
+                }
+
+                // Clean up original skill's member relationships before archiving
+                if let Err(e) = graph_store.remove_all_skill_members(*skill_id).await {
+                    warn!(skill_id = %skill_id, error = %e, "Failed to remove members from original skill during split");
+                }
+
                 // Archive the original skill
                 if let Ok(Some(mut original)) = graph_store.get_skill(*skill_id).await {
                     original.status = crate::skills::SkillStatus::Archived;
@@ -582,6 +607,11 @@ pub async fn execute_evolution(
                 // Orphan skill — no matching cluster. Archive it.
                 if let Ok(Some(mut skill)) = graph_store.get_skill(*skill_id).await {
                     if skill.status != crate::skills::SkillStatus::Archived {
+                        // Clean up member relationships before archiving
+                        if let Err(e) = graph_store.remove_all_skill_members(*skill_id).await {
+                            warn!(skill_id = %skill_id, error = %e, "Failed to remove members from orphaned skill");
+                        }
+
                         skill.status = crate::skills::SkillStatus::Archived;
                         skill.updated_at = Utc::now();
                         graph_store.update_skill(&skill).await?;

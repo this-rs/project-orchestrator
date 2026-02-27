@@ -1921,6 +1921,11 @@ pub trait GraphStore: Send + Sync {
         entity_id: Uuid,
     ) -> Result<bool>;
 
+    /// Remove all members (notes and decisions) from a skill.
+    /// Used during evolution to clean up relationships before archiving.
+    /// Returns the number of relationships removed.
+    async fn remove_all_skill_members(&self, skill_id: Uuid) -> Result<i64>;
+
     // ========================================================================
     // Skill query & activation operations
     // ========================================================================

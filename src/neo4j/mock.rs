@@ -6890,6 +6890,15 @@ impl GraphStore for MockGraphStore {
         }
     }
 
+    async fn remove_all_skill_members(&self, skill_id: Uuid) -> anyhow::Result<i64> {
+        let mut members = self.skill_members.write().await;
+        if let Some(list) = members.remove(&skill_id) {
+            Ok(list.len() as i64)
+        } else {
+            Ok(0)
+        }
+    }
+
     async fn get_skills_for_note(
         &self,
         note_id: Uuid,
