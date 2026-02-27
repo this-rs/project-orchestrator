@@ -1681,6 +1681,53 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
+    // Heritage navigation queries
+    // ========================================================================
+
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        _max_depth: u32,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "type_name": type_name,
+            "parents": [],
+            "children": [],
+        }))
+    }
+
+    async fn find_subclasses(&self, _class_name: &str) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn find_interface_implementors(
+        &self,
+        _interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    async fn list_processes(&self, _project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_process_detail(&self, _process_id: &str) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    async fn get_entry_points(
+        &self,
+        _project_id: uuid::Uuid,
+        _limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
     // Code exploration queries
     // ========================================================================
 

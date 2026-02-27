@@ -606,6 +606,55 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Heritage navigation queries
+    // ========================================================================
+
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.get_class_hierarchy(type_name, max_depth).await
+    }
+
+    async fn find_subclasses(&self, class_name: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.find_subclasses(class_name).await
+    }
+
+    async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.find_interface_implementors(interface_name).await
+    }
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    async fn list_processes(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.list_processes(project_id).await
+    }
+
+    async fn get_process_detail(
+        &self,
+        process_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.get_process_detail(process_id).await
+    }
+
+    async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.get_entry_points(project_id, limit).await
+    }
+
+    // ========================================================================
     // Code exploration queries
     // ========================================================================
 

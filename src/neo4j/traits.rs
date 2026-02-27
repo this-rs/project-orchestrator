@@ -477,6 +477,43 @@ pub trait GraphStore: Send + Sync {
     async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>>;
 
     // ========================================================================
+    // Heritage navigation queries (EXTENDS + IMPLEMENTS)
+    // ========================================================================
+
+    /// Get the full class hierarchy (parents + children) for a type
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> Result<serde_json::Value>;
+
+    /// Find all subclasses of a given class (via EXTENDS)
+    async fn find_subclasses(&self, class_name: &str) -> Result<Vec<serde_json::Value>>;
+
+    /// Find all classes that implement a given interface (via IMPLEMENTS)
+    async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    /// List all detected processes for a project
+    async fn list_processes(&self, project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>>;
+
+    /// Get details of a specific process including ordered steps
+    async fn get_process_detail(&self, process_id: &str) -> Result<Option<serde_json::Value>>;
+
+    /// Get scored entry points for a project
+    async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
     // Code exploration queries
     // ========================================================================
 

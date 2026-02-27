@@ -2278,6 +2278,297 @@ impl Neo4jClient {
     }
 
     // ========================================================================
+    // Heritage navigation queries (EXTENDS + IMPLEMENTS)
+    // ========================================================================
+
+    /// Get the full class hierarchy (parents + children) for a type.
+    ///
+    /// Traverses EXTENDS up (parents) and down (children) with depth limit.
+    pub async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> Result<serde_json::Value> {
+        // Parents (traverse EXTENDS upward)
+        let q_parents = query(
+            r#"
+            MATCH path = (child)-[:EXTENDS*1..10]->(ancestor)
+            WHERE child.name = $type_name
+            WITH ancestor, length(path) AS depth
+            WHERE depth <= $max_depth
+            RETURN DISTINCT ancestor.name AS name,
+                   ancestor.path AS path,
+                   depth
+            ORDER BY depth ASC
+            "#,
+        )
+        .param("type_name", type_name)
+        .param("max_depth", max_depth as i64);
+
+        let mut result = self.graph.execute(q_parents).await?;
+        let mut parents = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let path: Option<String> = row.get("path").ok();
+            let depth: i64 = row.get("depth").unwrap_or(0);
+            parents.push(serde_json::json!({
+                "name": name,
+                "path": path,
+                "depth": depth,
+            }));
+        }
+
+        // Children (traverse EXTENDS downward — reverse direction)
+        let q_children = query(
+            r#"
+            MATCH path = (descendant)-[:EXTENDS*1..10]->(parent)
+            WHERE parent.name = $type_name
+            WITH descendant, length(path) AS depth
+            WHERE depth <= $max_depth
+            RETURN DISTINCT descendant.name AS name,
+                   descendant.path AS path,
+                   depth
+            ORDER BY depth ASC
+            "#,
+        )
+        .param("type_name", type_name)
+        .param("max_depth", max_depth as i64);
+
+        let mut result = self.graph.execute(q_children).await?;
+        let mut children = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let path: Option<String> = row.get("path").ok();
+            let depth: i64 = row.get("depth").unwrap_or(0);
+            children.push(serde_json::json!({
+                "name": name,
+                "path": path,
+                "depth": depth,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "type_name": type_name,
+            "parents": parents,
+            "children": children,
+        }))
+    }
+
+    /// Find all subclasses of a given class (direct + transitive via EXTENDS).
+    pub async fn find_subclasses(&self, class_name: &str) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH path = (child)-[:EXTENDS*1..10]->(parent)
+            WHERE parent.name = $class_name
+            WITH child, length(path) AS depth
+            RETURN DISTINCT child.name AS name,
+                   child.path AS path,
+                   depth
+            ORDER BY depth ASC, name ASC
+            "#,
+        )
+        .param("class_name", class_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut subclasses = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let path: Option<String> = row.get("path").ok();
+            let depth: i64 = row.get("depth").unwrap_or(0);
+            subclasses.push(serde_json::json!({
+                "name": name,
+                "path": path,
+                "depth": depth,
+                "direct": depth == 1,
+            }));
+        }
+        Ok(subclasses)
+    }
+
+    /// Find all classes/types that implement a given interface (via IMPLEMENTS).
+    pub async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (type)-[:IMPLEMENTS]->(iface)
+            WHERE iface.name = $interface_name
+            RETURN DISTINCT type.name AS name,
+                   type.path AS path,
+                   labels(type) AS labels
+            ORDER BY name ASC
+            "#,
+        )
+        .param("interface_name", interface_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut implementors = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let path: Option<String> = row.get("path").ok();
+            implementors.push(serde_json::json!({
+                "name": name,
+                "path": path,
+            }));
+        }
+        Ok(implementors)
+    }
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    /// List all detected processes for a project.
+    pub async fn list_processes(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (p:Process {project_id: $project_id})
+            OPTIONAL MATCH (p)-[s:STEP_IN_PROCESS]->(f:Function)
+            WITH p, count(s) AS step_count
+            RETURN p.id AS id,
+                   p.label AS label,
+                   p.process_type AS process_type,
+                   p.entry_point_id AS entry_point,
+                   p.terminal_id AS terminal,
+                   step_count
+            ORDER BY step_count DESC
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut processes = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id").unwrap_or_default();
+            let label: String = row.get("label").unwrap_or_default();
+            let process_type: String = row.get("process_type").unwrap_or_default();
+            let entry_point: String = row.get("entry_point").unwrap_or_default();
+            let terminal: String = row.get("terminal").unwrap_or_default();
+            let step_count: i64 = row.get("step_count").unwrap_or(0);
+            processes.push(serde_json::json!({
+                "id": id,
+                "label": label,
+                "process_type": process_type,
+                "entry_point": entry_point,
+                "terminal": terminal,
+                "step_count": step_count,
+            }));
+        }
+        Ok(processes)
+    }
+
+    /// Get details of a specific process including ordered steps.
+    pub async fn get_process_detail(
+        &self,
+        process_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (p:Process {id: $process_id})
+            OPTIONAL MATCH (p)-[s:STEP_IN_PROCESS]->(f:Function)
+            WITH p, f, s
+            ORDER BY s.order ASC
+            RETURN p.id AS id,
+                   p.label AS label,
+                   p.process_type AS process_type,
+                   p.entry_point_id AS entry_point,
+                   p.terminal_id AS terminal,
+                   collect({
+                       function_id: f.id,
+                       name: f.name,
+                       file_path: f.file_path,
+                       order: s.order
+                   }) AS steps
+            "#,
+        )
+        .param("process_id", process_id);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let id: String = row.get("id").unwrap_or_default();
+            if id.is_empty() {
+                return Ok(None);
+            }
+            let label: String = row.get("label").unwrap_or_default();
+            let process_type: String = row.get("process_type").unwrap_or_default();
+            let entry_point: String = row.get("entry_point").unwrap_or_default();
+            let terminal: String = row.get("terminal").unwrap_or_default();
+            let steps: Vec<serde_json::Value> =
+                serde_json::from_value(row.get::<serde_json::Value>("steps").unwrap_or_default())
+                    .unwrap_or_default();
+
+            Ok(Some(serde_json::json!({
+                "id": id,
+                "label": label,
+                "process_type": process_type,
+                "entry_point": entry_point,
+                "terminal": terminal,
+                "steps": steps,
+            })))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get scored entry points for a project.
+    ///
+    /// Entry points are functions with in_degree=0 on the CALLS graph,
+    /// or functions matching framework/naming patterns.
+    pub async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (f:Function)
+            WHERE f.project_id = $project_id OR
+                  EXISTS {
+                      MATCH (file:File {project_id: $project_id})
+                      WHERE f.file_path = file.path
+                  }
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+            WITH f, count(caller) AS in_degree
+            WHERE in_degree = 0
+            OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
+            WITH f, in_degree, count(callee) AS out_degree
+            WHERE out_degree > 0
+            RETURN f.name AS name,
+                   f.file_path AS file_path,
+                   f.id AS id,
+                   in_degree,
+                   out_degree
+            ORDER BY out_degree DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut entry_points = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let file_path: String = row.get("file_path").unwrap_or_default();
+            let id: String = row.get("id").unwrap_or_default();
+            let in_degree: i64 = row.get("in_degree").unwrap_or(0);
+            let out_degree: i64 = row.get("out_degree").unwrap_or(0);
+            entry_points.push(serde_json::json!({
+                "name": name,
+                "file_path": file_path,
+                "id": id,
+                "in_degree": in_degree,
+                "out_degree": out_degree,
+            }));
+        }
+        Ok(entry_points)
+    }
+
+    // ========================================================================
     // Code exploration queries (encapsulated from handlers)
     // ========================================================================
 
