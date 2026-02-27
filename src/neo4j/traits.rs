@@ -1952,6 +1952,18 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Vec<(SkillNode, f64)>>;
 
     // ========================================================================
+    // Skill Detection — Graph Extraction
+    // ========================================================================
+
+    /// Extract the SYNAPSE graph for a project: all Note↔Note edges with weight > min_weight.
+    /// Returns Vec<(from_note_id, to_note_id, weight)>.
+    async fn get_synapse_graph(
+        &self,
+        project_id: Uuid,
+        min_weight: f64,
+    ) -> Result<Vec<(String, String, f64)>>;
+
+    // ========================================================================
     // Health check
     // ========================================================================
 

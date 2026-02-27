@@ -731,6 +731,46 @@ impl Neo4jClient {
 
         Ok(matches)
     }
+
+    // ========================================================================
+    // Skill Detection — Graph Extraction
+    // ========================================================================
+
+    /// Extract the SYNAPSE graph for a project.
+    ///
+    /// Returns all SYNAPSE edges between notes belonging to the given project,
+    /// filtered by minimum weight. Each edge is returned as (from_note_id, to_note_id, weight).
+    pub async fn get_synapse_graph(
+        &self,
+        project_id: Uuid,
+        min_weight: f64,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let q = query(
+            "MATCH (n1:Note)-[s:SYNAPSE]->(n2:Note)
+             WHERE n1.project_id = $project_id
+               AND n2.project_id = $project_id
+               AND s.weight > $min_weight
+             RETURN n1.id AS from_id, n2.id AS to_id, s.weight AS weight",
+        )
+        .param("project_id", project_id.to_string())
+        .param("min_weight", min_weight);
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("Failed to execute get_synapse_graph query")?;
+
+        let mut edges = Vec::new();
+        while let Some(row) = result.next().await? {
+            let from_id: String = row.get("from_id").unwrap_or_default();
+            let to_id: String = row.get("to_id").unwrap_or_default();
+            let weight: f64 = row.get("weight").unwrap_or(0.0);
+            edges.push((from_id, to_id, weight));
+        }
+
+        Ok(edges)
+    }
 }
 
 #[cfg(test)]

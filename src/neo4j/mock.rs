@@ -6957,6 +6957,15 @@ impl GraphStore for MockGraphStore {
             .map(|s| (s.clone(), 1.0))
             .collect())
     }
+
+    async fn get_synapse_graph(
+        &self,
+        _project_id: Uuid,
+        _min_weight: f64,
+    ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        // Mock: return empty synapse graph (no synapses in mock store)
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

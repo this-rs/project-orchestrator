@@ -2378,4 +2378,12 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
         self.match_skills_by_trigger(project_id, input).await
     }
+
+    async fn get_synapse_graph(
+        &self,
+        project_id: uuid::Uuid,
+        min_weight: f64,
+    ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        self.get_synapse_graph(project_id, min_weight).await
+    }
 }
