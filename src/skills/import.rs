@@ -754,9 +754,18 @@ mod tests {
 
     #[test]
     fn test_conflict_strategy_from_str() {
-        assert_eq!("skip".parse::<ConflictStrategy>().unwrap(), ConflictStrategy::Skip);
-        assert_eq!("merge".parse::<ConflictStrategy>().unwrap(), ConflictStrategy::Merge);
-        assert_eq!("replace".parse::<ConflictStrategy>().unwrap(), ConflictStrategy::Replace);
+        assert_eq!(
+            "skip".parse::<ConflictStrategy>().unwrap(),
+            ConflictStrategy::Skip
+        );
+        assert_eq!(
+            "merge".parse::<ConflictStrategy>().unwrap(),
+            ConflictStrategy::Merge
+        );
+        assert_eq!(
+            "replace".parse::<ConflictStrategy>().unwrap(),
+            ConflictStrategy::Replace
+        );
         assert!("invalid".parse::<ConflictStrategy>().is_err());
         assert!("SKIP".parse::<ConflictStrategy>().is_err()); // case-sensitive
     }

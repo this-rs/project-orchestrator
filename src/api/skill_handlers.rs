@@ -603,7 +603,9 @@ pub async fn import_skill(
 ) -> Result<(StatusCode, Json<ImportResult>), AppError> {
     // Parse conflict strategy (default: Skip)
     let strategy = match body.conflict_strategy.as_deref() {
-        Some(s) => s.parse::<ConflictStrategy>().map_err(AppError::BadRequest)?,
+        Some(s) => s
+            .parse::<ConflictStrategy>()
+            .map_err(AppError::BadRequest)?,
         None => ConflictStrategy::Skip,
     };
 

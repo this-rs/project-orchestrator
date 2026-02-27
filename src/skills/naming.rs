@@ -136,7 +136,11 @@ mod tests {
         existing.insert(base.clone());
         let deduped = generate_skill_name(&tags, 5, Some(&existing));
         assert_ne!(base, deduped);
-        assert!(deduped.ends_with("-5"), "Expected '-5' suffix in '{}'", deduped);
+        assert!(
+            deduped.ends_with("-5"),
+            "Expected '-5' suffix in '{}'",
+            deduped
+        );
     }
 
     #[test]
