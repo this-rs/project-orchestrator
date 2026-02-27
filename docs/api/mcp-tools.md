@@ -1,1835 +1,478 @@
-# MCP Tools Reference
+# MCP Mega-Tools Reference
 
-Complete documentation for all 145 MCP tools exposed by Project Orchestrator.
+Complete documentation for the **19 mega-tools** exposed by Project Orchestrator.
+
+---
+
+## How Mega-Tools Work
+
+Each mega-tool uses an **`action` parameter** to select the operation. This replaces the previous 145+ individual tools with a cleaner, consolidated interface.
+
+**Example call:**
+```json
+{
+  "tool": "project",
+  "arguments": {
+    "action": "sync",
+    "slug": "my-project"
+  }
+}
+```
 
 ---
 
 ## Quick Reference
 
-| Category | Count | Tools |
-|----------|-------|-------|
-| [Project Management](#project-management-8-tools) | 8 | `list_projects`, `create_project`, `get_project`, `update_project`, `delete_project`, `sync_project`, `get_project_roadmap`, `list_project_plans` |
-| [Plan Management](#plan-management-9-tools) | 9 | `list_plans`, `create_plan`, `get_plan`, `update_plan_status`, `link_plan_to_project`, `unlink_plan_from_project`, `get_dependency_graph`, `get_critical_path`, `delete_plan` |
-| [Task Management](#task-management-13-tools) | 13 | `list_tasks`, `create_task`, `get_task`, `update_task`, `delete_task`, `get_next_task`, `add_task_dependencies`, `remove_task_dependency`, `get_task_blockers`, `get_tasks_blocked_by`, `get_task_context`, `get_task_prompt`, `add_decision` |
-| [Step Management](#step-management-6-tools) | 6 | `list_steps`, `create_step`, `update_step`, `get_step`, `delete_step`, `get_step_progress` |
-| [Decision Management](#decision-management-4-tools) | 4 | `get_decision`, `update_decision`, `delete_decision`, `search_decisions` |
-| [Constraint Management](#constraint-management-5-tools) | 5 | `list_constraints`, `add_constraint`, `get_constraint`, `update_constraint`, `delete_constraint` |
-| [Commit Tracking](#commit-tracking-5-tools) | 5 | `create_commit`, `link_commit_to_task`, `link_commit_to_plan`, `get_task_commits`, `get_plan_commits` |
-| [Release Management](#release-management-7-tools) | 7 | `list_releases`, `create_release`, `get_release`, `update_release`, `delete_release`, `add_task_to_release`, `add_commit_to_release` |
-| [Milestone Management](#milestone-management-7-tools) | 7 | `list_milestones`, `create_milestone`, `get_milestone`, `update_milestone`, `delete_milestone`, `get_milestone_progress`, `add_task_to_milestone` |
-| [Code Exploration](#code-exploration-13-tools) | 13 | `search_code`, `search_project_code`, `search_workspace_code`, `get_file_symbols`, `find_references`, `get_file_dependencies`, `get_call_graph`, `analyze_impact`, `get_architecture`, `find_similar_code`, `find_trait_implementations`, `find_type_traits`, `get_impl_blocks` |
-| [Notes (Knowledge Base)](#notes-knowledge-base-17-tools) | 17 | `list_notes`, `create_note`, `get_note`, `update_note`, `delete_note`, `search_notes`, `confirm_note`, `invalidate_note`, `supersede_note`, `link_note_to_entity`, `unlink_note_from_entity`, `get_context_notes`, `get_propagated_notes`, `get_entity_notes`, `get_notes_needing_review`, `update_staleness_scores`, `list_project_notes` |
-| [Sync & Watch](#sync--watch-4-tools) | 4 | `sync_directory`, `start_watch`, `stop_watch`, `watch_status` |
-| [Workspace Management](#workspace-management-9-tools) | 9 | `list_workspaces`, `create_workspace`, `get_workspace`, `update_workspace`, `delete_workspace`, `get_workspace_overview`, `list_workspace_projects`, `add_project_to_workspace`, `remove_project_from_workspace` |
-| [Workspace Milestones](#workspace-milestones-8-tools) | 8 | `list_all_workspace_milestones`, `list_workspace_milestones`, `create_workspace_milestone`, `get_workspace_milestone`, `update_workspace_milestone`, `delete_workspace_milestone`, `add_task_to_workspace_milestone`, `get_workspace_milestone_progress` |
-| [Resources](#resources-6-tools) | 6 | `list_resources`, `create_resource`, `get_resource`, `update_resource`, `delete_resource`, `link_resource_to_project` |
-| [Components & Topology](#components--topology-9-tools) | 9 | `list_components`, `create_component`, `get_component`, `update_component`, `delete_component`, `add_component_dependency`, `remove_component_dependency`, `map_component_to_project`, `get_workspace_topology` |
-| [Chat](#chat-5-tools) | 5 | `list_chat_sessions`, `get_chat_session`, `delete_chat_session`, `list_chat_messages`, `chat_send_message` |
-| [Meilisearch Maintenance](#meilisearch-maintenance-2-tools) | 2 | `get_meilisearch_stats`, `delete_meilisearch_orphans` |
+| Mega-Tool | Actions | Description |
+|-----------|---------|-------------|
+| [`project`](#project) | 8 | Project CRUD, sync, roadmap |
+| [`plan`](#plan) | 10 | Plan lifecycle, dependency graph, critical path |
+| [`task`](#task) | 13 | Task CRUD, dependencies, blockers, context |
+| [`step`](#step) | 6 | Step CRUD, progress tracking |
+| [`decision`](#decision) | 12 | Decisions, semantic search, affects tracking |
+| [`constraint`](#constraint) | 5 | Plan constraints |
+| [`release`](#release) | 8 | Release management |
+| [`milestone`](#milestone) | 9 | Milestones with progress |
+| [`commit`](#commit) | 7 | Git commit tracking, file history |
+| [`note`](#note) | 20 | Knowledge notes, semantic search, propagation |
+| [`workspace`](#workspace) | 10 | Multi-project workspaces |
+| [`workspace_milestone`](#workspace_milestone) | 10 | Cross-project milestones |
+| [`resource`](#resource) | 6 | Shared API contracts, schemas |
+| [`component`](#component) | 8 | Service topology and dependencies |
+| [`chat`](#chat) | 7 | Chat sessions, messages, delegation |
+| [`feature_graph`](#feature_graph) | 6 | Feature graphs, auto-build |
+| [`code`](#code) | 30 | Code search, analysis, health, processes |
+| [`admin`](#admin) | 23 | Sync, watch, Knowledge Fabric, maintenance |
+| [`skill`](#skill) | 12 | Neural skills detection, activation |
+
+---
+
+## project
+
+Manage projects (codebases tracked by the orchestrator).
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List all projects | `search`, `limit`, `offset`, `sort_by`, `sort_order` |
+| `create` | Register a new project | `name`, `root_path`, `description` |
+| `get` | Get project by slug | `slug` |
+| `update` | Update project details | `slug`, `name`, `description`, `root_path` |
+| `delete` | Delete project and all data | `slug` |
+| `sync` | Parse and index codebase | `slug` |
+| `get_roadmap` | Aggregated roadmap view | `slug` |
+| `list_plans` | List plans for a project | `slug` |
 
 ---
 
-## Project Management (8 tools)
+## plan
+
+Manage development plans with tasks and constraints.
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List plans with filters | `project_id`, `search`, `status`, `priority_min`, `priority_max`, `limit`, `offset` |
+| `create` | Create a new plan | `title`, `description`, `priority`, `project_id` |
+| `get` | Get plan with tasks and constraints | `plan_id` |
+| `update_status` | Update plan status | `plan_id`, `status` (draft/approved/in_progress/completed/cancelled) |
+| `delete` | Delete plan and all data | `plan_id` |
+| `link_to_project` | Associate plan with project | `plan_id`, `project_id` |
+| `unlink_from_project` | Dissociate from project | `plan_id`, `project_id` |
+| `get_dependency_graph` | Task dependency DAG | `plan_id` |
+| `get_critical_path` | Longest dependency chain | `plan_id` |
+| `list_plans` | List all plans | (same as `list`) |
 
-### list_projects
-
-List all projects with optional search and pagination.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `search` | string | No | Search in name/description |
-| `limit` | integer | No | Max items (default 50, max 100) |
-| `offset` | integer | No | Items to skip |
-| `sort_by` | string | No | `name` or `created_at` |
-| `sort_order` | string | No | `asc` or `desc` |
-
----
-
-### create_project
-
-Create a new project to track a codebase.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `name` | string | **Yes** | Project name |
-| `root_path` | string | **Yes** | Path to codebase root |
-| `slug` | string | No | URL-safe identifier (auto-generated) |
-| `description` | string | No | Project description |
-
----
-
-### get_project
-
-Get project details by slug.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Project slug |
-
----
-
-### update_project
-
-Update a project's name, description, or root_path.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Project slug |
-| `name` | string | No | New project name |
-| `description` | string | No | New description |
-| `root_path` | string | No | New root path |
-
----
-
-### delete_project
-
-Delete a project and all associated data.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Project slug |
-
----
-
-### sync_project
-
-Sync a project's codebase (parse files, update graph).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Project slug |
-
----
-
-### get_project_roadmap
-
-Get aggregated roadmap view with milestones, releases, and progress.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | **Yes** | Project UUID |
-
----
-
-### list_project_plans
-
-List all plans for a specific project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_slug` | string | **Yes** | Project slug |
-| `status` | string | No | Filter by status |
-| `limit` | integer | No | Max items |
-| `offset` | integer | No | Items to skip |
-
----
-
-## Plan Management (9 tools)
-
-### list_plans
-
-List plans with optional filters and pagination.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | No | Filter by project UUID |
-| `status` | string | No | Comma-separated: `draft,approved,in_progress,completed,cancelled` |
-| `priority_min` | integer | No | Minimum priority |
-| `priority_max` | integer | No | Maximum priority |
-| `search` | string | No | Search in title/description |
-| `limit` | integer | No | Max items (default 50) |
-| `offset` | integer | No | Items to skip |
-| `sort_by` | string | No | `created_at`, `priority`, or `title` |
-| `sort_order` | string | No | `asc` or `desc` |
-
----
-
-### create_plan
-
-Create a new development plan.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `title` | string | **Yes** | Plan title |
-| `description` | string | **Yes** | Plan description |
-| `priority` | integer | No | Priority (higher = more important) |
-| `project_id` | string | No | Optional project UUID to link |
-
----
-
-### get_plan
-
-Get plan details including tasks, constraints, and decisions.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-
----
-
-### update_plan_status
-
-Update a plan's status.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-| `status` | string | **Yes** | `draft`, `approved`, `in_progress`, `completed`, `cancelled` |
-
----
-
-### link_plan_to_project
-
-Link a plan to a project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-| `project_id` | string | **Yes** | Project UUID |
-
----
-
-### unlink_plan_from_project
-
-Unlink a plan from its project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-
----
-
-### get_dependency_graph
-
-Get the task dependency graph for a plan.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-
-**Returns:** Graph with nodes (tasks) and edges (dependencies).
-
----
-
-### get_critical_path
-
-Get the critical path (longest dependency chain) for a plan.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-
-**Returns:** Ordered list of tasks in the critical path.
-
----
-
-### delete_plan
-
-Delete a plan and all its related data (tasks, steps, decisions, constraints).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-
----
-
-## Task Management (13 tools)
-
-### list_tasks
-
-List all tasks across plans with filters.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | No | Filter by plan UUID |
-| `status` | string | No | Comma-separated: `pending,in_progress,blocked,completed,failed` |
-| `priority_min` | integer | No | Minimum priority |
-| `priority_max` | integer | No | Maximum priority |
-| `tags` | string | No | Comma-separated tags |
-| `assigned_to` | string | No | Filter by assignee |
-| `limit` | integer | No | Max items (default 50) |
-| `offset` | integer | No | Items to skip |
-| `sort_by` | string | No | Sort field |
-| `sort_order` | string | No | `asc` or `desc` |
-
----
-
-### create_task
-
-Add a new task to a plan.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-| `description` | string | **Yes** | Task description |
-| `title` | string | No | Short title |
-| `priority` | integer | No | Priority (higher = more important) |
-| `tags` | array | No | Tags for categorization |
-| `acceptance_criteria` | array | No | Conditions for completion |
-| `affected_files` | array | No | Files to be modified |
-| `dependencies` | array | No | Task UUIDs this depends on |
-
----
-
-### get_task
-
-Get task details including steps and decisions.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-
----
-
-### update_task
-
-Update a task's status, assignee, or other fields.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-| `status` | string | No | `pending`, `in_progress`, `blocked`, `completed`, `failed` |
-| `assigned_to` | string | No | Assignee name |
-| `priority` | integer | No | New priority |
-| `tags` | array | No | New tags |
-
----
-
-### delete_task
-
-Delete a task and all its steps and decisions.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-
----
-
-### get_next_task
-
-Get the next available task from a plan (unblocked, highest priority).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-
----
-
-### add_task_dependencies
-
-Add dependencies to a task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-| `dependency_ids` | array | **Yes** | Task UUIDs to depend on |
-
----
-
-### remove_task_dependency
-
-Remove a dependency from a task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-| `dependency_id` | string | **Yes** | Dependency task UUID to remove |
-
----
-
-### get_task_blockers
-
-Get tasks that are blocking this task (uncompleted dependencies).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-
----
-
-### get_tasks_blocked_by
-
-Get tasks that are blocked by this task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-
----
-
-### get_task_context
-
-Get full context for a task (for agent execution).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-| `task_id` | string | **Yes** | Task UUID |
-
-**Returns:** Rich context including plan, constraints, related code, and decisions.
-
----
-
-### get_task_prompt
-
-Get generated prompt for a task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-| `task_id` | string | **Yes** | Task UUID |
-
-**Returns:** Ready-to-use prompt with all context embedded.
-
----
-
-### add_decision
-
-Record an architectural decision for a task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-| `description` | string | **Yes** | Decision description |
-| `rationale` | string | **Yes** | Why this decision was made |
-| `alternatives` | array | No | Alternatives considered |
-| `chosen_option` | string | No | The chosen option |
-
----
-
-## Step Management (6 tools)
-
-### list_steps
-
-List all steps for a task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-
----
-
-### create_step
-
-Add a step to a task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-| `description` | string | **Yes** | Step description |
-| `verification` | string | No | How to verify completion |
-
----
-
-### update_step
-
-Update a step's status.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `step_id` | string | **Yes** | Step UUID |
-| `status` | string | **Yes** | `pending`, `in_progress`, `completed`, `skipped` |
-
----
-
-### get_step
-
-Get a step by ID.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `step_id` | string | **Yes** | Step UUID |
-
----
-
-### delete_step
-
-Delete a step.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `step_id` | string | **Yes** | Step UUID |
-
----
-
-### get_step_progress
-
-Get step completion progress for a task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-
-**Returns:** `{completed: N, total: M, percentage: X}`
-
----
-
-## Decision Management (4 tools)
-
-### get_decision
-
-Get a decision by ID.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `decision_id` | string | **Yes** | Decision UUID |
-
----
-
-### update_decision
-
-Update a decision's description, rationale, or chosen_option.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `decision_id` | string | **Yes** | Decision UUID |
-| `description` | string | No | New description |
-| `rationale` | string | No | New rationale |
-| `chosen_option` | string | No | New chosen option |
-
----
-
-### delete_decision
-
-Delete a decision.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `decision_id` | string | **Yes** | Decision UUID |
-
----
-
-### search_decisions
-
-Search architectural decisions.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `query` | string | **Yes** | Search query |
-| `limit` | integer | No | Max results |
-| `project_slug` | string | No | Filter by project slug |
-
----
-
-## Constraint Management (5 tools)
-
-### list_constraints
-
-List constraints for a plan.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-
----
-
-### add_constraint
-
-Add a constraint to a plan.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-| `constraint_type` | string | **Yes** | `performance`, `security`, `style`, `compatibility`, `other` |
-| `description` | string | **Yes** | Constraint description |
-| `severity` | string | No | `low`, `medium`, `high`, `critical` |
-
----
-
-### get_constraint
-
-Get a constraint by ID.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `constraint_id` | string | **Yes** | Constraint UUID |
-
----
-
-### update_constraint
-
-Update a constraint's description, type, or enforced_by.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `constraint_id` | string | **Yes** | Constraint UUID |
-| `description` | string | No | New description |
-| `constraint_type` | string | No | New type: `performance`, `security`, `style`, `compatibility`, `other` |
-| `enforced_by` | string | No | New enforced_by |
-
----
-
-### delete_constraint
-
-Delete a constraint.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `constraint_id` | string | **Yes** | Constraint UUID |
-
----
-
-## Commit Tracking (5 tools)
-
-### create_commit
-
-Register a git commit.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `sha` | string | **Yes** | Commit SHA |
-| `message` | string | **Yes** | Commit message |
-| `author` | string | No | Author name |
-| `files_changed` | array | No | Files changed |
-| `project_id` | string | No | Project UUID -- enables incremental sync of changed files |
-
----
-
-### link_commit_to_task
-
-Link a commit to a task (RESOLVED_BY relationship).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-| `commit_sha` | string | **Yes** | Commit SHA |
-
----
-
-### link_commit_to_plan
-
-Link a commit to a plan (RESULTED_IN relationship).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-| `commit_sha` | string | **Yes** | Commit SHA |
-
----
-
-### get_task_commits
-
-Get commits linked to a task.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `task_id` | string | **Yes** | Task UUID |
-
----
-
-### get_plan_commits
-
-Get commits linked to a plan.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `plan_id` | string | **Yes** | Plan UUID |
-
----
-
-## Release Management (7 tools)
-
-### list_releases
-
-List releases for a project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | **Yes** | Project UUID |
-| `status` | string | No | Filter by status |
-| `limit` | integer | No | Max items |
-| `offset` | integer | No | Items to skip |
-
----
-
-### create_release
-
-Create a new release for a project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | **Yes** | Project UUID |
-| `version` | string | **Yes** | Version string (e.g., 1.0.0) |
-| `title` | string | No | Release title |
-| `description` | string | No | Release notes |
-| `target_date` | string | No | Target date (ISO 8601) |
-
----
-
-### get_release
-
-Get release details with tasks and commits.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `release_id` | string | **Yes** | Release UUID |
-
----
-
-### update_release
-
-Update a release.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `release_id` | string | **Yes** | Release UUID |
-| `status` | string | No | `planned`, `in_progress`, `released`, `cancelled` |
-| `target_date` | string | No | New target date |
-| `released_at` | string | No | Actual release date |
-| `title` | string | No | New title |
-| `description` | string | No | New description |
-
----
-
-### delete_release
-
-Delete a release.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `release_id` | string | **Yes** | Release UUID |
-
----
-
-### add_task_to_release
-
-Add a task to a release.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `release_id` | string | **Yes** | Release UUID |
-| `task_id` | string | **Yes** | Task UUID |
-
----
-
-### add_commit_to_release
-
-Add a commit to a release.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `release_id` | string | **Yes** | Release UUID |
-| `commit_sha` | string | **Yes** | Commit SHA |
-
----
-
-## Milestone Management (7 tools)
-
-### list_milestones
-
-List milestones for a project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | **Yes** | Project UUID |
-| `status` | string | No | `planned`, `open`, `in_progress`, `completed`, `closed` |
-| `limit` | integer | No | Max items |
-| `offset` | integer | No | Items to skip |
-
----
-
-### create_milestone
-
-Create a new milestone for a project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | **Yes** | Project UUID |
-| `title` | string | **Yes** | Milestone title |
-| `description` | string | No | Milestone description |
-| `target_date` | string | No | Target date (ISO 8601) |
-
----
-
-### get_milestone
-
-Get milestone details with tasks.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `milestone_id` | string | **Yes** | Milestone UUID |
-
----
-
-### update_milestone
-
-Update a milestone.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `milestone_id` | string | **Yes** | Milestone UUID |
-| `status` | string | No | `planned`, `open`, `in_progress`, `completed`, `closed` |
-| `target_date` | string | No | New target date |
-| `closed_at` | string | No | Closure date |
-| `title` | string | No | New title |
-| `description` | string | No | New description |
-
----
-
-### delete_milestone
-
-Delete a milestone.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `milestone_id` | string | **Yes** | Milestone UUID |
-
----
-
-### get_milestone_progress
-
-Get milestone completion progress.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `milestone_id` | string | **Yes** | Milestone UUID |
-
-**Returns:** `{completed: N, total: M, percentage: X}`
-
----
-
-### add_task_to_milestone
-
-Add a task to a milestone.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `milestone_id` | string | **Yes** | Milestone UUID |
-| `task_id` | string | **Yes** | Task UUID |
-
----
-
-## Code Exploration (13 tools)
-
-### search_code
-
-Search code semantically across all projects.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `query` | string | **Yes** | Search query |
-| `limit` | integer | No | Max results (default 10) |
-| `language` | string | No | Filter by language |
-| `project_slug` | string | No | Filter by project slug |
-| `path_prefix` | string | No | Filter by path prefix (e.g. `src/mcp/`) |
-
----
-
-### search_project_code
-
-Search code within a specific project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_slug` | string | **Yes** | Project slug |
-| `query` | string | **Yes** | Search query |
-| `limit` | integer | No | Max results |
-| `language` | string | No | Filter by language |
-| `path_prefix` | string | No | Filter by path prefix (e.g. `src/mcp/`) |
-
----
-
-### search_workspace_code
-
-Search code across all projects in a workspace.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `workspace_slug` | string | **Yes** | Workspace slug |
-| `query` | string | **Yes** | Search query |
-| `language` | string | No | Filter by language |
-| `limit` | integer | No | Max results (default 10) |
-| `path_prefix` | string | No | Filter by path prefix (e.g. `src/mcp/`) |
-
----
-
-### get_file_symbols
-
-Get all symbols (functions, structs, traits) in a file.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `file_path` | string | **Yes** | File path |
-
----
-
-### find_references
-
-Find all references to a symbol.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `symbol` | string | **Yes** | Symbol name |
-| `limit` | integer | No | Max results |
-
----
-
-### get_file_dependencies
-
-Get file imports and files that depend on it.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `file_path` | string | **Yes** | File path |
-
----
-
-### get_call_graph
-
-Get the call graph for a function.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `function` | string | **Yes** | Function name |
-| `limit` | integer | No | Max depth/results |
-
----
-
-### analyze_impact
-
-Analyze the impact of changing a file or symbol.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `target` | string | **Yes** | File path or symbol name |
-
-**Returns:** Directly affected, transitively affected, test files, risk level.
-
----
-
-### get_architecture
-
-Get codebase architecture overview (most connected files).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_slug` | string | No | Filter by project slug |
-
----
-
-### find_similar_code
-
-Find code similar to a given snippet.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `code_snippet` | string | **Yes** | Code to find similar matches for |
-| `limit` | integer | No | Max results |
-| `language` | string | No | Filter by language |
-| `project_slug` | string | No | Filter by project slug |
-
----
-
-### find_trait_implementations
-
-Find all implementations of a trait.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `trait_name` | string | **Yes** | Trait name |
-| `limit` | integer | No | Max results |
-
----
-
-### find_type_traits
-
-Find all traits implemented by a type.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `type_name` | string | **Yes** | Type name (struct/enum) |
-| `limit` | integer | No | Max results |
-
----
-
-### get_impl_blocks
-
-Get all impl blocks for a type.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `type_name` | string | **Yes** | Type name (struct/enum) |
-| `limit` | integer | No | Max results |
-
----
-
-## Notes (Knowledge Base) (17 tools)
-
-Knowledge Notes capture contextual knowledge about your codebase -- guidelines, gotchas, patterns, and tips that propagate through the code graph.
-
-See the [Knowledge Notes Guide](../guides/knowledge-notes.md) for detailed usage instructions.
-
-### list_notes
-
-List notes with optional filters and pagination.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | No | Filter by project UUID |
-| `note_type` | string | No | Filter by type: `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion` |
-| `status` | string | No | Comma-separated: `active,needs_review,stale,obsolete,archived` |
-| `importance` | string | No | `critical`, `high`, `medium`, `low` |
-| `tags` | string | No | Comma-separated tags |
-| `min_staleness` | number | No | Minimum staleness score (0.0-1.0) |
-| `max_staleness` | number | No | Maximum staleness score (0.0-1.0) |
-| `search` | string | No | Search in content |
-| `limit` | integer | No | Max items (default 50) |
-| `offset` | integer | No | Items to skip |
-
----
-
-### create_note
-
-Create a new knowledge note.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | **Yes** | Project UUID |
-| `note_type` | string | **Yes** | `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion` |
-| `content` | string | **Yes** | Note content |
-| `importance` | string | No | `critical`, `high`, `medium`, `low` (default: medium) |
-| `tags` | array | No | Tags for categorization |
-| `scope` | object | No | Scope: `{type: "file", path: "src/auth.rs"}` |
-| `anchors` | array | No | Initial anchors to code entities |
-
----
-
-### get_note
-
-Get a note by ID.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `note_id` | string | **Yes** | Note UUID |
-
----
-
-### update_note
-
-Update a note's content, importance, status, or tags.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `note_id` | string | **Yes** | Note UUID |
-| `content` | string | No | New content |
-| `importance` | string | No | New importance level |
-| `status` | string | No | New status |
-| `tags` | array | No | New tags |
-
----
-
-### delete_note
-
-Delete a note.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `note_id` | string | **Yes** | Note UUID |
-
----
-
-### search_notes
-
-Search notes using semantic search.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `query` | string | **Yes** | Search query |
-| `project_slug` | string | No | Filter by project slug |
-| `note_type` | string | No | Filter by note type |
-| `status` | string | No | Filter by status |
-| `importance` | string | No | Filter by importance |
-| `limit` | integer | No | Max results (default 20) |
-
----
-
-### confirm_note
-
-Confirm a note is still valid (resets staleness score).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `note_id` | string | **Yes** | Note UUID |
-
----
-
-### invalidate_note
-
-Mark a note as obsolete with a reason.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `note_id` | string | **Yes** | Note UUID |
-| `reason` | string | **Yes** | Reason for invalidation |
-
----
-
-### supersede_note
-
-Replace an old note with a new one (preserves history).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `old_note_id` | string | **Yes** | ID of note to supersede |
-| `project_id` | string | **Yes** | Project UUID |
-| `note_type` | string | **Yes** | Type of new note |
-| `content` | string | **Yes** | Content of new note |
-| `importance` | string | No | Importance of new note |
-| `tags` | array | No | Tags for new note |
-
----
-
-### link_note_to_entity
-
-Link a note to a code entity (file, function, struct, etc.).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `note_id` | string | **Yes** | Note UUID |
-| `entity_type` | string | **Yes** | `file`, `function`, `struct`, `trait`, `task`, `plan`, etc. |
-| `entity_id` | string | **Yes** | Entity ID (file path or UUID) |
-
----
-
-### unlink_note_from_entity
-
-Remove a link between a note and an entity.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `note_id` | string | **Yes** | Note UUID |
-| `entity_type` | string | **Yes** | Entity type |
-| `entity_id` | string | **Yes** | Entity ID |
-
----
-
-### get_context_notes
-
-Get contextual notes for an entity (direct + propagated through graph).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `entity_type` | string | **Yes** | `file`, `function`, `struct`, `task`, etc. |
-| `entity_id` | string | **Yes** | Entity ID |
-| `max_depth` | integer | No | Max traversal depth (default 3) |
-| `min_score` | number | No | Min relevance score (default 0.1) |
-
-**Returns:** Direct notes and propagated notes with relevance scores.
-
----
-
-### get_propagated_notes
-
-Get notes propagated through the graph (not directly attached).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `entity_type` | string | **Yes** | `file`, `function`, `struct`, `task`, etc. |
-| `entity_id` | string | **Yes** | Entity ID |
-| `max_depth` | integer | No | Max traversal depth (default 3) |
-| `min_score` | number | No | Min relevance score (default 0.1) |
-
----
-
-### get_entity_notes
-
-Get notes directly attached to an entity.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `entity_type` | string | **Yes** | `file`, `function`, `struct`, `trait`, `task`, `plan`, etc. |
-| `entity_id` | string | **Yes** | Entity ID (file path or UUID) |
-
----
-
-### get_notes_needing_review
-
-Get notes that need human review (stale or needs_review status).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | No | Optional project UUID filter |
-
----
-
-### update_staleness_scores
-
-Update staleness scores for all notes based on time decay.
-
-**Parameters:** None
-
----
-
-### list_project_notes
-
-List notes for a specific project.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_id` | string | **Yes** | Project UUID |
-| `note_type` | string | No | Filter by type |
-| `status` | string | No | Filter by status |
-| `importance` | string | No | Filter by importance |
-| `limit` | integer | No | Max items (default 50) |
-| `offset` | integer | No | Items to skip |
-
----
-
-## Sync & Watch (4 tools)
-
-### sync_directory
-
-Manually sync a directory to the knowledge graph.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `path` | string | **Yes** | Directory path |
-| `project_id` | string | No | Optional project UUID |
-
----
-
-### start_watch
-
-Start auto-sync file watcher.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `path` | string | **Yes** | Directory to watch |
-| `project_id` | string | No | Optional project UUID |
-
----
-
-### stop_watch
-
-Stop the file watcher.
-
-**Parameters:** None
-
----
-
-### watch_status
-
-Get file watcher status.
-
-**Parameters:** None
-
----
-
-## Workspace Management (9 tools)
-
-Workspaces group related projects together, enabling shared context, cross-project milestones, and deployment topology modeling.
-
-See the [Workspaces Guide](../guides/workspaces.md) for detailed usage instructions.
-
-### list_workspaces
-
-List all workspaces with optional search and pagination.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `search` | string | No | Search in name/description |
-| `limit` | integer | No | Max items (default 50, max 100) |
-| `offset` | integer | No | Items to skip |
-| `sort_by` | string | No | `name` or `created_at` |
-| `sort_order` | string | No | `asc` or `desc` |
-
----
-
-### create_workspace
-
-Create a new workspace to group related projects.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `name` | string | **Yes** | Workspace name |
-| `slug` | string | No | URL-safe identifier (auto-generated) |
-| `description` | string | No | Workspace description |
-| `metadata` | object | No | Optional metadata |
-
----
-
-### get_workspace
-
-Get workspace details by slug.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-
----
-
-### update_workspace
-
-Update a workspace's name, description, or metadata.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `name` | string | No | New name |
-| `description` | string | No | New description |
-| `metadata` | object | No | New metadata |
-
----
-
-### delete_workspace
-
-Delete a workspace (does not delete associated projects).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-
----
-
-### get_workspace_overview
-
-Get workspace overview with projects, milestones, resources, and progress.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-
-**Returns:** Projects, milestones, resources, components, and progress stats.
-
----
-
-### list_workspace_projects
-
-List all projects in a workspace.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-
----
-
-### add_project_to_workspace
-
-Add an existing project to a workspace.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `project_id` | string | **Yes** | Project UUID to add |
-
----
-
-### remove_project_from_workspace
-
-Remove a project from a workspace (does not delete the project).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `project_id` | string | **Yes** | Project UUID to remove |
-
----
-
-## Workspace Milestones (8 tools)
-
-Workspace milestones coordinate tasks across multiple projects within a workspace.
-
-### list_all_workspace_milestones
-
-List all workspace milestones across all workspaces with optional filters and pagination.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `workspace_id` | string | No | Filter by workspace UUID |
-| `status` | string | No | `planned`, `open`, `in_progress`, `completed`, `closed` |
-| `limit` | integer | No | Max items (default 50) |
-| `offset` | integer | No | Items to skip |
-
----
-
-### list_workspace_milestones
-
-List milestones for a workspace (cross-project milestones).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `status` | string | No | `planned`, `open`, `in_progress`, `completed`, `closed` |
-| `limit` | integer | No | Max items |
-| `offset` | integer | No | Items to skip |
-
----
-
-### create_workspace_milestone
-
-Create a cross-project milestone in a workspace.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `title` | string | **Yes** | Milestone title |
-| `description` | string | No | Milestone description |
-| `target_date` | string | No | Target date (ISO 8601) |
-| `tags` | array | No | Tags for categorization |
-
----
-
-### get_workspace_milestone
-
-Get workspace milestone details with linked tasks.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Workspace milestone UUID |
-
 ---
-
-### update_workspace_milestone
-
-Update a workspace milestone.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Workspace milestone UUID |
-| `title` | string | No | New title |
-| `description` | string | No | New description |
-| `status` | string | No | `planned`, `open`, `in_progress`, `completed`, `closed` |
-| `target_date` | string | No | New target date |
-| `closed_at` | string | No | Closure date |
+## task
+
+Manage tasks within plans.
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List tasks with filters | `plan_id`, `search`, `status`, `tags`, `assigned_to`, `limit`, `offset` |
+| `create` | Create a task | `plan_id`, `title`, `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` |
+| `get` | Get task details | `task_id` |
+| `update` | Update task fields | `task_id`, `status`, `assigned_to`, `priority`, `tags` |
+| `delete` | Delete task | `task_id` |
+| `get_next` | Next unblocked task (highest priority) | `plan_id` |
+| `add_dependencies` | Add task dependencies | `task_id`, `dependency_ids` |
+| `remove_dependency` | Remove a dependency | `task_id`, `depends_on_task_id` |
+| `get_blockers` | Tasks blocking this one | `task_id` |
+| `get_blocked_by` | Tasks blocked by this one | `task_id` |
+| `get_context` | Full context for agent work | `plan_id`, `task_id` |
+| `get_prompt` | Generated agent prompt | `plan_id`, `task_id` |
 
 ---
 
-### delete_workspace_milestone
+## step
 
-Delete a workspace milestone.
+Manage steps (sub-tasks) within tasks.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Workspace milestone UUID |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List steps for a task | `task_id` |
+| `create` | Add step to task | `task_id`, `description`, `verification` |
+| `update` | Update step status | `step_id`, `status` (pending/in_progress/completed/skipped) |
+| `get` | Get step by ID | `step_id` |
+| `delete` | Delete step | `step_id` |
+| `get_progress` | Step completion progress | `task_id` |
 
 ---
 
-### add_task_to_workspace_milestone
+## decision
 
-Add a task from any project to a workspace milestone.
+Manage architectural decisions with semantic search and impact tracking.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Workspace milestone UUID |
-| `task_id` | string | **Yes** | Task UUID (from any project) |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `add` | Record a decision | `task_id`, `description`, `rationale`, `alternatives`, `chosen_option` |
+| `get` | Get decision by ID | `decision_id` |
+| `update` | Update decision | `decision_id`, `description`, `chosen_option`, `status` |
+| `delete` | Delete decision | `decision_id` |
+| `search` | BM25 keyword search | `query` |
+| `search_semantic` | Vector similarity search | `query`, `project_id` |
+| `add_affects` | Link decision to impacted entity | `decision_id`, `entity_type`, `entity_id`, `impact_description` |
+| `remove_affects` | Remove impact link | `decision_id`, `entity_type`, `entity_id` |
+| `list_affects` | List impacted entities | `decision_id` |
+| `get_affecting` | Decisions affecting an entity | `entity_type`, `entity_id` |
+| `supersede` | Replace with new decision | `decision_id`, `superseded_by_id` |
+| `get_timeline` | Decision timeline | `task_id`, `from`, `to` |
 
 ---
 
-### get_workspace_milestone_progress
+## constraint
 
-Get completion progress for a workspace milestone.
+Manage plan constraints.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Workspace milestone UUID |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List constraints for a plan | `plan_id` |
+| `add` | Add constraint | `plan_id`, `constraint_type` (performance/security/style/compatibility/other), `description`, `severity` (must/should/nice_to_have) |
+| `get` | Get constraint by ID | `constraint_id` |
+| `update` | Update constraint | `constraint_id`, `description`, `constraint_type`, `enforced_by` |
+| `delete` | Delete constraint | `constraint_id` |
 
-**Returns:** `{total: N, completed: M, in_progress: P, pending: Q, by_project: {...}}`
-
 ---
-
-## Resources (6 tools)
-
-Resources are shared contracts, schemas, or specifications referenced by multiple projects.
-
-### list_resources
 
-List resources (API contracts, schemas) in a workspace.
+## release
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `resource_type` | string | No | Filter by type: `ApiContract`, `Protobuf`, `GraphqlSchema`, `JsonSchema`, `DatabaseSchema`, `SharedTypes`, `Config`, `Documentation`, `Other` |
-| `limit` | integer | No | Max items |
-| `offset` | integer | No | Items to skip |
+Manage releases with tasks and commits.
 
----
-
-### create_resource
-
-Create a shared resource reference (API contract, schema file).
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `name` | string | **Yes** | Resource name |
-| `resource_type` | string | **Yes** | `ApiContract`, `Protobuf`, `GraphqlSchema`, `JsonSchema`, `DatabaseSchema`, `SharedTypes`, `Config`, `Documentation`, `Other` |
-| `file_path` | string | **Yes** | Path to the resource file |
-| `url` | string | No | External URL |
-| `format` | string | No | Format: `openapi`, `protobuf`, `graphql` |
-| `version` | string | No | Version string |
-| `description` | string | No | Resource description |
-| `metadata` | object | No | Additional metadata |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List project releases | `project_id` |
+| `create` | Create release | `project_id`, `version`, `title`, `description`, `target_date` |
+| `get` | Get release with tasks/commits | `release_id` |
+| `update` | Update release | `release_id`, `status` (planned/in_progress/released/cancelled), `title`, `description`, `target_date` |
+| `delete` | Delete release | `release_id` |
+| `add_task` | Add task to release | `release_id`, `task_id` |
+| `add_commit` | Add commit to release | `release_id`, `commit_sha` |
+| `remove_commit` | Remove commit from release | `release_id`, `commit_sha` |
 
 ---
 
-### get_resource
+## milestone
 
-Get resource details.
+Manage project milestones.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Resource UUID |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List project milestones | `project_id` |
+| `create` | Create milestone | `project_id`, `title`, `description`, `target_date` |
+| `get` | Get milestone with tasks | `milestone_id`, `include_tasks` |
+| `update` | Update milestone | `milestone_id`, `title`, `status`, `target_date` |
+| `delete` | Delete milestone | `milestone_id` |
+| `get_progress` | Completion percentage | `milestone_id` |
+| `add_task` | Add task to milestone | `milestone_id`, `task_id` |
+| `link_plan` | Link plan to milestone | `milestone_id`, `plan_id` |
+| `unlink_plan` | Unlink plan from milestone | `milestone_id`, `plan_id` |
 
 ---
 
-### update_resource
+## commit
 
-Update a resource's name, file_path, url, version, or description.
+Track git commits and link to tasks/plans.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Resource UUID |
-| `name` | string | No | New name |
-| `file_path` | string | No | New file path |
-| `url` | string | No | New URL |
-| `version` | string | No | New version |
-| `description` | string | No | New description |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `create` | Register a commit | `sha`, `message`, `author`, `files_changed`, `project_id` |
+| `link_to_task` | Link commit → task | `task_id`, `commit_sha` |
+| `link_to_plan` | Link commit → plan | `plan_id`, `commit_sha` |
+| `get_task_commits` | Commits for a task | `task_id` |
+| `get_plan_commits` | Commits for a plan | `plan_id` |
+| `get_commit_files` | Files changed in commit | `sha` |
+| `get_file_history` | Commit history for a file | `file_path`, `limit` |
 
 ---
 
-### delete_resource
+## note
 
-Delete a resource.
+Manage knowledge notes with semantic search and graph propagation.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Resource UUID |
-
----
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List notes with filters | `project_id`, `status`, `note_type`, `importance`, `limit`, `offset` |
+| `create` | Create a note | `project_id`, `note_type`, `content`, `importance`, `tags` |
+| `get` | Get note by ID | `note_id` |
+| `update` | Update note | `note_id`, `content`, `importance`, `status`, `tags` |
+| `delete` | Delete note | `note_id` |
+| `search` | BM25 keyword search | `query` |
+| `search_semantic` | Vector similarity search | `query`, `project_id` |
+| `confirm` | Confirm note validity (reset staleness) | `note_id` |
+| `invalidate` | Mark note as obsolete | `note_id` |
+| `supersede` | Replace with new note | `note_id`, `superseded_by_id` |
+| `link_to_entity` | Link note to entity | `note_id`, `entity_type`, `entity_id` |
+| `unlink_from_entity` | Remove link | `note_id`, `entity_type`, `entity_id` |
+| `get_context` | Contextual notes for entity | `entity_type`, `entity_id` |
+| `get_needing_review` | Stale/needs_review notes | — |
+| `list_project` | Notes for a project | `slug` |
+| `get_propagated` | Notes propagated via graph | `slug`, `file_path` |
+| `get_entity` | Notes directly on entity | `entity_type`, `entity_id` |
+| `get_context_knowledge` | Context knowledge | `entity_type`, `entity_id` |
+| `get_propagated_knowledge` | Propagated knowledge | `entity_type`, `entity_id` |
 
-### link_resource_to_project
+**Note Types:** `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion`
 
-Link a resource to a project (implements or uses).
+**Note Status:** `active`, `needs_review`, `stale`, `obsolete`, `archived`
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Resource UUID |
-| `project_id` | string | **Yes** | Project UUID |
-| `link_type` | string | **Yes** | `implements` or `uses` |
+**Importance Levels:** `critical`, `high`, `medium`, `low`
 
 ---
 
-## Components & Topology (9 tools)
+## workspace
 
-Components model the deployment topology of your system.
+Manage multi-project workspaces.
 
-### list_components
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List workspaces | `limit`, `offset` |
+| `create` | Create workspace | `name`, `description` |
+| `get` | Get workspace by slug | `slug` |
+| `update` | Update workspace | `slug`, `name`, `description` |
+| `delete` | Delete workspace | `slug` |
+| `get_overview` | Overview with projects, milestones, resources | `slug` |
+| `list_projects` | Projects in workspace | `slug` |
+| `add_project` | Add project to workspace | `slug`, `project_id`, `role` |
+| `remove_project` | Remove project | `slug`, `project_id` |
+| `get_topology` | Component topology graph | `slug` |
 
-List components (services, databases, etc.) in a workspace.
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `component_type` | string | No | Filter by type: `Service`, `Frontend`, `Worker`, `Database`, `MessageQueue`, `Cache`, `Gateway`, `External`, `Other` |
-| `limit` | integer | No | Max items |
-| `offset` | integer | No | Items to skip |
-
 ---
 
-### create_component
+## workspace_milestone
 
-Create a component in the workspace topology.
+Manage cross-project milestones.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
-| `name` | string | **Yes** | Component name |
-| `component_type` | string | **Yes** | `Service`, `Frontend`, `Worker`, `Database`, `MessageQueue`, `Cache`, `Gateway`, `External`, `Other` |
-| `description` | string | No | Component description |
-| `runtime` | string | No | Runtime: `docker`, `kubernetes`, `lambda` |
-| `config` | object | No | Configuration (env vars, ports, etc.) |
-| `tags` | array | No | Tags for categorization |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list_all` | All workspace milestones | `workspace_id` |
+| `list` | Milestones for a workspace | `slug`, `status` |
+| `create` | Create workspace milestone | `slug`, `title`, `description`, `target_date` |
+| `get` | Get milestone details | `milestone_id` |
+| `update` | Update milestone | `milestone_id`, `title`, `status`, `target_date` |
+| `delete` | Delete milestone | `milestone_id` |
+| `add_task` | Add task from any project | `milestone_id`, `task_id` |
+| `link_plan` | Link plan to milestone | `milestone_id`, `plan_id` |
+| `unlink_plan` | Unlink plan | `milestone_id`, `plan_id` |
+| `get_progress` | Completion percentage | `milestone_id` |
 
 ---
-
-### get_component
-
-Get component details.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Component UUID |
+## resource
 
----
-
-### update_component
+Manage shared resources (API contracts, schemas).
 
-Update a component's name, description, runtime, config, or tags.
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List workspace resources | `slug` |
+| `create` | Create resource | `slug`, `name`, `resource_type`, `description`, `file_path`, `url`, `version` |
+| `get` | Get resource details | `id` |
+| `update` | Update resource | `id`, `name`, `description`, `file_path`, `url`, `version` |
+| `delete` | Delete resource | `id` |
+| `link_to_project` | Link resource to project | `resource_id`, `project_id` |
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Component UUID |
-| `name` | string | No | New name |
-| `description` | string | No | New description |
-| `runtime` | string | No | New runtime |
-| `config` | object | No | New configuration |
-| `tags` | array | No | New tags |
+**Resource Types:** `api_contract`, `schema`, `config`, `documentation`, `other`
 
 ---
-
-### delete_component
-
-Delete a component.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Component UUID |
+## component
 
----
-
-### add_component_dependency
+Manage workspace components and service topology.
 
-Add a dependency between components.
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List workspace components | `slug` |
+| `create` | Create component | `slug`, `name`, `component_type`, `description`, `runtime`, `tags` |
+| `get` | Get component details | `id` |
+| `update` | Update component | `id`, `name`, `description`, `runtime`, `tags` |
+| `delete` | Delete component | `id` |
+| `add_dependency` | Add component dependency | `from_id`, `to_id`, `dependency_type` |
+| `remove_dependency` | Remove dependency | `from_id`, `to_id` |
+| `map_to_project` | Map component to project | `component_id`, `project_id` |
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Source component UUID |
-| `depends_on_id` | string | **Yes** | Target component UUID |
-| `protocol` | string | No | Communication protocol: `http`, `grpc`, `amqp`, etc. |
-| `required` | boolean | No | Whether dependency is required |
+**Component Types:** `service`, `library`, `database`, `queue`, `external`
 
 ---
 
-### remove_component_dependency
+## chat
 
-Remove a dependency between components.
+Manage chat sessions and messages.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Source component UUID |
-| `dep_id` | string | **Yes** | Target component UUID to remove |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list_sessions` | List chat sessions | `project_slug`, `limit`, `offset` |
+| `get_session` | Get session details | `session_id` |
+| `delete_session` | Delete session | `session_id` |
+| `send_message` | Send message and wait for response | `message`, `cwd`, `project_slug`, `workspace_slug`, `model` |
+| `list_messages` | List message history | `session_id`, `limit`, `offset` |
+| `add_discussed` | Mark entities as discussed | `session_id`, `entities` |
+| `get_session_entities` | Get entities discussed in session | `session_id`, `project_id` |
 
 ---
 
-### map_component_to_project
+## feature_graph
 
-Map a component to a project (link source code).
+Manage feature graphs for code analysis.
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | string | **Yes** | Component UUID |
-| `project_id` | string | **Yes** | Project UUID |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `create` | Create feature graph | `project_id`, `name`, `description` |
+| `get` | Get feature graph | `id` |
+| `list` | List feature graphs | `project_id` |
+| `add_entity` | Add entity to graph | `feature_graph_id`, `entity_id`, `entity_type`, `role` |
+| `auto_build` | Auto-build from code analysis | `project_id`, `name`, `description`, `entry_function`, `depth`, `include_relations`, `filter_community` |
+| `delete` | Delete feature graph | `id` |
 
 ---
 
-### get_workspace_topology
+## code
 
-Get the full topology graph of a workspace (components and dependencies).
+Code exploration, search, and analytics (30 actions).
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `slug` | string | **Yes** | Workspace slug |
+### Search & Navigation
 
-**Returns:** All components with dependencies, protocols, and mapped projects.
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `search` | Semantic code search | `query`, `path_prefix`, `limit` |
+| `search_project` | Search within a project | `slug`, `query`, `limit` |
+| `search_workspace` | Search across workspace | `workspace_slug`, `query`, `limit` |
+| `get_file_symbols` | Functions, structs, traits in file | `file_path` |
+| `find_references` | All usages of a symbol | `symbol` |
+| `get_file_dependencies` | File imports and dependents | `file_path` |
+| `get_call_graph` | Function call graph | `function`, `limit` |
+| `analyze_impact` | Change impact analysis | `target` |
+| `get_architecture` | Codebase overview | `project_slug` |
+| `find_similar` | Find similar code snippets | `code_snippet` |
 
----
+### Type System & Heritage
 
-## Chat (5 tools)
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `find_trait_implementations` | Types implementing a trait | `trait_name` |
+| `find_type_traits` | Traits implemented by a type | `type_name` |
+| `get_impl_blocks` | All impl blocks for a type | `type_name` |
+| `get_class_hierarchy` | Full class hierarchy (parents + children) | `type_name`, `max_depth` |
+| `find_subclasses` | All transitive subclasses | `class_name` |
+| `find_interface_implementors` | All interface implementors | `interface_name` |
 
-Chat tools enable conversational interactions with AI agents, with session persistence and project association.
+### Process Detection
 
-### list_chat_sessions
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `get_entry_points` | Entry points (main, handlers, CLI) | `project_slug` |
+| `list_processes` | All detected business processes | `project_slug` |
+| `get_process` | Steps of a process | `process_id` |
+| `detect_processes` | Run process detection | `project_slug` |
 
-List chat sessions with optional project filter and pagination.
+### Analytics & Health (GDS)
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `project_slug` | string | No | Filter by project slug |
-| `limit` | integer | No | Max items (default 50) |
-| `offset` | integer | No | Items to skip |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `get_communities` | Louvain community clusters | `project_slug`, `min_size` |
+| `enrich_communities` | Enrich community labels via LLM | `project_slug` |
+| `get_health` | Full health report (hotspots, gaps, risk, neural) | `project_slug` |
+| `get_node_importance` | PageRank, betweenness, bridge detection | `project_slug`, `node_path`, `node_type` |
+| `plan_implementation` | AI-assisted implementation planning | `project_slug`, `description`, `entry_points`, `scope` |
+| `get_co_change_graph` | Files that change together | `project_slug` |
+| `get_file_co_changers` | Co-changers for a specific file | `file_path` |
+| `get_hotspots` | High-churn files | `project_slug` |
+| `get_knowledge_gaps` | Under-documented files | `project_slug` |
+| `get_risk_assessment` | Composite risk scores | `project_slug` |
 
 ---
-
-### get_chat_session
 
-Get chat session details by ID.
+## admin
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `session_id` | string | **Yes** | Session UUID |
+Administrative operations: sync, watch, Knowledge Fabric, maintenance.
 
----
-
-### delete_chat_session
+### Sync & Watch
 
-Delete a chat session.
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `sync_directory` | Manual directory sync | `path`, `project_id` |
+| `start_watch` | Start file watcher | `path`, `project_id` |
+| `stop_watch` | Stop file watcher | — |
+| `watch_status` | Get watcher status | — |
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `session_id` | string | **Yes** | Session UUID |
-
----
+### Meilisearch Maintenance
 
-### list_chat_messages
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `meilisearch_stats` | Code index statistics | — |
+| `delete_meilisearch_orphans` | Clean orphan documents | — |
 
-List message history for a chat session (chronological order).
+### Data Cleanup
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `session_id` | string | **Yes** | Session UUID |
-| `limit` | integer | No | Max messages to retrieve (default 50) |
-| `offset` | integer | No | Messages to skip for pagination (default 0) |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `cleanup_cross_project_calls` | Remove cross-project CALLS | — |
+| `cleanup_builtin_calls` | Remove builtin function calls | — |
+| `migrate_calls_confidence` | Migrate confidence scores | — |
+| `cleanup_sync_data` | Clean stale sync data | — |
 
----
+### Knowledge Fabric
 
-### chat_send_message
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `bootstrap_knowledge_fabric` | Initialize all fabric relations | `project_id` |
+| `update_fabric_scores` | Recalculate GDS multi-layer scores | `project_id` |
+| `update_staleness_scores` | Recalculate note staleness | `project_id` |
+| `update_energy_scores` | Recalculate neural energy | `project_id` |
+| `backfill_touches` | Backfill TOUCHES from git history | `project_id` |
+| `backfill_discussed` | Backfill DISCUSSED relations | — |
+| `backfill_synapses` | Backfill SYNAPSE relations | — |
+| `backfill_decision_embeddings` | Generate decision embeddings | — |
 
-Send a chat message and wait for the complete response (non-streaming). Creates a new session or resumes an existing one.
+### Neural Maintenance
 
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `message` | string | **Yes** | The user message to send |
-| `cwd` | string | **Yes** | Working directory for Claude Code CLI |
-| `session_id` | string | No | Session ID to resume (creates new session if omitted) |
-| `project_slug` | string | No | Project slug to associate with the session |
-| `model` | string | No | Model override (default: from config) |
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `search_neurons` | Search neural notes | `query`, `min_strength`, `limit` |
+| `reinforce_neurons` | Co-activate notes (boost synapses) | `note_ids`, `energy_boost`, `synapse_boost` |
+| `decay_synapses` | Decay weak synapses | `decay_amount`, `prune_threshold` |
+| `detect_skills` | Auto-detect neural skills | `project_id` |
+| `install_hooks` | Install git hooks for auto-tracking | `project_id`, `cwd`, `port` |
 
 ---
-
-## Meilisearch Maintenance (2 tools)
 
-### get_meilisearch_stats
+## skill
 
-Get Meilisearch code index statistics.
-
-**Parameters:** None
-
----
+Manage neural skills (emergent knowledge clusters).
 
-### delete_meilisearch_orphans
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List skills | `project_id`, `limit`, `offset` |
+| `create` | Create skill | `project_id`, `name`, `description`, `tags`, `trigger_patterns`, `context_template` |
+| `get` | Get skill details | `skill_id` |
+| `update` | Update skill | `skill_id`, `name`, `description`, `status`, `energy`, `cohesion`, `tags` |
+| `delete` | Delete skill | `skill_id` |
+| `get_members` | Get skill members (notes/decisions) | `skill_id` |
+| `add_member` | Add member to skill | `skill_id`, `entity_id`, `entity_type` |
+| `remove_member` | Remove member | `skill_id`, `entity_id`, `entity_type` |
+| `activate` | Activate skill with query | `skill_id`, `query` |
+| `export` | Export skill package | `skill_id`, `source_project_name` |
+| `import` | Import skill package | `project_id`, `package`, `conflict_strategy` |
+| `get_health` | Skill health metrics | `skill_id` |
 
-Delete documents without project_id from Meilisearch.
+**Skill Status:** `emerging`, `active`, `dormant`, `archived`, `imported`
 
-**Parameters:** None
+**Trigger Pattern Types:** `regex`, `file_glob`, `semantic`

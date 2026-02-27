@@ -91,6 +91,9 @@ RUN rm -rf src
 # Copy actual source code
 COPY src ./src
 
+# Copy hook scripts (embedded via include_str! in hook_handlers.rs)
+COPY hooks ./hooks/
+
 # Copy tree-sitter queries if they exist (optional — may not be present)
 COPY querie[s] ./queries/
 
