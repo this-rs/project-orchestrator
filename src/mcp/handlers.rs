@@ -325,6 +325,7 @@ impl ToolHandler {
             ("admin", "update_fabric_scores") => "update_fabric_scores",
             ("admin", "bootstrap_knowledge_fabric") => "bootstrap_knowledge_fabric",
             ("admin", "detect_skills") => "detect_skills",
+            ("admin", "install_hooks") => "install_hooks",
 
             _ => {
                 return Err(anyhow!(
@@ -1875,6 +1876,25 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/admin/detect-skills", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "install_hooks" => {
+                let mut body = serde_json::Map::new();
+                body.insert(
+                    "project_id".to_string(),
+                    json!(extract_string(args, "project_id")?),
+                );
+                body.insert(
+                    "cwd".to_string(),
+                    json!(extract_string(args, "cwd")?),
+                );
+                if let Some(port) = args.get("port").and_then(|v| v.as_u64()) {
+                    body.insert("port".to_string(), json!(port));
+                }
+                let result = http
+                    .post("/api/admin/install-hooks", &Value::Object(body))
                     .await?;
                 Ok(Some(result))
             }

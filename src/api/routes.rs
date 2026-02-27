@@ -779,6 +779,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/admin/detect-skills",
             post(handlers::detect_skills),
         )
+        .route(
+            "/api/admin/install-hooks",
+            post(hook_handlers::install_hooks),
+        )
         // ================================================================
         // Workspaces
         // ================================================================

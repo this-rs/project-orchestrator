@@ -438,6 +438,145 @@ fn extract_client_ip(headers: &HeaderMap) -> IpAddr {
 }
 
 // ============================================================================
+// Hook Installation
+// ============================================================================
+
+/// Embedded hook file contents (compiled into the binary for self-contained install)
+const HOOK_PRE_TOOL_USE: &str = include_str!("../../hooks/pre-tool-use.cjs");
+const HOOK_SESSION_START: &str = include_str!("../../hooks/session-start.sh");
+
+/// Request body for POST /api/admin/install-hooks
+#[derive(Debug, Deserialize)]
+pub struct InstallHooksRequest {
+    /// Project UUID to bind in .po-config
+    pub project_id: Uuid,
+    /// Directory to place .po-config (the project's working directory)
+    pub cwd: String,
+    /// PO server port (default: 6600)
+    #[serde(default = "default_port")]
+    pub port: u16,
+}
+
+fn default_port() -> u16 {
+    6600
+}
+
+/// POST /api/admin/install-hooks
+///
+/// Installs PO hooks into `~/.claude/hooks/` and generates a `.po-config`
+/// in the specified `cwd` directory. The installation is idempotent.
+///
+/// The hook files are embedded in the server binary at compile time,
+/// making the server self-contained for installation.
+///
+/// Returns:
+/// - 200 with `{ installed: true, hooks_path, config_path, hooks }`
+/// - 400 if cwd doesn't exist or project_id is invalid
+/// - 500 on filesystem errors
+pub async fn install_hooks(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<InstallHooksRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+    let cwd = std::path::PathBuf::from(&body.cwd);
+    let port = body.port;
+
+    // Verify project exists
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    // Verify cwd exists
+    if !cwd.is_dir() {
+        return Err(AppError::BadRequest(format!(
+            "Directory does not exist: {}",
+            cwd.display()
+        )));
+    }
+
+    // Resolve ~/.claude/hooks/
+    let home = std::env::var("HOME")
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("HOME environment variable not set")))?;
+    let hooks_dir = std::path::PathBuf::from(&home).join(".claude").join("hooks");
+
+    // Create hooks directory
+    std::fs::create_dir_all(&hooks_dir).map_err(|e| {
+        AppError::Internal(anyhow::anyhow!(
+            "Failed to create hooks directory {}: {}",
+            hooks_dir.display(),
+            e
+        ))
+    })?;
+
+    // Write hook files
+    let hook_files = vec![
+        ("pre-tool-use.cjs", HOOK_PRE_TOOL_USE),
+        ("session-start.sh", HOOK_SESSION_START),
+    ];
+
+    let mut installed_hooks = Vec::new();
+    for (filename, content) in &hook_files {
+        let target = hooks_dir.join(filename);
+        std::fs::write(&target, content).map_err(|e| {
+            AppError::Internal(anyhow::anyhow!(
+                "Failed to write {}: {}",
+                target.display(),
+                e
+            ))
+        })?;
+
+        // Make executable (unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&target, perms).map_err(|e| {
+                AppError::Internal(anyhow::anyhow!(
+                    "Failed to set permissions on {}: {}",
+                    target.display(),
+                    e
+                ))
+            })?;
+        }
+
+        installed_hooks.push(filename.to_string());
+    }
+
+    // Generate .po-config
+    let config_path = cwd.join(".po-config");
+    let config = serde_json::json!({
+        "project_id": project_id.to_string(),
+        "port": port,
+        "installed_at": chrono::Utc::now().to_rfc3339(),
+        "hooks_version": "1.0.0",
+        "hooks": installed_hooks,
+    });
+    let config_json = serde_json::to_string_pretty(&config).map_err(|e| {
+        AppError::Internal(anyhow::anyhow!("Failed to serialize config: {}", e))
+    })?;
+    std::fs::write(&config_path, format!("{}\n", config_json)).map_err(|e| {
+        AppError::Internal(anyhow::anyhow!(
+            "Failed to write .po-config at {}: {}",
+            config_path.display(),
+            e
+        ))
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "installed": true,
+        "hooks_path": hooks_dir.to_string_lossy(),
+        "config_path": config_path.to_string_lossy(),
+        "hooks": installed_hooks,
+        "project_id": project_id.to_string(),
+        "port": port,
+    })))
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -654,5 +793,57 @@ mod tests {
         assert!(response["current_plan"].is_null());
         assert!(response["current_task"].is_null());
         assert!(response["critical_notes"].as_array().unwrap().is_empty());
+    }
+
+    // ================================================================
+    // Embedded hook content tests
+    // ================================================================
+
+    #[test]
+    fn test_embedded_hooks_not_empty() {
+        assert!(!HOOK_PRE_TOOL_USE.is_empty(), "pre-tool-use.cjs should not be empty");
+        assert!(!HOOK_SESSION_START.is_empty(), "session-start.sh should not be empty");
+    }
+
+    #[test]
+    fn test_embedded_hooks_have_shebangs() {
+        assert!(
+            HOOK_PRE_TOOL_USE.starts_with("#!/usr/bin/env node"),
+            "pre-tool-use.cjs should start with node shebang"
+        );
+        assert!(
+            HOOK_SESSION_START.starts_with("#!/usr/bin/env bash"),
+            "session-start.sh should start with bash shebang"
+        );
+    }
+
+    #[test]
+    fn test_install_hooks_request_deserialize() {
+        let json = r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5","cwd":"/tmp/test"}"#;
+        let req: InstallHooksRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.project_id, Uuid::parse_str("00333b5f-2d0a-4467-9c98-155e55d2b7e5").unwrap());
+        assert_eq!(req.cwd, "/tmp/test");
+        assert_eq!(req.port, 6600); // default
+    }
+
+    #[test]
+    fn test_install_hooks_request_custom_port() {
+        let json = r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5","cwd":"/tmp","port":7700}"#;
+        let req: InstallHooksRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.port, 7700);
+    }
+
+    #[test]
+    fn test_install_hooks_request_missing_project_id() {
+        let json = r#"{"cwd":"/tmp"}"#;
+        let result: Result<InstallHooksRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_install_hooks_request_missing_cwd() {
+        let json = r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5"}"#;
+        let result: Result<InstallHooksRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 }
