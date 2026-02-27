@@ -216,10 +216,9 @@ impl SkillTrigger {
 ///
 /// # Neo4j Relations
 /// ```text
-/// (Skill)-[:CONTAINS]->(Note)           — member notes
-/// (Skill)-[:CONTAINS]->(Decision)       — member decisions
-/// (Skill)-[:COVERS]->(File)             — files covered by member notes
-/// (Skill)-[:BELONGS_TO]->(Project)      — project ownership
+/// (Note)-[:MEMBER_OF]->(Skill)           — member notes
+/// (Decision)-[:MEMBER_OF_SKILL]->(Skill) — member decisions
+/// (Skill)-[:BELONGS_TO]->(Project)       — project ownership
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillNode {

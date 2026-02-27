@@ -144,7 +144,7 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 /// 4. Then Context
 /// 5. Never remove Gotchas or Guidelines with Critical/High importance
 fn apply_token_budget(template: String, notes: &[Note]) -> String {
-    if template.len() <= MAX_TEMPLATE_CHARS {
+    if template.chars().count() <= MAX_TEMPLATE_CHARS {
         return template;
     }
 
@@ -244,7 +244,7 @@ fn apply_token_budget(template: String, notes: &[Note]) -> String {
 
     for (section_name, section_notes) in &dispensable_by_type {
         let section_text = format_section(section_name, section_notes);
-        if current.len() + section_text.len() + 4 <= MAX_TEMPLATE_CHARS - 200 {
+        if current.chars().count() + section_text.chars().count() + 4 <= MAX_TEMPLATE_CHARS - 200 {
             // Leave room for placeholders
             current.push_str("\n\n");
             current.push_str(&section_text);
@@ -468,11 +468,12 @@ mod tests {
 
         let template = generate_context_template("Big Skill", "Skill with many notes", &notes);
 
-        // Should be within budget
+        // Should be within budget (use chars().count() to match the budget logic)
+        let char_count = template.chars().count();
         assert!(
-            template.len() <= MAX_TEMPLATE_CHARS + 100, // small margin for truncation comment
+            char_count <= MAX_TEMPLATE_CHARS + 100, // small margin for truncation comment
             "Template too long: {} chars (max {})",
-            template.len(),
+            char_count,
             MAX_TEMPLATE_CHARS
         );
 

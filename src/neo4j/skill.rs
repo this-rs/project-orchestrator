@@ -27,8 +27,17 @@ impl Neo4jClient {
         let trigger_json: String = node
             .get("trigger_patterns_json")
             .unwrap_or_else(|_| "[]".to_string());
-        let trigger_patterns: Vec<SkillTrigger> =
-            serde_json::from_str(&trigger_json).unwrap_or_default();
+        let trigger_patterns: Vec<SkillTrigger> = match serde_json::from_str(&trigger_json) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    json = %trigger_json,
+                    error = %e,
+                    "Failed to deserialize skill trigger_patterns, using empty vec"
+                );
+                Vec::new()
+            }
+        };
 
         let tags: Vec<String> = node.get("tags").unwrap_or_default();
 
@@ -117,10 +126,10 @@ impl Neo4jClient {
                 decision_count: $decision_count,
                 activation_count: $activation_count,
                 hit_rate: $hit_rate,
-                last_activated: $last_activated,
+                last_activated: CASE WHEN $last_activated IS NOT NULL THEN datetime($last_activated) ELSE null END,
                 version: $version,
                 fingerprint: $fingerprint,
-                imported_at: $imported_at,
+                imported_at: CASE WHEN $imported_at IS NOT NULL THEN datetime($imported_at) ELSE null END,
                 is_validated: $is_validated,
                 tags: $tags,
                 created_at: datetime($created_at),
@@ -138,7 +147,11 @@ impl Neo4jClient {
         .param("trigger_patterns_json", trigger_json)
         .param(
             "context_template",
-            skill.context_template.clone().unwrap_or_default(),
+            skill
+                .context_template
+                .clone()
+                .map(neo4rs::BoltType::from)
+                .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
         )
         .param("energy", skill.energy)
         .param("cohesion", skill.cohesion)
@@ -151,17 +164,24 @@ impl Neo4jClient {
             "last_activated",
             skill
                 .last_activated
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default(),
+                .map(|dt| neo4rs::BoltType::from(dt.to_rfc3339()))
+                .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
         )
         .param("version", skill.version)
-        .param("fingerprint", skill.fingerprint.clone().unwrap_or_default())
+        .param(
+            "fingerprint",
+            skill
+                .fingerprint
+                .clone()
+                .map(neo4rs::BoltType::from)
+                .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
+        )
         .param(
             "imported_at",
             skill
                 .imported_at
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default(),
+                .map(|dt| neo4rs::BoltType::from(dt.to_rfc3339()))
+                .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
         )
         .param("is_validated", skill.is_validated)
         .param("tags", skill.tags.clone())
@@ -224,10 +244,10 @@ impl Neo4jClient {
                 s.decision_count = $decision_count,
                 s.activation_count = $activation_count,
                 s.hit_rate = $hit_rate,
-                s.last_activated = $last_activated,
+                s.last_activated = CASE WHEN $last_activated IS NOT NULL THEN datetime($last_activated) ELSE null END,
                 s.version = $version,
                 s.fingerprint = $fingerprint,
-                s.imported_at = $imported_at,
+                s.imported_at = CASE WHEN $imported_at IS NOT NULL THEN datetime($imported_at) ELSE null END,
                 s.is_validated = $is_validated,
                 s.tags = $tags,
                 s.updated_at = datetime($updated_at)
@@ -241,7 +261,11 @@ impl Neo4jClient {
         .param("trigger_patterns_json", trigger_json)
         .param(
             "context_template",
-            skill.context_template.clone().unwrap_or_default(),
+            skill
+                .context_template
+                .clone()
+                .map(neo4rs::BoltType::from)
+                .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
         )
         .param("energy", skill.energy)
         .param("cohesion", skill.cohesion)
@@ -254,17 +278,24 @@ impl Neo4jClient {
             "last_activated",
             skill
                 .last_activated
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default(),
+                .map(|dt| neo4rs::BoltType::from(dt.to_rfc3339()))
+                .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
         )
         .param("version", skill.version)
-        .param("fingerprint", skill.fingerprint.clone().unwrap_or_default())
+        .param(
+            "fingerprint",
+            skill
+                .fingerprint
+                .clone()
+                .map(neo4rs::BoltType::from)
+                .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
+        )
         .param(
             "imported_at",
             skill
                 .imported_at
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default(),
+                .map(|dt| neo4rs::BoltType::from(dt.to_rfc3339()))
+                .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
         )
         .param("is_validated", skill.is_validated)
         .param("tags", skill.tags.clone())

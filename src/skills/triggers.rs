@@ -7,7 +7,8 @@
 
 use crate::notes::{EntityType, Note};
 use crate::skills::{SkillTrigger, TriggerType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 // ============================================================================
 // FileGlob Triggers
@@ -151,6 +152,10 @@ const STOP_WORDS: &[&str] = &[
     "function", "method", "class", "type", "value", "data", "note", "notes",
 ];
 
+/// Pre-built HashSet for O(1) stop-word lookups (built once via LazyLock).
+static STOP_SET: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| STOP_WORDS.iter().copied().collect());
+
 /// Generate Regex triggers from tag frequencies and content keywords.
 ///
 /// Algorithm:
@@ -209,10 +214,10 @@ pub fn generate_regex_triggers(notes: &[Note]) -> Vec<SkillTrigger> {
         return Vec::new();
     }
 
-    // Build regex pattern with case-insensitive alternation
+    // Build regex pattern with word-boundary anchoring
     // Escape special regex characters in terms
     let escaped: Vec<String> = all_terms.iter().map(|t| regex_escape(t)).collect();
-    let pattern = escaped.join("|");
+    let pattern = format!("\\b(?:{})\\b", escaped.join("|"));
 
     // Confidence based on how many tags passed the threshold
     let tag_coverage = if !frequent_tags.is_empty() {
@@ -270,12 +275,10 @@ fn extract_content_keywords(notes: &[Note], top_n: usize) -> Vec<String> {
 
 /// Tokenize text into lowercase words, filtering stop words and short tokens.
 fn tokenize(text: &str) -> Vec<String> {
-    let stop_set: std::collections::HashSet<&str> = STOP_WORDS.iter().copied().collect();
-
     text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
         .filter(|w| !w.is_empty())
         .map(|w| w.to_lowercase())
-        .filter(|w| w.len() >= 3 && !stop_set.contains(w.as_str()))
+        .filter(|w| w.len() >= 3 && !STOP_SET.contains(w.as_str()))
         .collect()
 }
 
@@ -463,7 +466,16 @@ fn evaluate_file_glob_quality(
 ) -> Option<f64> {
     let glob = glob::Pattern::new(pattern).ok()?;
 
-    let total_skill = skill_notes.len();
+    // Only count skill notes that have at least one File anchor in the denominator
+    // (notes without file anchors can never match a FileGlob trigger)
+    let total_skill = skill_notes
+        .iter()
+        .filter(|n| {
+            n.anchors
+                .iter()
+                .any(|a| a.entity_type == crate::notes::EntityType::File)
+        })
+        .count();
     if total_skill == 0 {
         return Some(0.0);
     }

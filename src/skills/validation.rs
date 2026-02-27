@@ -91,6 +91,23 @@ impl std::fmt::Display for HealthRecommendation {
     }
 }
 
+impl std::str::FromStr for HealthRecommendation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "healthy" => Ok(Self::Healthy),
+            "needs_attention" => Ok(Self::NeedsAttention),
+            "at_risk" => Ok(Self::AtRisk),
+            "should_archive" => Ok(Self::ShouldArchive),
+            other => Err(format!(
+                "Invalid health recommendation '{}'. Must be: healthy, needs_attention, at_risk, should_archive",
+                other
+            )),
+        }
+    }
+}
+
 // ============================================================================
 // Computation
 // ============================================================================

@@ -255,6 +255,38 @@ pub fn validate_package(package: &SkillPackage) -> Result<(), Vec<PackageValidat
         }
     }
 
+    // Validate metadata stats consistency
+    if package.metadata.stats.note_count != package.notes.len() {
+        errors.push(PackageValidationError {
+            field: "metadata.stats.note_count".to_string(),
+            message: format!(
+                "Stats note_count ({}) does not match actual notes count ({}).",
+                package.metadata.stats.note_count,
+                package.notes.len()
+            ),
+        });
+    }
+    if package.metadata.stats.decision_count != package.decisions.len() {
+        errors.push(PackageValidationError {
+            field: "metadata.stats.decision_count".to_string(),
+            message: format!(
+                "Stats decision_count ({}) does not match actual decisions count ({}).",
+                package.metadata.stats.decision_count,
+                package.decisions.len()
+            ),
+        });
+    }
+    if package.metadata.stats.trigger_count != package.skill.trigger_patterns.len() {
+        errors.push(PackageValidationError {
+            field: "metadata.stats.trigger_count".to_string(),
+            message: format!(
+                "Stats trigger_count ({}) does not match actual trigger_patterns count ({}).",
+                package.metadata.stats.trigger_count,
+                package.skill.trigger_patterns.len()
+            ),
+        });
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {

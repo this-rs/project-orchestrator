@@ -90,6 +90,11 @@ pub fn extract_pattern(tool_name: &str, tool_input: &serde_json::Value) -> Optio
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
 
+        "NotebookEdit" => tool_input
+            .get("notebook_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+
         "Bash" => extract_bash_pattern(tool_input),
 
         _ => None,
@@ -114,6 +119,11 @@ pub fn extract_file_context(tool_name: &str, tool_input: &serde_json::Value) -> 
     match tool_name {
         "Read" | "Edit" | "Write" => tool_input
             .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+
+        "NotebookEdit" => tool_input
+            .get("notebook_path")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
 
@@ -307,9 +317,20 @@ fn tokenize_command(command: &str) -> Vec<String> {
     let mut current = String::new();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
+    let mut escaped = false;
 
     for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
         match ch {
+            '\\' if in_double_quote || (!in_single_quote && !in_double_quote) => {
+                // Backslash escapes next char in double quotes or unquoted context
+                // (In single quotes, backslash is literal per POSIX)
+                escaped = true;
+            }
             '\'' if !in_double_quote => {
                 in_single_quote = !in_single_quote;
                 // Include quote in token so we can strip later

@@ -109,7 +109,7 @@ pub fn cluster_to_skill(
 
     // Collect tags from member notes for naming
     let tags_per_note: Vec<Vec<String>> = notes.iter().map(|n| n.tags.clone()).collect();
-    let name = generate_skill_name(&tags_per_note, candidate.community_id);
+    let name = generate_skill_name(&tags_per_note, candidate.community_id, None);
 
     // Compute weighted energy: sum(energy × importance_weight) / sum(importance_weight)
     let (weighted_sum, weight_sum) = notes.iter().fold((0.0_f64, 0.0_f64), |(ws, wt), note| {

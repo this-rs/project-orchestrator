@@ -3,7 +3,7 @@
 //! Uses statistical analysis of note tags to compose human-readable skill names.
 //! No LLM needed — purely deterministic heuristic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Generate a skill name from the tags of its member notes.
 ///
@@ -12,7 +12,12 @@ use std::collections::HashMap;
 /// 2. Select top 2-3 most frequent tags
 /// 3. Title-case and join → e.g. "Api Authentication"
 /// 4. Fallback to "Cluster-{id}" if no tags available
-pub fn generate_skill_name(tags_per_note: &[Vec<String>], fallback_id: u32) -> String {
+/// 5. If `existing_names` is provided and the name collides, append "-{fallback_id}"
+pub fn generate_skill_name(
+    tags_per_note: &[Vec<String>],
+    fallback_id: u32,
+    existing_names: Option<&HashSet<String>>,
+) -> String {
     // Count tag frequencies
     let mut freq: HashMap<&str, usize> = HashMap::new();
     for tags in tags_per_note {
@@ -36,10 +41,21 @@ pub fn generate_skill_name(tags_per_note: &[Vec<String>], fallback_id: u32) -> S
         .map(|(tag, _)| title_case(tag))
         .collect();
 
-    if top_tags.is_empty() {
+    let base_name = if top_tags.is_empty() {
         format!("Cluster-{}", fallback_id)
     } else {
         top_tags.join(" ")
+    };
+
+    // Disambiguate if name already exists
+    if let Some(names) = existing_names {
+        if names.contains(&base_name) {
+            format!("{}-{}", base_name, fallback_id)
+        } else {
+            base_name
+        }
+    } else {
+        base_name
     }
 }
 
@@ -73,7 +89,7 @@ mod tests {
             vec!["api".to_string(), "jwt".to_string()],
             vec!["auth".to_string(), "security".to_string()],
         ];
-        let name = generate_skill_name(&tags, 0);
+        let name = generate_skill_name(&tags, 0, None);
         // "api" appears 2x, "auth" appears 2x, then "jwt" or "security" 1x each
         assert!(name.contains("Api"), "Expected 'Api' in '{}'", name);
         assert!(name.contains("Auth"), "Expected 'Auth' in '{}'", name);
@@ -82,14 +98,14 @@ mod tests {
     #[test]
     fn test_generate_skill_name_empty_tags() {
         let tags: Vec<Vec<String>> = vec![vec![], vec![]];
-        let name = generate_skill_name(&tags, 42);
+        let name = generate_skill_name(&tags, 42, None);
         assert_eq!(name, "Cluster-42");
     }
 
     #[test]
     fn test_generate_skill_name_no_notes() {
         let tags: Vec<Vec<String>> = vec![];
-        let name = generate_skill_name(&tags, 7);
+        let name = generate_skill_name(&tags, 7, None);
         assert_eq!(name, "Cluster-7");
     }
 
@@ -101,12 +117,26 @@ mod tests {
             vec!["neo4j".to_string()],
             vec!["cypher".to_string()],
         ];
-        let name = generate_skill_name(&tags, 0);
+        let name = generate_skill_name(&tags, 0, None);
         assert!(
             name.starts_with("Neo4j"),
             "Expected 'Neo4j' first in '{}'",
             name
         );
+    }
+
+    #[test]
+    fn test_generate_skill_name_collision() {
+        let tags = vec![
+            vec!["api".to_string(), "auth".to_string()],
+            vec!["api".to_string()],
+        ];
+        let base = generate_skill_name(&tags, 5, None);
+        let mut existing = HashSet::new();
+        existing.insert(base.clone());
+        let deduped = generate_skill_name(&tags, 5, Some(&existing));
+        assert_ne!(base, deduped);
+        assert!(deduped.ends_with("-5"), "Expected '-5' suffix in '{}'", deduped);
     }
 
     #[test]
@@ -133,7 +163,7 @@ mod tests {
                 "d".to_string(),
             ],
         ];
-        let name = generate_skill_name(&tags, 0);
+        let name = generate_skill_name(&tags, 0, None);
         // Should only use top 3 tags
         let word_count = name.split_whitespace().count();
         assert!(

@@ -735,6 +735,7 @@ mod tests {
 
         let mut package = make_test_package();
         package.decisions.clear();
+        package.metadata.stats.decision_count = 0;
 
         let result = import_skill(&package, project_id, &store, ConflictStrategy::Skip)
             .await

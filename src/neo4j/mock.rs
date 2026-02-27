@@ -6778,6 +6778,15 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        // Validate project exists (only if projects map is populated, for backward compatibility)
+        let projects = self.projects.read().await;
+        if !projects.is_empty() && !projects.contains_key(&skill.project_id) {
+            anyhow::bail!(
+                "Project not found: {}. Cannot create skill in non-existent project.",
+                skill.project_id
+            );
+        }
+        drop(projects);
         self.skills.write().await.insert(skill.id, skill.clone());
         Ok(())
     }
@@ -6869,6 +6878,16 @@ impl GraphStore for MockGraphStore {
         let list = members.entry(skill_id).or_default();
         if !list.contains(&entry) {
             list.push(entry);
+            // Update counters on the skill (consistent with Neo4j behavior)
+            drop(members);
+            let mut skills = self.skills.write().await;
+            if let Some(skill) = skills.get_mut(&skill_id) {
+                match entity_type {
+                    "note" => skill.note_count += 1,
+                    "decision" => skill.decision_count += 1,
+                    _ => {}
+                }
+            }
         }
         Ok(())
     }
@@ -6913,6 +6932,12 @@ impl GraphStore for MockGraphStore {
                 }
             }
         }
+        // Sort by energy DESC for consistency with Neo4j query
+        result.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(result)
     }
 
@@ -6937,11 +6962,33 @@ impl GraphStore for MockGraphStore {
             .get_skill(skill_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_id))?;
+        // Return actual member notes/decisions (consistent with Neo4j behavior)
+        let (member_notes, relevant_decisions) = self.get_skill_members(skill_id).await?;
+        // Wrap notes as ActivatedNote
+        let activated_notes: Vec<crate::neurons::activation::ActivatedNote> = member_notes
+            .iter()
+            .map(|n| crate::neurons::activation::ActivatedNote {
+                note: n.clone(),
+                activation_score: 1.0,
+                source: crate::neurons::activation::ActivationSource::Direct,
+                entity_type: "note".to_string(),
+            })
+            .collect();
+        // Build context_text from note content
+        let context_text = if let Some(ref tpl) = skill.context_template {
+            tpl.clone()
+        } else {
+            member_notes
+                .iter()
+                .map(|n| n.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
         Ok(crate::skills::ActivatedSkillContext {
             skill,
-            activated_notes: vec![],
-            relevant_decisions: vec![],
-            context_text: String::new(),
+            activated_notes,
+            relevant_decisions,
+            context_text,
             confidence: 1.0,
         })
     }
@@ -6949,12 +6996,10 @@ impl GraphStore for MockGraphStore {
     async fn match_skills_by_trigger(
         &self,
         project_id: Uuid,
-        _input: &str,
+        input: &str,
     ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
-        // Mock: return all active/emerging skills for the project
-        // Emerging skills get a 0.8x confidence penalty (consistent with Neo4j impl)
         let store = self.skills.read().await;
-        Ok(store
+        let candidates: Vec<_> = store
             .values()
             .filter(|s| {
                 s.project_id == project_id
@@ -6963,15 +7008,60 @@ impl GraphStore for MockGraphStore {
                         crate::skills::SkillStatus::Active | crate::skills::SkillStatus::Emerging
                     )
             })
-            .map(|s| {
-                let confidence = if s.status == crate::skills::SkillStatus::Emerging {
-                    0.8
-                } else {
-                    1.0
+            .cloned()
+            .collect();
+        drop(store);
+
+        let mut results = Vec::new();
+        for skill in candidates {
+            // Evaluate trigger_patterns against input (if skill has triggers)
+            let mut best_confidence = None;
+            for trigger in &skill.trigger_patterns {
+                let matched = match trigger.pattern_type {
+                    crate::skills::TriggerType::Regex => {
+                        regex::RegexBuilder::new(&format!("(?i){}", &trigger.pattern_value))
+                            .build()
+                            .map(|re| re.is_match(input))
+                            .unwrap_or(false)
+                    }
+                    crate::skills::TriggerType::FileGlob => {
+                        glob::Pattern::new(&trigger.pattern_value)
+                            .map(|g| g.matches(input))
+                            .unwrap_or(false)
+                    }
+                    crate::skills::TriggerType::Semantic => {
+                        // Semantic triggers can't be evaluated in mock
+                        false
+                    }
                 };
-                (s.clone(), confidence)
-            })
-            .collect())
+                if matched {
+                    let c = trigger.confidence_threshold;
+                    best_confidence = Some(best_confidence.map_or(c, |prev: f64| prev.max(c)));
+                }
+            }
+            // If no triggers defined, fall back to matching all (backward compatibility)
+            let confidence = if skill.trigger_patterns.is_empty() {
+                1.0
+            } else if let Some(c) = best_confidence {
+                c
+            } else {
+                continue; // Has triggers but none matched → skip
+            };
+            // Emerging skills get 0.8x penalty
+            let final_confidence = if skill.status == crate::skills::SkillStatus::Emerging {
+                confidence * 0.8
+            } else {
+                confidence
+            };
+            results.push((skill, final_confidence));
+        }
+        // Sort by energy DESC for consistency with Neo4j
+        results.sort_by(|a, b| {
+            b.0.energy
+                .partial_cmp(&a.0.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(results)
     }
 
     async fn get_synapse_graph(
