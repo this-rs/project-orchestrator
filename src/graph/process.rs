@@ -1108,4 +1108,93 @@ mod tests {
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].process_type, ProcessType::CrossCommunity);
     }
+
+    // ── BFS Edge-Case Tests ─────────────────────────────────────
+
+    #[test]
+    fn test_bfs_empty_graph() {
+        // Empty graph with a nonexistent start node should return empty Vec
+        let graph = CodeGraph::new();
+        let metrics = HashMap::new();
+        let config = ProcessConfig::default();
+
+        let traces = bfs_trace_single(&graph, "nonexistent", &config, &metrics);
+        assert!(
+            traces.is_empty(),
+            "BFS on empty graph should return empty Vec, got {} traces",
+            traces.len()
+        );
+    }
+
+    #[test]
+    fn test_bfs_single_node_no_edges() {
+        // Graph with one Function node and no edges.
+        // detect_processes should return empty Vec because
+        // the single-node trace (path length 1) is below min_steps.
+        let mut graph = CodeGraph::new();
+        graph.add_node(func_node("solo", "main", "src/main.rs"));
+
+        let mut metrics = HashMap::new();
+        metrics.insert("solo".into(), node_metrics(0, 0, 0));
+
+        let config = ProcessConfig::default(); // min_steps = 3
+
+        let processes = detect_processes(&graph, &metrics, &config);
+        assert!(
+            processes.is_empty(),
+            "Single node with no edges should produce no processes (path length 1 < min_steps), got {}",
+            processes.len()
+        );
+    }
+
+    #[test]
+    fn test_bfs_queue_size_limit() {
+        // Create a "star" topology that creates exponential path explosion:
+        // entry -> hub_0..hub_N, each hub_i -> leaf_i_0..leaf_i_M
+        // With small max_queue_size, BFS should terminate without hanging.
+        let mut graph = CodeGraph::new();
+        let mut metrics = HashMap::new();
+
+        // Entry node
+        graph.add_node(func_node("entry", "main", "src/main.rs"));
+        metrics.insert("entry".into(), node_metrics(0, 10, 0));
+
+        // Create 10 hub nodes, each connected from entry
+        for i in 0..10 {
+            let hub_id = format!("hub_{}", i);
+            graph.add_node(func_node(&hub_id, &format!("hub_{}", i), "src/hub.rs"));
+            graph.add_edge("entry", &hub_id, calls_edge(1.0));
+            metrics.insert(hub_id.clone(), node_metrics(1, 10, 0));
+
+            // Each hub connects to 10 leaf nodes
+            for j in 0..10 {
+                let leaf_id = format!("leaf_{}_{}", i, j);
+                graph.add_node(func_node(
+                    &leaf_id,
+                    &format!("leaf_{}_{}", i, j),
+                    "src/leaf.rs",
+                ));
+                graph.add_edge(&hub_id, &leaf_id, calls_edge(1.0));
+                metrics.insert(leaf_id, node_metrics(1, 0, 0));
+            }
+        }
+
+        let config = ProcessConfig {
+            max_queue_size: 50, // Small limit to test capping
+            min_steps: 2,
+            max_branching: 10, // Allow wide branching to stress the queue
+            ..Default::default()
+        };
+
+        // This should complete without hanging or consuming excessive memory
+        let traces = bfs_trace_single(&graph, "entry", &config, &metrics);
+
+        // We don't assert an exact count, but verify it completed and returned
+        // a reasonable number of results (not millions)
+        assert!(
+            traces.len() < 200,
+            "BFS with queue size limit should produce bounded results, got {}",
+            traces.len()
+        );
+    }
 }

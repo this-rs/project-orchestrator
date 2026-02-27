@@ -1508,3 +1508,206 @@ void transform_buffer(char* buf, int size) {
         call_names
     );
 }
+
+// =========================================================================
+// Parser Integration Tests: Zig, Scala, C#
+// =========================================================================
+
+#[test]
+fn test_parse_zig() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("hello", .{});
+}
+
+const Point = struct {
+    x: f32,
+    y: f32,
+};
+"#;
+
+    let path = Path::new("test.zig");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse Zig code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "zig");
+
+    // At least 1 function extracted with name "main"
+    let main_fn = parsed.functions.iter().find(|f| f.name == "main");
+    assert!(
+        main_fn.is_some(),
+        "Should find 'main' function, got functions: {:?}",
+        parsed.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+
+    // At least 1 struct with name "Point"
+    let point_struct = parsed.structs.iter().find(|s| s.name == "Point");
+    assert!(
+        point_struct.is_some(),
+        "Should find 'Point' struct, got structs: {:?}",
+        parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // At least 1 import for "std"
+    assert!(
+        !parsed.imports.is_empty(),
+        "Should find at least one import"
+    );
+    let std_import = parsed.imports.iter().find(|i| i.path == "std");
+    assert!(
+        std_import.is_some(),
+        "Should find import for 'std', got imports: {:?}",
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_parse_scala() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import java.io.File
+
+class UserService(db: Database) {
+  def findUser(id: String): Option[User] = {
+    db.query(id)
+  }
+}
+"#;
+
+    let path = Path::new("UserService.scala");
+    let result = parser.parse_file(path, code);
+
+    assert!(
+        result.is_ok(),
+        "Should parse Scala code: {:?}",
+        result.err()
+    );
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "scala");
+
+    // Imports extracted (with items for selective)
+    assert!(
+        parsed.imports.len() >= 2,
+        "Should find at least 2 imports, got {}",
+        parsed.imports.len()
+    );
+
+    // Selective import should have items
+    let selective_import = parsed
+        .imports
+        .iter()
+        .find(|i| i.path.contains("mutable"));
+    assert!(
+        selective_import.is_some(),
+        "Should find selective import for scala.collection.mutable, got imports: {:?}",
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+    let selective = selective_import.unwrap();
+    assert!(
+        !selective.items.is_empty(),
+        "Selective import should have items, got: {:?}",
+        selective
+    );
+
+    // Class "UserService" extracted
+    let user_service = parsed.structs.iter().find(|s| s.name == "UserService");
+    assert!(
+        user_service.is_some(),
+        "Should find 'UserService' class, got structs: {:?}",
+        parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // Method "findUser" extracted
+    let find_user = parsed.functions.iter().find(|f| f.name == "findUser");
+    assert!(
+        find_user.is_some(),
+        "Should find 'findUser' method, got functions: {:?}",
+        parsed.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_parse_csharp() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+using System;
+using static System.Math;
+using JsonAlias = Newtonsoft.Json.JsonConvert;
+
+public class Calculator {
+    public double Calculate(double x) {
+        return Abs(x);
+    }
+}
+"#;
+
+    let path = Path::new("Calculator.cs");
+    let result = parser.parse_file(path, code);
+
+    assert!(
+        result.is_ok(),
+        "Should parse C# code: {:?}",
+        result.err()
+    );
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "csharp");
+
+    // 3 using statements extracted
+    assert_eq!(
+        parsed.imports.len(),
+        3,
+        "Should find 3 using statements, got {}: {:?}",
+        parsed.imports.len(),
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+
+    // "using static System.Math" — path should be "System.Math" (without "static")
+    let static_import = parsed
+        .imports
+        .iter()
+        .find(|i| i.path.contains("System.Math"));
+    assert!(
+        static_import.is_some(),
+        "Should find 'using static System.Math' with path 'System.Math', got: {:?}",
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+
+    // "using JsonAlias = Newtonsoft.Json.JsonConvert" — alias "JsonAlias" extracted
+    let alias_import = parsed
+        .imports
+        .iter()
+        .find(|i| i.alias.as_deref() == Some("JsonAlias"));
+    assert!(
+        alias_import.is_some(),
+        "Should find using alias 'JsonAlias', got: {:?}",
+        parsed
+            .imports
+            .iter()
+            .map(|i| (&i.path, &i.alias))
+            .collect::<Vec<_>>()
+    );
+    let alias = alias_import.unwrap();
+    assert_eq!(
+        alias.path, "Newtonsoft.Json.JsonConvert",
+        "Alias import path should be 'Newtonsoft.Json.JsonConvert'"
+    );
+
+    // Class "Calculator" extracted
+    let calculator = parsed.structs.iter().find(|s| s.name == "Calculator");
+    assert!(
+        calculator.is_some(),
+        "Should find 'Calculator' class, got structs: {:?}",
+        parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}

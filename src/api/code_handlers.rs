@@ -1853,7 +1853,7 @@ pub async fn get_risk_assessment(
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
-pub struct DetectProcessesQuery {
+pub struct ProjectSlugBody {
     pub project_slug: String,
 }
 
@@ -1863,7 +1863,7 @@ pub struct DetectProcessesQuery {
 /// the CALLS graph, deduplication, and classification.
 pub async fn detect_processes(
     State(state): State<OrchestratorState>,
-    Json(body): Json<DetectProcessesQuery>,
+    Json(body): Json<ProjectSlugBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
@@ -2080,7 +2080,7 @@ pub async fn get_entry_points(
 /// Trigger LLM enrichment of community labels.
 pub async fn enrich_communities(
     State(state): State<OrchestratorState>,
-    Json(body): Json<DetectProcessesQuery>, // reuse project_slug query
+    Json(body): Json<ProjectSlugBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
@@ -4349,5 +4349,59 @@ mod tests {
         assert_eq!(q.project_slug, "my-proj");
         assert_eq!(q.node_path, "src/main.rs");
         assert_eq!(q.node_type, Some("file".to_string()));
+    }
+
+    // ====================================================================
+    // POST /api/code/processes/detect — nonexistent project
+    // ====================================================================
+
+    /// Create an authenticated POST request with JSON body
+    fn auth_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_detect_processes_404() {
+        let app = test_app().await;
+        let body = serde_json::json!({ "project_slug": "nonexistent-project" });
+        let resp = app
+            .oneshot(auth_post("/api/code/processes/detect", body))
+            .await
+            .unwrap();
+
+        // Project not found should return 404
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ====================================================================
+    // GET /api/code/class-hierarchy — max_depth clamping
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_class_hierarchy_max_depth_clamp() {
+        // Verify the handler doesn't panic when max_depth=100.
+        // The handler clamps max_depth to 20 via .clamp(1, 20).
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/class-hierarchy?type_name=SomeClass&max_depth=100",
+            ))
+            .await
+            .unwrap();
+
+        // The handler should succeed (200) — the mock graph store returns an
+        // empty hierarchy, so we just verify it doesn't panic or error out
+        // due to the extreme max_depth value.
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Handler should succeed even with max_depth=100 (clamped to 20)"
+        );
     }
 }

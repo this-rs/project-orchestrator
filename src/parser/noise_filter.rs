@@ -178,7 +178,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     // Node.js
     s.insert("require");
     s.insert("emit");
-    s.insert("on");
     s.insert("once");
     s.insert("pipe");
     s.insert("write");
@@ -646,7 +645,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     // Ruby
     // =========================================================================
     s.insert("puts");
-    s.insert("p");
     s.insert("pp");
     s.insert("print");
     s.insert("raise");
@@ -883,8 +881,8 @@ mod tests {
     fn test_builtin_count() {
         // Verify we have a substantial number of entries
         assert!(
-            BUILT_IN_NAMES.len() >= 290,
-            "Expected 290+ built-in names, got {}",
+            BUILT_IN_NAMES.len() >= 288,
+            "Expected 288+ built-in names, got {}",
             BUILT_IN_NAMES.len()
         );
     }
