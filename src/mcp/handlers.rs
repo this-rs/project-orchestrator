@@ -324,6 +324,7 @@ impl ToolHandler {
             ("admin", "backfill_discussed") => "backfill_discussed",
             ("admin", "update_fabric_scores") => "update_fabric_scores",
             ("admin", "bootstrap_knowledge_fabric") => "bootstrap_knowledge_fabric",
+            ("admin", "detect_skills") => "detect_skills",
 
             _ => {
                 return Err(anyhow!(
@@ -1863,6 +1864,17 @@ impl ToolHandler {
                         "/api/admin/bootstrap-knowledge-fabric",
                         &Value::Object(body),
                     )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "detect_skills" => {
+                let mut body = serde_json::Map::new();
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), Value::String(pid.to_string()));
+                }
+                let result = http
+                    .post("/api/admin/detect-skills", &Value::Object(body))
                     .await?;
                 Ok(Some(result))
             }

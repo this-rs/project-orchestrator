@@ -481,6 +481,188 @@ pub fn detect_skill_candidates(
 }
 
 // ============================================================================
+// Full Pipeline Orchestrator
+// ============================================================================
+
+/// Result of the full detect_skills pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectSkillsPipelineResult {
+    /// Detection status
+    pub status: ClusterDetectionStatus,
+    /// Number of skill candidates detected by Louvain
+    pub skills_detected: usize,
+    /// Number of new skills created
+    pub skills_created: usize,
+    /// Number of existing skills updated (merged)
+    pub skills_updated: usize,
+    /// Total notes in the SYNAPSE graph
+    pub total_notes: usize,
+    /// Total SYNAPSE edges
+    pub total_synapses: usize,
+    /// Louvain modularity score
+    pub modularity: f64,
+    /// Human-readable summary message
+    pub message: String,
+    /// IDs of created/updated skills
+    pub skill_ids: Vec<Uuid>,
+}
+
+/// Run the full skill detection pipeline:
+/// 1. Fetch SYNAPSE graph from store
+/// 2. Run Louvain community detection
+/// 3. Deduplicate against existing skills
+/// 4. Persist new/updated skills
+/// 5. Generate triggers and context templates
+///
+/// This function is idempotent — re-running updates existing skills
+/// rather than creating duplicates.
+pub async fn detect_skills_pipeline(
+    graph_store: &dyn crate::neo4j::traits::GraphStore,
+    project_id: Uuid,
+    config: &SkillDetectionConfig,
+) -> anyhow::Result<DetectSkillsPipelineResult> {
+    let project_id_str = project_id.to_string();
+
+    // Step 1: Fetch SYNAPSE edges
+    let edges = graph_store
+        .get_synapse_graph(project_id, config.min_synapse_weight)
+        .await?;
+
+    // Step 2: Run Louvain detection
+    let detection = detect_skill_candidates(&edges, &project_id_str, config);
+
+    if detection.status == ClusterDetectionStatus::InsufficientData {
+        return Ok(DetectSkillsPipelineResult {
+            status: ClusterDetectionStatus::InsufficientData,
+            skills_detected: 0,
+            skills_created: 0,
+            skills_updated: 0,
+            total_notes: detection.total_notes,
+            total_synapses: detection.total_synapses,
+            modularity: 0.0,
+            message: detection.message,
+            skill_ids: Vec::new(),
+        });
+    }
+
+    let skills_detected = detection.candidates.len();
+
+    // Step 3: Fetch existing skills for deduplication
+    let existing_skills = graph_store.get_skills_for_project(project_id).await?;
+    let mut existing_members: Vec<(Uuid, Vec<String>)> = Vec::new();
+    for skill in &existing_skills {
+        let (notes, _decisions) = graph_store.get_skill_members(skill.id).await?;
+        let member_ids: Vec<String> = notes.iter().map(|n| n.id.to_string()).collect();
+        existing_members.push((skill.id, member_ids));
+    }
+
+    // Step 4: Deduplicate
+    let outcomes = deduplicate_candidates(
+        detection.candidates,
+        &existing_members,
+        config.overlap_threshold,
+    );
+
+    let skills_created = outcomes
+        .iter()
+        .filter(|o| matches!(o, DeduplicationOutcome::New(_)))
+        .count();
+    let skills_updated = outcomes
+        .iter()
+        .filter(|o| matches!(o, DeduplicationOutcome::Merge { .. }))
+        .count();
+
+    // Step 5: Fetch notes for conversion
+    let mut notes_map: HashMap<String, crate::notes::Note> = HashMap::new();
+    for outcome in &outcomes {
+        let note_ids = match outcome {
+            DeduplicationOutcome::New(c) => &c.member_note_ids,
+            DeduplicationOutcome::Merge { candidate, .. } => &candidate.member_note_ids,
+        };
+        for note_id_str in note_ids {
+            if !notes_map.contains_key(note_id_str) {
+                if let Ok(uuid) = uuid::Uuid::parse_str(note_id_str) {
+                    if let Ok(Some(note)) = graph_store.get_note(uuid).await {
+                        notes_map.insert(note_id_str.clone(), note);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 6: Persist skills
+    let skill_ids = persist_detected_skills(
+        graph_store,
+        &outcomes,
+        &notes_map,
+        project_id,
+        detection.total_notes,
+    )
+    .await?;
+
+    // Step 7: Generate triggers and templates for each skill
+    // Fetch all project notes for quality evaluation
+    let all_project_notes = {
+        let filters = crate::notes::NoteFilters {
+            limit: Some(1000),
+            ..Default::default()
+        };
+        let (notes, _) = graph_store
+            .list_notes(Some(project_id), None, &filters)
+            .await?;
+        notes
+    };
+
+    for skill_id in &skill_ids {
+        if let Ok(Some(mut skill)) = graph_store.get_skill(*skill_id).await {
+            // Get member notes for this skill
+            let (member_notes, _) = graph_store.get_skill_members(*skill_id).await?;
+
+            // Generate triggers (no embeddings for now)
+            let embeddings = HashMap::new();
+            let trigger_result = crate::skills::triggers::generate_all_triggers(
+                &member_notes,
+                &all_project_notes,
+                &embeddings,
+            );
+            skill.trigger_patterns = trigger_result.triggers;
+
+            // Generate context template
+            skill.context_template = Some(crate::skills::templates::generate_context_template(
+                &skill.name,
+                &skill.description,
+                &member_notes,
+            ));
+
+            skill.updated_at = chrono::Utc::now();
+            graph_store.update_skill(&skill).await?;
+        }
+    }
+
+    let message = format!(
+        "Detected {} candidates from {} notes/{} synapses (modularity: {:.3}). Created {} new, updated {} existing skills.",
+        skills_detected,
+        detection.total_notes,
+        detection.total_synapses,
+        detection.modularity,
+        skills_created,
+        skills_updated
+    );
+
+    Ok(DetectSkillsPipelineResult {
+        status: ClusterDetectionStatus::Success,
+        skills_detected,
+        skills_created,
+        skills_updated,
+        total_notes: detection.total_notes,
+        total_synapses: detection.total_synapses,
+        modularity: detection.modularity,
+        message,
+        skill_ids,
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

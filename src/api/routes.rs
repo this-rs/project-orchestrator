@@ -762,6 +762,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/admin/bootstrap-knowledge-fabric",
             post(handlers::bootstrap_knowledge_fabric),
         )
+        .route(
+            "/api/admin/detect-skills",
+            post(handlers::detect_skills),
+        )
         // ================================================================
         // Workspaces
         // ================================================================

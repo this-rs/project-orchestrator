@@ -1931,6 +1931,59 @@ pub async fn bootstrap_knowledge_fabric(
 }
 
 // ============================================================================
+// Skill Detection
+// ============================================================================
+
+/// Request to run skill detection pipeline
+#[derive(Deserialize)]
+pub struct DetectSkillsRequest {
+    pub project_id: Uuid,
+}
+
+/// Run the full skill detection pipeline for a project
+pub async fn detect_skills(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<DetectSkillsRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    // Verify project exists
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let config = crate::skills::SkillDetectionConfig::default();
+    let start = std::time::Instant::now();
+
+    let result = crate::skills::detect_skills_pipeline(
+        state.orchestrator.neo4j(),
+        project_id,
+        &config,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "status": format!("{:?}", result.status),
+        "skills_detected": result.skills_detected,
+        "skills_created": result.skills_created,
+        "skills_updated": result.skills_updated,
+        "total_notes": result.total_notes,
+        "total_synapses": result.total_synapses,
+        "modularity": result.modularity,
+        "message": result.message,
+        "skill_ids": result.skill_ids,
+        "elapsed_ms": elapsed_ms,
+    })))
+}
+
+// ============================================================================
 // Releases
 // ============================================================================
 
