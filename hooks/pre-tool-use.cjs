@@ -192,6 +192,100 @@ function recordInjection(cache, skillId, context) {
 // ============================================================================
 
 /**
+ * Extract a file path from tool input, depending on the tool type.
+ * Returns the first absolute path found, or null.
+ */
+function extractFilePath(toolName, toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return null;
+
+  // Direct file_path fields (Read, Edit, Write, Glob path, NotebookEdit)
+  if (toolInput.file_path && typeof toolInput.file_path === 'string' && toolInput.file_path.startsWith('/')) {
+    return toolInput.file_path;
+  }
+
+  // Grep path field
+  if (toolInput.path && typeof toolInput.path === 'string' && toolInput.path.startsWith('/')) {
+    return toolInput.path;
+  }
+
+  // Bash: try to extract a path from the command string
+  if (toolName === 'Bash' && toolInput.command && typeof toolInput.command === 'string') {
+    // Look for absolute paths in the command
+    const pathMatch = toolInput.command.match(/(?:^|\s)(\/[^\s;|&>"']+)/);
+    if (pathMatch) return pathMatch[1];
+  }
+
+  // MCP tools: check various path fields
+  if (toolName.startsWith('mcp__')) {
+    for (const field of ['file_path', 'path', 'target', 'node_path', 'root_path', 'cwd']) {
+      const val = toolInput[field];
+      if (val && typeof val === 'string' && val.startsWith('/')) {
+        return val;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * GET resolve-project from the PO server with a very short timeout (50ms).
+ * Returns { project_id, slug, root_path } or null on any failure/timeout.
+ */
+function getResolveProject(port, filePath) {
+  return new Promise((resolve) => {
+    const encodedPath = encodeURIComponent(filePath);
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: port,
+        path: `/api/hooks/resolve-project?path=${encodedPath}`,
+        method: 'GET',
+        timeout: 50,
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          clearTimeout(timeoutId);
+          debug(`resolve-project returned ${res.statusCode}`);
+          resolve(null);
+          return;
+        }
+
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          clearTimeout(timeoutId);
+          try {
+            resolve(JSON.parse(body));
+          } catch (_) {
+            resolve(null);
+          }
+        });
+      }
+    );
+
+    req.on('error', (err) => {
+      clearTimeout(timeoutId);
+      debug(`resolve-project error: ${err.message}`);
+      resolve(null);
+    });
+
+    req.on('timeout', () => {
+      debug('resolve-project socket timeout');
+      req.destroy();
+    });
+
+    const timeoutId = setTimeout(() => {
+      debug('resolve-project timeout');
+      req.destroy();
+      resolve(null);
+    }, 50);
+
+    req.end();
+  });
+}
+
+/**
  * POST JSON to the PO server with strict timeout.
  * Returns parsed response body or null on any failure.
  */
@@ -338,6 +432,19 @@ async function main() {
 
   const port = config.port || DEFAULT_PORT;
 
+  // 4b. Resolve project from file path (if tool_input contains one)
+  //     This allows the hook to resolve the correct project when the agent
+  //     works on files outside the .po-config project (multi-project workspace).
+  let projectId = config.project_id;
+  const filePath = extractFilePath(toolName, toolInput);
+  if (filePath) {
+    const resolved = await getResolveProject(port, filePath);
+    if (resolved && resolved.project_id && resolved.project_id !== projectId) {
+      debug(`Resolved project from path: ${resolved.slug} (${resolved.project_id})`);
+      projectId = resolved.project_id;
+    }
+  }
+
   // 5. Load cache & check throttle
   const cache = readCache();
 
@@ -349,12 +456,12 @@ async function main() {
 
   // 6. Call the PO server
   const payload = {
-    project_id: config.project_id,
+    project_id: projectId,
     tool_name: toolName,
     tool_input: toolInput || {},
   };
 
-  debug(`Activating: tool=${toolName} project=${config.project_id}`);
+  debug(`Activating: tool=${toolName} project=${projectId}`);
 
   const response = await postActivate(port, payload);
   if (!response || !response.context) {

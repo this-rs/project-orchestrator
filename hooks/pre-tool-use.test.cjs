@@ -95,6 +95,117 @@ assert(!isActivatable('mcp_single'),      'mcp_ single underscore is NOT activat
 assert(!isActivatable('xmcp__fake'),      'xmcp__ non-prefix is NOT activatable');
 
 // ============================================================================
+// Replicate extractFilePath from pre-tool-use.cjs
+// ============================================================================
+
+function extractFilePath(toolName, toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return null;
+
+  if (toolInput.file_path && typeof toolInput.file_path === 'string' && toolInput.file_path.startsWith('/')) {
+    return toolInput.file_path;
+  }
+
+  if (toolInput.path && typeof toolInput.path === 'string' && toolInput.path.startsWith('/')) {
+    return toolInput.path;
+  }
+
+  if (toolName === 'Bash' && toolInput.command && typeof toolInput.command === 'string') {
+    const pathMatch = toolInput.command.match(/(?:^|\s)(\/[^\s;|&>"']+)/);
+    if (pathMatch) return pathMatch[1];
+  }
+
+  if (toolName.startsWith('mcp__')) {
+    for (const field of ['file_path', 'path', 'target', 'node_path', 'root_path', 'cwd']) {
+      const val = toolInput[field];
+      if (val && typeof val === 'string' && val.startsWith('/')) {
+        return val;
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================================
+// Tests: extractFilePath
+// ============================================================================
+
+process.stderr.write('\n--- extractFilePath: native tools ---\n');
+assert(
+  extractFilePath('Read', { file_path: '/Users/dev/src/main.rs' }) === '/Users/dev/src/main.rs',
+  'Read extracts file_path'
+);
+assert(
+  extractFilePath('Edit', { file_path: '/Users/dev/src/lib.rs', old_string: 'a', new_string: 'b' }) === '/Users/dev/src/lib.rs',
+  'Edit extracts file_path'
+);
+assert(
+  extractFilePath('Write', { file_path: '/tmp/output.txt', content: 'hello' }) === '/tmp/output.txt',
+  'Write extracts file_path'
+);
+assert(
+  extractFilePath('Grep', { pattern: 'foo', path: '/Users/dev/src' }) === '/Users/dev/src',
+  'Grep extracts path'
+);
+assert(
+  extractFilePath('Grep', { pattern: 'foo' }) === null,
+  'Grep without path returns null'
+);
+assert(
+  extractFilePath('Read', { file_path: 'relative/path.rs' }) === null,
+  'Relative file_path returns null'
+);
+
+process.stderr.write('\n--- extractFilePath: Bash ---\n');
+assert(
+  extractFilePath('Bash', { command: 'cargo test /Users/dev/src/test.rs' }) === '/Users/dev/src/test.rs',
+  'Bash extracts absolute path from command'
+);
+assert(
+  extractFilePath('Bash', { command: 'ls -la' }) === null,
+  'Bash without absolute path returns null'
+);
+assert(
+  extractFilePath('Bash', { command: 'cat /etc/passwd' }) === '/etc/passwd',
+  'Bash extracts path after command'
+);
+
+process.stderr.write('\n--- extractFilePath: MCP tools ---\n');
+assert(
+  extractFilePath('mcp__project-orchestrator__code', { action: 'get_file_symbols', file_path: '/Users/dev/src/main.rs' }) === '/Users/dev/src/main.rs',
+  'MCP code.get_file_symbols extracts file_path'
+);
+assert(
+  extractFilePath('mcp__project-orchestrator__code', { action: 'analyze_impact', target: '/Users/dev/src/api.rs' }) === '/Users/dev/src/api.rs',
+  'MCP code.analyze_impact extracts target'
+);
+assert(
+  extractFilePath('mcp__project-orchestrator__admin', { action: 'sync_directory', path: '/Users/dev/project' }) === '/Users/dev/project',
+  'MCP admin.sync_directory extracts path'
+);
+assert(
+  extractFilePath('mcp__project-orchestrator__code', { action: 'get_node_importance', node_path: '/Users/dev/src/lib.rs' }) === '/Users/dev/src/lib.rs',
+  'MCP code.get_node_importance extracts node_path'
+);
+assert(
+  extractFilePath('mcp__project-orchestrator__chat', { action: 'send_message', cwd: '/Users/dev/project' }) === '/Users/dev/project',
+  'MCP chat.send_message extracts cwd'
+);
+assert(
+  extractFilePath('mcp__project-orchestrator__task', { action: 'create', title: 'foo' }) === null,
+  'MCP task.create without path returns null'
+);
+
+process.stderr.write('\n--- extractFilePath: edge cases ---\n');
+assert(extractFilePath('Read', null) === null, 'null toolInput returns null');
+assert(extractFilePath('Read', 'string') === null, 'string toolInput returns null');
+assert(extractFilePath('Read', {}) === null, 'empty object returns null');
+assert(
+  extractFilePath('Read', { file_path: '' }) === null,
+  'empty file_path returns null'
+);
+
+// ============================================================================
 // Summary
 // ============================================================================
 
