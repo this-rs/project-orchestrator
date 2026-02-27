@@ -7,7 +7,8 @@
 //! Performance budget: < 200ms P99 for the complete request cycle.
 
 use super::handlers::{AppError, OrchestratorState};
-use crate::skills::activation::{activate_for_hook, HookActivationConfig};
+use crate::neurons::AutoReinforcementConfig;
+use crate::skills::activation::{activate_for_hook, spawn_hook_reinforcement, HookActivationConfig};
 use crate::skills::models::HookActivateRequest;
 use axum::{
     extract::State,
@@ -149,10 +150,20 @@ pub async fn activate_hook(
     })?;
 
     match result {
-        Some(response) => Ok((
-            StatusCode::OK,
-            Json(serde_json::to_value(&response).unwrap_or_default()),
-        )),
+        Some(outcome) => {
+            // Spawn async Hebbian reinforcement (fire-and-forget, never blocks response)
+            let reinforcement_config = AutoReinforcementConfig::default();
+            spawn_hook_reinforcement(
+                state.orchestrator.neo4j_arc(),
+                outcome.activated_note_ids,
+                reinforcement_config,
+            );
+
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::to_value(&outcome.response).unwrap_or_default()),
+            ))
+        }
         None => Ok((
             StatusCode::NO_CONTENT,
             Json(serde_json::json!(null)),

@@ -21,7 +21,11 @@
 use regex::Regex;
 use uuid::Uuid;
 
+use std::sync::Arc;
+
 use crate::neo4j::models::DecisionNode;
+use crate::neo4j::traits::GraphStore;
+use crate::neurons::AutoReinforcementConfig;
 use crate::notes::models::Note;
 use crate::skills::hook_extractor::{extract_file_context, extract_pattern};
 use crate::skills::models::{HookActivateResponse, SkillNode, TriggerType};
@@ -60,6 +64,18 @@ impl Default for HookActivationConfig {
     }
 }
 
+/// Result of the activation pipeline, containing both the response
+/// to send back and the note IDs needed for async reinforcement.
+///
+/// This is NOT serialized directly — the handler extracts `response` for
+/// the HTTP body and `activated_note_ids` for the reinforcement spawn.
+pub struct HookActivationOutcome {
+    /// The response to return to the hook caller.
+    pub response: HookActivateResponse,
+    /// IDs of notes included in the context — used for Hebbian reinforcement.
+    pub activated_note_ids: Vec<Uuid>,
+}
+
 // ============================================================================
 // Main activation function
 // ============================================================================
@@ -78,12 +94,12 @@ impl Default for HookActivationConfig {
 /// Target: < 150ms total. The bottleneck is the DB call to load skills
 /// and their members. Trigger matching is done locally in <1ms.
 pub async fn activate_for_hook(
-    graph_store: &dyn crate::neo4j::traits::GraphStore,
+    graph_store: &dyn GraphStore,
     project_id: Uuid,
     tool_name: &str,
     tool_input: &serde_json::Value,
     config: &HookActivationConfig,
-) -> anyhow::Result<Option<HookActivateResponse>> {
+) -> anyhow::Result<Option<HookActivationOutcome>> {
     // 1. Extract pattern and file context from tool input
     let pattern = extract_pattern(tool_name, tool_input);
     let file_context = extract_file_context(tool_name, tool_input);
@@ -163,13 +179,18 @@ pub async fn activate_for_hook(
             config.max_context_chars,
         );
 
-        Ok(Some(HookActivateResponse {
-            context,
-            skill_name: merged_name,
-            skill_id: skill1.id, // Use primary skill's ID
-            confidence: conf1,
-            notes_count: active_notes.len(),
-            decisions_count: all_decisions.len(),
+        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+
+        Ok(Some(HookActivationOutcome {
+            response: HookActivateResponse {
+                context,
+                skill_name: merged_name,
+                skill_id: skill1.id, // Use primary skill's ID
+                confidence: conf1,
+                notes_count: active_notes.len(),
+                decisions_count: all_decisions.len(),
+            },
+            activated_note_ids,
         }))
     } else {
         // Single top skill
@@ -188,13 +209,18 @@ pub async fn activate_for_hook(
             config.max_context_chars,
         );
 
-        Ok(Some(HookActivateResponse {
-            context,
-            skill_name: skill.name.clone(),
-            skill_id: skill.id,
-            confidence,
-            notes_count: active_notes.len(),
-            decisions_count: decisions.len(),
+        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+
+        Ok(Some(HookActivationOutcome {
+            response: HookActivateResponse {
+                context,
+                skill_name: skill.name.clone(),
+                skill_id: skill.id,
+                confidence,
+                notes_count: active_notes.len(),
+                decisions_count: decisions.len(),
+            },
+            activated_note_ids,
         }))
     }
 }
@@ -383,6 +409,73 @@ pub fn assemble_context(
     }
 
     context
+}
+
+// ============================================================================
+// Hebbian reinforcement (async, fire-and-forget)
+// ============================================================================
+
+/// Spawn async Hebbian reinforcement after a successful hook activation.
+///
+/// This is fire-and-forget: errors are logged but never propagated.
+/// The function returns immediately (< 1ms) — all DB work runs in the
+/// background via `tokio::spawn`.
+///
+/// Reinforcement actions:
+/// 1. Boost energy of each activated note by `hook_energy_boost`
+/// 2. Reinforce synapses between all co-activated notes by `hook_synapse_boost`
+pub fn spawn_hook_reinforcement(
+    graph_store: Arc<dyn GraphStore>,
+    activated_note_ids: Vec<Uuid>,
+    config: AutoReinforcementConfig,
+) {
+    if !config.enabled || activated_note_ids.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        if let Err(e) =
+            reinforce_hook_activation(&*graph_store, &activated_note_ids, &config).await
+        {
+            tracing::warn!(
+                notes_count = activated_note_ids.len(),
+                "Hook Hebbian reinforcement failed: {}",
+                e
+            );
+        }
+    });
+}
+
+/// Perform Hebbian reinforcement for activated notes.
+///
+/// This is the actual DB work — called inside a `tokio::spawn` by
+/// `spawn_hook_reinforcement`. NOT intended to be called directly
+/// from request handlers.
+async fn reinforce_hook_activation(
+    graph_store: &dyn GraphStore,
+    note_ids: &[Uuid],
+    config: &AutoReinforcementConfig,
+) -> anyhow::Result<()> {
+    // 1. Boost energy for each activated note
+    for &note_id in note_ids {
+        graph_store
+            .boost_energy(note_id, config.hook_energy_boost)
+            .await?;
+    }
+
+    // 2. Reinforce synapses between co-activated notes
+    if note_ids.len() >= 2 {
+        let reinforced = graph_store
+            .reinforce_synapses(note_ids, config.hook_synapse_boost)
+            .await?;
+        tracing::debug!(
+            notes = note_ids.len(),
+            synapses = reinforced,
+            "Hook Hebbian reinforcement completed"
+        );
+    }
+
+    Ok(())
 }
 
 /// Get emoji prefix for a note type.

@@ -111,6 +111,16 @@ pub struct AutoReinforcementConfig {
     /// When a chat message mentions 3 entities, notes of those entities are
     /// co-activated → reinforce_synapses between them with this boost.
     pub chat_synapse_boost: f64,
+
+    /// Energy boost per note when activated by a Claude Code hook.
+    /// Hook activation means the note's skill matched a tool input pattern
+    /// and the note was included in the injected context.
+    pub hook_energy_boost: f64,
+
+    /// Synapse weight boost between notes co-activated by the same hook.
+    /// When a skill is activated, all its member notes that were included
+    /// in the context are co-activated → reinforce_synapses with this boost.
+    pub hook_synapse_boost: f64,
 }
 
 impl Default for AutoReinforcementConfig {
@@ -124,6 +134,8 @@ impl Default for AutoReinforcementConfig {
             context_energy_boost: 0.05,
             chat_energy_boost: 0.05,
             chat_synapse_boost: 0.02,
+            hook_energy_boost: 0.1,
+            hook_synapse_boost: 0.03,
         }
     }
 }
@@ -143,5 +155,20 @@ mod tests {
         assert_eq!(config.max_results, 10);
         assert!((config.propagated_ratio - 0.4).abs() < f64::EPSILON);
         assert!((config.connectivity_boost - 0.02).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_auto_reinforcement_config_defaults() {
+        let config = AutoReinforcementConfig::default();
+        assert!(config.enabled);
+        assert!((config.search_energy_boost - 0.1).abs() < f64::EPSILON);
+        assert!((config.search_synapse_boost - 0.03).abs() < f64::EPSILON);
+        assert!((config.commit_energy_boost - 0.15).abs() < f64::EPSILON);
+        assert!((config.commit_synapse_boost - 0.03).abs() < f64::EPSILON);
+        assert!((config.context_energy_boost - 0.05).abs() < f64::EPSILON);
+        assert!((config.chat_energy_boost - 0.05).abs() < f64::EPSILON);
+        assert!((config.chat_synapse_boost - 0.02).abs() < f64::EPSILON);
+        assert!((config.hook_energy_boost - 0.1).abs() < f64::EPSILON);
+        assert!((config.hook_synapse_boost - 0.03).abs() < f64::EPSILON);
     }
 }
