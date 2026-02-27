@@ -1708,7 +1708,9 @@ impl Neo4jClient {
                         let q = query(cypher)
                             .param("items", chunk.to_vec())
                             .param("project_id", pid_str.clone());
-                        let _ = self.graph.run(q).await;
+                        if let Err(e) = self.graph.run(q).await {
+                            tracing::warn!("batch_create_call_relationships Phase 2 (project) chunk failed: {}", e);
+                        }
                     }
                 }
                 None => {
@@ -1726,7 +1728,9 @@ impl Neo4jClient {
                         "#;
                     for chunk in unresolved.chunks(BATCH_SIZE) {
                         let q = query(cypher).param("items", chunk.to_vec());
-                        let _ = self.graph.run(q).await;
+                        if let Err(e) = self.graph.run(q).await {
+                            tracing::warn!("batch_create_call_relationships Phase 2 (global) chunk failed: {}", e);
+                        }
                     }
                 }
             }
@@ -1821,7 +1825,12 @@ impl Neo4jClient {
                 "#;
             for chunk in unresolved.chunks(BATCH_SIZE) {
                 let q = query(phase2_cypher).param("items", chunk.to_vec());
-                let _ = self.graph.run(q).await;
+                if let Err(e) = self.graph.run(q).await {
+                    tracing::warn!(
+                        "batch_create_extends_relationships Phase 2 chunk failed: {}",
+                        e
+                    );
+                }
             }
         }
 

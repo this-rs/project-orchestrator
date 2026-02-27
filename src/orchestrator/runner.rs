@@ -2912,7 +2912,22 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         parsed_path,
                         &ctx.suffix_index,
                     ),
-                    "scala" => Self::resolve_scala_import_indexed(&import.path, &ctx.suffix_index),
+                    "scala" => {
+                        // Expand selective imports: if items are populated (e.g. {A, B}),
+                        // resolve each as "base_path.item" individually.
+                        if !import.items.is_empty() {
+                            import
+                                .items
+                                .iter()
+                                .flat_map(|item| {
+                                    let full_path = format!("{}.{}", import.path, item);
+                                    Self::resolve_scala_import_indexed(&full_path, &ctx.suffix_index)
+                                })
+                                .collect()
+                        } else {
+                            Self::resolve_scala_import_indexed(&import.path, &ctx.suffix_index)
+                        }
+                    }
                     "kotlin" => {
                         Self::resolve_kotlin_import_indexed(&import.path, &ctx.suffix_index)
                     }
