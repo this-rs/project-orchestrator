@@ -3138,6 +3138,7 @@ dependencies = [
  "petgraph",
  "rand 0.10.0",
  "rayon",
+ "regex",
  "reqwest 0.12.28",
  "rust-embed",
  "rustworkx-core",

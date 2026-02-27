@@ -92,6 +92,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Home directory detection
 dirs = "6"
+regex = "1.12.3"
 
 # Unix process signaling (SIGINT to process group for interrupt)
 [target.'cfg(unix)'.dependencies]

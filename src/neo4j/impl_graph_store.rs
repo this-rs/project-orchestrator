@@ -2292,90 +2292,90 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
-    // Skill operations — stubs (will be implemented in neo4j/skill.rs, Task 5)
+    // Skill operations (delegates to neo4j/skill.rs)
     // ========================================================================
 
-    async fn create_skill(&self, _skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+    async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        self.create_skill(skill).await
     }
 
     async fn get_skill(
         &self,
-        _id: uuid::Uuid,
+        id: uuid::Uuid,
     ) -> anyhow::Result<Option<crate::skills::SkillNode>> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.get_skill(id).await
     }
 
-    async fn update_skill(&self, _skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+    async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        self.update_skill(skill).await
     }
 
-    async fn delete_skill(&self, _id: uuid::Uuid) -> anyhow::Result<bool> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+    async fn delete_skill(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        self.delete_skill(id).await
     }
 
     async fn list_skills(
         &self,
-        _project_id: uuid::Uuid,
-        _status: Option<crate::skills::SkillStatus>,
-        _limit: usize,
-        _offset: usize,
+        project_id: uuid::Uuid,
+        status: Option<crate::skills::SkillStatus>,
+        limit: usize,
+        offset: usize,
     ) -> anyhow::Result<(Vec<crate::skills::SkillNode>, usize)> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.list_skills(project_id, status, limit, offset).await
     }
 
     async fn get_skill_members(
         &self,
-        _skill_id: uuid::Uuid,
+        skill_id: uuid::Uuid,
     ) -> anyhow::Result<(Vec<crate::notes::Note>, Vec<crate::neo4j::models::DecisionNode>)> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.get_skill_members(skill_id).await
     }
 
     async fn add_skill_member(
         &self,
-        _skill_id: uuid::Uuid,
-        _entity_type: &str,
-        _entity_id: uuid::Uuid,
+        skill_id: uuid::Uuid,
+        entity_type: &str,
+        entity_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.add_skill_member(skill_id, entity_type, entity_id).await
     }
 
     async fn remove_skill_member(
         &self,
-        _skill_id: uuid::Uuid,
-        _entity_type: &str,
-        _entity_id: uuid::Uuid,
+        skill_id: uuid::Uuid,
+        entity_type: &str,
+        entity_id: uuid::Uuid,
     ) -> anyhow::Result<bool> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.remove_skill_member(skill_id, entity_type, entity_id).await
     }
 
     async fn get_skills_for_note(
         &self,
-        _note_id: uuid::Uuid,
+        note_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.get_skills_for_note(note_id).await
     }
 
     async fn get_skills_for_project(
         &self,
-        _project_id: uuid::Uuid,
+        project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.get_skills_for_project(project_id).await
     }
 
     async fn activate_skill(
         &self,
-        _skill_id: uuid::Uuid,
-        _query: &str,
+        skill_id: uuid::Uuid,
+        query: &str,
     ) -> anyhow::Result<crate::skills::ActivatedSkillContext> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.activate_skill(skill_id, query).await
     }
 
     async fn match_skills_by_trigger(
         &self,
-        _project_id: uuid::Uuid,
-        _input: &str,
+        project_id: uuid::Uuid,
+        input: &str,
     ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
-        anyhow::bail!("Skill operations not yet implemented — see Plan 1, Task 5")
+        self.match_skills_by_trigger(project_id, input).await
     }
 }

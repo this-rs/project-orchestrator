@@ -1749,7 +1749,7 @@ impl Neo4jClient {
     }
 
     // Helper function to convert Neo4j node to Note
-    fn node_to_note(&self, node: &neo4rs::Node) -> Result<Note> {
+    pub(crate) fn node_to_note(&self, node: &neo4rs::Node) -> Result<Note> {
         let scope_type: String = node
             .get("scope_type")
             .unwrap_or_else(|_| "project".to_string());
