@@ -304,9 +304,25 @@ fn regex_escape(s: &str) -> String {
 
 /// Known MCP mega-tool names that can appear in tags.
 const MCP_MEGA_TOOLS: &[&str] = &[
-    "project", "plan", "task", "step", "decision", "constraint", "release",
-    "milestone", "commit", "note", "workspace", "workspace_milestone",
-    "resource", "component", "chat", "feature_graph", "code", "admin", "skill",
+    "project",
+    "plan",
+    "task",
+    "step",
+    "decision",
+    "constraint",
+    "release",
+    "milestone",
+    "commit",
+    "note",
+    "workspace",
+    "workspace_milestone",
+    "resource",
+    "component",
+    "chat",
+    "feature_graph",
+    "code",
+    "admin",
+    "skill",
 ];
 
 /// Generate McpAction triggers from notes tagged with MCP-related tags.
@@ -1138,7 +1154,10 @@ mod tests {
     #[test]
     fn test_mcp_action_triggers_empty_notes() {
         let triggers = generate_mcp_action_triggers(&[]);
-        assert!(triggers.is_empty(), "Empty notes should produce no triggers");
+        assert!(
+            triggers.is_empty(),
+            "Empty notes should produce no triggers"
+        );
     }
 
     #[test]
@@ -1178,18 +1197,29 @@ mod tests {
             make_mcp_note(vec!["refactor"], "Unrelated 2"),
         ];
         let triggers = generate_mcp_action_triggers(&notes);
-        assert!(!triggers.is_empty(), "60% mcp-usage should generate triggers");
+        assert!(
+            !triggers.is_empty(),
+            "60% mcp-usage should generate triggers"
+        );
 
         // "note" appears 2 times → should have a trigger
         let note_trigger = triggers.iter().find(|t| t.pattern_value == "note");
-        assert!(note_trigger.is_some(), "Expected trigger for 'note' mega-tool");
+        assert!(
+            note_trigger.is_some(),
+            "Expected trigger for 'note' mega-tool"
+        );
 
         // "task" appears only 1 time and there are 5 notes → min_freq=2, so no trigger for task
         let task_trigger = triggers.iter().find(|t| t.pattern_value == "task");
-        assert!(task_trigger.is_none(), "task appears only once with 5 notes (min_freq=2)");
+        assert!(
+            task_trigger.is_none(),
+            "task appears only once with 5 notes (min_freq=2)"
+        );
 
         // All triggers should be McpAction type
-        assert!(triggers.iter().all(|t| t.pattern_type == TriggerType::McpAction));
+        assert!(triggers
+            .iter()
+            .all(|t| t.pattern_type == TriggerType::McpAction));
     }
 
     #[test]
@@ -1200,7 +1230,11 @@ mod tests {
             make_mcp_note(vec!["mcp-usage", "commit"], "Commit guide"),
         ];
         let triggers = generate_mcp_action_triggers(&notes);
-        assert_eq!(triggers.len(), 2, "With 2 notes, min_freq=1, both tools should trigger");
+        assert_eq!(
+            triggers.len(),
+            2,
+            "With 2 notes, min_freq=1, both tools should trigger"
+        );
 
         let tools: Vec<&str> = triggers.iter().map(|t| t.pattern_value.as_str()).collect();
         assert!(tools.contains(&"note"), "Expected 'note' trigger");
@@ -1211,12 +1245,52 @@ mod tests {
     fn test_mcp_action_triggers_caps_at_5() {
         // Create notes with many different mega-tool tags, all mcp-usage
         let notes = vec![
-            make_mcp_note(vec!["mcp-usage", "note", "task", "plan", "step", "commit", "decision", "release"], "Multi-tool note 1"),
-            make_mcp_note(vec!["mcp-usage", "note", "task", "plan", "step", "commit", "decision", "release"], "Multi-tool note 2"),
-            make_mcp_note(vec!["mcp-usage", "note", "task", "plan", "step", "commit", "decision", "milestone"], "Multi-tool note 3"),
+            make_mcp_note(
+                vec![
+                    "mcp-usage",
+                    "note",
+                    "task",
+                    "plan",
+                    "step",
+                    "commit",
+                    "decision",
+                    "release",
+                ],
+                "Multi-tool note 1",
+            ),
+            make_mcp_note(
+                vec![
+                    "mcp-usage",
+                    "note",
+                    "task",
+                    "plan",
+                    "step",
+                    "commit",
+                    "decision",
+                    "release",
+                ],
+                "Multi-tool note 2",
+            ),
+            make_mcp_note(
+                vec![
+                    "mcp-usage",
+                    "note",
+                    "task",
+                    "plan",
+                    "step",
+                    "commit",
+                    "decision",
+                    "milestone",
+                ],
+                "Multi-tool note 3",
+            ),
         ];
         let triggers = generate_mcp_action_triggers(&notes);
-        assert!(triggers.len() <= 5, "Should cap at 5 triggers, got {}", triggers.len());
+        assert!(
+            triggers.len() <= 5,
+            "Should cap at 5 triggers, got {}",
+            triggers.len()
+        );
     }
 
     #[test]
@@ -1240,11 +1314,17 @@ mod tests {
     fn test_mcp_action_triggers_ignores_non_mega_tool_tags() {
         // Tags that aren't in MCP_MEGA_TOOLS should be ignored
         let notes = vec![
-            make_mcp_note(vec!["mcp-usage", "custom-tag", "api-handler"], "Custom tool guide"),
+            make_mcp_note(
+                vec!["mcp-usage", "custom-tag", "api-handler"],
+                "Custom tool guide",
+            ),
             make_mcp_note(vec!["mcp-usage", "random", "stuff"], "Random guide"),
         ];
         let triggers = generate_mcp_action_triggers(&notes);
-        assert!(triggers.is_empty(), "Non mega-tool tags should not generate triggers");
+        assert!(
+            triggers.is_empty(),
+            "Non mega-tool tags should not generate triggers"
+        );
     }
 
     #[test]

@@ -427,7 +427,9 @@ pub async fn resolve_project(
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let input_path = query.path.trim();
     if input_path.is_empty() {
-        return Err(AppError::BadRequest("path parameter is required".to_string()));
+        return Err(AppError::BadRequest(
+            "path parameter is required".to_string(),
+        ));
     }
 
     // Normalize the input path (expand ~ if present)
@@ -1061,8 +1063,7 @@ mod tests {
             "/Users/dev/projects/my-project",
         )];
 
-        let result =
-            find_longest_prefix_match(&entries, "/Users/dev/other-dir/something.rs");
+        let result = find_longest_prefix_match(&entries, "/Users/dev/other-dir/something.rs");
         assert!(result.is_none());
     }
 
@@ -1090,10 +1091,7 @@ mod tests {
         assert_eq!(result.unwrap().slug, "sub-project");
 
         // File in workspace root → should match workspace
-        let result = find_longest_prefix_match(
-            &entries,
-            "/Users/dev/workspace/README.md",
-        );
+        let result = find_longest_prefix_match(&entries, "/Users/dev/workspace/README.md");
         assert!(result.is_some());
         assert_eq!(result.unwrap().slug, "workspace");
     }

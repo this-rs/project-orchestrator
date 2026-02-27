@@ -208,7 +208,10 @@ const MCP_KEY_FIELDS: &[(&str, &[&str])] = &[
         ],
     ),
     // Skills — activation and management
-    ("skill", &["query", "name", "description", "context_template"]),
+    (
+        "skill",
+        &["query", "name", "description", "context_template"],
+    ),
     // Tasks — work units
     (
         "task",
@@ -227,10 +230,7 @@ const MCP_KEY_FIELDS: &[(&str, &[&str])] = &[
     // Commits — git tracking
     ("commit", &["message", "sha", "file_path", "task_id"]),
     // Feature graphs
-    (
-        "feature_graph",
-        &["name", "description", "entry_function"],
-    ),
+    ("feature_graph", &["name", "description", "entry_function"]),
     // Milestones
     ("milestone", &["title", "description"]),
     // Releases
@@ -919,7 +919,8 @@ mod tests {
 
     #[test]
     fn test_mcp_task_create() {
-        let input = json!({"action": "create", "plan_id": "abc-123", "title": "Implement auth middleware"});
+        let input =
+            json!({"action": "create", "plan_id": "abc-123", "title": "Implement auth middleware"});
         // title (1st key) + plan_id (2nd key) both extracted
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__task", &input),
@@ -959,7 +960,8 @@ mod tests {
 
     #[test]
     fn test_mcp_plan_create() {
-        let input = json!({"action": "create", "title": "Hook Augmentation for MCP", "priority": 85});
+        let input =
+            json!({"action": "create", "title": "Hook Augmentation for MCP", "priority": 85});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__plan", &input),
             Some("plan create Hook Augmentation for MCP".to_string())
@@ -1138,7 +1140,8 @@ mod tests {
 
     #[test]
     fn test_mcp_commit_create() {
-        let input = json!({"action": "create", "sha": "abc123", "message": "feat: add MCP hook support"});
+        let input =
+            json!({"action": "create", "sha": "abc123", "message": "feat: add MCP hook support"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__commit", &input),
             Some("commit create feat: add MCP hook support abc123".to_string())
@@ -1160,7 +1163,8 @@ mod tests {
 
     #[test]
     fn test_mcp_feature_graph_auto_build() {
-        let input = json!({"action": "auto_build", "name": "Auth Flow", "entry_function": "login_handler"});
+        let input =
+            json!({"action": "auto_build", "name": "Auth Flow", "entry_function": "login_handler"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__feature_graph", &input),
             Some("feature_graph auto_build Auth Flow login_handler".to_string())
@@ -1226,7 +1230,8 @@ mod tests {
 
     #[test]
     fn test_mcp_resource_create() {
-        let input = json!({"action": "create", "name": "OpenAPI schema", "file_path": "/api/openapi.yaml"});
+        let input =
+            json!({"action": "create", "name": "OpenAPI schema", "file_path": "/api/openapi.yaml"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__resource", &input),
             Some("resource create OpenAPI schema /api/openapi.yaml".to_string())
@@ -1237,7 +1242,8 @@ mod tests {
 
     #[test]
     fn test_mcp_component_create() {
-        let input = json!({"action": "create", "name": "Auth Service", "description": "JWT + OIDC"});
+        let input =
+            json!({"action": "create", "name": "Auth Service", "description": "JWT + OIDC"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__component", &input),
             Some("component create Auth Service JWT + OIDC".to_string())

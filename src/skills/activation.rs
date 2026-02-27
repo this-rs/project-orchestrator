@@ -754,7 +754,7 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::notes::models::{NoteImportance, NoteScope, NoteStatus, NoteType};
-    use crate::skills::models::{SkillNode, SkillTrigger, SkillStatus};
+    use crate::skills::models::{SkillNode, SkillStatus, SkillTrigger};
     use chrono::Utc;
 
     fn make_test_note(
@@ -1410,17 +1410,32 @@ mod tests {
     #[test]
     fn test_mcp_action_trigger_tool_only_matches() {
         // Trigger "note" matches any input starting with "note"
-        assert!(match_mcp_action_trigger("note", "note create Always use parameterized queries"));
+        assert!(match_mcp_action_trigger(
+            "note",
+            "note create Always use parameterized queries"
+        ));
         assert!(match_mcp_action_trigger("note", "note search some query"));
-        assert!(match_mcp_action_trigger("task", "task get_next plan_id=abc"));
+        assert!(match_mcp_action_trigger(
+            "task",
+            "task get_next plan_id=abc"
+        ));
     }
 
     #[test]
     fn test_mcp_action_trigger_tool_and_action_matches() {
         // Trigger "note:create" matches input "note create ..."
-        assert!(match_mcp_action_trigger("note:create", "note create Always use parameterized queries"));
-        assert!(match_mcp_action_trigger("task:update", "task update status=completed"));
-        assert!(match_mcp_action_trigger("code:analyze_impact", "code analyze_impact /src/main.rs"));
+        assert!(match_mcp_action_trigger(
+            "note:create",
+            "note create Always use parameterized queries"
+        ));
+        assert!(match_mcp_action_trigger(
+            "task:update",
+            "task update status=completed"
+        ));
+        assert!(match_mcp_action_trigger(
+            "code:analyze_impact",
+            "code analyze_impact /src/main.rs"
+        ));
     }
 
     #[test]
@@ -1466,9 +1481,15 @@ mod tests {
     #[test]
     fn test_mcp_action_trigger_whitespace_handling() {
         // Trigger with spaces around colon
-        assert!(match_mcp_action_trigger(" note : create ", "note create foo"));
+        assert!(match_mcp_action_trigger(
+            " note : create ",
+            "note create foo"
+        ));
         // Input with extra whitespace
-        assert!(match_mcp_action_trigger("note:create", "  note   create   foo  "));
+        assert!(match_mcp_action_trigger(
+            "note:create",
+            "  note   create   foo  "
+        ));
     }
 
     #[test]
@@ -1675,8 +1696,7 @@ mod tests {
         // Skill only triggers on "task" actions
         let triggers = vec![SkillTrigger::mcp_action("task", 0.7)];
 
-        let store =
-            setup_mcp_skill_store(project_id, "MCP Task Skill", triggers, vec![note]).await;
+        let store = setup_mcp_skill_store(project_id, "MCP Task Skill", triggers, vec![note]).await;
 
         let config = HookActivationConfig::default();
 
@@ -1696,7 +1716,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(result.is_none(), "commit tool should not match task trigger");
+        assert!(
+            result.is_none(),
+            "commit tool should not match task trigger"
+        );
     }
 
     #[tokio::test]
@@ -1754,8 +1777,7 @@ mod tests {
 
         let triggers = vec![SkillTrigger::mcp_action("task", 0.7)];
 
-        let store =
-            setup_mcp_skill_store(project_id, "MCP Task Skill", triggers, vec![note]).await;
+        let store = setup_mcp_skill_store(project_id, "MCP Task Skill", triggers, vec![note]).await;
 
         let config = HookActivationConfig::default();
         let tool_input = serde_json::json!({
@@ -1813,8 +1835,7 @@ mod tests {
 
         let triggers = vec![SkillTrigger::mcp_action("task", 0.7)];
 
-        let store =
-            setup_mcp_skill_store(project_id, "MCP Usage Patterns", triggers, notes).await;
+        let store = setup_mcp_skill_store(project_id, "MCP Usage Patterns", triggers, notes).await;
 
         let config = HookActivationConfig::default();
         let tool_input = serde_json::json!({
@@ -1834,9 +1855,15 @@ mod tests {
 
         assert!(result.is_some(), "Should match with multiple notes");
         let outcome = result.unwrap();
-        assert_eq!(outcome.response.notes_count, 3, "All 3 notes above energy threshold");
+        assert_eq!(
+            outcome.response.notes_count, 3,
+            "All 3 notes above energy threshold"
+        );
         assert!(outcome.response.context.contains("plan_id"));
-        assert!(outcome.response.context.len() <= 3200, "Context within budget");
+        assert!(
+            outcome.response.context.len() <= 3200,
+            "Context within budget"
+        );
     }
 
     #[tokio::test]
@@ -1863,8 +1890,7 @@ mod tests {
             SkillTrigger::file_glob("src/skills/**", 0.55),
         ];
 
-        let store =
-            setup_mcp_skill_store(project_id, "MCP Usage Patterns", triggers, notes).await;
+        let store = setup_mcp_skill_store(project_id, "MCP Usage Patterns", triggers, notes).await;
 
         let config = HookActivationConfig::default();
         let tool_input = serde_json::json!({
