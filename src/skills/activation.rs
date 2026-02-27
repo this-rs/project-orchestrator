@@ -16,7 +16,7 @@
 //!   Semantic matching is reserved for the MCP `skill(action: "activate")` tool.
 //! - **Local trigger evaluation**: Skills are loaded from DB then matched in Rust,
 //!   avoiding per-trigger Neo4j round-trips.
-//! - **Context budget**: 4000 chars max (will be refined to 3200/800 tokens by Task 5).
+//! - **Context budget**: 3200 chars max (~800 tokens) to prevent additionalContext flooding.
 
 use regex::Regex;
 use uuid::Uuid;
@@ -37,7 +37,9 @@ pub struct HookActivationConfig {
     /// Skills below this threshold are ignored.
     pub confidence_threshold: f64,
     /// Maximum characters for the assembled context text.
-    /// Budget: ~4000 chars (will be 3200 in dynamic assembly mode).
+    /// Budget: 3200 chars (~800 tokens) for hooks.
+    /// The additionalContext is injected at EVERY tool call, so keeping it small
+    /// is critical (20 calls/session x 3200 chars = 64K chars worst case).
     pub max_context_chars: usize,
     /// Minimum note energy to include in context.
     /// Notes below this energy are considered "dead" and excluded.
@@ -51,7 +53,7 @@ impl Default for HookActivationConfig {
     fn default() -> Self {
         Self {
             confidence_threshold: 0.5,
-            max_context_chars: 4000,
+            max_context_chars: 3200,
             min_note_energy: 0.1,
             merge_threshold: 0.1,
         }
@@ -284,39 +286,88 @@ fn match_file_glob_trigger(trigger_pattern: &str, file_path: &str) -> f64 {
 // Context assembly
 // ============================================================================
 
-/// Assemble context text from notes and decisions.
+/// Maximum chars reserved for decisions section.
+/// With max 2 decisions at ~100 chars each + header = ~250 chars.
+const DECISIONS_BUDGET: usize = 300;
+
+/// Assemble context text dynamically from notes and decisions.
 ///
-/// Produces a structured Markdown context with:
-/// - Header with skill name
-/// - Notes grouped and sorted by importance (Critical > High > Medium > Low)
-/// - Decisions with chosen options
-/// - Budget enforcement: truncates to max_chars
+/// Produces a compact Markdown context optimized for hook injection:
+/// - Header: `## \u{1f4a1} {skill_name}` (~20 tokens)
+/// - Notes: sorted by importance then energy, truncated to 150 chars each
+/// - Decisions: max 2, description + chosen option at 100 chars each
+/// - Budget: strict enforcement, never exceeds max_chars
+///
+/// The context_template from Plan 2 is NOT used here — this assembles
+/// fresh content at every activation for maximum relevance.
 pub fn assemble_context(
     skill_name: &str,
     notes: &[Note],
     decisions: &[DecisionNode],
     max_chars: usize,
 ) -> String {
-    let mut context = format!("## {}\n\n", skill_name);
+    let header = format!("## \u{1f4a1} {}\n", skill_name);
+    let mut context = header;
+
+    // Reserve budget for decisions if any exist
+    let notes_budget = if !decisions.is_empty() {
+        max_chars.saturating_sub(DECISIONS_BUDGET)
+    } else {
+        max_chars
+    };
 
     // Sort notes by importance (Critical first) then energy
     let mut sorted_notes: Vec<&Note> = notes.iter().collect();
     sorted_notes.sort_by(|a, b| {
-        let imp_ord = b.importance.weight().partial_cmp(&a.importance.weight())
+        let imp_ord = b
+            .importance
+            .weight()
+            .partial_cmp(&a.importance.weight())
             .unwrap_or(std::cmp::Ordering::Equal);
         if imp_ord != std::cmp::Ordering::Equal {
             return imp_ord;
         }
-        b.energy.partial_cmp(&a.energy).unwrap_or(std::cmp::Ordering::Equal)
+        b.energy
+            .partial_cmp(&a.energy)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Add notes
-    if !sorted_notes.is_empty() {
-        for note in &sorted_notes {
-            let emoji = note_type_emoji(&note.note_type.to_string());
-            let importance_badge = importance_badge(&note.importance.to_string());
-            let content = truncate_content(&note.content, 200);
-            let line = format!("- {}{} {}\n", emoji, importance_badge, content);
+    // Add notes one by one until budget is exhausted
+    let mut notes_included = 0;
+    for note in &sorted_notes {
+        let emoji = note_type_emoji(&note.note_type.to_string());
+        let importance_badge = importance_badge(&note.importance.to_string());
+        let content = truncate_content(&note.content, 150);
+        let line = format!("- {}{}{}\n", emoji, importance_badge, content);
+
+        if context.len() + line.len() > notes_budget {
+            break;
+        }
+        context.push_str(&line);
+        notes_included += 1;
+    }
+
+    // Show how many notes were included vs total
+    let omitted = sorted_notes.len().saturating_sub(notes_included);
+    if omitted > 0 {
+        let omit_line = format!("_(+{} more notes)_\n", omitted);
+        if context.len() + omit_line.len() <= notes_budget {
+            context.push_str(&omit_line);
+        }
+    }
+
+    // Add decisions (max 2, within reserved budget)
+    if !decisions.is_empty() {
+        for decision in decisions.iter().take(2) {
+            let chosen = decision
+                .chosen_option
+                .as_deref()
+                .unwrap_or("(pending)");
+            let line = format!(
+                "- \u{1f3af} **{}**: {}\n",
+                truncate_content(&decision.description, 60),
+                truncate_content(chosen, 100),
+            );
 
             if context.len() + line.len() > max_chars {
                 break;
@@ -325,34 +376,9 @@ pub fn assemble_context(
         }
     }
 
-    // Add decisions (max 3)
-    if !decisions.is_empty() {
-        let decisions_header = "\n### Decisions\n";
-        if context.len() + decisions_header.len() < max_chars {
-            context.push_str(decisions_header);
-
-            for decision in decisions.iter().take(3) {
-                let chosen = decision
-                    .chosen_option
-                    .as_deref()
-                    .unwrap_or("(pending)");
-                let line = format!(
-                    "- **{}**: {}\n",
-                    truncate_content(&decision.description, 80),
-                    truncate_content(chosen, 120),
-                );
-
-                if context.len() + line.len() > max_chars {
-                    break;
-                }
-                context.push_str(&line);
-            }
-        }
-    }
-
-    // Final budget enforcement
+    // Final hard budget enforcement
     if context.len() > max_chars {
-        context.truncate(max_chars - 3);
+        context.truncate(max_chars.saturating_sub(3));
         context.push_str("...");
     }
 
@@ -586,13 +612,13 @@ mod tests {
             make_test_decision(Uuid::new_v4(), "Use Neo4j 5.x driver", "neo4j-rust-driver 0.8"),
         ];
 
-        let context = assemble_context("Neo4j Performance", &notes, &decisions, 4000);
+        let context = assemble_context("Neo4j Performance", &notes, &decisions, 3200);
 
-        assert!(context.starts_with("## Neo4j Performance"));
+        assert!(context.starts_with("## \u{1f4a1} Neo4j Performance"));
         assert!(context.contains("UNWIND"));
         assert!(context.contains("Connection pool"));
         assert!(context.contains("Neo4j 5.x driver"));
-        assert!(context.len() <= 4000);
+        assert!(context.len() <= 3200);
     }
 
     #[test]
@@ -603,7 +629,7 @@ mod tests {
             make_test_note(Uuid::new_v4(), "Medium pattern note", NoteType::Pattern, NoteImportance::Medium, 0.7),
         ];
 
-        let context = assemble_context("Test", &notes, &[], 4000);
+        let context = assemble_context("Test", &notes, &[], 3200);
 
         // Critical should appear before Low
         let critical_pos = context.find("Critical gotcha").unwrap();
@@ -630,8 +656,8 @@ mod tests {
 
     #[test]
     fn test_assemble_context_empty_notes() {
-        let context = assemble_context("Empty Skill", &[], &[], 4000);
-        assert!(context.starts_with("## Empty Skill"));
+        let context = assemble_context("Empty Skill", &[], &[], 3200);
+        assert!(context.starts_with("## \u{1f4a1} Empty Skill"));
         assert!(!context.contains("Decisions"));
     }
 
@@ -640,7 +666,7 @@ mod tests {
         let notes = vec![
             make_test_note(Uuid::new_v4(), "A note", NoteType::Tip, NoteImportance::Medium, 0.5),
         ];
-        let context = assemble_context("Test", &notes, &[], 4000);
+        let context = assemble_context("Test", &notes, &[], 3200);
         assert!(!context.contains("Decisions"));
     }
 
@@ -653,7 +679,7 @@ mod tests {
             make_test_note(Uuid::new_v4(), "Helpful tip", NoteType::Tip, NoteImportance::Low, 0.5),
         ];
 
-        let context = assemble_context("Test", &notes, &[], 4000);
+        let context = assemble_context("Test", &notes, &[], 3200);
 
         // Check emojis are present (using unicode escapes)
         assert!(context.contains("\u{26a0}\u{fe0f}")); // ⚠️ for gotcha
@@ -702,13 +728,178 @@ mod tests {
         assert_eq!(importance_badge("low"), "");
     }
 
+    // --- Budget acceptance criteria ---
+
+    #[test]
+    fn test_assemble_context_20_notes_within_budget() {
+        // Acceptance criteria: "skill avec 20 notes → contexte de 790 tokens (tronqué correctement)"
+        // 800 tokens ≈ 3200 chars max
+        let mut notes = Vec::new();
+        let importances = [
+            NoteImportance::Critical,
+            NoteImportance::High,
+            NoteImportance::Medium,
+            NoteImportance::Low,
+        ];
+        let note_types = [
+            NoteType::Gotcha,
+            NoteType::Guideline,
+            NoteType::Pattern,
+            NoteType::Tip,
+        ];
+
+        for i in 0..20 {
+            notes.push(make_test_note(
+                Uuid::new_v4(),
+                &format!(
+                    "Note {} with substantial content that simulates a real knowledge note with useful information about the codebase patterns and conventions",
+                    i
+                ),
+                note_types[i % 4].clone(),
+                importances[i % 4].clone(),
+                0.9 - (i as f64 * 0.03), // decreasing energy
+            ));
+        }
+
+        let decisions = vec![
+            make_test_decision(Uuid::new_v4(), "Use async Neo4j driver for all database operations", "neo4j-rust-driver 0.8 with async support"),
+            make_test_decision(Uuid::new_v4(), "Implement caching with TTL-based invalidation", "30-second TTL per skill activation"),
+            make_test_decision(Uuid::new_v4(), "This third decision should be excluded", "Only 2 decisions max"),
+        ];
+
+        let context = assemble_context("Neo4j Expertise", &notes, &decisions, 3200);
+
+        // Strict budget enforcement
+        assert!(
+            context.len() <= 3200,
+            "Context length {} exceeds 3200 char budget",
+            context.len()
+        );
+
+        // Header present
+        assert!(context.starts_with("## \u{1f4a1} Neo4j Expertise\n"));
+
+        // Critical notes should appear first (they have highest importance weight)
+        let critical_pos = context.find("Note 0 with substantial");
+        let low_pos = context.find("Note 3 with substantial");
+        if let (Some(c), Some(l)) = (critical_pos, low_pos) {
+            assert!(c < l, "Critical notes should appear before Low notes");
+        }
+
+        // Not all 20 notes should fit — omitted indicator should be present
+        assert!(
+            context.contains("more notes)_"),
+            "Should show omitted notes count when not all fit"
+        );
+
+        // Max 2 decisions
+        assert!(
+            !context.contains("This third decision"),
+            "Only 2 decisions max should be included"
+        );
+
+        // At least some decisions are present
+        assert!(
+            context.contains("Neo4j driver") || context.contains("caching"),
+            "At least one decision should be included"
+        );
+    }
+
+    #[test]
+    fn test_assemble_context_30_notes_budget_enforcement() {
+        // Step 2 verification: "30 notes → contexte exactement ≤ 3200 chars"
+        let mut notes = Vec::new();
+        for i in 0..30 {
+            notes.push(make_test_note(
+                Uuid::new_v4(),
+                &format!(
+                    "Knowledge note number {} describing an important pattern or convention in the codebase that developers need to know about",
+                    i
+                ),
+                NoteType::Context,
+                NoteImportance::Medium,
+                0.5,
+            ));
+        }
+
+        let decisions = vec![
+            make_test_decision(Uuid::new_v4(), "Architecture decision for the module", "chosen approach"),
+        ];
+
+        let context = assemble_context("Large Skill", &notes, &decisions, 3200);
+
+        assert!(
+            context.len() <= 3200,
+            "Context length {} exceeds 3200 char budget with 30 notes",
+            context.len()
+        );
+
+        // Should include at least 5 notes (each note line is ~180 chars, 5 = ~900)
+        let note_count = context.matches("Knowledge note number").count();
+        assert!(
+            note_count >= 5,
+            "Should include at least 5 notes, got {}",
+            note_count
+        );
+        assert!(
+            note_count < 30,
+            "Should not include all 30 notes, got {}",
+            note_count
+        );
+
+        // Omitted indicator present
+        assert!(context.contains("more notes)_"));
+    }
+
+    #[test]
+    fn test_assemble_context_decisions_budget_reserved() {
+        // Ensure decisions budget (300 chars) is properly reserved
+        let mut notes = Vec::new();
+        for i in 0..50 {
+            notes.push(make_test_note(
+                Uuid::new_v4(),
+                &format!("Note content {} filling the budget", i),
+                NoteType::Tip,
+                NoteImportance::Medium,
+                0.5,
+            ));
+        }
+
+        let decisions = vec![
+            make_test_decision(Uuid::new_v4(), "Important decision", "chosen option value"),
+        ];
+
+        // With decisions present, notes should leave room
+        let context_with_decisions = assemble_context("Test", &notes, &decisions, 3200);
+        let context_without_decisions = assemble_context("Test", &notes, &[], 3200);
+
+        // Context without decisions should have more notes since no budget reservation
+        let notes_with = context_with_decisions
+            .matches("Note content")
+            .count();
+        let notes_without = context_without_decisions
+            .matches("Note content")
+            .count();
+
+        assert!(
+            notes_without >= notes_with,
+            "Without decisions reservation ({} notes), should include >= notes than with reservation ({} notes)",
+            notes_without,
+            notes_with,
+        );
+
+        // Both within budget
+        assert!(context_with_decisions.len() <= 3200);
+        assert!(context_without_decisions.len() <= 3200);
+    }
+
     // --- Config defaults ---
 
     #[test]
     fn test_hook_activation_config_defaults() {
         let config = HookActivationConfig::default();
         assert!((config.confidence_threshold - 0.5).abs() < f64::EPSILON);
-        assert_eq!(config.max_context_chars, 4000);
+        assert_eq!(config.max_context_chars, 3200);
         assert!((config.min_note_energy - 0.1).abs() < f64::EPSILON);
         assert!((config.merge_threshold - 0.1).abs() < f64::EPSILON);
     }
