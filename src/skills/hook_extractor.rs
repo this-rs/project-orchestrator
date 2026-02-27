@@ -361,17 +361,12 @@ fn extract_bash_file_context(tool_input: &serde_json::Value) -> Option<String> {
     }
 
     // For `cat`, `head`, `tail` commands, extract the file path
-    if command.starts_with("cat ") || command.starts_with("head ") || command.starts_with("tail ")
-    {
+    if command.starts_with("cat ") || command.starts_with("head ") || command.starts_with("tail ") {
         let tokens = tokenize_command(command);
         // Last non-flag argument
         for token in tokens.iter().rev() {
             let clean = token.trim_matches(|c| c == '\'' || c == '"');
-            if !clean.starts_with('-')
-                && clean != "cat"
-                && clean != "head"
-                && clean != "tail"
-            {
+            if !clean.starts_with('-') && clean != "cat" && clean != "head" && clean != "tail" {
                 return Some(clean.to_string());
             }
         }
@@ -555,10 +550,7 @@ mod tests {
     #[test]
     fn test_extract_pattern_bash_rg_with_e_flag() {
         let input = json!({"command": "rg -e 'pattern' src/"});
-        assert_eq!(
-            extract_pattern("Bash", &input),
-            Some("pattern".to_string())
-        );
+        assert_eq!(extract_pattern("Bash", &input), Some("pattern".to_string()));
     }
 
     #[test]

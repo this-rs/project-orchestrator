@@ -295,9 +295,7 @@ pub fn evaluate_cached_skill(
 
     for (trigger, threshold) in &cached_skill.compiled_triggers {
         let matched = match trigger {
-            CompiledTrigger::Regex(re) => {
-                pattern.map_or(false, |pat| re.is_match(pat))
-            }
+            CompiledTrigger::Regex(re) => pattern.map_or(false, |pat| re.is_match(pat)),
             CompiledTrigger::FileGlob(glob_pat) => {
                 // FileGlob only matches against file context, not pattern text
                 file_context.map_or(false, |file| glob_pat.matches(file))
@@ -536,7 +534,11 @@ mod tests {
         let cached = CachedSkill::from_skill(skill);
 
         let confidence = evaluate_cached_skill(&cached, None, Some("src/api/handlers.rs"));
-        assert!(confidence > 0.0, "FileGlob should match, got {}", confidence);
+        assert!(
+            confidence > 0.0,
+            "FileGlob should match, got {}",
+            confidence
+        );
         assert!((confidence - 0.5).abs() < f64::EPSILON);
     }
 
@@ -547,7 +549,10 @@ mod tests {
 
         // FileGlob should NOT fall back to pattern when file_context is None
         let confidence = evaluate_cached_skill(&cached, Some("src/api/test.rs"), None);
-        assert!((confidence - 0.0).abs() < f64::EPSILON, "FileGlob should not match pattern text");
+        assert!(
+            (confidence - 0.0).abs() < f64::EPSILON,
+            "FileGlob should not match pattern text"
+        );
     }
 
     #[test]

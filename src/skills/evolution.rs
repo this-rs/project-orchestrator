@@ -516,8 +516,7 @@ pub async fn execute_evolution(
                     graph_store.create_skill(&new_skill).await?;
 
                     for note in &member_notes {
-                        if let Err(e) =
-                            graph_store.add_skill_member(new_id, "note", note.id).await
+                        if let Err(e) = graph_store.add_skill_member(new_id, "note", note.id).await
                         {
                             warn!(skill_id = %new_id, note_id = %note.id, error = %e, "Failed to add member during split");
                         }
