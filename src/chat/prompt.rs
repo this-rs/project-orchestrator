@@ -62,6 +62,19 @@ Workspace
 - Commit → Plan : `commit(action: "link_to_plan", plan_id, commit_sha)`
 - Note → Entité : `note(action: "link_to_entity", note_id, entity_type, entity_id)`
 
+### Graphe de code — Relations structurelles
+
+Le graphe Neo4j contient aussi les relations extraites par Tree-sitter :
+- `IMPORTS` : File → File — imports/requires entre fichiers
+- `CALLS` : Function → Function — appels de fonctions (avec confidence score)
+- `EXTENDS` : Struct → Struct — héritage de classes (Java, TS, Python, PHP, C++, Ruby, Kotlin, Swift)
+- `IMPLEMENTS` : Struct → Struct — implémentation d'interfaces (Java, TS, PHP)
+- `IMPLEMENTS_TRAIT` / `IMPLEMENTS_FOR` : implémentation de traits Rust
+- `STEP_IN_PROCESS` : Process → Function — étapes ordonnées d'un processus métier détecté par BFS sur le CALLS graph
+
+Navigation heritage : `code(action: "get_class_hierarchy")`, `code(action: "find_subclasses")`, `code(action: "find_interface_implementors")`
+Processus métier : `code(action: "list_processes")`, `code(action: "get_process")`, `code(action: "get_entry_points")`
+
 ### Notes (base de connaissances)
 
 - **Types** : guideline, gotcha, pattern, context, tip, observation, assertion
@@ -368,6 +381,51 @@ Le Knowledge Fabric connecte toutes les entités du graphe via des relations sé
 - `workspace_milestone(action: "create", slug, title)` — milestones cross-projets
 - `workspace(action: "get_topology", slug)` — composants et dépendances entre services
 - `resource(action: "list", workspace_slug)` — contrats API, schémas partagés
+
+### Stratégie heritage (EXTENDS / IMPLEMENTS)
+
+Avant de modifier une classe dans un langage OOP :
+1. `code(action: "get_class_hierarchy", type_name)` — vérifier parents ET enfants (modifier une classe peut casser ses sous-classes)
+2. `code(action: "find_subclasses", class_name)` — identifier toutes les sous-classes transitives
+3. `code(action: "find_interface_implementors", interface_name)` — toutes les implémentations d'une interface
+
+**Règle** : toujours vérifier la hiérarchie d'héritage AVANT de modifier une méthode protégée/publique. Un changement de signature dans une classe parent peut casser silencieusement N sous-classes.
+
+### Process detection & workflow awareness
+
+Les processus métier sont des traces BFS sur le graphe CALLS depuis les entry points :
+- `code(action: "get_entry_points", project_slug)` — fonctions main, handlers HTTP, CLI commands, event handlers
+- `code(action: "list_processes", project_slug)` — tous les processus détectés (nom, entry point, steps count)
+- `code(action: "get_process", process_id)` — steps ordonnés d'un processus
+
+**Utilise ceci** : avant de modifier du code transversal (middleware, service partagé), explorer les processus qui le traversent pour anticiper les effets de bord.
+
+### Co-change patterns dans l'analyse d'impact
+
+Compléter `analyze_impact` (structural) avec les signaux de co-changement :
+- `code(action: "get_co_change_graph", project_slug)` — graphe global des fichiers co-modifiés
+- `code(action: "get_file_co_changers", file_path)` — fichiers souvent modifiés avec un fichier donné
+
+Les fichiers qui changent ensemble sont souvent couplés même sans import direct (couplage temporel). Penser à les vérifier après une modification.
+
+### Community-aware planning
+
+Utiliser `code(action: "get_communities", project_slug)` pour segmenter les tâches lors de la planification :
+- Chaque communauté = cluster de fichiers/fonctions fortement couplés (score `cohesion`)
+- Un task ne devrait pas traverser plus de 2 communautés sauf refactoring cross-cutting
+- Les labels enrichis (champ `enriched_by`) aident à nommer les modules fonctionnels
+- `code(action: "enrich_communities", project_slug)` — enrichir les labels via LLM (batch)
+
+### Notes globales vs project-scoped
+
+- **Note project-scoped** (avec `project_id`) : gotcha/pattern spécifique à un projet (ex: "cette API retourne 204 pas 200")
+- **Note globale** (sans `project_id`) : convention cross-projets, pattern workspace-wide (ex: "toujours utiliser ULID pour les IDs")
+- `note(action: "list_project", slug)` — lister les notes d'un projet spécifique
+- `note(action: "list")` — inclut aussi les notes globales
+
+### add_discussed obligatoire
+
+Appeler `chat(action: "add_discussed", session_id, entities)` pour chaque fichier/fonction significativement modifié ou analysé dans la session. Cela nourrit les relations DISCUSSED du Knowledge Fabric et améliore la propagation contextuelle pour les sessions futures.
 "#;
 
 use anyhow::Result;
