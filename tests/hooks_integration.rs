@@ -568,8 +568,7 @@ fn test_cjs_hook_cache_file_created_on_success() {
     let input = make_pre_tool_use_input("Grep", json!({"pattern": "cache test"}));
 
     let our_pid = std::process::id();
-    let hook_cache_file = std::path::PathBuf::from(std::env::temp_dir())
-        .join(format!("po-hook-cache-{}.json", our_pid));
+    let hook_cache_file = std::env::temp_dir().join(format!("po-hook-cache-{}.json", our_pid));
 
     // Clean any stale cache
     let _ = std::fs::remove_file(&hook_cache_file);
@@ -628,8 +627,7 @@ fn test_cjs_hook_global_throttle() {
     // the cache file format and that injection counting works.
     let dir = create_temp_project_dir(19996);
     let our_pid = std::process::id();
-    let cache_file = std::path::PathBuf::from(std::env::temp_dir())
-        .join(format!("po-hook-cache-{}.json", our_pid));
+    let cache_file = std::env::temp_dir().join(format!("po-hook-cache-{}.json", our_pid));
 
     // Pre-seed the cache with global_count = MAX_GLOBAL (10)
     let seeded_cache = json!({
