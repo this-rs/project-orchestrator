@@ -6,7 +6,7 @@
 
 use crate::graph::algorithms::{compute_cohesion, louvain_communities};
 use crate::graph::{
-    AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType, CommunityInfo,
+    AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
