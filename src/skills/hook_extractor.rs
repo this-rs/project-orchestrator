@@ -326,7 +326,7 @@ fn tokenize_command(command: &str) -> Vec<String> {
             continue;
         }
         match ch {
-            '\\' if in_double_quote || (!in_single_quote && !in_double_quote) => {
+            '\\' if !in_single_quote => {
                 // Backslash escapes next char in double quotes or unquoted context
                 // (In single quotes, backslash is literal per POSIX)
                 escaped = true;
