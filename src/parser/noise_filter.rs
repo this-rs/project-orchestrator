@@ -76,7 +76,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("indexOf");
     s.insert("lastIndexOf");
     s.insert("includes");
-    s.insert("find");
     s.insert("findIndex");
     s.insert("filter");
     s.insert("map");
@@ -374,7 +373,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("reinterpret_cast");
     s.insert("const_cast");
     s.insert("throw");
-    s.insert("new");
     s.insert("sizeof");
     s.insert("alignof");
     s.insert("decltype");
@@ -424,8 +422,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("getMessage");
     s.insert("printStackTrace");
     s.insert("currentThread");
-    s.insert("start");
-    s.insert("run");
     s.insert("interrupt");
     s.insert("isAlive");
     s.insert("currentTimeMillis");
@@ -437,7 +433,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     // Go
     // =========================================================================
     s.insert("make");
-    s.insert("new");
     s.insert("append");
     s.insert("copy");
     s.insert("cap");
@@ -457,13 +452,11 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("Fatalf");
     s.insert("Fatal");
     s.insert("Panicf");
-    s.insert("Error");
     s.insert("New");
     s.insert("Wrap");
     s.insert("Unwrap");
     s.insert("Is");
     s.insert("As");
-    s.insert("String");
     s.insert("Bytes");
     s.insert("Len");
     s.insert("Cap");
@@ -541,7 +534,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("into");
     s.insert("from");
     s.insert("default");
-    s.insert("new");
     s.insert("with_capacity");
     s.insert("push");
     s.insert("pop");
@@ -569,7 +561,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("read");
     s.insert("write");
     s.insert("try_lock");
-    s.insert("send");
     s.insert("recv");
     s.insert("try_recv");
     s.insert("spawn");
@@ -698,13 +689,11 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("tap");
     s.insert("then");
     s.insert("yield_self");
-    s.insert("send");
     s.insert("public_send");
     s.insert("method_missing");
     s.insert("define_method");
     s.insert("class_eval");
     s.insert("instance_eval");
-    s.insert("new");
     s.insert("initialize");
     s.insert("to_s");
     s.insert("to_i");
@@ -726,7 +715,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("error");
     s.insert("TODO");
     s.insert("let");
-    s.insert("run");
     s.insert("with");
     s.insert("apply");
     s.insert("also");
@@ -818,7 +806,6 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s.insert("grep");
     s.insert("sed");
     s.insert("awk");
-    s.insert("find");
     s.insert("xargs");
     s.insert("sort");
     s.insert("uniq");
@@ -896,8 +883,8 @@ mod tests {
     fn test_builtin_count() {
         // Verify we have a substantial number of entries
         assert!(
-            BUILT_IN_NAMES.len() >= 300,
-            "Expected 300+ built-in names, got {}",
+            BUILT_IN_NAMES.len() >= 290,
+            "Expected 290+ built-in names, got {}",
             BUILT_IN_NAMES.len()
         );
     }

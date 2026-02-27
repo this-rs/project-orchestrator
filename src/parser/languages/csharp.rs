@@ -223,20 +223,28 @@ fn extract_method(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
 
 fn extract_using(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<ImportNode> {
     let text = get_text(node, source)?;
-    // Parse: using Namespace.Sub; | using static Namespace.Class; | using Alias = Namespace.Type;
-    let path = text
+    let raw = text
         .trim_start_matches("using ")
         .trim_end_matches(';')
-        .trim()
-        .to_string();
+        .trim();
 
-    if path.is_empty() {
+    if raw.is_empty() {
         return None;
     }
 
+    // Handle: using static System.Math;
+    let raw = raw.strip_prefix("static ").unwrap_or(raw);
+
+    // Handle: using Alias = Full.Path;
+    let (alias, path) = if let Some((a, p)) = raw.split_once(" = ") {
+        (Some(a.trim().to_string()), p.trim().to_string())
+    } else {
+        (None, raw.to_string())
+    };
+
     Some(ImportNode {
         path,
-        alias: None,
+        alias,
         items: vec![],
         file_path: file_path.to_string(),
         line: node.start_position().row as u32 + 1,

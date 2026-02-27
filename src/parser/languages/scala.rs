@@ -226,18 +226,63 @@ fn extract_method(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
 
 fn extract_import(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<ImportNode> {
     let text = get_text(node, source)?;
-    let path = text.trim_start_matches("import ").trim().to_string();
+    let raw = text.trim_start_matches("import ").trim().to_string();
 
-    if path.is_empty() {
+    if raw.is_empty() {
         return None;
     }
 
+    let line = node.start_position().row as u32 + 1;
+
+    // Handle selective imports: import com.example.{A, B, C => D}
+    if let Some(brace_start) = raw.find('{') {
+        let base_path = raw[..brace_start].trim_end_matches('.').to_string();
+        let brace_end = raw.find('}').unwrap_or(raw.len());
+        let selectors = &raw[brace_start + 1..brace_end];
+
+        let items: Vec<String> = selectors
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                // Handle rename: A => B — use original name A as the item
+                if let Some((original, _)) = s.split_once("=>") {
+                    Some(original.trim().to_string())
+                } else {
+                    Some(s.to_string())
+                }
+            })
+            .collect();
+
+        // Check for single rename: import com.example.{A => B}
+        let alias = if items.len() == 1 {
+            let first = selectors.trim();
+            if let Some((_, renamed)) = first.split_once("=>") {
+                Some(renamed.trim().to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        return Some(ImportNode {
+            path: base_path,
+            alias,
+            items,
+            file_path: file_path.to_string(),
+            line,
+        });
+    }
+
     Some(ImportNode {
-        path,
+        path: raw,
         alias: None,
         items: vec![],
         file_path: file_path.to_string(),
-        line: node.start_position().row as u32 + 1,
+        line,
     })
 }
 

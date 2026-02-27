@@ -2797,9 +2797,9 @@ impl ToolHandler {
 
             "detect_processes" => {
                 let project_slug = extract_string(args, "project_slug")?;
-                let query = vec![("project_slug".to_string(), project_slug)];
+                let body = serde_json::json!({"project_slug": project_slug});
                 let result = http
-                    .get_with_query("/api/code/processes/detect", &query)
+                    .post("/api/code/processes/detect", &body)
                     .await?;
                 Ok(Some(result))
             }
@@ -2865,9 +2865,9 @@ impl ToolHandler {
             // ── Community Enrichment + REST Gaps ─────────────────────────
             "enrich_communities" => {
                 let project_slug = extract_string(args, "project_slug")?;
-                let query = vec![("project_slug".to_string(), project_slug)];
+                let body = serde_json::json!({"project_slug": project_slug});
                 let result = http
-                    .get_with_query("/api/code/communities/enrich", &query)
+                    .post("/api/code/communities/enrich", &body)
                     .await?;
                 Ok(Some(result))
             }

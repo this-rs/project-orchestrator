@@ -1863,15 +1863,15 @@ pub struct DetectProcessesQuery {
 /// the CALLS graph, deduplication, and classification.
 pub async fn detect_processes(
     State(state): State<OrchestratorState>,
-    Query(params): Query<DetectProcessesQuery>,
+    Json(body): Json<DetectProcessesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
         .neo4j()
-        .get_project_by_slug(&params.project_slug)
+        .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
         })?;
 
     let processes = state
@@ -1919,7 +1919,7 @@ pub async fn get_class_hierarchy(
     State(state): State<OrchestratorState>,
     Query(params): Query<ClassHierarchyQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let max_depth = params.max_depth.unwrap_or(10);
+    let max_depth = params.max_depth.unwrap_or(10).min(20);
     let hierarchy = state
         .orchestrator
         .neo4j()
@@ -2082,15 +2082,15 @@ pub async fn get_entry_points(
 /// Trigger LLM enrichment of community labels.
 pub async fn enrich_communities(
     State(state): State<OrchestratorState>,
-    Query(params): Query<DetectProcessesQuery>, // reuse project_slug query
+    Json(body): Json<DetectProcessesQuery>, // reuse project_slug query
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
         .neo4j()
-        .get_project_by_slug(&params.project_slug)
+        .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
         })?;
 
     // Run file graph analysis which includes enrichment

@@ -1756,18 +1756,18 @@ impl Neo4jClient {
                 MATCH (parent:Struct {name: rel.parent_name, file_path: rel.child_file})
                 WITH child, parent LIMIT 1
                 MERGE (child)-[:EXTENDS]->(parent)
-                RETURN child.name AS resolved
+                RETURN child.name AS resolved, child.file_path AS resolved_file
             }
-            RETURN resolved
+            RETURN resolved, resolved_file
             "#,
         )
         .param("items", items.clone());
 
-        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut resolved: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
         if let Ok(mut result) = self.graph.execute(q).await {
             while let Ok(Some(row)) = result.next().await {
-                if let Ok(name) = row.get::<String>("resolved") {
-                    resolved.insert(name);
+                if let (Ok(name), Ok(file)) = (row.get::<String>("resolved"), row.get::<String>("resolved_file")) {
+                    resolved.insert((name, file));
                 }
             }
         }
@@ -1780,7 +1780,11 @@ impl Neo4jClient {
                     Some(neo4rs::BoltType::String(s)) => s.value.clone(),
                     _ => String::new(),
                 };
-                !resolved.contains(&child)
+                let child_file = match m.get("child_file") {
+                    Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                    _ => String::new(),
+                };
+                !resolved.contains(&(child, child_file))
             })
             .collect();
 

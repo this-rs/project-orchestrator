@@ -353,13 +353,21 @@ impl FileWatcher {
                                 // For deletions we do NOT check path.exists()
                                 // (the file is gone — that's the whole point)
                                 if let Some(ctx) = resolve_project(&path, &project_map).await {
+                                    let project_id = ctx.project_id;
+                                    let path_clone = path.clone();
                                     pending_deletions
-                                        .entry(ctx.project_id)
+                                        .entry(project_id)
                                         .or_insert_with(|| (ctx, HashSet::new()))
                                         .1
                                         .insert(path);
+                                    // Also remove from pending_files to avoid syncing a deleted file
+                                    if let Some((_, files)) = pending_files.get_mut(&project_id) {
+                                        files.remove(&path_clone);
+                                    }
                                 } else {
+                                    let path_clone = path.clone();
                                     pending_orphan_deletions.insert(path);
+                                    pending_orphans.remove(&path_clone);
                                 }
                             }
                             WatchEventKind::Changed => {

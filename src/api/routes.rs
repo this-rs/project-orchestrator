@@ -540,7 +540,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         .route(
             "/api/code/processes/detect",
-            get(code_handlers::detect_processes),
+            post(code_handlers::detect_processes),
         )
         .route("/api/code/processes", get(code_handlers::list_processes))
         .route(
@@ -556,7 +556,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         .route(
             "/api/code/communities/enrich",
-            get(code_handlers::enrich_communities),
+            post(code_handlers::enrich_communities),
         )
         // ================================================================
         // Implementation Planner

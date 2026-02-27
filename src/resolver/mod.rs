@@ -30,8 +30,12 @@ pub struct ImportResolutionContext {
     pub go_module_path: Option<String>,
     /// PHP PSR-4 mappings from composer.json (namespace prefix → directory), lazy-loaded
     pub psr4_mappings: std::collections::HashMap<String, String>,
+    /// Whether PSR-4 mappings have been loaded (distinguishes empty result from not-yet-loaded)
+    pub psr4_loaded: bool,
     /// C/C++ include paths from CMakeLists.txt (best-effort), lazy-loaded
     pub c_include_paths: Vec<String>,
+    /// Whether CMake include paths have been loaded (distinguishes empty result from not-yet-loaded)
+    pub cmake_loaded: bool,
 }
 
 impl ImportResolutionContext {
@@ -46,7 +50,9 @@ impl ImportResolutionContext {
             resolve_cache: ResolveCache::new(),
             go_module_path: None,
             psr4_mappings: std::collections::HashMap::new(),
+            psr4_loaded: false,
             c_include_paths: Vec::new(),
+            cmake_loaded: false,
         }
     }
 
@@ -66,9 +72,10 @@ impl ImportResolutionContext {
     /// Parses `composer.json` in the project root and extracts
     /// `autoload.psr-4` namespace-to-directory mappings.
     pub fn load_composer_psr4(&mut self, project_root: &str) {
-        if !self.psr4_mappings.is_empty() {
+        if self.psr4_loaded {
             return; // Already loaded
         }
+        self.psr4_loaded = true;
         self.psr4_mappings = parse_composer_psr4(project_root);
     }
 
@@ -77,9 +84,10 @@ impl ImportResolutionContext {
     /// Extracts `include_directories(...)` and `target_include_directories(... PUBLIC|PRIVATE ...)`
     /// directives from CMakeLists.txt in the project root.
     pub fn load_cmake_include_paths(&mut self, project_root: &str) {
-        if !self.c_include_paths.is_empty() {
+        if self.cmake_loaded {
             return; // Already loaded
         }
+        self.cmake_loaded = true;
         self.c_include_paths = parse_cmake_include_paths(project_root);
     }
 
