@@ -3,8 +3,8 @@
 //
 // Project Orchestrator — PreToolUse Hook for Claude Code
 //
-// Intercepts Grep, Glob, Read, and Bash tool calls to inject contextual
-// knowledge from the Neural Skills system.
+// Intercepts native tools (Grep, Glob, Read, Bash, Edit, Write) and MCP
+// mega-tools (mcp__*) to inject contextual knowledge from Neural Skills.
 //
 // Protocol:
 //   stdin  → JSON { hookEventName, toolName, toolInput }
@@ -44,6 +44,7 @@ const CACHE_FILE = path.join(require('os').tmpdir(), `po-hook-cache-${PPID}.json
 
 // Tools that trigger skill activation
 const ACTIVATABLE_TOOLS = new Set(['Grep', 'Glob', 'Read', 'Bash', 'Edit', 'Write']);
+const MCP_TOOL_PREFIX = 'mcp__';
 
 // ============================================================================
 // Logging (stderr only, never stdout)
@@ -321,8 +322,9 @@ async function main() {
     return;
   }
 
-  // 3. Only handle activatable tools
-  if (!ACTIVATABLE_TOOLS.has(toolName)) {
+  // 3. Only handle activatable tools (native set + any MCP tool)
+  const isActivatable = ACTIVATABLE_TOOLS.has(toolName) || toolName.startsWith(MCP_TOOL_PREFIX);
+  if (!isActivatable) {
     debug(`Ignoring tool: ${toolName}`);
     return;
   }
