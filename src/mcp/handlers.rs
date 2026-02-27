@@ -3175,6 +3175,35 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "export_skill" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let mut query = Vec::new();
+                if let Some(name) = extract_optional_string(args, "source_project_name") {
+                    query.push(("source_project_name".to_string(), name));
+                }
+                let result = if query.is_empty() {
+                    http.get(&format!("/api/skills/{}/export", skill_id))
+                        .await?
+                } else {
+                    http.get_with_query(&format!("/api/skills/{}/export", skill_id), &query)
+                        .await?
+                };
+                Ok(Some(result))
+            }
+
+            "import_skill" => {
+                let result = http.post("/api/skills/import", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_skill_health" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let result = http
+                    .get(&format!("/api/skills/{}/health", skill_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
             // ── All tools migrated ──────────────────────────────────────
             _ => Ok(None),
         }
