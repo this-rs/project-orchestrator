@@ -6,7 +6,7 @@ Guide to integrating Project Orchestrator with OpenAI's Agents SDK.
 
 ## Overview
 
-OpenAI Agents SDK supports MCP (Model Context Protocol), allowing your agents to use Project Orchestrator's **145 tools** for code intelligence, plan management, and multi-agent coordination.
+OpenAI Agents SDK supports MCP (Model Context Protocol), allowing your agents to use Project Orchestrator's **19 mega-tools** for code intelligence, plan management, and multi-agent coordination.
 
 ### What you get
 
@@ -296,26 +296,21 @@ async def run_team():
 
 ---
 
-## Available Tools
+## Available Mega-Tools
 
-All 145 Project Orchestrator tools are available. See [Claude Code Integration](./claude-code.md#available-tools-145) for the complete list.
+All 19 Project Orchestrator mega-tools are available. See [MCP Tools Reference](../api/mcp-tools.md) for the complete list.
 
-Key tools for OpenAI agents:
+Key mega-tools for OpenAI agents:
 
-| Tool | Use Case |
-|------|----------|
-| `list_projects` | Discover available codebases |
-| `sync_project` | Parse and index code |
-| `search_code` | Semantic code search |
-| `get_next_task` | Get work assignments |
-| `update_task` | Track progress |
-| `add_decision` | Record architectural choices |
-| `analyze_impact` | Check before making changes |
-| `create_note` | Capture knowledge about code patterns |
-| `search_notes` | Find past observations and guidelines |
-| `get_context_notes` | Get notes relevant to a file or function |
-| `chat_send_message` | Delegate a task to a sub-agent |
-| `list_chat_sessions` | Review past sub-agent conversations |
+| Mega-Tool | Key Actions | Use Case |
+|-----------|-------------|----------|
+| `project` | `list`, `create`, `sync` | Discover and index codebases |
+| `code` | `search`, `analyze_impact`, `get_call_graph` | Code intelligence and exploration |
+| `task` | `get_next`, `update`, `get_context` | Work assignment and tracking |
+| `decision` | `add`, `search_semantic` | Record and search architectural choices |
+| `note` | `create`, `search_semantic`, `get_context` | Knowledge capture and retrieval |
+| `chat` | `send_message`, `list_sessions` | Sub-agent delegation |
+| `plan` | `create`, `get_critical_path` | Development planning |
 
 ### Authentication Considerations
 

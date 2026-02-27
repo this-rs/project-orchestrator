@@ -6,7 +6,7 @@ Guide to integrating Project Orchestrator with Cursor IDE.
 
 ## Overview
 
-Cursor supports MCP (Model Context Protocol) servers, giving you access to Project Orchestrator's **145 tools** directly in the editor. Use Chat or Composer to:
+Cursor supports MCP (Model Context Protocol) servers, giving you access to Project Orchestrator's **19 mega-tools** directly in the editor. Use Chat or Composer to:
 
 - **Explore code** with semantic search and graph queries
 - **Manage plans and tasks** without leaving your editor
@@ -123,7 +123,7 @@ Cursor should use the `list_projects` tool and return results.
 ```
 User: Find all functions that handle authentication
 
-Cursor: [Uses search_code tool]
+Cursor: [Uses code(action: "search")]
         Found 8 results related to authentication:
         1. src/auth/login.rs:45 - fn authenticate_user()
         2. src/auth/jwt.rs:23 - fn validate_token()
@@ -135,7 +135,7 @@ Cursor: [Uses search_code tool]
 ```
 User: What would be affected if I change the UserService struct?
 
-Cursor: [Uses analyze_impact tool]
+Cursor: [Uses code(action: "analyze_impact")]
         Impact analysis:
         - 12 files directly import UserService
         - 28 files transitively affected
@@ -148,7 +148,7 @@ Cursor: [Uses analyze_impact tool]
 ```
 User: What's my next task on the authentication plan?
 
-Cursor: [Uses get_next_task tool]
+Cursor: [Uses task(action: "get_next")]
         Next available task:
         - Title: Implement password reset
         - Priority: 8
@@ -168,16 +168,16 @@ Composer can use MCP tools for multi-step operations:
 User: Create a plan to add OAuth support to this project
 
 Cursor Composer:
-1. [Uses create_plan tool]
+1. [Uses plan(action: "create")]
    Created plan "OAuth Integration" (id: abc-123)
 
-2. [Uses create_task tool]
+2. [Uses task(action: "create")]
    Added task: "Research OAuth providers"
 
-3. [Uses create_task tool]
+3. [Uses task(action: "create")]
    Added task: "Implement OAuth flow"
 
-4. [Uses add_task_dependencies tool]
+4. [Uses task(action: "add_dependencies")]
    Set implementation depends on research
 
 Done! Created plan with 2 tasks.
@@ -189,13 +189,13 @@ Done! Created plan with 2 tasks.
 User: Refactor the error handling in this project
 
 Cursor Composer:
-1. [Uses search_code tool]
+1. [Uses code(action: "search")]
    Found error handling in 15 files
 
-2. [Uses analyze_impact tool]
+2. [Uses code(action: "analyze_impact")]
    Analyzing impact of changes...
 
-3. [Uses add_decision tool]
+3. [Uses decision(action: "add")]
    Recording decision: "Standardize on thiserror crate"
 
 4. [Makes code changes with full context]
@@ -279,28 +279,20 @@ Record this decision with rationale: better error handling and readability.
 
 ---
 
-## Available Tools
+## Available Mega-Tools
 
-All 145 Project Orchestrator tools are available in Cursor. Most useful for editor workflows:
+All 19 Project Orchestrator mega-tools are available in Cursor. Most useful for editor workflows:
 
-| Tool | Cursor Use Case |
-|------|-----------------|
-| `search_code` | Find code patterns before editing |
-| `get_file_symbols` | Understand file structure |
-| `analyze_impact` | Check scope before refactoring |
-| `find_references` | Find all usages of a symbol |
-| `get_call_graph` | Understand function relationships |
-| `list_tasks` | See your work queue |
-| `update_task` | Mark progress |
-| `add_decision` | Record architectural choices |
-| `search_decisions` | Review past decisions |
-| `create_note` | Capture knowledge about code patterns |
-| `search_notes` | Find past observations and guidelines |
-| `get_context_notes` | Get notes relevant to a file or function |
-| `chat_send_message` | Delegate a task to a sub-agent |
-| `list_chat_sessions` | Review past sub-agent conversations |
+| Mega-Tool | Key Actions | Cursor Use Case |
+|-----------|-------------|-----------------|
+| `code` | `search`, `get_file_symbols`, `analyze_impact`, `find_references`, `get_call_graph` | Code exploration, impact analysis, refactoring scope |
+| `task` | `list`, `update`, `get_next` | Work queue and progress tracking |
+| `decision` | `add`, `search_semantic` | Record and review architectural choices |
+| `note` | `create`, `search_semantic`, `get_context` | Knowledge capture and retrieval |
+| `project` | `sync`, `list` | Keep code index fresh |
+| `chat` | `send_message`, `list_sessions` | Sub-agent delegation |
 
-See [Claude Code Integration](./claude-code.md#available-tools-145) for the complete tool list.
+See [MCP Tools Reference](../api/mcp-tools.md) for the complete tool list.
 
 ---
 

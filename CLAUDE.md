@@ -537,7 +537,7 @@ event: error             → {"message": "..."}
 
 ```bash
 # All tests use mock backends (no Docker required for unit tests)
-cargo test                     # 752 tests passing
+cargo test                     # 1992 tests passing
 ```
 
 ## Neo4j Graph Relationships

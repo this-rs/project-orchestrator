@@ -6,7 +6,7 @@ Complete guide to integrating Project Orchestrator with Claude Code (Anthropic's
 
 ## Overview
 
-The integration gives Claude Code access to **145 MCP tools** for:
+The integration gives Claude Code access to **19 mega-tools** (each with multiple actions) for:
 
 - **Project Management** — Create, sync, and explore codebases
 - **Plan & Task Tracking** — Manage development workflows with dependencies
@@ -120,186 +120,49 @@ Ask Claude:
 List all registered projects
 ```
 
-Claude should use the `list_projects` tool and return results.
+Claude should use the `project` tool with action `list` and return results.
 
 ---
 
-## Available Tools (145)
+## Available Mega-Tools (19)
 
-### Project Management (7 tools)
+Project Orchestrator uses a **mega-tool architecture**: 19 tools, each with an `action` parameter that dispatches to specific operations. This keeps the tool count low while providing comprehensive functionality.
 
-| Tool | Description |
-|------|-------------|
-| `list_projects` | List all projects with optional search and pagination |
-| `create_project` | Create a new project to track a codebase |
-| `get_project` | Get project details by slug |
-| `update_project` | Update a project's name, description, or root_path |
-| `delete_project` | Delete a project and all associated data |
-| `sync_project` | Sync a project's codebase (parse files, update graph) |
-| `get_project_roadmap` | Get aggregated roadmap view with milestones and releases |
+### How it works
 
-### Plan Management (10 tools)
+```json
+// Example: List all projects
+{ "tool": "project", "action": "list" }
 
-| Tool | Description |
-|------|-------------|
-| `list_plans` | List plans with optional filters and pagination |
-| `list_project_plans` | List all plans for a specific project |
-| `create_plan` | Create a new development plan |
-| `get_plan` | Get plan details including tasks, constraints, and decisions |
-| `update_plan_status` | Update a plan's status |
-| `delete_plan` | Delete a plan and all its related data |
-| `link_plan_to_project` | Link a plan to a project |
-| `unlink_plan_from_project` | Unlink a plan from its project |
-| `get_dependency_graph` | Get the task dependency graph for a plan |
-| `get_critical_path` | Get the critical path (longest dependency chain) |
+// Example: Search code in a project
+{ "tool": "code", "action": "search_project", "slug": "my-project", "query": "authentication" }
+```
 
-### Task Management (13 tools)
+### Quick Reference
 
-| Tool | Description |
-|------|-------------|
-| `list_tasks` | List all tasks across plans with filters |
-| `create_task` | Add a new task to a plan |
-| `get_task` | Get task details including steps and decisions |
-| `update_task` | Update a task's status, assignee, or other fields |
-| `delete_task` | Delete a task and all its steps and decisions |
-| `get_next_task` | Get the next available task (unblocked, highest priority) |
-| `add_task_dependencies` | Add dependencies to a task |
-| `remove_task_dependency` | Remove a dependency from a task |
-| `get_task_blockers` | Get tasks that are blocking this task |
-| `get_tasks_blocked_by` | Get tasks that are blocked by this task |
-| `get_task_context` | Get full context for a task (for agent execution) |
-| `get_task_prompt` | Get generated prompt for a task |
-| `add_decision` | Record an architectural decision for a task |
+| Mega-Tool | Actions | Description |
+|-----------|---------|-------------|
+| `project` | 8 | Project CRUD, sync, roadmap |
+| `plan` | 10 | Plans, status, dependencies, critical path |
+| `task` | 13 | Tasks, dependencies, blockers, context, prompt |
+| `step` | 6 | Sub-steps within tasks |
+| `decision` | 12 | Architectural decisions, semantic search, affects |
+| `constraint` | 5 | Plan constraints (performance, security, style) |
+| `release` | 8 | Release management with tasks and commits |
+| `milestone` | 9 | Milestones with progress tracking |
+| `commit` | 7 | Git commit tracking, file history |
+| `note` | 20 | Knowledge notes, semantic search, propagation |
+| `workspace` | 10 | Multi-project workspaces, topology |
+| `workspace_milestone` | 10 | Cross-project milestones |
+| `resource` | 6 | API contracts, schemas, shared resources |
+| `component` | 8 | Service architecture, dependencies |
+| `chat` | 7 | Chat sessions, sub-agent delegation |
+| `feature_graph` | 6 | Feature dependency graphs |
+| `code` | 30 | Code search, impact analysis, call graphs, health metrics |
+| `admin` | 23 | Sync, watch, Knowledge Fabric, neural maintenance |
+| `skill` | 12 | Neural skills: emergent knowledge clusters |
 
-### Step Management (6 tools)
-
-| Tool | Description |
-|------|-------------|
-| `list_steps` | List all steps for a task |
-| `create_step` | Add a step to a task |
-| `get_step` | Get a step by ID |
-| `update_step` | Update a step's status |
-| `delete_step` | Delete a step |
-| `get_step_progress` | Get step completion progress for a task |
-
-### Constraint Management (5 tools)
-
-| Tool | Description |
-|------|-------------|
-| `list_constraints` | List constraints for a plan |
-| `add_constraint` | Add a constraint to a plan |
-| `get_constraint` | Get a constraint by ID |
-| `update_constraint` | Update a constraint's description, type, or enforced_by |
-| `delete_constraint` | Delete a constraint |
-
-### Release Management (7 tools)
-
-| Tool | Description |
-|------|-------------|
-| `list_releases` | List releases for a project |
-| `create_release` | Create a new release for a project |
-| `get_release` | Get release details with tasks and commits |
-| `update_release` | Update a release |
-| `delete_release` | Delete a release |
-| `add_task_to_release` | Add a task to a release |
-| `add_commit_to_release` | Add a commit to a release |
-
-### Milestone Management (7 tools)
-
-| Tool | Description |
-|------|-------------|
-| `list_milestones` | List milestones for a project |
-| `create_milestone` | Create a new milestone for a project |
-| `get_milestone` | Get milestone details with tasks |
-| `update_milestone` | Update a milestone |
-| `delete_milestone` | Delete a milestone |
-| `get_milestone_progress` | Get milestone completion progress |
-| `add_task_to_milestone` | Add a task to a milestone |
-
-### Commit Tracking (5 tools)
-
-| Tool | Description |
-|------|-------------|
-| `create_commit` | Register a git commit |
-| `link_commit_to_task` | Link a commit to a task (RESOLVED_BY) |
-| `link_commit_to_plan` | Link a commit to a plan (RESULTED_IN) |
-| `get_task_commits` | Get commits linked to a task |
-| `get_plan_commits` | Get commits linked to a plan |
-
-### Code Exploration (13 tools)
-
-| Tool | Description |
-|------|-------------|
-| `search_code` | Search code semantically across all projects |
-| `search_project_code` | Search code within a specific project |
-| `search_workspace_code` | Search code across all projects in a workspace |
-| `get_file_symbols` | Get all symbols in a file (functions, structs, traits) |
-| `find_references` | Find all references to a symbol |
-| `get_file_dependencies` | Get file imports and files that depend on it |
-| `get_call_graph` | Get the call graph for a function |
-| `analyze_impact` | Analyze the impact of changing a file or symbol |
-| `get_architecture` | Get codebase architecture overview |
-| `find_similar_code` | Find code similar to a given snippet |
-| `find_trait_implementations` | Find all implementations of a trait |
-| `find_type_traits` | Find all traits implemented by a type |
-| `get_impl_blocks` | Get all impl blocks for a type |
-
-### Decision Management (4 tools)
-
-| Tool | Description |
-|------|-------------|
-| `search_decisions` | Search architectural decisions |
-| `get_decision` | Get a decision by ID |
-| `update_decision` | Update a decision's description, rationale, or chosen_option |
-| `delete_decision` | Delete a decision |
-
-### Sync & Watch (4 tools)
-
-| Tool | Description |
-|------|-------------|
-| `sync_directory` | Manually sync a directory to the knowledge graph |
-| `start_watch` | Start auto-sync file watcher |
-| `stop_watch` | Stop the file watcher |
-| `watch_status` | Get file watcher status |
-
-### Notes / Knowledge Base (17 tools)
-
-| Tool | Description |
-|------|-------------|
-| `list_notes` | List notes with optional filters and pagination |
-| `create_note` | Create a new knowledge note |
-| `get_note` | Get a note by ID |
-| `update_note` | Update a note's content, importance, status, or tags |
-| `delete_note` | Delete a note |
-| `search_notes` | Search notes using semantic search |
-| `confirm_note` | Confirm a note is still valid (resets staleness) |
-| `invalidate_note` | Mark a note as obsolete with a reason |
-| `supersede_note` | Replace an old note with a new one |
-| `link_note_to_entity` | Link a note to a code entity (file, function, struct, etc.) |
-| `unlink_note_from_entity` | Remove a link between a note and an entity |
-| `get_context_notes` | Get contextual notes for an entity (direct + propagated) |
-| `get_notes_needing_review` | Get notes that need human review (stale or needs_review) |
-| `update_staleness_scores` | Update staleness scores for all notes based on time decay |
-| `list_project_notes` | List notes for a specific project |
-| `get_propagated_notes` | Get notes propagated through the graph |
-| `get_entity_notes` | Get notes directly attached to an entity |
-
-### Chat (5 tools)
-
-| Tool | Description |
-|------|-------------|
-| `list_chat_sessions` | List chat sessions with optional project filter |
-| `get_chat_session` | Get chat session details by ID |
-| `delete_chat_session` | Delete a chat session |
-| `list_chat_messages` | List message history for a chat session |
-| `chat_send_message` | Send a chat message and wait for the complete response |
-
-### Meilisearch Maintenance (2 tools)
-
-| Tool | Description |
-|------|-------------|
-| `get_meilisearch_stats` | Get Meilisearch code index statistics |
-| `delete_meilisearch_orphans` | Delete documents without project_id from Meilisearch |
+For detailed documentation of every action and parameter, see the [MCP Tools Reference](../api/mcp-tools.md).
 
 ---
 
@@ -310,17 +173,17 @@ Claude should use the `list_projects` tool and return results.
 ```
 You: Register my project at /Users/me/myapp
 
-Claude: [Uses create_project tool]
+Claude: [Uses project(action: "create")]
         Created project "myapp" with slug "myapp"
 
 You: Now sync it so you can understand the code
 
-Claude: [Uses sync_project tool]
+Claude: [Uses project(action: "sync")]
         Synced 342 files. Found 128 functions, 45 structs, 12 traits.
 
 You: Show me the architecture overview
 
-Claude: [Uses get_architecture tool]
+Claude: [Uses code(action: "get_architecture")]
         Most connected files:
         - src/lib.rs (imported by 23 files)
         - src/models/user.rs (imported by 15 files)
@@ -332,26 +195,26 @@ Claude: [Uses get_architecture tool]
 ```
 You: What's the next task I should work on for plan abc123?
 
-Claude: [Uses get_next_task tool]
+Claude: [Uses task(action: "get_next")]
         Next task: "Implement user authentication"
         Priority: 10
         Tags: [backend, security]
 
 You: Okay, I'm starting on it
 
-Claude: [Uses update_task tool with status: "in_progress"]
+Claude: [Uses task(action: "update", status: "in_progress")]
         Task marked as in progress.
 
 You: I decided to use JWT instead of sessions. Record that.
 
-Claude: [Uses add_decision tool]
+Claude: [Uses decision(action: "add")]
         Decision recorded:
         - Description: Use JWT instead of sessions
         - Rationale: Better for stateless API
 
 You: Done! Mark it complete.
 
-Claude: [Uses update_task tool with status: "completed"]
+Claude: [Uses task(action: "update", status: "completed")]
         Task completed! Next available task is...
 ```
 
@@ -360,7 +223,7 @@ Claude: [Uses update_task tool with status: "completed"]
 ```
 You: Find all code related to error handling
 
-Claude: [Uses search_code tool]
+Claude: [Uses code(action: "search")]
         Found 15 results:
         1. src/api/handlers.rs - AppError struct
         2. src/lib.rs - Error handling middleware
@@ -368,7 +231,7 @@ Claude: [Uses search_code tool]
 
 You: What would be impacted if I change the AppError struct?
 
-Claude: [Uses analyze_impact tool]
+Claude: [Uses code(action: "analyze_impact")]
         Impact analysis for AppError:
         - Directly affected: 8 files
         - Transitively affected: 23 files
@@ -377,7 +240,7 @@ Claude: [Uses analyze_impact tool]
 
 You: Show me everything that calls the handle_request function
 
-Claude: [Uses get_call_graph tool]
+Claude: [Uses code(action: "get_call_graph")]
         Call graph for handle_request:
         Callers: main, route_handler, test_handler
         Callees: validate_input, process_request, send_response
@@ -388,19 +251,19 @@ Claude: [Uses get_call_graph tool]
 ```
 Agent 1: Get the next task for plan xyz
 
-Claude: [Uses get_next_task]
+Claude: [Uses task(action: "get_next")]
         Task: "Implement login endpoint"
 
 Agent 1: [Works on task, completes it]
 
 Agent 1: Mark task as completed and record my commit
 
-Claude: [Uses update_task, create_commit, link_commit_to_task]
+Claude: [Uses task(action: "update"), commit(action: "create"), commit(action: "link_to_task")]
         Task completed. Commit abc123 linked.
 
 Agent 2: Get the next task (runs in parallel)
 
-Claude: [Uses get_next_task]
+Claude: [Uses task(action: "get_next")]
         Task: "Implement logout endpoint" (was blocked by login, now available)
 ```
 
@@ -440,7 +303,7 @@ Claude: The Project Orchestrator HTTP API supports two authentication methods:
 ```
 You: Send a task to a sub-agent to analyze the auth module
 
-Claude: [Uses chat_send_message tool]
+Claude: [Uses chat(action: "send_message")]
         Sent message: "Analyze the auth module structure and report key findings"
         Working directory: /Users/me/myapp
 
@@ -453,7 +316,7 @@ Claude: [Uses chat_send_message tool]
 
 You: List all my chat sessions
 
-Claude: [Uses list_chat_sessions tool]
+Claude: [Uses chat(action: "list_sessions")]
         1. Session abc-123 (project: myapp) — 5 messages
         2. Session def-456 (project: myapp) — 12 messages
 ```
