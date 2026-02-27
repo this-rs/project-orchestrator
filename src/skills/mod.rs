@@ -27,21 +27,25 @@ pub mod activation;
 pub mod cache;
 pub mod detection;
 pub mod evolution;
+pub mod export;
 pub mod feedback;
 pub mod hook_extractor;
 pub mod lifecycle;
 pub mod maintenance;
 pub mod models;
 pub mod naming;
+pub mod package;
 pub mod templates;
 pub mod triggers;
 
 pub use activation::*;
 pub use cache::*;
 pub use detection::*;
+pub use export::*;
 pub use hook_extractor::*;
 pub use lifecycle::*;
 pub use models::*;
+pub use package::*;
 pub use templates::*;
 pub use triggers::*;
 
