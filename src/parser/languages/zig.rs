@@ -32,39 +32,25 @@ fn extract_recursive(
 
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "FnDecl" | "TopLevelDecl" => {
-                // Try to extract as function
+            // tree-sitter-zig 1.1 uses snake_case node kinds
+            "function_declaration" => {
                 if let Some(func) = extract_function(&child, source, file_path) {
                     let func_id = format!("{}:{}:{}", file_path, func.name, func.line_start);
                     let calls = extract_calls_from_node(&child, source, &func_id);
                     parsed.function_calls.extend(calls);
                     parsed.symbols.push(func.name.clone());
                     parsed.functions.push(func);
-                } else {
-                    // Check for variable declarations with struct/enum types
-                    if let Some(s) = extract_type_decl(&child, source, file_path) {
-                        parsed.symbols.push(s.name.clone());
-                        parsed.structs.push(s);
-                    } else if let Some(e) = extract_enum_decl(&child, source, file_path) {
-                        parsed.symbols.push(e.name.clone());
-                        parsed.enums.push(e);
-                    }
-                    // Check for imports in variable declarations
-                    if let Some(import) = extract_import_from_decl(&child, source, file_path) {
-                        parsed.imports.push(import);
-                    }
-                    extract_recursive(&child, source, file_path, parsed)?;
                 }
             }
-            "TestDecl" => {
+            "test_declaration" => {
                 // Zig test blocks: test "name" { ... }
                 if let Some(func) = extract_test(&child, source, file_path) {
                     parsed.symbols.push(func.name.clone());
                     parsed.functions.push(func);
                 }
             }
-            "VarDecl" => {
-                // Top-level const/var declarations
+            "variable_declaration" => {
+                // const/var declarations — may contain @import, struct, or enum
                 if let Some(import) = extract_import_from_decl(&child, source, file_path) {
                     parsed.imports.push(import);
                 } else if let Some(s) = extract_type_decl(&child, source, file_path) {
