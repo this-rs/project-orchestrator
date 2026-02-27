@@ -2945,6 +2945,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         parsed_path,
                         &ctx.suffix_index,
                     ),
+                    "hcl" => Self::resolve_hcl_module_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
                     _ => Vec::new(),
                 };
 
@@ -3827,6 +3832,58 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             return vec![resolved.to_string()];
         }
 
+        Vec::new()
+    }
+
+    /// Resolve HCL/Terraform module imports using SuffixIndex.
+    ///
+    /// Handles three cases:
+    /// 1. `__same_dir__` — resolves to all .tf files in the same directory (excluding self)
+    /// 2. Relative paths (`./modules/vpc`, `../networking`) — resolves to .tf files in the target dir
+    /// 3. Registry/git modules — returns empty (external, not in codebase)
+    fn resolve_hcl_module_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim().trim_matches('"');
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        let source_dir = source_file
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("");
+
+        // Case 1: Implicit same-directory scope
+        if path == "__same_dir__" {
+            let files = index.get_files_in_dir(source_dir, "tf");
+            return files
+                .into_iter()
+                .filter(|f| *f != source_file)
+                .map(|f| f.to_string())
+                .collect();
+        }
+
+        // Case 2: Relative paths → resolve to .tf files in target directory
+        if path.starts_with("./") || path.starts_with("../") {
+            let clean_path = path.strip_prefix("./").unwrap_or(path);
+            let resolved_dir = if source_dir.is_empty() {
+                clean_path.to_string()
+            } else {
+                resolve_relative_path(source_dir, clean_path)
+            };
+
+            return index
+                .get_files_in_dir(&resolved_dir, "tf")
+                .into_iter()
+                .map(|f| f.to_string())
+                .collect();
+        }
+
+        // Case 3: Registry modules (e.g. "terraform-aws-modules/vpc/aws"),
+        // git sources (e.g. "git::https://..."), S3/GCS, etc. → not resolvable
         Vec::new()
     }
 
@@ -7963,6 +8020,117 @@ mod tests {
         let result =
             Orchestrator::resolve_bash_import_indexed("./missing.sh", "scripts/main.sh", &index);
         assert!(result.is_empty());
+    }
+
+    // =========================================================================
+    // HCL/Terraform Resolver Tests
+    // =========================================================================
+
+    #[test]
+    fn test_resolve_hcl_module_local() {
+        let paths = vec![
+            "infra/main.tf".to_string(),
+            "infra/modules/vpc/main.tf".to_string(),
+            "infra/modules/vpc/variables.tf".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_hcl_module_indexed("./modules/vpc", "infra/main.tf", &index);
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 files in modules/vpc, got: {:?}",
+            result
+        );
+        assert!(result.contains(&"infra/modules/vpc/main.tf".to_string()));
+        assert!(result.contains(&"infra/modules/vpc/variables.tf".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_hcl_module_parent() {
+        let paths = vec![
+            "infra/env/prod/main.tf".to_string(),
+            "infra/networking/main.tf".to_string(),
+            "infra/networking/outputs.tf".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // From infra/env/prod, ../../networking → up to infra/env, up to infra, into networking
+        let result = Orchestrator::resolve_hcl_module_indexed(
+            "../../networking",
+            "infra/env/prod/main.tf",
+            &index,
+        );
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 files in networking, got: {:?}",
+            result
+        );
+        assert!(result.contains(&"infra/networking/main.tf".to_string()));
+        assert!(result.contains(&"infra/networking/outputs.tf".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_hcl_module_registry_ignored() {
+        let paths = vec!["infra/main.tf".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_hcl_module_indexed(
+            "terraform-aws-modules/vpc/aws",
+            "infra/main.tf",
+            &index,
+        );
+        assert!(result.is_empty(), "Registry modules should not resolve");
+    }
+
+    #[test]
+    fn test_resolve_hcl_module_git_ignored() {
+        let paths = vec!["infra/main.tf".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_hcl_module_indexed(
+            "git::https://example.com/module.git",
+            "infra/main.tf",
+            &index,
+        );
+        assert!(result.is_empty(), "Git modules should not resolve");
+    }
+
+    #[test]
+    fn test_resolve_hcl_same_dir() {
+        let paths = vec![
+            "infra/main.tf".to_string(),
+            "infra/network.tf".to_string(),
+            "infra/variables.tf".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_hcl_module_indexed("__same_dir__", "infra/main.tf", &index);
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 sibling files, got: {:?}",
+            result
+        );
+        assert!(result.contains(&"infra/network.tf".to_string()));
+        assert!(result.contains(&"infra/variables.tf".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_hcl_same_dir_excludes_self() {
+        let paths = vec!["infra/main.tf".to_string(), "infra/network.tf".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_hcl_module_indexed("__same_dir__", "infra/main.tf", &index);
+        assert!(
+            !result.contains(&"infra/main.tf".to_string()),
+            "Source file must be excluded from __same_dir__"
+        );
+        assert_eq!(result, vec!["infra/network.tf"]);
     }
 
     #[test]
