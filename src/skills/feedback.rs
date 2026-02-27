@@ -110,7 +110,7 @@ impl ActivationBuffer {
 
         let mut is_miss = false;
 
-        let mut buffers = self.buffers.write().expect("feedback buffer lock poisoned");
+        let mut buffers = self.buffers.write().unwrap_or_else(|e| e.into_inner());
         let buffer = buffers.entry(project_id).or_default();
 
         // Check if there's a recent activation with the same pattern
@@ -156,7 +156,7 @@ impl ActivationBuffer {
         let mut total = 0usize;
         let mut misses = 0usize;
 
-        let buffers = self.buffers.read().expect("feedback buffer lock poisoned");
+        let buffers = self.buffers.read().unwrap_or_else(|e| e.into_inner());
         for buffer in buffers.values() {
             for event in buffer.iter() {
                 if event.skill_id == skill_id {
@@ -183,7 +183,7 @@ impl ActivationBuffer {
         // Collect all skill IDs from all buffers
         let mut skill_stats: HashMap<Uuid, (usize, usize)> = HashMap::new();
 
-        let buffers = self.buffers.read().expect("feedback buffer lock poisoned");
+        let buffers = self.buffers.read().unwrap_or_else(|e| e.into_inner());
         for buffer in buffers.values() {
             for event in buffer.iter() {
                 let stat = skill_stats.entry(event.skill_id).or_insert((0, 0));
@@ -252,13 +252,13 @@ impl ActivationBuffer {
 
     /// Clear the buffer for a specific project.
     pub fn clear_project(&self, project_id: Uuid) {
-        let mut buffers = self.buffers.write().expect("feedback buffer lock poisoned");
+        let mut buffers = self.buffers.write().unwrap_or_else(|e| e.into_inner());
         buffers.remove(&project_id);
     }
 
     /// Get the total number of events across all projects.
     pub fn total_events(&self) -> usize {
-        let buffers = self.buffers.read().expect("feedback buffer lock poisoned");
+        let buffers = self.buffers.read().unwrap_or_else(|e| e.into_inner());
         buffers.values().map(|b| b.len()).sum()
     }
 }
@@ -497,7 +497,11 @@ mod tests {
 
         // Verify penalty candidate is produced (hit_rate 0.2 < 0.3 threshold)
         let candidates = buffer.get_penalty_candidates();
-        assert_eq!(candidates.len(), 1, "Should produce exactly 1 penalty candidate");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "Should produce exactly 1 penalty candidate"
+        );
         assert_eq!(candidates[0].0, skill_id);
         assert!(
             candidates[0].1 < 0.3,

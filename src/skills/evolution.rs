@@ -272,11 +272,7 @@ pub fn analyze_evolution(
 // ============================================================================
 
 /// Create an observation note to trace an evolution event.
-async fn trace_evolution_note(
-    graph_store: &dyn GraphStore,
-    project_id: Uuid,
-    content: String,
-) {
+async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, content: String) {
     let note = Note {
         id: Uuid::new_v4(),
         project_id: Some(project_id),
@@ -425,6 +421,13 @@ pub async fn execute_evolution(
                     // Transfer all members from absorbed skills to survivor
                     for absorbed in all_skills.iter().skip(1) {
                         let (notes, decisions) = graph_store.get_skill_members(absorbed.id).await?;
+
+                        // Compute actual overlap between absorbed skill's members and candidate
+                        let absorbed_member_ids: Vec<String> =
+                            notes.iter().map(|n| n.id.to_string()).collect();
+                        let overlap =
+                            jaccard_similarity(&candidate.member_note_ids, &absorbed_member_ids);
+
                         for note in &notes {
                             let _ = graph_store
                                 .add_skill_member(survivor_id, "note", note.id)
@@ -445,13 +448,7 @@ pub async fn execute_evolution(
                         result.merged.push(MergeEvent {
                             survivor_id,
                             absorbed_id: absorbed.id,
-                            overlap: jaccard_similarity(
-                                &candidate.member_note_ids,
-                                &all_skills
-                                    .iter()
-                                    .flat_map(|_| candidate.member_note_ids.clone())
-                                    .collect::<Vec<_>>(),
-                            ),
+                            overlap,
                         });
 
                         trace_evolution_note(
@@ -816,7 +813,8 @@ mod tests {
             .filter(|e| matches!(e, SkillEvolution::Split { .. }))
             .count();
         assert_eq!(
-            split_count, 1,
+            split_count,
+            1,
             "Expected 1 split, got evolutions: {:?}",
             evolutions
                 .iter()

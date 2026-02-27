@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
-use crate::skills::detection::{detect_skills_pipeline, SkillDetectionConfig};
+use crate::skills::detection::SkillDetectionConfig;
 use crate::skills::evolution::{analyze_evolution, execute_evolution, EvolutionResult};
 use crate::skills::lifecycle::{update_skill_lifecycle, MetricsUpdateResult, SkillLifecycleConfig};
 
@@ -201,94 +201,87 @@ pub async fn run_weekly_maintenance(
     let mut result = run_daily_maintenance(graph_store, project_id, config).await?;
     result.level = "weekly".to_string();
 
-    // Step 2: Re-detect skills via Louvain
-    match detect_skills_pipeline(graph_store, project_id, &config.detection).await {
-        Ok(detection_result) => {
-            result.skills_detected = Some(detection_result.skills_detected);
+    // Step 2: Snapshot existing skills BEFORE detection (for evolution comparison)
+    let existing_skills = graph_store.get_skills_for_project(project_id).await?;
+    let mut existing_members: Vec<(Uuid, Vec<String>)> = Vec::new();
+    for skill in &existing_skills {
+        let (notes, _) = graph_store.get_skill_members(skill.id).await?;
+        let member_ids: Vec<String> = notes.iter().map(|n| n.id.to_string()).collect();
+        existing_members.push((skill.id, member_ids));
+    }
 
-            if detection_result.status == crate::skills::detection::ClusterDetectionStatus::Success
-                && !detection_result.skill_ids.is_empty()
-            {
-                // Step 3: Evolve existing skills based on new clusters
-                let existing_skills = graph_store.get_skills_for_project(project_id).await?;
-                let mut existing_members: Vec<(Uuid, Vec<String>)> = Vec::new();
-                for skill in &existing_skills {
-                    let (notes, _) = graph_store.get_skill_members(skill.id).await?;
-                    let member_ids: Vec<String> = notes.iter().map(|n| n.id.to_string()).collect();
-                    existing_members.push((skill.id, member_ids));
+    // Step 3: Run Louvain detection once — detect candidates for evolution analysis
+    // (We use detect_skill_candidates directly instead of detect_skills_pipeline
+    // to avoid persisting skills twice. Evolution will handle persistence.)
+    let detection_candidates = match graph_store
+        .get_synapse_graph(project_id, config.detection.min_synapse_weight)
+        .await
+    {
+        Ok(edges) => {
+            let detection = crate::skills::detection::detect_skill_candidates(
+                &edges,
+                &project_id.to_string(),
+                &config.detection,
+            );
+            result.skills_detected = Some(detection.candidates.len());
+            detection.candidates
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to get synapse graph for detection");
+            result
+                .warnings
+                .push(format!("Synapse graph fetch failed: {}", e));
+            vec![]
+        }
+    };
+
+    // Step 4: Evolve existing skills based on new clusters
+    if !detection_candidates.is_empty() && !existing_members.is_empty() {
+        let evolutions = analyze_evolution(
+            &existing_members,
+            &detection_candidates,
+            config.evolution_overlap_threshold,
+        );
+
+        // Fetch notes needed for evolution (split, new, grow)
+        let mut notes_map = std::collections::HashMap::new();
+        for evolution in &evolutions {
+            let note_ids: Vec<&str> = match evolution {
+                crate::skills::evolution::SkillEvolution::Stable { notes_to_add, .. } => {
+                    notes_to_add.iter().map(|s| s.as_str()).collect()
                 }
-
-                // Get new candidates from a fresh detection
-                let edges = graph_store
-                    .get_synapse_graph(project_id, config.detection.min_synapse_weight)
-                    .await?;
-                let detection = crate::skills::detection::detect_skill_candidates(
-                    &edges,
-                    &project_id.to_string(),
-                    &config.detection,
-                );
-
-                if !detection.candidates.is_empty() {
-                    let evolutions = analyze_evolution(
-                        &existing_members,
-                        &detection.candidates,
-                        config.evolution_overlap_threshold,
-                    );
-
-                    // Fetch notes for evolution
-                    let mut notes_map = std::collections::HashMap::new();
-                    for evolution in &evolutions {
-                        let note_ids: Vec<&str> = match evolution {
-                            crate::skills::evolution::SkillEvolution::Stable {
-                                notes_to_add,
-                                ..
-                            } => notes_to_add.iter().map(|s| s.as_str()).collect(),
-                            crate::skills::evolution::SkillEvolution::Split {
-                                candidates, ..
-                            } => candidates
-                                .iter()
-                                .flat_map(|c| c.member_note_ids.iter().map(|s| s.as_str()))
-                                .collect(),
-                            crate::skills::evolution::SkillEvolution::New { candidate } => {
-                                candidate
-                                    .member_note_ids
-                                    .iter()
-                                    .map(|s| s.as_str())
-                                    .collect()
-                            }
-                            _ => vec![],
-                        };
-                        for note_id_str in note_ids {
-                            if !notes_map.contains_key(note_id_str) {
-                                if let Ok(uuid) = Uuid::parse_str(note_id_str) {
-                                    if let Ok(Some(note)) = graph_store.get_note(uuid).await {
-                                        notes_map.insert(note_id_str.to_string(), note);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    match execute_evolution(graph_store, &evolutions, &notes_map, project_id).await
-                    {
-                        Ok(evolution) => {
-                            result.evolution = Some(evolution);
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to execute skill evolution");
-                            result
-                                .warnings
-                                .push(format!("Evolution execution failed: {}", e));
+                crate::skills::evolution::SkillEvolution::Split { candidates, .. } => candidates
+                    .iter()
+                    .flat_map(|c| c.member_note_ids.iter().map(|s| s.as_str()))
+                    .collect(),
+                crate::skills::evolution::SkillEvolution::New { candidate } => candidate
+                    .member_note_ids
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect(),
+                _ => vec![],
+            };
+            for note_id_str in note_ids {
+                if !notes_map.contains_key(note_id_str) {
+                    if let Ok(uuid) = Uuid::parse_str(note_id_str) {
+                        if let Ok(Some(note)) = graph_store.get_note(uuid).await {
+                            notes_map.insert(note_id_str.to_string(), note);
                         }
                     }
                 }
             }
         }
-        Err(e) => {
-            warn!(error = %e, "Failed to detect skills");
-            result
-                .warnings
-                .push(format!("Skill detection failed: {}", e));
+
+        match execute_evolution(graph_store, &evolutions, &notes_map, project_id).await {
+            Ok(evolution) => {
+                result.evolution = Some(evolution);
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to execute skill evolution");
+                result
+                    .warnings
+                    .push(format!("Evolution execution failed: {}", e));
+            }
         }
     }
 

@@ -138,11 +138,20 @@ pub async fn promote_skill(graph_store: &dyn GraphStore, skill_id: Uuid) -> anyh
     // Collect file paths covered by member notes (via LINKED_TO anchors)
     let mut covered_files: std::collections::HashSet<String> = std::collections::HashSet::new();
     for note in &member_notes {
-        if let Ok(anchors) = graph_store.get_note_anchors(note.id).await {
-            for anchor in &anchors {
-                if anchor.entity_type == crate::notes::EntityType::File {
-                    covered_files.insert(anchor.entity_id.clone());
+        match graph_store.get_note_anchors(note.id).await {
+            Ok(anchors) => {
+                for anchor in &anchors {
+                    if anchor.entity_type == crate::notes::EntityType::File {
+                        covered_files.insert(anchor.entity_id.clone());
+                    }
                 }
+            }
+            Err(e) => {
+                warn!(
+                    note_id = %note.id,
+                    error = %e,
+                    "Failed to get note anchors during promotion"
+                );
             }
         }
     }
@@ -348,10 +357,7 @@ pub async fn archive_skill(graph_store: &dyn GraphStore, skill_id: Uuid) -> anyh
 /// This allows manual recovery of a skill that was demoted but is still useful.
 /// The skill is set to `Emerging` (not `Active`) — it must prove itself again
 /// through activation hook usage before being re-promoted to Active.
-pub async fn reactivate_skill(
-    graph_store: &dyn GraphStore,
-    skill_id: Uuid,
-) -> anyhow::Result<()> {
+pub async fn reactivate_skill(graph_store: &dyn GraphStore, skill_id: Uuid) -> anyhow::Result<()> {
     let mut skill = graph_store
         .get_skill(skill_id)
         .await?
@@ -365,10 +371,11 @@ pub async fn reactivate_skill(
         );
     }
 
+    let now = Utc::now();
     skill.status = SkillStatus::Emerging;
     skill.activation_count = 0; // Reset activations so it must prove itself
-    skill.updated_at = Utc::now();
-    skill.last_activated = Some(Utc::now());
+    skill.updated_at = now;
+    skill.last_activated = Some(now);
     graph_store.update_skill(&skill).await?;
 
     info!(
@@ -812,7 +819,7 @@ mod tests {
             SkillStatus::Emerging,
             SkillStatus::Archived,
         ] {
-            let skill = make_skill(status.clone(), 0.5, 0.5);
+            let skill = make_skill(status, 0.5, 0.5);
             // We can't call the async function in a sync test, but we can verify
             // the status guard logic by checking evaluate_demotion doesn't interfere
             // The reactivate_skill function checks status == Dormant
