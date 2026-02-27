@@ -403,6 +403,8 @@ pub struct ProcessConfig {
     pub min_steps: usize,
     /// Minimum edge confidence (weight) to follow.
     pub min_trace_confidence: f64,
+    /// Maximum BFS queue size to prevent OOM from exponential path explosion.
+    pub max_queue_size: usize,
 }
 
 impl Default for ProcessConfig {
@@ -413,6 +415,7 @@ impl Default for ProcessConfig {
             max_processes: 75,
             min_steps: 3,
             min_trace_confidence: 0.5,
+            max_queue_size: 10_000,
         }
     }
 }
@@ -481,15 +484,19 @@ fn bfs_trace_single(
 
     let mut traces = Vec::new();
 
-    // BFS with path tracking: (current_index, path_so_far)
-    let mut queue: VecDeque<(petgraph::graph::NodeIndex, Vec<String>)> = VecDeque::new();
-    queue.push_back((start_idx, vec![start.to_string()]));
+    // BFS with path tracking: (current_index, path_so_far, visited_set)
+    let mut queue: VecDeque<(petgraph::graph::NodeIndex, Vec<String>, HashSet<String>)> =
+        VecDeque::new();
+    let initial_visited: HashSet<String> = [start.to_string()].into_iter().collect();
+    queue.push_back((start_idx, vec![start.to_string()], initial_visited));
 
-    while let Some((current_idx, path)) = queue.pop_front() {
+    while let Some((current_idx, path, visited)) = queue.pop_front() {
         if path.len() > config.max_trace_depth {
-            // Terminal by depth limit — record trace
-            let trace = build_trace(&path, metrics);
-            traces.push(trace);
+            // Terminal by depth limit — record trace only if long enough
+            if path.len() >= config.min_steps {
+                let trace = build_trace(&path, metrics);
+                traces.push(trace);
+            }
             continue;
         }
 
@@ -509,8 +516,8 @@ fn bfs_trace_single(
             let target_idx = edge_ref.target();
             let target_node = &graph.graph[target_idx];
 
-            // Skip if already in path (cycle avoidance)
-            if path.contains(&target_node.id) {
+            // Skip if already in path (O(1) cycle avoidance via HashSet)
+            if visited.contains(&target_node.id) {
                 continue;
             }
 
@@ -534,11 +541,23 @@ fn bfs_trace_single(
         });
         callees.truncate(config.max_branching);
 
+        // Check queue size limit to prevent OOM from exponential path explosion
+        if queue.len() >= config.max_queue_size {
+            tracing::warn!(
+                "BFS queue size limit ({}) reached for entry point '{}'; stopping expansion",
+                config.max_queue_size,
+                start
+            );
+            break;
+        }
+
         for (target_idx, _, _) in &callees {
             let target_node = &graph.graph[*target_idx];
             let mut new_path = path.clone();
             new_path.push(target_node.id.clone());
-            queue.push_back((*target_idx, new_path));
+            let mut new_visited = visited.clone();
+            new_visited.insert(target_node.id.clone());
+            queue.push_back((*target_idx, new_path, new_visited));
         }
     }
 
@@ -636,13 +655,26 @@ pub fn deduplicate_endpoints(traces: &mut Vec<ProcessTrace>) {
         }
     }
 
-    *traces = best.into_values().collect();
+    let mut result: Vec<ProcessTrace> = best.into_values().collect();
+    result.sort_by(|a, b| {
+        a.entry_point_id
+            .cmp(&b.entry_point_id)
+            .then_with(|| a.terminal_id.cmp(&b.terminal_id))
+    });
+    *traces = result;
 }
 
 // ── Classification ──────────────────────────────────────────────────
 
 /// Classify traces into Process objects with intra/cross community labels.
-pub fn classify_processes(traces: Vec<ProcessTrace>, graph: &CodeGraph) -> Vec<Process> {
+pub fn classify_processes(mut traces: Vec<ProcessTrace>, graph: &CodeGraph) -> Vec<Process> {
+    // Sort traces deterministically so process IDs are stable across runs
+    traces.sort_by(|a, b| {
+        a.entry_point_id
+            .cmp(&b.entry_point_id)
+            .then_with(|| a.terminal_id.cmp(&b.terminal_id))
+    });
+
     traces
         .into_iter()
         .enumerate()

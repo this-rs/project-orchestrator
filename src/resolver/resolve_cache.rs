@@ -1,12 +1,12 @@
 //! ResolveCache: LRU cache for import resolution results
 //!
 //! Avoids re-resolving the same import path from different source files.
-//! Key: `(source_file, import_path)`, Value: `Option<String>` (resolved path or None).
+//! Key: `(source_file, import_path)`, Value: `Vec<String>` (resolved paths).
 //!
-//! The double-Option pattern distinguishes:
+//! Return semantics:
 //! - `get() → None`: not in cache (cache miss)
-//! - `get() → Some(None)`: cached as unresolvable
-//! - `get() → Some(Some(path))`: cached as resolved to `path`
+//! - `get() → Some(&vec![])`: cached as unresolvable (negative cache)
+//! - `get() → Some(&vec![...])`: cached as resolved to one or more paths
 
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -18,7 +18,7 @@ const DEFAULT_CAPACITY: usize = 100_000;
 ///
 /// Shared during a sync pass, cleared between syncs.
 pub struct ResolveCache {
-    cache: LruCache<(String, String), Option<String>>,
+    cache: LruCache<(String, String), Vec<String>>,
     hits: u64,
     misses: u64,
 }
@@ -59,13 +59,13 @@ impl ResolveCache {
     ///
     /// Returns:
     /// - `None` — not in cache (miss)
-    /// - `Some(None)` — cached as unresolvable
-    /// - `Some(Some(path))` — cached as resolved
-    pub fn get(&mut self, source: &str, import: &str) -> Option<Option<&String>> {
+    /// - `Some(&vec![])` — cached as unresolvable (negative cache)
+    /// - `Some(&vec![...])` — cached as resolved to one or more paths
+    pub fn get(&mut self, source: &str, import: &str) -> Option<&Vec<String>> {
         let key = (source.to_string(), import.to_string());
         if let Some(result) = self.cache.get(&key) {
             self.hits += 1;
-            Some(result.as_ref())
+            Some(result)
         } else {
             self.misses += 1;
             None
@@ -74,8 +74,9 @@ impl ResolveCache {
 
     /// Insert a resolution result into the cache.
     ///
+    /// Pass an empty Vec to cache a negative result (unresolvable import).
     /// If the cache is at capacity, the least recently used entry is evicted.
-    pub fn insert(&mut self, source: String, import: String, result: Option<String>) {
+    pub fn insert(&mut self, source: String, import: String, result: Vec<String>) {
         self.cache.put((source, import), result);
     }
 
@@ -140,11 +141,33 @@ mod tests {
         cache.insert(
             "src/main.rs".to_string(),
             "crate::api::handlers".to_string(),
-            Some("src/api/handlers.rs".to_string()),
+            vec!["src/api/handlers.rs".to_string()],
         );
 
         let result = cache.get("src/main.rs", "crate::api::handlers");
-        assert_eq!(result, Some(Some(&"src/api/handlers.rs".to_string())));
+        assert_eq!(result, Some(&vec!["src/api/handlers.rs".to_string()]));
+    }
+
+    #[test]
+    fn test_insert_and_get_multiple() {
+        let mut cache = ResolveCache::new();
+        cache.insert(
+            "src/Main.java".to_string(),
+            "com.example.utils.*".to_string(),
+            vec![
+                "src/com/example/utils/StringUtils.java".to_string(),
+                "src/com/example/utils/DateUtils.java".to_string(),
+            ],
+        );
+
+        let result = cache.get("src/Main.java", "com.example.utils.*");
+        assert_eq!(
+            result,
+            Some(&vec![
+                "src/com/example/utils/StringUtils.java".to_string(),
+                "src/com/example/utils/DateUtils.java".to_string(),
+            ])
+        );
     }
 
     #[test]
@@ -153,11 +176,11 @@ mod tests {
         cache.insert(
             "src/main.rs".to_string(),
             "external::crate".to_string(),
-            None,
+            vec![],
         );
 
         let result = cache.get("src/main.rs", "external::crate");
-        assert_eq!(result, Some(None)); // Cached as unresolvable
+        assert_eq!(result, Some(&vec![])); // Cached as unresolvable (empty Vec)
     }
 
     #[test]
@@ -173,7 +196,7 @@ mod tests {
         cache.insert(
             "a.rs".to_string(),
             "foo".to_string(),
-            Some("foo.rs".to_string()),
+            vec!["foo.rs".to_string()],
         );
 
         let _ = cache.get("a.rs", "foo"); // hit
@@ -190,13 +213,13 @@ mod tests {
     fn test_eviction_at_capacity() {
         let mut cache = ResolveCache::with_capacity(3);
 
-        cache.insert("a.rs".to_string(), "1".to_string(), Some("r1".to_string()));
-        cache.insert("a.rs".to_string(), "2".to_string(), Some("r2".to_string()));
-        cache.insert("a.rs".to_string(), "3".to_string(), Some("r3".to_string()));
+        cache.insert("a.rs".to_string(), "1".to_string(), vec!["r1".to_string()]);
+        cache.insert("a.rs".to_string(), "2".to_string(), vec!["r2".to_string()]);
+        cache.insert("a.rs".to_string(), "3".to_string(), vec!["r3".to_string()]);
         assert_eq!(cache.len(), 3);
 
         // Adding a 4th should evict the LRU (key "1")
-        cache.insert("a.rs".to_string(), "4".to_string(), Some("r4".to_string()));
+        cache.insert("a.rs".to_string(), "4".to_string(), vec!["r4".to_string()]);
         assert_eq!(cache.len(), 3);
 
         // "1" should be evicted
@@ -217,7 +240,7 @@ mod tests {
             cache.insert(
                 "src/file.rs".to_string(),
                 format!("import_{}", i),
-                Some(format!("resolved_{}", i)),
+                vec![format!("resolved_{}", i)],
             );
         }
 
@@ -237,7 +260,7 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut cache = ResolveCache::new();
-        cache.insert("a.rs".to_string(), "foo".to_string(), Some("r".to_string()));
+        cache.insert("a.rs".to_string(), "foo".to_string(), vec!["r".to_string()]);
         let _ = cache.get("a.rs", "foo");
 
         cache.clear();

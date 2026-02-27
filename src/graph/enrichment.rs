@@ -193,7 +193,17 @@ impl LlmCommunityEnricher {
             .trim_end_matches("```")
             .trim();
 
-        let parsed: HashMap<String, String> = serde_json::from_str(clean).unwrap_or_default();
+        let parsed: HashMap<String, String> = match serde_json::from_str(clean) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    "LLM returned invalid JSON for community labels: {} — raw: {:.200}",
+                    e,
+                    clean
+                );
+                HashMap::new()
+            }
+        };
 
         Ok(parsed)
     }

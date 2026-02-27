@@ -19,6 +19,19 @@ use uuid::Uuid;
 
 use super::models::{CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType, FabricWeights};
 
+/// Parse a qualified function ID of the form `"file_path:function_name:index"`
+/// into `(Some(file_path), function_name)`.
+///
+/// Falls back to `(None, id.clone())` when the ID does not contain at least two
+/// colon-separated segments.
+fn parse_qualified_id(id: &str) -> (Option<String>, String) {
+    let mut parts = id.splitn(3, ':');
+    match (parts.next(), parts.next()) {
+        (Some(file_path), Some(func_name)) => (Some(file_path.to_string()), func_name.to_string()),
+        _ => (None, id.to_string()),
+    }
+}
+
 /// Extracts code graphs from the knowledge graph (Neo4j) via the `GraphStore` trait.
 ///
 /// Each extraction method performs at most 2 bulk queries:
@@ -304,18 +317,22 @@ impl GraphExtractor {
 
         for (caller, callee) in &edges {
             // Ensure both nodes exist (auto-created from edge endpoints)
+            // Parse qualified ID "file_path:function_name:index" to extract
+            // the short function name and file path for process detection.
+            let (caller_path, caller_name) = parse_qualified_id(caller);
             graph.add_node(CodeNode {
                 id: caller.clone(),
                 node_type: CodeNodeType::Function,
-                path: None,
-                name: caller.clone(),
+                path: caller_path,
+                name: caller_name,
                 project_id: Some(project_id.to_string()),
             });
+            let (callee_path, callee_name) = parse_qualified_id(callee);
             graph.add_node(CodeNode {
                 id: callee.clone(),
                 node_type: CodeNodeType::Function,
-                path: None,
-                name: callee.clone(),
+                path: callee_path,
+                name: callee_name,
                 project_id: Some(project_id.to_string()),
             });
 
@@ -777,5 +794,83 @@ mod tests {
         // Only the valid edge should be present — missing.rs was filtered by
         // get_project_import_edges (scoped to project) OR by the robustness check
         assert_eq!(graph.edge_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_extract_function_graph_parses_qualified_ids() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // Seed two functions in different files
+        let file_a = "src/api/handlers.rs";
+        let file_b = "src/api/routes.rs";
+
+        let func_a = FunctionNode {
+            name: "get_user".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_a.to_string(),
+            line_start: 10,
+            line_end: 20,
+            docstring: None,
+        };
+        let func_b = FunctionNode {
+            name: "route_request".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_b.to_string(),
+            line_start: 5,
+            line_end: 15,
+            docstring: None,
+        };
+
+        store.upsert_function(&func_a).await.unwrap();
+        store.upsert_function(&func_b).await.unwrap();
+
+        // Register project files so the mock scopes correctly
+        {
+            let mut pf = store.project_files.write().await;
+            pf.entry(project.id).or_default().push(file_a.to_string());
+            pf.entry(project.id).or_default().push(file_b.to_string());
+        }
+
+        // Seed a call: route_request -> get_user
+        // The mock stores calls keyed by "file_path::name"
+        {
+            let mut cr = store.call_relationships.write().await;
+            cr.entry(format!("{}::{}", file_b, "route_request"))
+                .or_default()
+                .push("get_user".to_string());
+        }
+
+        let extractor = GraphExtractor::new(Arc::new(store));
+        let graph = extractor.extract_function_graph(project.id).await.unwrap();
+
+        // The qualified IDs produced by the mock are "file:name:line_start"
+        let caller_id = "src/api/routes.rs:route_request:5";
+        let callee_id = "src/api/handlers.rs:get_user:10";
+
+        // Verify nodes exist
+        let caller_node = graph.get_node(caller_id).expect("caller node should exist");
+        let callee_node = graph.get_node(callee_id).expect("callee node should exist");
+
+        // Verify name is the short function name, NOT the full qualified ID
+        assert_eq!(caller_node.name, "route_request");
+        assert_eq!(callee_node.name, "get_user");
+
+        // Verify path is extracted from the qualified ID
+        assert_eq!(caller_node.path, Some("src/api/routes.rs".to_string()));
+        assert_eq!(callee_node.path, Some("src/api/handlers.rs".to_string()));
     }
 }

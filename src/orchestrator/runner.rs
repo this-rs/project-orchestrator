@@ -2862,7 +2862,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             Some(ctx) => {
                 // Check cache first
                 if let Some(cached) = ctx.resolve_cache.get(parsed_path, &import.path) {
-                    return cached.into_iter().cloned().collect();
+                    return cached.clone();
                 }
 
                 let result = match language {
@@ -2930,10 +2930,12 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     _ => Vec::new(),
                 };
 
-                // Cache the result (store first resolved path or None)
-                let cache_value = result.first().cloned();
-                ctx.resolve_cache
-                    .insert(parsed_path.to_string(), import.path.clone(), cache_value);
+                // Cache the full result Vec (empty Vec = negative cache)
+                ctx.resolve_cache.insert(
+                    parsed_path.to_string(),
+                    import.path.clone(),
+                    result.clone(),
+                );
 
                 result
             }
@@ -7949,7 +7951,7 @@ mod tests {
         ctx.resolve_cache.insert(
             "src/main.rs".to_string(),
             "crate::api::handlers".to_string(),
-            Some("src/api/handlers.rs".to_string()),
+            vec!["src/api/handlers.rs".to_string()],
         );
         assert!(ctx
             .resolve_cache
