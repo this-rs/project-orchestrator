@@ -32,6 +32,7 @@ pub enum SupportedLanguage {
     Bash,
     CSharp,
     Scala,
+    Zig,
 }
 
 impl SupportedLanguage {
@@ -53,6 +54,7 @@ impl SupportedLanguage {
             "sh" | "bash" | "zsh" => Some(Self::Bash),
             "cs" => Some(Self::CSharp),
             "scala" | "sc" => Some(Self::Scala),
+            "zig" => Some(Self::Zig),
             _ => None,
         }
     }
@@ -74,6 +76,7 @@ impl SupportedLanguage {
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::Scala => tree_sitter_scala::LANGUAGE.into(),
+            Self::Zig => tree_sitter_zig::LANGUAGE.into(),
         }
     }
 
@@ -94,6 +97,7 @@ impl SupportedLanguage {
             Self::Bash => "bash",
             Self::CSharp => "csharp",
             Self::Scala => "scala",
+            Self::Zig => "zig",
         }
     }
 
@@ -114,6 +118,7 @@ impl SupportedLanguage {
             Self::Bash,
             Self::CSharp,
             Self::Scala,
+            Self::Zig,
         ]
     }
 }
@@ -223,6 +228,9 @@ impl CodeParser {
             }
             SupportedLanguage::Scala => {
                 languages::scala::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Zig => {
+                languages::zig::extract(&root, content, &path_str, &mut parsed)?;
             }
         }
 
@@ -568,12 +576,13 @@ mod tests {
         assert_eq!(SupportedLanguage::Bash.as_str(), "bash");
         assert_eq!(SupportedLanguage::CSharp.as_str(), "csharp");
         assert_eq!(SupportedLanguage::Scala.as_str(), "scala");
+        assert_eq!(SupportedLanguage::Zig.as_str(), "zig");
     }
 
     #[test]
     fn test_all_returns_12_languages() {
         let all = SupportedLanguage::all();
-        assert_eq!(all.len(), 14);
+        assert_eq!(all.len(), 15);
     }
 
     #[test]
@@ -593,6 +602,7 @@ mod tests {
         assert!(all.contains(&SupportedLanguage::Bash));
         assert!(all.contains(&SupportedLanguage::CSharp));
         assert!(all.contains(&SupportedLanguage::Scala));
+        assert!(all.contains(&SupportedLanguage::Zig));
     }
 
     // =========================================================================

@@ -16,6 +16,7 @@ pub mod rust;
 pub mod scala;
 pub mod swift;
 pub mod typescript;
+pub mod zig;
 
 /// Tree-sitter query patterns for different languages (kept for reference)
 pub mod queries {

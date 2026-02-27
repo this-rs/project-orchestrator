@@ -43,6 +43,7 @@ tree-sitter-swift = "0.6"
 tree-sitter-bash = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-scala = "0.24"
+tree-sitter-zig = "1.1"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
