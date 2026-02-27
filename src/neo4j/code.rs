@@ -1729,7 +1729,10 @@ impl Neo4jClient {
                     for chunk in unresolved.chunks(BATCH_SIZE) {
                         let q = query(cypher).param("items", chunk.to_vec());
                         if let Err(e) = self.graph.run(q).await {
-                            tracing::warn!("batch_create_call_relationships Phase 2 (global) chunk failed: {}", e);
+                            tracing::warn!(
+                                "batch_create_call_relationships Phase 2 (global) chunk failed: {}",
+                                e
+                            );
                         }
                     }
                 }

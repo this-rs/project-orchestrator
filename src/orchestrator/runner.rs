@@ -2921,7 +2921,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                                 .iter()
                                 .flat_map(|item| {
                                     let full_path = format!("{}.{}", import.path, item);
-                                    Self::resolve_scala_import_indexed(&full_path, &ctx.suffix_index)
+                                    Self::resolve_scala_import_indexed(
+                                        &full_path,
+                                        &ctx.suffix_index,
+                                    )
                                 })
                                 .collect()
                         } else {
