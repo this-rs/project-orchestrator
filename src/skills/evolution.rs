@@ -356,7 +356,7 @@ pub async fn execute_evolution(
                 if let Ok(Some(mut skill)) = graph_store.get_skill(*skill_id).await {
                     let (members, _) = graph_store.get_skill_members(*skill_id).await?;
                     skill.note_count = members.len() as i64;
-                    skill.cohesion = candidate.cohesion;
+                    skill.cohesion = candidate.cohesion.clamp(0.0, 1.0);
                     skill.coverage = candidate.size as i64;
                     skill.version += 1;
                     skill.updated_at = Utc::now();
@@ -488,7 +488,7 @@ pub async fn execute_evolution(
                     // Update survivor metrics
                     let (members, _) = graph_store.get_skill_members(survivor_id).await?;
                     survivor.note_count = members.len() as i64;
-                    survivor.cohesion = candidate.cohesion;
+                    survivor.cohesion = candidate.cohesion.clamp(0.0, 1.0);
                     survivor.coverage = candidate.size as i64;
                     survivor.version += 1;
                     survivor.updated_at = Utc::now();

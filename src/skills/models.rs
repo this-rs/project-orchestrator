@@ -171,7 +171,7 @@ impl SkillTrigger {
         Self {
             pattern_type: TriggerType::Regex,
             pattern_value: pattern.into(),
-            confidence_threshold: confidence,
+            confidence_threshold: confidence.clamp(0.0, 1.0),
             quality_score: None,
         }
     }
@@ -181,7 +181,7 @@ impl SkillTrigger {
         Self {
             pattern_type: TriggerType::FileGlob,
             pattern_value: pattern.into(),
-            confidence_threshold: confidence,
+            confidence_threshold: confidence.clamp(0.0, 1.0),
             quality_score: None,
         }
     }
@@ -191,7 +191,7 @@ impl SkillTrigger {
         Self {
             pattern_type: TriggerType::Semantic,
             pattern_value: embedding_json.into(),
-            confidence_threshold: confidence,
+            confidence_threshold: confidence.clamp(0.0, 1.0),
             quality_score: None,
         }
     }
@@ -253,7 +253,7 @@ pub struct SkillNode {
     /// Louvain intra-cluster cohesion score (0.0-1.0). Higher = tighter cluster.
     #[serde(default)]
     pub cohesion: f64,
-    /// Number of files covered by member notes (via LINKED_TO).
+    /// Size of the detected Louvain community (cluster node count).
     #[serde(default)]
     pub coverage: i64,
     /// Number of member notes

@@ -395,6 +395,7 @@ impl Neo4jClient {
             MATCH (n:Note)-[:MEMBER_OF]->(s:Skill {id: $skill_id})
             RETURN n
             ORDER BY n.energy DESC
+            LIMIT 500
             "#,
         )
         .param("skill_id", skill_id.to_string());
@@ -412,6 +413,7 @@ impl Neo4jClient {
             MATCH (d:Decision)-[:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
             RETURN d
             ORDER BY d.decided_at DESC
+            LIMIT 200
             "#,
         )
         .param("skill_id", skill_id.to_string());
@@ -590,6 +592,7 @@ impl Neo4jClient {
             MATCH (n:Note {id: $note_id})-[:MEMBER_OF]->(s:Skill)
             RETURN s
             ORDER BY s.energy DESC
+            LIMIT 100
             "#,
         )
         .param("note_id", note_id.to_string());
@@ -610,6 +613,7 @@ impl Neo4jClient {
             MATCH (s:Skill {project_id: $project_id})
             RETURN s
             ORDER BY s.energy DESC, s.name ASC
+            LIMIT 1000
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -653,6 +657,7 @@ impl Neo4jClient {
             WHERE n.energy > 0.05
             RETURN n
             ORDER BY n.energy DESC
+            LIMIT 500
             "#,
         )
         .param("skill_id", skill_id.to_string());
@@ -677,6 +682,7 @@ impl Neo4jClient {
             MATCH (d:Decision)-[:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
             RETURN d
             ORDER BY d.decided_at DESC
+            LIMIT 200
             "#,
         )
         .param("skill_id", skill_id.to_string());
@@ -759,6 +765,7 @@ impl Neo4jClient {
             MATCH (s:Skill {project_id: $project_id})
             WHERE s.status IN ['active', 'emerging']
             RETURN s
+            LIMIT 500
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -866,7 +873,8 @@ impl Neo4jClient {
              WHERE n1.project_id = $project_id
                AND n2.project_id = $project_id
                AND s.weight > $min_weight
-             RETURN n1.id AS from_id, n2.id AS to_id, s.weight AS weight",
+             RETURN n1.id AS from_id, n2.id AS to_id, s.weight AS weight
+             LIMIT 10000",
         )
         .param("project_id", project_id.to_string())
         .param("min_weight", min_weight);

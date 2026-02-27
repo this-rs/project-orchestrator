@@ -471,11 +471,8 @@ pub async fn add_skill_member(
         .neo4j()
         .get_skill(skill_id)
         .await
-        .map_err(AppError::Internal)?;
-
-    if skill.is_none() {
-        return Err(AppError::NotFound(format!("Skill {} not found", skill_id)));
-    }
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Skill {} not found", skill_id)))?;
 
     state
         .orchestrator
@@ -483,6 +480,9 @@ pub async fn add_skill_member(
         .add_skill_member(skill_id, &body.entity_type, body.entity_id)
         .await
         .map_err(AppError::Internal)?;
+
+    // Invalidate cache — membership change may affect trigger evaluation
+    skill_cache().invalidate_project(&skill.project_id).await;
 
     Ok(StatusCode::CREATED)
 }
@@ -500,6 +500,14 @@ pub async fn remove_skill_member(
         ));
     }
 
+    // Get skill for project_id (needed for cache invalidation)
+    let skill = state
+        .orchestrator
+        .neo4j()
+        .get_skill(skill_id)
+        .await
+        .map_err(AppError::Internal)?;
+
     let removed = state
         .orchestrator
         .neo4j()
@@ -508,6 +516,10 @@ pub async fn remove_skill_member(
         .map_err(AppError::Internal)?;
 
     if removed {
+        // Invalidate cache — membership change may affect trigger evaluation
+        if let Some(skill) = skill {
+            skill_cache().invalidate_project(&skill.project_id).await;
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
@@ -591,15 +603,8 @@ pub async fn import_skill(
 ) -> Result<(StatusCode, Json<ImportResult>), AppError> {
     // Parse conflict strategy (default: Skip)
     let strategy = match body.conflict_strategy.as_deref() {
-        Some("merge") => ConflictStrategy::Merge,
-        Some("replace") => ConflictStrategy::Replace,
-        Some("skip") | None => ConflictStrategy::Skip,
-        Some(other) => {
-            return Err(AppError::BadRequest(format!(
-                "Invalid conflict_strategy '{}'. Must be: skip, merge, replace",
-                other
-            )));
-        }
+        Some(s) => s.parse::<ConflictStrategy>().map_err(AppError::BadRequest)?,
+        None => ConflictStrategy::Skip,
     };
 
     let result = crate::skills::import_skill(
@@ -706,7 +711,13 @@ mod tests {
 
     #[test]
     fn test_validate_trigger_patterns_bad_confidence() {
-        let triggers = vec![SkillTrigger::regex("test", 1.5)];
+        // Bypass constructor clamping to simulate deserialized input with bad confidence
+        let triggers = vec![SkillTrigger {
+            pattern_type: TriggerType::Regex,
+            pattern_value: "test".to_string(),
+            confidence_threshold: 1.5,
+            quality_score: None,
+        }];
         let result = validate_trigger_patterns(&triggers);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("confidence_threshold"));

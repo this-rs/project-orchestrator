@@ -501,8 +501,16 @@ pub async fn update_skill_lifecycle(
     let skills = graph_store.get_skills_for_project(project_id).await?;
 
     for skill in &skills {
+        // Wrap per-skill processing — one corrupted skill should not abort the batch
+        let member_notes = match graph_store.get_skill_members(skill.id).await {
+            Ok((notes, _)) => notes,
+            Err(e) => {
+                warn!(skill_id = %skill.id, error = %e, "Failed to get skill members — skipping");
+                continue;
+            }
+        };
+
         // Recalculate energy from member notes
-        let (member_notes, _) = graph_store.get_skill_members(skill.id).await?;
         if !member_notes.is_empty() {
             let (weighted_sum, weight_sum) =
                 member_notes
@@ -523,16 +531,26 @@ pub async fn update_skill_lifecycle(
                 updated.energy = new_energy;
                 updated.note_count = member_notes.len() as i64;
                 updated.updated_at = now;
-                graph_store.update_skill(&updated).await?;
+                if let Err(e) = graph_store.update_skill(&updated).await {
+                    warn!(skill_id = %skill.id, error = %e, "Failed to update skill energy — skipping");
+                    continue;
+                }
                 result.skills_updated += 1;
             }
         }
 
         // Re-fetch to get updated energy
-        let current_skill = graph_store
-            .get_skill(skill.id)
-            .await?
-            .unwrap_or_else(|| skill.clone());
+        let current_skill = match graph_store.get_skill(skill.id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                warn!(skill_id = %skill.id, "Skill disappeared during lifecycle — skipping");
+                continue;
+            }
+            Err(e) => {
+                warn!(skill_id = %skill.id, error = %e, "Failed to re-fetch skill — skipping");
+                continue;
+            }
+        };
 
         // Evaluate lifecycle transitions
         match current_skill.status {
@@ -549,6 +567,33 @@ pub async fn update_skill_lifecycle(
                                 error = %e,
                                 "Failed to promote skill"
                             );
+                        }
+                    }
+                } else {
+                    // Zombie detection: Emerging skill with no activations, low energy,
+                    // and past the archive inactivity window → archive directly
+                    let days_inactive = (now - current_skill.updated_at).num_days();
+                    if current_skill.activation_count == 0
+                        && current_skill.energy < config.demotion_energy_threshold
+                        && days_inactive > config.archive_inactivity_days
+                    {
+                        match archive_skill(graph_store, current_skill.id).await {
+                            Ok(()) => {
+                                result.skills_archived += 1;
+                                info!(
+                                    skill_id = %current_skill.id,
+                                    name = %current_skill.name,
+                                    days_inactive,
+                                    "Archived zombie Emerging skill — no activations, low energy"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    skill_id = %current_skill.id,
+                                    error = %e,
+                                    "Failed to archive zombie Emerging skill"
+                                );
+                            }
                         }
                     }
                 }

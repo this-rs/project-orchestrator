@@ -261,8 +261,8 @@ pub async fn activate_for_hook_cached(
         None => {
             // Cache miss — load from DB and populate cache
             let skills = graph_store.get_skills_for_project(project_id).await?;
-            cache.insert(project_id, skills.clone()).await;
-            // Re-get from cache to get compiled triggers
+            cache.insert(project_id, skills).await;
+            // Get from cache (just inserted, no TOCTOU since insert is write-locked)
             cache.get(&project_id).await.unwrap_or_default()
         }
     };

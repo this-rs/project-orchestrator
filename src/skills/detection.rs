@@ -98,7 +98,7 @@ pub struct SkillCandidate {
 /// - `name` is generated from member note tags (via `naming::generate_skill_name`)
 /// - `energy` = weighted average of note energies (weighted by importance)
 /// - `cohesion` = from Louvain community cohesion score
-/// - `coverage` = cluster size / total notes in graph
+/// - `coverage` = cluster size (number of nodes in the Louvain community)
 pub fn cluster_to_skill(
     candidate: &SkillCandidate,
     notes: &[crate::notes::Note],
@@ -132,8 +132,8 @@ pub fn cluster_to_skill(
     all_tags.dedup();
 
     let mut skill = crate::skills::SkillNode::new(project_id, name);
-    skill.energy = energy;
-    skill.cohesion = candidate.cohesion;
+    skill.energy = energy.clamp(0.0, 1.0);
+    skill.cohesion = candidate.cohesion.clamp(0.0, 1.0);
     skill.note_count = note_count;
     skill.coverage = coverage;
     skill.tags = all_tags;
@@ -296,7 +296,7 @@ pub async fn persist_detected_skills(
                     if weight_sum > 0.0 {
                         skill.energy = (weighted_sum / weight_sum).clamp(0.0, 1.0);
                     }
-                    skill.cohesion = candidate.cohesion;
+                    skill.cohesion = candidate.cohesion.clamp(0.0, 1.0);
                     skill.coverage = candidate.size as i64;
                     skill.updated_at = chrono::Utc::now();
 

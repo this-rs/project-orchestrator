@@ -65,6 +65,22 @@ impl std::fmt::Display for ConflictStrategy {
     }
 }
 
+impl std::str::FromStr for ConflictStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "skip" => Ok(Self::Skip),
+            "merge" => Ok(Self::Merge),
+            "replace" => Ok(Self::Replace),
+            other => Err(format!(
+                "Invalid conflict_strategy '{}'. Must be: skip, merge, replace",
+                other
+            )),
+        }
+    }
+}
+
 /// Conflict information when a skill name collision is detected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportConflict {
@@ -733,6 +749,15 @@ mod tests {
         assert_eq!(ConflictStrategy::Skip.to_string(), "skip");
         assert_eq!(ConflictStrategy::Merge.to_string(), "merge");
         assert_eq!(ConflictStrategy::Replace.to_string(), "replace");
+    }
+
+    #[test]
+    fn test_conflict_strategy_from_str() {
+        assert_eq!("skip".parse::<ConflictStrategy>().unwrap(), ConflictStrategy::Skip);
+        assert_eq!("merge".parse::<ConflictStrategy>().unwrap(), ConflictStrategy::Merge);
+        assert_eq!("replace".parse::<ConflictStrategy>().unwrap(), ConflictStrategy::Replace);
+        assert!("invalid".parse::<ConflictStrategy>().is_err());
+        assert!("SKIP".parse::<ConflictStrategy>().is_err()); // case-sensitive
     }
 
     #[test]
