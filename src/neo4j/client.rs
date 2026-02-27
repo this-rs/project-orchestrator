@@ -201,6 +201,8 @@ impl Neo4jClient {
             "CREATE CONSTRAINT release_id IF NOT EXISTS FOR (r:Release) REQUIRE r.id IS UNIQUE",
             // FeatureGraph constraint
             "CREATE CONSTRAINT feature_graph_id IF NOT EXISTS FOR (fg:FeatureGraph) REQUIRE fg.id IS UNIQUE",
+            // Skill constraint
+            "CREATE CONSTRAINT skill_id IF NOT EXISTS FOR (s:Skill) REQUIRE s.id IS UNIQUE",
             // User constraint
             "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
             // RefreshToken constraint
@@ -288,6 +290,11 @@ impl Neo4jClient {
             // Process node indexes (Plan 6)
             "CREATE INDEX process_project_id IF NOT EXISTS FOR (p:Process) ON (p.project_id)",
             "CREATE INDEX process_id IF NOT EXISTS FOR (p:Process) ON (p.id)",
+            // Skill indexes — Neural Skills system
+            "CREATE INDEX skill_project IF NOT EXISTS FOR (s:Skill) ON (s.project_id)",
+            "CREATE INDEX skill_status IF NOT EXISTS FOR (s:Skill) ON (s.status)",
+            "CREATE INDEX skill_project_status IF NOT EXISTS FOR (s:Skill) ON (s.project_id, s.status)",
+            "CREATE INDEX skill_energy IF NOT EXISTS FOR (s:Skill) ON (s.energy)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)
@@ -333,6 +340,14 @@ impl Neo4jClient {
                 tracing::warn!("Index may already exist: {}", e);
             }
         }
+
+        // ---------------------------------------------------------------
+        // Skill relations (not enforced by Neo4j, documented here):
+        //   (Note)-[:MEMBER_OF]->(Skill)        — member note
+        //   (Decision)-[:MEMBER_OF_SKILL]->(Skill) — member decision
+        //   (Skill)-[:BELONGS_TO]->(Project)    — project ownership
+        //   (Skill)-[:COVERS]->(File)           — files covered by member notes
+        // ---------------------------------------------------------------
 
         // Data migrations — idempotent, run on every startup
         let migrations = vec![
