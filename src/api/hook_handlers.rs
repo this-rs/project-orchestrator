@@ -397,8 +397,9 @@ struct ResolvedProject {
 /// 1. Project count is small (typically <20)
 /// 2. Avoids cache key explosion (infinite distinct file paths)
 /// 3. A single cache entry covers all files under a root_path
-static RESOLVE_CACHE: LazyLock<Mutex<Option<(Vec<ResolvedProject>, Instant)>>> =
-    LazyLock::new(|| Mutex::new(None));
+type ResolveCache = Option<(Vec<ResolvedProject>, Instant)>;
+
+static RESOLVE_CACHE: LazyLock<Mutex<ResolveCache>> = LazyLock::new(|| Mutex::new(None));
 
 /// TTL for the resolve-project cache (5 minutes).
 const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
