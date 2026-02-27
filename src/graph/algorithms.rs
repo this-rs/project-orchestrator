@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use super::models::{
     AnalyticsConfig, CodeGraph, CodeHealthReport, CommunityInfo, ComponentInfo, GraphAnalytics,
-    LargeGraphConfig, NodeMetrics,
+    NodeMetrics,
 };
 
 // ============================================================================
@@ -845,7 +845,7 @@ pub fn compute_all(graph: &CodeGraph, config: &AnalyticsConfig) -> GraphAnalytic
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::models::{CodeEdge, CodeEdgeType, CodeNode, CodeNodeType};
+    use crate::graph::models::{CodeEdge, CodeEdgeType, CodeNode, CodeNodeType, LargeGraphConfig};
 
     /// Build a star graph: center → [leaf1, leaf2, ..., leafN]
     fn make_star_graph(n_leaves: usize) -> CodeGraph {

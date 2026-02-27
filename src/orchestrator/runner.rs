@@ -2032,7 +2032,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             &parsed.function_calls,
             parsed,
             &import_rels,
-            ctx.as_ref().map(|c| &**c),
+            ctx.as_deref(),
         );
 
         // Batch create CALLS relationships (scoped to project to prevent cross-project pollution)
@@ -3111,9 +3111,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     return Some(resolved.to_string());
                 }
             }
-        } else if import_path.starts_with("@/") {
+        } else if let Some(after_alias) = import_path.strip_prefix("@/") {
             // @/ alias — try src/ prefix
-            let after_alias = &import_path[2..];
             let target = format!("src/{}", after_alias);
 
             let extensions = ["ts", "tsx", "js", "jsx"];
@@ -3199,8 +3198,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         };
 
         // Check for wildcard imports (com.example.*)
-        if path.ends_with(".*") {
-            let package = &path[..path.len() - 2]; // strip ".*"
+        if let Some(package) = path.strip_suffix(".*") {
             let dir = package.replace('.', "/");
             return index
                 .get_files_in_dir(&dir, "java")
@@ -3520,8 +3518,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         // Check for wildcard: com.example._
-        if path.ends_with("._") {
-            let package = &path[..path.len() - 2];
+        if let Some(package) = path.strip_suffix("._") {
             let dir = package.replace('.', "/");
             return index
                 .get_files_in_dir(&dir, "scala")
@@ -3566,8 +3563,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         // Wildcard import: com.example.*
-        if path.ends_with(".*") {
-            let package = &path[..path.len() - 2];
+        if let Some(package) = path.strip_suffix(".*") {
             let dir = package.replace('.', "/");
             return index
                 .get_files_in_dir(&dir, "kt")
@@ -4985,7 +4981,7 @@ pub fn init_rayon_pool() {
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let max_threads = num_cpus.saturating_sub(1).min(8).max(1);
+    let max_threads = num_cpus.saturating_sub(1).clamp(1, 8);
 
     match rayon::ThreadPoolBuilder::new()
         .num_threads(max_threads)
@@ -5156,8 +5152,7 @@ pub async fn parse_files_with_cache(
 
     // ── Cache lookup (single-threaded, before rayon) ───────────
     let mut cached_results: Vec<ParsedFile> = Vec::new();
-    let to_parse: Vec<FileContent> = if cache.is_some() {
-        let c = cache.as_mut().unwrap();
+    let to_parse: Vec<FileContent> = if let Some(c) = &mut cache {
         let mut needs_parse = Vec::new();
         for file in files {
             if let Some(cached) = c.get(&file.path, &file.hash) {
@@ -5195,7 +5190,7 @@ pub async fn parse_files_with_cache(
             use std::cell::RefCell;
 
             thread_local! {
-                static TL_PARSER: RefCell<Option<CodeParser>> = RefCell::new(None);
+                static TL_PARSER: RefCell<Option<CodeParser>> = const { RefCell::new(None) };
             }
 
             let mut all_parsed = Vec::new();
@@ -8509,7 +8504,7 @@ mod tests {
             FileContent {
                 path: "/tmp/small.rs".to_string(),
                 content: String::new(),
-                size: 1 * 1024 * 1024, // 1MB
+                size: 1024 * 1024, // 1MB
                 language: SupportedLanguage::Rust,
                 hash: "h1".to_string(),
             },
@@ -8600,7 +8595,7 @@ mod tests {
         }];
 
         // Budget = 1MB → file should get its own chunk (content is 2MB)
-        let chunks = chunk_by_size(files, 1 * 1024 * 1024);
+        let chunks = chunk_by_size(files, 1024 * 1024);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 1);
     }
@@ -8790,7 +8785,7 @@ mod tests {
     async fn test_store_parsed_files_batch_accumulates() {
         // Verify that batch store accumulates all entities across files
         let (orch, _rx) = orch_with_bus().await;
-        let mock = orch.neo4j().clone();
+        let mock = orch.neo4j();
 
         let parsed_files = vec![
             ParsedFile {
@@ -9596,7 +9591,7 @@ mod tests {
                 language: "rust".to_string(),
                 hash: "hash".to_string(),
                 functions: vec![FunctionNode {
-                    name: format!("fn_{}", path.split('/').last().unwrap()),
+                    name: format!("fn_{}", path.split('/').next_back().unwrap()),
                     visibility: Visibility::Public,
                     params: vec![],
                     return_type: None,

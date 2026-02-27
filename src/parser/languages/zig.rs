@@ -129,8 +129,7 @@ fn extract_function(
 fn extract_test(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<FunctionNode> {
     let text = get_text(node, source)?;
     // test "test name" { ... }
-    let name = if text.starts_with("test ") {
-        let after = &text[5..];
+    let name = if let Some(after) = text.strip_prefix("test ") {
         after
             .find('"')
             .and_then(|start| {

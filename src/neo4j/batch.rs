@@ -129,6 +129,7 @@ pub async fn run_unwind_in_chunks(
 ///     |q| q.param("project_id", pid.to_string()),
 /// ).await?;
 /// ```
+#[allow(dead_code)]
 pub async fn run_unwind_in_chunks_with<F>(
     graph: &neo4rs::Graph,
     items: Vec<BoltMap>,
@@ -195,6 +196,7 @@ where
 ///     RETURN count(r) AS cnt
 /// "#, "EXTENDS rels").await?;
 /// ```
+#[allow(dead_code)]
 pub async fn cleanup_in_batches(graph: &neo4rs::Graph, cypher: &str, label: &str) -> Result<i64> {
     let mut total_deleted: i64 = 0;
 
@@ -247,6 +249,7 @@ pub async fn cleanup_in_batches(graph: &neo4rs::Graph, cypher: &str, label: &str
 ///     ("name", func.name.clone().into()),
 /// ]);
 /// ```
+#[allow(dead_code)]
 pub fn bolt_map(pairs: &[(&str, neo4rs::BoltType)]) -> BoltMap {
     pairs
         .iter()

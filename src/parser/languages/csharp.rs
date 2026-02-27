@@ -331,7 +331,7 @@ fn extract_base_list(node: &tree_sitter::Node, source: &str) -> (Option<String>,
                 // Heuristic: interface names start with 'I' + uppercase
                 let is_interface = name.starts_with('I')
                     && name.len() > 1
-                    && name.chars().nth(1).map_or(false, |c| c.is_uppercase());
+                    && name.chars().nth(1).is_some_and(|c| c.is_uppercase());
 
                 if first && !is_interface {
                     parent_class = Some(name);

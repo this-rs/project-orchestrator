@@ -272,7 +272,7 @@ impl CommunityEnricher for LlmCommunityEnricher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::models::{CodeEdge, CodeEdgeType, CodeNode, CodeNodeType};
+    use crate::graph::models::{CodeNode, CodeNodeType};
 
     fn make_test_communities() -> (Vec<CommunityInfo>, CodeGraph, HashMap<String, NodeMetrics>) {
         let mut graph = CodeGraph::new();

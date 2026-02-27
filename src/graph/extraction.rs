@@ -538,7 +538,7 @@ mod tests {
     /// `implements` = vec of (struct_name, struct_file, trait_name, trait_file).
     async fn seed_heritage(
         store: &MockGraphStore,
-        project_id: Uuid,
+        _project_id: Uuid,
         extends: &[(&str, &str, &str, &str)],
         implements: &[(&str, &str, &str, &str)],
     ) {

@@ -103,17 +103,13 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
 
     // Check for "case" keyword (case class)
     let text = get_text(node, source).unwrap_or_default();
-    let is_case = text.starts_with("case ");
+    let _is_case = text.starts_with("case ");
 
     // Extract extends clause
     let (parent_class, interfaces) = extract_extends(node, source);
 
     Some(StructNode {
-        name: if is_case {
-            name // case classes are still named normally
-        } else {
-            name
-        },
+        name,
         visibility,
         generics,
         file_path: file_path.to_string(),
