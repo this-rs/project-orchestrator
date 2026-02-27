@@ -251,6 +251,9 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "add_skill_member" => Some(("skill", "add_member")),
         "remove_skill_member" => Some(("skill", "remove_member")),
         "activate_skill" => Some(("skill", "activate")),
+        "export_skill" => Some(("skill", "export")),
+        "import_skill" => Some(("skill", "import")),
+        "get_skill_health" => Some(("skill", "get_health")),
 
         // Admin
         "sync_directory" => Some(("admin", "sync_directory")),
