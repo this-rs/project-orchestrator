@@ -1602,10 +1602,7 @@ class UserService(db: Database) {
     );
 
     // Selective import should have items
-    let selective_import = parsed
-        .imports
-        .iter()
-        .find(|i| i.path.contains("mutable"));
+    let selective_import = parsed.imports.iter().find(|i| i.path.contains("mutable"));
     assert!(
         selective_import.is_some(),
         "Should find selective import for scala.collection.mutable, got imports: {:?}",
@@ -1654,11 +1651,7 @@ public class Calculator {
     let path = Path::new("Calculator.cs");
     let result = parser.parse_file(path, code);
 
-    assert!(
-        result.is_ok(),
-        "Should parse C# code: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "Should parse C# code: {:?}", result.err());
 
     let parsed = result.unwrap();
     assert_eq!(parsed.language, "csharp");

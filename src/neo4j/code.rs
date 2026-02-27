@@ -2325,9 +2325,8 @@ impl Neo4jClient {
         max_depth: u32,
     ) -> Result<serde_json::Value> {
         // Parents (traverse EXTENDS upward)
-        let q_parents = query(
-            &format!(
-                r#"
+        let q_parents = query(&format!(
+            r#"
             MATCH path = (child)-[:EXTENDS*1..{}]->(ancestor)
             WHERE child.name = $type_name
             WITH ancestor, length(path) AS depth
@@ -2337,9 +2336,8 @@ impl Neo4jClient {
                    depth
             ORDER BY depth ASC
             "#,
-                max_depth
-            ),
-        )
+            max_depth
+        ))
         .param("type_name", type_name)
         .param("max_depth", max_depth as i64);
 
@@ -2357,9 +2355,8 @@ impl Neo4jClient {
         }
 
         // Children (traverse EXTENDS downward — reverse direction)
-        let q_children = query(
-            &format!(
-                r#"
+        let q_children = query(&format!(
+            r#"
             MATCH path = (descendant)-[:EXTENDS*1..{}]->(parent)
             WHERE parent.name = $type_name
             WITH descendant, length(path) AS depth
@@ -2369,9 +2366,8 @@ impl Neo4jClient {
                    depth
             ORDER BY depth ASC
             "#,
-                max_depth
-            ),
-        )
+            max_depth
+        ))
         .param("type_name", type_name)
         .param("max_depth", max_depth as i64);
 
