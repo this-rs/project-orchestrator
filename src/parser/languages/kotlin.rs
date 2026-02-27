@@ -150,13 +150,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
                 })
                 .filter_map(|c| {
                     // Get the type name, stripping constructor call parens and generics
-                    get_text(&c, source).map(|s| {
-                        s.split(['(', '<'])
-                            .next()
-                            .unwrap_or(&s)
-                            .trim()
-                            .to_string()
-                    })
+                    get_text(&c, source)
+                        .map(|s| s.split(['(', '<']).next().unwrap_or(&s).trim().to_string())
                 })
                 .filter(|s| !s.is_empty())
                 .collect()

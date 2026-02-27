@@ -153,7 +153,10 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
             .await
         {
-            tracing::warn!("Community enrichment failed, keeping heuristic labels: {}", e);
+            tracing::warn!(
+                "Community enrichment failed, keeping heuristic labels: {}",
+                e
+            );
         }
 
         // 3. Persist
@@ -175,7 +178,10 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
             .await
         {
-            tracing::warn!("Community enrichment failed, keeping heuristic labels: {}", e);
+            tracing::warn!(
+                "Community enrichment failed, keeping heuristic labels: {}",
+                e
+            );
         }
 
         // 3. Persist
@@ -215,7 +221,10 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
             .await
         {
-            tracing::warn!("Community enrichment failed, keeping heuristic labels: {}", e);
+            tracing::warn!(
+                "Community enrichment failed, keeping heuristic labels: {}",
+                e
+            );
         }
 
         // 3. Persist to fabric_* properties (NOT the code-only properties)
@@ -273,13 +282,16 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         let step_rels: Vec<(String, String, u32)> = processes
             .iter()
             .flat_map(|p| {
-                p.steps.iter().enumerate().map(move |(i, step_id)| {
-                    (p.id.clone(), step_id.clone(), (i + 1) as u32)
-                })
+                p.steps
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, step_id)| (p.id.clone(), step_id.clone(), (i + 1) as u32))
             })
             .collect();
 
-        self.store.batch_create_step_relationships(&step_rels).await?;
+        self.store
+            .batch_create_step_relationships(&step_rels)
+            .await?;
 
         tracing::info!(
             project_id = %project_id,

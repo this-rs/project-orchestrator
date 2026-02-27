@@ -1766,10 +1766,8 @@ pub trait GraphStore: Send + Sync {
 
     /// Get all IMPLEMENTS edges between structs and traits in a project as (struct_file, trait_file) pairs.
     /// Returns file-level edges for the graph analytics engine.
-    async fn get_project_implements_edges(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(String, String)>>;
+    async fn get_project_implements_edges(&self, project_id: Uuid)
+        -> Result<Vec<(String, String)>>;
 
     /// Batch-update analytics scores on File nodes.
     /// Uses UNWIND for single-query efficiency.
@@ -1863,10 +1861,7 @@ pub trait GraphStore: Send + Sync {
 
     /// Batch create STEP_IN_PROCESS relationships.
     /// Takes (process_id, function_id, step_number) tuples.
-    async fn batch_create_step_relationships(
-        &self,
-        steps: &[(String, String, u32)],
-    ) -> Result<()>;
+    async fn batch_create_step_relationships(&self, steps: &[(String, String, u32)]) -> Result<()>;
 
     /// Delete all Process nodes and their STEP_IN_PROCESS relationships for a project.
     /// Returns the number of deleted entities.

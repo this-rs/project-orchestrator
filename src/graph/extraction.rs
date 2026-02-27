@@ -710,11 +710,7 @@ mod tests {
         let project = test_project();
         store.create_project(&project).await.unwrap();
 
-        let files = [
-            "src/base.rs",
-            "src/child.rs",
-            "src/iface.rs",
-        ];
+        let files = ["src/base.rs", "src/child.rs", "src/iface.rs"];
         let imports = [("src/child.rs", "src/base.rs")];
 
         seed_files_and_imports(&store, project.id, &files, &imports).await;
@@ -735,11 +731,7 @@ mod tests {
 
         assert_eq!(graph.node_count(), 3, "3 file nodes");
         // 1 import (weight 0.8) + 1 extends (weight 0.95) + 1 implements (weight 0.85) = 3 edges
-        assert_eq!(
-            graph.edge_count(),
-            3,
-            "1 import + 1 extends + 1 implements"
-        );
+        assert_eq!(graph.edge_count(), 3, "1 import + 1 extends + 1 implements");
 
         // Verify fabric weights are applied (not hardcoded)
         let extends_edge = graph

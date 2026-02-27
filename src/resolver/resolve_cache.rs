@@ -229,7 +229,9 @@ mod tests {
         assert_eq!(cache.get("src/file.rs", "import_99"), None);
 
         // Last entry should be present
-        assert!(cache.get("src/file.rs", &format!("import_{}", cap + 99)).is_some());
+        assert!(cache
+            .get("src/file.rs", &format!("import_{}", cap + 99))
+            .is_some());
     }
 
     #[test]

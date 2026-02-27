@@ -164,12 +164,15 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         .and_then(|s| {
             // Try to get the identifier child directly
             s.children(&mut s.walk())
-                .find(|c| c.kind() == "constant" || c.kind() == "scope_resolution" || c.kind() == "identifier")
+                .find(|c| {
+                    c.kind() == "constant"
+                        || c.kind() == "scope_resolution"
+                        || c.kind() == "identifier"
+                })
                 .and_then(|c| get_text(&c, source).map(|t| t.to_string()))
                 .or_else(|| {
                     // Fallback: strip "< " from full text
-                    get_text(&s, source)
-                        .map(|t| t.trim_start_matches('<').trim().to_string())
+                    get_text(&s, source).map(|t| t.trim_start_matches('<').trim().to_string())
                 })
         })
         .filter(|s| !s.is_empty());

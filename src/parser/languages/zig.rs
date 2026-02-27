@@ -126,11 +126,7 @@ fn extract_function(
     })
 }
 
-fn extract_test(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-) -> Option<FunctionNode> {
+fn extract_test(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<FunctionNode> {
     let text = get_text(node, source)?;
     // test "test name" { ... }
     let name = if text.starts_with("test ") {
@@ -138,9 +134,9 @@ fn extract_test(
         after
             .find('"')
             .and_then(|start| {
-                after[start + 1..].find('"').map(|end| {
-                    after[start + 1..start + 1 + end].to_string()
-                })
+                after[start + 1..]
+                    .find('"')
+                    .map(|end| after[start + 1..start + 1 + end].to_string())
             })
             .unwrap_or_else(|| "test".to_string())
     } else {
@@ -232,11 +228,7 @@ fn extract_type_decl(
     })
 }
 
-fn extract_enum_decl(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-) -> Option<EnumNode> {
+fn extract_enum_decl(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<EnumNode> {
     let text = get_text(node, source)?;
 
     if !text.contains("= enum") {

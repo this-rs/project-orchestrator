@@ -247,7 +247,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
                 .children(&mut clause.walk())
                 .filter_map(|c| {
                     // Each base specifier may have access_specifier + type_identifier
-                    if c.kind() == "type_identifier" || c.kind() == "scoped_type_identifier"
+                    if c.kind() == "type_identifier"
+                        || c.kind() == "scoped_type_identifier"
                         || c.kind() == "template_type"
                     {
                         get_text(&c, source).map(|s| s.to_string())

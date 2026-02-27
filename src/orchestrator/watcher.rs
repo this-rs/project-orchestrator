@@ -591,22 +591,14 @@ async fn flush_pending_files(
 
             // Remove from Neo4j (File node + all children symbols + relationships)
             if let Err(e) = orchestrator.neo4j().delete_file(&path_str).await {
-                tracing::warn!(
-                    "Failed to delete {} from Neo4j: {}",
-                    path_str,
-                    e
-                );
+                tracing::warn!("Failed to delete {} from Neo4j: {}", path_str, e);
                 errors += 1;
                 continue;
             }
 
             // Remove from Meilisearch search index
             if let Err(e) = orchestrator.meili().delete_code(&path_str).await {
-                tracing::warn!(
-                    "Failed to delete {} from Meilisearch: {}",
-                    path_str,
-                    e
-                );
+                tracing::warn!("Failed to delete {} from Meilisearch: {}", path_str, e);
                 // Non-fatal: Neo4j is source of truth, Meili is secondary index
             }
 
@@ -1886,26 +1878,11 @@ mod tests {
             HashMap::new();
 
         let events: Vec<(PathBuf, WatchEventKind)> = vec![
-            (
-                PathBuf::from("/project/src/a.rs"),
-                WatchEventKind::Changed,
-            ),
-            (
-                PathBuf::from("/project/src/b.rs"),
-                WatchEventKind::Deleted,
-            ),
-            (
-                PathBuf::from("/project/src/c.rs"),
-                WatchEventKind::Changed,
-            ),
-            (
-                PathBuf::from("/project/src/d.rs"),
-                WatchEventKind::Deleted,
-            ),
-            (
-                PathBuf::from("/project/src/e.rs"),
-                WatchEventKind::Changed,
-            ),
+            (PathBuf::from("/project/src/a.rs"), WatchEventKind::Changed),
+            (PathBuf::from("/project/src/b.rs"), WatchEventKind::Deleted),
+            (PathBuf::from("/project/src/c.rs"), WatchEventKind::Changed),
+            (PathBuf::from("/project/src/d.rs"), WatchEventKind::Deleted),
+            (PathBuf::from("/project/src/e.rs"), WatchEventKind::Changed),
         ];
 
         for (path, kind) in events {
@@ -1975,7 +1952,11 @@ mod tests {
         orphan_deletions.insert(PathBuf::from("/tmp/untracked/removed2.rs"));
         orphan_deletions.insert(PathBuf::from("/tmp/untracked/removed1.rs")); // dupe
 
-        assert_eq!(orphan_deletions.len(), 2, "Orphan deletions should be deduped");
+        assert_eq!(
+            orphan_deletions.len(),
+            2,
+            "Orphan deletions should be deduped"
+        );
     }
 
     #[test]

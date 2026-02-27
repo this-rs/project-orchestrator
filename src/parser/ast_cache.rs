@@ -158,7 +158,11 @@ mod tests {
         assert_eq!(cache.stats().hits, 0);
 
         // Set
-        cache.set("src/main.rs", "abc123", make_parsed("src/main.rs", "abc123"));
+        cache.set(
+            "src/main.rs",
+            "abc123",
+            make_parsed("src/main.rs", "abc123"),
+        );
 
         // Hit
         let result = cache.get("src/main.rs", "abc123");
@@ -171,7 +175,11 @@ mod tests {
     #[test]
     fn test_cache_different_hash_is_miss() {
         let mut cache = AstCache::new();
-        cache.set("src/main.rs", "hash_v1", make_parsed("src/main.rs", "hash_v1"));
+        cache.set(
+            "src/main.rs",
+            "hash_v1",
+            make_parsed("src/main.rs", "hash_v1"),
+        );
 
         // Same path, different hash → miss
         assert!(cache.get("src/main.rs", "hash_v2").is_none());

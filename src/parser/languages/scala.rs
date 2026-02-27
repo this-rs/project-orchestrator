@@ -174,10 +174,7 @@ fn extract_enum(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opti
         .child_by_field_name("body")
         .map(|body| {
             body.children(&mut body.walk())
-                .filter(|c| {
-                    c.kind() == "enum_case_definitions"
-                        || c.kind() == "simple_enum_case"
-                })
+                .filter(|c| c.kind() == "enum_case_definitions" || c.kind() == "simple_enum_case")
                 .flat_map(|c| {
                     // Recurse into case definitions
                     c.children(&mut c.walk())
@@ -199,11 +196,7 @@ fn extract_enum(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opti
     })
 }
 
-fn extract_method(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-) -> Option<FunctionNode> {
+fn extract_method(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<FunctionNode> {
     let name = get_field_text(node, "name", source)?;
     let visibility = get_scala_visibility(node, source);
     let docstring = get_scaladoc(node, source);
@@ -235,16 +228,9 @@ fn extract_method(
     })
 }
 
-fn extract_import(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-) -> Option<ImportNode> {
+fn extract_import(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<ImportNode> {
     let text = get_text(node, source)?;
-    let path = text
-        .trim_start_matches("import ")
-        .trim()
-        .to_string();
+    let path = text.trim_start_matches("import ").trim().to_string();
 
     if path.is_empty() {
         return None;
@@ -314,16 +300,13 @@ fn extract_extends(node: &tree_sitter::Node, source: &str) -> (Option<String>, V
     let mut parent_class = None;
     let mut interfaces = Vec::new();
 
-    let extends_clause = node
-        .child_by_field_name("extend")
-        .or_else(|| {
-            node.children(&mut node.walk())
-                .find(|c| {
-                    c.kind() == "extends_clause"
-                        || c.kind() == "template_body"
-                        || c.kind() == "class_parents"
-                })
-        });
+    let extends_clause = node.child_by_field_name("extend").or_else(|| {
+        node.children(&mut node.walk()).find(|c| {
+            c.kind() == "extends_clause"
+                || c.kind() == "template_body"
+                || c.kind() == "class_parents"
+        })
+    });
 
     if let Some(clause) = extends_clause {
         let text = get_text(&clause, source).unwrap_or_default();

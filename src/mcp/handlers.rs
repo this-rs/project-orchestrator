@@ -2805,7 +2805,6 @@ impl ToolHandler {
             }
 
             // ── Heritage Navigation ──────────────────────────────────────
-
             "get_class_hierarchy" => {
                 let type_name = extract_string(args, "type_name")?;
                 let mut query = vec![("type_name".to_string(), type_name)];
@@ -2821,9 +2820,7 @@ impl ToolHandler {
             "find_subclasses" => {
                 let class_name = extract_string(args, "class_name")?;
                 let query = vec![("class_name".to_string(), class_name)];
-                let result = http
-                    .get_with_query("/api/code/subclasses", &query)
-                    .await?;
+                let result = http.get_with_query("/api/code/subclasses", &query).await?;
                 Ok(Some(result))
             }
 
@@ -2837,13 +2834,10 @@ impl ToolHandler {
             }
 
             // ── Process Navigation ───────────────────────────────────────
-
             "list_processes" => {
                 let project_slug = extract_string(args, "project_slug")?;
                 let query = vec![("project_slug".to_string(), project_slug)];
-                let result = http
-                    .get_with_query("/api/code/processes", &query)
-                    .await?;
+                let result = http.get_with_query("/api/code/processes", &query).await?;
                 Ok(Some(result))
             }
 
@@ -2869,7 +2863,6 @@ impl ToolHandler {
             }
 
             // ── Community Enrichment + REST Gaps ─────────────────────────
-
             "enrich_communities" => {
                 let project_slug = extract_string(args, "project_slug")?;
                 let query = vec![("project_slug".to_string(), project_slug)];
@@ -2885,9 +2878,7 @@ impl ToolHandler {
                 if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
                     query.push(("limit".to_string(), v.to_string()));
                 }
-                let result = http
-                    .get_with_query("/api/code/hotspots", &query)
-                    .await?;
+                let result = http.get_with_query("/api/code/hotspots", &query).await?;
                 Ok(Some(result))
             }
 

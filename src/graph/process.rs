@@ -34,22 +34,68 @@ pub struct EntryPointScore {
 
 /// Name patterns that indicate entry-point functions (high multiplier).
 const ENTRY_POINT_NAMES: &[&str] = &[
-    "main", "run", "start", "init", "execute", "launch", "boot", "setup",
-    "serve", "listen", "handle", "dispatch", "process", "route",
-    "handler", "controller", "endpoint", "middleware",
-    "cli", "command", "cmd",
-    "test_", "spec_", "bench_",
+    "main",
+    "run",
+    "start",
+    "init",
+    "execute",
+    "launch",
+    "boot",
+    "setup",
+    "serve",
+    "listen",
+    "handle",
+    "dispatch",
+    "process",
+    "route",
+    "handler",
+    "controller",
+    "endpoint",
+    "middleware",
+    "cli",
+    "command",
+    "cmd",
+    "test_",
+    "spec_",
+    "bench_",
 ];
 
 /// Name patterns that indicate utility/helper functions (penalty).
 const UTILITY_NAMES: &[&str] = &[
-    "get", "set", "is_", "has_", "can_", "should_",
-    "to_", "from_", "into_", "as_",
-    "format", "parse", "validate", "sanitize", "normalize",
-    "log", "debug", "trace", "warn", "error", "info",
-    "helper", "util", "utils", "internal", "private",
-    "new", "default", "clone", "drop", "fmt", "eq",
-    "serialize", "deserialize",
+    "get",
+    "set",
+    "is_",
+    "has_",
+    "can_",
+    "should_",
+    "to_",
+    "from_",
+    "into_",
+    "as_",
+    "format",
+    "parse",
+    "validate",
+    "sanitize",
+    "normalize",
+    "log",
+    "debug",
+    "trace",
+    "warn",
+    "error",
+    "info",
+    "helper",
+    "util",
+    "utils",
+    "internal",
+    "private",
+    "new",
+    "default",
+    "clone",
+    "drop",
+    "fmt",
+    "eq",
+    "serialize",
+    "deserialize",
 ];
 
 /// Score all functions in the graph as entry point candidates.
@@ -79,7 +125,11 @@ pub fn score_entry_points(
         // We use in_degree == 0 as a proxy for "not called internally" combined
         // with the visibility check from the node name conventions.
         // Default to 1.0; boost if the function has no internal callers.
-        let export_multiplier = if node_metrics.in_degree == 0 { 2.0 } else { 1.0 };
+        let export_multiplier = if node_metrics.in_degree == 0 {
+            2.0
+        } else {
+            1.0
+        };
 
         // Name multiplier
         let name_multiplier = compute_name_multiplier(&name_lower);
@@ -102,7 +152,10 @@ pub fn score_entry_points(
             reasons.push("no internal callers".to_string());
         }
         if name_multiplier > 1.5 {
-            reasons.push(format!("entry-point name pattern (×{:.1})", name_multiplier));
+            reasons.push(format!(
+                "entry-point name pattern (×{:.1})",
+                name_multiplier
+            ));
         } else if name_multiplier < 0.5 {
             reasons.push(format!("utility name penalty (×{:.1})", name_multiplier));
         }
@@ -113,7 +166,10 @@ pub fn score_entry_points(
                 .and_then(detect_framework)
                 .map(|(_, name)| name)
                 .unwrap_or("unknown");
-            reasons.push(format!("{} framework (×{:.1})", fw_name, framework_multiplier));
+            reasons.push(format!(
+                "{} framework (×{:.1})",
+                fw_name, framework_multiplier
+            ));
         }
 
         let reason = if reasons.is_empty() {
@@ -173,43 +229,151 @@ struct FrameworkPattern {
 /// All known framework patterns, ordered by specificity (most specific first).
 const FRAMEWORK_PATTERNS: &[FrameworkPattern] = &[
     // Next.js (pages/api is highest specificity)
-    FrameworkPattern { path_contains: "pages/api/", multiplier: 3.0, name: "Next.js API" },
-    FrameworkPattern { path_contains: "app/api/", multiplier: 3.0, name: "Next.js App Router" },
-    FrameworkPattern { path_contains: "pages/", multiplier: 1.5, name: "Next.js Pages" },
+    FrameworkPattern {
+        path_contains: "pages/api/",
+        multiplier: 3.0,
+        name: "Next.js API",
+    },
+    FrameworkPattern {
+        path_contains: "app/api/",
+        multiplier: 3.0,
+        name: "Next.js App Router",
+    },
+    FrameworkPattern {
+        path_contains: "pages/",
+        multiplier: 1.5,
+        name: "Next.js Pages",
+    },
     // Express / Fastify / Node.js
-    FrameworkPattern { path_contains: "/routes/", multiplier: 2.5, name: "Express/Node" },
-    FrameworkPattern { path_contains: "/middleware/", multiplier: 2.0, name: "Express Middleware" },
+    FrameworkPattern {
+        path_contains: "/routes/",
+        multiplier: 2.5,
+        name: "Express/Node",
+    },
+    FrameworkPattern {
+        path_contains: "/middleware/",
+        multiplier: 2.0,
+        name: "Express Middleware",
+    },
     // Django
-    FrameworkPattern { path_contains: "views.py", multiplier: 3.0, name: "Django" },
-    FrameworkPattern { path_contains: "urls.py", multiplier: 2.5, name: "Django URLs" },
+    FrameworkPattern {
+        path_contains: "views.py",
+        multiplier: 3.0,
+        name: "Django",
+    },
+    FrameworkPattern {
+        path_contains: "urls.py",
+        multiplier: 2.5,
+        name: "Django URLs",
+    },
     // Flask
-    FrameworkPattern { path_contains: "/blueprints/", multiplier: 2.5, name: "Flask" },
+    FrameworkPattern {
+        path_contains: "/blueprints/",
+        multiplier: 2.5,
+        name: "Flask",
+    },
     // Spring Boot / Java
-    FrameworkPattern { path_contains: "/controllers/", multiplier: 3.0, name: "Spring/MVC" },
-    FrameworkPattern { path_contains: "/controller/", multiplier: 3.0, name: "Spring/MVC" },
-    FrameworkPattern { path_contains: "/rest/", multiplier: 2.5, name: "REST API" },
+    FrameworkPattern {
+        path_contains: "/controllers/",
+        multiplier: 3.0,
+        name: "Spring/MVC",
+    },
+    FrameworkPattern {
+        path_contains: "/controller/",
+        multiplier: 3.0,
+        name: "Spring/MVC",
+    },
+    FrameworkPattern {
+        path_contains: "/rest/",
+        multiplier: 2.5,
+        name: "REST API",
+    },
     // Laravel
-    FrameworkPattern { path_contains: "Controllers/", multiplier: 3.0, name: "Laravel" },
+    FrameworkPattern {
+        path_contains: "Controllers/",
+        multiplier: 3.0,
+        name: "Laravel",
+    },
     // Rails
-    FrameworkPattern { path_contains: "app/controllers/", multiplier: 2.5, name: "Rails" },
+    FrameworkPattern {
+        path_contains: "app/controllers/",
+        multiplier: 2.5,
+        name: "Rails",
+    },
     // Rust web (Actix/Axum)
-    FrameworkPattern { path_contains: "/handlers/", multiplier: 2.5, name: "Rust Web" },
-    FrameworkPattern { path_contains: "/handlers.rs", multiplier: 2.5, name: "Rust Web" },
-    FrameworkPattern { path_contains: "/api/", multiplier: 2.0, name: "API" },
+    FrameworkPattern {
+        path_contains: "/handlers/",
+        multiplier: 2.5,
+        name: "Rust Web",
+    },
+    FrameworkPattern {
+        path_contains: "/handlers.rs",
+        multiplier: 2.5,
+        name: "Rust Web",
+    },
+    FrameworkPattern {
+        path_contains: "/api/",
+        multiplier: 2.0,
+        name: "API",
+    },
     // Go
-    FrameworkPattern { path_contains: "handler.go", multiplier: 2.5, name: "Go HTTP" },
-    FrameworkPattern { path_contains: "handlers.go", multiplier: 2.5, name: "Go HTTP" },
+    FrameworkPattern {
+        path_contains: "handler.go",
+        multiplier: 2.5,
+        name: "Go HTTP",
+    },
+    FrameworkPattern {
+        path_contains: "handlers.go",
+        multiplier: 2.5,
+        name: "Go HTTP",
+    },
     // Frontend frameworks
-    FrameworkPattern { path_contains: "/components/", multiplier: 1.5, name: "Component" },
-    FrameworkPattern { path_contains: "/views/", multiplier: 1.5, name: "View" },
-    FrameworkPattern { path_contains: ".component.ts", multiplier: 1.5, name: "Angular" },
-    FrameworkPattern { path_contains: ".service.ts", multiplier: 1.5, name: "Angular Service" },
+    FrameworkPattern {
+        path_contains: "/components/",
+        multiplier: 1.5,
+        name: "Component",
+    },
+    FrameworkPattern {
+        path_contains: "/views/",
+        multiplier: 1.5,
+        name: "View",
+    },
+    FrameworkPattern {
+        path_contains: ".component.ts",
+        multiplier: 1.5,
+        name: "Angular",
+    },
+    FrameworkPattern {
+        path_contains: ".service.ts",
+        multiplier: 1.5,
+        name: "Angular Service",
+    },
     // CLI
-    FrameworkPattern { path_contains: "/commands/", multiplier: 2.5, name: "CLI" },
-    FrameworkPattern { path_contains: "/cmd/", multiplier: 2.5, name: "CLI" },
-    FrameworkPattern { path_contains: "cli.rs", multiplier: 2.5, name: "CLI" },
-    FrameworkPattern { path_contains: "cli.py", multiplier: 2.5, name: "CLI" },
-    FrameworkPattern { path_contains: "cli.ts", multiplier: 2.5, name: "CLI" },
+    FrameworkPattern {
+        path_contains: "/commands/",
+        multiplier: 2.5,
+        name: "CLI",
+    },
+    FrameworkPattern {
+        path_contains: "/cmd/",
+        multiplier: 2.5,
+        name: "CLI",
+    },
+    FrameworkPattern {
+        path_contains: "cli.rs",
+        multiplier: 2.5,
+        name: "CLI",
+    },
+    FrameworkPattern {
+        path_contains: "cli.py",
+        multiplier: 2.5,
+        name: "CLI",
+    },
+    FrameworkPattern {
+        path_contains: "cli.ts",
+        multiplier: 2.5,
+        name: "CLI",
+    },
 ];
 
 /// Detect the framework from a file path.
@@ -331,7 +495,10 @@ fn bfs_trace_single(
 
         // Get outgoing CALLS edges
         let mut callees: Vec<(petgraph::graph::NodeIndex, &str, f64)> = Vec::new();
-        for edge_ref in graph.graph.edges_directed(current_idx, petgraph::Direction::Outgoing) {
+        for edge_ref in graph
+            .graph
+            .edges_directed(current_idx, petgraph::Direction::Outgoing)
+        {
             let edge = edge_ref.weight();
             if edge.edge_type != CodeEdgeType::Calls {
                 continue;
@@ -475,10 +642,7 @@ pub fn deduplicate_endpoints(traces: &mut Vec<ProcessTrace>) {
 // ── Classification ──────────────────────────────────────────────────
 
 /// Classify traces into Process objects with intra/cross community labels.
-pub fn classify_processes(
-    traces: Vec<ProcessTrace>,
-    graph: &CodeGraph,
-) -> Vec<Process> {
+pub fn classify_processes(traces: Vec<ProcessTrace>, graph: &CodeGraph) -> Vec<Process> {
     traces
         .into_iter()
         .enumerate()
@@ -604,7 +768,12 @@ mod tests {
 
         // Center: base=3/1=3.0, export=2.0 (in_deg=0), name=3.0 (dispatch→handler pattern)
         // Leaf: base=0/2=0.0
-        assert!(center_score > leaf_score, "center ({}) should score higher than leaf ({})", center_score, leaf_score);
+        assert!(
+            center_score > leaf_score,
+            "center ({}) should score higher than leaf ({})",
+            center_score,
+            leaf_score
+        );
     }
 
     #[test]
@@ -725,7 +894,10 @@ mod tests {
         // Should not loop forever; trace is A → B → C (C's edge back to A is skipped)
         assert!(!traces.is_empty());
         assert_eq!(traces[0].steps.len(), 3);
-        assert!(!traces[0].steps[1..].contains(&"A".to_string()), "should not revisit A");
+        assert!(
+            !traces[0].steps[1..].contains(&"A".to_string()),
+            "should not revisit A"
+        );
     }
 
     #[test]
@@ -742,11 +914,41 @@ mod tests {
         let mut metrics = HashMap::new();
         metrics.insert("A".into(), node_metrics(0, 5, 0));
         // Give B highest PageRank, then C
-        metrics.insert("B".into(), NodeMetrics { pagerank: 0.5, ..node_metrics(1, 0, 0) });
-        metrics.insert("C".into(), NodeMetrics { pagerank: 0.4, ..node_metrics(1, 0, 0) });
-        metrics.insert("D".into(), NodeMetrics { pagerank: 0.1, ..node_metrics(1, 0, 0) });
-        metrics.insert("E".into(), NodeMetrics { pagerank: 0.05, ..node_metrics(1, 0, 0) });
-        metrics.insert("F".into(), NodeMetrics { pagerank: 0.01, ..node_metrics(1, 0, 0) });
+        metrics.insert(
+            "B".into(),
+            NodeMetrics {
+                pagerank: 0.5,
+                ..node_metrics(1, 0, 0)
+            },
+        );
+        metrics.insert(
+            "C".into(),
+            NodeMetrics {
+                pagerank: 0.4,
+                ..node_metrics(1, 0, 0)
+            },
+        );
+        metrics.insert(
+            "D".into(),
+            NodeMetrics {
+                pagerank: 0.1,
+                ..node_metrics(1, 0, 0)
+            },
+        );
+        metrics.insert(
+            "E".into(),
+            NodeMetrics {
+                pagerank: 0.05,
+                ..node_metrics(1, 0, 0)
+            },
+        );
+        metrics.insert(
+            "F".into(),
+            NodeMetrics {
+                pagerank: 0.01,
+                ..node_metrics(1, 0, 0)
+            },
+        );
 
         let config = ProcessConfig {
             max_branching: 2,

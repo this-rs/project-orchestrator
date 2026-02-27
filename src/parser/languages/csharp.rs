@@ -141,11 +141,7 @@ fn extract_struct(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
     })
 }
 
-fn extract_interface(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-) -> Option<TraitNode> {
+fn extract_interface(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<TraitNode> {
     let name = get_field_text(node, "name", source)?;
     let visibility = get_csharp_visibility(node, source);
     let docstring = get_xml_doc(node, source);
@@ -190,11 +186,7 @@ fn extract_enum(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opti
     })
 }
 
-fn extract_method(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-) -> Option<FunctionNode> {
+fn extract_method(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<FunctionNode> {
     let name = get_field_text(node, "name", source)?;
     let visibility = get_csharp_visibility(node, source);
     let docstring = get_xml_doc(node, source);
@@ -229,11 +221,7 @@ fn extract_method(
     })
 }
 
-fn extract_using(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-) -> Option<ImportNode> {
+fn extract_using(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<ImportNode> {
     let text = get_text(node, source)?;
     // Parse: using Namespace.Sub; | using static Namespace.Class; | using Alias = Namespace.Type;
     let path = text
@@ -323,12 +311,10 @@ fn extract_base_list(node: &tree_sitter::Node, source: &str) -> (Option<String>,
     let mut parent_class = None;
     let mut interfaces = Vec::new();
 
-    let base_list = node
-        .child_by_field_name("bases")
-        .or_else(|| {
-            node.children(&mut node.walk())
-                .find(|c| c.kind() == "base_list")
-        });
+    let base_list = node.child_by_field_name("bases").or_else(|| {
+        node.children(&mut node.walk())
+            .find(|c| c.kind() == "base_list")
+    });
 
     if let Some(bases) = base_list {
         let mut first = true;

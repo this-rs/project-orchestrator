@@ -183,7 +183,10 @@ fn extract_calls_recursive(
 
         // Handle different call expression types across languages
         match node.kind() {
-            "call_expression" | "call" | "function_call_expression" | "method_call_expression"
+            "call_expression"
+            | "call"
+            | "function_call_expression"
+            | "method_call_expression"
             | "method_invocation" => {
                 if let Some(callee_name) = extract_callee_name(&node, source) {
                     if !super::noise_filter::is_builtin_call(&callee_name) {

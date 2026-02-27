@@ -13,7 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-use super::models::{CommunityInfo, CodeGraph, NodeMetrics};
+use super::models::{CodeGraph, CommunityInfo, NodeMetrics};
 
 // ============================================================================
 // Trait
@@ -193,8 +193,7 @@ impl LlmCommunityEnricher {
             .trim_end_matches("```")
             .trim();
 
-        let parsed: HashMap<String, String> = serde_json::from_str(clean)
-            .unwrap_or_default();
+        let parsed: HashMap<String, String> = serde_json::from_str(clean).unwrap_or_default();
 
         Ok(parsed)
     }
@@ -253,7 +252,10 @@ impl CommunityEnricher for LlmCommunityEnricher {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("LLM enrichment failed for batch, keeping heuristic labels: {}", e);
+                    tracing::warn!(
+                        "LLM enrichment failed for batch, keeping heuristic labels: {}",
+                        e
+                    );
                     // Labels stay as heuristic (already set)
                 }
             }
@@ -270,14 +272,18 @@ impl CommunityEnricher for LlmCommunityEnricher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::models::{CodeNode, CodeNodeType, CodeEdge, CodeEdgeType};
+    use crate::graph::models::{CodeEdge, CodeEdgeType, CodeNode, CodeNodeType};
 
     fn make_test_communities() -> (Vec<CommunityInfo>, CodeGraph, HashMap<String, NodeMetrics>) {
         let mut graph = CodeGraph::new();
         let mut metrics = HashMap::new();
 
         // Community 0: API files
-        for name in &["src/api/handlers.rs", "src/api/routes.rs", "src/api/middleware.rs"] {
+        for name in &[
+            "src/api/handlers.rs",
+            "src/api/routes.rs",
+            "src/api/middleware.rs",
+        ] {
             graph.add_node(CodeNode {
                 id: name.to_string(),
                 node_type: CodeNodeType::File,
@@ -355,14 +361,8 @@ mod tests {
 
         assert_eq!(communities[0].label, "api");
         assert_eq!(communities[1].label, "graph");
-        assert_eq!(
-            communities[0].enriched_by,
-            Some("heuristic".to_string())
-        );
-        assert_eq!(
-            communities[1].enriched_by,
-            Some("heuristic".to_string())
-        );
+        assert_eq!(communities[0].enriched_by, Some("heuristic".to_string()));
+        assert_eq!(communities[1].enriched_by, Some("heuristic".to_string()));
     }
 
     #[test]
@@ -377,13 +377,12 @@ mod tests {
             (
                 0u32,
                 "api",
-                vec!["src/api/handlers.rs".to_string(), "src/api/routes.rs".to_string()],
+                vec![
+                    "src/api/handlers.rs".to_string(),
+                    "src/api/routes.rs".to_string(),
+                ],
             ),
-            (
-                1u32,
-                "graph",
-                vec!["src/graph/algorithms.rs".to_string()],
-            ),
+            (1u32, "graph", vec!["src/graph/algorithms.rs".to_string()]),
         ];
 
         let prompt = enricher.build_prompt(&batch);
@@ -412,9 +411,27 @@ mod tests {
         };
 
         let mut metrics = HashMap::new();
-        metrics.insert("a".to_string(), NodeMetrics { pagerank: 0.1, ..Default::default() });
-        metrics.insert("b".to_string(), NodeMetrics { pagerank: 0.5, ..Default::default() });
-        metrics.insert("c".to_string(), NodeMetrics { pagerank: 0.3, ..Default::default() });
+        metrics.insert(
+            "a".to_string(),
+            NodeMetrics {
+                pagerank: 0.1,
+                ..Default::default()
+            },
+        );
+        metrics.insert(
+            "b".to_string(),
+            NodeMetrics {
+                pagerank: 0.5,
+                ..Default::default()
+            },
+        );
+        metrics.insert(
+            "c".to_string(),
+            NodeMetrics {
+                pagerank: 0.3,
+                ..Default::default()
+            },
+        );
 
         let top = enricher.top_members_by_pagerank(&community, &metrics);
         assert_eq!(top.len(), 3);

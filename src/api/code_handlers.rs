@@ -2033,9 +2033,7 @@ pub async fn get_process_detail(
         .neo4j()
         .get_process_detail(&params.process_id)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Process '{}' not found", params.process_id))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Process '{}' not found", params.process_id)))?;
 
     Ok(Json(process))
 }

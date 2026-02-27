@@ -195,11 +195,7 @@ where
 ///     RETURN count(r) AS cnt
 /// "#, "EXTENDS rels").await?;
 /// ```
-pub async fn cleanup_in_batches(
-    graph: &neo4rs::Graph,
-    cypher: &str,
-    label: &str,
-) -> Result<i64> {
+pub async fn cleanup_in_batches(graph: &neo4rs::Graph, cypher: &str, label: &str) -> Result<i64> {
     let mut total_deleted: i64 = 0;
 
     loop {

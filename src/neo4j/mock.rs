@@ -1485,8 +1485,14 @@ impl GraphStore for MockGraphStore {
         project_id: Option<Uuid>,
     ) -> Result<()> {
         for call in calls {
-            self.create_call_relationship(&call.caller_id, &call.callee_name, project_id, call.confidence, &call.reason)
-                .await?;
+            self.create_call_relationship(
+                &call.caller_id,
+                &call.callee_name,
+                project_id,
+                call.confidence,
+                &call.reason,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -6554,9 +6560,10 @@ impl GraphStore for MockGraphStore {
         for (key, parents) in cr.iter() {
             if let Some(child_name) = key.strip_prefix("extends:") {
                 // Find the child struct's file
-                if let Some(child_struct) = structs.values().find(|s| {
-                    s.name == child_name && project_paths.contains(&s.file_path)
-                }) {
+                if let Some(child_struct) = structs
+                    .values()
+                    .find(|s| s.name == child_name && project_paths.contains(&s.file_path))
+                {
                     for parent_name in parents {
                         // Find the parent struct's file
                         if let Some(parent_struct) = structs.values().find(|s| {
@@ -6599,14 +6606,16 @@ impl GraphStore for MockGraphStore {
         for (key, ifaces) in cr.iter() {
             if let Some(struct_name) = key.strip_prefix("implements:") {
                 // Find the struct's file
-                if let Some(struct_node) = structs.values().find(|s| {
-                    s.name == struct_name && project_paths.contains(&s.file_path)
-                }) {
+                if let Some(struct_node) = structs
+                    .values()
+                    .find(|s| s.name == struct_name && project_paths.contains(&s.file_path))
+                {
                     for iface_name in ifaces {
                         // Find the trait's file
-                        if let Some(trait_node) = traits.values().find(|t| {
-                            t.name == *iface_name && project_paths.contains(&t.file_path)
-                        }) {
+                        if let Some(trait_node) = traits
+                            .values()
+                            .find(|t| t.name == *iface_name && project_paths.contains(&t.file_path))
+                        {
                             if struct_node.file_path != trait_node.file_path {
                                 edges.push((
                                     struct_node.file_path.clone(),
@@ -7274,7 +7283,13 @@ mod tests {
 
         // Create a call: main -> helper
         store
-            .create_call_relationship("src/main.rs::main", "helper", Some(project.id), 0.50, "unscored")
+            .create_call_relationship(
+                "src/main.rs::main",
+                "helper",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7304,7 +7319,13 @@ mod tests {
 
         // Try to create a call from project_a::process -> transform (which only exists in project_b)
         store
-            .create_call_relationship("a/src/main.rs::process", "transform", Some(project_a.id), 0.50, "unscored")
+            .create_call_relationship(
+                "a/src/main.rs::process",
+                "transform",
+                Some(project_a.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7327,7 +7348,13 @@ mod tests {
 
         // Without project_id (None), cross-project call is allowed (backward compat)
         store
-            .create_call_relationship("a/src/main.rs::process", "transform", None, 0.50, "unscored")
+            .create_call_relationship(
+                "a/src/main.rs::process",
+                "transform",
+                None,
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7348,11 +7375,23 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("src/lib.rs::caller_a", "target", Some(project.id), 0.50, "unscored")
+            .create_call_relationship(
+                "src/lib.rs::caller_a",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
         store
-            .create_call_relationship("src/lib.rs::caller_b", "target", Some(project.id), 0.50, "unscored")
+            .create_call_relationship(
+                "src/lib.rs::caller_b",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7561,7 +7600,13 @@ mod tests {
         seed_project(&store, &project, &[("src/lib.rs", &["caller", "target"])]).await;
 
         store
-            .create_call_relationship("src/lib.rs::caller", "target", Some(project.id), 0.50, "unscored")
+            .create_call_relationship(
+                "src/lib.rs::caller",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7840,7 +7885,13 @@ mod tests {
 
         // service.rs::do_work calls lib.rs::execute (CALLS axis)
         store
-            .create_call_relationship("src/service.rs::do_work", "execute", Some(project.id), 0.50, "unscored")
+            .create_call_relationship(
+                "src/service.rs::do_work",
+                "execute",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7869,7 +7920,13 @@ mod tests {
         seed_project(&store, &project, &[("src/lib.rs", &["fn_a", "fn_b"])]).await;
 
         store
-            .create_call_relationship("src/lib.rs::fn_a", "fn_b", Some(project.id), 0.50, "unscored")
+            .create_call_relationship(
+                "src/lib.rs::fn_a",
+                "fn_b",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7907,7 +7964,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/caller.rs::call_it_b", "target", None, 0.50, "unscored")
+            .create_call_relationship(
+                "b/src/caller.rs::call_it_b",
+                "target",
+                None,
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -8182,7 +8245,13 @@ mod tests {
         let callee_func = make_function("process_data", "src/processor.rs", 1);
         store.upsert_function(&callee_func).await.unwrap();
         store
-            .create_call_relationship("handle_request", "process_data", Some(pid), 0.50, "unscored")
+            .create_call_relationship(
+                "handle_request",
+                "process_data",
+                Some(pid),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -9707,7 +9776,13 @@ mod tests {
         // Create CALLS: process -> transform_data (real) and process -> println (built-in)
         // Use None for project_id to skip project-file scoping in mock
         store
-            .create_call_relationship("src/main.rs::process", "transform_data", None, 0.50, "unscored")
+            .create_call_relationship(
+                "src/main.rs::process",
+                "transform_data",
+                None,
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
         store

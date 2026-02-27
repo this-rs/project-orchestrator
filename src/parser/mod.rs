@@ -686,7 +686,10 @@ class Standalone:
         let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
         assert!(animal.parent_class.is_none());
         assert!(animal.interfaces.is_empty());
-        assert!(animal.generics.is_empty(), "generics should be empty, heritage goes in parent_class/interfaces");
+        assert!(
+            animal.generics.is_empty(),
+            "generics should be empty, heritage goes in parent_class/interfaces"
+        );
 
         // Dog — inherits from Animal
         let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
@@ -694,12 +697,20 @@ class Standalone:
         assert!(dog.interfaces.is_empty());
 
         // GuideDog — multiple inheritance
-        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
         assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
         assert_eq!(guide.interfaces, vec!["Serializable", "Loggable"]);
 
         // Standalone — no inheritance
-        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
         assert!(standalone.parent_class.is_none());
         assert!(standalone.interfaces.is_empty());
     }
@@ -734,7 +745,10 @@ class Standalone {
         let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
         assert!(animal.parent_class.is_none());
         assert!(animal.interfaces.is_empty());
-        assert!(animal.generics.is_empty(), "generics should be empty, heritage goes in parent_class/interfaces");
+        assert!(
+            animal.generics.is_empty(),
+            "generics should be empty, heritage goes in parent_class/interfaces"
+        );
 
         // Dog — extends Animal
         let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
@@ -742,12 +756,20 @@ class Standalone {
         assert!(dog.interfaces.is_empty());
 
         // GuideDog — extends Dog, implements Serializable + JsonSerializable
-        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
         assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
         assert_eq!(guide.interfaces, vec!["Serializable", "JsonSerializable"]);
 
         // Standalone — no inheritance
-        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
         assert!(standalone.parent_class.is_none());
         assert!(standalone.interfaces.is_empty());
     }
@@ -785,11 +807,23 @@ public class Standalone {
         assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
         assert!(dog.interfaces.is_empty());
 
-        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
         assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
-        assert!(guide.interfaces.len() >= 2, "expected at least 2 interfaces: {:?}", guide.interfaces);
+        assert!(
+            guide.interfaces.len() >= 2,
+            "expected at least 2 interfaces: {:?}",
+            guide.interfaces
+        );
 
-        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
         assert!(standalone.parent_class.is_none());
         assert!(standalone.interfaces.is_empty());
     }
@@ -838,7 +872,11 @@ namespace MyApp.Services
         assert_eq!(parsed.language, "csharp");
 
         // Imports
-        assert!(parsed.imports.len() >= 2, "expected at least 2 using directives, got {}", parsed.imports.len());
+        assert!(
+            parsed.imports.len() >= 2,
+            "expected at least 2 using directives, got {}",
+            parsed.imports.len()
+        );
 
         // Interface
         let iface = parsed.traits.iter().find(|t| t.name == "IUserService");
@@ -853,8 +891,14 @@ namespace MyApp.Services
         assert!(svc.interfaces.contains(&"IDisposable".to_string()));
 
         // Methods
-        assert!(parsed.functions.iter().any(|f| f.name == "GetUser"), "GetUser method not found");
-        assert!(parsed.functions.iter().any(|f| f.name == "Cleanup"), "Cleanup method not found");
+        assert!(
+            parsed.functions.iter().any(|f| f.name == "GetUser"),
+            "GetUser method not found"
+        );
+        assert!(
+            parsed.functions.iter().any(|f| f.name == "Cleanup"),
+            "Cleanup method not found"
+        );
 
         // Enum
         let e = parsed.enums.iter().find(|e| e.name == "UserRole");
@@ -920,11 +964,23 @@ class Standalone {
         assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
         assert!(dog.interfaces.is_empty());
 
-        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
         assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
-        assert!(guide.interfaces.len() >= 2, "expected at least 2 interfaces: {:?}", guide.interfaces);
+        assert!(
+            guide.interfaces.len() >= 2,
+            "expected at least 2 interfaces: {:?}",
+            guide.interfaces
+        );
 
-        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
         assert!(standalone.parent_class.is_none());
         assert!(standalone.interfaces.is_empty());
     }
@@ -963,11 +1019,24 @@ class Standalone {
         assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
         assert!(dog.interfaces.is_empty());
 
-        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
         assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
-        assert_eq!(guide.interfaces.len(), 1, "expected 1 interface: {:?}", guide.interfaces);
+        assert_eq!(
+            guide.interfaces.len(),
+            1,
+            "expected 1 interface: {:?}",
+            guide.interfaces
+        );
 
-        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
         assert!(standalone.parent_class.is_none());
         assert!(standalone.interfaces.is_empty());
     }
@@ -993,13 +1062,20 @@ end
 
         let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
         assert!(animal.parent_class.is_none());
-        assert!(animal.generics.is_empty(), "generics should be empty for Ruby classes");
+        assert!(
+            animal.generics.is_empty(),
+            "generics should be empty for Ruby classes"
+        );
 
         let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
         assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
         assert!(dog.generics.is_empty());
 
-        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
         assert!(standalone.parent_class.is_none());
     }
 
@@ -1033,11 +1109,23 @@ class Standalone {
         assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
         assert!(dog.interfaces.is_empty());
 
-        let guide = parsed.structs.iter().find(|s| s.name == "GuideDog").unwrap();
+        let guide = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "GuideDog")
+            .unwrap();
         assert_eq!(guide.parent_class.as_deref(), Some("Dog"));
-        assert!(guide.interfaces.len() >= 2, "expected at least 2 interfaces: {:?}", guide.interfaces);
+        assert!(
+            guide.interfaces.len() >= 2,
+            "expected at least 2 interfaces: {:?}",
+            guide.interfaces
+        );
 
-        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
         assert!(standalone.parent_class.is_none());
     }
 
@@ -1066,7 +1154,11 @@ class Standalone {
         let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
         assert_eq!(dog.parent_class.as_deref(), Some("Animal"));
 
-        let standalone = parsed.structs.iter().find(|s| s.name == "Standalone").unwrap();
+        let standalone = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap();
         assert!(standalone.parent_class.is_none());
     }
 

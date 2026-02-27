@@ -100,10 +100,7 @@ impl SymbolTable {
             .insert(name.to_string(), node_id.to_string());
 
         // Global index (deduplicate by node_id)
-        let defs = self
-            .global_index
-            .entry(name.to_string())
-            .or_default();
+        let defs = self.global_index.entry(name.to_string()).or_default();
 
         // Avoid duplicates (same node_id)
         if !defs.iter().any(|d| d.node_id == node_id) {
@@ -187,13 +184,7 @@ impl SymbolTable {
 
             for e in &parsed.enums {
                 let node_id = format!("{}:{}:{}", file_path, e.name, e.line_start);
-                self.add(
-                    &e.name,
-                    &node_id,
-                    file_path,
-                    SymbolType::Enum,
-                    e.line_start,
-                );
+                self.add(&e.name, &node_id, file_path, SymbolType::Enum, e.line_start);
             }
         }
     }
@@ -237,7 +228,11 @@ mod tests {
     use crate::neo4j::models::*;
     use crate::parser::ParsedFile;
 
-    fn make_parsed_file(path: &str, functions: &[(&str, u32)], structs: &[(&str, u32)]) -> ParsedFile {
+    fn make_parsed_file(
+        path: &str,
+        functions: &[(&str, u32)],
+        structs: &[(&str, u32)],
+    ) -> ParsedFile {
         ParsedFile {
             path: path.to_string(),
             language: "rust".to_string(),
@@ -300,8 +295,20 @@ mod tests {
     #[test]
     fn test_lookup_exact() {
         let mut table = SymbolTable::new();
-        table.add("foo", "src/main.rs:foo:1", "src/main.rs", SymbolType::Function, 1);
-        table.add("bar", "src/lib.rs:bar:5", "src/lib.rs", SymbolType::Function, 5);
+        table.add(
+            "foo",
+            "src/main.rs:foo:1",
+            "src/main.rs",
+            SymbolType::Function,
+            1,
+        );
+        table.add(
+            "bar",
+            "src/lib.rs:bar:5",
+            "src/lib.rs",
+            SymbolType::Function,
+            5,
+        );
 
         assert_eq!(
             table.lookup_exact("src/main.rs", "foo"),
@@ -321,9 +328,27 @@ mod tests {
     fn test_lookup_fuzzy_cross_file() {
         let mut table = SymbolTable::new();
         // Same name in two different files
-        table.add("handle", "src/api.rs:handle:1", "src/api.rs", SymbolType::Function, 1);
-        table.add("handle", "src/ws.rs:handle:10", "src/ws.rs", SymbolType::Function, 10);
-        table.add("unique", "src/lib.rs:unique:1", "src/lib.rs", SymbolType::Function, 1);
+        table.add(
+            "handle",
+            "src/api.rs:handle:1",
+            "src/api.rs",
+            SymbolType::Function,
+            1,
+        );
+        table.add(
+            "handle",
+            "src/ws.rs:handle:10",
+            "src/ws.rs",
+            SymbolType::Function,
+            10,
+        );
+        table.add(
+            "unique",
+            "src/lib.rs:unique:1",
+            "src/lib.rs",
+            SymbolType::Function,
+            1,
+        );
 
         let results = table.lookup_fuzzy("handle");
         assert_eq!(results.len(), 2);
@@ -369,7 +394,11 @@ mod tests {
     #[test]
     fn test_populate_from_parsed() {
         let files = vec![
-            make_parsed_file("src/main.rs", &[("main", 1), ("helper", 10)], &[("Config", 20)]),
+            make_parsed_file(
+                "src/main.rs",
+                &[("main", 1), ("helper", 10)],
+                &[("Config", 20)],
+            ),
             make_parsed_file("src/lib.rs", &[("init", 1)], &[("State", 10)]),
             make_parsed_file("src/api.rs", &[("handle_request", 1)], &[]),
         ];

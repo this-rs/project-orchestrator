@@ -144,11 +144,7 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
 ///
 /// Returns (AppState, Arc<MockGraphStore>, Arc<MockSearchStore>) so tests can
 /// inspect both stores after operations.
-pub fn mock_app_state_with_stores() -> (
-    AppState,
-    Arc<MockGraphStore>,
-    Arc<MockSearchStore>,
-) {
+pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockSearchStore>) {
     let graph = Arc::new(MockGraphStore::new());
     let meili = Arc::new(MockSearchStore::new());
     let state = AppState {

@@ -1623,7 +1623,12 @@ impl Neo4jClient {
                 m.insert("caller_id".into(), call.caller_id.clone().into());
                 m.insert("callee_name".into(), call.callee_name.clone().into());
                 m.insert("caller_file_path".into(), caller_file_path.into());
-                m.insert("confidence".into(), neo4rs::BoltType::Float(neo4rs::BoltFloat { value: call.confidence }));
+                m.insert(
+                    "confidence".into(),
+                    neo4rs::BoltType::Float(neo4rs::BoltFloat {
+                        value: call.confidence,
+                    }),
+                );
                 m.insert("reason".into(), call.reason.clone().into());
                 m
             })
@@ -2420,10 +2425,7 @@ impl Neo4jClient {
     // ========================================================================
 
     /// List all detected processes for a project.
-    pub async fn list_processes(
-        &self,
-        project_id: uuid::Uuid,
-    ) -> Result<Vec<serde_json::Value>> {
+    pub async fn list_processes(&self, project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>> {
         let q = query(
             r#"
             MATCH (p:Process {project_id: $project_id})
@@ -2462,10 +2464,7 @@ impl Neo4jClient {
     }
 
     /// Get details of a specific process including ordered steps.
-    pub async fn get_process_detail(
-        &self,
-        process_id: &str,
-    ) -> Result<Option<serde_json::Value>> {
+    pub async fn get_process_detail(&self, process_id: &str) -> Result<Option<serde_json::Value>> {
         let q = query(
             r#"
             MATCH (p:Process {id: $process_id})
@@ -3012,12 +3011,11 @@ impl Neo4jClient {
         let mut callers = Vec::new();
 
         while let Some(row) = result.next().await? {
-            if let (Ok(name), Ok(file)) = (
-                row.get::<String>("name"),
-                row.get::<String>("file"),
-            ) {
+            if let (Ok(name), Ok(file)) = (row.get::<String>("name"), row.get::<String>("file")) {
                 let confidence = row.get::<f64>("confidence").unwrap_or(0.50);
-                let reason = row.get::<String>("reason").unwrap_or_else(|_| "unknown".to_string());
+                let reason = row
+                    .get::<String>("reason")
+                    .unwrap_or_else(|_| "unknown".to_string());
                 callers.push((name, file, confidence, reason));
             }
         }
@@ -3060,12 +3058,11 @@ impl Neo4jClient {
         let mut callees = Vec::new();
 
         while let Some(row) = result.next().await? {
-            if let (Ok(name), Ok(file)) = (
-                row.get::<String>("name"),
-                row.get::<String>("file"),
-            ) {
+            if let (Ok(name), Ok(file)) = (row.get::<String>("name"), row.get::<String>("file")) {
                 let confidence = row.get::<f64>("confidence").unwrap_or(0.50);
-                let reason = row.get::<String>("reason").unwrap_or_else(|_| "unknown".to_string());
+                let reason = row
+                    .get::<String>("reason")
+                    .unwrap_or_else(|_| "unknown".to_string());
                 callees.push((name, file, confidence, reason));
             }
         }

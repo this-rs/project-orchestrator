@@ -1226,7 +1226,8 @@ mod tests {
     #[test]
     fn test_louvain_two_cliques_detects_2_communities() {
         let g = make_two_cliques(4); // Two K4 connected by one edge
-        let (node_map, communities, modularity) = louvain_communities(&g, &AnalyticsConfig::default());
+        let (node_map, communities, modularity) =
+            louvain_communities(&g, &AnalyticsConfig::default());
 
         assert_eq!(node_map.len(), 8);
         assert!(

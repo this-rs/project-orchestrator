@@ -79,8 +79,7 @@ impl SuffixIndex {
                 // Insert into lowercase_map
                 match lowercase_map.get(&suffix_lower) {
                     None => {
-                        lowercase_map
-                            .insert(suffix_lower, SuffixEntry::Unique(normalized.clone()));
+                        lowercase_map.insert(suffix_lower, SuffixEntry::Unique(normalized.clone()));
                     }
                     Some(SuffixEntry::Unique(_)) => {
                         lowercase_map.insert(suffix_lower, SuffixEntry::Ambiguous);
@@ -212,10 +211,7 @@ mod tests {
             Some("src/api/handlers.rs")
         );
         // Partial suffix
-        assert_eq!(
-            index.get("api/handlers.rs"),
-            Some("src/api/handlers.rs")
-        );
+        assert_eq!(index.get("api/handlers.rs"), Some("src/api/handlers.rs"));
         // Just filename (unique)
         assert_eq!(index.get("handlers.rs"), Some("src/api/handlers.rs"));
         assert_eq!(index.get("client.rs"), Some("src/neo4j/client.rs"));
@@ -234,10 +230,7 @@ mod tests {
             index.get_insensitive("Api/Handlers.rs"),
             Some("src/api/handlers.rs")
         );
-        assert_eq!(
-            index.get_insensitive("cargo.toml"),
-            Some("Cargo.toml")
-        );
+        assert_eq!(index.get_insensitive("cargo.toml"), Some("Cargo.toml"));
     }
 
     #[test]
@@ -248,10 +241,7 @@ mod tests {
         assert_eq!(index.get("mod.rs"), Some("src/parser/mod.rs"));
 
         // But "rust.rs" and "python.rs" are unique filenames
-        assert_eq!(
-            index.get("rust.rs"),
-            Some("src/parser/languages/rust.rs")
-        );
+        assert_eq!(index.get("rust.rs"), Some("src/parser/languages/rust.rs"));
         assert_eq!(
             index.get("python.rs"),
             Some("src/parser/languages/python.rs")
@@ -334,14 +324,8 @@ mod tests {
         let paths = vec!["src\\api\\handlers.rs".to_string()];
         let index = SuffixIndex::build(&paths);
 
-        assert_eq!(
-            index.get("api/handlers.rs"),
-            Some("src/api/handlers.rs")
-        );
-        assert_eq!(
-            index.get("handlers.rs"),
-            Some("src/api/handlers.rs")
-        );
+        assert_eq!(index.get("api/handlers.rs"), Some("src/api/handlers.rs"));
+        assert_eq!(index.get("handlers.rs"), Some("src/api/handlers.rs"));
     }
 
     #[test]
@@ -349,21 +333,17 @@ mod tests {
         let index = SuffixIndex::build(&sample_paths());
 
         assert_eq!(index.file_count(), 8);
-        assert!(index.suffix_count() > 8, "Should have more suffixes than files");
+        assert!(
+            index.suffix_count() > 8,
+            "Should have more suffixes than files"
+        );
     }
 
     #[test]
     fn test_large_index_performance() {
         // Generate 10K synthetic paths
         let paths: Vec<String> = (0..10_000)
-            .map(|i| {
-                format!(
-                    "src/module_{}/sub_{}/file_{}.rs",
-                    i / 100,
-                    i / 10 % 10,
-                    i
-                )
-            })
+            .map(|i| format!("src/module_{}/sub_{}/file_{}.rs", i / 100, i / 10 % 10, i))
             .collect();
 
         let start = std::time::Instant::now();

@@ -1326,11 +1326,7 @@ pub async fn cleanup_cross_project_calls(
 pub async fn cleanup_builtin_calls(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let deleted = state
-        .orchestrator
-        .neo4j()
-        .cleanup_builtin_calls()
-        .await?;
+    let deleted = state.orchestrator.neo4j().cleanup_builtin_calls().await?;
     Ok(Json(serde_json::json!({ "deleted_count": deleted })))
 }
 

@@ -1512,11 +1512,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             for parsed in &parsed_files {
                 let doc = CodeParser::to_code_document(parsed, &pid.to_string(), slug);
                 if let Err(e) = self.state.meili.index_code(&doc).await {
-                    tracing::warn!(
-                        "Failed to index {} in Meilisearch: {}",
-                        parsed.path,
-                        e
-                    );
+                    tracing::warn!("Failed to index {} in Meilisearch: {}", parsed.path, e);
                 }
             }
         }
@@ -2046,9 +2042,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .await?;
 
         // ── Heritage relationships (EXTENDS / IMPLEMENTS) ───────────────
-        let project_id_str = project_id
-            .map(|id| id.to_string())
-            .unwrap_or_default();
+        let project_id_str = project_id.map(|id| id.to_string()).unwrap_or_default();
 
         let mut extends_rels: Vec<(String, String, String, String)> = Vec::new();
         let mut implements_rels: Vec<(String, String, String, String)> = Vec::new();
@@ -2177,17 +2171,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .neo4j
             .batch_upsert_functions(&all_functions)
             .await?;
-        self.state
-            .neo4j
-            .batch_upsert_structs(&all_structs)
-            .await?;
+        self.state.neo4j.batch_upsert_structs(&all_structs).await?;
         self.state.neo4j.batch_upsert_traits(&all_traits).await?;
         self.state.neo4j.batch_upsert_enums(&all_enums).await?;
         self.state.neo4j.batch_upsert_impls(&all_impls).await?;
-        self.state
-            .neo4j
-            .batch_upsert_imports(&all_imports)
-            .await?;
+        self.state.neo4j.batch_upsert_imports(&all_imports).await?;
 
         // ── 3. Resolve imports per-file, accumulate relationships ─────
         let mut all_import_rels: Vec<(String, String, String)> = Vec::new();
@@ -2195,9 +2183,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let mut all_scored_calls: Vec<crate::parser::FunctionCall> = Vec::new();
         let mut all_extends_rels: Vec<(String, String, String, String)> = Vec::new();
         let mut all_implements_rels: Vec<(String, String, String, String)> = Vec::new();
-        let project_id_str = project_id
-            .map(|id| id.to_string())
-            .unwrap_or_default();
+        let project_id_str = project_id.map(|id| id.to_string()).unwrap_or_default();
 
         for parsed in parsed_files {
             // Import resolution (per-file — needs source file path)
@@ -2218,15 +2204,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 }
 
                 // IMPORTS_SYMBOL relationships
-                let import_id =
-                    format!("{}:{}:{}", import.file_path, import.line, import.path);
+                let import_id = format!("{}:{}:{}", import.file_path, import.line, import.path);
                 let symbols = Self::extract_imported_symbols(import);
                 for symbol_name in &symbols {
-                    all_symbol_rels.push((
-                        import_id.clone(),
-                        symbol_name.clone(),
-                        project_id,
-                    ));
+                    all_symbol_rels.push((import_id.clone(), symbol_name.clone(), project_id));
                 }
             }
 
@@ -2299,8 +2280,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 let file_path = normalize_path(&parsed.path);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path)
-                            .await
+                        Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path).await
                     {
                         tracing::warn!(
                             file = %file_path,
@@ -2912,10 +2892,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         ctx.go_module_path.as_deref(),
                         &ctx.suffix_index,
                     ),
-                    "java" => Self::resolve_java_import_indexed(
-                        &import.path,
-                        &ctx.suffix_index,
-                    ),
+                    "java" => Self::resolve_java_import_indexed(&import.path, &ctx.suffix_index),
                     "php" => Self::resolve_php_import_indexed(
                         &import.path,
                         &ctx.psr4_mappings,
@@ -2927,32 +2904,24 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         &ctx.c_include_paths,
                         &ctx.suffix_index,
                     ),
-                    "csharp" => Self::resolve_csharp_import_indexed(
-                        &import.path,
-                        &ctx.suffix_index,
-                    ),
+                    "csharp" => {
+                        Self::resolve_csharp_import_indexed(&import.path, &ctx.suffix_index)
+                    }
                     "ruby" => Self::resolve_ruby_import_indexed(
                         &import.path,
                         parsed_path,
                         &ctx.suffix_index,
                     ),
-                    "scala" => Self::resolve_scala_import_indexed(
-                        &import.path,
-                        &ctx.suffix_index,
-                    ),
-                    "kotlin" => Self::resolve_kotlin_import_indexed(
-                        &import.path,
-                        &ctx.suffix_index,
-                    ),
+                    "scala" => Self::resolve_scala_import_indexed(&import.path, &ctx.suffix_index),
+                    "kotlin" => {
+                        Self::resolve_kotlin_import_indexed(&import.path, &ctx.suffix_index)
+                    }
                     "zig" => Self::resolve_zig_import_indexed(
                         &import.path,
                         parsed_path,
                         &ctx.suffix_index,
                     ),
-                    "swift" => Self::resolve_swift_import_indexed(
-                        &import.path,
-                        &ctx.suffix_index,
-                    ),
+                    "swift" => Self::resolve_swift_import_indexed(&import.path, &ctx.suffix_index),
                     "bash" => Self::resolve_bash_import_indexed(
                         &import.path,
                         parsed_path,
@@ -2963,11 +2932,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
                 // Cache the result (store first resolved path or None)
                 let cache_value = result.first().cloned();
-                ctx.resolve_cache.insert(
-                    parsed_path.to_string(),
-                    import.path.clone(),
-                    cache_value,
-                );
+                ctx.resolve_cache
+                    .insert(parsed_path.to_string(), import.path.clone(), cache_value);
 
                 result
             }
@@ -3122,7 +3088,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         if import_path.starts_with('.') {
             // Relative import: resolve against source directory
-            let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            let source_dir = source_file
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
             let target = resolve_relative_path(source_dir, import_path);
 
             // Try extensions
@@ -3294,11 +3263,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         if !best_prefix.is_empty() {
             // Strip namespace prefix, convert \ to /, prepend directory, append .php
             let relative = &path[best_prefix.len()..];
-            let file_path = format!(
-                "{}{}.php",
-                best_dir,
-                relative.replace('\\', "/")
-            );
+            let file_path = format!("{}{}.php", best_dir, relative.replace('\\', "/"));
             if let Some(resolved) = index.get(&file_path) {
                 return vec![resolved.to_string()];
             }
@@ -3335,7 +3300,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         // 1. Try relative to source file directory
-        let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        let source_dir = source_file
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("");
         if !source_dir.is_empty() {
             let relative = format!("{}/{}", source_dir, path);
             if let Some(resolved) = index.get(&relative) {
@@ -3345,11 +3313,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // 2. Try each include path
         for inc_dir in include_paths {
-            let candidate = format!(
-                "{}/{}",
-                inc_dir.trim_end_matches('/'),
-                path
-            );
+            let candidate = format!("{}/{}", inc_dir.trim_end_matches('/'), path);
             if let Some(resolved) = index.get(&candidate) {
                 return vec![resolved.to_string()];
             }
@@ -3470,9 +3434,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 .unwrap_or("");
 
             // Normalize: strip leading ./ and resolve ../
-            let rel_path = with_ext
-                .strip_prefix("./")
-                .unwrap_or(&with_ext);
+            let rel_path = with_ext.strip_prefix("./").unwrap_or(&with_ext);
 
             let candidate = if source_dir.is_empty() {
                 rel_path.to_string()
@@ -3532,11 +3494,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             for selector in selectors.split(',') {
                 let selector = selector.trim();
                 // Handle rename: Foo => MyFoo — use original name
-                let name = selector
-                    .split("=>")
-                    .next()
-                    .unwrap_or(selector)
-                    .trim();
+                let name = selector.split("=>").next().unwrap_or(selector).trim();
 
                 if name == "_" {
                     // Wildcard within selective import
@@ -3655,7 +3613,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Relative path: resolve from source file directory
         if path.ends_with(".zig") {
-            let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            let source_dir = source_file
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
             let candidate = if source_dir.is_empty() {
                 path.to_string()
             } else {
@@ -3714,18 +3675,64 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Ignore Apple/system frameworks
         const SYSTEM_FRAMEWORKS: &[&str] = &[
-            "Foundation", "UIKit", "SwiftUI", "AppKit", "Combine", "CoreData",
-            "CoreGraphics", "CoreLocation", "CoreImage", "CoreML", "MapKit",
-            "Metal", "MetalKit", "SceneKit", "SpriteKit", "AVFoundation",
-            "ARKit", "RealityKit", "GameplayKit", "StoreKit", "CloudKit",
-            "HealthKit", "HomeKit", "WatchKit", "WidgetKit", "ActivityKit",
-            "Accelerate", "Darwin", "Dispatch", "ObjectiveC", "os", "Swift",
-            "XCTest", "PlaygroundSupport", "CryptoKit", "Network", "NaturalLanguage",
-            "Vision", "CoreMotion", "CoreBluetooth", "MultipeerConnectivity",
-            "Security", "LocalAuthentication", "WebKit", "SafariServices",
-            "MessageUI", "Contacts", "EventKit", "Photos", "PhotosUI",
-            "UniformTypeIdentifiers", "Intents", "IntentsUI", "UserNotifications",
-            "NotificationCenter", "SystemConfiguration", "IOKit", "OSLog",
+            "Foundation",
+            "UIKit",
+            "SwiftUI",
+            "AppKit",
+            "Combine",
+            "CoreData",
+            "CoreGraphics",
+            "CoreLocation",
+            "CoreImage",
+            "CoreML",
+            "MapKit",
+            "Metal",
+            "MetalKit",
+            "SceneKit",
+            "SpriteKit",
+            "AVFoundation",
+            "ARKit",
+            "RealityKit",
+            "GameplayKit",
+            "StoreKit",
+            "CloudKit",
+            "HealthKit",
+            "HomeKit",
+            "WatchKit",
+            "WidgetKit",
+            "ActivityKit",
+            "Accelerate",
+            "Darwin",
+            "Dispatch",
+            "ObjectiveC",
+            "os",
+            "Swift",
+            "XCTest",
+            "PlaygroundSupport",
+            "CryptoKit",
+            "Network",
+            "NaturalLanguage",
+            "Vision",
+            "CoreMotion",
+            "CoreBluetooth",
+            "MultipeerConnectivity",
+            "Security",
+            "LocalAuthentication",
+            "WebKit",
+            "SafariServices",
+            "MessageUI",
+            "Contacts",
+            "EventKit",
+            "Photos",
+            "PhotosUI",
+            "UniformTypeIdentifiers",
+            "Intents",
+            "IntentsUI",
+            "UserNotifications",
+            "NotificationCenter",
+            "SystemConfiguration",
+            "IOKit",
+            "OSLog",
         ];
 
         if SYSTEM_FRAMEWORKS.contains(&module) {
@@ -3768,7 +3775,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             return Vec::new();
         }
 
-        let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        let source_dir = source_file
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("");
 
         // Strip leading ./ if present
         let clean_path = path.strip_prefix("./").unwrap_or(path);
@@ -3801,7 +3811,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ) -> Option<String> {
         if import_path.starts_with('.') {
             // Relative import
-            let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            let source_dir = source_file
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
             let dots = import_path.chars().take_while(|c| *c == '.').count();
             let module_part = &import_path[dots..];
 
@@ -3865,11 +3878,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         ctx: Option<&crate::resolver::ImportResolutionContext>,
     ) -> Vec<crate::parser::FunctionCall> {
         // Build set of function names defined in this file
-        let same_file_names: std::collections::HashSet<&str> = parsed
-            .functions
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect();
+        let same_file_names: std::collections::HashSet<&str> =
+            parsed.functions.iter().map(|f| f.name.as_str()).collect();
 
         // Build set of imported file paths from this file
         let imported_files: std::collections::HashSet<&str> = import_rels
@@ -3928,7 +3938,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 // Normalize: imported_files may have full paths, def.file_path may be relative
                 let def_path = def.file_path.as_str();
                 if imported_files.contains(def_path)
-                    || imported_files.iter().any(|f| f.ends_with(def_path) || def_path.ends_with(f))
+                    || imported_files
+                        .iter()
+                        .any(|f| f.ends_with(def_path) || def_path.ends_with(f))
                 {
                     return (0.90, "import-resolved".to_string());
                 }
@@ -5137,7 +5149,10 @@ pub async fn parse_files_with_cache(
 ) -> Vec<ParsedFile> {
     let start = std::time::Instant::now();
     let total_files = files.len();
-    let total_bytes: u64 = files.iter().map(|f| f.size.max(f.content.len() as u64)).sum();
+    let total_bytes: u64 = files
+        .iter()
+        .map(|f| f.size.max(f.content.len() as u64))
+        .sum();
 
     // ── Cache lookup (single-threaded, before rayon) ───────────
     let mut cached_results: Vec<ParsedFile> = Vec::new();
@@ -7208,11 +7223,8 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // npm package — should return None
-        let result = Orchestrator::resolve_typescript_import_indexed(
-            "react",
-            "src/main.ts",
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_typescript_import_indexed("react", "src/main.ts", &index);
         assert_eq!(result, None);
     }
 
@@ -7226,19 +7238,12 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // .models from src/app.py (1 dot = same directory)
-        let result = Orchestrator::resolve_python_import_indexed(
-            ".models",
-            "src/app.py",
-            &index,
-        );
+        let result = Orchestrator::resolve_python_import_indexed(".models", "src/app.py", &index);
         assert_eq!(result, Some("src/models/__init__.py".to_string()));
 
         // .utils.helpers from src/app.py
-        let result = Orchestrator::resolve_python_import_indexed(
-            ".utils.helpers",
-            "src/app.py",
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_python_import_indexed(".utils.helpers", "src/app.py", &index);
         assert_eq!(result, Some("src/utils/helpers.py".to_string()));
     }
 
@@ -7335,11 +7340,8 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // Standard library import — doesn't match our module path
-        let result = Orchestrator::resolve_go_import_indexed(
-            "fmt",
-            Some("github.com/user/project"),
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_go_import_indexed("fmt", Some("github.com/user/project"), &index);
         assert!(result.is_empty(), "stdlib imports should be skipped");
 
         let result = Orchestrator::resolve_go_import_indexed(
@@ -7360,10 +7362,7 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // Standard import: com.example.models.User → com/example/models/User.java
-        let result = Orchestrator::resolve_java_import_indexed(
-            "com.example.models.User",
-            &index,
-        );
+        let result = Orchestrator::resolve_java_import_indexed("com.example.models.User", &index);
         assert_eq!(result, vec!["com/example/models/User.java"]);
     }
 
@@ -7377,10 +7376,7 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // Wildcard import: com.example.models.* → all .java in com/example/models/
-        let result = Orchestrator::resolve_java_import_indexed(
-            "com.example.models.*",
-            &index,
-        );
+        let result = Orchestrator::resolve_java_import_indexed("com.example.models.*", &index);
         assert_eq!(result.len(), 2, "should find 2 .java files in models/");
         assert!(result.contains(&"com/example/models/User.java".to_string()));
         assert!(result.contains(&"com/example/models/Order.java".to_string()));
@@ -7388,16 +7384,12 @@ mod tests {
 
     #[test]
     fn test_resolve_java_import_indexed_static() {
-        let paths = vec![
-            "com/example/Utils.java".to_string(),
-        ];
+        let paths = vec!["com/example/Utils.java".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // Static import: static com.example.Utils.MAX_VALUE → com/example/Utils.java
-        let result = Orchestrator::resolve_java_import_indexed(
-            "static com.example.Utils.MAX_VALUE",
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_java_import_indexed("static com.example.Utils.MAX_VALUE", &index);
         assert_eq!(result, vec!["com/example/Utils.java"]);
     }
 
@@ -7407,10 +7399,7 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // Package that doesn't exist
-        let result = Orchestrator::resolve_java_import_indexed(
-            "org.missing.Bar",
-            &index,
-        );
+        let result = Orchestrator::resolve_java_import_indexed("org.missing.Bar", &index);
         assert!(result.is_empty());
     }
 
@@ -7424,11 +7413,7 @@ mod tests {
         psr4.insert("App\\".to_string(), "src/".to_string());
 
         // App\Models\User → src/Models/User.php
-        let result = Orchestrator::resolve_php_import_indexed(
-            "App\\Models\\User",
-            &psr4,
-            &index,
-        );
+        let result = Orchestrator::resolve_php_import_indexed("App\\Models\\User", &psr4, &index);
         assert_eq!(result, vec!["src/Models/User.php"]);
     }
 
@@ -7443,11 +7428,8 @@ mod tests {
         psr4.insert("App\\".to_string(), "src/".to_string());
         psr4.insert("Domain\\".to_string(), "lib/domain/".to_string());
 
-        let result = Orchestrator::resolve_php_import_indexed(
-            "Domain\\Entity\\Product",
-            &psr4,
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_php_import_indexed("Domain\\Entity\\Product", &psr4, &index);
         assert_eq!(result, vec!["lib/domain/Entity/Product.php"]);
 
         let result = Orchestrator::resolve_php_import_indexed(
@@ -7468,11 +7450,8 @@ mod tests {
 
         // "App\Sub\Deep\Thing" matches both "App\" and "App\Sub\",
         // longest prefix "App\Sub\" wins → src/Sub/ + Deep/Thing.php
-        let result = Orchestrator::resolve_php_import_indexed(
-            "App\\Sub\\Deep\\Thing",
-            &psr4,
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_php_import_indexed("App\\Sub\\Deep\\Thing", &psr4, &index);
         assert_eq!(result, vec!["src/Sub/Deep/Thing.php"]);
     }
 
@@ -7483,11 +7462,7 @@ mod tests {
         let psr4 = std::collections::HashMap::new(); // empty = no composer.json
 
         // Fallback: direct namespace→path conversion
-        let result = Orchestrator::resolve_php_import_indexed(
-            "Models\\User",
-            &psr4,
-            &index,
-        );
+        let result = Orchestrator::resolve_php_import_indexed("Models\\User", &psr4, &index);
         assert_eq!(result, vec!["Models/User.php"]);
     }
 
@@ -7499,11 +7474,7 @@ mod tests {
         psr4.insert("App\\".to_string(), "src/".to_string());
 
         // Leading backslash (fully qualified) should be stripped
-        let result = Orchestrator::resolve_php_import_indexed(
-            "\\App\\Models\\User",
-            &psr4,
-            &index,
-        );
+        let result = Orchestrator::resolve_php_import_indexed("\\App\\Models\\User", &psr4, &index);
         assert_eq!(result, vec!["src/Models/User.php"]);
     }
 
@@ -7514,11 +7485,7 @@ mod tests {
         let mut psr4 = std::collections::HashMap::new();
         psr4.insert("App\\".to_string(), "src/".to_string());
 
-        let result = Orchestrator::resolve_php_import_indexed(
-            "App\\Missing\\Class",
-            &psr4,
-            &index,
-        );
+        let result = Orchestrator::resolve_php_import_indexed("App\\Missing\\Class", &psr4, &index);
         assert!(result.is_empty());
     }
 
@@ -7534,39 +7501,24 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // #include "utils.h" from src/main.c → relative: src/utils.h
-        let result = Orchestrator::resolve_c_include_indexed(
-            "utils.h",
-            "src/main.c",
-            &[],
-            &index,
-        );
+        let result = Orchestrator::resolve_c_include_indexed("utils.h", "src/main.c", &[], &index);
         assert_eq!(result, vec!["src/utils.h"]);
     }
 
     #[test]
     fn test_resolve_c_include_with_path() {
-        let paths = vec![
-            "src/main.c".to_string(),
-            "src/lib/parser.h".to_string(),
-        ];
+        let paths = vec!["src/main.c".to_string(), "src/lib/parser.h".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // #include "lib/parser.h" from src/main.c → src/lib/parser.h
-        let result = Orchestrator::resolve_c_include_indexed(
-            "lib/parser.h",
-            "src/main.c",
-            &[],
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_c_include_indexed("lib/parser.h", "src/main.c", &[], &index);
         assert_eq!(result, vec!["src/lib/parser.h"]);
     }
 
     #[test]
     fn test_resolve_c_include_via_include_path() {
-        let paths = vec![
-            "src/main.c".to_string(),
-            "include/config.h".to_string(),
-        ];
+        let paths = vec!["src/main.c".to_string(), "include/config.h".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
         let include_paths = vec!["include".to_string()];
 
@@ -7583,27 +7535,17 @@ mod tests {
 
     #[test]
     fn test_resolve_c_include_system_header_ignored() {
-        let paths = vec![
-            "src/main.c".to_string(),
-            "src/utils.h".to_string(),
-        ];
+        let paths = vec!["src/main.c".to_string(), "src/utils.h".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // System header like <stdio.h> — not in project index, returns empty
-        let result = Orchestrator::resolve_c_include_indexed(
-            "stdio.h",
-            "src/main.c",
-            &[],
-            &index,
-        );
+        let result = Orchestrator::resolve_c_include_indexed("stdio.h", "src/main.c", &[], &index);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_resolve_c_include_suffix_fallback() {
-        let paths = vec![
-            "vendor/lib/common.h".to_string(),
-        ];
+        let paths = vec!["vendor/lib/common.h".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // Not relative, not in include paths, but found via suffix index
@@ -7639,10 +7581,8 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // using Services.Auth.TokenService; → direct class file
-        let result = Orchestrator::resolve_csharp_import_indexed(
-            "Services.Auth.TokenService",
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_csharp_import_indexed("Services.Auth.TokenService", &index);
         assert_eq!(result, vec!["Services/Auth/TokenService.cs"]);
     }
 
@@ -7652,10 +7592,8 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // using static Utils.MathHelper.PI → strip member, resolve class
-        let result = Orchestrator::resolve_csharp_import_indexed(
-            "static Utils.MathHelper.PI",
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_csharp_import_indexed("static Utils.MathHelper.PI", &index);
         assert_eq!(result, vec!["Utils/MathHelper.cs"]);
     }
 
@@ -7677,10 +7615,14 @@ mod tests {
         let paths = vec!["System/Console.cs".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_csharp_import_indexed("System.Collections.Generic", &index);
+        let result =
+            Orchestrator::resolve_csharp_import_indexed("System.Collections.Generic", &index);
         assert!(result.is_empty());
 
-        let result = Orchestrator::resolve_csharp_import_indexed("Microsoft.Extensions.DependencyInjection", &index);
+        let result = Orchestrator::resolve_csharp_import_indexed(
+            "Microsoft.Extensions.DependencyInjection",
+            &index,
+        );
         assert!(result.is_empty());
     }
 
@@ -7697,18 +7639,12 @@ mod tests {
 
     #[test]
     fn test_resolve_ruby_require_simple() {
-        let paths = vec![
-            "lib/models/user.rb".to_string(),
-            "lib/utils.rb".to_string(),
-        ];
+        let paths = vec!["lib/models/user.rb".to_string(), "lib/utils.rb".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // require 'models/user' → lib/models/user.rb (lib/ prefix fallback)
-        let result = Orchestrator::resolve_ruby_import_indexed(
-            "models/user",
-            "app/main.rb",
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_ruby_import_indexed("models/user", "app/main.rb", &index);
         assert_eq!(result, vec!["lib/models/user.rb"]);
     }
 
@@ -7721,11 +7657,8 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // require_relative './helper' from app/models/user.rb
-        let result = Orchestrator::resolve_ruby_import_indexed(
-            "./helper",
-            "app/models/user.rb",
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_ruby_import_indexed("./helper", "app/models/user.rb", &index);
         assert_eq!(result, vec!["app/models/helper.rb"]);
     }
 
@@ -7735,11 +7668,7 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // System gem — not in project index
-        let result = Orchestrator::resolve_ruby_import_indexed(
-            "json",
-            "lib/app.rb",
-            &index,
-        );
+        let result = Orchestrator::resolve_ruby_import_indexed("json", "lib/app.rb", &index);
         assert!(result.is_empty());
     }
 
@@ -7749,11 +7678,7 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // require 'config.rb' (explicit extension)
-        let result = Orchestrator::resolve_ruby_import_indexed(
-            "config.rb",
-            "app/main.rb",
-            &index,
-        );
+        let result = Orchestrator::resolve_ruby_import_indexed("config.rb", "app/main.rb", &index);
         assert_eq!(result, vec!["lib/config.rb"]);
     }
 
@@ -7789,10 +7714,7 @@ mod tests {
         ];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_scala_import_indexed(
-            "com.example.{Foo, Bar}",
-            &index,
-        );
+        let result = Orchestrator::resolve_scala_import_indexed("com.example.{Foo, Bar}", &index);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&"com/example/Foo.scala".to_string()));
         assert!(result.contains(&"com/example/Bar.scala".to_string()));
@@ -7804,10 +7726,8 @@ mod tests {
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // Rename: Foo => MyFoo — should resolve Foo
-        let result = Orchestrator::resolve_scala_import_indexed(
-            "com.example.{Foo => MyFoo}",
-            &index,
-        );
+        let result =
+            Orchestrator::resolve_scala_import_indexed("com.example.{Foo => MyFoo}", &index);
         assert_eq!(result, vec!["com/example/Foo.scala"]);
     }
 
@@ -7816,7 +7736,8 @@ mod tests {
         let paths = vec!["scala/collection/List.scala".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_scala_import_indexed("scala.collection.mutable._", &index);
+        let result =
+            Orchestrator::resolve_scala_import_indexed("scala.collection.mutable._", &index);
         assert!(result.is_empty());
 
         let result = Orchestrator::resolve_scala_import_indexed("java.util.List", &index);
@@ -7854,7 +7775,8 @@ mod tests {
         let result = Orchestrator::resolve_kotlin_import_indexed("kotlin.collections.List", &index);
         assert!(result.is_empty());
 
-        let result = Orchestrator::resolve_kotlin_import_indexed("kotlinx.coroutines.launch", &index);
+        let result =
+            Orchestrator::resolve_kotlin_import_indexed("kotlinx.coroutines.launch", &index);
         assert!(result.is_empty());
 
         let result = Orchestrator::resolve_kotlin_import_indexed("android.os.Bundle", &index);
@@ -7865,10 +7787,7 @@ mod tests {
 
     #[test]
     fn test_resolve_zig_import_local() {
-        let paths = vec![
-            "src/main.zig".to_string(),
-            "src/utils.zig".to_string(),
-        ];
+        let paths = vec!["src/main.zig".to_string(), "src/utils.zig".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         let result = Orchestrator::resolve_zig_import_indexed("utils.zig", "src/main.zig", &index);
@@ -7877,13 +7796,11 @@ mod tests {
 
     #[test]
     fn test_resolve_zig_import_subdirectory() {
-        let paths = vec![
-            "src/main.zig".to_string(),
-            "src/lib/parser.zig".to_string(),
-        ];
+        let paths = vec!["src/main.zig".to_string(), "src/lib/parser.zig".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_zig_import_indexed("lib/parser.zig", "src/main.zig", &index);
+        let result =
+            Orchestrator::resolve_zig_import_indexed("lib/parser.zig", "src/main.zig", &index);
         assert_eq!(result, vec!["src/lib/parser.zig"]);
     }
 
@@ -7904,7 +7821,8 @@ mod tests {
         let paths = vec!["src/main.zig".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_zig_import_indexed("nonexistent.zig", "src/main.zig", &index);
+        let result =
+            Orchestrator::resolve_zig_import_indexed("nonexistent.zig", "src/main.zig", &index);
         assert!(result.is_empty());
     }
 
@@ -7979,20 +7897,19 @@ mod tests {
         ];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_bash_import_indexed("./utils.sh", "scripts/main.sh", &index);
+        let result =
+            Orchestrator::resolve_bash_import_indexed("./utils.sh", "scripts/main.sh", &index);
         assert_eq!(result, vec!["scripts/utils.sh"]);
     }
 
     #[test]
     fn test_resolve_bash_dot_source() {
-        let paths = vec![
-            "bin/run.sh".to_string(),
-            "bin/lib/helpers.sh".to_string(),
-        ];
+        let paths = vec!["bin/run.sh".to_string(), "bin/lib/helpers.sh".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
         // `. lib/helpers.sh` from bin/run.sh
-        let result = Orchestrator::resolve_bash_import_indexed("lib/helpers.sh", "bin/run.sh", &index);
+        let result =
+            Orchestrator::resolve_bash_import_indexed("lib/helpers.sh", "bin/run.sh", &index);
         assert_eq!(result, vec!["bin/lib/helpers.sh"]);
     }
 
@@ -8001,7 +7918,8 @@ mod tests {
         let paths = vec!["scripts/lib.sh".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_bash_import_indexed("$HOME/scripts/lib.sh", "main.sh", &index);
+        let result =
+            Orchestrator::resolve_bash_import_indexed("$HOME/scripts/lib.sh", "main.sh", &index);
         assert!(result.is_empty());
 
         let result = Orchestrator::resolve_bash_import_indexed("${DIR}/lib.sh", "main.sh", &index);
@@ -8013,7 +7931,8 @@ mod tests {
         let paths = vec!["scripts/main.sh".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_bash_import_indexed("./missing.sh", "scripts/main.sh", &index);
+        let result =
+            Orchestrator::resolve_bash_import_indexed("./missing.sh", "scripts/main.sh", &index);
         assert!(result.is_empty());
     }
 
@@ -8026,7 +7945,10 @@ mod tests {
         let mut ctx = crate::resolver::ImportResolutionContext::new(&paths);
 
         // Cache miss
-        assert!(ctx.resolve_cache.get("src/main.rs", "crate::api::handlers").is_none());
+        assert!(ctx
+            .resolve_cache
+            .get("src/main.rs", "crate::api::handlers")
+            .is_none());
 
         // Insert + hit
         ctx.resolve_cache.insert(
@@ -8034,7 +7956,10 @@ mod tests {
             "crate::api::handlers".to_string(),
             Some("src/api/handlers.rs".to_string()),
         );
-        assert!(ctx.resolve_cache.get("src/main.rs", "crate::api::handlers").is_some());
+        assert!(ctx
+            .resolve_cache
+            .get("src/main.rs", "crate::api::handlers")
+            .is_some());
 
         // SuffixIndex works
         assert_eq!(
@@ -8093,9 +8018,7 @@ mod tests {
         }];
         let import_rels = vec![];
 
-        let scored = Orchestrator::score_function_calls(
-            &calls, &parsed, &import_rels, None,
-        );
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, None);
 
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].confidence, 0.85);
@@ -8132,9 +8055,7 @@ mod tests {
             1,
         );
 
-        let scored = Orchestrator::score_function_calls(
-            &calls, &parsed, &import_rels, Some(&ctx),
-        );
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, Some(&ctx));
 
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].confidence, 0.90);
@@ -8166,9 +8087,7 @@ mod tests {
             1,
         );
 
-        let scored = Orchestrator::score_function_calls(
-            &calls, &parsed, &import_rels, Some(&ctx),
-        );
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, Some(&ctx));
 
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].confidence, 0.50);
@@ -8208,9 +8127,7 @@ mod tests {
             10,
         );
 
-        let scored = Orchestrator::score_function_calls(
-            &calls, &parsed, &import_rels, Some(&ctx),
-        );
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, Some(&ctx));
 
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].confidence, 0.30);
@@ -8230,13 +8147,9 @@ mod tests {
         }];
         let import_rels = vec![];
 
-        let ctx = crate::resolver::ImportResolutionContext::new(&[
-            "src/lib.rs".to_string(),
-        ]);
+        let ctx = crate::resolver::ImportResolutionContext::new(&["src/lib.rs".to_string()]);
 
-        let scored = Orchestrator::score_function_calls(
-            &calls, &parsed, &import_rels, Some(&ctx),
-        );
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, Some(&ctx));
 
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].confidence, 0.30);
@@ -8256,9 +8169,7 @@ mod tests {
         }];
         let import_rels = vec![];
 
-        let scored = Orchestrator::score_function_calls(
-            &calls, &parsed, &import_rels, None,
-        );
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, None);
 
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].confidence, 0.50);
@@ -8409,9 +8320,10 @@ mod tests {
         }
 
         // Verify specific languages are detected
-        let languages: Vec<String> = entries.iter().map(|e| {
-            e.language.as_str().to_string()
-        }).collect();
+        let languages: Vec<String> = entries
+            .iter()
+            .map(|e| e.language.as_str().to_string())
+            .collect();
         assert!(languages.contains(&"rust".to_string()));
         assert!(languages.contains(&"typescript".to_string()));
         assert!(languages.contains(&"python".to_string()));
@@ -8428,7 +8340,11 @@ mod tests {
 
         // Files in ignored directories
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
-        std::fs::write(root.join("node_modules/pkg/index.js"), "module.exports = {}").unwrap();
+        std::fs::write(
+            root.join("node_modules/pkg/index.js"),
+            "module.exports = {}",
+        )
+        .unwrap();
 
         std::fs::create_dir_all(root.join(".git/objects")).unwrap();
         std::fs::write(root.join(".git/objects/hook.sh"), "#!/bin/bash").unwrap();
@@ -8476,7 +8392,11 @@ mod tests {
         std::fs::write(root.join("Rakefile.rake"), "task :default").unwrap();
 
         let entries = scan_files(root);
-        assert_eq!(entries.len(), 3, "from_extension should match mjs, pyi, rake");
+        assert_eq!(
+            entries.len(),
+            3,
+            "from_extension should match mjs, pyi, rake"
+        );
     }
 
     #[tokio::test]
@@ -8674,7 +8594,7 @@ mod tests {
         let files = vec![FileContent {
             path: "/tmp/f.rs".to_string(),
             content: "x".repeat(2 * 1024 * 1024), // 2MB content
-            size: 100,                              // but size metadata says 100 bytes
+            size: 100,                            // but size metadata says 100 bytes
             language: SupportedLanguage::Rust,
             hash: "h".to_string(),
         }];
@@ -8700,7 +8620,8 @@ mod tests {
                 pub struct User {
                     pub name: String,
                 }
-            "#.to_string(),
+            "#
+            .to_string(),
             size: 100,
             language: SupportedLanguage::Rust,
             hash: "abc123".to_string(),
@@ -8830,16 +8751,34 @@ mod tests {
         let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
 
         // SuffixIndex should find all files
-        assert_eq!(ctx.suffix_index.get("handlers.rs"), Some("src/api/handlers.rs"));
-        assert_eq!(ctx.suffix_index.get("client.rs"), Some("src/neo4j/client.rs"));
+        assert_eq!(
+            ctx.suffix_index.get("handlers.rs"),
+            Some("src/api/handlers.rs")
+        );
+        assert_eq!(
+            ctx.suffix_index.get("client.rs"),
+            Some("src/neo4j/client.rs")
+        );
 
         // SymbolTable starts empty, populated incrementally
         assert_eq!(ctx.symbol_table.stats().total_definitions, 0);
 
         // Simulate populating from parsed files
         use crate::resolver::symbol_table::SymbolType;
-        ctx.symbol_table.add("handle_request", "src/api/handlers.rs::handle_request", "src/api/handlers.rs", SymbolType::Function, 1);
-        ctx.symbol_table.add("query", "src/neo4j/client.rs::query", "src/neo4j/client.rs", SymbolType::Function, 1);
+        ctx.symbol_table.add(
+            "handle_request",
+            "src/api/handlers.rs::handle_request",
+            "src/api/handlers.rs",
+            SymbolType::Function,
+            1,
+        );
+        ctx.symbol_table.add(
+            "query",
+            "src/neo4j/client.rs::query",
+            "src/neo4j/client.rs",
+            SymbolType::Function,
+            1,
+        );
 
         // Now lookups work
         let defs = ctx.symbol_table.lookup_fuzzy("handle_request");
@@ -8908,10 +8847,7 @@ mod tests {
             },
         ];
 
-        let all_paths = vec![
-            "/tmp/batch_a.rs".to_string(),
-            "/tmp/batch_b.rs".to_string(),
-        ];
+        let all_paths = vec!["/tmp/batch_a.rs".to_string(), "/tmp/batch_b.rs".to_string()];
         let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
         ctx.populate_symbols(&parsed_files);
 
@@ -8957,8 +8893,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_files_with_cache_hit() {
-        use crate::parser::SupportedLanguage;
         use crate::parser::ast_cache::AstCache;
+        use crate::parser::SupportedLanguage;
 
         let mut cache = AstCache::new();
 
@@ -8992,8 +8928,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_files_with_cache_miss_on_changed_content() {
-        use crate::parser::SupportedLanguage;
         use crate::parser::ast_cache::AstCache;
+        use crate::parser::SupportedLanguage;
 
         let mut cache = AstCache::new();
 
@@ -9071,7 +9007,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result1.files_synced, 10, "First sync should parse all 10 files");
+        assert_eq!(
+            result1.files_synced, 10,
+            "First sync should parse all 10 files"
+        );
 
         let stats1 = orch.ast_cache_stats().await;
         assert_eq!(stats1.misses, 10, "All 10 files should be cache misses");
@@ -9081,7 +9020,11 @@ mod tests {
         // ── Modify 3 files ─────────────────────────────────────────
         for i in 0..3 {
             let file_path = src_dir.join(format!("file_{}.rs", i));
-            fs::write(&file_path, format!("pub fn func_{}_v2() {{ /* updated */ }}", i)).unwrap();
+            fs::write(
+                &file_path,
+                format!("pub fn func_{}_v2() {{ /* updated */ }}", i),
+            )
+            .unwrap();
         }
 
         // Reset counters to isolate second sync stats
@@ -9093,14 +9036,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result2.files_synced, 10, "All 10 files should be stored (force=true)");
+        assert_eq!(
+            result2.files_synced, 10,
+            "All 10 files should be stored (force=true)"
+        );
 
         let stats2 = orch.ast_cache_stats().await;
         assert_eq!(stats2.hits, 7, "7 unchanged files should be cache hits");
         assert_eq!(stats2.misses, 3, "3 modified files should be cache misses");
         // Cache has 13 entries: 10 original + 3 new (old entries have different hashes
         // and will be evicted naturally via LRU when capacity is reached)
-        assert_eq!(stats2.size, 13, "Cache should hold 10 + 3 entries (old + new hashes)");
+        assert_eq!(
+            stats2.size, 13,
+            "Cache should hold 10 + 3 entries (old + new hashes)"
+        );
     }
 
     #[test]
@@ -9229,11 +9178,9 @@ mod tests {
         std::fs::write(
             root.join("math.rs"),
             "pub fn multiply(a: i32, b: i32) -> i32 { a * b }",
-        ).unwrap();
-        std::fs::write(
-            root.join("utils.py"),
-            "def square(x):\n    return x * x\n",
-        ).unwrap();
+        )
+        .unwrap();
+        std::fs::write(root.join("utils.py"), "def square(x):\n    return x * x\n").unwrap();
         std::fs::write(root.join("readme.md"), "# Skip me").unwrap();
 
         // Phase 1: Scan
@@ -9258,7 +9205,10 @@ mod tests {
         assert!(rs.functions.iter().any(|f| f.name == "multiply"));
 
         // Verify Python file parsed correctly
-        let py = parsed.iter().find(|p| p.path.ends_with("utils.py")).unwrap();
+        let py = parsed
+            .iter()
+            .find(|p| p.path.ends_with("utils.py"))
+            .unwrap();
         assert!(py.functions.iter().any(|f| f.name == "square"));
     }
 
@@ -9280,22 +9230,20 @@ mod tests {
             path: file_path.clone(),
             language: "rust".to_string(),
             hash: "add-test-hash".to_string(),
-            functions: vec![
-                FunctionNode {
-                    name: "handler".to_string(),
-                    visibility: Visibility::Public,
-                    params: vec![],
-                    return_type: Some("Response".to_string()),
-                    generics: vec![],
-                    is_async: true,
-                    is_unsafe: false,
-                    complexity: 3,
-                    file_path: file_path.clone(),
-                    line_start: 10,
-                    line_end: 30,
-                    docstring: Some("Handle request".to_string()),
-                },
-            ],
+            functions: vec![FunctionNode {
+                name: "handler".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: Some("Response".to_string()),
+                generics: vec![],
+                is_async: true,
+                is_unsafe: false,
+                complexity: 3,
+                file_path: file_path.clone(),
+                line_start: 10,
+                line_end: 30,
+                docstring: Some("Handle request".to_string()),
+            }],
             structs: vec![StructNode {
                 name: "Config".to_string(),
                 visibility: Visibility::Public,
@@ -9535,7 +9483,10 @@ mod tests {
         let funcs = neo4j.functions.read().await;
         assert_eq!(funcs.len(), 1, "Should have exactly 1 function");
         let func = funcs.values().next().unwrap();
-        assert_eq!(func.file_path, new_path, "Function should reference new path");
+        assert_eq!(
+            func.file_path, new_path,
+            "Function should reference new path"
+        );
 
         // MeiliSearch: only new file
         let code_docs = meili.code_documents.read().await;
@@ -9604,16 +9555,14 @@ mod tests {
         assert_eq!(neo4j.files.read().await.len(), 60);
 
         // Simulate keeping only 10 files (50 deletions) via delete_stale_files
-        let valid_paths: Vec<String> =
-            (0..10).map(|i| format!("/tmp/bulk-test/src/file_{}.rs", i)).collect();
+        let valid_paths: Vec<String> = (0..10)
+            .map(|i| format!("/tmp/bulk-test/src/file_{}.rs", i))
+            .collect();
 
-        let (files_deleted, _symbols_deleted, stale_paths) = GraphStore::delete_stale_files(
-            neo4j.as_ref(),
-            project_id,
-            &valid_paths,
-        )
-        .await
-        .unwrap();
+        let (files_deleted, _symbols_deleted, stale_paths) =
+            GraphStore::delete_stale_files(neo4j.as_ref(), project_id, &valid_paths)
+                .await
+                .unwrap();
 
         assert_eq!(files_deleted, 50, "Should delete 50 stale files");
         assert_eq!(stale_paths.len(), 50, "Should return 50 deleted paths");
@@ -9743,10 +9692,7 @@ mod tests {
 
         // file_b should have 2 functions now
         let funcs = neo4j.functions.read().await;
-        let file_b_funcs: Vec<_> = funcs
-            .values()
-            .filter(|f| f.file_path == file_b)
-            .collect();
+        let file_b_funcs: Vec<_> = funcs.values().filter(|f| f.file_path == file_b).collect();
         assert_eq!(file_b_funcs.len(), 2, "file_b should have 2 functions");
 
         // MeiliSearch: only file_b
@@ -9920,7 +9866,10 @@ mod tests {
 
         // Verify deleted file is not in results
         let phantom = code_docs.iter().find(|d| d.path == deleted_path);
-        assert!(phantom.is_none(), "Deleted file should not be in MeiliSearch");
+        assert!(
+            phantom.is_none(),
+            "Deleted file should not be in MeiliSearch"
+        );
 
         // Verify remaining files are correct
         let paths: Vec<&str> = code_docs.iter().map(|d| d.path.as_str()).collect();
@@ -9998,8 +9947,13 @@ mod tests {
             let file_path = format!("{}/file_{}.rs", file_base, file_idx);
             let calls: Vec<FunctionCall> = (0..100)
                 .map(|func_idx| {
-                    let caller_id =
-                        format!("{}:func_{}_{}:{}", file_path, file_idx, func_idx, func_idx * 10 + 1);
+                    let caller_id = format!(
+                        "{}:func_{}_{}:{}",
+                        file_path,
+                        file_idx,
+                        func_idx,
+                        func_idx * 10 + 1
+                    );
                     let callee_name = format!("func_{}_{}", file_idx, (func_idx + 1) % 100);
                     FunctionCall {
                         caller_id,
@@ -10231,11 +10185,23 @@ mod tests {
         // Verify EXTENDS relationships
         let cr = mock_store.call_relationships.read().await;
 
-        let dog_extends = cr.get("extends:Dog").expect("Dog should have an extends edge");
-        assert_eq!(dog_extends, &vec!["Animal".to_string()], "Dog extends Animal");
+        let dog_extends = cr
+            .get("extends:Dog")
+            .expect("Dog should have an extends edge");
+        assert_eq!(
+            dog_extends,
+            &vec!["Animal".to_string()],
+            "Dog extends Animal"
+        );
 
-        let cat_extends = cr.get("extends:Cat").expect("Cat should have an extends edge");
-        assert_eq!(cat_extends, &vec!["Animal".to_string()], "Cat extends Animal");
+        let cat_extends = cr
+            .get("extends:Cat")
+            .expect("Cat should have an extends edge");
+        assert_eq!(
+            cat_extends,
+            &vec!["Animal".to_string()],
+            "Cat extends Animal"
+        );
 
         assert!(
             cr.get("extends:Animal").is_none(),

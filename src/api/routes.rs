@@ -530,10 +530,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/class-hierarchy",
             get(code_handlers::get_class_hierarchy),
         )
-        .route(
-            "/api/code/subclasses",
-            get(code_handlers::find_subclasses),
-        )
+        .route("/api/code/subclasses", get(code_handlers::find_subclasses))
         .route(
             "/api/code/interface-implementors",
             get(code_handlers::find_interface_implementors),
@@ -545,10 +542,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/processes/detect",
             get(code_handlers::detect_processes),
         )
-        .route(
-            "/api/code/processes",
-            get(code_handlers::list_processes),
-        )
+        .route("/api/code/processes", get(code_handlers::list_processes))
         .route(
             "/api/code/processes/detail",
             get(code_handlers::get_process_detail),
