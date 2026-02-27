@@ -95,10 +95,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 dirs = "6"
 regex = "1.12.3"
 
-# Unix process signaling (SIGINT to process group for interrupt)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # NATS message broker (inter-process event sync)
 async-nats = "0.39"
 
@@ -120,6 +116,10 @@ fastembed = "5.11"
 # avoiding cross-compilation conflicts between host and target libssl-dev packages.
 # Only activated for cross-compiled builds (e.g. aarch64-unknown-linux-gnu).
 openssl-sys = { version = "0.9", optional = true, features = ["vendored"] }
+
+# Unix process signaling (SIGINT to process group for interrupt)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = []
