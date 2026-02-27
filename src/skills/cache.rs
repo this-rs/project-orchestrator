@@ -232,10 +232,7 @@ impl SkillCache {
 
     /// Evict the oldest entry to make room for a new one.
     fn evict_oldest(&self, entries: &mut HashMap<Uuid, CacheEntry>) {
-        if let Some((&oldest_key, _)) = entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.cached_at)
-        {
+        if let Some((&oldest_key, _)) = entries.iter().min_by_key(|(_, entry)| entry.cached_at) {
             entries.remove(&oldest_key);
         }
     }
@@ -356,7 +353,10 @@ mod tests {
     async fn test_cache_hit_after_insert() {
         let cache = SkillCache::new();
         let project_id = Uuid::new_v4();
-        let skills = vec![make_test_skill("Neo4j", vec![(TriggerType::Regex, "neo4j")])];
+        let skills = vec![make_test_skill(
+            "Neo4j",
+            vec![(TriggerType::Regex, "neo4j")],
+        )];
 
         cache.insert(project_id, skills).await;
         let result = cache.get(&project_id).await;
@@ -404,10 +404,16 @@ mod tests {
         let p2 = Uuid::new_v4();
 
         cache
-            .insert(p1, vec![make_test_skill("S1", vec![(TriggerType::Regex, "a")])])
+            .insert(
+                p1,
+                vec![make_test_skill("S1", vec![(TriggerType::Regex, "a")])],
+            )
             .await;
         cache
-            .insert(p2, vec![make_test_skill("S2", vec![(TriggerType::Regex, "b")])])
+            .insert(
+                p2,
+                vec![make_test_skill("S2", vec![(TriggerType::Regex, "b")])],
+            )
             .await;
 
         cache.invalidate_all().await;
@@ -468,7 +474,10 @@ mod tests {
         let cached = CachedSkill::from_skill(skill);
 
         assert_eq!(cached.compiled_triggers.len(), 1);
-        assert!(matches!(&cached.compiled_triggers[0].0, CompiledTrigger::Regex(_)));
+        assert!(matches!(
+            &cached.compiled_triggers[0].0,
+            CompiledTrigger::Regex(_)
+        ));
     }
 
     #[test]
@@ -531,7 +540,8 @@ mod tests {
         let cached = CachedSkill::from_skill(skill);
 
         // Regex matches, glob doesn't
-        let confidence = evaluate_cached_skill(&cached, Some("neo4j_query"), Some("src/api/test.rs"));
+        let confidence =
+            evaluate_cached_skill(&cached, Some("neo4j_query"), Some("src/api/test.rs"));
         assert!((confidence - 1.0).abs() < f64::EPSILON);
     }
 

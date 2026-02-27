@@ -27,14 +27,12 @@ use std::sync::LazyLock;
 // because single-pass regex can't handle flags with values (e.g., --type rust).
 
 /// Matches: find ... -name "pattern" or find ... -name pattern
-static FIND_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"-name\s+['""]?([^'""\s]+)['""]?"#).unwrap()
-});
+static FIND_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"-name\s+['""]?([^'""\s]+)['""]?"#).unwrap());
 
 /// Matches: cargo test [flags] pattern (last non-flag argument)
-static CARGO_TEST_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:^|\s)cargo\s+test\s+(?:-\S+\s+)*(\S+)"#).unwrap()
-});
+static CARGO_TEST_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:^|\s)cargo\s+test\s+(?:-\S+\s+)*(\S+)"#).unwrap());
 
 // ============================================================================
 // Public API
@@ -67,9 +65,15 @@ static CARGO_TEST_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// ```
 pub fn extract_pattern(tool_name: &str, tool_input: &serde_json::Value) -> Option<String> {
     match tool_name {
-        "Grep" => tool_input.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        "Grep" => tool_input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
 
-        "Glob" => tool_input.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        "Glob" => tool_input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
 
         "Read" => tool_input
             .get("file_path")
@@ -136,20 +140,55 @@ pub fn extract_file_context(tool_name: &str, tool_input: &serde_json::Value) -> 
 /// Known rg flags that take a value argument.
 /// When we see `--type rust`, `rust` is a flag value, not the pattern.
 const RG_FLAGS_WITH_VALUES: &[&str] = &[
-    "--type", "-t", "--glob", "-g", "--max-count", "-m", "--max-depth",
-    "--threads", "-j", "--color", "--colors", "--encoding", "-E",
-    "--replace", "-r", "--context", "-C", "--after-context", "-A",
-    "--before-context", "-B", "--max-filesize", "--type-add",
-    "--type-not", "-T", "--file", "-f",
+    "--type",
+    "-t",
+    "--glob",
+    "-g",
+    "--max-count",
+    "-m",
+    "--max-depth",
+    "--threads",
+    "-j",
+    "--color",
+    "--colors",
+    "--encoding",
+    "-E",
+    "--replace",
+    "-r",
+    "--context",
+    "-C",
+    "--after-context",
+    "-A",
+    "--before-context",
+    "-B",
+    "--max-filesize",
+    "--type-add",
+    "--type-not",
+    "-T",
+    "--file",
+    "-f",
 ];
 
 /// Known grep flags that take a value argument.
 /// Note: `-r` in grep means --recursive (no value), unlike rg where it means --replace.
 const GREP_FLAGS_WITH_VALUES: &[&str] = &[
-    "--include", "--exclude", "--exclude-dir", "--label",
-    "--max-count", "-m", "--context", "-C", "--after-context", "-A",
-    "--before-context", "-B", "--color", "--file", "-f",
-    "-e", "--regexp",
+    "--include",
+    "--exclude",
+    "--exclude-dir",
+    "--label",
+    "--max-count",
+    "-m",
+    "--context",
+    "-C",
+    "--after-context",
+    "-A",
+    "--before-context",
+    "-B",
+    "--color",
+    "--file",
+    "-f",
+    "-e",
+    "--regexp",
 ];
 
 /// Extract a search pattern from a Bash command.
@@ -189,7 +228,11 @@ fn extract_bash_pattern(tool_input: &serde_json::Value) -> Option<String> {
 ///
 /// Handles flags with values correctly (e.g., `--type rust` skips `rust`).
 /// Returns the first non-flag, non-flag-value token as the pattern.
-fn extract_rg_grep_pattern(command: &str, tool: &str, flags_with_values: &[&str]) -> Option<String> {
+fn extract_rg_grep_pattern(
+    command: &str,
+    tool: &str,
+    flags_with_values: &[&str],
+) -> Option<String> {
     let tokens = tokenize_command(command);
 
     // Find the tool position
@@ -287,8 +330,7 @@ fn extract_bash_file_context(tool_input: &serde_json::Value) -> Option<String> {
     }
 
     // For `cat`, `head`, `tail` commands, extract the file path
-    if command.starts_with("cat ") || command.starts_with("head ") || command.starts_with("tail ")
-    {
+    if command.starts_with("cat ") || command.starts_with("head ") || command.starts_with("tail ") {
         let parts: Vec<&str> = command.split_whitespace().collect();
         // Last non-flag argument
         for part in parts.iter().rev() {
@@ -338,10 +380,7 @@ mod tests {
     #[test]
     fn test_extract_pattern_glob() {
         let input = json!({"pattern": "**/*.rs", "path": "src/"});
-        assert_eq!(
-            extract_pattern("Glob", &input),
-            Some("**/*.rs".to_string())
-        );
+        assert_eq!(extract_pattern("Glob", &input), Some("**/*.rs".to_string()));
     }
 
     #[test]
@@ -418,10 +457,7 @@ mod tests {
     #[test]
     fn test_extract_pattern_bash_grep() {
         let input = json!({"command": "grep -r 'pattern' ."});
-        assert_eq!(
-            extract_pattern("Bash", &input),
-            Some("pattern".to_string())
-        );
+        assert_eq!(extract_pattern("Bash", &input), Some("pattern".to_string()));
     }
 
     #[test]
@@ -496,7 +532,8 @@ mod tests {
 
     #[test]
     fn test_extract_file_context_edit() {
-        let input = json!({"file_path": "src/neo4j/client.rs", "old_string": "a", "new_string": "b"});
+        let input =
+            json!({"file_path": "src/neo4j/client.rs", "old_string": "a", "new_string": "b"});
         assert_eq!(
             extract_file_context("Edit", &input),
             Some("src/neo4j/client.rs".to_string())

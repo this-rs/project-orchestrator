@@ -109,7 +109,9 @@ fn find_common_glob_patterns(paths: &[&str]) -> Vec<(String, f64)> {
     let mut covered = std::collections::HashSet::new();
     for (prefix, coverage) in candidates {
         // Skip if a more specific prefix already covers these paths
-        let dominated = results.iter().any(|(existing, _)| existing.starts_with(&prefix));
+        let dominated = results
+            .iter()
+            .any(|(existing, _)| existing.starts_with(&prefix));
         if dominated {
             continue;
         }
@@ -136,18 +138,17 @@ fn find_common_glob_patterns(paths: &[&str]) -> Vec<(String, f64)> {
 /// Common English stop words to filter out from content analysis.
 const STOP_WORDS: &[&str] = &[
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
-    "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through",
-    "during", "before", "after", "above", "below", "between", "out", "off", "over", "under",
-    "and", "but", "or", "nor", "not", "so", "yet", "both", "either", "neither",
-    "this", "that", "these", "those", "it", "its", "they", "them", "their", "we", "our",
-    "you", "your", "he", "she", "him", "her", "his", "i", "me", "my",
-    "if", "then", "else", "when", "where", "how", "what", "which", "who", "whom",
-    "all", "each", "every", "any", "some", "no", "more", "most", "other", "such",
-    "only", "very", "just", "also", "than", "too", "here", "there", "now",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can", "to",
+    "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through", "during",
+    "before", "after", "above", "below", "between", "out", "off", "over", "under", "and", "but",
+    "or", "nor", "not", "so", "yet", "both", "either", "neither", "this", "that", "these", "those",
+    "it", "its", "they", "them", "their", "we", "our", "you", "your", "he", "she", "him", "her",
+    "his", "i", "me", "my", "if", "then", "else", "when", "where", "how", "what", "which", "who",
+    "whom", "all", "each", "every", "any", "some", "no", "more", "most", "other", "such", "only",
+    "very", "just", "also", "than", "too", "here", "there", "now",
     // Common technical stop words
-    "use", "used", "using", "new", "get", "set", "add", "update", "delete", "create",
-    "file", "function", "method", "class", "type", "value", "data", "note", "notes",
+    "use", "used", "using", "new", "get", "set", "add", "update", "delete", "create", "file",
+    "function", "method", "class", "type", "value", "data", "note", "notes",
 ];
 
 /// Generate Regex triggers from tag frequencies and content keywords.
@@ -260,7 +261,11 @@ fn extract_content_keywords(notes: &[Note], top_n: usize) -> Vec<String> {
 
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    scored.into_iter().take(top_n).map(|(term, _)| term).collect()
+    scored
+        .into_iter()
+        .take(top_n)
+        .map(|(term, _)| term)
+        .collect()
 }
 
 /// Tokenize text into lowercase words, filtering stop words and short tokens.
@@ -276,7 +281,9 @@ fn tokenize(text: &str) -> Vec<String> {
 
 /// Escape special regex characters in a string.
 fn regex_escape(s: &str) -> String {
-    let special = ['\\', '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$'];
+    let special = [
+        '\\', '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$',
+    ];
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
         if special.contains(&c) {
@@ -363,8 +370,12 @@ pub fn evaluate_trigger_quality(
     all_project_notes: &[Note],
 ) -> Option<f64> {
     match trigger.pattern_type {
-        TriggerType::Regex => evaluate_regex_quality(&trigger.pattern_value, skill_notes, all_project_notes),
-        TriggerType::FileGlob => evaluate_file_glob_quality(&trigger.pattern_value, skill_notes, all_project_notes),
+        TriggerType::Regex => {
+            evaluate_regex_quality(&trigger.pattern_value, skill_notes, all_project_notes)
+        }
+        TriggerType::FileGlob => {
+            evaluate_file_glob_quality(&trigger.pattern_value, skill_notes, all_project_notes)
+        }
         TriggerType::Semantic => None, // Semantic triggers are evaluated at activation time
     }
 }
@@ -538,11 +549,7 @@ mod tests {
     use crate::notes::{NoteAnchor, NoteImportance, NoteScope, NoteStatus, NoteType};
     use chrono::Utc;
 
-    fn make_note_with_anchors(
-        tags: Vec<&str>,
-        content: &str,
-        anchors: Vec<NoteAnchor>,
-    ) -> Note {
+    fn make_note_with_anchors(tags: Vec<&str>, content: &str, anchors: Vec<NoteAnchor>) -> Note {
         Note {
             id: uuid::Uuid::new_v4(),
             project_id: Some(uuid::Uuid::nil()),
@@ -612,7 +619,11 @@ mod tests {
 
     #[test]
     fn test_file_glob_no_anchors() {
-        let notes = vec![make_note_with_anchors(vec!["test"], "No file anchors", vec![])];
+        let notes = vec![make_note_with_anchors(
+            vec!["test"],
+            "No file anchors",
+            vec![],
+        )];
 
         let triggers = generate_file_glob_triggers(&notes);
         assert!(triggers.is_empty());
@@ -640,7 +651,11 @@ mod tests {
     #[test]
     fn test_regex_from_tags() {
         let notes = vec![
-            make_note_with_anchors(vec!["neo4j", "cypher", "query"], "Neo4j query patterns", vec![]),
+            make_note_with_anchors(
+                vec!["neo4j", "cypher", "query"],
+                "Neo4j query patterns",
+                vec![],
+            ),
             make_note_with_anchors(vec!["neo4j", "index"], "Neo4j indexing tips", vec![]),
             make_note_with_anchors(vec!["cypher", "perf"], "Cypher performance", vec![]),
         ];
@@ -709,14 +724,8 @@ mod tests {
     #[test]
     fn test_semantic_trigger_centroid() {
         let mut embeddings = HashMap::new();
-        embeddings.insert(
-            "note-1".to_string(),
-            vec![1.0, 0.0, 0.0],
-        );
-        embeddings.insert(
-            "note-2".to_string(),
-            vec![0.0, 1.0, 0.0],
-        );
+        embeddings.insert("note-1".to_string(), vec![1.0, 0.0, 0.0]);
+        embeddings.insert("note-2".to_string(), vec![0.0, 1.0, 0.0]);
 
         let trigger = generate_semantic_trigger(&embeddings, 0.75);
         assert!(trigger.is_some());
@@ -729,7 +738,10 @@ mod tests {
         let centroid: Vec<f64> = serde_json::from_str(&t.pattern_value).unwrap();
         assert_eq!(centroid.len(), 3);
         // After normalization: [0.5, 0.5, 0.0] / sqrt(0.5) ≈ [0.707, 0.707, 0.0]
-        assert!((centroid[0] - centroid[1]).abs() < 0.01, "x and y should be equal");
+        assert!(
+            (centroid[0] - centroid[1]).abs() < 0.01,
+            "x and y should be equal"
+        );
         assert!(centroid[2].abs() < 0.01, "z should be ~0");
     }
 
@@ -777,10 +789,7 @@ mod tests {
             result.file_glob_count >= 1,
             "Expected at least 1 FileGlob trigger"
         );
-        assert!(
-            result.regex_count >= 1,
-            "Expected at least 1 Regex trigger"
-        );
+        assert!(result.regex_count >= 1, "Expected at least 1 Regex trigger");
         assert_eq!(result.semantic_count, 0, "No embeddings → no semantic");
         assert!(
             result.triggers.len() >= 2,
@@ -824,7 +833,11 @@ mod tests {
 
         // P=3/3=1.0, R=3/3=1.0, F1=1.0
         assert!(quality.is_some());
-        assert!(quality.unwrap() > 0.9, "Expected high F1, got {:?}", quality);
+        assert!(
+            quality.unwrap() > 0.9,
+            "Expected high F1, got {:?}",
+            quality
+        );
     }
 
     #[test]
@@ -899,14 +912,21 @@ mod tests {
 
         // P=2/2=1.0, R=2/2=1.0, F1=1.0
         assert!(quality.is_some());
-        assert!(quality.unwrap() > 0.9, "Expected high F1, got {:?}", quality);
+        assert!(
+            quality.unwrap() > 0.9,
+            "Expected high F1, got {:?}",
+            quality
+        );
     }
 
     #[test]
     fn test_semantic_trigger_no_quality() {
         let trigger = SkillTrigger::semantic("[0.1, 0.2]", 0.75);
         let quality = evaluate_trigger_quality(&trigger, &[], &[]);
-        assert!(quality.is_none(), "Semantic triggers should have no quality score");
+        assert!(
+            quality.is_none(),
+            "Semantic triggers should have no quality score"
+        );
     }
 
     #[test]

@@ -145,11 +145,8 @@ fn make_pre_tool_use_input(tool_name: &str, tool_input: Value) -> String {
 fn test_cjs_hook_invalid_json_input() {
     // Invalid JSON on stdin → should exit 0 without crash
     let dir = create_temp_project_dir(19999);
-    let (exit_code, stdout, stderr) = run_cjs_hook(
-        "this is not json {{{",
-        dir.path(),
-        Duration::from_secs(5),
-    );
+    let (exit_code, stdout, stderr) =
+        run_cjs_hook("this is not json {{{", dir.path(), Duration::from_secs(5));
 
     assert_eq!(exit_code, 0, "Hook should exit 0 on invalid input");
     assert!(
@@ -164,14 +161,10 @@ fn test_cjs_hook_invalid_json_input() {
 fn test_cjs_hook_empty_stdin() {
     // Empty stdin → should exit 0 without crash
     let dir = create_temp_project_dir(19999);
-    let (exit_code, stdout, _stderr) =
-        run_cjs_hook("", dir.path(), Duration::from_secs(5));
+    let (exit_code, stdout, _stderr) = run_cjs_hook("", dir.path(), Duration::from_secs(5));
 
     assert_eq!(exit_code, 0, "Hook should exit 0 on empty stdin");
-    assert!(
-        stdout.trim().is_empty(),
-        "No stdout output on empty stdin"
-    );
+    assert!(stdout.trim().is_empty(), "No stdout output on empty stdin");
 }
 
 #[test]
@@ -180,14 +173,10 @@ fn test_cjs_hook_no_po_config() {
     let dir = tempfile::tempdir().expect("Failed to create temp dir");
     // No .po-config created!
     let input = make_pre_tool_use_input("Grep", json!({"pattern": "test"}));
-    let (exit_code, stdout, stderr) =
-        run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+    let (exit_code, stdout, stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
 
     assert_eq!(exit_code, 0, "Hook should exit 0 when no .po-config found");
-    assert!(
-        stdout.trim().is_empty(),
-        "No stdout output when no config"
-    );
+    assert!(stdout.trim().is_empty(), "No stdout output when no config");
     assert!(
         stderr.contains("No .po-config") || stderr.contains("no .po-config") || stderr.is_empty(),
         "Debug should mention missing config"
@@ -199,8 +188,7 @@ fn test_cjs_hook_non_activatable_tool() {
     // Tool not in ACTIVATABLE_TOOLS → should ignore and exit 0
     let dir = create_temp_project_dir(19999);
     let input = make_pre_tool_use_input("WebSearch", json!({"query": "test"}));
-    let (exit_code, stdout, stderr) =
-        run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+    let (exit_code, stdout, stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
 
     assert_eq!(exit_code, 0, "Hook should exit 0 for non-activatable tool");
     assert!(
@@ -224,8 +212,7 @@ fn test_cjs_hook_wrong_event_type() {
     })
     .to_string();
 
-    let (exit_code, stdout, _stderr) =
-        run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+    let (exit_code, stdout, _stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
 
     assert_eq!(exit_code, 0, "Hook should exit 0 for wrong event type");
     assert!(stdout.trim().is_empty(), "No stdout for wrong event type");
@@ -238,8 +225,7 @@ fn test_cjs_hook_server_down_fast_timeout() {
     let input = make_pre_tool_use_input("Grep", json!({"pattern": "neo4j query"}));
 
     let start = Instant::now();
-    let (exit_code, stdout, _stderr) =
-        run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+    let (exit_code, stdout, _stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
     let elapsed = start.elapsed();
 
     assert_eq!(exit_code, 0, "Hook should exit 0 when server is down");
@@ -310,8 +296,7 @@ fn test_cjs_hook_match_success_with_mock() {
     let dir = create_temp_project_dir(port);
     let input = make_pre_tool_use_input("Grep", json!({"pattern": "neo4j query optimization"}));
 
-    let (exit_code, stdout, stderr) =
-        run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+    let (exit_code, stdout, stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
 
     eprintln!("  Mock test stderr: {}", stderr.trim());
 
@@ -323,8 +308,7 @@ fn test_cjs_hook_match_success_with_mock() {
         "stdout should contain hook output"
     );
 
-    let output: Value =
-        serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON");
+    let output: Value = serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON");
     assert!(
         output["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -363,8 +347,7 @@ fn test_cjs_hook_no_match_204_with_mock() {
     let dir = create_temp_project_dir(port);
     let input = make_pre_tool_use_input("Grep", json!({"pattern": "unrelated pattern xyz"}));
 
-    let (exit_code, stdout, _stderr) =
-        run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+    let (exit_code, stdout, _stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
 
     assert_eq!(exit_code, 0, "Hook should exit 0 on 204");
     assert!(
@@ -412,10 +395,7 @@ fn test_session_start_hook_server_down() {
     let elapsed = start.elapsed();
 
     assert_eq!(exit_code, 0, "Session hook should exit 0 when server down");
-    assert!(
-        stdout.trim().is_empty(),
-        "No stdout when server is down"
-    );
+    assert!(stdout.trim().is_empty(), "No stdout when server is down");
     // curl has a 2s connect timeout, so total should be < 5s
     assert!(
         elapsed < Duration::from_secs(6),
@@ -492,8 +472,7 @@ fn test_session_start_hook_with_mock() {
     );
 
     // Parse the JSON output
-    let output: Value =
-        serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON");
+    let output: Value = serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON");
     let ctx = output["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("Should have additionalContext");
@@ -541,9 +520,7 @@ fn spawn_counted_mock(
     let skill_id = skill_id.to_string();
 
     // Set accept timeout so the thread doesn't hang forever
-    listener
-        .set_nonblocking(false)
-        .expect("set blocking");
+    listener.set_nonblocking(false).expect("set blocking");
 
     let handle = std::thread::spawn(move || {
         let mut served = 0;
@@ -555,9 +532,7 @@ fn spawn_counted_mock(
             };
             let mut stream = stream;
             use std::io::{Read, Write};
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .ok();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
             let mut buf = vec![0u8; 4096];
             let _ = stream.read(&mut buf);
 
@@ -570,7 +545,8 @@ fn spawn_counted_mock(
             let body_str = serde_json::to_string(&body).unwrap();
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body_str.len(), body_str
+                body_str.len(),
+                body_str
             );
             let _ = stream.write_all(resp.as_bytes());
             let _ = stream.flush();
@@ -618,11 +594,13 @@ fn test_cjs_hook_cache_file_created_on_success() {
         hook_cache_file
     );
 
-    let cache_content =
-        std::fs::read_to_string(&hook_cache_file).expect("read cache file");
+    let cache_content = std::fs::read_to_string(&hook_cache_file).expect("read cache file");
     let cache: Value = serde_json::from_str(&cache_content).expect("parse cache JSON");
 
-    assert_eq!(cache["ppid"], our_pid as u64, "Cache ppid should match our PID");
+    assert_eq!(
+        cache["ppid"], our_pid as u64,
+        "Cache ppid should match our PID"
+    );
     assert_eq!(cache["global_count"], 1, "Should have 1 injection recorded");
     assert!(cache["entries"].is_object(), "Should have entries object");
 
@@ -665,8 +643,7 @@ fn test_cjs_hook_global_throttle() {
     // Now run the hook — it should see the global throttle and exit silently
     // even though the server is down (it shouldn't even try to call it)
     let input = make_pre_tool_use_input("Grep", json!({"pattern": "throttled"}));
-    let (exit_code, stdout, stderr) =
-        run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
+    let (exit_code, stdout, stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
 
     assert_eq!(exit_code, 0);
     assert!(

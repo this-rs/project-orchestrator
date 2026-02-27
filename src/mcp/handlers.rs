@@ -1886,10 +1886,7 @@ impl ToolHandler {
                     "project_id".to_string(),
                     json!(extract_string(args, "project_id")?),
                 );
-                body.insert(
-                    "cwd".to_string(),
-                    json!(extract_string(args, "cwd")?),
-                );
+                body.insert("cwd".to_string(), json!(extract_string(args, "cwd")?));
                 if let Some(port) = args.get("port").and_then(|v| v.as_u64()) {
                     body.insert("port".to_string(), json!(port));
                 }
@@ -3022,7 +3019,6 @@ impl ToolHandler {
             }
 
             // ── P10: Skills (9 tools) ──────────────────────────────────
-
             "list_skills" => {
                 let project_id = extract_id(args, "project_id")?;
                 let mut query = vec![("project_id".to_string(), project_id)];
@@ -3078,19 +3074,14 @@ impl ToolHandler {
                     body.insert("cohesion".to_string(), v.clone());
                 }
                 let result = http
-                    .put(
-                        &format!("/api/skills/{}", skill_id),
-                        &Value::Object(body),
-                    )
+                    .put(&format!("/api/skills/{}", skill_id), &Value::Object(body))
                     .await?;
                 Ok(Some(result))
             }
 
             "delete_skill" => {
                 let skill_id = extract_id(args, "skill_id")?;
-                let result = http
-                    .delete(&format!("/api/skills/{}", skill_id))
-                    .await?;
+                let result = http.delete(&format!("/api/skills/{}", skill_id)).await?;
                 Ok(Some(if result.is_null() {
                     json!({"deleted": true})
                 } else {

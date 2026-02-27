@@ -5,9 +5,7 @@
 //! connected notes becomes a candidate skill.
 
 use crate::graph::algorithms::{compute_cohesion, louvain_communities};
-use crate::graph::{
-    AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType,
-};
+use crate::graph::{AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -128,10 +126,7 @@ pub fn cluster_to_skill(
     let coverage = candidate.size as i64;
 
     // Collect all unique tags from member notes
-    let mut all_tags: Vec<String> = notes
-        .iter()
-        .flat_map(|n| n.tags.iter().cloned())
-        .collect();
+    let mut all_tags: Vec<String> = notes.iter().flat_map(|n| n.tags.iter().cloned()).collect();
     all_tags.sort();
     all_tags.dedup();
 
@@ -330,10 +325,7 @@ pub async fn persist_detected_skills(
 ///
 /// Each note becomes a node (CodeNodeType::Function as proxy), and each
 /// SYNAPSE edge becomes a weighted edge. The graph is ready for `louvain_communities()`.
-pub fn build_synapse_graph(
-    edges: &[(String, String, f64)],
-    project_id: &str,
-) -> CodeGraph {
+pub fn build_synapse_graph(edges: &[(String, String, f64)], project_id: &str) -> CodeGraph {
     // Collect unique note IDs
     let mut note_ids: Vec<&str> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -841,7 +833,12 @@ mod tests {
     // cluster_to_skill tests
     // ================================================================
 
-    fn make_test_note(id: &str, energy: f64, importance: crate::notes::NoteImportance, tags: Vec<&str>) -> crate::notes::Note {
+    fn make_test_note(
+        id: &str,
+        energy: f64,
+        importance: crate::notes::NoteImportance,
+        tags: Vec<&str>,
+    ) -> crate::notes::Note {
         use chrono::Utc;
         crate::notes::Note {
             id: uuid::Uuid::parse_str(id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
@@ -879,14 +876,28 @@ mod tests {
         };
 
         let notes = vec![
-            make_test_note("00000000-0000-0000-0000-000000000001", 1.0, crate::notes::NoteImportance::Critical, vec!["api"]),
-            make_test_note("00000000-0000-0000-0000-000000000002", 0.2, crate::notes::NoteImportance::Low, vec!["api"]),
+            make_test_note(
+                "00000000-0000-0000-0000-000000000001",
+                1.0,
+                crate::notes::NoteImportance::Critical,
+                vec!["api"],
+            ),
+            make_test_note(
+                "00000000-0000-0000-0000-000000000002",
+                0.2,
+                crate::notes::NoteImportance::Low,
+                vec!["api"],
+            ),
         ];
 
         let skill = cluster_to_skill(&candidate, &notes, uuid::Uuid::nil(), 10);
         // Critical weight=1.0, Low weight=0.3
         // weighted = (1.0*1.0 + 0.2*0.3) / (1.0+0.3) = 1.06/1.3 ≈ 0.815
-        assert!(skill.energy > 0.7, "Energy should be weighted towards critical note, got {}", skill.energy);
+        assert!(
+            skill.energy > 0.7,
+            "Energy should be weighted towards critical note, got {}",
+            skill.energy
+        );
         assert_eq!(skill.cohesion, 0.8);
         assert_eq!(skill.coverage, 2); // 2 notes in cluster
     }
@@ -902,13 +913,32 @@ mod tests {
         };
 
         let notes = vec![
-            make_test_note("00000000-0000-0000-0000-000000000001", 0.5, crate::notes::NoteImportance::Medium, vec!["neo4j", "cypher"]),
-            make_test_note("00000000-0000-0000-0000-000000000002", 0.5, crate::notes::NoteImportance::Medium, vec!["neo4j", "graph"]),
-            make_test_note("00000000-0000-0000-0000-000000000003", 0.5, crate::notes::NoteImportance::Medium, vec!["neo4j"]),
+            make_test_note(
+                "00000000-0000-0000-0000-000000000001",
+                0.5,
+                crate::notes::NoteImportance::Medium,
+                vec!["neo4j", "cypher"],
+            ),
+            make_test_note(
+                "00000000-0000-0000-0000-000000000002",
+                0.5,
+                crate::notes::NoteImportance::Medium,
+                vec!["neo4j", "graph"],
+            ),
+            make_test_note(
+                "00000000-0000-0000-0000-000000000003",
+                0.5,
+                crate::notes::NoteImportance::Medium,
+                vec!["neo4j"],
+            ),
         ];
 
         let skill = cluster_to_skill(&candidate, &notes, uuid::Uuid::nil(), 10);
-        assert!(skill.name.contains("Neo4j"), "Expected 'Neo4j' in skill name '{}'" , skill.name);
+        assert!(
+            skill.name.contains("Neo4j"),
+            "Expected 'Neo4j' in skill name '{}'",
+            skill.name
+        );
     }
 
     // ================================================================
@@ -949,15 +979,13 @@ mod tests {
 
     #[test]
     fn test_deduplicate_no_existing_skills() {
-        let candidates = vec![
-            SkillCandidate {
-                community_id: 0,
-                member_note_ids: vec!["a".into(), "b".into(), "c".into()],
-                cohesion: 0.8,
-                size: 3,
-                label: "test".into(),
-            },
-        ];
+        let candidates = vec![SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec!["a".into(), "b".into(), "c".into()],
+            cohesion: 0.8,
+            size: 3,
+            label: "test".into(),
+        }];
         let existing: Vec<(Uuid, Vec<String>)> = vec![];
         let results = deduplicate_candidates(candidates, &existing, 0.7);
         assert_eq!(results.len(), 1);
@@ -967,16 +995,14 @@ mod tests {
     #[test]
     fn test_deduplicate_high_overlap_merges() {
         let existing_id = Uuid::new_v4();
-        let candidates = vec![
-            SkillCandidate {
-                community_id: 0,
-                // 4 out of 5 overlap with existing → Jaccard = 4/5 = 0.8
-                member_note_ids: vec!["a".into(), "b".into(), "c".into(), "d".into()],
-                cohesion: 0.8,
-                size: 4,
-                label: "test".into(),
-            },
-        ];
+        let candidates = vec![SkillCandidate {
+            community_id: 0,
+            // 4 out of 5 overlap with existing → Jaccard = 4/5 = 0.8
+            member_note_ids: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            cohesion: 0.8,
+            size: 4,
+            label: "test".into(),
+        }];
         let existing = vec![(
             existing_id,
             vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
@@ -984,7 +1010,11 @@ mod tests {
         let results = deduplicate_candidates(candidates, &existing, 0.7);
         assert_eq!(results.len(), 1);
         match &results[0] {
-            DeduplicationOutcome::Merge { existing_skill_id, jaccard, .. } => {
+            DeduplicationOutcome::Merge {
+                existing_skill_id,
+                jaccard,
+                ..
+            } => {
                 assert_eq!(*existing_skill_id, existing_id);
                 assert!(*jaccard >= 0.7);
             }
@@ -995,20 +1025,15 @@ mod tests {
     #[test]
     fn test_deduplicate_low_overlap_creates_new() {
         let existing_id = Uuid::new_v4();
-        let candidates = vec![
-            SkillCandidate {
-                community_id: 0,
-                // Only 1 overlap out of 5 → Jaccard = 1/5 = 0.2
-                member_note_ids: vec!["x".into(), "y".into(), "z".into()],
-                cohesion: 0.8,
-                size: 3,
-                label: "test".into(),
-            },
-        ];
-        let existing = vec![(
-            existing_id,
-            vec!["a".into(), "b".into(), "x".into()],
-        )];
+        let candidates = vec![SkillCandidate {
+            community_id: 0,
+            // Only 1 overlap out of 5 → Jaccard = 1/5 = 0.2
+            member_note_ids: vec!["x".into(), "y".into(), "z".into()],
+            cohesion: 0.8,
+            size: 3,
+            label: "test".into(),
+        }];
+        let existing = vec![(existing_id, vec!["a".into(), "b".into(), "x".into()])];
         let results = deduplicate_candidates(candidates, &existing, 0.7);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], DeduplicationOutcome::New(_)));
@@ -1018,23 +1043,26 @@ mod tests {
     fn test_deduplicate_best_match_wins() {
         let skill_a = Uuid::new_v4();
         let skill_b = Uuid::new_v4();
-        let candidates = vec![
-            SkillCandidate {
-                community_id: 0,
-                member_note_ids: vec!["a".into(), "b".into(), "c".into()],
-                cohesion: 0.8,
-                size: 3,
-                label: "test".into(),
-            },
-        ];
+        let candidates = vec![SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec!["a".into(), "b".into(), "c".into()],
+            cohesion: 0.8,
+            size: 3,
+            label: "test".into(),
+        }];
         // skill_a has 1/4 overlap (0.25), skill_b has 3/3 overlap (1.0)
         let existing = vec![
-            (skill_a, vec!["a".into(), "x".into(), "y".into(), "z".into()]),
+            (
+                skill_a,
+                vec!["a".into(), "x".into(), "y".into(), "z".into()],
+            ),
             (skill_b, vec!["a".into(), "b".into(), "c".into()]),
         ];
         let results = deduplicate_candidates(candidates, &existing, 0.7);
         match &results[0] {
-            DeduplicationOutcome::Merge { existing_skill_id, .. } => {
+            DeduplicationOutcome::Merge {
+                existing_skill_id, ..
+            } => {
                 assert_eq!(*existing_skill_id, skill_b);
             }
             _ => panic!("Expected Merge with skill_b"),

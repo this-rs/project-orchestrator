@@ -1959,13 +1959,10 @@ pub async fn detect_skills(
     let config = crate::skills::SkillDetectionConfig::default();
     let start = std::time::Instant::now();
 
-    let result = crate::skills::detect_skills_pipeline(
-        state.orchestrator.neo4j(),
-        project_id,
-        &config,
-    )
-    .await
-    .map_err(AppError::Internal)?;
+    let result =
+        crate::skills::detect_skills_pipeline(state.orchestrator.neo4j(), project_id, &config)
+            .await
+            .map_err(AppError::Internal)?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 

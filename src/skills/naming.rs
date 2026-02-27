@@ -102,7 +102,11 @@ mod tests {
             vec!["cypher".to_string()],
         ];
         let name = generate_skill_name(&tags, 0);
-        assert!(name.starts_with("Neo4j"), "Expected 'Neo4j' first in '{}'", name);
+        assert!(
+            name.starts_with("Neo4j"),
+            "Expected 'Neo4j' first in '{}'",
+            name
+        );
     }
 
     #[test]
@@ -116,12 +120,27 @@ mod tests {
     #[test]
     fn test_generate_skill_name_max_3_tags() {
         let tags = vec![
-            vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
-            vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
         ];
         let name = generate_skill_name(&tags, 0);
         // Should only use top 3 tags
         let word_count = name.split_whitespace().count();
-        assert!(word_count <= 3, "Expected max 3 words, got {} in '{}'", word_count, name);
+        assert!(
+            word_count <= 3,
+            "Expected max 3 words, got {} in '{}'",
+            word_count,
+            name
+        );
     }
 }

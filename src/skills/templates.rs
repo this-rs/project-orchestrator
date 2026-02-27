@@ -82,7 +82,11 @@ fn filter_sort(notes: &[Note], note_type: NoteType) -> Vec<&Note> {
     filtered.sort_by(|a, b| {
         importance_rank(&b.importance)
             .cmp(&importance_rank(&a.importance))
-            .then(b.energy.partial_cmp(&a.energy).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                b.energy
+                    .partial_cmp(&a.energy)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
     filtered
 }
@@ -147,7 +151,10 @@ fn apply_token_budget(template: String, notes: &[Note]) -> String {
         .iter()
         .filter(|n| {
             PROTECTED_TYPES.contains(&n.note_type)
-                || matches!(n.importance, NoteImportance::Critical | NoteImportance::High)
+                || matches!(
+                    n.importance,
+                    NoteImportance::Critical | NoteImportance::High
+                )
         })
         .collect();
 
@@ -155,7 +162,10 @@ fn apply_token_budget(template: String, notes: &[Note]) -> String {
         .iter()
         .filter(|n| {
             !PROTECTED_TYPES.contains(&n.note_type)
-                && !matches!(n.importance, NoteImportance::Critical | NoteImportance::High)
+                && !matches!(
+                    n.importance,
+                    NoteImportance::Critical | NoteImportance::High
+                )
         })
         .collect();
 
@@ -242,7 +252,10 @@ fn apply_token_budget(template: String, notes: &[Note]) -> String {
     current.push_str("\n\n## Relevant Decisions\n\n{{relevant_decisions}}");
 
     if omitted > 0 {
-        current.push_str(&format!("\n\n<!-- {} notes omitted due to token budget -->", omitted));
+        current.push_str(&format!(
+            "\n\n<!-- {} notes omitted due to token budget -->",
+            omitted
+        ));
     }
 
     current
@@ -292,29 +305,77 @@ mod tests {
     #[test]
     fn test_generate_template_basic_sections() {
         let notes = vec![
-            make_note(NoteType::Guideline, NoteImportance::High, "Always use UNWIND for batch operations", vec!["neo4j"]),
-            make_note(NoteType::Gotcha, NoteImportance::Critical, "Neo4j driver pool exhaustion under load", vec!["neo4j"]),
-            make_note(NoteType::Pattern, NoteImportance::Medium, "Repository pattern for data access", vec!["pattern"]),
-            make_note(NoteType::Tip, NoteImportance::Low, "Use EXPLAIN to debug queries", vec!["neo4j"]),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::High,
+                "Always use UNWIND for batch operations",
+                vec!["neo4j"],
+            ),
+            make_note(
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                "Neo4j driver pool exhaustion under load",
+                vec!["neo4j"],
+            ),
+            make_note(
+                NoteType::Pattern,
+                NoteImportance::Medium,
+                "Repository pattern for data access",
+                vec!["pattern"],
+            ),
+            make_note(
+                NoteType::Tip,
+                NoteImportance::Low,
+                "Use EXPLAIN to debug queries",
+                vec!["neo4j"],
+            ),
         ];
 
-        let template = generate_context_template("Neo4j Skills", "Knowledge about Neo4j usage", &notes);
+        let template =
+            generate_context_template("Neo4j Skills", "Knowledge about Neo4j usage", &notes);
 
         assert!(template.contains("# Neo4j Skills"), "Missing header");
-        assert!(template.contains("## Guidelines"), "Missing Guidelines section");
-        assert!(template.contains("## ⚠️ Gotchas"), "Missing Gotchas section");
+        assert!(
+            template.contains("## Guidelines"),
+            "Missing Guidelines section"
+        );
+        assert!(
+            template.contains("## ⚠️ Gotchas"),
+            "Missing Gotchas section"
+        );
         assert!(template.contains("## Patterns"), "Missing Patterns section");
         assert!(template.contains("## Tips"), "Missing Tips section");
-        assert!(template.contains("{{activated_notes}}"), "Missing activated_notes placeholder");
-        assert!(template.contains("{{relevant_decisions}}"), "Missing relevant_decisions placeholder");
+        assert!(
+            template.contains("{{activated_notes}}"),
+            "Missing activated_notes placeholder"
+        );
+        assert!(
+            template.contains("{{relevant_decisions}}"),
+            "Missing relevant_decisions placeholder"
+        );
     }
 
     #[test]
     fn test_generate_template_sorted_by_importance() {
         let notes = vec![
-            make_note(NoteType::Guideline, NoteImportance::Low, "Low importance guideline", vec![]),
-            make_note(NoteType::Guideline, NoteImportance::Critical, "Critical guideline", vec![]),
-            make_note(NoteType::Guideline, NoteImportance::High, "High importance guideline", vec![]),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::Low,
+                "Low importance guideline",
+                vec![],
+            ),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::Critical,
+                "Critical guideline",
+                vec![],
+            ),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::High,
+                "High importance guideline",
+                vec![],
+            ),
         ];
 
         let template = generate_context_template("Test", "Test skill", &notes);
@@ -343,9 +404,24 @@ mod tests {
     #[test]
     fn test_generate_template_importance_badges() {
         let notes = vec![
-            make_note(NoteType::Guideline, NoteImportance::Critical, "Critical note", vec![]),
-            make_note(NoteType::Guideline, NoteImportance::High, "High note", vec![]),
-            make_note(NoteType::Guideline, NoteImportance::Medium, "Medium note", vec![]),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::Critical,
+                "Critical note",
+                vec![],
+            ),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::High,
+                "High note",
+                vec![],
+            ),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                "Medium note",
+                vec![],
+            ),
         ];
 
         let template = generate_context_template("Test", "Test", &notes);
@@ -451,14 +527,49 @@ mod tests {
     #[test]
     fn test_generate_template_varied_types() {
         let notes = vec![
-            make_note(NoteType::Guideline, NoteImportance::High, "Use batch operations", vec![]),
-            make_note(NoteType::Gotcha, NoteImportance::Critical, "Connection pool limit", vec![]),
-            make_note(NoteType::Pattern, NoteImportance::Medium, "Repository pattern", vec![]),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::High,
+                "Use batch operations",
+                vec![],
+            ),
+            make_note(
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                "Connection pool limit",
+                vec![],
+            ),
+            make_note(
+                NoteType::Pattern,
+                NoteImportance::Medium,
+                "Repository pattern",
+                vec![],
+            ),
             make_note(NoteType::Tip, NoteImportance::Low, "Use EXPLAIN", vec![]),
-            make_note(NoteType::Observation, NoteImportance::Low, "Performance observation", vec![]),
-            make_note(NoteType::Context, NoteImportance::Medium, "Current refactoring context", vec![]),
-            make_note(NoteType::Assertion, NoteImportance::High, "All queries must use parameters", vec![]),
-            make_note(NoteType::Guideline, NoteImportance::Medium, "Prefer MERGE over CREATE", vec![]),
+            make_note(
+                NoteType::Observation,
+                NoteImportance::Low,
+                "Performance observation",
+                vec![],
+            ),
+            make_note(
+                NoteType::Context,
+                NoteImportance::Medium,
+                "Current refactoring context",
+                vec![],
+            ),
+            make_note(
+                NoteType::Assertion,
+                NoteImportance::High,
+                "All queries must use parameters",
+                vec![],
+            ),
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                "Prefer MERGE over CREATE",
+                vec![],
+            ),
         ];
 
         let template = generate_context_template("Neo4j", "Neo4j knowledge", &notes);

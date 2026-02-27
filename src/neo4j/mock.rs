@@ -6782,10 +6782,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn get_skill(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<crate::skills::SkillNode>> {
+    async fn get_skill(&self, id: Uuid) -> anyhow::Result<Option<crate::skills::SkillNode>> {
         Ok(self.skills.read().await.get(&id).cloned())
     }
 
@@ -6895,10 +6892,7 @@ impl GraphStore for MockGraphStore {
         let skills_store = self.skills.read().await;
         let mut result = Vec::new();
         for (skill_id, entries) in members.iter() {
-            if entries
-                .iter()
-                .any(|(t, id)| t == "note" && *id == note_id)
-            {
+            if entries.iter().any(|(t, id)| t == "note" && *id == note_id) {
                 if let Some(s) = skills_store.get(skill_id) {
                     result.push(s.clone());
                 }
@@ -6950,8 +6944,7 @@ impl GraphStore for MockGraphStore {
                 s.project_id == project_id
                     && matches!(
                         s.status,
-                        crate::skills::SkillStatus::Active
-                            | crate::skills::SkillStatus::Emerging
+                        crate::skills::SkillStatus::Active | crate::skills::SkillStatus::Emerging
                     )
             })
             .map(|s| (s.clone(), 1.0))

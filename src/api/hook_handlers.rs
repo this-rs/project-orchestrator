@@ -136,9 +136,7 @@ pub async fn activate_hook(
 
     // Periodic cleanup (every 100 requests)
     {
-        let mut counter = REQUEST_COUNTER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut counter = REQUEST_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
         *counter += 1;
         if *counter % 100 == 0 {
             HOOK_RATE_LIMITER.cleanup();
@@ -147,9 +145,7 @@ pub async fn activate_hook(
 
     // --- Input validation ---
     if req.tool_name.is_empty() {
-        return Err(AppError::BadRequest(
-            "tool_name is required".to_string(),
-        ));
+        return Err(AppError::BadRequest("tool_name is required".to_string()));
     }
 
     // --- Activation pipeline (cached) ---
@@ -184,10 +180,7 @@ pub async fn activate_hook(
                 Json(serde_json::to_value(&outcome.response).unwrap_or_default()),
             ))
         }
-        None => Ok((
-            StatusCode::NO_CONTENT,
-            Json(serde_json::json!(null)),
-        )),
+        None => Ok((StatusCode::NO_CONTENT, Json(serde_json::json!(null)))),
     }
 }
 
@@ -195,19 +188,14 @@ pub async fn activate_hook(
 ///
 /// Health check for the hooks subsystem.
 /// Returns stats about rate limiter, skill cache, and overall hook status.
-pub async fn hooks_health(
-    State(_state): State<OrchestratorState>,
-) -> Json<serde_json::Value> {
+pub async fn hooks_health(State(_state): State<OrchestratorState>) -> Json<serde_json::Value> {
     let entries_count = HOOK_RATE_LIMITER
         .entries
         .lock()
         .map(|e| e.len())
         .unwrap_or(0);
 
-    let total_requests = REQUEST_COUNTER
-        .lock()
-        .map(|c| *c)
-        .unwrap_or(0);
+    let total_requests = REQUEST_COUNTER.lock().map(|c| *c).unwrap_or(0);
 
     let cache_stats = SKILL_CACHE.stats().await;
 
@@ -284,12 +272,7 @@ pub async fn session_context(
 
     // Fetch current in-progress plan (limit 1)
     let (current_plan, current_task) = match neo4j
-        .list_plans_for_project(
-            project_id,
-            Some(vec!["in_progress".to_string()]),
-            1,
-            0,
-        )
+        .list_plans_for_project(project_id, Some(vec!["in_progress".to_string()]), 1, 0)
         .await
     {
         Ok((plans, _)) => {
@@ -300,10 +283,7 @@ pub async fn session_context(
                         let total = tasks.len();
                         let completed = tasks
                             .iter()
-                            .filter(|t| {
-                                t.status
-                                    == crate::neo4j::models::TaskStatus::Completed
-                            })
+                            .filter(|t| t.status == crate::neo4j::models::TaskStatus::Completed)
                             .count();
                         if total > 0 {
                             Some(format!("{}/{} tasks", completed, total))
@@ -325,10 +305,7 @@ pub async fn session_context(
                 let task_json = match neo4j.get_plan_tasks(plan.id).await {
                     Ok(tasks) => tasks
                         .into_iter()
-                        .find(|t| {
-                            t.status
-                                == crate::neo4j::models::TaskStatus::InProgress
-                        })
+                        .find(|t| t.status == crate::neo4j::models::TaskStatus::InProgress)
                         .map(|t| {
                             serde_json::json!({
                                 "title": t.title.unwrap_or_default(),
@@ -501,7 +478,9 @@ pub async fn install_hooks(
     // Resolve ~/.claude/hooks/
     let home = std::env::var("HOME")
         .map_err(|_| AppError::Internal(anyhow::anyhow!("HOME environment variable not set")))?;
-    let hooks_dir = std::path::PathBuf::from(&home).join(".claude").join("hooks");
+    let hooks_dir = std::path::PathBuf::from(&home)
+        .join(".claude")
+        .join("hooks");
 
     // Create hooks directory
     std::fs::create_dir_all(&hooks_dir).map_err(|e| {
@@ -555,9 +534,8 @@ pub async fn install_hooks(
         "hooks_version": "1.0.0",
         "hooks": installed_hooks,
     });
-    let config_json = serde_json::to_string_pretty(&config).map_err(|e| {
-        AppError::Internal(anyhow::anyhow!("Failed to serialize config: {}", e))
-    })?;
+    let config_json = serde_json::to_string_pretty(&config)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to serialize config: {}", e)))?;
     std::fs::write(&config_path, format!("{}\n", config_json)).map_err(|e| {
         AppError::Internal(anyhow::anyhow!(
             "Failed to write .po-config at {}: {}",
@@ -801,8 +779,14 @@ mod tests {
 
     #[test]
     fn test_embedded_hooks_not_empty() {
-        assert!(!HOOK_PRE_TOOL_USE.is_empty(), "pre-tool-use.cjs should not be empty");
-        assert!(!HOOK_SESSION_START.is_empty(), "session-start.sh should not be empty");
+        assert!(
+            !HOOK_PRE_TOOL_USE.is_empty(),
+            "pre-tool-use.cjs should not be empty"
+        );
+        assert!(
+            !HOOK_SESSION_START.is_empty(),
+            "session-start.sh should not be empty"
+        );
     }
 
     #[test]
@@ -821,14 +805,18 @@ mod tests {
     fn test_install_hooks_request_deserialize() {
         let json = r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5","cwd":"/tmp/test"}"#;
         let req: InstallHooksRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.project_id, Uuid::parse_str("00333b5f-2d0a-4467-9c98-155e55d2b7e5").unwrap());
+        assert_eq!(
+            req.project_id,
+            Uuid::parse_str("00333b5f-2d0a-4467-9c98-155e55d2b7e5").unwrap()
+        );
         assert_eq!(req.cwd, "/tmp/test");
         assert_eq!(req.port, 6600); // default
     }
 
     #[test]
     fn test_install_hooks_request_custom_port() {
-        let json = r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5","cwd":"/tmp","port":7700}"#;
+        let json =
+            r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5","cwd":"/tmp","port":7700}"#;
         let req: InstallHooksRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.port, 7700);
     }

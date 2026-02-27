@@ -121,8 +121,7 @@ pub async fn activate_for_hook(
     // 3. Evaluate trigger patterns locally
     let mut matches: Vec<(SkillNode, f64)> = Vec::new();
     for skill in matchable {
-        let confidence =
-            evaluate_skill_match(&skill, pattern.as_deref(), file_context.as_deref());
+        let confidence = evaluate_skill_match(&skill, pattern.as_deref(), file_context.as_deref());
         if confidence >= config.confidence_threshold {
             matches.push((skill, confidence));
         }
@@ -133,14 +132,11 @@ pub async fn activate_for_hook(
     }
 
     // Sort by confidence descending
-    matches.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // 4. Pick top skill (or merge top-2 if confidence is very close)
-    let should_merge = matches.len() >= 2
-        && (matches[0].1 - matches[1].1).abs() < config.merge_threshold;
+    let should_merge =
+        matches.len() >= 2 && (matches[0].1 - matches[1].1).abs() < config.merge_threshold;
 
     if should_merge {
         // Merge top-2 skills
@@ -276,8 +272,7 @@ pub async fn activate_for_hook_cached(
     // 3. Evaluate using pre-compiled triggers (no Regex::new per request)
     let mut matches: Vec<(SkillNode, f64)> = Vec::new();
     for cached in &cached_skills {
-        let confidence =
-            evaluate_cached_skill(cached, pattern.as_deref(), file_context.as_deref());
+        let confidence = evaluate_cached_skill(cached, pattern.as_deref(), file_context.as_deref());
         if confidence >= config.confidence_threshold {
             matches.push((cached.skill.clone(), confidence));
         }
@@ -288,14 +283,11 @@ pub async fn activate_for_hook_cached(
     }
 
     // Sort by confidence descending
-    matches.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // 4. Pick top skill (or merge top-2 if confidence is very close)
-    let should_merge = matches.len() >= 2
-        && (matches[0].1 - matches[1].1).abs() < config.merge_threshold;
+    let should_merge =
+        matches.len() >= 2 && (matches[0].1 - matches[1].1).abs() < config.merge_threshold;
 
     if should_merge {
         let (skill1, conf1) = matches.remove(0);
@@ -556,10 +548,7 @@ pub fn assemble_context_with_confidence(
     // Add decisions (max 2, within reserved budget)
     if !decisions.is_empty() {
         for decision in decisions.iter().take(2) {
-            let chosen = decision
-                .chosen_option
-                .as_deref()
-                .unwrap_or("(pending)");
+            let chosen = decision.chosen_option.as_deref().unwrap_or("(pending)");
             let line = format!(
                 "- \u{1f3af} **{}**: {}\n",
                 truncate_content(&decision.description, 60),
@@ -605,8 +594,7 @@ pub fn spawn_hook_reinforcement(
     }
 
     tokio::spawn(async move {
-        if let Err(e) =
-            reinforce_hook_activation(&*graph_store, &activated_note_ids, &config).await
+        if let Err(e) = reinforce_hook_activation(&*graph_store, &activated_note_ids, &config).await
         {
             tracing::warn!(
                 notes_count = activated_note_ids.len(),
@@ -652,13 +640,13 @@ async fn reinforce_hook_activation(
 /// Get emoji prefix for a note type.
 fn note_type_emoji(note_type: &str) -> &'static str {
     match note_type {
-        "gotcha" => "\u{26a0}\u{fe0f} ",      // ⚠️
-        "guideline" => "\u{1f4cb} ",           // 📋
-        "pattern" => "\u{1f504} ",             // 🔄
-        "tip" => "\u{1f4a1} ",                 // 💡
-        "context" => "\u{1f4dd} ",             // 📝
-        "observation" => "\u{1f50d} ",         // 🔍
-        "assertion" => "\u{2705} ",            // ✅
+        "gotcha" => "\u{26a0}\u{fe0f} ", // ⚠️
+        "guideline" => "\u{1f4cb} ",     // 📋
+        "pattern" => "\u{1f504} ",       // 🔄
+        "tip" => "\u{1f4a1} ",           // 💡
+        "context" => "\u{1f4dd} ",       // 📝
+        "observation" => "\u{1f50d} ",   // 🔍
+        "assertion" => "\u{2705} ",      // ✅
         _ => "",
     }
 }
@@ -696,7 +684,13 @@ mod tests {
     use crate::skills::models::{SkillNode, SkillTrigger};
     use chrono::Utc;
 
-    fn make_test_note(id: Uuid, content: &str, note_type: NoteType, importance: NoteImportance, energy: f64) -> Note {
+    fn make_test_note(
+        id: Uuid,
+        content: &str,
+        note_type: NoteType,
+        importance: NoteImportance,
+        energy: f64,
+    ) -> Note {
         Note {
             id,
             project_id: Some(Uuid::new_v4()),
@@ -757,13 +751,22 @@ mod tests {
 
     #[test]
     fn test_match_file_glob_trigger_matches() {
-        assert!((match_file_glob_trigger("src/neo4j/**", "src/neo4j/client.rs") - 1.0).abs() < f64::EPSILON);
-        assert!((match_file_glob_trigger("src/neo4j/*", "src/neo4j/client.rs") - 1.0).abs() < f64::EPSILON);
+        assert!(
+            (match_file_glob_trigger("src/neo4j/**", "src/neo4j/client.rs") - 1.0).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (match_file_glob_trigger("src/neo4j/*", "src/neo4j/client.rs") - 1.0).abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
     fn test_match_file_glob_trigger_no_match() {
-        assert!((match_file_glob_trigger("src/neo4j/**", "src/api/handlers.rs") - 0.0).abs() < f64::EPSILON);
+        assert!(
+            (match_file_glob_trigger("src/neo4j/**", "src/api/handlers.rs") - 0.0).abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
@@ -818,7 +821,8 @@ mod tests {
             SkillTrigger::file_glob("src/api/**", 0.8), // won't match
         ];
 
-        let confidence = evaluate_skill_match(&skill, Some("neo4j_client"), Some("src/skills/test.rs"));
+        let confidence =
+            evaluate_skill_match(&skill, Some("neo4j_client"), Some("src/skills/test.rs"));
         assert!((confidence - 1.0).abs() < f64::EPSILON); // regex matched
     }
 
@@ -868,13 +872,27 @@ mod tests {
     #[test]
     fn test_assemble_context_basic() {
         let notes = vec![
-            make_test_note(Uuid::new_v4(), "Always use UNWIND for batch operations", NoteType::Guideline, NoteImportance::High, 0.8),
-            make_test_note(Uuid::new_v4(), "Connection pool leak if not closed", NoteType::Gotcha, NoteImportance::Critical, 0.9),
+            make_test_note(
+                Uuid::new_v4(),
+                "Always use UNWIND for batch operations",
+                NoteType::Guideline,
+                NoteImportance::High,
+                0.8,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Connection pool leak if not closed",
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+            ),
         ];
 
-        let decisions = vec![
-            make_test_decision(Uuid::new_v4(), "Use Neo4j 5.x driver", "neo4j-rust-driver 0.8"),
-        ];
+        let decisions = vec![make_test_decision(
+            Uuid::new_v4(),
+            "Use Neo4j 5.x driver",
+            "neo4j-rust-driver 0.8",
+        )];
 
         let context = assemble_context("Neo4j Performance", &notes, &decisions, 3200);
 
@@ -888,9 +906,27 @@ mod tests {
     #[test]
     fn test_assemble_context_sorted_by_importance() {
         let notes = vec![
-            make_test_note(Uuid::new_v4(), "Low importance note", NoteType::Tip, NoteImportance::Low, 0.5),
-            make_test_note(Uuid::new_v4(), "Critical gotcha note", NoteType::Gotcha, NoteImportance::Critical, 0.9),
-            make_test_note(Uuid::new_v4(), "Medium pattern note", NoteType::Pattern, NoteImportance::Medium, 0.7),
+            make_test_note(
+                Uuid::new_v4(),
+                "Low importance note",
+                NoteType::Tip,
+                NoteImportance::Low,
+                0.5,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Critical gotcha note",
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Medium pattern note",
+                NoteType::Pattern,
+                NoteImportance::Medium,
+                0.7,
+            ),
         ];
 
         let context = assemble_context("Test", &notes, &[], 3200);
@@ -927,9 +963,13 @@ mod tests {
 
     #[test]
     fn test_assemble_context_no_decisions() {
-        let notes = vec![
-            make_test_note(Uuid::new_v4(), "A note", NoteType::Tip, NoteImportance::Medium, 0.5),
-        ];
+        let notes = vec![make_test_note(
+            Uuid::new_v4(),
+            "A note",
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.5,
+        )];
         let context = assemble_context("Test", &notes, &[], 3200);
         assert!(!context.contains("Decisions"));
     }
@@ -937,10 +977,34 @@ mod tests {
     #[test]
     fn test_assemble_context_with_emojis() {
         let notes = vec![
-            make_test_note(Uuid::new_v4(), "Watch out for this", NoteType::Gotcha, NoteImportance::Critical, 0.9),
-            make_test_note(Uuid::new_v4(), "Follow this rule", NoteType::Guideline, NoteImportance::High, 0.8),
-            make_test_note(Uuid::new_v4(), "Common pattern here", NoteType::Pattern, NoteImportance::Medium, 0.7),
-            make_test_note(Uuid::new_v4(), "Helpful tip", NoteType::Tip, NoteImportance::Low, 0.5),
+            make_test_note(
+                Uuid::new_v4(),
+                "Watch out for this",
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Follow this rule",
+                NoteType::Guideline,
+                NoteImportance::High,
+                0.8,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Common pattern here",
+                NoteType::Pattern,
+                NoteImportance::Medium,
+                0.7,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Helpful tip",
+                NoteType::Tip,
+                NoteImportance::Low,
+                0.5,
+            ),
         ];
 
         let context = assemble_context("Test", &notes, &[], 3200);
@@ -956,16 +1020,23 @@ mod tests {
 
     #[test]
     fn test_assemble_context_with_confidence_header() {
-        let notes = vec![
-            make_test_note(Uuid::new_v4(), "Always use UNWIND for batch operations", NoteType::Guideline, NoteImportance::High, 0.8),
-        ];
+        let notes = vec![make_test_note(
+            Uuid::new_v4(),
+            "Always use UNWIND for batch operations",
+            NoteType::Guideline,
+            NoteImportance::High,
+            0.8,
+        )];
 
-        let decisions = vec![
-            make_test_decision(Uuid::new_v4(), "Use Neo4j 5.x driver", "neo4j-rust-driver 0.8"),
-        ];
+        let decisions = vec![make_test_decision(
+            Uuid::new_v4(),
+            "Use Neo4j 5.x driver",
+            "neo4j-rust-driver 0.8",
+        )];
 
         // With confidence → 🧠 header with percentage
-        let context = assemble_context_with_confidence("Neo4j Perf", &notes, &decisions, 3200, Some(0.85));
+        let context =
+            assemble_context_with_confidence("Neo4j Perf", &notes, &decisions, 3200, Some(0.85));
         assert!(
             context.starts_with("## \u{1f9e0} Skill \"Neo4j Perf\" (confidence 85%)"),
             "Expected confidence header, got: {}",
@@ -977,9 +1048,13 @@ mod tests {
 
     #[test]
     fn test_assemble_context_with_confidence_none() {
-        let notes = vec![
-            make_test_note(Uuid::new_v4(), "A note", NoteType::Tip, NoteImportance::Medium, 0.5),
-        ];
+        let notes = vec![make_test_note(
+            Uuid::new_v4(),
+            "A note",
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.5,
+        )];
 
         // Without confidence → 💡 header (same as assemble_context)
         let context = assemble_context_with_confidence("Test Skill", &notes, &[], 3200, None);
@@ -992,9 +1067,13 @@ mod tests {
 
     #[test]
     fn test_assemble_context_with_confidence_rounding() {
-        let notes = vec![
-            make_test_note(Uuid::new_v4(), "Content", NoteType::Context, NoteImportance::Medium, 0.5),
-        ];
+        let notes = vec![make_test_note(
+            Uuid::new_v4(),
+            "Content",
+            NoteType::Context,
+            NoteImportance::Medium,
+            0.5,
+        )];
 
         // Confidence 0.666 → should round to 67%
         let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666));
@@ -1095,9 +1174,21 @@ mod tests {
         }
 
         let decisions = vec![
-            make_test_decision(Uuid::new_v4(), "Use async Neo4j driver for all database operations", "neo4j-rust-driver 0.8 with async support"),
-            make_test_decision(Uuid::new_v4(), "Implement caching with TTL-based invalidation", "30-second TTL per skill activation"),
-            make_test_decision(Uuid::new_v4(), "This third decision should be excluded", "Only 2 decisions max"),
+            make_test_decision(
+                Uuid::new_v4(),
+                "Use async Neo4j driver for all database operations",
+                "neo4j-rust-driver 0.8 with async support",
+            ),
+            make_test_decision(
+                Uuid::new_v4(),
+                "Implement caching with TTL-based invalidation",
+                "30-second TTL per skill activation",
+            ),
+            make_test_decision(
+                Uuid::new_v4(),
+                "This third decision should be excluded",
+                "Only 2 decisions max",
+            ),
         ];
 
         let context = assemble_context("Neo4j Expertise", &notes, &decisions, 3200);
@@ -1155,9 +1246,11 @@ mod tests {
             ));
         }
 
-        let decisions = vec![
-            make_test_decision(Uuid::new_v4(), "Architecture decision for the module", "chosen approach"),
-        ];
+        let decisions = vec![make_test_decision(
+            Uuid::new_v4(),
+            "Architecture decision for the module",
+            "chosen approach",
+        )];
 
         let context = assemble_context("Large Skill", &notes, &decisions, 3200);
 
@@ -1198,21 +1291,19 @@ mod tests {
             ));
         }
 
-        let decisions = vec![
-            make_test_decision(Uuid::new_v4(), "Important decision", "chosen option value"),
-        ];
+        let decisions = vec![make_test_decision(
+            Uuid::new_v4(),
+            "Important decision",
+            "chosen option value",
+        )];
 
         // With decisions present, notes should leave room
         let context_with_decisions = assemble_context("Test", &notes, &decisions, 3200);
         let context_without_decisions = assemble_context("Test", &notes, &[], 3200);
 
         // Context without decisions should have more notes since no budget reservation
-        let notes_with = context_with_decisions
-            .matches("Note content")
-            .count();
-        let notes_without = context_without_decisions
-            .matches("Note content")
-            .count();
+        let notes_with = context_with_decisions.matches("Note content").count();
+        let notes_without = context_without_decisions.matches("Note content").count();
 
         assert!(
             notes_without >= notes_with,

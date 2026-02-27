@@ -174,10 +174,7 @@ fn public_routes() -> Router<OrchestratorState> {
         // ================================================================
         // Hook activation (public — called from Claude Code hooks, rate limited)
         // ================================================================
-        .route(
-            "/api/hooks/activate",
-            post(hook_handlers::activate_hook),
-        )
+        .route("/api/hooks/activate", post(hook_handlers::activate_hook))
         .route("/api/hooks/health", get(hook_handlers::hooks_health))
         .route(
             "/api/hooks/session-context",
@@ -775,10 +772,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/admin/bootstrap-knowledge-fabric",
             post(handlers::bootstrap_knowledge_fabric),
         )
-        .route(
-            "/api/admin/detect-skills",
-            post(handlers::detect_skills),
-        )
+        .route("/api/admin/detect-skills", post(handlers::detect_skills))
         .route(
             "/api/admin/install-hooks",
             post(hook_handlers::install_hooks),

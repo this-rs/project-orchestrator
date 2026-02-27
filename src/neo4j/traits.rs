@@ -1900,10 +1900,7 @@ pub trait GraphStore: Send + Sync {
     // ========================================================================
 
     /// Get all member notes and decisions for a skill.
-    async fn get_skill_members(
-        &self,
-        skill_id: Uuid,
-    ) -> Result<(Vec<Note>, Vec<DecisionNode>)>;
+    async fn get_skill_members(&self, skill_id: Uuid) -> Result<(Vec<Note>, Vec<DecisionNode>)>;
 
     /// Add a note or decision as a member of a skill.
     /// `entity_type` must be "note" or "decision".
@@ -1936,11 +1933,7 @@ pub trait GraphStore: Send + Sync {
 
     /// Activate a skill: collect member notes (above min energy) and relevant
     /// decisions, assemble context text. Returns the full activation payload.
-    async fn activate_skill(
-        &self,
-        skill_id: Uuid,
-        query: &str,
-    ) -> Result<ActivatedSkillContext>;
+    async fn activate_skill(&self, skill_id: Uuid, query: &str) -> Result<ActivatedSkillContext>;
 
     /// Match skills by evaluating trigger patterns against an input string.
     /// Returns matching skills with their confidence scores, sorted descending.

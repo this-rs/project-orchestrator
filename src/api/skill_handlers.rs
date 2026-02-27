@@ -88,10 +88,7 @@ pub async fn list_skills(
     State(state): State<OrchestratorState>,
     Query(query): Query<SkillsListQuery>,
 ) -> Result<Json<PaginatedResponse<SkillNode>>, AppError> {
-    query
-        .pagination
-        .validate()
-        .map_err(AppError::BadRequest)?;
+    query.pagination.validate().map_err(AppError::BadRequest)?;
 
     let status_filter = query
         .status
@@ -255,10 +252,7 @@ pub async fn delete_skill(
         }
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(AppError::NotFound(format!(
-            "Skill {} not found",
-            skill_id
-        )))
+        Err(AppError::NotFound(format!("Skill {} not found", skill_id)))
     }
 }
 

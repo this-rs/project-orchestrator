@@ -338,7 +338,10 @@ impl SkillNode {
 
     /// Get reliable triggers (quality >= 0.3 or unscored).
     pub fn reliable_triggers(&self) -> Vec<&SkillTrigger> {
-        self.trigger_patterns.iter().filter(|t| t.is_reliable()).collect()
+        self.trigger_patterns
+            .iter()
+            .filter(|t| t.is_reliable())
+            .collect()
     }
 }
 
@@ -641,7 +644,10 @@ mod tests {
             TriggerType::from_str("file_glob").unwrap(),
             TriggerType::FileGlob
         );
-        assert_eq!(TriggerType::from_str("glob").unwrap(), TriggerType::FileGlob);
+        assert_eq!(
+            TriggerType::from_str("glob").unwrap(),
+            TriggerType::FileGlob
+        );
         assert_eq!(
             TriggerType::from_str("semantic").unwrap(),
             TriggerType::Semantic
@@ -650,7 +656,11 @@ mod tests {
 
     #[test]
     fn test_trigger_type_serde_roundtrip() {
-        for tt in [TriggerType::Regex, TriggerType::FileGlob, TriggerType::Semantic] {
+        for tt in [
+            TriggerType::Regex,
+            TriggerType::FileGlob,
+            TriggerType::Semantic,
+        ] {
             let json = serde_json::to_string(&tt).unwrap();
             let deserialized: TriggerType = serde_json::from_str(&json).unwrap();
             assert_eq!(tt, deserialized);
@@ -707,7 +717,9 @@ mod tests {
 
         assert_eq!(deserialized.pattern_type, trigger.pattern_type);
         assert_eq!(deserialized.pattern_value, trigger.pattern_value);
-        assert!((deserialized.confidence_threshold - trigger.confidence_threshold).abs() < f64::EPSILON);
+        assert!(
+            (deserialized.confidence_threshold - trigger.confidence_threshold).abs() < f64::EPSILON
+        );
     }
 
     #[test]
@@ -751,7 +763,10 @@ mod tests {
         );
 
         assert_eq!(skill.name, "API Auth");
-        assert_eq!(skill.description, "Authentication and authorization patterns");
+        assert_eq!(
+            skill.description,
+            "Authentication and authorization patterns"
+        );
         assert!((skill.energy - 0.75).abs() < f64::EPSILON);
         assert!((skill.cohesion - 0.82).abs() < f64::EPSILON);
         assert_eq!(skill.tags, vec!["auth", "jwt"]);
@@ -896,7 +911,10 @@ mod tests {
         assert_eq!(result.status, DetectionStatus::InsufficientData);
         assert!(result.message.contains("5 notes"));
         assert!(result.message.contains("15"));
-        assert!(result.suggestion.unwrap().contains("Continue creating notes"));
+        assert!(result
+            .suggestion
+            .unwrap()
+            .contains("Continue creating notes"));
     }
 
     #[test]

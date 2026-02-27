@@ -2299,10 +2299,7 @@ impl GraphStore for Neo4jClient {
         self.create_skill(skill).await
     }
 
-    async fn get_skill(
-        &self,
-        id: uuid::Uuid,
-    ) -> anyhow::Result<Option<crate::skills::SkillNode>> {
+    async fn get_skill(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::skills::SkillNode>> {
         self.get_skill(id).await
     }
 
@@ -2327,7 +2324,10 @@ impl GraphStore for Neo4jClient {
     async fn get_skill_members(
         &self,
         skill_id: uuid::Uuid,
-    ) -> anyhow::Result<(Vec<crate::notes::Note>, Vec<crate::neo4j::models::DecisionNode>)> {
+    ) -> anyhow::Result<(
+        Vec<crate::notes::Note>,
+        Vec<crate::neo4j::models::DecisionNode>,
+    )> {
         self.get_skill_members(skill_id).await
     }
 
@@ -2337,7 +2337,8 @@ impl GraphStore for Neo4jClient {
         entity_type: &str,
         entity_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        self.add_skill_member(skill_id, entity_type, entity_id).await
+        self.add_skill_member(skill_id, entity_type, entity_id)
+            .await
     }
 
     async fn remove_skill_member(
@@ -2346,7 +2347,8 @@ impl GraphStore for Neo4jClient {
         entity_type: &str,
         entity_id: uuid::Uuid,
     ) -> anyhow::Result<bool> {
-        self.remove_skill_member(skill_id, entity_type, entity_id).await
+        self.remove_skill_member(skill_id, entity_type, entity_id)
+            .await
     }
 
     async fn get_skills_for_note(

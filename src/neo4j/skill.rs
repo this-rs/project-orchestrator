@@ -429,10 +429,12 @@ impl Neo4jClient {
             .param("skill_id", skill_id.to_string())
             .param("entity_id", entity_id.to_string());
 
-        self.graph
-            .run(q)
-            .await
-            .with_context(|| format!("Failed to add {} {} to skill {}", entity_type, entity_id, skill_id))?;
+        self.graph.run(q).await.with_context(|| {
+            format!(
+                "Failed to add {} {} to skill {}",
+                entity_type, entity_id, skill_id
+            )
+        })?;
 
         Ok(())
     }
