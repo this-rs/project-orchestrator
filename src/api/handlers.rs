@@ -1969,6 +1969,11 @@ pub async fn detect_skills(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
+    // Invalidate hook activation cache — skills have changed
+    super::hook_handlers::skill_cache()
+        .invalidate_project(&project_id)
+        .await;
+
     Ok(Json(serde_json::json!({
         "status": format!("{:?}", result.status),
         "skills_detected": result.skills_detected,

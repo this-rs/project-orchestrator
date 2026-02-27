@@ -27,6 +27,7 @@ use crate::neo4j::models::DecisionNode;
 use crate::neo4j::traits::GraphStore;
 use crate::neurons::AutoReinforcementConfig;
 use crate::notes::models::Note;
+use crate::skills::cache::{evaluate_cached_skill, SkillCache};
 use crate::skills::hook_extractor::{extract_file_context, extract_pattern};
 use crate::skills::models::{HookActivateResponse, SkillNode, TriggerType};
 
@@ -194,6 +195,154 @@ pub async fn activate_for_hook(
         }))
     } else {
         // Single top skill
+        let (skill, confidence) = matches.remove(0);
+        let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
+
+        let active_notes: Vec<_> = notes
+            .into_iter()
+            .filter(|n| n.energy >= config.min_note_energy)
+            .collect();
+
+        let context = assemble_context(
+            &skill.name,
+            &active_notes,
+            &decisions,
+            config.max_context_chars,
+        );
+
+        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+
+        Ok(Some(HookActivationOutcome {
+            response: HookActivateResponse {
+                context,
+                skill_name: skill.name.clone(),
+                skill_id: skill.id,
+                confidence,
+                notes_count: active_notes.len(),
+                decisions_count: decisions.len(),
+            },
+            activated_note_ids,
+        }))
+    }
+}
+
+/// Cached version of `activate_for_hook`.
+///
+/// Uses the `SkillCache` to avoid:
+/// 1. Neo4j round-trip for `get_skills_for_project()` on cache hit
+/// 2. `Regex::new()` / `glob::Pattern::new()` recompilation (pre-compiled triggers)
+///
+/// Falls back to DB on cache miss, then populates the cache for next request.
+/// Member notes/decisions are always loaded fresh from DB (energy may change).
+///
+/// # Performance
+///
+/// - Cache hit: ~1ms (trigger matching only, no DB for skills)
+/// - Cache miss: ~150ms (same as uncached, plus cache insert ~0.1ms)
+pub async fn activate_for_hook_cached(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    config: &HookActivationConfig,
+    cache: &SkillCache,
+) -> anyhow::Result<Option<HookActivationOutcome>> {
+    // 1. Extract pattern and file context from tool input
+    let pattern = extract_pattern(tool_name, tool_input);
+    let file_context = extract_file_context(tool_name, tool_input);
+
+    if pattern.is_none() && file_context.is_none() {
+        return Ok(None);
+    }
+
+    // 2. Try cache first, fallback to DB
+    let cached_skills = match cache.get(&project_id).await {
+        Some(skills) => skills,
+        None => {
+            // Cache miss — load from DB and populate cache
+            let skills = graph_store.get_skills_for_project(project_id).await?;
+            cache.insert(project_id, skills.clone()).await;
+            // Re-get from cache to get compiled triggers
+            cache.get(&project_id).await.unwrap_or_default()
+        }
+    };
+
+    if cached_skills.is_empty() {
+        return Ok(None);
+    }
+
+    // 3. Evaluate using pre-compiled triggers (no Regex::new per request)
+    let mut matches: Vec<(SkillNode, f64)> = Vec::new();
+    for cached in &cached_skills {
+        let confidence =
+            evaluate_cached_skill(cached, pattern.as_deref(), file_context.as_deref());
+        if confidence >= config.confidence_threshold {
+            matches.push((cached.skill.clone(), confidence));
+        }
+    }
+
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    // Sort by confidence descending
+    matches.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // 4. Pick top skill (or merge top-2 if confidence is very close)
+    let should_merge = matches.len() >= 2
+        && (matches[0].1 - matches[1].1).abs() < config.merge_threshold;
+
+    if should_merge {
+        let (skill1, conf1) = matches.remove(0);
+        let (skill2, _conf2) = matches.remove(0);
+
+        let (notes1, decisions1) = graph_store.get_skill_members(skill1.id).await?;
+        let (notes2, decisions2) = graph_store.get_skill_members(skill2.id).await?;
+
+        let mut all_notes = notes1;
+        for note in notes2 {
+            if !all_notes.iter().any(|n| n.id == note.id) {
+                all_notes.push(note);
+            }
+        }
+
+        let mut all_decisions = decisions1;
+        for dec in decisions2 {
+            if !all_decisions.iter().any(|d| d.id == dec.id) {
+                all_decisions.push(dec);
+            }
+        }
+
+        let active_notes: Vec<_> = all_notes
+            .into_iter()
+            .filter(|n| n.energy >= config.min_note_energy)
+            .collect();
+
+        let merged_name = format!("{} + {}", skill1.name, skill2.name);
+        let context = assemble_context(
+            &merged_name,
+            &active_notes,
+            &all_decisions,
+            config.max_context_chars,
+        );
+
+        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+
+        Ok(Some(HookActivationOutcome {
+            response: HookActivateResponse {
+                context,
+                skill_name: merged_name,
+                skill_id: skill1.id,
+                confidence: conf1,
+                notes_count: active_notes.len(),
+                decisions_count: all_decisions.len(),
+            },
+            activated_note_ids,
+        }))
+    } else {
         let (skill, confidence) = matches.remove(0);
         let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
 

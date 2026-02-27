@@ -8,7 +8,10 @@
 
 use super::handlers::{AppError, OrchestratorState};
 use crate::neurons::AutoReinforcementConfig;
-use crate::skills::activation::{activate_for_hook, spawn_hook_reinforcement, HookActivationConfig};
+use crate::skills::activation::{
+    activate_for_hook_cached, spawn_hook_reinforcement, HookActivationConfig,
+};
+use crate::skills::cache::SkillCache;
 use crate::skills::models::HookActivateRequest;
 use axum::{
     extract::State,
@@ -82,6 +85,15 @@ static HOOK_RATE_LIMITER: LazyLock<RateLimiter> =
 /// Request counter for periodic cleanup.
 static REQUEST_COUNTER: LazyLock<Mutex<u64>> = LazyLock::new(|| Mutex::new(0));
 
+/// Global skill cache for the hook activation hot path.
+/// Caches skills per project (TTL 5min) with pre-compiled triggers.
+static SKILL_CACHE: LazyLock<SkillCache> = LazyLock::new(SkillCache::new);
+
+/// Get the global skill cache (for invalidation from other handlers).
+pub fn skill_cache() -> &'static SkillCache {
+    &SKILL_CACHE
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -133,15 +145,16 @@ pub async fn activate_hook(
         ));
     }
 
-    // --- Activation pipeline ---
+    // --- Activation pipeline (cached) ---
     let config = HookActivationConfig::default();
 
-    let result = activate_for_hook(
+    let result = activate_for_hook_cached(
         state.orchestrator.neo4j(),
         req.project_id,
         &req.tool_name,
         &req.tool_input,
         &config,
+        &SKILL_CACHE,
     )
     .await
     .map_err(|e| {
@@ -174,7 +187,7 @@ pub async fn activate_hook(
 /// GET /api/hooks/health
 ///
 /// Health check for the hooks subsystem.
-/// Returns basic stats about the rate limiter and hook status.
+/// Returns stats about rate limiter, skill cache, and overall hook status.
 pub async fn hooks_health(
     State(_state): State<OrchestratorState>,
 ) -> Json<serde_json::Value> {
@@ -189,11 +202,21 @@ pub async fn hooks_health(
         .map(|c| *c)
         .unwrap_or(0);
 
+    let cache_stats = SKILL_CACHE.stats().await;
+
     Json(serde_json::json!({
         "status": "ok",
         "rate_limiter": {
             "tracked_ips": entries_count,
             "max_requests_per_minute": 100,
+        },
+        "cache": {
+            "active_entries": cache_stats.active_entries,
+            "total_skills": cache_stats.total_skills,
+            "hits": cache_stats.hits,
+            "misses": cache_stats.misses,
+            "hit_rate": cache_stats.hit_rate,
+            "invalidations": cache_stats.invalidations,
         },
         "total_requests": total_requests,
     }))

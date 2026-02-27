@@ -1,6 +1,7 @@
 //! API handlers for Neural Skills
 
 use super::handlers::{AppError, OrchestratorState};
+use super::hook_handlers::skill_cache;
 use super::{PaginatedResponse, PaginationParams};
 use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus, SkillTrigger};
 use axum::{
@@ -140,6 +141,9 @@ pub async fn create_skill(
         .await
         .map_err(AppError::Internal)?;
 
+    // Invalidate hook activation cache for this project
+    skill_cache().invalidate_project(&skill.project_id).await;
+
     Ok((StatusCode::CREATED, Json(skill)))
 }
 
@@ -216,6 +220,9 @@ pub async fn update_skill(
         .await
         .map_err(AppError::Internal)?;
 
+    // Invalidate hook activation cache for this project
+    skill_cache().invalidate_project(&skill.project_id).await;
+
     Ok(Json(skill))
 }
 
@@ -226,6 +233,14 @@ pub async fn delete_skill(
     State(state): State<OrchestratorState>,
     Path(skill_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
+    // Get project_id before deletion for cache invalidation
+    let skill = state
+        .orchestrator
+        .neo4j()
+        .get_skill(skill_id)
+        .await
+        .map_err(AppError::Internal)?;
+
     let deleted = state
         .orchestrator
         .neo4j()
@@ -234,6 +249,10 @@ pub async fn delete_skill(
         .map_err(AppError::Internal)?;
 
     if deleted {
+        // Invalidate hook activation cache for this project
+        if let Some(skill) = skill {
+            skill_cache().invalidate_project(&skill.project_id).await;
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
