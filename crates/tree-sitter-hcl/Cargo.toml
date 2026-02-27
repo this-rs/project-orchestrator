@@ -1,0 +1,14 @@
+[package]
+name = "tree-sitter-hcl"
+version = "1.1.0"
+edition = "2021"
+description = "HCL/Terraform grammar for tree-sitter (ABI 14 compatible)"
+license = "Apache-2.0"
+# Built from tree-sitter-grammars/tree-sitter-hcl v1.1.0 (commit 636dbe7)
+# Grammar ABI version 14, compatible with tree-sitter 0.24.x
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1.0"
