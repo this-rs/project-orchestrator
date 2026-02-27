@@ -8035,12 +8035,14 @@ mod tests {
         ];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_hcl_module_indexed(
-            "./modules/vpc",
-            "infra/main.tf",
-            &index,
+        let result =
+            Orchestrator::resolve_hcl_module_indexed("./modules/vpc", "infra/main.tf", &index);
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 files in modules/vpc, got: {:?}",
+            result
         );
-        assert_eq!(result.len(), 2, "Expected 2 files in modules/vpc, got: {:?}", result);
         assert!(result.contains(&"infra/modules/vpc/main.tf".to_string()));
         assert!(result.contains(&"infra/modules/vpc/variables.tf".to_string()));
     }
@@ -8060,7 +8062,12 @@ mod tests {
             "infra/env/prod/main.tf",
             &index,
         );
-        assert_eq!(result.len(), 2, "Expected 2 files in networking, got: {:?}", result);
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 files in networking, got: {:?}",
+            result
+        );
         assert!(result.contains(&"infra/networking/main.tf".to_string()));
         assert!(result.contains(&"infra/networking/outputs.tf".to_string()));
     }
@@ -8100,30 +8107,29 @@ mod tests {
         ];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_hcl_module_indexed(
-            "__same_dir__",
-            "infra/main.tf",
-            &index,
+        let result =
+            Orchestrator::resolve_hcl_module_indexed("__same_dir__", "infra/main.tf", &index);
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 sibling files, got: {:?}",
+            result
         );
-        assert_eq!(result.len(), 2, "Expected 2 sibling files, got: {:?}", result);
         assert!(result.contains(&"infra/network.tf".to_string()));
         assert!(result.contains(&"infra/variables.tf".to_string()));
     }
 
     #[test]
     fn test_resolve_hcl_same_dir_excludes_self() {
-        let paths = vec![
-            "infra/main.tf".to_string(),
-            "infra/network.tf".to_string(),
-        ];
+        let paths = vec!["infra/main.tf".to_string(), "infra/network.tf".to_string()];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        let result = Orchestrator::resolve_hcl_module_indexed(
-            "__same_dir__",
-            "infra/main.tf",
-            &index,
+        let result =
+            Orchestrator::resolve_hcl_module_indexed("__same_dir__", "infra/main.tf", &index);
+        assert!(
+            !result.contains(&"infra/main.tf".to_string()),
+            "Source file must be excluded from __same_dir__"
         );
-        assert!(!result.contains(&"infra/main.tf".to_string()), "Source file must be excluded from __same_dir__");
         assert_eq!(result, vec!["infra/network.tf"]);
     }
 

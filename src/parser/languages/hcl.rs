@@ -69,12 +69,7 @@ fn extract_blocks(
 }
 
 /// Extract a single HCL block based on its type identifier
-fn extract_block(
-    node: &tree_sitter::Node,
-    source: &str,
-    file_path: &str,
-    parsed: &mut ParsedFile,
-) {
+fn extract_block(node: &tree_sitter::Node, source: &str, file_path: &str, parsed: &mut ParsedFile) {
     // First child should be the block type identifier
     let block_type = match get_block_type(node, source) {
         Some(t) => t,
@@ -333,11 +328,7 @@ fn extract_provider(
 /// e.g., find_attribute_value(body, "source", ...) extracts the value of `source = "..."`.
 ///
 /// Attribute children (no named fields): named_child(0)=identifier, named_child(1)=expression
-fn find_attribute_value(
-    body: &tree_sitter::Node,
-    attr_name: &str,
-    source: &str,
-) -> Option<String> {
+fn find_attribute_value(body: &tree_sitter::Node, attr_name: &str, source: &str) -> Option<String> {
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         if child.kind() == "attribute" {
@@ -404,18 +395,13 @@ fn extract_references_recursive(
                             let prefix = &ref_parts[0];
                             // Skip internal scopes
                             if !is_internal_scope(prefix) {
-                                let callee_name =
-                                    format!("{}.{}", ref_parts[0], ref_parts[1]);
+                                let callee_name = format!("{}.{}", ref_parts[0], ref_parts[1]);
                                 // Avoid duplicate references
-                                if !parsed
-                                    .function_calls
-                                    .iter()
-                                    .any(|c| {
-                                        c.caller_id == caller_id
-                                            && c.callee_name == callee_name
-                                            && c.line == node.start_position().row as u32 + 1
-                                    })
-                                {
+                                if !parsed.function_calls.iter().any(|c| {
+                                    c.caller_id == caller_id
+                                        && c.callee_name == callee_name
+                                        && c.line == node.start_position().row as u32 + 1
+                                }) {
                                     parsed.function_calls.push(FunctionCall {
                                         caller_id: caller_id.to_string(),
                                         callee_name,

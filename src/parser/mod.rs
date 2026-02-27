@@ -1235,7 +1235,10 @@ data "aws_ami" "ubuntu" {
         assert!(parsed.structs.iter().any(|s| s.name == "aws_vpc.main"));
         assert!(parsed.structs.iter().any(|s| s.name == "aws_instance.web"));
         // 1 data source → StructNode
-        assert!(parsed.structs.iter().any(|s| s.name == "data.aws_ami.ubuntu"));
+        assert!(parsed
+            .structs
+            .iter()
+            .any(|s| s.name == "data.aws_ami.ubuntu"));
 
         // Symbols should also contain the struct names
         assert!(parsed.symbols.contains(&"aws_vpc.main".to_string()));
@@ -1318,8 +1321,14 @@ module "database" {
         assert!(parsed.symbols.contains(&"module.database".to_string()));
 
         // Module source imports (+ __same_dir__)
-        assert!(parsed.imports.iter().any(|i| i.path == "./modules/vpc" && i.alias == Some("vpc".to_string())));
-        assert!(parsed.imports.iter().any(|i| i.path == "terraform-aws-modules/rds/aws"));
+        assert!(parsed
+            .imports
+            .iter()
+            .any(|i| i.path == "./modules/vpc" && i.alias == Some("vpc".to_string())));
+        assert!(parsed
+            .imports
+            .iter()
+            .any(|i| i.path == "terraform-aws-modules/rds/aws"));
         assert!(parsed.imports.iter().any(|i| i.path == "__same_dir__"));
     }
 
@@ -1365,15 +1374,29 @@ output "ip" {
         let parsed = result.unwrap();
         // aws_subnet.main reference from aws_instance.web (data.aws_ami is internal scope → filtered)
         assert!(
-            parsed.function_calls.iter().any(|c| c.callee_name == "aws_subnet.main" && c.reason == "hcl-reference"),
+            parsed
+                .function_calls
+                .iter()
+                .any(|c| c.callee_name == "aws_subnet.main" && c.reason == "hcl-reference"),
             "Expected aws_subnet.main reference, got: {:?}",
-            parsed.function_calls.iter().map(|c| &c.callee_name).collect::<Vec<_>>()
+            parsed
+                .function_calls
+                .iter()
+                .map(|c| &c.callee_name)
+                .collect::<Vec<_>>()
         );
         // aws_instance.web reference from output
         assert!(
-            parsed.function_calls.iter().any(|c| c.callee_name == "aws_instance.web" && c.reason == "hcl-reference"),
+            parsed
+                .function_calls
+                .iter()
+                .any(|c| c.callee_name == "aws_instance.web" && c.reason == "hcl-reference"),
             "Expected aws_instance.web reference, got: {:?}",
-            parsed.function_calls.iter().map(|c| &c.callee_name).collect::<Vec<_>>()
+            parsed
+                .function_calls
+                .iter()
+                .map(|c| &c.callee_name)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1426,16 +1449,39 @@ provider "aws" {
         assert_eq!(parsed.language, "hcl");
 
         // 2 resources + 1 data source = 3 structs
-        assert_eq!(parsed.structs.len(), 3, "Expected 3 structs, got: {:?}", parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>());
+        assert_eq!(
+            parsed.structs.len(),
+            3,
+            "Expected 3 structs, got: {:?}",
+            parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
 
         // symbols: 2 resources + 1 data + 1 variable + 2 locals + 1 output + 1 module + 1 provider = 9
-        assert_eq!(parsed.symbols.len(), 9, "Expected 9 symbols, got: {:?}", parsed.symbols);
+        assert_eq!(
+            parsed.symbols.len(),
+            9,
+            "Expected 9 symbols, got: {:?}",
+            parsed.symbols
+        );
 
         // imports: 1 module source + 1 __same_dir__ = 2
-        assert_eq!(parsed.imports.len(), 2, "Expected 2 imports, got: {:?}", parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>());
+        assert_eq!(
+            parsed.imports.len(),
+            2,
+            "Expected 2 imports, got: {:?}",
+            parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+        );
 
         // references: aws_subnet.main + aws_instance.web (data.aws_ami is filtered as internal scope)
-        assert!(parsed.function_calls.len() >= 2, "Expected >= 2 references, got: {:?}", parsed.function_calls.iter().map(|c| &c.callee_name).collect::<Vec<_>>());
+        assert!(
+            parsed.function_calls.len() >= 2,
+            "Expected >= 2 references, got: {:?}",
+            parsed
+                .function_calls
+                .iter()
+                .map(|c| &c.callee_name)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
