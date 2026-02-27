@@ -1167,8 +1167,8 @@ mod tests {
                     "Note {} with substantial content that simulates a real knowledge note with useful information about the codebase patterns and conventions",
                     i
                 ),
-                note_types[i % 4].clone(),
-                importances[i % 4].clone(),
+                note_types[i % 4],
+                importances[i % 4],
                 0.9 - (i as f64 * 0.03), // decreasing energy
             ));
         }

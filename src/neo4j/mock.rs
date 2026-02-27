@@ -6788,8 +6788,8 @@ impl GraphStore for MockGraphStore {
 
     async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
         let mut store = self.skills.write().await;
-        if store.contains_key(&skill.id) {
-            store.insert(skill.id, skill.clone());
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(skill.id) {
+            e.insert(skill.clone());
             Ok(())
         } else {
             anyhow::bail!("Skill not found: {}", skill.id)
@@ -6815,7 +6815,7 @@ impl GraphStore for MockGraphStore {
         let mut filtered: Vec<_> = store
             .values()
             .filter(|s| s.project_id == project_id)
-            .filter(|s| status.map_or(true, |st| s.status == st))
+            .filter(|s| status.is_none_or(|st| s.status == st))
             .cloned()
             .collect();
         filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));

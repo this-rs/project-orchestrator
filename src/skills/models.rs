@@ -170,7 +170,7 @@ impl SkillTrigger {
     /// Check if this trigger is considered reliable based on quality score.
     /// Triggers with quality < 0.3 are unreliable and should be skipped.
     pub fn is_reliable(&self) -> bool {
-        self.quality_score.map_or(true, |q| q >= 0.3)
+        self.quality_score.is_none_or(|q| q >= 0.3)
     }
 }
 

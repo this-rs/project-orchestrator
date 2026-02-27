@@ -45,7 +45,7 @@ pub fn generate_skill_name(tags_per_note: &[Vec<String>], fallback_id: u32) -> S
 
 /// Convert a tag string to title case: "api_auth" → "Api Auth", "neo4j" → "Neo4j"
 fn title_case(s: &str) -> String {
-    s.split(|c: char| c == '_' || c == '-' || c == ' ')
+    s.split(['_', '-', ' '])
         .filter(|part| !part.is_empty())
         .map(|part| {
             let mut chars = part.chars();

@@ -138,7 +138,7 @@ pub async fn activate_hook(
     {
         let mut counter = REQUEST_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
         *counter += 1;
-        if *counter % 100 == 0 {
+        if (*counter).is_multiple_of(100) {
             HOOK_RATE_LIMITER.cleanup();
         }
     }
