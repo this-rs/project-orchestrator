@@ -821,17 +821,17 @@ fn admin_tool() -> ToolDefinition {
 fn skill_tool() -> ToolDefinition {
     ToolDefinition {
         name: "skill".to_string(),
-        description: "Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate".to_string(),
+        description: "Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate"],
+                    "enum": ["list", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate", "export", "import", "get_health"],
                     "description": "Operation to perform"
                 },
-                "skill_id": {"type": "string", "description": "Skill UUID (get/update/delete/get_members/add_member/remove_member/activate)"},
-                "project_id": {"type": "string", "description": "Project UUID (list/create)"},
+                "skill_id": {"type": "string", "description": "Skill UUID (get/update/delete/get_members/add_member/remove_member/activate/export)"},
+                "project_id": {"type": "string", "description": "Project UUID (list/create/import)"},
                 "name": {"type": "string", "description": "Skill name (create/update)"},
                 "description": {"type": "string", "description": "Skill description (create/update)"},
                 "status": {"type": "string", "description": "Status (update): emerging, active, dormant, archived, imported"},
@@ -847,6 +847,9 @@ fn skill_tool() -> ToolDefinition {
                 "entity_type": {"type": "string", "description": "Member entity type: 'note' or 'decision' (add_member/remove_member)"},
                 "entity_id": {"type": "string", "description": "Member entity UUID (add_member/remove_member)"},
                 "query": {"type": "string", "description": "Activation query (activate)"},
+                "package": {"type": "object", "description": "SkillPackage JSON to import (import)"},
+                "conflict_strategy": {"type": "string", "description": "Conflict strategy (import): skip, merge, replace. Default: skip"},
+                "source_project_name": {"type": "string", "description": "Source project name for export metadata (export)"},
                 "limit": {"type": "integer", "description": "Max items (list)"},
                 "offset": {"type": "integer", "description": "Skip items (list)"}
             })),

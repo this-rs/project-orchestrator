@@ -29,6 +29,7 @@ pub mod detection;
 pub mod evolution;
 pub mod export;
 pub mod feedback;
+pub mod import;
 pub mod hook_extractor;
 pub mod lifecycle;
 pub mod maintenance;
@@ -37,17 +38,20 @@ pub mod naming;
 pub mod package;
 pub mod templates;
 pub mod triggers;
+pub mod validation;
 
 pub use activation::*;
 pub use cache::*;
 pub use detection::*;
 pub use export::*;
 pub use hook_extractor::*;
+pub use import::*;
 pub use lifecycle::*;
 pub use models::*;
 pub use package::*;
 pub use templates::*;
 pub use triggers::*;
+pub use validation::*;
 
 // ============================================================================
 // Shared constants for trigger compilation

@@ -3,7 +3,9 @@
 use super::handlers::{AppError, OrchestratorState};
 use super::hook_handlers::skill_cache;
 use super::{PaginatedResponse, PaginationParams};
-use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus, SkillTrigger};
+use crate::skills::{
+    ActivatedSkillContext, ConflictStrategy, ImportResult, SkillNode, SkillStatus, SkillTrigger,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -75,6 +77,25 @@ pub struct SkillMembersResponse {
 #[derive(Debug, Deserialize)]
 pub struct ActivateSkillBody {
     pub query: String,
+}
+
+/// Query parameters for export
+#[derive(Debug, Deserialize, Default)]
+pub struct ExportQuery {
+    /// Optional source project name for metadata
+    pub source_project_name: Option<String>,
+}
+
+/// Request body for importing a skill
+#[derive(Debug, Deserialize)]
+pub struct ImportSkillBody {
+    /// Target project ID
+    pub project_id: Uuid,
+    /// The SkillPackage to import
+    pub package: crate::skills::SkillPackage,
+    /// Conflict strategy: "skip" (default), "merge", "replace"
+    #[serde(default)]
+    pub conflict_strategy: Option<String>,
 }
 
 // ============================================================================
@@ -376,4 +397,102 @@ pub async fn activate_skill(
         })?;
 
     Ok(Json(context))
+}
+
+// ============================================================================
+// Handlers — Export / Import
+// ============================================================================
+
+/// Export a skill as a portable SkillPackage
+///
+/// GET /api/skills/:id/export?source_project_name=...
+pub async fn export_skill(
+    State(state): State<OrchestratorState>,
+    Path(skill_id): Path<Uuid>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Json<crate::skills::SkillPackage>, AppError> {
+    let package = crate::skills::export_skill(
+        skill_id,
+        state.orchestrator.neo4j(),
+        query.source_project_name,
+    )
+    .await
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("not found") {
+            AppError::NotFound(format!("Skill {} not found", skill_id))
+        } else {
+            AppError::Internal(e)
+        }
+    })?;
+
+    Ok(Json(package))
+}
+
+/// Import a skill from a SkillPackage into a target project
+///
+/// POST /api/skills/import
+pub async fn import_skill(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<ImportSkillBody>,
+) -> Result<(StatusCode, Json<ImportResult>), AppError> {
+    // Parse conflict strategy (default: Skip)
+    let strategy = match body.conflict_strategy.as_deref() {
+        Some("merge") => ConflictStrategy::Merge,
+        Some("replace") => ConflictStrategy::Replace,
+        Some("skip") | None => ConflictStrategy::Skip,
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "Invalid conflict_strategy '{}'. Must be: skip, merge, replace",
+                other
+            )));
+        }
+    };
+
+    let result = crate::skills::import_skill(
+        &body.package,
+        body.project_id,
+        state.orchestrator.neo4j(),
+        strategy,
+    )
+    .await
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("already exists") {
+            AppError::Conflict(msg)
+        } else if msg.contains("validation failed") {
+            AppError::BadRequest(msg)
+        } else {
+            AppError::Internal(e)
+        }
+    })?;
+
+    // Invalidate skill cache for the target project
+    skill_cache().invalidate_project(&body.project_id).await;
+
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+// ============================================================================
+// Handlers — Health
+// ============================================================================
+
+/// Get health metrics for a skill
+///
+/// GET /api/skills/:id/health
+pub async fn get_skill_health(
+    State(state): State<OrchestratorState>,
+    Path(skill_id): Path<Uuid>,
+) -> Result<Json<crate::skills::SkillHealthMetrics>, AppError> {
+    let skill = state
+        .orchestrator
+        .neo4j()
+        .get_skill(skill_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Skill {} not found", skill_id)))?;
+
+    let health = crate::skills::validation::compute_health(&skill, Utc::now());
+
+    Ok(Json(health))
 }

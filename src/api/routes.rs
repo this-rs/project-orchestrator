@@ -696,6 +696,18 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/skills/{skill_id}/activate",
             post(skill_handlers::activate_skill),
         )
+        .route(
+            "/api/skills/{skill_id}/export",
+            get(skill_handlers::export_skill),
+        )
+        .route(
+            "/api/skills/import",
+            post(skill_handlers::import_skill),
+        )
+        .route(
+            "/api/skills/{skill_id}/health",
+            get(skill_handlers::get_skill_health),
+        )
         // ================================================================
         // Admin — Embedding Backfill
         // ================================================================

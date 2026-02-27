@@ -301,6 +301,9 @@ impl ToolHandler {
             ("skill", "add_member") => "add_skill_member",
             ("skill", "remove_member") => "remove_skill_member",
             ("skill", "activate") => "activate_skill",
+            ("skill", "export") => "export_skill",
+            ("skill", "import") => "import_skill",
+            ("skill", "get_health") => "get_skill_health",
 
             // Admin
             ("admin", "sync_directory") => "sync_directory",

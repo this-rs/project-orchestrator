@@ -349,6 +349,82 @@ pub async fn archive_skill(graph_store: &dyn GraphStore, skill_id: Uuid) -> anyh
 }
 
 // ============================================================================
+// Imported skill transitions
+// ============================================================================
+
+/// Archive an imported skill directly (accelerated degradation).
+///
+/// Used for imported skills that fail the probation period (no activations
+/// after `IMPORT_PROBATION_DAYS`). Skips the normal Dormant stage.
+pub async fn archive_imported_skill(
+    graph_store: &dyn GraphStore,
+    skill_id: Uuid,
+) -> anyhow::Result<()> {
+    let mut skill = graph_store
+        .get_skill(skill_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Skill {} not found", skill_id))?;
+
+    if skill.status != SkillStatus::Imported {
+        anyhow::bail!(
+            "Cannot archive imported skill {} — status is {:?}, expected Imported",
+            skill_id,
+            skill.status
+        );
+    }
+
+    skill.status = SkillStatus::Archived;
+    skill.updated_at = Utc::now();
+    graph_store.update_skill(&skill).await?;
+
+    info!(
+        skill_id = %skill_id,
+        skill_name = %skill.name,
+        days_since_import = skill.imported_at.map(|dt| (Utc::now() - dt).num_days()).unwrap_or(0),
+        "Archived imported skill (failed probation) Imported → Archived"
+    );
+
+    Ok(())
+}
+
+/// Validate an imported skill and promote to Emerging.
+///
+/// Called when an imported skill has enough activations to prove its value.
+/// Sets `is_validated = true` and transitions to Emerging, where the normal
+/// lifecycle rules apply (Emerging → Active with further usage).
+pub async fn validate_imported_skill(
+    graph_store: &dyn GraphStore,
+    skill_id: Uuid,
+) -> anyhow::Result<()> {
+    let mut skill = graph_store
+        .get_skill(skill_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Skill {} not found", skill_id))?;
+
+    if skill.status != SkillStatus::Imported {
+        anyhow::bail!(
+            "Cannot validate skill {} — status is {:?}, expected Imported",
+            skill_id,
+            skill.status
+        );
+    }
+
+    skill.status = SkillStatus::Emerging;
+    skill.is_validated = true;
+    skill.updated_at = Utc::now();
+    graph_store.update_skill(&skill).await?;
+
+    info!(
+        skill_id = %skill_id,
+        skill_name = %skill.name,
+        activation_count = skill.activation_count,
+        "Validated imported skill Imported → Emerging (is_validated=true)"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
 // Reactivation
 // ============================================================================
 
@@ -509,7 +585,39 @@ pub async fn update_skill_lifecycle(
                     }
                 }
             }
-            _ => {} // Archived/Imported — no transitions
+            SkillStatus::Imported => {
+                // Imported skills: accelerated Darwinian selection
+                if crate::skills::validation::should_accelerate_archive(&current_skill, now) {
+                    // Past probation with zero activations → archive directly
+                    match archive_imported_skill(graph_store, current_skill.id).await {
+                        Ok(()) => {
+                            result.skills_archived += 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                skill_id = %current_skill.id,
+                                error = %e,
+                                "Failed to archive unused imported skill"
+                            );
+                        }
+                    }
+                } else if crate::skills::validation::qualifies_for_validation(&current_skill) {
+                    // Enough activations → validate and promote to Emerging
+                    match validate_imported_skill(graph_store, current_skill.id).await {
+                        Ok(()) => {
+                            result.skills_promoted += 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                skill_id = %current_skill.id,
+                                error = %e,
+                                "Failed to validate imported skill"
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {} // Archived — no transitions
         }
     }
 
