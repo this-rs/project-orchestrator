@@ -56,6 +56,9 @@ RUN apt-get update && apt-get install -y \
 # Copy manifests for dependency caching (Cargo.lock required for reproducible builds)
 COPY Cargo.toml Cargo.lock ./
 
+# Copy local crates (path dependencies referenced in Cargo.toml)
+COPY crates ./crates/
+
 # Create dummy source files to build dependencies.
 # This must match the actual module layout so the dep-cache layer is valid.
 # Module directories (11):
