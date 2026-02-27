@@ -291,6 +291,18 @@ pub async fn add_skill_member(
         ));
     }
 
+    // Pre-check skill existence to return 404 instead of silent 201
+    let skill = state
+        .orchestrator
+        .neo4j()
+        .get_skill(skill_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    if skill.is_none() {
+        return Err(AppError::NotFound(format!("Skill {} not found", skill_id)));
+    }
+
     state
         .orchestrator
         .neo4j()
@@ -345,6 +357,18 @@ pub async fn activate_skill(
 ) -> Result<Json<ActivatedSkillContext>, AppError> {
     if body.query.trim().is_empty() {
         return Err(AppError::BadRequest("query cannot be empty".to_string()));
+    }
+
+    // Pre-check existence to return 404 instead of 500 for missing skills
+    let skill = state
+        .orchestrator
+        .neo4j()
+        .get_skill(skill_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    if skill.is_none() {
+        return Err(AppError::NotFound(format!("Skill {} not found", skill_id)));
     }
 
     let context = state

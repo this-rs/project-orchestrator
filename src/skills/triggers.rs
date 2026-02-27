@@ -318,21 +318,27 @@ pub fn generate_semantic_trigger(
         return None;
     }
 
-    // Compute centroid: mean of all embedding vectors
+    // Compute centroid: mean of dimension-matched embedding vectors
     let mut centroid = vec![0.0_f64; dim];
-    let count = embeddings.len() as f64;
+    let mut matched_count = 0_usize;
 
     for embedding in embeddings.values() {
         if embedding.len() != dim {
             continue; // Skip mismatched dimensions
         }
+        matched_count += 1;
         for (i, val) in embedding.iter().enumerate() {
             centroid[i] += val;
         }
     }
 
+    if matched_count == 0 {
+        return None;
+    }
+
+    let divisor = matched_count as f64;
     for val in &mut centroid {
-        *val /= count;
+        *val /= divisor;
     }
 
     // Normalize the centroid to unit length

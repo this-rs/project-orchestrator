@@ -837,7 +837,7 @@ fn skill_tool() -> ToolDefinition {
                 "trigger_patterns": {
                     "type": "array",
                     "items": {"type": "object"},
-                    "description": "Trigger patterns (create/update): [{\"pattern_type\": \"Regex\"|\"FileGlob\"|\"Semantic\", \"pattern_value\": \"...\", \"confidence_threshold\": 0.7}]"
+                    "description": "Trigger patterns (create/update): [{\"pattern_type\": \"regex\"|\"file_glob\"|\"semantic\", \"pattern_value\": \"...\", \"confidence_threshold\": 0.7}]"
                 },
                 "context_template": {"type": "string", "description": "Context template (create/update)"},
                 "energy": {"type": "number", "description": "Energy 0-1 (update)"},

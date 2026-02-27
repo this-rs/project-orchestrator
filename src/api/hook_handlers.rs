@@ -374,8 +374,9 @@ pub async fn session_context(
 // ============================================================================
 
 /// Truncate a string to `max_len` characters, appending "..." if truncated.
+/// Uses char count (not byte length) for correct multi-byte UTF-8 handling.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
         let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();

@@ -570,10 +570,13 @@ pub fn assemble_context_with_confidence(
         }
     }
 
-    // Final hard budget enforcement
-    if context.len() > max_chars {
-        context.truncate(max_chars.saturating_sub(3));
-        context.push_str("...");
+    // Final hard budget enforcement (use char_indices for UTF-8 safety)
+    if context.chars().count() > max_chars {
+        let trunc_target = max_chars.saturating_sub(3);
+        if let Some((byte_pos, _)) = context.char_indices().nth(trunc_target) {
+            context.truncate(byte_pos);
+            context.push_str("...");
+        }
     }
 
     context
