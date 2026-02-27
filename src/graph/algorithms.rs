@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use super::models::{
     AnalyticsConfig, CodeGraph, CodeHealthReport, CommunityInfo, ComponentInfo, GraphAnalytics,
-    NodeMetrics,
+    LargeGraphConfig, NodeMetrics,
 };
 
 // ============================================================================
@@ -144,15 +144,30 @@ pub fn betweenness_centrality(graph: &CodeGraph) -> HashMap<String, f64> {
 ///
 /// The algorithm works on an undirected view of the graph and maximizes
 /// modularity through greedy local moves of nodes between communities.
+///
+/// When `config.large_graph` is `Some` AND the graph exceeds `max_nodes_full`,
+/// the algorithm applies adaptive optimizations:
+/// - **Edge filtering**: edges with weight < `min_confidence` are excluded
+/// - **Degree-1 pre-assignment**: leaf nodes skip Louvain iterations
+/// - **Timeout**: the loop aborts after `max_duration_ms` returning partial results
 pub fn louvain_communities(
     graph: &CodeGraph,
-    resolution: f64,
+    config: &AnalyticsConfig,
 ) -> (HashMap<String, u32>, Vec<CommunityInfo>, f64) {
     let g = &graph.graph;
     let n = g.node_count();
+    let resolution = config.louvain_resolution;
     if n == 0 {
         return (HashMap::new(), vec![], 0.0);
     }
+
+    // Determine if large-graph mode is active
+    let large_graph_active = config
+        .large_graph
+        .as_ref()
+        .map(|lg| n > lg.max_nodes_full)
+        .unwrap_or(false);
+    let lg_config = config.large_graph.as_ref();
 
     // Build undirected adjacency lists (much faster than HashMap<(usize,usize)>)
     let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
@@ -162,6 +177,15 @@ pub fn louvain_communities(
         let s = edge.source().index();
         let t = edge.target().index();
         let w = edge.weight().weight;
+
+        // Large-graph mode: filter low-confidence edges
+        if large_graph_active {
+            if let Some(lg) = lg_config {
+                if w < lg.min_confidence {
+                    continue;
+                }
+            }
+        }
 
         // Undirected: add weight to both directions
         adj[s].push((t, w));
@@ -183,6 +207,8 @@ pub fn louvain_communities(
                 size: 1,
                 members: vec![id],
                 label: format!("community_{}", i),
+                cohesion: 1.0,
+                enriched_by: Some("heuristic".to_string()),
             });
         }
         return (node_map, communities, 0.0);
@@ -190,6 +216,22 @@ pub fn louvain_communities(
 
     // Initialize: each node in its own community
     let mut community: Vec<u32> = (0..n as u32).collect();
+
+    // Large-graph mode: pre-assign degree-1 nodes to their sole neighbor's community
+    let mut frozen: Vec<bool> = vec![false; n];
+    if large_graph_active {
+        if let Some(lg) = lg_config {
+            if lg.skip_degree_one {
+                for node_idx in 0..n {
+                    if adj[node_idx].len() == 1 {
+                        let neighbor = adj[node_idx][0].0;
+                        community[node_idx] = community[neighbor];
+                        frozen[node_idx] = true;
+                    }
+                }
+            }
+        }
+    }
 
     // Maintain community total strength incrementally
     let mut comm_total_strength: HashMap<u32, f64> = HashMap::with_capacity(n);
@@ -199,13 +241,36 @@ pub fn louvain_communities(
 
     let mut improved = true;
     let mut iterations = 0;
-    let max_iterations = 100;
+    let max_iterations = config.louvain_max_iterations;
+
+    // Timeout support
+    let start_time = std::time::Instant::now();
+    let timeout_ms = if large_graph_active {
+        lg_config.map(|lg| lg.max_duration_ms).unwrap_or(u64::MAX)
+    } else {
+        u64::MAX // no timeout in classic mode
+    };
 
     while improved && iterations < max_iterations {
+        // Check timeout
+        if start_time.elapsed().as_millis() as u64 > timeout_ms {
+            tracing::warn!(
+                "Louvain timeout after {}ms ({} iterations) — returning partial result",
+                start_time.elapsed().as_millis(),
+                iterations
+            );
+            break;
+        }
+
         improved = false;
         iterations += 1;
 
         for node_idx in 0..n {
+            // Skip frozen (degree-1 pre-assigned) nodes
+            if frozen[node_idx] {
+                continue;
+            }
+
             let current_comm = community[node_idx];
 
             // Calculate sum of weights to each neighboring community using adjacency list
@@ -285,7 +350,7 @@ pub fn louvain_communities(
         comm_members.entry(comm_id).or_default().push(id);
     }
 
-    // Build CommunityInfo with auto-generated labels
+    // Build CommunityInfo with auto-generated labels (cohesion computed separately)
     let mut communities: Vec<CommunityInfo> = comm_members
         .into_iter()
         .map(|(id, members)| {
@@ -295,6 +360,8 @@ pub fn louvain_communities(
                 size: members.len(),
                 members,
                 label,
+                cohesion: 0.0, // Computed later by compute_cohesion()
+                enriched_by: Some("heuristic".to_string()),
             }
         })
         .collect();
@@ -382,6 +449,97 @@ fn compute_modularity(
     // Each undirected edge is counted twice in the adjacency list,
     // so dividing by m2 gives the correct Q
     q / m2
+}
+
+// ============================================================================
+// Cohesion Scoring — internal vs external edge ratio per community
+// ============================================================================
+
+/// Compute cohesion for each community.
+///
+/// Cohesion = internal_edges / (internal_edges + external_edges)
+/// where:
+/// - internal_edges = edges with both endpoints in the same community
+/// - external_edges = edges with one endpoint in the community and one outside
+///
+/// For large communities (> `sample_threshold` members), we sample a subset
+/// of members to estimate cohesion efficiently.
+///
+/// Returns a map from community ID to cohesion score (0.0–1.0).
+pub fn compute_cohesion(
+    graph: &CodeGraph,
+    communities: &[CommunityInfo],
+    node_to_community: &HashMap<String, u32>,
+) -> HashMap<u32, f64> {
+    let g = &graph.graph;
+    let sample_threshold: usize = 50;
+    let mut result = HashMap::with_capacity(communities.len());
+
+    for community in communities {
+        if community.size == 0 {
+            result.insert(community.id, 1.0);
+            continue;
+        }
+        if community.size == 1 {
+            // Single-node community: no internal or external edges possible
+            // by convention, treat as perfectly cohesive
+            result.insert(community.id, 1.0);
+            continue;
+        }
+
+        // Determine which members to inspect
+        let members_to_scan: Vec<&str> = if community.members.len() > sample_threshold {
+            // Deterministic sampling: take every Nth member
+            let step = community.members.len() / sample_threshold;
+            community
+                .members
+                .iter()
+                .step_by(step.max(1))
+                .take(sample_threshold)
+                .map(|s| s.as_str())
+                .collect()
+        } else {
+            community.members.iter().map(|s| s.as_str()).collect()
+        };
+
+        let mut internal = 0u64;
+        let mut external = 0u64;
+
+        for member_id in &members_to_scan {
+            if let Some(&idx) = graph.id_to_index.get(*member_id) {
+                // Check outgoing edges
+                for neighbor in g.neighbors_directed(idx, Direction::Outgoing) {
+                    let neighbor_id = &g[neighbor].id;
+                    let neighbor_comm = node_to_community.get(neighbor_id).copied();
+                    if neighbor_comm == Some(community.id) {
+                        internal += 1;
+                    } else {
+                        external += 1;
+                    }
+                }
+                // Check incoming edges
+                for neighbor in g.neighbors_directed(idx, Direction::Incoming) {
+                    let neighbor_id = &g[neighbor].id;
+                    let neighbor_comm = node_to_community.get(neighbor_id).copied();
+                    if neighbor_comm == Some(community.id) {
+                        internal += 1;
+                    } else {
+                        external += 1;
+                    }
+                }
+            }
+        }
+
+        let total = internal + external;
+        let cohesion = if total == 0 {
+            1.0 // No edges at all → treat as perfectly cohesive
+        } else {
+            internal as f64 / total as f64
+        };
+        result.insert(community.id, cohesion);
+    }
+
+    result
 }
 
 // ============================================================================
@@ -616,7 +774,15 @@ pub fn compute_all(graph: &CodeGraph, config: &AnalyticsConfig) -> GraphAnalytic
     let bc = betweenness_centrality(graph);
 
     // 3. Louvain communities
-    let (comm_map, communities, modularity) = louvain_communities(graph, config.louvain_resolution);
+    let (comm_map, mut communities, modularity) = louvain_communities(graph, config);
+
+    // 3b. Compute cohesion for each community
+    let cohesion_map = compute_cohesion(graph, &communities, &comm_map);
+    for community in &mut communities {
+        if let Some(&coh) = cohesion_map.get(&community.id) {
+            community.cohesion = coh;
+        }
+    }
 
     // 4. Clustering coefficient
     let cc = clustering_coefficient(graph);
@@ -1060,7 +1226,7 @@ mod tests {
     #[test]
     fn test_louvain_two_cliques_detects_2_communities() {
         let g = make_two_cliques(4); // Two K4 connected by one edge
-        let (node_map, communities, modularity) = louvain_communities(&g, 1.0);
+        let (node_map, communities, modularity) = louvain_communities(&g, &AnalyticsConfig::default());
 
         assert_eq!(node_map.len(), 8);
         assert!(
@@ -1096,7 +1262,7 @@ mod tests {
     #[test]
     fn test_louvain_complete_graph_single_community() {
         let g = make_complete_graph(5); // K5
-        let (_, communities, _) = louvain_communities(&g, 1.0);
+        let (_, communities, _) = louvain_communities(&g, &AnalyticsConfig::default());
 
         assert_eq!(
             communities.len(),
@@ -1352,5 +1518,264 @@ mod tests {
             "src/orphan.rs should be detected as orphan, got: {:?}",
             analytics.health.orphan_files
         );
+    }
+
+    // --- Large-Graph Mode Tests ---
+
+    /// Build a graph with mixed edge weights (some low, some high) for
+    /// testing the large-graph edge filtering.
+    fn make_mixed_weight_graph(n: usize) -> CodeGraph {
+        let mut g = CodeGraph::new();
+        let names: Vec<String> = (0..n).map(|i| format!("node_{}", i)).collect();
+        for name in &names {
+            g.add_node(CodeNode {
+                id: name.clone(),
+                node_type: CodeNodeType::Function,
+                path: None,
+                name: name.clone(),
+                project_id: None,
+            });
+        }
+        // Create two dense subgraphs connected by low-weight edges:
+        // First half: strong edges (weight 0.9)
+        let half = n / 2;
+        for i in 0..half {
+            for j in (i + 1)..half {
+                g.add_edge(
+                    &names[i],
+                    &names[j],
+                    CodeEdge {
+                        edge_type: CodeEdgeType::Calls,
+                        weight: 0.9,
+                    },
+                );
+            }
+        }
+        // Second half: strong edges (weight 0.9)
+        for i in half..n {
+            for j in (i + 1)..n {
+                g.add_edge(
+                    &names[i],
+                    &names[j],
+                    CodeEdge {
+                        edge_type: CodeEdgeType::Calls,
+                        weight: 0.9,
+                    },
+                );
+            }
+        }
+        // Cross-group: low-weight edges (weight 0.3)
+        for i in 0..half {
+            let j = half + (i % (n - half));
+            g.add_edge(
+                &names[i],
+                &names[j],
+                CodeEdge {
+                    edge_type: CodeEdgeType::Calls,
+                    weight: 0.3,
+                },
+            );
+        }
+        g
+    }
+
+    #[test]
+    fn test_louvain_large_graph_none_identical_to_classic() {
+        // With large_graph = None, results must be identical to classic mode
+        let g = make_two_cliques(4);
+        let config_none = AnalyticsConfig::default(); // large_graph: None
+        let (map1, comms1, mod1) = louvain_communities(&g, &config_none);
+
+        // Explicitly set large_graph but with a threshold above the graph size
+        let config_high = AnalyticsConfig {
+            large_graph: Some(LargeGraphConfig {
+                max_nodes_full: 1000, // 8 nodes < 1000 → not activated
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (map2, comms2, mod2) = louvain_communities(&g, &config_high);
+
+        assert_eq!(map1, map2, "Community assignments should be identical");
+        assert_eq!(comms1.len(), comms2.len());
+        assert!(
+            (mod1 - mod2).abs() < 1e-10,
+            "Modularity should be identical"
+        );
+    }
+
+    #[test]
+    fn test_louvain_large_graph_filters_low_weight_edges() {
+        // Create a graph where low-weight cross-edges link two clusters.
+        // With large-graph mode (threshold low enough to activate), those
+        // low-weight edges should be filtered, resulting in cleaner separation.
+        let g = make_mixed_weight_graph(20); // 10 + 10 nodes
+
+        // Classic mode (no filtering) — may merge clusters
+        let config_classic = AnalyticsConfig::default();
+        let (_, comms_classic, _) = louvain_communities(&g, &config_classic);
+
+        // Large-graph mode with threshold = 5 (20 > 5 → activated), min_confidence = 0.5
+        let config_lg = AnalyticsConfig {
+            large_graph: Some(LargeGraphConfig {
+                max_nodes_full: 5,
+                min_confidence: 0.5,
+                skip_degree_one: true,
+                max_duration_ms: 60_000,
+            }),
+            ..Default::default()
+        };
+        let (map_lg, comms_lg, _) = louvain_communities(&g, &config_lg);
+
+        // With filtering, the two halves should clearly separate into 2 communities
+        assert!(
+            comms_lg.len() >= 2,
+            "Large-graph mode should detect ≥2 communities (got {}), classic had {}",
+            comms_lg.len(),
+            comms_classic.len()
+        );
+
+        // Verify: first half and second half are in different communities
+        let comm_first = map_lg["node_0"];
+        let comm_second = map_lg["node_10"];
+        assert_ne!(
+            comm_first, comm_second,
+            "The two halves should be in different communities with edge filtering"
+        );
+    }
+
+    #[test]
+    fn test_louvain_large_graph_timeout_returns_partial() {
+        // With max_duration_ms = 0, the loop should break immediately
+        // and return a valid (partial) result
+        let g = make_two_cliques(4);
+        let config = AnalyticsConfig {
+            large_graph: Some(LargeGraphConfig {
+                max_nodes_full: 1, // 8 > 1 → activated
+                min_confidence: 0.0,
+                skip_degree_one: false,
+                max_duration_ms: 0, // instant timeout
+            }),
+            ..Default::default()
+        };
+        let (node_map, communities, _modularity) = louvain_communities(&g, &config);
+
+        // Should still return valid data (every node assigned to a community)
+        assert_eq!(node_map.len(), 8, "All 8 nodes should be assigned");
+        assert!(
+            !communities.is_empty(),
+            "Should return at least one community"
+        );
+        // The community count may vary (partial result), but it should be valid
+        let total_members: usize = communities.iter().map(|c| c.size).sum();
+        assert_eq!(
+            total_members, 8,
+            "Total members across communities should equal node count"
+        );
+    }
+
+    #[test]
+    fn test_louvain_large_graph_degree_one_pre_assignment() {
+        // Build a star graph: center has 5 neighbors, each leaf has degree 1
+        // With skip_degree_one, leaves should be pre-assigned to center's community
+        let g = make_star_graph(5);
+        let config = AnalyticsConfig {
+            large_graph: Some(LargeGraphConfig {
+                max_nodes_full: 1, // 6 > 1 → activated
+                min_confidence: 0.0,
+                skip_degree_one: true,
+                max_duration_ms: 60_000,
+            }),
+            ..Default::default()
+        };
+        let (node_map, communities, _) = louvain_communities(&g, &config);
+
+        // All leaves should be in the same community as center
+        let center_comm = node_map["center"];
+        for i in 0..5 {
+            assert_eq!(
+                node_map[&format!("leaf_{}", i)],
+                center_comm,
+                "Leaf {} should be pre-assigned to center's community",
+                i
+            );
+        }
+        // Should be a single community
+        assert_eq!(communities.len(), 1, "Star graph should form 1 community");
+    }
+
+    // --- Cohesion Tests ---
+
+    #[test]
+    fn test_cohesion_two_cliques_high() {
+        let g = make_two_cliques(4);
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+
+        // Two well-separated cliques should each have high cohesion
+        assert_eq!(analytics.communities.len(), 2);
+        for comm in &analytics.communities {
+            assert!(
+                comm.cohesion > 0.8,
+                "Community {} (size {}) should have high cohesion, got {}",
+                comm.id,
+                comm.size,
+                comm.cohesion
+            );
+        }
+    }
+
+    #[test]
+    fn test_cohesion_single_node_community() {
+        // A single isolated node forms its own community → cohesion = 1.0
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "alone".to_string(),
+            node_type: CodeNodeType::Function,
+            path: None,
+            name: "alone".to_string(),
+            project_id: None,
+        });
+
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+
+        assert_eq!(analytics.communities.len(), 1);
+        assert!(
+            (analytics.communities[0].cohesion - 1.0).abs() < f64::EPSILON,
+            "Single-node community should have cohesion 1.0, got {}",
+            analytics.communities[0].cohesion
+        );
+    }
+
+    #[test]
+    fn test_cohesion_complete_graph_is_one() {
+        // Complete graph K5 → 1 community → all edges internal → cohesion = 1.0
+        let g = make_complete_graph(5);
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+
+        assert_eq!(analytics.communities.len(), 1);
+        assert!(
+            (analytics.communities[0].cohesion - 1.0).abs() < f64::EPSILON,
+            "Complete graph single community should have cohesion 1.0, got {}",
+            analytics.communities[0].cohesion
+        );
+    }
+
+    #[test]
+    fn test_cohesion_compute_all_includes_cohesion() {
+        // Verify that compute_all populates cohesion on every community
+        let g = make_two_cliques(4);
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+
+        for comm in &analytics.communities {
+            assert!(
+                comm.cohesion > 0.0,
+                "Community {} should have non-zero cohesion",
+                comm.id
+            );
+        }
     }
 }

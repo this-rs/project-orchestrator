@@ -258,6 +258,13 @@ pub struct CommunityInfo {
     pub members: Vec<String>,
     /// Auto-generated label (e.g. top file or function names)
     pub label: String,
+    /// Cohesion ratio: internal_edges / (internal_edges + external_edges).
+    /// 1.0 = perfectly isolated community, 0.0 = no internal edges.
+    #[serde(default)]
+    pub cohesion: f64,
+    /// How the label was generated: "heuristic" (path prefix) or "llm" (LLM-enriched).
+    #[serde(default)]
+    pub enriched_by: Option<String>,
 }
 
 /// Metadata about a weakly connected component.
@@ -378,6 +385,38 @@ pub struct FunctionAnalyticsUpdate {
 // Configuration
 // ============================================================================
 
+/// Configuration for large-graph adaptive mode in Louvain community detection.
+///
+/// When enabled AND the graph exceeds `max_nodes_full` nodes, the algorithm
+/// applies optimizations:
+/// - **Edge filtering**: edges with weight < `min_confidence` are excluded
+/// - **Degree-1 pre-assignment**: leaf nodes are assigned to their sole neighbor's
+///   community without participating in Louvain iterations
+/// - **Timeout**: the iterative loop aborts after `max_duration_ms` and returns
+///   a partial (but valid) result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LargeGraphConfig {
+    /// Node count threshold to activate large-graph mode (default: 10_000)
+    pub max_nodes_full: usize,
+    /// Minimum edge weight to keep in the adjacency list (default: 0.5)
+    pub min_confidence: f64,
+    /// Pre-assign degree-1 nodes to their neighbor's community (default: true)
+    pub skip_degree_one: bool,
+    /// Maximum wall-clock time for the Louvain loop in ms (default: 60_000)
+    pub max_duration_ms: u64,
+}
+
+impl Default for LargeGraphConfig {
+    fn default() -> Self {
+        Self {
+            max_nodes_full: 10_000,
+            min_confidence: 0.5,
+            skip_degree_one: true,
+            max_duration_ms: 60_000,
+        }
+    }
+}
+
 /// Tuning parameters for graph analytics algorithms.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsConfig {
@@ -393,6 +432,9 @@ pub struct AnalyticsConfig {
     pub louvain_max_iterations: usize,
     /// Percentile threshold for "god function" detection (default: 0.95)
     pub god_function_percentile: f64,
+    /// Optional large-graph mode for Louvain (None = classic mode, Some = adaptive)
+    #[serde(default)]
+    pub large_graph: Option<LargeGraphConfig>,
 }
 
 impl Default for AnalyticsConfig {
@@ -404,6 +446,7 @@ impl Default for AnalyticsConfig {
             louvain_resolution: 1.0,
             louvain_max_iterations: 100,
             god_function_percentile: 0.95,
+            large_graph: None,
         }
     }
 }

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::algorithms::compute_all;
+use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
 use super::writer::AnalyticsWriter;
@@ -97,22 +98,42 @@ pub trait AnalyticsEngine: Send + Sync {
 /// Real analytics engine backed by a `GraphStore`.
 ///
 /// Composes `GraphExtractor` (extraction), `compute_all` (algorithms),
+/// `CommunityEnricher` (optional LLM label enrichment),
 /// and `AnalyticsWriter` (persistence) into a single pipeline.
 pub struct GraphAnalyticsEngine {
     store: Arc<dyn GraphStore>,
     extractor: GraphExtractor,
     writer: AnalyticsWriter,
     config: AnalyticsConfig,
+    enricher: Arc<dyn CommunityEnricher>,
 }
 
 impl GraphAnalyticsEngine {
     /// Create a new engine backed by the given GraphStore.
+    ///
+    /// Uses `NoopCommunityEnricher` by default (heuristic labels only).
     pub fn new(store: Arc<dyn GraphStore>, config: AnalyticsConfig) -> Self {
         Self {
             store: store.clone(),
             extractor: GraphExtractor::new(store.clone()),
             writer: AnalyticsWriter::new(store),
             config,
+            enricher: Arc::new(NoopCommunityEnricher),
+        }
+    }
+
+    /// Create a new engine with a custom community enricher.
+    pub fn with_enricher(
+        store: Arc<dyn GraphStore>,
+        config: AnalyticsConfig,
+        enricher: Arc<dyn CommunityEnricher>,
+    ) -> Self {
+        Self {
+            store: store.clone(),
+            extractor: GraphExtractor::new(store.clone()),
+            writer: AnalyticsWriter::new(store),
+            config,
+            enricher,
         }
     }
 }
@@ -124,7 +145,16 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         let graph = self.extractor.extract_file_graph(project_id).await?;
 
         // 2. Compute
-        let analytics = compute_all(&graph, &self.config);
+        let mut analytics = compute_all(&graph, &self.config);
+
+        // 2b. Enrich community labels (LLM or noop)
+        if let Err(e) = self
+            .enricher
+            .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
+            .await
+        {
+            tracing::warn!("Community enrichment failed, keeping heuristic labels: {}", e);
+        }
 
         // 3. Persist
         self.writer.write_analytics(&analytics, &graph).await?;
@@ -137,7 +167,16 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         let graph = self.extractor.extract_function_graph(project_id).await?;
 
         // 2. Compute
-        let analytics = compute_all(&graph, &self.config);
+        let mut analytics = compute_all(&graph, &self.config);
+
+        // 2b. Enrich community labels (LLM or noop)
+        if let Err(e) = self
+            .enricher
+            .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
+            .await
+        {
+            tracing::warn!("Community enrichment failed, keeping heuristic labels: {}", e);
+        }
 
         // 3. Persist
         self.writer.write_analytics(&analytics, &graph).await?;
@@ -168,7 +207,16 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             .await?;
 
         // 2. Compute analytics (PageRank, Louvain, Betweenness all use edge weights)
-        let analytics = compute_all(&graph, &self.config);
+        let mut analytics = compute_all(&graph, &self.config);
+
+        // 2b. Enrich community labels (LLM or noop)
+        if let Err(e) = self
+            .enricher
+            .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
+            .await
+        {
+            tracing::warn!("Community enrichment failed, keeping heuristic labels: {}", e);
+        }
 
         // 3. Persist to fabric_* properties (NOT the code-only properties)
         self.writer

@@ -32,6 +32,7 @@
 pub mod algorithms;
 pub mod debouncer;
 pub mod engine;
+pub mod enrichment;
 pub mod extraction;
 pub mod models;
 pub mod process;
