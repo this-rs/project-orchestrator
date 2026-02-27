@@ -4,24 +4,31 @@
 //! to get contextual knowledge injection. This endpoint is PUBLIC (no JWT)
 //! but rate-limited per IP (100 requests/minute).
 //!
+//! Also provides `/api/hooks/session-context` for session-start hooks to
+//! inject active skills, current plan/task, and critical notes.
+//!
 //! Performance budget: < 200ms P99 for the complete request cycle.
 
 use super::handlers::{AppError, OrchestratorState};
 use crate::neurons::AutoReinforcementConfig;
+use crate::notes::models::{NoteFilters, NoteImportance, NoteStatus};
 use crate::skills::activation::{
     activate_for_hook_cached, spawn_hook_reinforcement, HookActivationConfig,
 };
 use crate::skills::cache::SkillCache;
 use crate::skills::models::HookActivateRequest;
+use crate::skills::SkillStatus;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 // ============================================================================
 // Rate Limiter
@@ -223,6 +230,167 @@ pub async fn hooks_health(
 }
 
 // ============================================================================
+// Session Context
+// ============================================================================
+
+/// Query parameters for GET /api/hooks/session-context
+#[derive(Debug, Deserialize)]
+pub struct SessionContextQuery {
+    /// Project UUID (required)
+    pub project_id: Uuid,
+}
+
+/// GET /api/hooks/session-context
+///
+/// Returns session context for the SessionStart hook.
+/// Provides a snapshot of active skills, current plan/task, and critical notes
+/// for injection into the Claude Code system prompt at session start.
+///
+/// Public endpoint (no JWT required) — same as activate_hook.
+///
+/// Returns:
+/// - 200 with session context JSON
+/// - 400 Bad Request if project_id is missing or invalid
+pub async fn session_context(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<SessionContextQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    let project_id = query.project_id;
+
+    // Fetch active skills (limit 5, sorted by energy desc)
+    let active_skills = match neo4j
+        .list_skills(project_id, Some(SkillStatus::Active), 5, 0)
+        .await
+    {
+        Ok((skills, _)) => skills
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "energy": s.energy,
+                    "note_count": s.note_count,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::debug!("Failed to fetch skills for session context: {}", e);
+            vec![]
+        }
+    };
+
+    // Fetch current in-progress plan (limit 1)
+    let (current_plan, current_task) = match neo4j
+        .list_plans_for_project(
+            project_id,
+            Some(vec!["in_progress".to_string()]),
+            1,
+            0,
+        )
+        .await
+    {
+        Ok((plans, _)) => {
+            if let Some(plan) = plans.first() {
+                // Calculate plan progress: completed tasks / total tasks
+                let progress = match neo4j.get_plan_tasks(plan.id).await {
+                    Ok(tasks) => {
+                        let total = tasks.len();
+                        let completed = tasks
+                            .iter()
+                            .filter(|t| {
+                                t.status
+                                    == crate::neo4j::models::TaskStatus::Completed
+                            })
+                            .count();
+                        if total > 0 {
+                            Some(format!("{}/{} tasks", completed, total))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                };
+
+                let plan_json = serde_json::json!({
+                    "title": plan.title,
+                    "status": plan.status,
+                    "progress": progress,
+                    "priority": plan.priority,
+                });
+
+                // Find the current in-progress task within this plan
+                let task_json = match neo4j.get_plan_tasks(plan.id).await {
+                    Ok(tasks) => tasks
+                        .into_iter()
+                        .find(|t| {
+                            t.status
+                                == crate::neo4j::models::TaskStatus::InProgress
+                        })
+                        .map(|t| {
+                            serde_json::json!({
+                                "title": t.title.unwrap_or_default(),
+                                "status": t.status,
+                                "priority": t.priority,
+                                "tags": t.tags,
+                            })
+                        }),
+                    Err(_) => None,
+                };
+
+                (Some(plan_json), task_json)
+            } else {
+                (None, None)
+            }
+        }
+        Err(e) => {
+            tracing::debug!("Failed to fetch plans for session context: {}", e);
+            (None, None)
+        }
+    };
+
+    // Fetch critical/high-importance notes (limit 10)
+    let critical_notes = match neo4j
+        .list_notes(
+            Some(project_id),
+            None,
+            &NoteFilters {
+                importance: Some(vec![NoteImportance::Critical, NoteImportance::High]),
+                status: Some(vec![NoteStatus::Active]),
+                limit: Some(10),
+                sort_by: Some("importance".to_string()),
+                sort_order: Some("desc".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok((notes, _)) => notes
+            .into_iter()
+            .map(|n| {
+                serde_json::json!({
+                    "content": n.content,
+                    "note_type": n.note_type,
+                    "importance": n.importance,
+                    "tags": n.tags,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::debug!("Failed to fetch notes for session context: {}", e);
+            vec![]
+        }
+    };
+
+    Ok(Json(serde_json::json!({
+        "active_skills": active_skills,
+        "current_plan": current_plan,
+        "current_task": current_task,
+        "critical_notes": critical_notes,
+    })))
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -372,5 +540,107 @@ mod tests {
 
         let ip = extract_client_ip(&headers);
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST)); // fallback
+    }
+
+    // ================================================================
+    // SessionContextQuery tests
+    // ================================================================
+
+    #[test]
+    fn test_session_context_query_deserialize_valid() {
+        let query: SessionContextQuery =
+            serde_json::from_str(r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5"}"#)
+                .unwrap();
+        assert_eq!(
+            query.project_id,
+            Uuid::parse_str("00333b5f-2d0a-4467-9c98-155e55d2b7e5").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_session_context_query_deserialize_invalid_uuid() {
+        let result: Result<SessionContextQuery, _> =
+            serde_json::from_str(r#"{"project_id":"not-a-uuid"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_session_context_query_deserialize_missing_project_id() {
+        let result: Result<SessionContextQuery, _> = serde_json::from_str(r#"{}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_session_context_response_structure() {
+        // Verify the expected response JSON structure
+        let response = serde_json::json!({
+            "active_skills": [
+                {
+                    "name": "Neo4j Performance",
+                    "description": "Query optimization",
+                    "energy": 0.85,
+                    "note_count": 12
+                }
+            ],
+            "current_plan": {
+                "title": "Neural Skills",
+                "status": "in_progress",
+                "progress": "4/7 tasks",
+                "priority": 90
+            },
+            "current_task": {
+                "title": "Create Hook",
+                "status": "in_progress",
+                "priority": 90,
+                "tags": ["hook"]
+            },
+            "critical_notes": [
+                {
+                    "content": "Always check permissions",
+                    "note_type": "gotcha",
+                    "importance": "critical",
+                    "tags": ["security"]
+                }
+            ]
+        });
+
+        // Verify all expected keys exist
+        assert!(response["active_skills"].is_array());
+        assert!(response["current_plan"].is_object());
+        assert!(response["current_task"].is_object());
+        assert!(response["critical_notes"].is_array());
+
+        // Verify skill structure
+        let skill = &response["active_skills"][0];
+        assert_eq!(skill["name"], "Neo4j Performance");
+        assert_eq!(skill["energy"], 0.85);
+
+        // Verify plan structure
+        assert_eq!(response["current_plan"]["title"], "Neural Skills");
+        assert_eq!(response["current_plan"]["progress"], "4/7 tasks");
+
+        // Verify task structure
+        assert_eq!(response["current_task"]["title"], "Create Hook");
+
+        // Verify note structure
+        let note = &response["critical_notes"][0];
+        assert_eq!(note["note_type"], "gotcha");
+        assert_eq!(note["importance"], "critical");
+    }
+
+    #[test]
+    fn test_session_context_empty_response_structure() {
+        // When nothing is found, all fields should be empty/null
+        let response = serde_json::json!({
+            "active_skills": [],
+            "current_plan": null,
+            "current_task": null,
+            "critical_notes": []
+        });
+
+        assert!(response["active_skills"].as_array().unwrap().is_empty());
+        assert!(response["current_plan"].is_null());
+        assert!(response["current_task"].is_null());
+        assert!(response["critical_notes"].as_array().unwrap().is_empty());
     }
 }

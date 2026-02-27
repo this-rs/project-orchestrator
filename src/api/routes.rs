@@ -179,6 +179,10 @@ fn public_routes() -> Router<OrchestratorState> {
             post(hook_handlers::activate_hook),
         )
         .route("/api/hooks/health", get(hook_handlers::hooks_health))
+        .route(
+            "/api/hooks/session-context",
+            get(hook_handlers::session_context),
+        )
 }
 
 // ============================================================================
