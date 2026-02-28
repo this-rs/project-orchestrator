@@ -774,7 +774,7 @@ mod tests {
                 allow: false,
             },
             ChatEvent::ModelChanged {
-                model: "claude-opus-4-20250514".into(),
+                model: "claude-opus-4-6".into(),
             },
             ChatEvent::CompactionStarted {
                 trigger: "auto".into(),
@@ -792,7 +792,7 @@ mod tests {
             },
             ChatEvent::SystemInit {
                 cli_session_id: "cli-init-123".into(),
-                model: Some("claude-sonnet-4-20250514".into()),
+                model: Some("claude-sonnet-4-6".into()),
                 tools: vec!["Bash".into(), "Read".into(), "Write".into()],
                 mcp_servers: vec![serde_json::json!({"name": "po", "status": "connected"})],
                 permission_mode: Some("default".into()),
@@ -934,17 +934,17 @@ mod tests {
         );
 
         // ModelChanged
-        let json = r#"{"type":"model_changed","model":"claude-opus-4-20250514"}"#;
+        let json = r#"{"type":"model_changed","model":"claude-opus-4-6"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(
-            matches!(event, ChatEvent::ModelChanged { ref model } if model == "claude-opus-4-20250514")
+            matches!(event, ChatEvent::ModelChanged { ref model } if model == "claude-opus-4-6")
         );
 
         // SystemInit with all fields
-        let json = r#"{"type":"system_init","cli_session_id":"sid-1","model":"claude-sonnet-4-20250514","tools":["Bash","Read"],"mcp_servers":[{"name":"po"}],"permission_mode":"default"}"#;
+        let json = r#"{"type":"system_init","cli_session_id":"sid-1","model":"claude-sonnet-4-6","tools":["Bash","Read"],"mcp_servers":[{"name":"po"}],"permission_mode":"default"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(
-            matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref model, .. } if cli_session_id == "sid-1" && model.as_deref() == Some("claude-sonnet-4-20250514"))
+            matches!(event, ChatEvent::SystemInit { ref cli_session_id, ref model, .. } if cli_session_id == "sid-1" && model.as_deref() == Some("claude-sonnet-4-6"))
         );
 
         // SystemInit minimal (backward compat — only required field)
@@ -1114,14 +1114,14 @@ mod tests {
             "session_id": "existing-session",
             "cwd": "/home/dev/project",
             "project_slug": "my-project",
-            "model": "claude-sonnet-4-20250514"
+            "model": "claude-sonnet-4-6"
         }"#;
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.message, "Create a plan");
         assert_eq!(req.session_id.as_deref(), Some("existing-session"));
         assert_eq!(req.cwd, "/home/dev/project");
         assert_eq!(req.project_slug.as_deref(), Some("my-project"));
-        assert_eq!(req.model.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(req.model.as_deref(), Some("claude-sonnet-4-6"));
     }
 
     #[test]

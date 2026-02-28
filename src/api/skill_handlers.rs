@@ -798,4 +798,374 @@ mod tests {
     fn test_validate_input_limits_none_values() {
         assert!(validate_input_limits(None, None, None, None).is_ok());
     }
+
+    // ================================================================
+    // Async integration tests (mock backends)
+    // ================================================================
+
+    use crate::api::handlers::ServerState;
+    use crate::api::routes::create_router;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_bearer_token, test_project};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as HttpStatus};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn auth_post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn auth_put_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn auth_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn test_app() -> axum::Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        create_router(state)
+    }
+
+    async fn test_app_with_project() -> (axum::Router, uuid::Uuid) {
+        let app_state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        app_state.neo4j.create_project(&project).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        (create_router(state), project_id)
+    }
+
+    #[tokio::test]
+    async fn test_list_skills_empty() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_get(&format!("/api/skills?project_id={}", project_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 0);
+        assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_skill() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/skills",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Test Skill",
+                    "description": "A test skill",
+                    "tags": ["test", "coverage"]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "Test Skill");
+        assert_eq!(json["description"], "A test skill");
+        assert_eq!(json["status"], "emerging");
+    }
+
+    #[tokio::test]
+    async fn test_create_skill_empty_name_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/skills",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_skill() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+        let skill = SkillNode::new(project.id, "My Skill");
+        let skill_id = skill.id;
+        app_state.neo4j.create_skill(&skill).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/skills/{}", skill_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "My Skill");
+    }
+
+    #[tokio::test]
+    async fn test_get_skill_not_found() {
+        let app = test_app().await;
+        let fake_id = uuid::Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_get(&format!("/api/skills/{}", fake_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_skill() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+        let skill = SkillNode::new(project.id, "To Delete");
+        let skill_id = skill.id;
+        app_state.neo4j.create_skill(&skill).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_delete(&format!("/api/skills/{}", skill_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_get_skill_members_empty() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+        let skill = SkillNode::new(project.id, "Skill With No Members");
+        let skill_id = skill.id;
+        app_state.neo4j.create_skill(&skill).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/skills/{}/members", skill_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["notes"].as_array().unwrap().len(), 0);
+        assert_eq!(json["decisions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_skill() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+        let skill = SkillNode::new(project.id, "Original Name");
+        let skill_id = skill.id;
+        app_state.neo4j.create_skill(&skill).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/skills/{}", skill_id),
+                serde_json::json!({
+                    "name": "Updated Name",
+                    "description": "Updated desc"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "Updated Name");
+    }
+
+    #[tokio::test]
+    async fn test_get_skill_health() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+        let skill = SkillNode::new(project.id, "Health Check");
+        let skill_id = skill.id;
+        app_state.neo4j.create_skill(&skill).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/skills/{}/health", skill_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
 }
