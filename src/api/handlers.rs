@@ -965,11 +965,8 @@ pub async fn sync_directory(
         // Spawn auto-anchor in background: link notes to newly synced files
         let neo4j = state.orchestrator.neo4j_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(
-                neo4j.as_ref(),
-                pid,
-            )
-            .await
+            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
+                .await
             {
                 Ok(r) if r.anchors_created > 0 => {
                     tracing::info!(
@@ -1550,11 +1547,7 @@ pub async fn create_commit(
             orch2.co_change_debouncer().trigger(pid);
 
             // Auto-anchor notes to newly synced files
-            match crate::skills::activation::auto_anchor_notes_for_project(
-                orch2.neo4j(),
-                pid,
-            )
-            .await
+            match crate::skills::activation::auto_anchor_notes_for_project(orch2.neo4j(), pid).await
             {
                 Ok(r) if r.anchors_created > 0 => {
                     tracing::info!(

@@ -584,11 +584,8 @@ async fn flush_pending_files(
         // Spawn auto-anchor in background: link notes to newly synced files
         let neo4j = orchestrator.neo4j_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(
-                neo4j.as_ref(),
-                pid,
-            )
-            .await
+            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
+                .await
             {
                 Ok(r) if r.anchors_created > 0 => {
                     tracing::info!(
@@ -654,11 +651,8 @@ async fn flush_pending_files(
         // remaining files may now need re-anchoring.
         let neo4j = orchestrator.neo4j_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(
-                neo4j.as_ref(),
-                pid,
-            )
-            .await
+            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
+                .await
             {
                 Ok(r) if r.anchors_created > 0 => {
                     tracing::info!(
