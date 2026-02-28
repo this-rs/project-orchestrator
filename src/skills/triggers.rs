@@ -137,8 +137,13 @@ fn find_common_glob_patterns(paths: &[&str]) -> Vec<(String, f64)> {
 // Regex Triggers
 // ============================================================================
 
-/// Common English stop words to filter out from content analysis.
+/// Common English and French stop words to filter out from content analysis.
+///
+/// French stop words are included because many notes in the PO project are
+/// written in French. Without filtering, common French words ("les", "dans",
+/// "pour") end up as TF-IDF top terms and generate false-positive triggers.
 const STOP_WORDS: &[&str] = &[
+    // --- English ---
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
     "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can", "to",
     "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through", "during",
@@ -148,7 +153,17 @@ const STOP_WORDS: &[&str] = &[
     "his", "i", "me", "my", "if", "then", "else", "when", "where", "how", "what", "which", "who",
     "whom", "all", "each", "every", "any", "some", "no", "more", "most", "other", "such", "only",
     "very", "just", "also", "than", "too", "here", "there", "now",
-    // Common technical stop words
+    // --- French articles, prepositions, pronouns, conjunctions, common verbs ---
+    "le", "la", "les", "un", "une", "des", "du", "au", "aux",
+    "de", "dans", "pour", "par", "sur", "en", "avec", "sans", "vers", "chez", "entre",
+    "je", "tu", "il", "elle", "nous", "vous", "ils", "elles", "on",
+    "qui", "que", "quoi", "dont", "ce", "cette", "ces", "son", "sa", "ses",
+    "leur", "leurs", "mon", "ma", "mes", "ton", "ta", "tes", "se",
+    "et", "ou", "mais", "donc", "car", "ni", "si", "comme", "quand", "lorsque",
+    "est", "sont", "ont", "fait", "peut", "doit", "faut", "va", "vont",
+    "ne", "pas", "plus", "aussi", "bien", "tout", "toute", "tous", "toutes",
+    "même", "encore", "déjà", "toujours", "jamais", "très", "trop",
+    // --- Common technical stop words ---
     "use", "used", "using", "new", "get", "set", "add", "update", "delete", "create", "file",
     "function", "method", "class", "type", "value", "data", "note", "notes",
 ];
@@ -1346,5 +1361,83 @@ mod tests {
                 "Triggers should be sorted by confidence descending"
             );
         }
+    }
+
+    // ================================================================
+    // French stop words tests
+    // ================================================================
+
+    #[test]
+    fn test_french_stop_words_in_stop_set() {
+        let french_words = [
+            "le", "la", "les", "un", "une", "des", "du", "au", "aux",
+            "de", "dans", "pour", "par", "sur", "en", "avec", "sans",
+            "je", "tu", "il", "elle", "nous", "vous", "ils", "elles", "on",
+            "qui", "que", "quoi", "dont", "ce", "cette", "ces",
+            "et", "ou", "mais", "donc", "car", "ni", "si",
+            "est", "sont", "ont", "fait", "peut", "doit",
+            "ne", "pas", "plus", "aussi", "bien", "tout",
+        ];
+        for word in &french_words {
+            assert!(
+                STOP_SET.contains(word),
+                "French stop word '{}' should be in STOP_SET",
+                word
+            );
+        }
+    }
+
+    #[test]
+    fn test_french_stop_words_filtered_from_regex_triggers() {
+        // Notes with predominantly French content — stop words should NOT
+        // appear in the generated regex patterns
+        let notes = vec![
+            make_note_with_anchors(
+                vec!["neo4j", "cypher"],
+                "Les requêtes dans le système pour les utilisateurs avec des paramètres",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["neo4j", "performance"],
+                "Il faut toujours utiliser des index pour les recherches dans Neo4j",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["neo4j"],
+                "Cette fonction est très importante pour la gestion des connexions",
+                vec![],
+            ),
+        ];
+
+        let triggers = generate_regex_triggers(&notes);
+
+        // Check that no trigger pattern contains common French stop words
+        let french_stop_words = ["les", "dans", "pour", "des", "avec", "une", "est", "sont"];
+        for trigger in &triggers {
+            let pattern_lower = trigger.pattern_value.to_lowercase();
+            // Split the alternation pattern to check individual terms
+            for term in pattern_lower.split('|') {
+                let term = term.trim().replace("\\b(?:", "").replace("(?:", "").replace(")", "").replace("\\b", "");
+                let term = term.trim();
+                if !term.is_empty() {
+                    assert!(
+                        !french_stop_words.contains(&term),
+                        "French stop word '{}' found in trigger pattern: {}",
+                        term,
+                        trigger.pattern_value
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_stop_words_count_includes_french() {
+        // Verify we have a substantial number of stop words (English + French)
+        assert!(
+            STOP_WORDS.len() >= 120,
+            "Expected at least 120 stop words (EN + FR), got {}",
+            STOP_WORDS.len()
+        );
     }
 }
