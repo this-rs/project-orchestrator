@@ -1137,12 +1137,24 @@ pub struct FeatureGraphEntity {
     pub importance_score: Option<f64>,
 }
 
-/// Full feature graph with its included entities.
+/// A relationship between two entities inside a feature graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureGraphRelation {
+    pub source_type: String,
+    pub source_id: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub relation_type: String,
+}
+
+/// Full feature graph with its included entities and intra-graph relations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureGraphDetail {
     #[serde(flatten)]
     pub graph: FeatureGraphNode,
     pub entities: Vec<FeatureGraphEntity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<FeatureGraphRelation>,
 }
 
 // ============================================================================

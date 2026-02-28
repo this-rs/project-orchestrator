@@ -5754,6 +5754,7 @@ impl GraphStore for MockGraphStore {
         Ok(Some(FeatureGraphDetail {
             graph: fg,
             entities,
+            relations: vec![],
         }))
     }
 
@@ -6179,6 +6180,7 @@ impl GraphStore for MockGraphStore {
         Ok(FeatureGraphDetail {
             graph: fg,
             entities,
+            relations: vec![],
         })
     }
 
