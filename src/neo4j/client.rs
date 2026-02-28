@@ -353,6 +353,17 @@ impl Neo4jClient {
         let migrations = vec![
             // T3.2: Set default status on existing Decision nodes without one
             r#"MATCH (d:Decision) WHERE d.status IS NULL SET d.status = 'accepted'"#,
+            // Rename ATTACHED_TO → LINKED_TO (note.rs used ATTACHED_TO for writes,
+            // but analytics.rs, project.rs, lifecycle.rs all read LINKED_TO).
+            // This migration copies any remaining ATTACHED_TO rels to LINKED_TO and deletes the old ones.
+            // Idempotent: does nothing if no ATTACHED_TO rels exist.
+            r#"MATCH (a)-[r:ATTACHED_TO]->(b)
+               WITH a, r, b LIMIT 5000
+               MERGE (a)-[r2:LINKED_TO]->(b)
+               SET r2.signature_hash = r.signature_hash,
+                   r2.body_hash = r.body_hash,
+                   r2.last_verified = r.last_verified
+               DELETE r"#,
         ];
         for migration in migrations {
             if let Err(e) = self.graph.run(query(migration)).await {

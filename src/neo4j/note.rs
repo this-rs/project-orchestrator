@@ -358,7 +358,7 @@ impl Neo4jClient {
             r#"
             MATCH (n:Note {{id: $note_id}})
             MATCH (e:{} {{{}: $entity_id}})
-            MERGE (n)-[r:ATTACHED_TO]->(e)
+            MERGE (n)-[r:LINKED_TO]->(e)
             SET r.signature_hash = $sig_hash,
                 r.body_hash = $body_hash,
                 r.last_verified = datetime()
@@ -414,7 +414,7 @@ impl Neo4jClient {
 
         let cypher = format!(
             r#"
-            MATCH (n:Note {{id: $note_id}})-[r:ATTACHED_TO]->(e:{} {{{}: $entity_id}})
+            MATCH (n:Note {{id: $note_id}})-[r:LINKED_TO]->(e:{} {{{}: $entity_id}})
             DELETE r
             "#,
             node_label, match_field
@@ -465,7 +465,7 @@ impl Neo4jClient {
 
         let cypher = format!(
             r#"
-            MATCH (n:Note)-[:ATTACHED_TO]->(e:{} {{{}: $entity_id}})
+            MATCH (n:Note)-[:LINKED_TO]->(e:{} {{{}: $entity_id}})
             WHERE n.status IN ['active', 'needs_review']
             RETURN n
             ORDER BY n.importance DESC, n.created_at DESC
@@ -585,7 +585,7 @@ impl Neo4jClient {
         let cypher = format!(
             r#"
             MATCH (target:{} {{{}: $entity_id}})
-            MATCH path = (n:Note)-[:ATTACHED_TO]->(source)-[:{}*0..{}]->(target)
+            MATCH path = (n:Note)-[:LINKED_TO]->(source)-[:{}*0..{}]->(target)
             WHERE n.status = 'active'
             WITH n, source, path, length(path) - 1 AS distance,
                  [node IN nodes(path) | coalesce(node.name, node.path, node.id)] AS path_names,
@@ -697,7 +697,7 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:BELONGS_TO_WORKSPACE]->(w:Workspace)
-            MATCH (n:Note)-[:ATTACHED_TO]->(w)
+            MATCH (n:Note)-[:LINKED_TO]->(w)
             WHERE n.status IN ['active', 'needs_review']
             RETURN n, w.name AS workspace_name
             ORDER BY n.importance DESC, n.created_at DESC
@@ -861,7 +861,7 @@ impl Neo4jClient {
     pub async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>> {
         let q = query(
             r#"
-            MATCH (n:Note {id: $id})-[r:ATTACHED_TO]->(e)
+            MATCH (n:Note {id: $id})-[r:LINKED_TO]->(e)
             RETURN labels(e)[0] AS entity_type,
                    coalesce(e.id, e.path, e.hash) AS entity_id,
                    r.signature_hash AS sig_hash,
