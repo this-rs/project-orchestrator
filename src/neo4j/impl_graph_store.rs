@@ -994,6 +994,10 @@ impl GraphStore for Neo4jClient {
         self.delete_task(task_id).await
     }
 
+    async fn get_project_for_task(&self, task_id: Uuid) -> anyhow::Result<Option<ProjectNode>> {
+        self.get_project_for_task(task_id).await
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================

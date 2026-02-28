@@ -580,6 +580,30 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Get the project that owns a task (via Task→Plan→Project chain).
+    ///
+    /// Traverses: `(Task)-[:PART_OF]->(Plan)-[:BELONGS_TO]->(Project)`
+    /// Returns `None` if the task doesn't exist or has no linked project.
+    pub async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $task_id})-[:PART_OF]->(p:Plan)-[:BELONGS_TO]->(proj:Project)
+            RETURN proj
+            LIMIT 1
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("proj")?;
+            let project = self.node_to_project(&node)?;
+            Ok(Some(project))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Link a task to files it modifies
     pub async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> Result<()> {
         for path in file_paths {

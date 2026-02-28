@@ -1687,6 +1687,22 @@ pub async fn backfill_decision_embeddings(
     })))
 }
 
+/// POST /api/admin/backfill-decision-project-slugs — Backfill project_slug on DecisionDocuments in Meilisearch
+pub async fn backfill_decision_project_slugs(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (total, updated) = state
+        .orchestrator
+        .plan_manager()
+        .backfill_decision_project_slugs()
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "decisions_processed": total,
+        "decisions_updated": updated,
+    })))
+}
+
 /// POST /api/admin/backfill-discussed — Backfill DISCUSSED relations on existing sessions
 pub async fn backfill_discussed(
     State(state): State<OrchestratorState>,
@@ -1858,6 +1874,24 @@ pub async fn bootstrap_knowledge_fabric(
         })),
         Err(e) => failed.push(serde_json::json!({
             "step": "backfill_decision_embeddings",
+            "error": e.to_string(),
+        })),
+    }
+
+    // Step 2b: Backfill decision project_slugs in Meilisearch
+    match state
+        .orchestrator
+        .plan_manager()
+        .backfill_decision_project_slugs()
+        .await
+    {
+        Ok((total, updated)) => completed.push(serde_json::json!({
+            "step": "backfill_decision_project_slugs",
+            "decisions_processed": total,
+            "decisions_updated": updated,
+        })),
+        Err(e) => failed.push(serde_json::json!({
+            "step": "backfill_decision_project_slugs",
             "error": e.to_string(),
         })),
     }
@@ -3844,6 +3878,31 @@ mod tests {
         let json = body_json(resp).await;
         assert!(json["decisions_processed"].is_number());
         assert!(json["embeddings_created"].is_number());
+    }
+
+    // ----------------------------------------------------------------
+    // Backfill decision project slugs
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_backfill_decision_project_slugs() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/backfill-decision-project-slugs")
+                    .header("authorization", test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json["decisions_processed"].is_number());
+        assert!(json["decisions_updated"].is_number());
     }
 
     // ----------------------------------------------------------------

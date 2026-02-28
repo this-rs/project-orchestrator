@@ -776,6 +776,12 @@ pub trait GraphStore: Send + Sync {
     /// Delete a task and all its related data (steps, decisions)
     async fn delete_task(&self, task_id: Uuid) -> Result<()>;
 
+    /// Get the project that owns a task (via Task→Plan→Project chain).
+    ///
+    /// Traverses: `(Task)-[:PART_OF]->(Plan)-[:BELONGS_TO]->(Project)`
+    /// Returns `None` if the task doesn't exist or has no linked project.
+    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>>;
+
     // ========================================================================
     // Step operations
     // ========================================================================

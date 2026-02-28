@@ -49,7 +49,11 @@ fn match_score(text: &str, query: &str) -> f64 {
 }
 
 /// Check if any of the given fields contain the query as a substring (case-insensitive).
+/// A query of "*" matches everything (Meilisearch convention for "all documents").
 fn any_field_matches(fields: &[&str], query: &str) -> bool {
+    if query == "*" {
+        return true;
+    }
     let query_lower = query.to_lowercase();
     fields
         .iter()

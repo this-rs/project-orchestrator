@@ -741,6 +741,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::backfill_decision_embeddings),
         )
         .route(
+            "/api/admin/backfill-decision-project-slugs",
+            post(handlers::backfill_decision_project_slugs),
+        )
+        .route(
             "/api/admin/backfill-discussed",
             post(handlers::backfill_discussed),
         )

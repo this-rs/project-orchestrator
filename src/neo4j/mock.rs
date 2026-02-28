@@ -3327,6 +3327,38 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>> {
+        // Reverse lookup: task_id → plan_id (via plan_tasks)
+        let plan_tasks = self.plan_tasks.read().await;
+        let plan_id = plan_tasks
+            .iter()
+            .find(|(_, tasks)| tasks.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id);
+
+        let plan_id = match plan_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        drop(plan_tasks);
+
+        // Reverse lookup: plan_id → project_id (via project_plans)
+        let project_plans = self.project_plans.read().await;
+        let project_id = project_plans
+            .iter()
+            .find(|(_, plans)| plans.contains(&plan_id))
+            .map(|(project_id, _)| *project_id);
+
+        let project_id = match project_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        drop(project_plans);
+
+        // Get the project
+        let projects = self.projects.read().await;
+        Ok(projects.get(&project_id).cloned())
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================
