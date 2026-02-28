@@ -671,6 +671,24 @@ pub fn spawn_hook_reinforcement(
     });
 }
 
+/// Spawn async activation_count increment after a successful hook activation.
+///
+/// Fire-and-forget: errors are logged but never propagated.
+/// This ensures hook activations are tracked in the skill's metrics
+/// (activation_count, last_activated), which is required for lifecycle
+/// promotion logic.
+pub fn spawn_activation_increment(graph_store: Arc<dyn GraphStore>, skill_id: Uuid) {
+    tokio::spawn(async move {
+        if let Err(e) = graph_store.increment_skill_activation(skill_id).await {
+            tracing::warn!(
+                %skill_id,
+                "Hook activation count increment failed: {}",
+                e
+            );
+        }
+    });
+}
+
 /// Perform Hebbian reinforcement for activated notes.
 ///
 /// This is the actual DB work — called inside a `tokio::spawn` by

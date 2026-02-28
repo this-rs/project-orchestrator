@@ -13,7 +13,8 @@ use super::handlers::{AppError, OrchestratorState};
 use crate::neurons::AutoReinforcementConfig;
 use crate::notes::models::{NoteFilters, NoteImportance, NoteStatus};
 use crate::skills::activation::{
-    activate_for_hook_cached, spawn_hook_reinforcement, HookActivationConfig,
+    activate_for_hook_cached, spawn_activation_increment, spawn_hook_reinforcement,
+    HookActivationConfig,
 };
 use crate::skills::cache::SkillCache;
 use crate::skills::models::HookActivateRequest;
@@ -182,6 +183,12 @@ pub async fn activate_hook(
                 state.orchestrator.neo4j_arc(),
                 outcome.activated_note_ids,
                 reinforcement_config,
+            );
+
+            // Increment activation_count (fire-and-forget)
+            spawn_activation_increment(
+                state.orchestrator.neo4j_arc(),
+                outcome.response.skill_id,
             );
 
             Ok((

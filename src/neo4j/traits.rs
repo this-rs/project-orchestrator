@@ -1950,6 +1950,10 @@ pub trait GraphStore: Send + Sync {
     /// decisions, assemble context text. Returns the full activation payload.
     async fn activate_skill(&self, skill_id: Uuid, query: &str) -> Result<ActivatedSkillContext>;
 
+    /// Increment a skill's activation_count and update last_activated.
+    /// Used by hook activation paths (fire-and-forget, best-effort).
+    async fn increment_skill_activation(&self, skill_id: Uuid) -> Result<()>;
+
     /// Match skills by evaluating trigger patterns against an input string.
     /// Returns matching skills with their confidence scores, sorted descending.
     /// Only matches Active/Emerging skills with reliable triggers.

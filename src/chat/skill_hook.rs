@@ -19,7 +19,8 @@ use crate::api::hook_handlers::skill_cache;
 use crate::neo4j::traits::GraphStore;
 use crate::neurons::AutoReinforcementConfig;
 use crate::skills::activation::{
-    activate_for_hook_cached, spawn_hook_reinforcement, HookActivationConfig,
+    activate_for_hook_cached, spawn_activation_increment, spawn_hook_reinforcement,
+    HookActivationConfig,
 };
 use crate::skills::project_resolver::resolve_project_from_context;
 use std::sync::Arc;
@@ -126,6 +127,9 @@ impl nexus_claude::HookCallback for SkillActivationHook {
             outcome.activated_note_ids,
             reinforcement_config,
         );
+
+        // 4b. Increment activation_count (fire-and-forget)
+        spawn_activation_increment(self.graph_store.clone(), outcome.response.skill_id);
 
         // 5. Return skill context as additionalContext
         info!(

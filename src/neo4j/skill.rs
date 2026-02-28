@@ -781,6 +781,22 @@ impl Neo4jClient {
         })
     }
 
+    /// Increment a skill's activation_count and update last_activated.
+    /// Best-effort, fire-and-forget — used by hook activation paths.
+    pub async fn increment_skill_activation(&self, skill_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (s:Skill {id: $skill_id})
+            SET s.activation_count = s.activation_count + 1,
+                s.last_activated = datetime(),
+                s.updated_at = datetime()
+            "#,
+        )
+        .param("skill_id", skill_id.to_string());
+        let _ = self.graph.run(q).await; // Best-effort
+        Ok(())
+    }
+
     /// Match skills by evaluating trigger patterns against an input string.
     ///
     /// Only matches Active/Emerging skills. Triggers with quality_score < 0.3

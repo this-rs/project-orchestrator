@@ -2386,6 +2386,10 @@ impl GraphStore for Neo4jClient {
         self.activate_skill(skill_id, query).await
     }
 
+    async fn increment_skill_activation(&self, skill_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.increment_skill_activation(skill_id).await
+    }
+
     async fn match_skills_by_trigger(
         &self,
         project_id: uuid::Uuid,

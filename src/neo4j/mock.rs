@@ -7048,6 +7048,14 @@ impl GraphStore for MockGraphStore {
         })
     }
 
+    async fn increment_skill_activation(&self, skill_id: Uuid) -> anyhow::Result<()> {
+        let mut store = self.skills.write().await;
+        if let Some(skill) = store.get_mut(&skill_id) {
+            skill.activation_count += 1;
+        }
+        Ok(())
+    }
+
     async fn match_skills_by_trigger(
         &self,
         project_id: Uuid,
