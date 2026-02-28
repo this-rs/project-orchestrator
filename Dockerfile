@@ -61,21 +61,23 @@ COPY crates ./crates/
 
 # Create dummy source files to build dependencies.
 # This must match the actual module layout so the dep-cache layer is valid.
-# Module directories (11):
-#   api, auth, chat, events, mcp, meilisearch, neo4j, notes, orchestrator, parser, plan
+# Module directories (16):
+#   api, auth, chat, embeddings, events, graph, mcp, meilisearch,
+#   neo4j, neurons, notes, orchestrator, parser, plan, resolver, skills
 # Single files: setup_claude.rs, update.rs
 # Binary: bin/mcp_server.rs
 RUN mkdir -p src/bin \
-             src/api src/auth src/chat src/events src/mcp \
-             src/meilisearch src/neo4j src/notes src/orchestrator \
-             src/parser src/plan && \
+             src/api src/auth src/chat src/embeddings src/events \
+             src/graph src/mcp src/meilisearch src/neo4j src/neurons \
+             src/notes src/orchestrator src/parser src/plan \
+             src/resolver src/skills && \
     echo "fn main() {}" > src/main.rs && \
     echo "fn main() {}" > src/cli.rs && \
     echo "fn main() {}" > src/bin/mcp_server.rs && \
-    echo "pub mod api; pub mod auth; pub mod chat; pub mod events; pub mod mcp; pub mod meilisearch; pub mod neo4j; pub mod notes; pub mod orchestrator; pub mod parser; pub mod plan; pub mod setup_claude; pub mod update;" > src/lib.rs && \
+    echo "pub mod api; pub mod auth; pub mod chat; pub mod embeddings; pub mod events; pub mod graph; pub mod mcp; pub mod meilisearch; pub mod neo4j; pub mod neurons; pub mod notes; pub mod orchestrator; pub mod parser; pub mod plan; pub mod resolver; pub mod setup_claude; pub mod skills; pub mod update;" > src/lib.rs && \
     echo "" > src/setup_claude.rs && \
     echo "" > src/update.rs && \
-    for dir in api auth chat events mcp meilisearch neo4j notes orchestrator parser plan; do \
+    for dir in api auth chat embeddings events graph mcp meilisearch neo4j neurons notes orchestrator parser plan resolver skills; do \
         echo "" > "src/$dir/mod.rs"; \
     done
 
@@ -90,9 +92,6 @@ RUN rm -rf src
 
 # Copy actual source code
 COPY src ./src
-
-# Copy hook scripts (embedded via include_str! in hook_handlers.rs)
-COPY hooks ./hooks/
 
 # Copy tree-sitter queries if they exist (optional — may not be present)
 COPY querie[s] ./queries/
