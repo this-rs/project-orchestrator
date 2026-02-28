@@ -34,6 +34,7 @@ pub const IGNORED_PATH_SEGMENTS: &[&str] = &[
     "/.nuxt/",
     "/coverage/",
     "/.cache/",
+    "/.claude/",
 ];
 
 /// Check whether a file path should be ignored during sync.
@@ -81,6 +82,15 @@ mod tests {
         assert!(!should_ignore_path("/project/src/distribution.rs"));
         // "rebuild" should NOT be caught by "/build/"
         assert!(!should_ignore_path("/project/src/rebuild.rs"));
+    }
+
+    #[test]
+    fn test_should_ignore_claude_directory() {
+        // .claude/ can contain worktrees (copies of the repo) created by Claude Code
+        assert!(should_ignore_path("/project/.claude/worktrees/abc123/src/main.rs"));
+        assert!(should_ignore_path("/project/.claude/settings.json"));
+        // But "claude" without dots/slashes should NOT be caught
+        assert!(!should_ignore_path("/project/src/claude/handler.rs"));
     }
 
     #[test]

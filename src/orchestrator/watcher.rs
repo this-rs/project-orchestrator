@@ -1147,6 +1147,16 @@ mod tests {
     }
 
     #[test]
+    fn test_should_not_sync_claude_worktrees() {
+        assert!(!should_sync_file(Path::new(
+            "/project/.claude/worktrees/abc123/src/main.rs"
+        )));
+        assert!(!should_sync_file(Path::new(
+            "/project/.claude/worktrees/fix-bug/lib/utils.ts"
+        )));
+    }
+
+    #[test]
     fn test_should_sync_empty_extension() {
         // Files without extension should not be synced
         assert!(!should_sync_file(Path::new("/project/Makefile")));
