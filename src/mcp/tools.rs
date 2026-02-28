@@ -762,9 +762,8 @@ fn code_tool() -> ToolDefinition {
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
-                "slug": {"type": "string", "description": "Project slug (search_project)"},
                 "workspace_slug": {"type": "string", "description": "Workspace slug (search_workspace)"},
-                "project_slug": {"type": "string", "description": "Project slug (get_communities/get_health/get_node_importance/plan_implementation/get_architecture)"},
+                "project_slug": {"type": "string", "description": "Project slug (search_project/get_communities/get_health/get_node_importance/plan_implementation/get_architecture)"},
                 "file_path": {"type": "string", "description": "File path (get_file_symbols/get_file_dependencies)"},
                 "symbol": {"type": "string", "description": "Symbol name (find_references)"},
                 "function": {"type": "string", "description": "Function name (get_call_graph)"},

@@ -456,15 +456,15 @@ impl ToolHandler {
             }
 
             "get_project_roadmap" => {
-                let project_id = extract_id(args, "project_id")?;
+                let slug = extract_string(args, "slug")?;
                 let result = http
-                    .get(&format!("/api/projects/{}/roadmap", project_id))
+                    .get(&format!("/api/projects/{}/roadmap", slug))
                     .await?;
                 Ok(Some(result))
             }
 
             "list_project_plans" => {
-                let slug = extract_string(args, "project_slug")?;
+                let slug = extract_string(args, "slug")?;
                 let mut query = Vec::new();
                 if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
                     query.push(("status".to_string(), s.to_string()));

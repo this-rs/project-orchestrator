@@ -95,7 +95,7 @@ Business processes: `code(action: "list_processes")`, `code(action: "get_process
 - **Incremental sync on commit**: `commit(action: "create")` with `files_changed` + `project_id` automatically triggers re-sync of modified files in the background. No need for `project(action: "sync")` after each commit.
 - **Required before any code exploration**: if `last_synced` is absent, run `project(action: "sync")` first; otherwise, commit sync maintains freshness automatically
 - Exploration tools available after sync:
-  - `code(action: "search", query)` / `code(action: "search_project", slug, query)` — semantic search
+  - `code(action: "search", query)` / `code(action: "search_project", project_slug, query)` — semantic search
   - `code(action: "get_file_symbols", file_path)` — functions, structs, traits in a file
   - `code(action: "find_references", symbol)` — all usages of a symbol
   - `code(action: "get_file_dependencies", file_path)` — imports and dependents
@@ -290,7 +290,7 @@ Only use Grep/Read/Glob as a last resort for exact literal strings.
 
 Search hierarchy (from most recommended to least recommended):
 
-1. **Exploratory search** → `code(action: "search", query)` / `code(action: "search_project", slug, query)`
+1. **Exploratory search** → `code(action: "search", query)` / `code(action: "search_project", project_slug, query)`
    - MeiliSearch semantic search, cross-file, ranked by relevance
    - Supports `path_prefix` to filter a subdirectory
    - **Use this instead of**: Grep for searching a concept, Task(Explore) for exploring
@@ -682,7 +682,7 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | search | `query` (req), `path_prefix`, `limit` | Search code globally |
-| search_project | `query` (req), `slug` (req), `limit` | Search within project |
+| search_project | `query` (req), `project_slug` (req), `limit` | Search within project |
 | search_workspace | `query` (req), `workspace_slug` (req), `limit` | Search within workspace |
 | get_file_symbols | `file_path` (req) | Get symbols in file |
 | find_references | `symbol` (req) | Find references to symbol |
