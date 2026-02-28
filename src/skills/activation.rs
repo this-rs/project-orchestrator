@@ -765,6 +765,179 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 }
 
 // ============================================================================
+// Contextual note scoring (pure functions, zero DB queries)
+// ============================================================================
+
+/// Extract meaningful path segments from a file context string.
+///
+/// Filters out trivial segments like "src", "lib", "mod", "index", "main", "tests".
+/// Strips file extensions. Returns lowercased segments for case-insensitive matching.
+///
+/// # Examples
+/// ```
+/// extract_path_segments("src/neo4j/client.rs")  // → ["neo4j", "client"]
+/// extract_path_segments("src/lib.rs")            // → []
+/// extract_path_segments("/Users/x/project/src/skills/activation.rs")
+///     // → ["skills", "activation"]
+/// ```
+pub fn extract_path_segments(file_context: &str) -> Vec<String> {
+    const TRIVIAL_SEGMENTS: &[&str] = &[
+        "src", "lib", "mod", "index", "main", "tests", "test", "benches", "bench",
+        "examples", "example", "bin", "target", "build", "dist", "out", "pkg",
+    ];
+
+    file_context
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            // Strip file extension
+            s.rsplit_once('.').map(|(name, _)| name).unwrap_or(s)
+        })
+        .map(|s| s.to_lowercase())
+        .filter(|s| !s.is_empty() && s.len() > 1 && !TRIVIAL_SEGMENTS.contains(&s.as_str()))
+        .collect()
+}
+
+/// Extract the basename (filename without extension) from a file path.
+fn extract_basename(file_context: &str) -> Option<String> {
+    let filename = file_context.rsplit('/').next()?;
+    let name = filename.rsplit_once('.').map(|(n, _)| n).unwrap_or(filename);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_lowercase())
+    }
+}
+
+/// Score a note's relevance to the current tool context.
+///
+/// This is a **pure function** — no async, no DB calls, no side effects.
+/// It operates entirely on data already loaded in memory from `get_skill_members()`.
+///
+/// # Signals
+///
+/// 1. **Tag-path affinity** (0 → 0.4): overlap between note.tags and file path segments
+/// 2. **Content keyword match** (0 → 0.3): note.content mentions the filename or path segments
+/// 3. **Importance weight** (multiplicative): critical ×1.5, high ×1.2, medium ×1.0, low ×0.8
+/// 4. **Freshness decay** (subtractive): -staleness_score × 0.1
+/// 5. **Note type affinity** (0 → 0.1): gotcha notes score higher for Edit/Write tools
+/// 6. **Anchor bonus** (0 → 0.4): LINKED_TO anchor matches file_context (added by T4)
+///
+/// Returns a score in approximately [0.0, 1.5] range. Higher = more relevant.
+pub fn score_note_relevance(
+    note: &Note,
+    file_context: Option<&str>,
+    _pattern: Option<&str>,
+    tool_name: &str,
+) -> f64 {
+    let mut score: f64 = 0.1; // base score — every note has some value
+
+    if let Some(file_ctx) = file_context {
+        let path_segments = extract_path_segments(file_ctx);
+        let basename = extract_basename(file_ctx);
+
+        // Signal 1: Tag-path affinity (0 → 0.4)
+        // Count how many path segments overlap with note tags (case-insensitive)
+        let tag_overlap = note
+            .tags
+            .iter()
+            .filter(|tag| {
+                let tag_lower = tag.to_lowercase();
+                path_segments.iter().any(|seg| *seg == tag_lower)
+            })
+            .count();
+        score += (tag_overlap as f64 * 0.15).min(0.4);
+
+        // Signal 2: Content keyword match (0 → 0.3)
+        let content_lower = note.content.to_lowercase();
+
+        // Basename match: e.g., "client.rs" found in content → +0.2
+        if let Some(ref base) = basename {
+            if content_lower.contains(base.as_str()) {
+                score += 0.2;
+            }
+        }
+
+        // Path segment matches in content: each unique match → +0.05 (max +0.1)
+        let segment_matches = path_segments
+            .iter()
+            .filter(|seg| seg.len() >= 3 && content_lower.contains(seg.as_str()))
+            .count();
+        score += (segment_matches as f64 * 0.05).min(0.1);
+
+        // Signal 6: Anchor bonus (LINKED_TO) — added by T4
+        // Checks note.anchors for File entities matching the file_context.
+        // When anchors are empty (pre-T4 or pre-auto-anchor), this adds 0.
+        let mut best_anchor_bonus = 0.0_f64;
+        for anchor in &note.anchors {
+            if matches!(anchor.entity_type, crate::notes::EntityType::File) {
+                if anchor.entity_id == file_ctx
+                    || anchor.entity_id.ends_with(&format!("/{}", file_ctx))
+                    || file_ctx.ends_with(&format!("/{}", anchor.entity_id))
+                {
+                    best_anchor_bonus = best_anchor_bonus.max(0.4); // exact match
+                } else if same_directory(&anchor.entity_id, file_ctx) {
+                    best_anchor_bonus = best_anchor_bonus.max(0.2); // same dir
+                }
+            }
+        }
+        score += best_anchor_bonus;
+    }
+
+    // Signal 3: Importance weight (multiplicative)
+    let importance_multiplier = match note.importance {
+        crate::notes::NoteImportance::Critical => 1.5,
+        crate::notes::NoteImportance::High => 1.2,
+        crate::notes::NoteImportance::Medium => 1.0,
+        crate::notes::NoteImportance::Low => 0.8,
+    };
+    score *= importance_multiplier;
+
+    // Signal 4: Freshness decay (subtractive)
+    score -= note.staleness_score * 0.1;
+
+    // Signal 5: Note type affinity
+    // Edit/Write/Bash tools benefit from gotcha notes (error prevention)
+    // MCP tools benefit from guideline/pattern notes
+    match tool_name {
+        "Edit" | "Write" | "Bash" | "NotebookEdit" => {
+            if matches!(note.note_type, crate::notes::NoteType::Gotcha) {
+                score += 0.1;
+            }
+        }
+        t if t.starts_with("mcp__") => {
+            if matches!(
+                note.note_type,
+                crate::notes::NoteType::Guideline | crate::notes::NoteType::Pattern
+            ) {
+                score += 0.1;
+            }
+        }
+        _ => {}
+    }
+
+    // Ensure score is non-negative
+    score.max(0.0)
+}
+
+/// Check if two file paths share the same parent directory.
+///
+/// Handles both absolute and relative paths by comparing the substring
+/// before the last '/'.
+pub fn same_directory(path_a: &str, path_b: &str) -> bool {
+    let dir_a = path_a.rsplit_once('/').map(|(dir, _)| dir);
+    let dir_b = path_b.rsplit_once('/').map(|(dir, _)| dir);
+    match (dir_a, dir_b) {
+        (Some(a), Some(b)) => {
+            // Handle case where one is absolute and the other relative
+            // e.g., "/Users/x/src/neo4j/client.rs" vs "src/neo4j/analytics.rs"
+            a == b || a.ends_with(b) || b.ends_with(a)
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1964,6 +2137,486 @@ mod tests {
         assert!(
             result.is_none(),
             "No skills in project → should return None gracefully"
+        );
+    }
+
+    // --- Contextual note scoring ---
+
+    fn make_scored_note(
+        content: &str,
+        tags: Vec<&str>,
+        note_type: NoteType,
+        importance: NoteImportance,
+        energy: f64,
+        staleness: f64,
+    ) -> Note {
+        let mut note = make_test_note(Uuid::new_v4(), content, note_type, importance, energy);
+        note.tags = tags.into_iter().map(|t| t.to_string()).collect();
+        note.staleness_score = staleness;
+        note
+    }
+
+    #[test]
+    fn test_extract_path_segments_basic() {
+        let segments = extract_path_segments("src/neo4j/client.rs");
+        assert_eq!(segments, vec!["neo4j", "client"]);
+    }
+
+    #[test]
+    fn test_extract_path_segments_filters_trivial() {
+        let segments = extract_path_segments("src/lib.rs");
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_extract_path_segments_absolute_path() {
+        let segments =
+            extract_path_segments("/Users/x/project/src/skills/activation.rs");
+        assert_eq!(segments, vec!["users", "project", "skills", "activation"]);
+    }
+
+    #[test]
+    fn test_extract_path_segments_no_extension() {
+        let segments = extract_path_segments("src/neo4j/Dockerfile");
+        assert_eq!(segments, vec!["neo4j", "dockerfile"]);
+    }
+
+    #[test]
+    fn test_score_tag_path_affinity() {
+        let neo4j_note = make_scored_note(
+            "Neo4j performance tip",
+            vec!["neo4j", "cypher"],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        let tauri_note = make_scored_note(
+            "Tauri macOS gotcha",
+            vec!["tauri", "macos"],
+            NoteType::Gotcha,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let neo4j_score =
+            score_note_relevance(&neo4j_note, Some("src/neo4j/client.rs"), None, "Read");
+        let tauri_score =
+            score_note_relevance(&tauri_note, Some("src/neo4j/client.rs"), None, "Read");
+
+        assert!(
+            neo4j_score > tauri_score,
+            "neo4j note ({}) should score higher than tauri note ({}) for neo4j file",
+            neo4j_score,
+            tauri_score
+        );
+    }
+
+    #[test]
+    fn test_score_content_keyword_match() {
+        let matching_note = make_scored_note(
+            "Modify src/neo4j/client.rs to fix the query pattern",
+            vec![],
+            NoteType::Observation,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        let non_matching_note = make_scored_note(
+            "General performance optimization advice",
+            vec![],
+            NoteType::Observation,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let matching_score =
+            score_note_relevance(&matching_note, Some("src/neo4j/client.rs"), None, "Read");
+        let non_matching_score = score_note_relevance(
+            &non_matching_note,
+            Some("src/neo4j/client.rs"),
+            None,
+            "Read",
+        );
+
+        assert!(
+            matching_score > non_matching_score,
+            "Note mentioning 'client' ({}) should score higher than generic note ({})",
+            matching_score,
+            non_matching_score
+        );
+    }
+
+    #[test]
+    fn test_score_importance_weighting() {
+        let critical_note = make_scored_note(
+            "Same content",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Critical,
+            0.8,
+            0.0,
+        );
+        let low_note = make_scored_note(
+            "Same content",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Low,
+            0.8,
+            0.0,
+        );
+
+        let critical_score = score_note_relevance(
+            &critical_note,
+            Some("src/neo4j/client.rs"),
+            None,
+            "Read",
+        );
+        let low_score =
+            score_note_relevance(&low_note, Some("src/neo4j/client.rs"), None, "Read");
+
+        // critical = 1.5x, low = 0.8x → critical should be ~1.875x the low
+        assert!(
+            critical_score > low_score,
+            "Critical note ({}) should score higher than low note ({})",
+            critical_score,
+            low_score
+        );
+        let ratio = critical_score / low_score;
+        assert!(
+            (ratio - 1.875).abs() < 0.3,
+            "Ratio should be ~1.875, got {}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_score_freshness_decay() {
+        let fresh_note = make_scored_note(
+            "Fresh note",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0, // fresh
+        );
+        let stale_note = make_scored_note(
+            "Stale note",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.5, // stale
+        );
+
+        let fresh_score =
+            score_note_relevance(&fresh_note, Some("src/neo4j/client.rs"), None, "Read");
+        let stale_score =
+            score_note_relevance(&stale_note, Some("src/neo4j/client.rs"), None, "Read");
+
+        assert!(
+            fresh_score > stale_score,
+            "Fresh note ({}) should score higher than stale note ({})",
+            fresh_score,
+            stale_score
+        );
+    }
+
+    #[test]
+    fn test_score_note_type_affinity_edit_gotcha() {
+        let gotcha_note = make_scored_note(
+            "Watch out for this",
+            vec![],
+            NoteType::Gotcha,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        let tip_note = make_scored_note(
+            "Helpful tip here",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let gotcha_score =
+            score_note_relevance(&gotcha_note, Some("src/neo4j/client.rs"), None, "Edit");
+        let tip_score =
+            score_note_relevance(&tip_note, Some("src/neo4j/client.rs"), None, "Edit");
+
+        assert!(
+            gotcha_score > tip_score,
+            "Gotcha note ({}) should score higher than tip ({}) for Edit tool",
+            gotcha_score,
+            tip_score
+        );
+    }
+
+    #[test]
+    fn test_score_note_type_affinity_mcp_guideline() {
+        let guideline_note = make_scored_note(
+            "Follow this pattern",
+            vec![],
+            NoteType::Guideline,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        let tip_note = make_scored_note(
+            "Helpful tip here",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let guideline_score = score_note_relevance(
+            &guideline_note,
+            Some("src/neo4j/client.rs"),
+            None,
+            "mcp__project-orchestrator__task",
+        );
+        let tip_score = score_note_relevance(
+            &tip_note,
+            Some("src/neo4j/client.rs"),
+            None,
+            "mcp__project-orchestrator__task",
+        );
+
+        assert!(
+            guideline_score > tip_score,
+            "Guideline note ({}) should score higher than tip ({}) for MCP tool",
+            guideline_score,
+            tip_score
+        );
+    }
+
+    #[test]
+    fn test_score_is_pure_no_side_effects() {
+        let note = make_scored_note(
+            "Test note",
+            vec!["neo4j"],
+            NoteType::Gotcha,
+            NoteImportance::High,
+            0.8,
+            0.1,
+        );
+
+        // Call twice with same inputs → same output
+        let score1 =
+            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
+        let score2 =
+            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
+
+        assert!(
+            (score1 - score2).abs() < f64::EPSILON,
+            "Function should be pure: {} != {}",
+            score1,
+            score2
+        );
+    }
+
+    #[test]
+    fn test_score_without_file_context() {
+        let note = make_scored_note(
+            "Generic note",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        // Without file_context, only base score + importance + type affinity apply
+        let score = score_note_relevance(&note, None, None, "Read");
+        assert!(score > 0.0, "Score should still be positive: {}", score);
+        // Should be base (0.1) × importance (1.0) = 0.1
+        assert!(
+            (score - 0.1).abs() < f64::EPSILON,
+            "Score without context should be base 0.1, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn test_score_combo_ordering() {
+        // Simulate a real scenario: skill with mixed notes, file is neo4j
+        let notes = vec![
+            make_scored_note(
+                "Neo4j RETURN count() gotcha after DELETE",
+                vec!["neo4j", "cypher", "gotcha"],
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+                0.0,
+            ),
+            make_scored_note(
+                "Tauri window decoration bug on macOS",
+                vec!["tauri", "macos"],
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+                0.0,
+            ),
+            make_scored_note(
+                "General code review tip for better readability",
+                vec!["code-review"],
+                NoteType::Tip,
+                NoteImportance::Low,
+                0.5,
+                0.3,
+            ),
+        ];
+
+        let mut scored: Vec<(usize, f64)> = notes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    i,
+                    score_note_relevance(n, Some("src/neo4j/client.rs"), None, "Edit"),
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Neo4j note should be first (tag affinity + content match + critical)
+        assert_eq!(scored[0].0, 0, "Neo4j note should rank first");
+        // Code review tip should be last (no affinity + low importance + stale)
+        assert_eq!(scored[2].0, 2, "Code review tip should rank last");
+    }
+
+    #[test]
+    fn test_same_directory() {
+        assert!(same_directory(
+            "src/neo4j/client.rs",
+            "src/neo4j/analytics.rs"
+        ));
+        assert!(!same_directory("src/neo4j/client.rs", "src/api/handlers.rs"));
+        assert!(same_directory(
+            "/Users/x/src/neo4j/a.rs",
+            "src/neo4j/b.rs"
+        ));
+        assert!(!same_directory("a.rs", "b.rs")); // no parent dir
+    }
+
+    #[test]
+    fn test_score_anchor_exact_match() {
+        use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
+
+        let mut note = make_scored_note(
+            "Neo4j tip",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        note.anchors = vec![NoteAnchor::new(
+            NoteEntityType::File,
+            "src/neo4j/client.rs".to_string(),
+        )];
+
+        let note_without_anchors = make_scored_note(
+            "Neo4j tip",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let with_anchor =
+            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        let without_anchor = score_note_relevance(
+            &note_without_anchors,
+            Some("src/neo4j/client.rs"),
+            None,
+            "Read",
+        );
+
+        assert!(
+            with_anchor > without_anchor,
+            "Anchored note ({}) should score higher than non-anchored ({})",
+            with_anchor,
+            without_anchor
+        );
+        // Difference should be ~0.4 (exact match bonus)
+        let diff = with_anchor - without_anchor;
+        assert!(
+            (diff - 0.4).abs() < 0.01,
+            "Anchor bonus should be ~0.4, got {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_score_anchor_directory_match() {
+        use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
+
+        let mut note = make_scored_note(
+            "Neo4j tip",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        note.anchors = vec![NoteAnchor::new(
+            NoteEntityType::File,
+            "src/neo4j/analytics.rs".to_string(),
+        )];
+
+        let note_without_anchors = make_scored_note(
+            "Neo4j tip",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let with_dir_anchor =
+            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        let without_anchor = score_note_relevance(
+            &note_without_anchors,
+            Some("src/neo4j/client.rs"),
+            None,
+            "Read",
+        );
+
+        // Directory match → +0.2
+        let diff = with_dir_anchor - without_anchor;
+        assert!(
+            (diff - 0.2).abs() < 0.01,
+            "Directory anchor bonus should be ~0.2, got {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_score_no_anchors_no_bonus() {
+        let note = make_scored_note(
+            "Generic note",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let score =
+            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        // base(0.1) × importance(1.0) = 0.1
+        assert!(
+            (score - 0.1).abs() < f64::EPSILON,
+            "No tags, no content match, no anchors → base score 0.1, got {}",
+            score
         );
     }
 }
