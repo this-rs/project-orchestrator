@@ -457,9 +457,7 @@ impl ToolHandler {
 
             "get_project_roadmap" => {
                 let slug = extract_string(args, "slug")?;
-                let result = http
-                    .get(&format!("/api/projects/{}/roadmap", slug))
-                    .await?;
+                let result = http.get(&format!("/api/projects/{}/roadmap", slug)).await?;
                 Ok(Some(result))
             }
 

@@ -1053,8 +1053,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let prompt = Self::build_feature_graph_prompt(&context);
 
         // 3. Oneshot LLM call
-        let model = std::env::var("FEATURE_GRAPH_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-6".into());
+        let model =
+            std::env::var("FEATURE_GRAPH_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
 
         if model.is_empty() {
             tracing::info!("FEATURE_GRAPH_MODEL is empty, skipping LLM feature graph proposal");

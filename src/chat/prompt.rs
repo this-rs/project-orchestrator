@@ -1858,10 +1858,7 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
             ));
         }
         if !fm.top_hotspots.is_empty() {
-            md.push_str(&format!(
-                "- **Hotspots**: {}\n",
-                fm.top_hotspots.join(", ")
-            ));
+            md.push_str(&format!("- **Hotspots**: {}\n", fm.top_hotspots.join(", ")));
         }
         if !fm.critical_risk_files.is_empty() {
             md.push_str(&format!(
@@ -1891,9 +1888,7 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
                 ));
             }
         }
-        md.push_str(
-            "\n→ Use `get_feature_graph(id)` to explore graph entities\n\n",
-        );
+        md.push_str("\n→ Use `get_feature_graph(id)` to explore graph entities\n\n");
     }
 
     // Only show sync warnings if we have a project
@@ -1907,10 +1902,7 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
                         ago.num_minutes().max(1)
                     ));
                 } else if ago.num_hours() < 24 {
-                    md.push_str(&format!(
-                        "- **Last sync**: {}h ago\n\n",
-                        ago.num_hours()
-                    ));
+                    md.push_str(&format!("- **Last sync**: {}h ago\n\n", ago.num_hours()));
                 } else {
                     md.push_str(&format!(
                         "- **Last sync**: {}d ago — run `sync_project` if code has changed\n\n",

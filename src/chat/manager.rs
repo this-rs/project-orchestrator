@@ -35,8 +35,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use nexus_claude::ToolsConfig;
 use crate::expand_tilde;
+use nexus_claude::ToolsConfig;
 
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
