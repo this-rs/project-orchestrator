@@ -499,9 +499,14 @@ pub struct DetectSkillsPipelineResult {
     pub message: String,
     /// IDs of created/updated skills
     pub skill_ids: Vec<Uuid>,
+    /// Number of note→file anchors created during the auto-anchor prelude (Step 0).
+    /// This ensures all notes have fresh LINKED_TO relations before clustering.
+    #[serde(default)]
+    pub anchors_created: usize,
 }
 
 /// Run the full skill detection pipeline:
+/// 0. Auto-anchor notes to files (ensures fresh LINKED_TO for FileGlob triggers)
 /// 1. Fetch SYNAPSE graph from store
 /// 2. Run Louvain community detection
 /// 3. Deduplicate against existing skills
@@ -516,6 +521,35 @@ pub async fn detect_skills_pipeline(
     config: &SkillDetectionConfig,
 ) -> anyhow::Result<DetectSkillsPipelineResult> {
     let project_id_str = project_id.to_string();
+
+    // Step 0: Auto-anchor notes to files mentioned in their content.
+    // This ensures all notes have fresh LINKED_TO relations before clustering,
+    // so that generated FileGlob triggers reference correct files.
+    let anchors_created =
+        match crate::skills::activation::auto_anchor_notes_for_project(graph_store, project_id)
+            .await
+        {
+            Ok(result) => {
+                if result.anchors_created > 0 {
+                    tracing::info!(
+                        %project_id,
+                        anchors = result.anchors_created,
+                        notes = result.notes_processed,
+                        "detect_skills: auto-anchor prelude created {} anchors",
+                        result.anchors_created
+                    );
+                }
+                result.anchors_created
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %project_id,
+                    "detect_skills: auto-anchor prelude failed (continuing): {}",
+                    e
+                );
+                0
+            }
+        };
 
     // Step 1: Fetch SYNAPSE edges
     let edges = graph_store
@@ -536,6 +570,7 @@ pub async fn detect_skills_pipeline(
             modularity: 0.0,
             message: detection.message,
             skill_ids: Vec::new(),
+            anchors_created,
         });
     }
 
@@ -662,6 +697,7 @@ pub async fn detect_skills_pipeline(
         modularity: detection.modularity,
         message,
         skill_ids,
+        anchors_created,
     })
 }
 
@@ -1078,5 +1114,107 @@ mod tests {
             }
             _ => panic!("Expected Merge with skill_b"),
         }
+    }
+
+    // ========================================================================
+    // Async tests for detect_skills_pipeline (requires MockGraphStore)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_pipeline_runs_auto_anchor_prelude() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{FileNode, ProjectNode};
+        use crate::neo4j::traits::GraphStore;
+        use crate::notes::models::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
+        use chrono::Utc;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create project with root_path
+        let project = ProjectNode {
+            id: project_id,
+            name: "anchor-test".to_string(),
+            slug: "anchor-test".to_string(),
+            root_path: "/tmp/anchor-test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Create a File node with absolute path
+        let file = FileNode {
+            path: "/tmp/anchor-test/src/main.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            last_parsed: Utc::now(),
+            project_id: Some(project_id),
+        };
+        store.upsert_file(&file).await.unwrap();
+
+        // Create a note mentioning the file (relative path)
+        let note = Note {
+            id: Uuid::new_v4(),
+            project_id: Some(project_id),
+            note_type: NoteType::Tip,
+            importance: NoteImportance::Medium,
+            scope: NoteScope::Project,
+            status: NoteStatus::Active,
+            content: "Remember to check src/main.rs for the entry point.".to_string(),
+            tags: vec![],
+            anchors: vec![],
+            created_by: "test".to_string(),
+            created_at: Utc::now(),
+            last_confirmed_at: None,
+            last_confirmed_by: None,
+            staleness_score: 0.0,
+            energy: 0.5,
+            last_activated: None,
+            supersedes: None,
+            superseded_by: None,
+            changes: vec![],
+            assertion_rule: None,
+            last_assertion_result: None,
+        };
+        store.create_note(&note).await.unwrap();
+
+        // Run detect_skills_pipeline — it will have InsufficientData (no synapses)
+        // but the auto-anchor prelude should still run and create LINKED_TO
+        let config = SkillDetectionConfig {
+            min_notes_for_detection: 100, // force InsufficientData
+            ..Default::default()
+        };
+        let result = detect_skills_pipeline(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        // Pipeline should report the anchor was created
+        assert_eq!(result.anchors_created, 1, "Should have created 1 anchor");
+        assert_eq!(result.status, ClusterDetectionStatus::InsufficientData);
+
+        // Verify the LINKED_TO relation was actually created
+        let anchors = store.get_note_anchors(note.id).await.unwrap();
+        assert_eq!(anchors.len(), 1, "Note should have 1 anchor");
+        assert_eq!(anchors[0].entity_id, "/tmp/anchor-test/src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_auto_anchor_no_project_still_works() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let store = MockGraphStore::new();
+        let fake_project_id = Uuid::new_v4();
+
+        // No project exists — pipeline should handle gracefully
+        let config = SkillDetectionConfig::default();
+        let result = detect_skills_pipeline(&store, fake_project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.anchors_created, 0);
+        assert_eq!(result.status, ClusterDetectionStatus::InsufficientData);
     }
 }
