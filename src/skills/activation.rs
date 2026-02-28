@@ -2921,7 +2921,7 @@ mod tests {
     #[test]
     fn test_score_combo_ordering() {
         // Simulate a real scenario: skill with mixed notes, file is neo4j
-        let notes = vec![
+        let notes = [
             make_scored_note(
                 "Neo4j RETURN count() gotcha after DELETE",
                 vec!["neo4j", "cypher", "gotcha"],
