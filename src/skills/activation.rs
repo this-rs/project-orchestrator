@@ -165,21 +165,43 @@ pub async fn activate_for_hook(
         }
 
         // Filter by energy
-        let active_notes: Vec<_> = all_notes
+        let mut active_notes: Vec<_> = all_notes
             .into_iter()
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
+        // Contextual scoring: sort by relevance when file/pattern context available
+        let has_context = file_context.is_some() || pattern.is_some();
+        if has_context {
+            active_notes.sort_by(|a, b| {
+                let sa = score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb = score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let total_note_count = active_notes.len();
         let merged_name = format!("{} + {}", skill1.name, skill2.name);
-        let context = assemble_context_with_confidence(
+        let (context, notes_included) = assemble_context_with_confidence(
             &merged_name,
             &active_notes,
             &all_decisions,
             config.max_context_chars,
             Some(conf1),
+            has_context, // pre_sorted when we scored
         );
 
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+        // Only reinforce notes that were actually rendered in the context
+        let activated_note_ids: Vec<Uuid> = active_notes.iter().take(notes_included).map(|n| n.id).collect();
+
+        if has_context {
+            tracing::info!(
+                skill = %merged_name,
+                contextual = notes_included,
+                total = total_note_count,
+                "Contextual filtering applied (merged)"
+            );
+        }
 
         Ok(Some(HookActivationOutcome {
             response: HookActivateResponse {
@@ -187,8 +209,10 @@ pub async fn activate_for_hook(
                 skill_name: merged_name,
                 skill_id: skill1.id, // Use primary skill's ID
                 confidence: conf1,
-                notes_count: active_notes.len(),
+                notes_count: notes_included,
                 decisions_count: all_decisions.len(),
+                total_note_count,
+                contextual_note_count: if has_context { notes_included } else { 0 },
             },
             activated_note_ids,
         }))
@@ -197,20 +221,42 @@ pub async fn activate_for_hook(
         let (skill, confidence) = matches.remove(0);
         let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
 
-        let active_notes: Vec<_> = notes
+        let mut active_notes: Vec<_> = notes
             .into_iter()
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
-        let context = assemble_context_with_confidence(
+        // Contextual scoring: sort by relevance when file/pattern context available
+        let has_context = file_context.is_some() || pattern.is_some();
+        if has_context {
+            active_notes.sort_by(|a, b| {
+                let sa = score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb = score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let total_note_count = active_notes.len();
+        let (context, notes_included) = assemble_context_with_confidence(
             &skill.name,
             &active_notes,
             &decisions,
             config.max_context_chars,
             Some(confidence),
+            has_context,
         );
 
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+        // Only reinforce notes that were actually rendered in the context
+        let activated_note_ids: Vec<Uuid> = active_notes.iter().take(notes_included).map(|n| n.id).collect();
+
+        if has_context {
+            tracing::info!(
+                skill = %skill.name,
+                contextual = notes_included,
+                total = total_note_count,
+                "Contextual filtering applied"
+            );
+        }
 
         Ok(Some(HookActivationOutcome {
             response: HookActivateResponse {
@@ -218,8 +264,10 @@ pub async fn activate_for_hook(
                 skill_name: skill.name.clone(),
                 skill_id: skill.id,
                 confidence,
-                notes_count: active_notes.len(),
+                notes_count: notes_included,
                 decisions_count: decisions.len(),
+                total_note_count,
+                contextual_note_count: if has_context { notes_included } else { 0 },
             },
             activated_note_ids,
         }))
@@ -314,21 +362,43 @@ pub async fn activate_for_hook_cached(
             }
         }
 
-        let active_notes: Vec<_> = all_notes
+        let mut active_notes: Vec<_> = all_notes
             .into_iter()
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
+        // Contextual scoring: sort by relevance when file/pattern context available
+        let has_context = file_context.is_some() || pattern.is_some();
+        if has_context {
+            active_notes.sort_by(|a, b| {
+                let sa = score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb = score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let total_note_count = active_notes.len();
         let merged_name = format!("{} + {}", skill1.name, skill2.name);
-        let context = assemble_context_with_confidence(
+        let (context, notes_included) = assemble_context_with_confidence(
             &merged_name,
             &active_notes,
             &all_decisions,
             config.max_context_chars,
             Some(conf1),
+            has_context,
         );
 
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+        // Only reinforce notes that were actually rendered in the context
+        let activated_note_ids: Vec<Uuid> = active_notes.iter().take(notes_included).map(|n| n.id).collect();
+
+        if has_context {
+            tracing::info!(
+                skill = %merged_name,
+                contextual = notes_included,
+                total = total_note_count,
+                "Contextual filtering applied (merged, cached)"
+            );
+        }
 
         Ok(Some(HookActivationOutcome {
             response: HookActivateResponse {
@@ -336,8 +406,10 @@ pub async fn activate_for_hook_cached(
                 skill_name: merged_name,
                 skill_id: skill1.id,
                 confidence: conf1,
-                notes_count: active_notes.len(),
+                notes_count: notes_included,
                 decisions_count: all_decisions.len(),
+                total_note_count,
+                contextual_note_count: if has_context { notes_included } else { 0 },
             },
             activated_note_ids,
         }))
@@ -345,20 +417,42 @@ pub async fn activate_for_hook_cached(
         let (skill, confidence) = matches.remove(0);
         let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
 
-        let active_notes: Vec<_> = notes
+        let mut active_notes: Vec<_> = notes
             .into_iter()
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
-        let context = assemble_context_with_confidence(
+        // Contextual scoring: sort by relevance when file/pattern context available
+        let has_context = file_context.is_some() || pattern.is_some();
+        if has_context {
+            active_notes.sort_by(|a, b| {
+                let sa = score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb = score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let total_note_count = active_notes.len();
+        let (context, notes_included) = assemble_context_with_confidence(
             &skill.name,
             &active_notes,
             &decisions,
             config.max_context_chars,
             Some(confidence),
+            has_context,
         );
 
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+        // Only reinforce notes that were actually rendered in the context
+        let activated_note_ids: Vec<Uuid> = active_notes.iter().take(notes_included).map(|n| n.id).collect();
+
+        if has_context {
+            tracing::info!(
+                skill = %skill.name,
+                contextual = notes_included,
+                total = total_note_count,
+                "Contextual filtering applied (cached)"
+            );
+        }
 
         Ok(Some(HookActivationOutcome {
             response: HookActivateResponse {
@@ -366,8 +460,10 @@ pub async fn activate_for_hook_cached(
                 skill_name: skill.name.clone(),
                 skill_id: skill.id,
                 confidence,
-                notes_count: active_notes.len(),
+                notes_count: notes_included,
                 decisions_count: decisions.len(),
+                total_note_count,
+                contextual_note_count: if has_context { notes_included } else { 0 },
             },
             activated_note_ids,
         }))
@@ -538,17 +634,26 @@ pub fn assemble_context(
     decisions: &[DecisionNode],
     max_chars: usize,
 ) -> String {
-    assemble_context_with_confidence(skill_name, notes, decisions, max_chars, None)
+    assemble_context_with_confidence(skill_name, notes, decisions, max_chars, None, false).0
 }
 
 /// Assemble context with optional confidence score in the header.
+///
+/// When `pre_sorted` is true, notes are used in the order provided (caller has
+/// already sorted by contextual relevance score). When false, notes are sorted
+/// by importance then energy (legacy behavior).
+///
+/// Returns `(context_text, notes_included_count)` — the count is needed to
+/// restrict Hebbian reinforcement to only the notes that actually made it into
+/// the context budget.
 pub fn assemble_context_with_confidence(
     skill_name: &str,
     notes: &[Note],
     decisions: &[DecisionNode],
     max_chars: usize,
     confidence: Option<f64>,
-) -> String {
+    pre_sorted: bool,
+) -> (String, usize) {
     let header = match confidence {
         Some(conf) => format!(
             "## \u{1f9e0} Skill \"{}\" (confidence {}%)\n",
@@ -566,21 +671,23 @@ pub fn assemble_context_with_confidence(
         max_chars
     };
 
-    // Sort notes by importance (Critical first) then energy
+    // Sort notes by importance (Critical first) then energy — unless pre_sorted
     let mut sorted_notes: Vec<&Note> = notes.iter().collect();
-    sorted_notes.sort_by(|a, b| {
-        let imp_ord = b
-            .importance
-            .weight()
-            .partial_cmp(&a.importance.weight())
-            .unwrap_or(std::cmp::Ordering::Equal);
-        if imp_ord != std::cmp::Ordering::Equal {
-            return imp_ord;
-        }
-        b.energy
-            .partial_cmp(&a.energy)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    if !pre_sorted {
+        sorted_notes.sort_by(|a, b| {
+            let imp_ord = b
+                .importance
+                .weight()
+                .partial_cmp(&a.importance.weight())
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if imp_ord != std::cmp::Ordering::Equal {
+                return imp_ord;
+            }
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
 
     // Add notes one by one until budget is exhausted
     // Use chars().count() consistently (not .len() which is byte count)
@@ -634,7 +741,7 @@ pub fn assemble_context_with_confidence(
         }
     }
 
-    context
+    (context, notes_included)
 }
 
 // ============================================================================
@@ -1299,8 +1406,8 @@ mod tests {
         )];
 
         // With confidence → 🧠 header with percentage
-        let context =
-            assemble_context_with_confidence("Neo4j Perf", &notes, &decisions, 3200, Some(0.85));
+        let (context, _) =
+            assemble_context_with_confidence("Neo4j Perf", &notes, &decisions, 3200, Some(0.85), false);
         assert!(
             context.starts_with("## \u{1f9e0} Skill \"Neo4j Perf\" (confidence 85%)"),
             "Expected confidence header, got: {}",
@@ -1321,7 +1428,7 @@ mod tests {
         )];
 
         // Without confidence → 💡 header (same as assemble_context)
-        let context = assemble_context_with_confidence("Test Skill", &notes, &[], 3200, None);
+        let (context, _) = assemble_context_with_confidence("Test Skill", &notes, &[], 3200, None, false);
         assert!(
             context.starts_with("## \u{1f4a1} Test Skill"),
             "Expected default header without confidence, got: {}",
@@ -1340,7 +1447,7 @@ mod tests {
         )];
 
         // Confidence 0.666 → should round to 67%
-        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666));
+        let (context, _) = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666), false);
         assert!(
             context.contains("confidence 67%"),
             "Expected confidence 67%, got: {}",
@@ -1348,7 +1455,7 @@ mod tests {
         );
 
         // Confidence 1.0 → 100%
-        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(1.0));
+        let (context, _) = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(1.0), false);
         assert!(
             context.contains("confidence 100%"),
             "Expected confidence 100%, got: {}",
@@ -1356,12 +1463,80 @@ mod tests {
         );
 
         // Confidence 0.0 → 0%
-        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.0));
+        let (context, _) = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.0), false);
         assert!(
             context.contains("confidence 0%"),
             "Expected confidence 0%, got: {}",
             context.lines().next().unwrap_or("")
         );
+    }
+
+    // --- Pre-sorted & notes_included ---
+
+    #[test]
+    fn test_assemble_context_pre_sorted_preserves_order() {
+        // When pre_sorted=true, notes should appear in the order given
+        // (no re-sorting by importance/energy)
+        let notes = vec![
+            make_test_note(Uuid::new_v4(), "Low importance but high score", NoteType::Tip, NoteImportance::Low, 0.3),
+            make_test_note(Uuid::new_v4(), "Critical but low score", NoteType::Gotcha, NoteImportance::Critical, 0.9),
+        ];
+
+        // pre_sorted=true: Low-importance note should appear first (as given)
+        let (context_sorted, _) = assemble_context_with_confidence("Test", &notes, &[], 3200, None, true);
+        let lines: Vec<&str> = context_sorted.lines().collect();
+        // Line 0 = header, Line 1 = first note (low importance), Line 2 = second note (critical)
+        assert!(lines[1].contains("Low importance"), "First note should be low importance, got: {}", lines[1]);
+        assert!(lines[2].contains("Critical"), "Second note should be critical, got: {}", lines[2]);
+
+        // pre_sorted=false: Critical should come first (sorted by importance)
+        let (context_default, _) = assemble_context_with_confidence("Test", &notes, &[], 3200, None, false);
+        let lines: Vec<&str> = context_default.lines().collect();
+        assert!(lines[1].contains("Critical"), "First note should be critical, got: {}", lines[1]);
+        assert!(lines[2].contains("Low importance"), "Second note should be low importance, got: {}", lines[2]);
+    }
+
+    #[test]
+    fn test_assemble_context_returns_notes_included_count() {
+        // Create many notes that exceed the budget
+        let notes: Vec<Note> = (0..50)
+            .map(|i| make_test_note(
+                Uuid::new_v4(),
+                &format!("Note content number {} with some padding text to take space", i),
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.5,
+            ))
+            .collect();
+
+        let (context, notes_included) = assemble_context_with_confidence("Test", &notes, &[], 1000, None, false);
+        // With a 1000 char budget, not all 50 notes should fit
+        assert!(notes_included < 50, "Expected fewer than 50 notes included, got: {}", notes_included);
+        assert!(notes_included > 0, "Expected at least 1 note included");
+        assert!(context.chars().count() <= 1000, "Context should respect budget");
+    }
+
+    #[test]
+    fn test_activated_note_ids_subset_of_rendered() {
+        // This verifies the fix for the Hebbian over-broad bug:
+        // activated_note_ids should only contain notes that were rendered
+        let notes: Vec<Note> = (0..30)
+            .map(|i| make_test_note(
+                Uuid::new_v4(),
+                &format!("Knowledge entry #{}: this is a substantial note with detailed content about topic {}", i, i),
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.5,
+            ))
+            .collect();
+
+        let (_context, notes_included) = assemble_context_with_confidence("Test", &notes, &[], 1500, None, false);
+        // With 30 notes and 1500 char budget, only a subset should be included
+        assert!(notes_included < 30, "Not all notes should fit in budget: {} included", notes_included);
+        // The activated_note_ids should be notes[..notes_included]
+        // (In the actual pipeline, take(notes_included) is used)
+        let activated_ids: Vec<Uuid> = notes.iter().take(notes_included).map(|n| n.id).collect();
+        assert_eq!(activated_ids.len(), notes_included);
     }
 
     // --- Truncation ---

@@ -470,10 +470,16 @@ pub struct HookActivateResponse {
     pub skill_id: Uuid,
     /// Confidence of the trigger match (0.0-1.0)
     pub confidence: f64,
-    /// Number of notes included in the context
+    /// Number of notes included in the context (after budget truncation)
     pub notes_count: usize,
     /// Number of decisions included in the context
     pub decisions_count: usize,
+    /// Total number of active notes before contextual filtering
+    #[serde(default)]
+    pub total_note_count: usize,
+    /// Number of notes selected by contextual scoring (0 if no context available)
+    #[serde(default)]
+    pub contextual_note_count: usize,
 }
 
 /// Session context response for SessionStart hook
@@ -1065,6 +1071,8 @@ mod tests {
             confidence: 0.85,
             notes_count: 4,
             decisions_count: 1,
+            total_note_count: 12,
+            contextual_note_count: 4,
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -1072,5 +1080,23 @@ mod tests {
 
         assert_eq!(deserialized.skill_name, "Neo4j Performance");
         assert_eq!(deserialized.notes_count, 4);
+        assert_eq!(deserialized.total_note_count, 12);
+        assert_eq!(deserialized.contextual_note_count, 4);
+    }
+
+    #[test]
+    fn test_hook_activate_response_backward_compat() {
+        // Ensure old JSON without new fields deserializes correctly (serde default)
+        let json = r#"{
+            "context": "test",
+            "skill_name": "test",
+            "skill_id": "00000000-0000-0000-0000-000000000000",
+            "confidence": 0.5,
+            "notes_count": 3,
+            "decisions_count": 1
+        }"#;
+        let resp: HookActivateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total_note_count, 0);
+        assert_eq!(resp.contextual_note_count, 0);
     }
 }
