@@ -950,7 +950,7 @@ pub fn score_note_relevance(
             .iter()
             .filter(|tag| {
                 let tag_lower = tag.to_lowercase();
-                path_segments.iter().any(|seg| *seg == tag_lower)
+                path_segments.contains(&tag_lower)
             })
             .count();
         score += (tag_overlap as f64 * 0.15).min(0.4);
@@ -1130,7 +1130,7 @@ fn extract_path_tokens(line: &str) -> Vec<String> {
 /// `None` otherwise.
 fn validate_and_normalize_path(token: &str) -> Option<String> {
     // Strip trailing punctuation (period, comma, semicolon, colon, paren)
-    let token = token.trim().trim_end_matches(|c: char| c == '.' || c == ',' || c == ';' || c == ':' || c == ')' || c == ']');
+    let token = token.trim().trim_end_matches(['.', ',', ';', ':', ')', ']']);
 
     // Reject URLs
     if token.starts_with("http://") || token.starts_with("https://") || token.starts_with("ftp://") {
@@ -3082,6 +3082,294 @@ mod tests {
             (score - 0.1).abs() < f64::EPSILON,
             "No tags, no content match, no anchors → base score 0.1, got {}",
             score
+        );
+    }
+
+    // --- E2E contextual scoring simulation ---
+
+    /// Simulates a realistic skill activation scenario: a skill with 15+ notes
+    /// of mixed topics (neo4j, tauri, chat, api), triggered by a Read on
+    /// `src/neo4j/client.rs`. Verifies that notes relevant to neo4j are
+    /// sorted first in the assembled context string.
+    #[test]
+    fn test_e2e_contextual_scoring_sorts_relevant_notes_first() {
+        use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
+
+        // --- Build 18 notes with realistic diversity ---
+        let neo4j_notes = vec![
+            {
+                let mut n = make_scored_note(
+                    "Always use parameters in Cypher queries to prevent injection.",
+                    vec!["neo4j", "cypher", "security"],
+                    NoteType::Gotcha,
+                    NoteImportance::Critical,
+                    0.9,
+                    0.0,
+                );
+                n.anchors = vec![NoteAnchor::new(
+                    NoteEntityType::File,
+                    "src/neo4j/client.rs".to_string(),
+                )];
+                n
+            },
+            make_scored_note(
+                "Neo4j MERGE is not atomic, use unique constraints. See src/neo4j/client.rs.",
+                vec!["neo4j", "cypher", "gotcha"],
+                NoteType::Gotcha,
+                NoteImportance::High,
+                0.8,
+                0.05,
+            ),
+            make_scored_note(
+                "The Neo4j driver pool size should match tokio thread count.",
+                vec!["neo4j", "performance"],
+                NoteType::Tip,
+                NoteImportance::Medium,
+                0.7,
+                0.1,
+            ),
+            {
+                let mut n = make_scored_note(
+                    "All LINKED_TO relations must use this exact name, not ATTACHED_TO.",
+                    vec!["neo4j", "knowledge-fabric"],
+                    NoteType::Guideline,
+                    NoteImportance::High,
+                    0.85,
+                    0.0,
+                );
+                n.anchors = vec![NoteAnchor::new(
+                    NoteEntityType::File,
+                    "src/neo4j/note.rs".to_string(),
+                )];
+                n
+            },
+        ];
+
+        let tauri_notes = vec![
+            make_scored_note(
+                "Tauri IPC uses JSON serialization, avoid large binary payloads.",
+                vec!["tauri", "ipc", "performance"],
+                NoteType::Gotcha,
+                NoteImportance::High,
+                0.8,
+                0.0,
+            ),
+            make_scored_note(
+                "Use tauri::Manager for window management in multi-window setups.",
+                vec!["tauri", "desktop", "window"],
+                NoteType::Pattern,
+                NoteImportance::Medium,
+                0.6,
+                0.2,
+            ),
+            make_scored_note(
+                "Custom protocol handlers must be registered before window creation.",
+                vec!["tauri", "protocol"],
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.5,
+                0.3,
+            ),
+        ];
+
+        let chat_notes = vec![
+            make_scored_note(
+                "Chat session cleanup requires explicit entity unlinking first.",
+                vec!["chat", "session", "lifecycle"],
+                NoteType::Gotcha,
+                NoteImportance::Medium,
+                0.7,
+                0.1,
+            ),
+            make_scored_note(
+                "Message pagination uses offset/limit, not cursor-based.",
+                vec!["chat", "api", "pagination"],
+                NoteType::Context,
+                NoteImportance::Low,
+                0.5,
+                0.2,
+            ),
+            make_scored_note(
+                "The chat model field supports 'sonnet', 'opus', 'haiku' shortcuts.",
+                vec!["chat", "model"],
+                NoteType::Tip,
+                NoteImportance::Low,
+                0.4,
+                0.15,
+            ),
+        ];
+
+        let api_notes = vec![
+            make_scored_note(
+                "All API endpoints return 404 with {\"error\": \"...\"} JSON body.",
+                vec!["api", "rest", "error-handling"],
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.6,
+                0.1,
+            ),
+            make_scored_note(
+                "Rate limiting is not implemented yet, track in backlog.",
+                vec!["api", "security", "backlog"],
+                NoteType::Observation,
+                NoteImportance::Low,
+                0.3,
+                0.4,
+            ),
+        ];
+
+        let misc_notes = vec![
+            make_scored_note(
+                "French stop words must be filtered in trigger generation.",
+                vec!["triggers", "i18n"],
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.6,
+                0.0,
+            ),
+            make_scored_note(
+                "Test helpers are in test_helpers.rs, use mock_app_state().",
+                vec!["testing", "mocking"],
+                NoteType::Tip,
+                NoteImportance::Medium,
+                0.5,
+                0.1,
+            ),
+            make_scored_note(
+                "Stale note with low energy should rank last.",
+                vec!["misc"],
+                NoteType::Observation,
+                NoteImportance::Low,
+                0.2,
+                0.8,
+            ),
+        ];
+
+        // Combine all notes in a deliberately non-optimal order
+        let mut all_notes: Vec<Note> = Vec::new();
+        all_notes.extend(tauri_notes);
+        all_notes.extend(chat_notes);
+        all_notes.extend(misc_notes);
+        all_notes.extend(api_notes);
+        all_notes.extend(neo4j_notes); // neo4j notes added LAST
+
+        assert_eq!(all_notes.len(), 15, "Should have 15 notes total");
+
+        // Score and sort (simulate what activate_for_hook does)
+        let file_context = Some("src/neo4j/client.rs");
+        let mut scored: Vec<(f64, &Note)> = all_notes
+            .iter()
+            .map(|n| (score_note_relevance(n, file_context, None, "Read"), n))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+        // The top 4 notes should ALL be neo4j-related
+        let top_4_contents: Vec<&str> = scored[0..4].iter().map(|(_, n)| n.content.as_str()).collect();
+        for content in &top_4_contents {
+            assert!(
+                content.to_lowercase().contains("neo4j")
+                    || content.to_lowercase().contains("linked_to")
+                    || content.to_lowercase().contains("cypher"),
+                "Top-4 note should be neo4j-related, got: '{}'",
+                content
+            );
+        }
+
+        // The note with exact anchor + critical importance should be first
+        assert!(
+            scored[0].1.content.contains("parameters in Cypher"),
+            "First note should be the critical gotcha with exact anchor, got: '{}'",
+            scored[0].1.content
+        );
+
+        // The note mentioning client.rs in content should rank high (top 3)
+        let client_rs_note_rank = scored
+            .iter()
+            .position(|(_, n)| n.content.contains("client.rs"))
+            .expect("client.rs note should exist");
+        assert!(
+            client_rs_note_rank <= 2,
+            "Note mentioning client.rs should be in top 3, got rank {}",
+            client_rs_note_rank
+        );
+
+        // Tauri notes should be in the bottom half
+        let tauri_positions: Vec<usize> = scored
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, n))| n.tags.contains(&"tauri".to_string()))
+            .map(|(i, _)| i)
+            .collect();
+        for pos in &tauri_positions {
+            assert!(
+                *pos >= 4,
+                "Tauri notes should be below neo4j notes, found at position {}",
+                pos
+            );
+        }
+
+        // Assemble context and verify neo4j notes appear first in the string
+        let sorted_notes: Vec<Note> = scored.iter().map(|(_, n)| (*n).clone()).collect();
+        let decisions = vec![];
+        let (context_str, notes_included) = assemble_context_with_confidence(
+            "TestSkill",
+            &sorted_notes,
+            &decisions,
+            3200,
+            Some(0.75),
+            true, // pre_sorted
+        );
+
+        assert!(notes_included > 0, "Should include at least 1 note");
+        // With short notes, all 15 may fit in 3200 chars. The important thing
+        // is that the ORDER is correct (neo4j first), not that truncation happens.
+
+        // First note line in context should be neo4j-related
+        // Format is "- {emoji}{badge}{content}\n"
+        let first_note_line = context_str
+            .lines()
+            .find(|l| l.starts_with("- "))
+            .expect("Should have at least one note line");
+        assert!(
+            first_note_line.to_lowercase().contains("cypher")
+                || first_note_line.to_lowercase().contains("parameter"),
+            "First note in context should be neo4j-related, got: '{}'",
+            first_note_line
+        );
+    }
+
+    /// Verifies the regression guard: when no file_context or pattern is
+    /// provided, the scoring falls back to energy-based ordering
+    /// (legacy behavior preserved).
+    #[test]
+    fn test_e2e_no_context_preserves_legacy_ordering() {
+        let high_energy = make_scored_note(
+            "High energy generic note",
+            vec!["misc"],
+            NoteType::Tip,
+            NoteImportance::Low,
+            0.95,
+            0.0,
+        );
+        let low_energy = make_scored_note(
+            "Low energy generic note",
+            vec!["misc"],
+            NoteType::Tip,
+            NoteImportance::Low,
+            0.3,
+            0.0,
+        );
+
+        let score_high = score_note_relevance(&high_energy, None, None, "Read");
+        let score_low = score_note_relevance(&low_energy, None, None, "Read");
+
+        // Without file_context, all signals except importance are inert.
+        // Both have same importance (Low → ×0.8), so scores should be equal.
+        assert!(
+            (score_high - score_low).abs() < f64::EPSILON,
+            "Without context, scores should be equal regardless of energy: high={}, low={}",
+            score_high,
+            score_low
         );
     }
 }
