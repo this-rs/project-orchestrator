@@ -70,7 +70,7 @@ impl Neo4jClient {
         let q = query(
             "MATCH (fg:FeatureGraph {id: $id})-[r:INCLUDES_ENTITY]->(e)
              RETURN labels(e)[0] AS entity_type,
-                    COALESCE(e.path, e.id) AS entity_id,
+                    COALESCE(e.path, e.name, e.id) AS entity_id,
                     COALESCE(e.name, e.path) AS name,
                     r.role AS role,
                     e.pagerank AS pagerank",
