@@ -1232,22 +1232,43 @@ fn validate_and_normalize_path(token: &str) -> Option<String> {
 /// to matching File nodes in the graph. Uses `link_note_to_entity` which
 /// performs MERGE (idempotent — safe to call multiple times).
 ///
+/// **Important**: `root_path` must be provided so that relative paths extracted
+/// from note content (e.g. `src/neo4j/client.rs`) are resolved to the absolute
+/// paths used by File nodes in Neo4j (e.g. `/home/user/project/src/neo4j/client.rs`).
+/// Without `root_path`, the MATCH query silently returns 0 rows (ghost anchors).
+///
 /// Returns the number of new anchors created.
-pub async fn auto_anchor_note(graph_store: &dyn GraphStore, note: &Note) -> anyhow::Result<usize> {
+pub async fn auto_anchor_note(
+    graph_store: &dyn GraphStore,
+    note: &Note,
+    root_path: Option<&str>,
+) -> anyhow::Result<usize> {
     use crate::notes::models::EntityType;
 
     let paths = extract_file_paths_from_content(&note.content);
     let mut anchored = 0;
 
     for path in &paths {
+        // File nodes in Neo4j use absolute paths. extract_file_paths_from_content
+        // returns relative paths (e.g. "src/neo4j/client.rs"). Resolve them to
+        // absolute using the project's root_path so the MATCH query finds the node.
+        let resolved_path = if let Some(root) = root_path {
+            let root = root.trim_end_matches('/');
+            format!("{}/{}", root, path)
+        } else {
+            // No root_path — use relative path as-is (will likely not match,
+            // but keeps backward compatibility for tests/edge cases)
+            path.clone()
+        };
+
         // Try to link — link_note_to_entity uses MERGE, so it's safe if already linked
         if let Err(e) = graph_store
-            .link_note_to_entity(note.id, &EntityType::File, path, None, None)
+            .link_note_to_entity(note.id, &EntityType::File, &resolved_path, None, None)
             .await
         {
             tracing::debug!(
                 note_id = %note.id,
-                path = %path,
+                path = %resolved_path,
                 "Auto-anchor skipped (file may not exist in graph): {}",
                 e
             );
@@ -1262,8 +1283,8 @@ pub async fn auto_anchor_note(graph_store: &dyn GraphStore, note: &Note) -> anyh
 /// Auto-anchor all notes for a project to files mentioned in their content.
 ///
 /// This is a batch operation meant to be called from the MCP admin action
-/// `auto_anchor_notes`. It loads all project notes and runs `auto_anchor_note`
-/// on each.
+/// `auto_anchor_notes`. It loads the project's `root_path` and all project notes,
+/// then runs `auto_anchor_note` on each with path resolution.
 ///
 /// Returns `(notes_processed, anchors_created)`.
 pub async fn auto_anchor_notes_for_project(
@@ -1271,6 +1292,17 @@ pub async fn auto_anchor_notes_for_project(
     project_id: Uuid,
 ) -> anyhow::Result<(usize, usize)> {
     use crate::notes::models::NoteFilters;
+
+    // Resolve project root_path for absolute file path matching.
+    // File nodes in Neo4j use absolute paths, but extract_file_paths_from_content
+    // returns relative paths — we need root_path to bridge the gap.
+    let root_path = match graph_store.get_project(project_id).await? {
+        Some(proj) => Some(proj.root_path),
+        None => {
+            tracing::warn!(%project_id, "Auto-anchor: project not found, using relative paths");
+            None
+        }
+    };
 
     let filters = NoteFilters::default();
     let (notes, _total) = graph_store
@@ -1281,7 +1313,7 @@ pub async fn auto_anchor_notes_for_project(
     let mut total_anchors = 0;
 
     for note in &notes {
-        let anchored = auto_anchor_note(graph_store, note).await?;
+        let anchored = auto_anchor_note(graph_store, note, root_path.as_deref()).await?;
         total_anchors += anchored;
     }
 
@@ -1289,6 +1321,7 @@ pub async fn auto_anchor_notes_for_project(
         %project_id,
         notes = notes_count,
         anchors = total_anchors,
+        root_path = root_path.as_deref().unwrap_or("<none>"),
         "Auto-anchoring completed"
     );
 

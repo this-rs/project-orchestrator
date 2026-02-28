@@ -228,7 +228,25 @@ impl NoteManager {
         let note_clone = note.clone();
 
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_note(&*neo4j, &note_clone).await {
+            // Resolve project root_path for absolute file path matching.
+            // File nodes use absolute paths, but extract_file_paths_from_content
+            // returns relative — we need root_path to bridge the gap.
+            let root_path = if let Some(pid) = note_clone.project_id {
+                match neo4j.get_project(pid).await {
+                    Ok(Some(proj)) => Some(proj.root_path),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            match crate::skills::activation::auto_anchor_note(
+                &*neo4j,
+                &note_clone,
+                root_path.as_deref(),
+            )
+            .await
+            {
                 Ok(count) => {
                     if count > 0 {
                         tracing::debug!(
