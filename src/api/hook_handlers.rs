@@ -186,10 +186,7 @@ pub async fn activate_hook(
             );
 
             // Increment activation_count (fire-and-forget)
-            spawn_activation_increment(
-                state.orchestrator.neo4j_arc(),
-                outcome.response.skill_id,
-            );
+            spawn_activation_increment(state.orchestrator.neo4j_arc(), outcome.response.skill_id);
 
             Ok((
                 StatusCode::OK,
