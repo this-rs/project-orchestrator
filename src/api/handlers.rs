@@ -2088,6 +2088,49 @@ pub async fn detect_skills(
 }
 
 // ============================================================================
+// Auto-anchor Notes
+// ============================================================================
+
+/// POST /api/admin/auto-anchor-notes
+///
+/// Scan all notes for a project, extract file paths from their content,
+/// and create LINKED_TO relations to matching File nodes in the graph.
+/// Idempotent — safe to run multiple times.
+pub async fn auto_anchor_notes(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FabricProjectRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    // Verify project exists
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let start = std::time::Instant::now();
+
+    let (notes_processed, anchors_created) =
+        crate::skills::activation::auto_anchor_notes_for_project(
+            state.orchestrator.neo4j(),
+            project_id,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "notes_processed": notes_processed,
+        "anchors_created": anchors_created,
+        "elapsed_ms": elapsed_ms,
+    })))
+}
+
+// ============================================================================
 // Skill Maintenance
 // ============================================================================
 

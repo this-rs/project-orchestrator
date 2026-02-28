@@ -330,6 +330,7 @@ impl ToolHandler {
             ("admin", "bootstrap_knowledge_fabric") => "bootstrap_knowledge_fabric",
             ("admin", "detect_skills") => "detect_skills",
             ("admin", "maintain_skills") => "maintain_skills",
+            ("admin", "auto_anchor_notes") => "auto_anchor_notes",
             ("admin", "install_hooks") => "install_hooks",
 
             _ => {
@@ -1901,6 +1902,18 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/admin/skill-maintenance", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "auto_anchor_notes" => {
+                let mut body = serde_json::Map::new();
+                body.insert(
+                    "project_id".to_string(),
+                    json!(extract_string(args, "project_id")?),
+                );
+                let result = http
+                    .post("/api/admin/auto-anchor-notes", &Value::Object(body))
                     .await?;
                 Ok(Some(result))
             }

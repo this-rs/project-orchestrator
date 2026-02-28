@@ -1045,6 +1045,219 @@ pub fn same_directory(path_a: &str, path_b: &str) -> bool {
 }
 
 // ============================================================================
+// File path extraction from note content (for auto-anchoring)
+// ============================================================================
+
+/// Known source file extensions for path detection.
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift",
+    "rb", "php", "cs", "cpp", "c", "h", "hpp", "toml", "yaml", "yml",
+    "json", "sql", "sh", "bash", "zsh", "md", "html", "css", "scss",
+    "vue", "svelte", "ex", "exs", "zig", "lua", "r", "m", "mm",
+];
+
+/// Extract file paths mentioned in a note's content.
+///
+/// Detects:
+/// - Relative paths: `src/neo4j/client.rs`, `tests/unit/test_foo.py`
+/// - Absolute paths: `/Users/foo/project/src/bar.rs` → normalized to relative after `src/`
+/// - Backtick-wrapped: \`src/neo4j/client.rs\`
+/// - Paths with known source extensions
+///
+/// Filters out:
+/// - URLs (http://, https://, ftp://)
+/// - Package/import strings (no `/` separators like `crate::foo::bar`)
+/// - Paths that are too short or don't contain a `/`
+///
+/// Returns deduplicated relative paths.
+pub fn extract_file_paths_from_content(content: &str) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut paths = HashSet::new();
+
+    // Regex-free approach: split content into tokens, check each for path patterns
+    for line in content.lines() {
+        // Extract tokens from the line, handling backticks specially
+        let tokens = extract_path_tokens(line);
+        for token in tokens {
+            if let Some(path) = validate_and_normalize_path(&token) {
+                paths.insert(path);
+            }
+        }
+    }
+
+    let mut result: Vec<String> = paths.into_iter().collect();
+    result.sort(); // Deterministic ordering
+    result
+}
+
+/// Extract potential path tokens from a line of text.
+///
+/// Handles backtick-wrapped paths and whitespace/punctuation-delimited tokens.
+fn extract_path_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    // First: extract backtick-wrapped content (highest priority)
+    let mut rest = line;
+    while let Some(start) = rest.find('`') {
+        let after_tick = &rest[start + 1..];
+        if let Some(end) = after_tick.find('`') {
+            let inside = &after_tick[..end];
+            if inside.contains('/') && !inside.contains(' ') {
+                tokens.push(inside.to_string());
+            }
+            rest = &after_tick[end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    // Second: split line by whitespace and common delimiters, look for path-like tokens
+    for word in line.split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '(' || c == ')' || c == '[' || c == ']' || c == '"' || c == '\'') {
+        // Strip surrounding backticks, parens, quotes
+        let clean = word.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ':');
+        if clean.contains('/') && !clean.is_empty() {
+            tokens.push(clean.to_string());
+        }
+    }
+
+    tokens
+}
+
+/// Validate a token as a file path and normalize it.
+///
+/// Returns `Some(normalized_path)` if the token looks like a valid source file path,
+/// `None` otherwise.
+fn validate_and_normalize_path(token: &str) -> Option<String> {
+    // Strip trailing punctuation (period, comma, semicolon, colon, paren)
+    let token = token.trim().trim_end_matches(|c: char| c == '.' || c == ',' || c == ';' || c == ':' || c == ')' || c == ']');
+
+    // Reject URLs
+    if token.starts_with("http://") || token.starts_with("https://") || token.starts_with("ftp://") {
+        return None;
+    }
+
+    // Must contain at least one '/' (to be a path, not just a filename)
+    if !token.contains('/') {
+        return None;
+    }
+
+    // Reject Rust module paths (::)
+    if token.contains("::") {
+        return None;
+    }
+
+    // Must have a recognized extension
+    let extension = token.rsplit('.').next()?;
+    if !SOURCE_EXTENSIONS.contains(&extension.to_lowercase().as_str()) {
+        return None;
+    }
+
+    // Normalize absolute paths: find "src/" and take from there
+    let normalized = if token.starts_with('/') {
+        if let Some(idx) = token.find("/src/") {
+            &token[idx + 1..] // Skip the leading '/', keep "src/..."
+        } else if let Some(idx) = token.find("/tests/") {
+            &token[idx + 1..]
+        } else {
+            // Absolute path without src/ or tests/ — skip (could be system path)
+            return None;
+        }
+    } else {
+        token
+    };
+
+    // Sanity checks
+    let segments: Vec<&str> = normalized.split('/').collect();
+    if segments.len() < 2 {
+        return None; // Need at least dir/file.ext
+    }
+
+    // Reject if any segment is empty or starts with '.'
+    if segments.iter().any(|s| s.is_empty() || s.starts_with('.')) {
+        return None;
+    }
+
+    Some(normalized.to_string())
+}
+
+// ============================================================================
+// Auto-anchoring: link notes to files mentioned in their content
+// ============================================================================
+
+/// Auto-anchor a single note to files mentioned in its content.
+///
+/// Extracts file paths from the note content and creates LINKED_TO relations
+/// to matching File nodes in the graph. Uses `link_note_to_entity` which
+/// performs MERGE (idempotent — safe to call multiple times).
+///
+/// Returns the number of new anchors created.
+pub async fn auto_anchor_note(
+    graph_store: &dyn GraphStore,
+    note: &Note,
+) -> anyhow::Result<usize> {
+    use crate::notes::models::EntityType;
+
+    let paths = extract_file_paths_from_content(&note.content);
+    let mut anchored = 0;
+
+    for path in &paths {
+        // Try to link — link_note_to_entity uses MERGE, so it's safe if already linked
+        if let Err(e) = graph_store
+            .link_note_to_entity(note.id, &EntityType::File, path, None, None)
+            .await
+        {
+            tracing::debug!(
+                note_id = %note.id,
+                path = %path,
+                "Auto-anchor skipped (file may not exist in graph): {}",
+                e
+            );
+            continue;
+        }
+        anchored += 1;
+    }
+
+    Ok(anchored)
+}
+
+/// Auto-anchor all notes for a project to files mentioned in their content.
+///
+/// This is a batch operation meant to be called from the MCP admin action
+/// `auto_anchor_notes`. It loads all project notes and runs `auto_anchor_note`
+/// on each.
+///
+/// Returns `(notes_processed, anchors_created)`.
+pub async fn auto_anchor_notes_for_project(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+) -> anyhow::Result<(usize, usize)> {
+    use crate::notes::models::NoteFilters;
+
+    let filters = NoteFilters::default();
+    let (notes, _total) = graph_store
+        .list_notes(Some(project_id), None, &filters)
+        .await?;
+
+    let notes_count = notes.len();
+    let mut total_anchors = 0;
+
+    for note in &notes {
+        let anchored = auto_anchor_note(graph_store, note).await?;
+        total_anchors += anchored;
+    }
+
+    tracing::info!(
+        %project_id,
+        notes = notes_count,
+        anchors = total_anchors,
+        "Auto-anchoring completed"
+    );
+
+    Ok((notes_count, total_anchors))
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2678,6 +2891,83 @@ mod tests {
             "src/neo4j/b.rs"
         ));
         assert!(!same_directory("a.rs", "b.rs")); // no parent dir
+    }
+
+    // --- extract_file_paths_from_content ---
+
+    #[test]
+    fn test_extract_file_paths_relative() {
+        let content = "Modifier `src/neo4j/client.rs` pour ajouter la méthode.";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+    }
+
+    #[test]
+    fn test_extract_file_paths_multiple() {
+        let content = "Les fichiers src/api/handlers.rs et src/neo4j/note.rs doivent être modifiés. Voir aussi src/skills/activation.rs.";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&"src/api/handlers.rs".to_string()));
+        assert!(paths.contains(&"src/neo4j/note.rs".to_string()));
+        assert!(paths.contains(&"src/skills/activation.rs".to_string()));
+    }
+
+    #[test]
+    fn test_extract_file_paths_absolute_normalized() {
+        let content = "Le fichier /Users/foo/project/src/neo4j/client.rs doit être modifié.";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+    }
+
+    #[test]
+    fn test_extract_file_paths_backtick_wrapped() {
+        let content = "Modifier `src/skills/triggers.rs` puis `src/mcp/tools.rs`";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"src/skills/triggers.rs".to_string()));
+        assert!(paths.contains(&"src/mcp/tools.rs".to_string()));
+    }
+
+    #[test]
+    fn test_extract_file_paths_ignores_urls() {
+        let content = "See https://example.com/src/neo4j/client.rs for docs";
+        let paths = extract_file_paths_from_content(content);
+        assert!(paths.is_empty(), "URLs should be ignored, got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_extract_file_paths_ignores_rust_modules() {
+        let content = "Use crate::neo4j::client for the implementation";
+        let paths = extract_file_paths_from_content(content);
+        assert!(paths.is_empty(), "Rust module paths should be ignored, got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_extract_file_paths_no_paths() {
+        let content = "This is a note without any file path references at all.";
+        let paths = extract_file_paths_from_content(content);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_extract_file_paths_deduplicates() {
+        let content = "Modifier src/neo4j/client.rs. Le fichier src/neo4j/client.rs est critique.";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+    }
+
+    #[test]
+    fn test_extract_file_paths_various_extensions() {
+        let content = "Files: src/app.ts, src/index.tsx, tests/test_foo.py, src/main.go";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths.len(), 4);
+    }
+
+    #[test]
+    fn test_extract_file_paths_tests_dir() {
+        let content = "Le fichier /home/user/project/tests/unit/test_note.rs à vérifier";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths, vec!["tests/unit/test_note.rs"]);
     }
 
     #[test]
