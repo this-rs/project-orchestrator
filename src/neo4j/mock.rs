@@ -4899,6 +4899,7 @@ impl GraphStore for MockGraphStore {
         limit: usize,
         project_id: Option<Uuid>,
         workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>> {
         let notes = self.notes.read().await;
         let embeddings = self.note_embeddings.read().await;
@@ -4951,6 +4952,12 @@ impl GraphStore for MockGraphStore {
 
         // Sort by score descending
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Filter by minimum cosine similarity threshold
+        if let Some(min_sim) = min_similarity {
+            scored.retain(|(_, score)| *score >= min_sim);
+        }
+
         scored.truncate(limit);
 
         Ok(scored)

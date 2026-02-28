@@ -967,6 +967,7 @@ impl Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
         workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>> {
         // Convert f32 to f64 for neo4rs
         let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
@@ -1035,6 +1036,14 @@ impl Neo4jClient {
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("n")?;
             let score: f64 = row.get("score")?;
+
+            // Filter by minimum cosine similarity threshold
+            if let Some(min_sim) = min_similarity {
+                if score < min_sim {
+                    continue;
+                }
+            }
+
             let note = self.node_to_note(&node)?;
             notes.push((note, score));
         }

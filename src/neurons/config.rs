@@ -54,6 +54,19 @@ pub struct SpreadingActivationConfig {
     ///
     /// Set to 0.0 to disable (original behavior: no re-ranking).
     pub connectivity_boost: f64,
+
+    /// Minimum cosine similarity threshold for vector search results.
+    ///
+    /// Notes with similarity score below this threshold are discarded from
+    /// seed results (Phase 1). This prevents gibberish queries from returning
+    /// irrelevant "top-K" results that always exist due to HNSW/vector search
+    /// returning the nearest neighbors regardless of actual relevance.
+    ///
+    /// Typical ranges:
+    /// - 0.0 = disabled (original behavior: accept all top-K results)
+    /// - 0.3 = moderate filtering (recommended default)
+    /// - 0.5 = strict filtering (only highly relevant results)
+    pub min_cosine_similarity: f64,
 }
 
 impl Default for SpreadingActivationConfig {
@@ -67,6 +80,7 @@ impl Default for SpreadingActivationConfig {
             max_results: 10,
             propagated_ratio: 0.4,
             connectivity_boost: 0.02,
+            min_cosine_similarity: 0.3,
         }
     }
 }
@@ -155,6 +169,7 @@ mod tests {
         assert_eq!(config.max_results, 10);
         assert!((config.propagated_ratio - 0.4).abs() < f64::EPSILON);
         assert!((config.connectivity_boost - 0.02).abs() < f64::EPSILON);
+        assert!((config.min_cosine_similarity - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]

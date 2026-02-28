@@ -1005,6 +1005,9 @@ pub struct SemanticSearchQuery {
     pub project_slug: Option<String>,
     pub workspace_slug: Option<String>,
     pub limit: Option<usize>,
+    /// Minimum cosine similarity threshold (0.0 - 1.0).
+    /// Results below this score are filtered out. Default: none (return all top-K).
+    pub min_similarity: Option<f64>,
 }
 
 /// GET /api/notes/search-semantic — Vector-based semantic search
@@ -1033,6 +1036,7 @@ pub async fn search_notes_semantic(
             project_id,
             query.workspace_slug.as_deref(),
             query.limit,
+            query.min_similarity,
         )
         .await
         .map_err(AppError::Internal)?;

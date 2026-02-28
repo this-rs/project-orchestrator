@@ -1726,8 +1726,9 @@ impl GraphStore for Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
         workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
     ) -> anyhow::Result<Vec<(Note, f64)>> {
-        self.vector_search_notes(embedding, limit, project_id, workspace_slug)
+        self.vector_search_notes(embedding, limit, project_id, workspace_slug, min_similarity)
             .await
     }
 

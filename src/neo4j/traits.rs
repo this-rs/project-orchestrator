@@ -1357,6 +1357,7 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         project_id: Option<Uuid>,
         workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>>;
 
     /// List notes that don't have an embedding yet.

@@ -166,7 +166,7 @@ impl NoteManager {
 
             // Step 2: Vector search for nearest neighbors
             let candidates = match neo4j
-                .vector_search_notes(&embedding, max_neighbors + 1, project_id, None)
+                .vector_search_notes(&embedding, max_neighbors + 1, project_id, None, None)
                 .await
             {
                 Ok(c) => c,
@@ -630,6 +630,7 @@ impl NoteManager {
         project_id: Option<Uuid>,
         workspace_slug: Option<&str>,
         limit: Option<usize>,
+        min_similarity: Option<f64>,
     ) -> Result<Vec<NoteSearchHit>> {
         let limit = limit.unwrap_or(20);
 
@@ -657,7 +658,7 @@ impl NoteManager {
         // Perform vector similarity search via Neo4j HNSW index
         let results = self
             .neo4j
-            .vector_search_notes(&query_embedding, limit, project_id, workspace_slug)
+            .vector_search_notes(&query_embedding, limit, project_id, workspace_slug, min_similarity)
             .await?;
 
         // Convert to NoteSearchHit
@@ -1263,7 +1264,7 @@ impl NoteManager {
                 // Vector search for nearest neighbours
                 let neighbors = match self
                     .neo4j
-                    .vector_search_notes(&embedding, max_neighbors + 1, note.project_id, None)
+                    .vector_search_notes(&embedding, max_neighbors + 1, note.project_id, None, None)
                     .await
                 {
                     Ok(results) => results,
@@ -1441,7 +1442,7 @@ impl NoteManager {
                 // Search for similar Notes using the note vector index
                 let note_neighbors = match self
                     .neo4j
-                    .vector_search_notes(&embedding, max_neighbors, None, None)
+                    .vector_search_notes(&embedding, max_neighbors, None, None, None)
                     .await
                 {
                     Ok(results) => results,
@@ -2345,7 +2346,7 @@ mod tests {
 
         // Search for error-handling related notes
         let results = mgr
-            .semantic_search_notes("how to handle errors", None, None, Some(10))
+            .semantic_search_notes("how to handle errors", None, None, Some(10), None)
             .await
             .unwrap();
 
@@ -2376,7 +2377,7 @@ mod tests {
 
         // Semantic search without provider should fall back to BM25 (no panic, no error)
         let results = mgr
-            .semantic_search_notes("test", None, None, Some(10))
+            .semantic_search_notes("test", None, None, Some(10), None)
             .await;
 
         // Should not error — falls back gracefully to Meilisearch
@@ -2392,7 +2393,7 @@ mod tests {
 
         // Search with project filter
         let results = mgr
-            .semantic_search_notes("guideline", Some(pid), None, Some(10))
+            .semantic_search_notes("guideline", Some(pid), None, Some(10), None)
             .await
             .unwrap();
 
