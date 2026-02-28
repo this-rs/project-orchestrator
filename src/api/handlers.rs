@@ -961,6 +961,30 @@ pub async fn sync_directory(
             .neo4j()
             .update_project_synced(pid)
             .await?;
+
+        // Spawn auto-anchor in background: link notes to newly synced files
+        let neo4j = state.orchestrator.neo4j_arc();
+        tokio::spawn(async move {
+            match crate::skills::activation::auto_anchor_notes_for_project(
+                neo4j.as_ref(),
+                pid,
+            )
+            .await
+            {
+                Ok(r) if r.anchors_created > 0 => {
+                    tracing::info!(
+                        %pid,
+                        anchors = r.anchors_created,
+                        "Post-sync auto-anchor: created {} anchors",
+                        r.anchors_created
+                    );
+                }
+                Ok(_) => {} // no new anchors needed
+                Err(e) => {
+                    tracing::warn!(%pid, "Post-sync auto-anchor failed: {}", e);
+                }
+            }
+        });
     }
 
     Ok(Json(SyncResponse {
@@ -1524,6 +1548,27 @@ pub async fn create_commit(
             }
             orch2.analytics_debouncer().trigger(pid);
             orch2.co_change_debouncer().trigger(pid);
+
+            // Auto-anchor notes to newly synced files
+            match crate::skills::activation::auto_anchor_notes_for_project(
+                orch2.neo4j(),
+                pid,
+            )
+            .await
+            {
+                Ok(r) if r.anchors_created > 0 => {
+                    tracing::info!(
+                        %pid,
+                        anchors = r.anchors_created,
+                        "Post-commit auto-anchor: created {} anchors",
+                        r.anchors_created
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(%pid, "Post-commit auto-anchor failed: {}", e);
+                }
+            }
         });
 
         // Side-effect 3: Debounced Hebbian energy boost + synapse reinforcement.

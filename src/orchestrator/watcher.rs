@@ -580,6 +580,30 @@ async fn flush_pending_files(
         // Trigger analytics debouncer once per project (will be further
         // debounced by the AnalyticsDebouncer's own quiet period)
         orchestrator.analytics_debouncer().trigger(pid);
+
+        // Spawn auto-anchor in background: link notes to newly synced files
+        let neo4j = orchestrator.neo4j_arc();
+        tokio::spawn(async move {
+            match crate::skills::activation::auto_anchor_notes_for_project(
+                neo4j.as_ref(),
+                pid,
+            )
+            .await
+            {
+                Ok(r) if r.anchors_created > 0 => {
+                    tracing::info!(
+                        %pid,
+                        anchors = r.anchors_created,
+                        "Watcher post-sync auto-anchor: created {} anchors",
+                        r.anchors_created
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(%pid, "Watcher post-sync auto-anchor failed: {}", e);
+                }
+            }
+        });
     }
 
     // ── Handle deleted files ─────────────────────────────────────────
@@ -624,6 +648,32 @@ async fn flush_pending_files(
 
         // Trigger analytics debouncer (graph changed)
         orchestrator.analytics_debouncer().trigger(pid);
+
+        // Spawn auto-anchor in background after deletions too:
+        // notes referencing deleted files won't match, but notes referencing
+        // remaining files may now need re-anchoring.
+        let neo4j = orchestrator.neo4j_arc();
+        tokio::spawn(async move {
+            match crate::skills::activation::auto_anchor_notes_for_project(
+                neo4j.as_ref(),
+                pid,
+            )
+            .await
+            {
+                Ok(r) if r.anchors_created > 0 => {
+                    tracing::info!(
+                        %pid,
+                        anchors = r.anchors_created,
+                        "Watcher post-delete auto-anchor: created {} anchors",
+                        r.anchors_created
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(%pid, "Watcher post-delete auto-anchor failed: {}", e);
+                }
+            }
+        });
     }
 
     // Sync orphan files (no project association) individually
