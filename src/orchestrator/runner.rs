@@ -1054,7 +1054,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // 3. Oneshot LLM call
         let model = std::env::var("FEATURE_GRAPH_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+            .unwrap_or_else(|_| "claude-sonnet-4-6".into());
 
         if model.is_empty() {
             tracing::info!("FEATURE_GRAPH_MODEL is empty, skipping LLM feature graph proposal");

@@ -394,7 +394,7 @@ mod tests {
         assert!(!config.auto_update_cli);
 
         // Phase 2: custom values
-        std::env::set_var("CHAT_DEFAULT_MODEL", "claude-sonnet-4-20250514");
+        std::env::set_var("CHAT_DEFAULT_MODEL", "claude-sonnet-4-6");
         std::env::set_var("CHAT_MAX_SESSIONS", "5");
         std::env::set_var("CHAT_SESSION_TIMEOUT_SECS", "600");
         std::env::set_var("MCP_SERVER_PATH", "/custom/path/mcp_server");
@@ -412,7 +412,7 @@ mod tests {
         std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
 
         let config = ChatConfig::from_env();
-        assert_eq!(config.default_model, "claude-sonnet-4-20250514");
+        assert_eq!(config.default_model, "claude-sonnet-4-6");
         assert_eq!(config.max_sessions, 5);
         assert_eq!(config.session_timeout.as_secs(), 600);
         assert_eq!(

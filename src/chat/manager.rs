@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use nexus_claude::ToolsConfig;
 use crate::expand_tilde;
 
 /// Broadcast channel buffer size for WebSocket subscribers
@@ -1127,12 +1128,12 @@ impl ChatManager {
     ) -> String {
         use super::prompt::{
             assemble_prompt, context_to_json, context_to_markdown, fetch_project_context,
-            BASE_SYSTEM_PROMPT,
+            BASE_SYSTEM_PROMPT, TOOL_REFERENCE,
         };
 
-        // No project → base prompt only
+        // No project → base prompt + tool reference only
         let Some(slug) = project_slug else {
-            return BASE_SYSTEM_PROMPT.to_string();
+            return format!("{}\n\n---\n\n{}", BASE_SYSTEM_PROMPT, TOOL_REFERENCE);
         };
 
         // Fetch raw context from Neo4j
@@ -1143,7 +1144,7 @@ impl ChatManager {
                     "Failed to fetch project context for '{}': {} — using base prompt only",
                     slug, e
                 );
-                return BASE_SYSTEM_PROMPT.to_string();
+                return format!("{}\n\n---\n\n{}", BASE_SYSTEM_PROMPT, TOOL_REFERENCE);
             }
         };
 
@@ -1206,7 +1207,9 @@ impl ChatManager {
             context_to_markdown(&ctx, Some(user_message))
         };
 
-        assemble_prompt(BASE_SYSTEM_PROMPT, &dynamic_section)
+        let prompt = assemble_prompt(BASE_SYSTEM_PROMPT, &dynamic_section);
+        // Append exhaustive tool reference as final section
+        format!("{}\n\n---\n\n{}", prompt, TOOL_REFERENCE)
     }
 
     /// Use a oneshot Opus call to refine raw project context into a concise,
@@ -1229,8 +1232,9 @@ impl ChatManager {
         #[allow(deprecated)]
         let options = ClaudeCodeOptions::builder()
             .model(&self.config.prompt_builder_model)
-            .system_prompt("Tu es un assistant qui construit des sections de contexte concises.")
-            .permission_mode(PermissionMode::BypassPermissions)
+            .system_prompt("You are an assistant that builds concise context sections.")
+            .permission_mode(PermissionMode::Plan)
+            .tools(ToolsConfig::none())
             .max_turns(1)
             .build();
 
@@ -4710,8 +4714,8 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         assert_eq!(
-            manager.resolve_model(Some("claude-sonnet-4-20250514")),
-            "claude-sonnet-4-20250514"
+            manager.resolve_model(Some("claude-sonnet-4-6")),
+            "claude-sonnet-4-6"
         );
     }
 
@@ -4919,8 +4923,8 @@ mod tests {
 
         let prompt = manager.build_system_prompt(None, "test").await;
         assert!(prompt.contains("Project Orchestrator"));
-        assert!(prompt.contains("EXCLUSIVEMENT les outils MCP"));
-        assert!(!prompt.contains("Projet actif"));
+        assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
+        assert!(!prompt.contains("Active Project"));
     }
 
     #[tokio::test]
@@ -4935,7 +4939,7 @@ mod tests {
             .await;
 
         // Contains the base prompt
-        assert!(prompt.contains("EXCLUSIVEMENT les outils MCP"));
+        assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
         // Contains dynamic context section (either oneshot or fallback)
         assert!(prompt.contains("---"));
         // The project name should appear somewhere in the dynamic context
@@ -5401,7 +5405,7 @@ mod tests {
             subtype: "init".into(),
             data: serde_json::json!({
                 "session_id": "cli-sess-abc",
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "tools": ["Bash", "Read", "Write", "Edit"],
                 "mcp_servers": [{"name": "po", "status": "connected"}],
                 "permissionMode": "default"
@@ -5413,7 +5417,7 @@ mod tests {
         assert!(matches!(&events[0], ChatEvent::SystemInit {
             cli_session_id, model, tools, mcp_servers, permission_mode,
         } if cli_session_id == "cli-sess-abc"
-            && model.as_deref() == Some("claude-sonnet-4-20250514")
+            && model.as_deref() == Some("claude-sonnet-4-6")
             && tools.len() == 4
             && mcp_servers.len() == 1
             && permission_mode.as_deref() == Some("default")
@@ -5724,7 +5728,7 @@ mod tests {
             .await;
 
         // Base prompt present
-        assert!(prompt.contains("EXCLUSIVEMENT les outils MCP"));
+        assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
         // Dynamic context section present (either oneshot or fallback)
         assert!(prompt.contains("---"));
         // Project name should appear in the dynamic context
@@ -7411,7 +7415,7 @@ mod tests {
             "request_id": "req_other",
             "request": {
                 "subtype": "server_info",
-                "data": {"model": "claude-sonnet-4-20250514"}
+                "data": {"model": "claude-sonnet-4-6"}
             }
         });
 
