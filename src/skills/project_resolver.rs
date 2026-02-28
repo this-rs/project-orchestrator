@@ -52,8 +52,7 @@ pub(crate) const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
 /// 3. A single cache entry covers all files under a root_path
 type ResolveCache = Option<(Vec<ResolvedProject>, Instant)>;
 
-pub(crate) static RESOLVE_CACHE: LazyLock<Mutex<ResolveCache>> =
-    LazyLock::new(|| Mutex::new(None));
+pub(crate) static RESOLVE_CACHE: LazyLock<Mutex<ResolveCache>> = LazyLock::new(|| Mutex::new(None));
 
 // ============================================================================
 // Core Functions

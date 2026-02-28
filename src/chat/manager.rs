@@ -1765,9 +1765,7 @@ impl ChatManager {
             );
 
             // PreToolUse → SkillActivationHook injects skill context as additionalContext
-            let skill_hook = skill_hook::SkillActivationHook::new(
-                self.graph.clone(),
-            );
+            let skill_hook = skill_hook::SkillActivationHook::new(self.graph.clone());
             hooks.insert(
                 "PreToolUse".to_string(),
                 vec![nexus_claude::HookMatcher {
@@ -3815,9 +3813,7 @@ impl ChatManager {
             );
 
             // PreToolUse → SkillActivationHook injects skill context as additionalContext
-            let skill_hook = skill_hook::SkillActivationHook::new(
-                self.graph.clone(),
-            );
+            let skill_hook = skill_hook::SkillActivationHook::new(self.graph.clone());
             hooks.insert(
                 "PreToolUse".to_string(),
                 vec![nexus_claude::HookMatcher {
