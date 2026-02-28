@@ -420,11 +420,27 @@ impl Neo4jClient {
         &self,
         skill_id: Uuid,
     ) -> Result<(Vec<Note>, Vec<DecisionNode>)> {
-        // Get member notes
+        use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
+
+        // Get member notes WITH inline anchors (avoids N+1 queries).
+        // OPTIONAL MATCH loads LINKED_TO targets in a single query.
+        // collect() returns [] when no anchors exist (not null).
         let notes_q = query(
             r#"
             MATCH (n:Note)-[:MEMBER_OF]->(s:Skill {id: $skill_id})
-            RETURN n
+            OPTIONAL MATCH (n)-[:LINKED_TO]->(e)
+            WITH n, collect(DISTINCT {
+                entity_type: CASE
+                    WHEN e:File THEN 'file'
+                    WHEN e:Function THEN 'function'
+                    WHEN e:Struct THEN 'struct'
+                    WHEN e:Trait THEN 'trait'
+                    WHEN e:Enum THEN 'enum'
+                    ELSE 'unknown'
+                END,
+                entity_id: coalesce(e.path, e.id, '')
+            }) AS anchors
+            RETURN n, anchors
             ORDER BY n.energy DESC
             LIMIT 500
             "#,
@@ -435,7 +451,34 @@ impl Neo4jClient {
         let mut notes = Vec::new();
         while let Some(row) = notes_result.next().await? {
             let node: neo4rs::Node = row.get("n")?;
-            notes.push(self.node_to_note(&node)?);
+            let mut note = self.node_to_note(&node)?;
+
+            // Parse inline anchors from the collected map list.
+            // Neo4j returns collect() as a BoltList — neo4rs deserializes it
+            // as serde_json::Value (array of maps).
+            if let Ok(anchors_val) = row.get::<serde_json::Value>("anchors") {
+                if let Some(anchor_list) = anchors_val.as_array() {
+                    for anchor_val in anchor_list {
+                        let entity_type_str = anchor_val.get("entity_type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let entity_id = anchor_val.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
+                        // Skip empty/unknown anchors (from notes with no LINKED_TO)
+                        if entity_id.is_empty() || entity_type_str == "unknown" {
+                            continue;
+                        }
+                        let entity_type = match entity_type_str {
+                            "file" => NoteEntityType::File,
+                            "function" => NoteEntityType::Function,
+                            "struct" => NoteEntityType::Struct,
+                            "trait" => NoteEntityType::Trait,
+                            "enum" => NoteEntityType::Enum,
+                            _ => continue,
+                        };
+                        note.anchors.push(NoteAnchor::new(entity_type, entity_id.to_string()));
+                    }
+                }
+            }
+
+            notes.push(note);
         }
 
         // Get member decisions
