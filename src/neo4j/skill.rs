@@ -459,8 +459,14 @@ impl Neo4jClient {
             if let Ok(anchors_val) = row.get::<serde_json::Value>("anchors") {
                 if let Some(anchor_list) = anchors_val.as_array() {
                     for anchor_val in anchor_list {
-                        let entity_type_str = anchor_val.get("entity_type").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let entity_id = anchor_val.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let entity_type_str = anchor_val
+                            .get("entity_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let entity_id = anchor_val
+                            .get("entity_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         // Skip empty/unknown anchors (from notes with no LINKED_TO)
                         if entity_id.is_empty() || entity_type_str == "unknown" {
                             continue;
@@ -473,7 +479,8 @@ impl Neo4jClient {
                             "enum" => NoteEntityType::Enum,
                             _ => continue,
                         };
-                        note.anchors.push(NoteAnchor::new(entity_type, entity_id.to_string()));
+                        note.anchors
+                            .push(NoteAnchor::new(entity_type, entity_id.to_string()));
                     }
                 }
             }

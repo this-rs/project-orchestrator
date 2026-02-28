@@ -174,8 +174,10 @@ pub async fn activate_for_hook(
         let has_context = file_context.is_some() || pattern.is_some();
         if has_context {
             active_notes.sort_by(|a, b| {
-                let sa = score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
-                let sb = score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sa =
+                    score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb =
+                    score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
@@ -192,7 +194,11 @@ pub async fn activate_for_hook(
         );
 
         // Only reinforce notes that were actually rendered in the context
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().take(notes_included).map(|n| n.id).collect();
+        let activated_note_ids: Vec<Uuid> = active_notes
+            .iter()
+            .take(notes_included)
+            .map(|n| n.id)
+            .collect();
 
         if has_context {
             tracing::info!(
@@ -230,8 +236,10 @@ pub async fn activate_for_hook(
         let has_context = file_context.is_some() || pattern.is_some();
         if has_context {
             active_notes.sort_by(|a, b| {
-                let sa = score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
-                let sb = score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sa =
+                    score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb =
+                    score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
@@ -247,7 +255,11 @@ pub async fn activate_for_hook(
         );
 
         // Only reinforce notes that were actually rendered in the context
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().take(notes_included).map(|n| n.id).collect();
+        let activated_note_ids: Vec<Uuid> = active_notes
+            .iter()
+            .take(notes_included)
+            .map(|n| n.id)
+            .collect();
 
         if has_context {
             tracing::info!(
@@ -371,8 +383,10 @@ pub async fn activate_for_hook_cached(
         let has_context = file_context.is_some() || pattern.is_some();
         if has_context {
             active_notes.sort_by(|a, b| {
-                let sa = score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
-                let sb = score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sa =
+                    score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb =
+                    score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
@@ -389,7 +403,11 @@ pub async fn activate_for_hook_cached(
         );
 
         // Only reinforce notes that were actually rendered in the context
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().take(notes_included).map(|n| n.id).collect();
+        let activated_note_ids: Vec<Uuid> = active_notes
+            .iter()
+            .take(notes_included)
+            .map(|n| n.id)
+            .collect();
 
         if has_context {
             tracing::info!(
@@ -426,8 +444,10 @@ pub async fn activate_for_hook_cached(
         let has_context = file_context.is_some() || pattern.is_some();
         if has_context {
             active_notes.sort_by(|a, b| {
-                let sa = score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
-                let sb = score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sa =
+                    score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb =
+                    score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
@@ -443,7 +463,11 @@ pub async fn activate_for_hook_cached(
         );
 
         // Only reinforce notes that were actually rendered in the context
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().take(notes_included).map(|n| n.id).collect();
+        let activated_note_ids: Vec<Uuid> = active_notes
+            .iter()
+            .take(notes_included)
+            .map(|n| n.id)
+            .collect();
 
         if has_context {
             tracing::info!(
@@ -889,8 +913,8 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 /// ```
 pub fn extract_path_segments(file_context: &str) -> Vec<String> {
     const TRIVIAL_SEGMENTS: &[&str] = &[
-        "src", "lib", "mod", "index", "main", "tests", "test", "benches", "bench",
-        "examples", "example", "bin", "target", "build", "dist", "out", "pkg",
+        "src", "lib", "mod", "index", "main", "tests", "test", "benches", "bench", "examples",
+        "example", "bin", "target", "build", "dist", "out", "pkg",
     ];
 
     file_context
@@ -908,7 +932,10 @@ pub fn extract_path_segments(file_context: &str) -> Vec<String> {
 /// Extract the basename (filename without extension) from a file path.
 fn extract_basename(file_context: &str) -> Option<String> {
     let filename = file_context.rsplit('/').next()?;
-    let name = filename.rsplit_once('.').map(|(n, _)| n).unwrap_or(filename);
+    let name = filename
+        .rsplit_once('.')
+        .map(|(n, _)| n)
+        .unwrap_or(filename);
     if name.is_empty() {
         None
     } else {
@@ -1050,10 +1077,9 @@ pub fn same_directory(path_a: &str, path_b: &str) -> bool {
 
 /// Known source file extensions for path detection.
 const SOURCE_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift",
-    "rb", "php", "cs", "cpp", "c", "h", "hpp", "toml", "yaml", "yml",
-    "json", "sql", "sh", "bash", "zsh", "md", "html", "css", "scss",
-    "vue", "svelte", "ex", "exs", "zig", "lua", "r", "m", "mm",
+    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "rb", "php", "cs", "cpp",
+    "c", "h", "hpp", "toml", "yaml", "yml", "json", "sql", "sh", "bash", "zsh", "md", "html",
+    "css", "scss", "vue", "svelte", "ex", "exs", "zig", "lua", "r", "m", "mm",
 ];
 
 /// Extract file paths mentioned in a note's content.
@@ -1113,9 +1139,21 @@ fn extract_path_tokens(line: &str) -> Vec<String> {
     }
 
     // Second: split line by whitespace and common delimiters, look for path-like tokens
-    for word in line.split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '(' || c == ')' || c == '[' || c == ']' || c == '"' || c == '\'') {
+    for word in line.split(|c: char| {
+        c.is_whitespace()
+            || c == ','
+            || c == ';'
+            || c == '('
+            || c == ')'
+            || c == '['
+            || c == ']'
+            || c == '"'
+            || c == '\''
+    }) {
         // Strip surrounding backticks, parens, quotes
-        let clean = word.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ':');
+        let clean = word.trim_matches(|c: char| {
+            c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ':'
+        });
         if clean.contains('/') && !clean.is_empty() {
             tokens.push(clean.to_string());
         }
@@ -1130,10 +1168,13 @@ fn extract_path_tokens(line: &str) -> Vec<String> {
 /// `None` otherwise.
 fn validate_and_normalize_path(token: &str) -> Option<String> {
     // Strip trailing punctuation (period, comma, semicolon, colon, paren)
-    let token = token.trim().trim_end_matches(['.', ',', ';', ':', ')', ']']);
+    let token = token
+        .trim()
+        .trim_end_matches(['.', ',', ';', ':', ')', ']']);
 
     // Reject URLs
-    if token.starts_with("http://") || token.starts_with("https://") || token.starts_with("ftp://") {
+    if token.starts_with("http://") || token.starts_with("https://") || token.starts_with("ftp://")
+    {
         return None;
     }
 
@@ -1192,10 +1233,7 @@ fn validate_and_normalize_path(token: &str) -> Option<String> {
 /// performs MERGE (idempotent — safe to call multiple times).
 ///
 /// Returns the number of new anchors created.
-pub async fn auto_anchor_note(
-    graph_store: &dyn GraphStore,
-    note: &Note,
-) -> anyhow::Result<usize> {
+pub async fn auto_anchor_note(graph_store: &dyn GraphStore, note: &Note) -> anyhow::Result<usize> {
     use crate::notes::models::EntityType;
 
     let paths = extract_file_paths_from_content(&note.content);
@@ -1619,8 +1657,14 @@ mod tests {
         )];
 
         // With confidence → 🧠 header with percentage
-        let (context, _) =
-            assemble_context_with_confidence("Neo4j Perf", &notes, &decisions, 3200, Some(0.85), false);
+        let (context, _) = assemble_context_with_confidence(
+            "Neo4j Perf",
+            &notes,
+            &decisions,
+            3200,
+            Some(0.85),
+            false,
+        );
         assert!(
             context.starts_with("## \u{1f9e0} Skill \"Neo4j Perf\" (confidence 85%)"),
             "Expected confidence header, got: {}",
@@ -1641,7 +1685,8 @@ mod tests {
         )];
 
         // Without confidence → 💡 header (same as assemble_context)
-        let (context, _) = assemble_context_with_confidence("Test Skill", &notes, &[], 3200, None, false);
+        let (context, _) =
+            assemble_context_with_confidence("Test Skill", &notes, &[], 3200, None, false);
         assert!(
             context.starts_with("## \u{1f4a1} Test Skill"),
             "Expected default header without confidence, got: {}",
@@ -1660,7 +1705,8 @@ mod tests {
         )];
 
         // Confidence 0.666 → should round to 67%
-        let (context, _) = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666), false);
+        let (context, _) =
+            assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666), false);
         assert!(
             context.contains("confidence 67%"),
             "Expected confidence 67%, got: {}",
@@ -1668,7 +1714,8 @@ mod tests {
         );
 
         // Confidence 1.0 → 100%
-        let (context, _) = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(1.0), false);
+        let (context, _) =
+            assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(1.0), false);
         assert!(
             context.contains("confidence 100%"),
             "Expected confidence 100%, got: {}",
@@ -1676,7 +1723,8 @@ mod tests {
         );
 
         // Confidence 0.0 → 0%
-        let (context, _) = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.0), false);
+        let (context, _) =
+            assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.0), false);
         assert!(
             context.contains("confidence 0%"),
             "Expected confidence 0%, got: {}",
@@ -1691,42 +1739,85 @@ mod tests {
         // When pre_sorted=true, notes should appear in the order given
         // (no re-sorting by importance/energy)
         let notes = vec![
-            make_test_note(Uuid::new_v4(), "Low importance but high score", NoteType::Tip, NoteImportance::Low, 0.3),
-            make_test_note(Uuid::new_v4(), "Critical but low score", NoteType::Gotcha, NoteImportance::Critical, 0.9),
+            make_test_note(
+                Uuid::new_v4(),
+                "Low importance but high score",
+                NoteType::Tip,
+                NoteImportance::Low,
+                0.3,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Critical but low score",
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+            ),
         ];
 
         // pre_sorted=true: Low-importance note should appear first (as given)
-        let (context_sorted, _) = assemble_context_with_confidence("Test", &notes, &[], 3200, None, true);
+        let (context_sorted, _) =
+            assemble_context_with_confidence("Test", &notes, &[], 3200, None, true);
         let lines: Vec<&str> = context_sorted.lines().collect();
         // Line 0 = header, Line 1 = first note (low importance), Line 2 = second note (critical)
-        assert!(lines[1].contains("Low importance"), "First note should be low importance, got: {}", lines[1]);
-        assert!(lines[2].contains("Critical"), "Second note should be critical, got: {}", lines[2]);
+        assert!(
+            lines[1].contains("Low importance"),
+            "First note should be low importance, got: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("Critical"),
+            "Second note should be critical, got: {}",
+            lines[2]
+        );
 
         // pre_sorted=false: Critical should come first (sorted by importance)
-        let (context_default, _) = assemble_context_with_confidence("Test", &notes, &[], 3200, None, false);
+        let (context_default, _) =
+            assemble_context_with_confidence("Test", &notes, &[], 3200, None, false);
         let lines: Vec<&str> = context_default.lines().collect();
-        assert!(lines[1].contains("Critical"), "First note should be critical, got: {}", lines[1]);
-        assert!(lines[2].contains("Low importance"), "Second note should be low importance, got: {}", lines[2]);
+        assert!(
+            lines[1].contains("Critical"),
+            "First note should be critical, got: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("Low importance"),
+            "Second note should be low importance, got: {}",
+            lines[2]
+        );
     }
 
     #[test]
     fn test_assemble_context_returns_notes_included_count() {
         // Create many notes that exceed the budget
         let notes: Vec<Note> = (0..50)
-            .map(|i| make_test_note(
-                Uuid::new_v4(),
-                &format!("Note content number {} with some padding text to take space", i),
-                NoteType::Guideline,
-                NoteImportance::Medium,
-                0.5,
-            ))
+            .map(|i| {
+                make_test_note(
+                    Uuid::new_v4(),
+                    &format!(
+                        "Note content number {} with some padding text to take space",
+                        i
+                    ),
+                    NoteType::Guideline,
+                    NoteImportance::Medium,
+                    0.5,
+                )
+            })
             .collect();
 
-        let (context, notes_included) = assemble_context_with_confidence("Test", &notes, &[], 1000, None, false);
+        let (context, notes_included) =
+            assemble_context_with_confidence("Test", &notes, &[], 1000, None, false);
         // With a 1000 char budget, not all 50 notes should fit
-        assert!(notes_included < 50, "Expected fewer than 50 notes included, got: {}", notes_included);
+        assert!(
+            notes_included < 50,
+            "Expected fewer than 50 notes included, got: {}",
+            notes_included
+        );
         assert!(notes_included > 0, "Expected at least 1 note included");
-        assert!(context.chars().count() <= 1000, "Context should respect budget");
+        assert!(
+            context.chars().count() <= 1000,
+            "Context should respect budget"
+        );
     }
 
     #[test]
@@ -1743,9 +1834,14 @@ mod tests {
             ))
             .collect();
 
-        let (_context, notes_included) = assemble_context_with_confidence("Test", &notes, &[], 1500, None, false);
+        let (_context, notes_included) =
+            assemble_context_with_confidence("Test", &notes, &[], 1500, None, false);
         // With 30 notes and 1500 char budget, only a subset should be included
-        assert!(notes_included < 30, "Not all notes should fit in budget: {} included", notes_included);
+        assert!(
+            notes_included < 30,
+            "Not all notes should fit in budget: {} included",
+            notes_included
+        );
         // The activated_note_ids should be notes[..notes_included]
         // (In the actual pipeline, take(notes_included) is used)
         let activated_ids: Vec<Uuid> = notes.iter().take(notes_included).map(|n| n.id).collect();
@@ -2558,8 +2654,7 @@ mod tests {
 
     #[test]
     fn test_extract_path_segments_absolute_path() {
-        let segments =
-            extract_path_segments("/Users/x/project/src/skills/activation.rs");
+        let segments = extract_path_segments("/Users/x/project/src/skills/activation.rs");
         assert_eq!(segments, vec!["users", "project", "skills", "activation"]);
     }
 
@@ -2656,14 +2751,9 @@ mod tests {
             0.0,
         );
 
-        let critical_score = score_note_relevance(
-            &critical_note,
-            Some("src/neo4j/client.rs"),
-            None,
-            "Read",
-        );
-        let low_score =
-            score_note_relevance(&low_note, Some("src/neo4j/client.rs"), None, "Read");
+        let critical_score =
+            score_note_relevance(&critical_note, Some("src/neo4j/client.rs"), None, "Read");
+        let low_score = score_note_relevance(&low_note, Some("src/neo4j/client.rs"), None, "Read");
 
         // critical = 1.5x, low = 0.8x → critical should be ~1.875x the low
         assert!(
@@ -2733,8 +2823,7 @@ mod tests {
 
         let gotcha_score =
             score_note_relevance(&gotcha_note, Some("src/neo4j/client.rs"), None, "Edit");
-        let tip_score =
-            score_note_relevance(&tip_note, Some("src/neo4j/client.rs"), None, "Edit");
+        let tip_score = score_note_relevance(&tip_note, Some("src/neo4j/client.rs"), None, "Edit");
 
         assert!(
             gotcha_score > tip_score,
@@ -2796,10 +2885,8 @@ mod tests {
         );
 
         // Call twice with same inputs → same output
-        let score1 =
-            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
-        let score2 =
-            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
+        let score1 = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
+        let score2 = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
 
         assert!(
             (score1 - score2).abs() < f64::EPSILON,
@@ -2885,11 +2972,11 @@ mod tests {
             "src/neo4j/client.rs",
             "src/neo4j/analytics.rs"
         ));
-        assert!(!same_directory("src/neo4j/client.rs", "src/api/handlers.rs"));
-        assert!(same_directory(
-            "/Users/x/src/neo4j/a.rs",
-            "src/neo4j/b.rs"
+        assert!(!same_directory(
+            "src/neo4j/client.rs",
+            "src/api/handlers.rs"
         ));
+        assert!(same_directory("/Users/x/src/neo4j/a.rs", "src/neo4j/b.rs"));
         assert!(!same_directory("a.rs", "b.rs")); // no parent dir
     }
 
@@ -2939,7 +3026,11 @@ mod tests {
     fn test_extract_file_paths_ignores_rust_modules() {
         let content = "Use crate::neo4j::client for the implementation";
         let paths = extract_file_paths_from_content(content);
-        assert!(paths.is_empty(), "Rust module paths should be ignored, got: {:?}", paths);
+        assert!(
+            paths.is_empty(),
+            "Rust module paths should be ignored, got: {:?}",
+            paths
+        );
     }
 
     #[test]
@@ -2996,8 +3087,7 @@ mod tests {
             0.0,
         );
 
-        let with_anchor =
-            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        let with_anchor = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
         let without_anchor = score_note_relevance(
             &note_without_anchors,
             Some("src/neo4j/client.rs"),
@@ -3075,8 +3165,7 @@ mod tests {
             0.0,
         );
 
-        let score =
-            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        let score = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
         // base(0.1) × importance(1.0) = 0.1
         assert!(
             (score - 0.1).abs() < f64::EPSILON,
@@ -3264,7 +3353,10 @@ mod tests {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
         // The top 4 notes should ALL be neo4j-related
-        let top_4_contents: Vec<&str> = scored[0..4].iter().map(|(_, n)| n.content.as_str()).collect();
+        let top_4_contents: Vec<&str> = scored[0..4]
+            .iter()
+            .map(|(_, n)| n.content.as_str())
+            .collect();
         for content in &top_4_contents {
             assert!(
                 content.to_lowercase().contains("neo4j")
