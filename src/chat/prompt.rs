@@ -741,7 +741,7 @@ Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status
 | bootstrap_knowledge_fabric | `project_id` | Bootstrap knowledge fabric |
 | detect_skills | `project_id` | Detect emergent skills |
 | maintain_skills | `level` (hourly/daily/weekly/full) | Run skill maintenance |
-| install_hooks | `project_id`, `cwd`, `port` | Install Claude Code hooks |
+| install_hooks | `project_id`, `cwd`, `port` | **Deprecated** — hooks are now automatic via SDK |
 
 ## skill
 Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health

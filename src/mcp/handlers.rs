@@ -1906,19 +1906,12 @@ impl ToolHandler {
             }
 
             "install_hooks" => {
-                let mut body = serde_json::Map::new();
-                body.insert(
-                    "project_id".to_string(),
-                    json!(extract_string(args, "project_id")?),
-                );
-                body.insert("cwd".to_string(), json!(extract_string(args, "cwd")?));
-                if let Some(port) = args.get("port").and_then(|v| v.as_u64()) {
-                    body.insert("port".to_string(), json!(port));
-                }
-                let result = http
-                    .post("/api/admin/install-hooks", &Value::Object(body))
-                    .await?;
-                Ok(Some(result))
+                // Hooks are now managed automatically via the Nexus SDK's
+                // in-process SkillActivationHook. No installation needed.
+                Ok(Some(json!({
+                    "message": "Hooks are now managed automatically via the Nexus SDK. No installation needed. Skill activation happens in-process during create_session/resume_session.",
+                    "deprecated": true
+                })))
             }
 
             // ── P8: Workspaces (34 tools) ──────────────────────────────────

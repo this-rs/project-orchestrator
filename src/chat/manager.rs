@@ -10,6 +10,7 @@
 //! - A cleanup task periodically closes timed-out sessions
 
 use super::config::ChatConfig;
+use super::skill_hook;
 use super::types::{
     classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
     CreateSessionResponse, MessageSearchHit, MessageSearchResult,
@@ -1745,14 +1746,16 @@ impl ChatManager {
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
 
-        // Build PreCompact hook → CompactionNotifier broadcasts ChatEvent::CompactionStarted
-        let compaction_hooks = {
+        // Build session hooks: PreCompact (compaction notifier) + PreToolUse (skill activation)
+        let session_hooks = {
+            let mut hooks = std::collections::HashMap::new();
+
+            // PreCompact → CompactionNotifier broadcasts ChatEvent::CompactionStarted
             let notifier = CompactionNotifier::new(
                 events_tx.clone(),
                 self.nats.clone(),
                 session_id.to_string(),
             );
-            let mut hooks = std::collections::HashMap::new();
             hooks.insert(
                 "PreCompact".to_string(),
                 vec![nexus_claude::HookMatcher {
@@ -1760,6 +1763,19 @@ impl ChatManager {
                     hooks: vec![std::sync::Arc::new(notifier)],
                 }],
             );
+
+            // PreToolUse → SkillActivationHook injects skill context as additionalContext
+            let skill_hook = skill_hook::SkillActivationHook::new(
+                self.graph.clone(),
+            );
+            hooks.insert(
+                "PreToolUse".to_string(),
+                vec![nexus_claude::HookMatcher {
+                    matcher: None, // Match all tools — filtering is done inside the hook
+                    hooks: vec![std::sync::Arc::new(skill_hook)],
+                }],
+            );
+
             hooks
         };
 
@@ -1771,7 +1787,7 @@ impl ChatManager {
                 &system_prompt,
                 None,
                 request.permission_mode.as_deref(),
-                Some(compaction_hooks),
+                Some(session_hooks),
                 &resolved_add_dirs,
                 request.user_claims.as_ref(),
             )
@@ -1836,11 +1852,11 @@ impl ChatManager {
         // (which is held by stream_response during streaming → deadlock).
         let stdin_tx = client.clone_stdin_sender().await;
 
-        // Capture the CLI subprocess PID for process group signaling.
-        // Used by interrupt() to send SIGINT to the entire process group,
-        // killing child processes (find, sleep, etc.) that survive the
-        // control_request interrupt.
-        let child_pid = client.child_pid().await;
+        // CLI subprocess PID for process group signaling.
+        // TODO: re-add child_pid() to nexus SDK (was on feature branch, never merged to main).
+        // Without it, interrupt() relies solely on the SDK's stdin-based interrupt mechanism.
+        // The descendant-PID SIGINT cascade is disabled until child_pid() is available.
+        let child_pid: Option<u32> = None;
 
         info!(
             session_id = %session_id,
@@ -3780,14 +3796,16 @@ impl ChatManager {
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
 
-        // Build PreCompact hook → CompactionNotifier broadcasts ChatEvent::CompactionStarted
-        let compaction_hooks = {
+        // Build session hooks: PreCompact (compaction notifier) + PreToolUse (skill activation)
+        let session_hooks = {
+            let mut hooks = std::collections::HashMap::new();
+
+            // PreCompact → CompactionNotifier broadcasts ChatEvent::CompactionStarted
             let notifier = CompactionNotifier::new(
                 events_tx.clone(),
                 self.nats.clone(),
                 session_id.to_string(),
             );
-            let mut hooks = std::collections::HashMap::new();
             hooks.insert(
                 "PreCompact".to_string(),
                 vec![nexus_claude::HookMatcher {
@@ -3795,6 +3813,19 @@ impl ChatManager {
                     hooks: vec![std::sync::Arc::new(notifier)],
                 }],
             );
+
+            // PreToolUse → SkillActivationHook injects skill context as additionalContext
+            let skill_hook = skill_hook::SkillActivationHook::new(
+                self.graph.clone(),
+            );
+            hooks.insert(
+                "PreToolUse".to_string(),
+                vec![nexus_claude::HookMatcher {
+                    matcher: None,
+                    hooks: vec![std::sync::Arc::new(skill_hook)],
+                }],
+            );
+
             hooks
         };
 
@@ -3806,7 +3837,7 @@ impl ChatManager {
                 &system_prompt,
                 cli_session_id,
                 session_node.permission_mode.as_deref(),
-                Some(compaction_hooks),
+                Some(session_hooks),
                 &resume_add_dirs,
                 user_claims,
             )
@@ -3839,8 +3870,8 @@ impl ChatManager {
         // Clone stdin sender for lock-free permission responses (see create_session).
         let stdin_tx = client.clone_stdin_sender().await;
 
-        // Capture CLI subprocess PID for process group signaling (see create_session).
-        let child_pid = client.child_pid().await;
+        // CLI subprocess PID — see TODO in create_session (child_pid not yet in nexus main).
+        let child_pid: Option<u32> = None;
 
         let client = Arc::new(Mutex::new(client));
 

@@ -449,7 +449,7 @@ pub struct UpdateSkillRequest {
 /// Hook activation request payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookActivateRequest {
-    /// Project ID (resolved from .po-config or cwd matching)
+    /// Project ID (resolved from cwd/file path matching via project_resolver)
     pub project_id: Uuid,
     /// Name of the Claude Code tool being invoked
     pub tool_name: String,

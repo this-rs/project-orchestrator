@@ -17,6 +17,7 @@ use crate::skills::activation::{
 };
 use crate::skills::cache::SkillCache;
 use crate::skills::models::HookActivateRequest;
+use crate::skills::project_resolver::{find_longest_prefix_match, load_project_entries};
 use crate::skills::SkillStatus;
 use axum::{
     extract::{Query, State},
@@ -379,30 +380,7 @@ pub async fn session_context(
 // ============================================================================
 // Resolve Project (path → project_id)
 // ============================================================================
-
-/// Cache entry for project resolution: maps a path to its resolved project.
-/// Uses a simple TTL-based cache to avoid repeated Neo4j lookups.
-struct ResolvedProject {
-    project_id: Uuid,
-    slug: String,
-    root_path: String,
-}
-
-/// Global cache for resolve-project endpoint.
-/// Key: canonical prefix path (the resolved root_path of the matched project).
-/// Value: ResolvedProject with TTL.
-///
-/// We cache the full project list (expanded root_paths) with a short TTL
-/// rather than individual path lookups, because:
-/// 1. Project count is small (typically <20)
-/// 2. Avoids cache key explosion (infinite distinct file paths)
-/// 3. A single cache entry covers all files under a root_path
-type ResolveCache = Option<(Vec<ResolvedProject>, Instant)>;
-
-static RESOLVE_CACHE: LazyLock<Mutex<ResolveCache>> = LazyLock::new(|| Mutex::new(None));
-
-/// TTL for the resolve-project cache (5 minutes).
-const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
+// Types and cache are in crate::skills::project_resolver (shared with SkillActivationHook).
 
 /// Query parameters for GET /api/hooks/resolve-project
 #[derive(Debug, Deserialize)]
@@ -436,71 +414,12 @@ pub async fn resolve_project(
     // Normalize the input path (expand ~ if present)
     let normalized_input = crate::expand_tilde(input_path);
 
-    // Try the cache first
-    {
-        let cache = RESOLVE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((ref entries, ref cached_at)) = *cache {
-            if cached_at.elapsed() < RESOLVE_CACHE_TTL {
-                if let Some(matched) = find_longest_prefix_match(entries, &normalized_input) {
-                    return Ok((
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "project_id": matched.project_id,
-                            "slug": matched.slug,
-                            "root_path": matched.root_path,
-                        })),
-                    ));
-                }
-                // Cache is valid but no match — still return 404 without hitting Neo4j
-                return Ok((
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": "No project found for path",
-                        "path": input_path,
-                    })),
-                ));
-            }
-        }
-    }
-
-    // Cache miss or expired — fetch all projects from Neo4j
-    let projects = state
-        .orchestrator
-        .neo4j()
-        .list_projects()
+    // Load project entries (cached for 5 min via project_resolver)
+    let entries = load_project_entries(state.orchestrator.neo4j())
         .await
         .map_err(AppError::Internal)?;
 
-    // Build resolved entries with expanded paths
-    let now = Instant::now();
-    let entries: Vec<ResolvedProject> = projects
-        .iter()
-        .map(|p| {
-            let expanded = crate::expand_tilde(&p.root_path);
-            // Ensure root_path ends with / for correct prefix matching
-            let normalized = if expanded.ends_with('/') {
-                expanded
-            } else {
-                format!("{}/", expanded)
-            };
-            ResolvedProject {
-                project_id: p.id,
-                slug: p.slug.clone(),
-                root_path: normalized,
-            }
-        })
-        .collect();
-
-    // Find the longest prefix match
-    let result = find_longest_prefix_match(&entries, &normalized_input);
-
-    // Update cache
-    {
-        let mut cache = RESOLVE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        *cache = Some((entries, now));
-    }
-
-    match result {
+    match find_longest_prefix_match(&entries, &normalized_input) {
         Some(matched) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({
@@ -517,45 +436,6 @@ pub async fn resolve_project(
             })),
         )),
     }
-}
-
-/// A lightweight struct returned from find_longest_prefix_match
-/// to avoid lifetime issues with the cache lock.
-struct MatchedProject {
-    project_id: Uuid,
-    slug: String,
-    root_path: String,
-}
-
-/// Find the project whose root_path is the longest prefix of the given path.
-///
-/// Example: if projects have root_paths `/a/b/` and `/a/b/c/`,
-/// and the input is `/a/b/c/d/file.rs`, the match is `/a/b/c/`.
-fn find_longest_prefix_match(entries: &[ResolvedProject], path: &str) -> Option<MatchedProject> {
-    // Normalize input: ensure it can be compared with trailing-slash root_paths
-    // For a file path like /a/b/c/file.rs, we check if it starts with /a/b/c/
-    // For a dir path like /a/b/c/, it naturally starts with /a/b/c/
-    let check_path = if path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{}/", path)
-    };
-
-    let mut best: Option<&ResolvedProject> = None;
-    let mut best_len = 0;
-
-    for entry in entries {
-        if check_path.starts_with(&entry.root_path) && entry.root_path.len() > best_len {
-            best_len = entry.root_path.len();
-            best = Some(entry);
-        }
-    }
-
-    best.map(|b| MatchedProject {
-        project_id: b.project_id,
-        slug: b.slug.clone(),
-        root_path: b.root_path.clone(),
-    })
 }
 
 // ============================================================================
@@ -593,158 +473,10 @@ fn extract_client_ip(_headers: &HeaderMap) -> IpAddr {
 // ============================================================================
 // Hook Installation
 // ============================================================================
-
-/// Embedded hook file contents (compiled into the binary for self-contained install)
-const HOOK_PRE_TOOL_USE: &str = include_str!("../../hooks/pre-tool-use.cjs");
-const HOOK_SESSION_START: &str = include_str!("../../hooks/session-start.sh");
-
-/// Request body for POST /api/admin/install-hooks
-#[derive(Debug, Deserialize)]
-pub struct InstallHooksRequest {
-    /// Project UUID to bind in .po-config
-    pub project_id: Uuid,
-    /// Directory to place .po-config (the project's working directory)
-    pub cwd: String,
-    /// PO server port (default: 6600)
-    #[serde(default = "default_port")]
-    pub port: u16,
-}
-
-fn default_port() -> u16 {
-    6600
-}
-
-/// POST /api/admin/install-hooks
-///
-/// Installs PO hooks into `~/.claude/hooks/` and generates a `.po-config`
-/// in the specified `cwd` directory. The installation is idempotent.
-///
-/// The hook files are embedded in the server binary at compile time,
-/// making the server self-contained for installation.
-///
-/// Returns:
-/// - 200 with `{ installed: true, hooks_path, config_path, hooks }`
-/// - 400 if cwd doesn't exist or project_id is invalid
-/// - 500 on filesystem errors
-pub async fn install_hooks(
-    State(state): State<OrchestratorState>,
-    Json(body): Json<InstallHooksRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let project_id = body.project_id;
-    let port = body.port;
-
-    // Canonicalize cwd to prevent path traversal attacks (e.g., "../../etc")
-    let raw_cwd = std::path::PathBuf::from(&body.cwd);
-    if !raw_cwd.is_dir() {
-        return Err(AppError::BadRequest(format!(
-            "Directory does not exist: {}",
-            raw_cwd.display()
-        )));
-    }
-    let cwd = raw_cwd.canonicalize().map_err(|e| {
-        AppError::BadRequest(format!(
-            "Cannot resolve directory path '{}': {}",
-            raw_cwd.display(),
-            e
-        ))
-    })?;
-
-    // Safety check: reject system directories
-    let cwd_str = cwd.to_string_lossy();
-    if cwd_str == "/" || cwd_str.starts_with("/etc") || cwd_str.starts_with("/usr") {
-        return Err(AppError::BadRequest(format!(
-            "Refusing to install hooks in system directory: {}",
-            cwd.display()
-        )));
-    }
-
-    // Verify project exists
-    state
-        .orchestrator
-        .neo4j()
-        .get_project(project_id)
-        .await
-        .map_err(AppError::Internal)?
-        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
-
-    // Resolve ~/.claude/hooks/
-    let home = std::env::var("HOME")
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("HOME environment variable not set")))?;
-    let hooks_dir = std::path::PathBuf::from(&home)
-        .join(".claude")
-        .join("hooks");
-
-    // Create hooks directory
-    std::fs::create_dir_all(&hooks_dir).map_err(|e| {
-        AppError::Internal(anyhow::anyhow!(
-            "Failed to create hooks directory {}: {}",
-            hooks_dir.display(),
-            e
-        ))
-    })?;
-
-    // Write hook files
-    let hook_files = vec![
-        ("pre-tool-use.cjs", HOOK_PRE_TOOL_USE),
-        ("session-start.sh", HOOK_SESSION_START),
-    ];
-
-    let mut installed_hooks = Vec::new();
-    for (filename, content) in &hook_files {
-        let target = hooks_dir.join(filename);
-        std::fs::write(&target, content).map_err(|e| {
-            AppError::Internal(anyhow::anyhow!(
-                "Failed to write {}: {}",
-                target.display(),
-                e
-            ))
-        })?;
-
-        // Make executable (unix only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(&target, perms).map_err(|e| {
-                AppError::Internal(anyhow::anyhow!(
-                    "Failed to set permissions on {}: {}",
-                    target.display(),
-                    e
-                ))
-            })?;
-        }
-
-        installed_hooks.push(filename.to_string());
-    }
-
-    // Generate .po-config
-    let config_path = cwd.join(".po-config");
-    let config = serde_json::json!({
-        "project_id": project_id.to_string(),
-        "port": port,
-        "installed_at": chrono::Utc::now().to_rfc3339(),
-        "hooks_version": "1.0.0",
-        "hooks": installed_hooks,
-    });
-    let config_json = serde_json::to_string_pretty(&config)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to serialize config: {}", e)))?;
-    std::fs::write(&config_path, format!("{}\n", config_json)).map_err(|e| {
-        AppError::Internal(anyhow::anyhow!(
-            "Failed to write .po-config at {}: {}",
-            config_path.display(),
-            e
-        ))
-    })?;
-
-    Ok(Json(serde_json::json!({
-        "installed": true,
-        "hooks_path": hooks_dir.to_string_lossy(),
-        "config_path": config_path.to_string_lossy(),
-        "hooks": installed_hooks,
-        "project_id": project_id.to_string(),
-        "port": port,
-    })))
-}
+// NOTE: install_hooks() and external hook files (.cjs, .sh, .po-config)
+// have been removed. Skill activation is now handled in-process via
+// SkillActivationHook (src/chat/skill_hook.rs), registered automatically
+// in create_session() and resume_session(). Zero configuration required.
 
 // ============================================================================
 // Tests
@@ -951,82 +683,9 @@ mod tests {
     }
 
     // ================================================================
-    // Embedded hook content tests
-    // ================================================================
-
-    #[test]
-    fn test_embedded_hooks_not_empty() {
-        assert!(
-            !HOOK_PRE_TOOL_USE.is_empty(),
-            "pre-tool-use.cjs should not be empty"
-        );
-        assert!(
-            !HOOK_SESSION_START.is_empty(),
-            "session-start.sh should not be empty"
-        );
-    }
-
-    #[test]
-    fn test_embedded_hooks_have_shebangs() {
-        assert!(
-            HOOK_PRE_TOOL_USE.starts_with("#!/usr/bin/env node"),
-            "pre-tool-use.cjs should start with node shebang"
-        );
-        assert!(
-            HOOK_SESSION_START.starts_with("#!/usr/bin/env bash"),
-            "session-start.sh should start with bash shebang"
-        );
-    }
-
-    #[test]
-    fn test_install_hooks_request_deserialize() {
-        let json = r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5","cwd":"/tmp/test"}"#;
-        let req: InstallHooksRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            req.project_id,
-            Uuid::parse_str("00333b5f-2d0a-4467-9c98-155e55d2b7e5").unwrap()
-        );
-        assert_eq!(req.cwd, "/tmp/test");
-        assert_eq!(req.port, 6600); // default
-    }
-
-    #[test]
-    fn test_install_hooks_request_custom_port() {
-        let json =
-            r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5","cwd":"/tmp","port":7700}"#;
-        let req: InstallHooksRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.port, 7700);
-    }
-
-    #[test]
-    fn test_install_hooks_request_missing_project_id() {
-        let json = r#"{"cwd":"/tmp"}"#;
-        let result: Result<InstallHooksRequest, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_install_hooks_request_missing_cwd() {
-        let json = r#"{"project_id":"00333b5f-2d0a-4467-9c98-155e55d2b7e5"}"#;
-        let result: Result<InstallHooksRequest, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
-
-    // ================================================================
     // Resolve Project tests
     // ================================================================
-
-    fn make_entry(id: &str, slug: &str, root: &str) -> ResolvedProject {
-        ResolvedProject {
-            project_id: Uuid::parse_str(id).unwrap(),
-            slug: slug.to_string(),
-            root_path: if root.ends_with('/') {
-                root.to_string()
-            } else {
-                format!("{}/", root)
-            },
-        }
-    }
+    // Note: find_longest_prefix_match tests moved to skills::project_resolver::tests
 
     #[test]
     fn test_resolve_project_query_deserialize() {
@@ -1039,134 +698,5 @@ mod tests {
     fn test_resolve_project_query_missing_path() {
         let result: Result<ResolveProjectQuery, _> = serde_json::from_str(r#"{}"#);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_longest_prefix_match_single_project() {
-        let entries = vec![make_entry(
-            "00000000-0000-0000-0000-000000000001",
-            "my-project",
-            "/Users/dev/projects/my-project",
-        )];
-
-        let result =
-            find_longest_prefix_match(&entries, "/Users/dev/projects/my-project/src/main.rs");
-        assert!(result.is_some());
-        let matched = result.unwrap();
-        assert_eq!(matched.slug, "my-project");
-    }
-
-    #[test]
-    fn test_longest_prefix_match_no_match() {
-        let entries = vec![make_entry(
-            "00000000-0000-0000-0000-000000000001",
-            "my-project",
-            "/Users/dev/projects/my-project",
-        )];
-
-        let result = find_longest_prefix_match(&entries, "/Users/dev/other-dir/something.rs");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_longest_prefix_match_picks_longest() {
-        let entries = vec![
-            make_entry(
-                "00000000-0000-0000-0000-000000000001",
-                "workspace",
-                "/Users/dev/workspace",
-            ),
-            make_entry(
-                "00000000-0000-0000-0000-000000000002",
-                "sub-project",
-                "/Users/dev/workspace/packages/sub-project",
-            ),
-        ];
-
-        // File in sub-project → should match sub-project (longer prefix), not workspace
-        let result = find_longest_prefix_match(
-            &entries,
-            "/Users/dev/workspace/packages/sub-project/src/lib.rs",
-        );
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().slug, "sub-project");
-
-        // File in workspace root → should match workspace
-        let result = find_longest_prefix_match(&entries, "/Users/dev/workspace/README.md");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().slug, "workspace");
-    }
-
-    #[test]
-    fn test_longest_prefix_match_exact_root_path() {
-        let entries = vec![make_entry(
-            "00000000-0000-0000-0000-000000000001",
-            "my-project",
-            "/Users/dev/my-project",
-        )];
-
-        // Passing the root_path itself (as directory) should match
-        let result = find_longest_prefix_match(&entries, "/Users/dev/my-project");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().slug, "my-project");
-
-        // With trailing slash
-        let result = find_longest_prefix_match(&entries, "/Users/dev/my-project/");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().slug, "my-project");
-    }
-
-    #[test]
-    fn test_longest_prefix_match_no_false_positive_on_similar_names() {
-        let entries = vec![make_entry(
-            "00000000-0000-0000-0000-000000000001",
-            "foo",
-            "/Users/dev/foo",
-        )];
-
-        // /Users/dev/foobar should NOT match /Users/dev/foo/
-        // because the trailing / in root_path prevents false positives
-        let result = find_longest_prefix_match(&entries, "/Users/dev/foobar/src/main.rs");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_longest_prefix_match_multiple_projects() {
-        let entries = vec![
-            make_entry(
-                "00000000-0000-0000-0000-000000000001",
-                "alpha",
-                "/Users/dev/alpha",
-            ),
-            make_entry(
-                "00000000-0000-0000-0000-000000000002",
-                "beta",
-                "/Users/dev/beta",
-            ),
-            make_entry(
-                "00000000-0000-0000-0000-000000000003",
-                "gamma",
-                "/opt/projects/gamma",
-            ),
-        ];
-
-        let r = find_longest_prefix_match(&entries, "/Users/dev/alpha/src/lib.rs");
-        assert_eq!(r.unwrap().slug, "alpha");
-
-        let r = find_longest_prefix_match(&entries, "/Users/dev/beta/tests/test.rs");
-        assert_eq!(r.unwrap().slug, "beta");
-
-        let r = find_longest_prefix_match(&entries, "/opt/projects/gamma/main.py");
-        assert_eq!(r.unwrap().slug, "gamma");
-
-        let r = find_longest_prefix_match(&entries, "/completely/different/path");
-        assert!(r.is_none());
-    }
-
-    #[test]
-    fn test_longest_prefix_match_empty_entries() {
-        let entries: Vec<ResolvedProject> = vec![];
-        let result = find_longest_prefix_match(&entries, "/some/path");
-        assert!(result.is_none());
     }
 }

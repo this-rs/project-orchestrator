@@ -798,10 +798,8 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/admin/skill-maintenance",
             post(handlers::skill_maintenance),
         )
-        .route(
-            "/api/admin/install-hooks",
-            post(hook_handlers::install_hooks),
-        )
+        // NOTE: /api/admin/install-hooks removed — hooks are now managed
+        // in-process via SkillActivationHook (zero config required)
         // ================================================================
         // Workspaces
         // ================================================================

@@ -803,9 +803,9 @@ fn admin_tool() -> ToolDefinition {
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
-                "project_id": {"type": "string", "description": "Project UUID (sync_directory/start_watch/update_staleness_scores/update_energy_scores/update_fabric_scores/bootstrap_knowledge_fabric/detect_skills/install_hooks)"},
-                "cwd": {"type": "string", "description": "Working directory for .po-config (install_hooks)"},
-                "port": {"type": "integer", "description": "PO server port (install_hooks, default 6600)"},
+                "project_id": {"type": "string", "description": "Project UUID (sync_directory/start_watch/update_staleness_scores/update_energy_scores/update_fabric_scores/bootstrap_knowledge_fabric/detect_skills)"},
+                "cwd": {"type": "string", "description": "Working directory (install_hooks — deprecated, hooks are now automatic)"},
+                "port": {"type": "integer", "description": "PO server port (install_hooks — deprecated, default 6600)"},
                 "query": {"type": "string", "description": "Search query (search_neurons)"},
                 "note_ids": {"type": "array", "items": {"type": "string"}, "description": "Note UUIDs to co-activate (reinforce_neurons, min 2)"},
                 "energy_boost": {"type": "number", "description": "Energy boost amount 0-1 (reinforce_neurons, default 0.2)"},
