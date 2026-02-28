@@ -2127,7 +2127,6 @@ pub async fn auto_anchor_notes(
         "anchors_created": result.anchors_created,
         "elapsed_ms": elapsed_ms,
         "root_path_resolved": result.root_path_resolved,
-        "sample_resolved_paths": result.sample_resolved_paths,
     })))
 }
 
