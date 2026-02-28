@@ -660,7 +660,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         ],
         tools: &[ToolRef {
             name: "admin",
-            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric)",
+            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/reindex_decisions/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric)",
         }],
     },
 ];

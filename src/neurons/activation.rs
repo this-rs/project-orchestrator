@@ -131,7 +131,13 @@ impl SpreadingActivationEngine {
         let embedding = self.embedding_provider.embed_text(query).await?;
         let seed_notes = self
             .graph_store
-            .vector_search_notes(&embedding, config.initial_k, project_id, None, Some(config.min_cosine_similarity))
+            .vector_search_notes(
+                &embedding,
+                config.initial_k,
+                project_id,
+                None,
+                Some(config.min_cosine_similarity),
+            )
             .await?;
 
         debug!(
@@ -1124,12 +1130,8 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Create two notes with different content
-        let note_exact = note_with_energy(
-            Uuid::new_v4(),
-            Some(project_id),
-            "exact match query",
-            1.0,
-        );
+        let note_exact =
+            note_with_energy(Uuid::new_v4(), Some(project_id), "exact match query", 1.0);
         let note_different = note_with_energy(
             Uuid::new_v4(),
             Some(project_id),
@@ -1171,7 +1173,11 @@ mod tests {
             .unwrap();
 
         // Only the exact match note should be returned
-        assert_eq!(results.len(), 1, "Strict threshold should keep only exact match");
+        assert_eq!(
+            results.len(),
+            1,
+            "Strict threshold should keep only exact match"
+        );
         assert_eq!(results[0].note.id, note_exact.id);
 
         // With no threshold: both should appear

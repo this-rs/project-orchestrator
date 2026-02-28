@@ -580,14 +580,14 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// Get the project that owns a task (via Task→Plan→Project chain).
+    /// Get the project that owns a task (via Plan←Task, Project←Plan chain).
     ///
-    /// Traverses: `(Task)-[:PART_OF]->(Plan)-[:BELONGS_TO]->(Project)`
+    /// Traverses: `(Project)-[:HAS_PLAN]->(Plan)-[:HAS_TASK]->(Task)`
     /// Returns `None` if the task doesn't exist or has no linked project.
     pub async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>> {
         let q = query(
             r#"
-            MATCH (t:Task {id: $task_id})-[:PART_OF]->(p:Plan)-[:BELONGS_TO]->(proj:Project)
+            MATCH (proj:Project)-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task {id: $task_id})
             RETURN proj
             LIMIT 1
             "#,

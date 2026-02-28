@@ -3566,6 +3566,20 @@ impl GraphStore for MockGraphStore {
             .map(|emb| emb.iter().map(|&x| x as f32).collect()))
     }
 
+    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>> {
+        let decisions = self.decisions.read().await;
+        let td = self.task_decisions.read().await;
+        let mut result = Vec::new();
+        for (&task_id, decision_ids) in td.iter() {
+            for did in decision_ids {
+                if let Some(d) = decisions.get(did) {
+                    result.push((d.clone(), task_id));
+                }
+            }
+        }
+        Ok(result)
+    }
+
     async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>> {
         let decisions = self.decisions.read().await;
         Ok(decisions

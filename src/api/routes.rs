@@ -734,8 +734,12 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(note_handlers::get_backfill_synapses_status),
         )
         // ================================================================
-        // Admin — Decision Embedding Backfill
+        // Admin — Decision Reindex & Backfill
         // ================================================================
+        .route(
+            "/api/admin/reindex-decisions",
+            post(handlers::reindex_decisions),
+        )
         .route(
             "/api/admin/backfill-decision-embeddings",
             post(handlers::backfill_decision_embeddings),

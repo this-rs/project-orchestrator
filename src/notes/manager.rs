@@ -658,7 +658,13 @@ impl NoteManager {
         // Perform vector similarity search via Neo4j HNSW index
         let results = self
             .neo4j
-            .vector_search_notes(&query_embedding, limit, project_id, workspace_slug, min_similarity)
+            .vector_search_notes(
+                &query_embedding,
+                limit,
+                project_id,
+                workspace_slug,
+                min_similarity,
+            )
             .await?;
 
         // Convert to NoteSearchHit

@@ -342,6 +342,34 @@ impl MeiliClient {
         Ok(results.hits.into_iter().map(|h| h.result).collect())
     }
 
+    /// Search decisions within multiple projects (workspace-level filter).
+    ///
+    /// Uses Meilisearch `IN` filter: `project_slug IN ["slug1", "slug2"]`
+    pub async fn search_decisions_in_projects(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slugs: &[String],
+    ) -> Result<Vec<DecisionDocument>> {
+        if project_slugs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let index = self.client.index(index_names::DECISIONS);
+
+        let quoted: Vec<String> = project_slugs.iter().map(|s| format!("\"{}\"", s)).collect();
+        let filter_str = format!("project_slug IN [{}]", quoted.join(", "));
+
+        let mut search = index.search();
+        search
+            .with_query(query)
+            .with_limit(limit)
+            .with_filter(&filter_str);
+
+        let results: SearchResults<DecisionDocument> = search.execute().await?;
+        Ok(results.hits.into_iter().map(|h| h.result).collect())
+    }
+
     /// Delete a decision document by ID
     pub async fn delete_decision(&self, id: &str) -> Result<()> {
         let index = self.client.index(index_names::DECISIONS);

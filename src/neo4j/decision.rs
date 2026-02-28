@@ -262,6 +262,33 @@ impl Neo4jClient {
         }
     }
 
+    /// Get all decisions with their linked task_id.
+    /// Used by the reindex command to rebuild MeiliSearch from Neo4j.
+    pub async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>> {
+        let q = query(
+            r#"
+            MATCH (t:Task)-[:INFORMED_BY]->(d:Decision)
+            RETURN d, t.id AS task_id
+            ORDER BY d.decided_at DESC
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut decisions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            let task_id_str: String = row.get("task_id")?;
+            if let (Ok(decision), Ok(task_id)) =
+                (Self::node_to_decision(&node), task_id_str.parse::<Uuid>())
+            {
+                decisions.push((decision, task_id));
+            }
+        }
+
+        Ok(decisions)
+    }
+
     /// Get all Decision IDs that have no embedding yet.
     /// Used by the backfill command.
     pub async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>> {

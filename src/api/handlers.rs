@@ -681,20 +681,56 @@ pub struct SearchQuery {
     pub q: String,
     pub limit: Option<usize>,
     pub project_slug: Option<String>,
+    /// Filter by workspace slug (searches all projects in the workspace)
+    pub workspace_slug: Option<String>,
 }
 
 pub async fn search_decisions(
     State(state): State<OrchestratorState>,
     axum::extract::Query(query): axum::extract::Query<SearchQuery>,
 ) -> Result<Json<Vec<DecisionNode>>, AppError> {
+    let limit = query.limit.unwrap_or(10);
+
+    // If project_slug is given, use it directly (takes precedence)
+    if query.project_slug.is_some() {
+        let decisions = state
+            .orchestrator
+            .plan_manager()
+            .search_decisions(&query.q, limit, query.project_slug.as_deref())
+            .await?;
+        return Ok(Json(decisions));
+    }
+
+    // If workspace_slug is given, resolve to project slugs and filter
+    if let Some(ref ws_slug) = query.workspace_slug {
+        let workspace = state
+            .orchestrator
+            .neo4j()
+            .get_workspace_by_slug(ws_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Workspace not found: {}", ws_slug)))?;
+
+        let projects = state
+            .orchestrator
+            .neo4j()
+            .list_workspace_projects(workspace.id)
+            .await?;
+
+        let project_slugs: Vec<String> = projects.iter().map(|p| p.slug.clone()).collect();
+
+        let decisions = state
+            .orchestrator
+            .plan_manager()
+            .search_decisions_in_workspace(&query.q, limit, &project_slugs)
+            .await?;
+        return Ok(Json(decisions));
+    }
+
+    // No filter — global search
     let decisions = state
         .orchestrator
         .plan_manager()
-        .search_decisions(
-            &query.q,
-            query.limit.unwrap_or(10),
-            query.project_slug.as_deref(),
-        )
+        .search_decisions(&query.q, limit, None)
         .await?;
     Ok(Json(decisions))
 }
@@ -1669,6 +1705,25 @@ pub async fn backfill_commit_touches(
     Ok(Json(result))
 }
 
+/// POST /api/admin/reindex-decisions — Reindex all decisions from Neo4j into MeiliSearch.
+///
+/// Reads all Decision nodes from Neo4j and upserts them into MeiliSearch.
+/// Useful after MeiliSearch data loss or rebuild.
+pub async fn reindex_decisions(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (total, indexed) = state
+        .orchestrator
+        .plan_manager()
+        .reindex_decisions()
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "decisions_processed": total,
+        "decisions_indexed": indexed,
+    })))
+}
+
 /// Backfill embeddings for all decisions that don't have one yet.
 ///
 /// Returns synchronously with the count of decisions processed.
@@ -1860,7 +1915,20 @@ pub async fn bootstrap_knowledge_fabric(
         })),
     }
 
-    // Step 2: Backfill decision embeddings
+    // Step 2: Reindex decisions from Neo4j into MeiliSearch
+    match state.orchestrator.plan_manager().reindex_decisions().await {
+        Ok((total, indexed)) => completed.push(serde_json::json!({
+            "step": "reindex_decisions",
+            "decisions_processed": total,
+            "decisions_indexed": indexed,
+        })),
+        Err(e) => failed.push(serde_json::json!({
+            "step": "reindex_decisions",
+            "error": e.to_string(),
+        })),
+    }
+
+    // Step 2b: Backfill decision embeddings
     match state
         .orchestrator
         .plan_manager()
@@ -1878,7 +1946,7 @@ pub async fn bootstrap_knowledge_fabric(
         })),
     }
 
-    // Step 2b: Backfill decision project_slugs in Meilisearch
+    // Step 2c: Backfill decision project_slugs in Meilisearch
     match state
         .orchestrator
         .plan_manager()

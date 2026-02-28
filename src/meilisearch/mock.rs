@@ -278,6 +278,31 @@ impl SearchStore for MockSearchStore {
         Ok(results)
     }
 
+    async fn search_decisions_in_projects(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slugs: &[String],
+    ) -> Result<Vec<DecisionDocument>> {
+        let docs = self.decision_documents.read().await;
+        let results: Vec<DecisionDocument> = docs
+            .iter()
+            .filter(|d| {
+                if let Some(ref slug) = d.project_slug {
+                    if !project_slugs.iter().any(|s| s == slug) {
+                        return false;
+                    }
+                } else {
+                    return false; // No project_slug means not in any project
+                }
+                any_field_matches(&[&d.description, &d.rationale], query)
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
     async fn delete_decision(&self, id: &str) -> Result<()> {
         let mut docs = self.decision_documents.write().await;
         docs.retain(|d| d.id != id);

@@ -322,6 +322,7 @@ impl ToolHandler {
             ("admin", "reinforce_neurons") => "reinforce_neurons",
             ("admin", "decay_synapses") => "decay_synapses",
             ("admin", "backfill_synapses") => "backfill_synapses",
+            ("admin", "reindex_decisions") => "reindex_decisions",
             ("admin", "backfill_decision_embeddings") => "backfill_decision_embeddings",
             ("admin", "backfill_touches") => "backfill_touches",
             ("admin", "backfill_discussed") => "backfill_discussed",
@@ -1818,6 +1819,13 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/admin/backfill-synapses", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "reindex_decisions" => {
+                let result = http
+                    .post("/api/admin/reindex-decisions", &json!({}))
                     .await?;
                 Ok(Some(result))
             }

@@ -98,6 +98,16 @@ impl SearchStore for MeiliClient {
             .await
     }
 
+    async fn search_decisions_in_projects(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slugs: &[String],
+    ) -> Result<Vec<DecisionDocument>> {
+        self.search_decisions_in_projects(query, limit, project_slugs)
+            .await
+    }
+
     async fn delete_decision(&self, id: &str) -> Result<()> {
         self.delete_decision(id).await
     }

@@ -87,7 +87,9 @@ mod tests {
     #[test]
     fn test_should_ignore_claude_directory() {
         // .claude/ can contain worktrees (copies of the repo) created by Claude Code
-        assert!(should_ignore_path("/project/.claude/worktrees/abc123/src/main.rs"));
+        assert!(should_ignore_path(
+            "/project/.claude/worktrees/abc123/src/main.rs"
+        ));
         assert!(should_ignore_path("/project/.claude/settings.json"));
         // But "claude" without dots/slashes should NOT be caught
         assert!(!should_ignore_path("/project/src/claude/handler.rs"));

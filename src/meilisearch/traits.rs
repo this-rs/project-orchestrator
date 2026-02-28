@@ -81,6 +81,14 @@ pub trait SearchStore: Send + Sync {
         project_slug: Option<&str>,
     ) -> Result<Vec<DecisionDocument>>;
 
+    /// Search decisions within multiple projects (workspace-level filter)
+    async fn search_decisions_in_projects(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slugs: &[String],
+    ) -> Result<Vec<DecisionDocument>>;
+
     /// Delete a decision document by ID
     async fn delete_decision(&self, id: &str) -> Result<()>;
 

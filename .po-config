@@ -1,0 +1,10 @@
+{
+  "hooks": [
+    "pre-tool-use.cjs",
+    "session-start.sh"
+  ],
+  "hooks_version": "1.0.0",
+  "installed_at": "2026-02-27T16:01:09.216163+00:00",
+  "port": 8080,
+  "project_id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5"
+}
