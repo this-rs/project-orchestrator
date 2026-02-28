@@ -984,4 +984,285 @@ mod tests {
             );
         }
     }
+
+    // ================================================================
+    // Async lifecycle tests (MockGraphStore)
+    // ================================================================
+
+    use crate::neo4j::mock::MockGraphStore;
+    use std::sync::Arc;
+
+    async fn mock_store_with_skill(skill: SkillNode) -> Arc<MockGraphStore> {
+        let store = MockGraphStore::new();
+        let project_id = skill.project_id;
+        let mut p = crate::test_helpers::test_project();
+        p.id = project_id;
+        store.projects.write().await.insert(p.id, p);
+        store.create_skill(&skill).await.unwrap();
+        Arc::new(store)
+    }
+
+    #[tokio::test]
+    async fn test_demote_skill_active_to_dormant() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Active Skill");
+        skill.status = SkillStatus::Active;
+        skill.energy = 0.05;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        demote_skill(store.as_ref(), skill_id).await.unwrap();
+
+        let updated = store.get_skill(skill_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, SkillStatus::Dormant);
+    }
+
+    #[tokio::test]
+    async fn test_demote_skill_wrong_status_fails() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Emerging Skill");
+        skill.status = SkillStatus::Emerging;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        let result = demote_skill(store.as_ref(), skill_id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected Active"));
+    }
+
+    #[tokio::test]
+    async fn test_demote_skill_not_found() {
+        let store = Arc::new(MockGraphStore::new());
+        let result = demote_skill(store.as_ref(), Uuid::new_v4()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_archive_skill_dormant_to_archived() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Dormant Skill");
+        skill.status = SkillStatus::Dormant;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        archive_skill(store.as_ref(), skill_id).await.unwrap();
+
+        let updated = store.get_skill(skill_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, SkillStatus::Archived);
+    }
+
+    #[tokio::test]
+    async fn test_archive_skill_wrong_status_fails() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Active Skill");
+        skill.status = SkillStatus::Active;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        let result = archive_skill(store.as_ref(), skill_id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected Dormant"));
+    }
+
+    #[tokio::test]
+    async fn test_archive_imported_skill_success() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Imported Skill");
+        skill.status = SkillStatus::Imported;
+        skill.imported_at = Some(Utc::now() - chrono::Duration::days(30));
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        archive_imported_skill(store.as_ref(), skill_id)
+            .await
+            .unwrap();
+
+        let updated = store.get_skill(skill_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, SkillStatus::Archived);
+    }
+
+    #[tokio::test]
+    async fn test_archive_imported_skill_wrong_status_fails() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Active Skill");
+        skill.status = SkillStatus::Active;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        let result = archive_imported_skill(store.as_ref(), skill_id).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected Imported"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_imported_skill_success() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Imported Skill");
+        skill.status = SkillStatus::Imported;
+        skill.activation_count = 5;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        validate_imported_skill(store.as_ref(), skill_id)
+            .await
+            .unwrap();
+
+        let updated = store.get_skill(skill_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, SkillStatus::Emerging);
+        assert!(updated.is_validated);
+    }
+
+    #[tokio::test]
+    async fn test_validate_imported_skill_wrong_status_fails() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Dormant Skill");
+        skill.status = SkillStatus::Dormant;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        let result = validate_imported_skill(store.as_ref(), skill_id).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected Imported"));
+    }
+
+    #[tokio::test]
+    async fn test_reactivate_skill_dormant_to_emerging() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Dormant Skill");
+        skill.status = SkillStatus::Dormant;
+        skill.activation_count = 10;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        reactivate_skill(store.as_ref(), skill_id).await.unwrap();
+
+        let updated = store.get_skill(skill_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, SkillStatus::Emerging);
+        assert_eq!(updated.activation_count, 0);
+        assert!(updated.last_activated.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_reactivate_skill_wrong_status_fails() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Active Skill");
+        skill.status = SkillStatus::Active;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        let result = reactivate_skill(store.as_ref(), skill_id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected Dormant"));
+    }
+
+    #[tokio::test]
+    async fn test_promote_skill_emerging_to_active() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Emerging Skill");
+        skill.status = SkillStatus::Emerging;
+        skill.energy = 0.5;
+        skill.cohesion = 0.6;
+        skill.note_count = 5;
+        skill.activation_count = 3;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        let decisions_added = promote_skill(store.as_ref(), skill_id).await.unwrap();
+
+        let updated = store.get_skill(skill_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, SkillStatus::Active);
+        assert_eq!(updated.version, 2);
+        assert_eq!(decisions_added, 0);
+    }
+
+    #[tokio::test]
+    async fn test_promote_skill_wrong_status_fails() {
+        let project_id = Uuid::new_v4();
+        let mut skill = SkillNode::new(project_id, "Active Skill");
+        skill.status = SkillStatus::Active;
+        let skill_id = skill.id;
+        let store = mock_store_with_skill(skill).await;
+
+        let result = promote_skill(store.as_ref(), skill_id).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected Emerging"));
+    }
+
+    #[tokio::test]
+    async fn test_update_skill_lifecycle_no_skills() {
+        let project_id = Uuid::new_v4();
+        let store = MockGraphStore::new();
+        let mut p = crate::test_helpers::test_project();
+        p.id = project_id;
+        store.projects.write().await.insert(p.id, p);
+        let config = SkillLifecycleConfig::default();
+
+        let result = update_skill_lifecycle(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.skills_updated, 0);
+        assert_eq!(result.skills_promoted, 0);
+        assert_eq!(result.skills_demoted, 0);
+        assert_eq!(result.skills_archived, 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_skill_lifecycle_demotes_active_skill() {
+        let project_id = Uuid::new_v4();
+        let store = MockGraphStore::new();
+        let mut p = crate::test_helpers::test_project();
+        p.id = project_id;
+        store.projects.write().await.insert(p.id, p);
+
+        let mut skill = SkillNode::new(project_id, "Should Demote");
+        skill.status = SkillStatus::Active;
+        skill.energy = 0.05;
+        skill.cohesion = 0.15;
+        skill.last_activated = Some(Utc::now() - chrono::Duration::days(40));
+        store.create_skill(&skill).await.unwrap();
+
+        let config = SkillLifecycleConfig::default();
+        let result = update_skill_lifecycle(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.skills_demoted, 1);
+        let updated = store.get_skill(skill.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, SkillStatus::Dormant);
+    }
+
+    #[tokio::test]
+    async fn test_update_skill_lifecycle_archives_dormant_skill() {
+        let project_id = Uuid::new_v4();
+        let store = MockGraphStore::new();
+        let mut p = crate::test_helpers::test_project();
+        p.id = project_id;
+        store.projects.write().await.insert(p.id, p);
+
+        let mut skill = SkillNode::new(project_id, "Should Archive");
+        skill.status = SkillStatus::Dormant;
+        skill.energy = 0.01;
+        skill.last_activated = Some(Utc::now() - chrono::Duration::days(100));
+        store.create_skill(&skill).await.unwrap();
+
+        let config = SkillLifecycleConfig::default();
+        let result = update_skill_lifecycle(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.skills_archived, 1);
+        let updated = store.get_skill(skill.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, SkillStatus::Archived);
+    }
 }

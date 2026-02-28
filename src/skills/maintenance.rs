@@ -352,4 +352,162 @@ mod tests {
         assert!(result.evolution.is_none());
         assert!(result.warnings.is_empty());
     }
+
+    // ================================================================
+    // Async maintenance tests (MockGraphStore)
+    // ================================================================
+
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::skills::models::{SkillNode, SkillStatus};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    async fn setup_store_with_project() -> (MockGraphStore, Uuid) {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let mut p = crate::test_helpers::test_project();
+        p.id = project_id;
+        store.projects.write().await.insert(p.id, p);
+        (store, project_id)
+    }
+
+    #[tokio::test]
+    async fn test_hourly_maintenance_no_skills() {
+        let (store, project_id) = setup_store_with_project().await;
+        let config = SkillMaintenanceConfig::default();
+
+        let result = run_hourly_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "hourly");
+        assert!(result.lifecycle.is_some());
+        let lifecycle = result.lifecycle.unwrap();
+        assert_eq!(lifecycle.skills_updated, 0);
+        assert_eq!(lifecycle.skills_promoted, 0);
+        assert_eq!(lifecycle.skills_demoted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_hourly_maintenance_with_active_skill() {
+        let (store, project_id) = setup_store_with_project().await;
+
+        // Create an active skill with low energy and old activation
+        let mut skill = SkillNode::new(project_id, "Active Low Energy");
+        skill.status = SkillStatus::Active;
+        skill.energy = 0.05;
+        skill.cohesion = 0.15;
+        skill.last_activated = Some(Utc::now() - chrono::Duration::days(35));
+        store.create_skill(&skill).await.unwrap();
+
+        let config = SkillMaintenanceConfig::default();
+        let result = run_hourly_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "hourly");
+        let lifecycle = result.lifecycle.unwrap();
+        assert_eq!(lifecycle.skills_demoted, 1);
+    }
+
+    #[tokio::test]
+    async fn test_daily_maintenance_decays_synapses() {
+        let (store, project_id) = setup_store_with_project().await;
+        let config = SkillMaintenanceConfig::default();
+
+        let result = run_daily_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "daily");
+        // Decay runs but nothing to decay
+        assert!(result.synapses_decayed.is_some());
+        assert_eq!(result.synapses_decayed.unwrap(), 0);
+        assert!(result.synapses_pruned.is_some());
+        assert_eq!(result.synapses_pruned.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_daily_maintenance_with_synapses() {
+        let (store, project_id) = setup_store_with_project().await;
+
+        // Seed two notes with a synapse between them
+        let note1_id = Uuid::new_v4();
+        let note2_id = Uuid::new_v4();
+        let note1 =
+            crate::test_helpers::test_note(project_id, crate::notes::NoteType::Pattern, "Note 1");
+        let note2 =
+            crate::test_helpers::test_note(project_id, crate::notes::NoteType::Tip, "Note 2");
+        let mut n1 = note1;
+        n1.id = note1_id;
+        let mut n2 = note2;
+        n2.id = note2_id;
+        store.notes.write().await.insert(n1.id, n1);
+        store.notes.write().await.insert(n2.id, n2);
+        store
+            .note_synapses
+            .write()
+            .await
+            .insert(note1_id, vec![(note2_id, 0.5)]);
+
+        let config = SkillMaintenanceConfig::default();
+        let result = run_daily_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "daily");
+        assert_eq!(result.synapses_decayed.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_weekly_maintenance_no_skills_no_synapses() {
+        let (store, project_id) = setup_store_with_project().await;
+        let config = SkillMaintenanceConfig::default();
+
+        let result = run_weekly_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "weekly");
+        assert!(result.lifecycle.is_some());
+        // No synapses → no detection candidates
+        assert!(result.skills_detected.is_none() || result.skills_detected == Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_full_maintenance_delegates_to_weekly() {
+        let (store, project_id) = setup_store_with_project().await;
+        let config = SkillMaintenanceConfig::default();
+
+        let result = run_full_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "full");
+        assert!(result.lifecycle.is_some());
+    }
+
+    #[test]
+    fn test_maintenance_result_serde() {
+        let result = MaintenanceResult {
+            level: "daily".to_string(),
+            lifecycle: Some(MetricsUpdateResult {
+                skills_updated: 5,
+                skills_promoted: 1,
+                skills_demoted: 2,
+                skills_archived: 0,
+                decisions_added: 3,
+            }),
+            synapses_decayed: Some(10),
+            synapses_pruned: Some(2),
+            evolution: None,
+            skills_detected: None,
+            warnings: vec!["test warning".to_string()],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: MaintenanceResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.level, "daily");
+        assert_eq!(deserialized.synapses_decayed, Some(10));
+        assert_eq!(deserialized.warnings.len(), 1);
+    }
 }

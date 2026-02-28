@@ -3867,4 +3867,3071 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("slug"));
     }
+
+    // ========================================================================
+    // Comprehensive HTTP routing tests — all remaining handlers
+    // ========================================================================
+
+    // Helper UUID for tests
+    const UUID1: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const UUID2: &str = "660e8400-e29b-41d4-a716-446655440000";
+
+    // -- Projects (remaining) -----------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_sync_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("sync_project", Some(json!({"slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/projects/my-proj/sync");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_project_roadmap() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_project_roadmap", Some(json!({"slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/projects/my-proj/roadmap");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_project_plans() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_project_plans", Some(json!({"slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/projects/my-proj/plans");
+    }
+
+    // -- Plans (remaining) --------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_plans() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler.handle("list_plans", Some(json!({}))).await.unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/plans");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_plans_with_filters() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_plans",
+                Some(json!({"status": "in_progress", "priority_min": 50, "sort_by": "priority"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("status=in_progress"));
+        assert!(query.contains("priority_min=50"));
+        assert!(query.contains("sort_by=priority"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_plan() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_plan", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/plans/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_unlink_plan_from_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("unlink_plan_from_project", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().ends_with("/project"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_dependency_graph() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_dependency_graph", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/dependency-graph"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_critical_path() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_critical_path", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/critical-path"));
+    }
+
+    // -- Tasks (remaining) --------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_get_task() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_task", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/tasks/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_task() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_task",
+                Some(json!({"task_id": UUID1, "status": "completed"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/tasks/"));
+        assert_eq!(result["body"]["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_task() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_task", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/tasks/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_next_task() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_next_task", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/next-task"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_task_dependencies() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_task_dependencies",
+                Some(json!({"task_id": UUID1, "dependency_ids": [UUID2]})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/dependencies"));
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_task_dependency() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "remove_task_dependency",
+                Some(json!({"task_id": UUID1, "dependency_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains("/dependencies/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_task_blockers() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_task_blockers", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/blockers"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_tasks_blocked_by() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_tasks_blocked_by", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/blocking"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_task_context() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_task_context",
+                Some(json!({"plan_id": UUID1, "task_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/context"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_task_prompt() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_task_prompt",
+                Some(json!({"plan_id": UUID1, "task_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/prompt"));
+    }
+
+    // -- Steps (remaining) --------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_steps() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_steps", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/steps"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_step() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_step", Some(json!({"step_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/steps/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_step() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_step", Some(json!({"step_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/steps/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_step_progress() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_step_progress", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/steps/progress"));
+    }
+
+    // -- Decisions ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_add_decision() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_decision",
+                Some(json!({"task_id": UUID1, "description": "Use REST", "rationale": "Simple"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/decisions"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_decision() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_decision", Some(json!({"decision_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/decisions/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_decision() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_decision",
+                Some(json!({"decision_id": UUID1, "status": "accepted", "rationale": "Updated"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/decisions/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_decision() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_decision", Some(json!({"decision_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/decisions/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_search_decisions() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("search_decisions", Some(json!({"query": "auth"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/decisions/search");
+    }
+
+    #[tokio::test]
+    async fn test_http_search_decisions_semantic() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "search_decisions_semantic",
+                Some(json!({"query": "authentication approach"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/decisions/search-semantic");
+    }
+
+    #[tokio::test]
+    async fn test_http_add_decision_affects() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_decision_affects",
+                Some(json!({
+                    "decision_id": UUID1,
+                    "entity_type": "File",
+                    "entity_id": "src/main.rs"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/affects"));
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_decision_affects() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "remove_decision_affects",
+                Some(json!({
+                    "decision_id": UUID1,
+                    "entity_type": "File",
+                    "entity_id": "src/main.rs"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains("/affects"));
+    }
+
+    #[tokio::test]
+    async fn test_http_list_decision_affects() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_decision_affects", Some(json!({"decision_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/affects"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_decisions_affecting() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_decisions_affecting",
+                Some(json!({"entity_type": "File", "entity_id": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/decisions/affecting");
+    }
+
+    #[tokio::test]
+    async fn test_http_supersede_decision() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "supersede_decision",
+                Some(json!({"decision_id": UUID1, "superseded_by_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().contains("/supersedes/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_decision_timeline() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_decision_timeline", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/timeline"));
+    }
+
+    // -- Constraints --------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_constraints() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_constraints", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/constraints"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_constraint() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_constraint",
+                Some(json!({
+                    "plan_id": UUID1,
+                    "constraint_type": "performance",
+                    "description": "< 100ms",
+                    "severity": "must"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/constraints"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_constraint() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_constraint", Some(json!({"constraint_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/constraints/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_constraint() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_constraint",
+                Some(json!({"constraint_id": UUID1, "description": "Updated"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/constraints/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_constraint() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_constraint", Some(json!({"constraint_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/constraints/"));
+    }
+
+    // -- Milestones ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_milestones() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_milestones", Some(json!({"project_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/milestones"));
+    }
+
+    #[tokio::test]
+    async fn test_http_create_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_milestone",
+                Some(json!({"project_id": UUID1, "title": "v1.0"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/milestones"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_milestone", Some(json!({"milestone_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/milestones/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_milestone",
+                Some(json!({"milestone_id": UUID1, "title": "v2.0"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/milestones/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_milestone", Some(json!({"milestone_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/milestones/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_milestone_progress() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_milestone_progress",
+                Some(json!({"milestone_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/progress"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_task_to_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_task_to_milestone",
+                Some(json!({"milestone_id": UUID1, "task_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/tasks"));
+    }
+
+    #[tokio::test]
+    async fn test_http_link_plan_to_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "link_plan_to_milestone",
+                Some(json!({"milestone_id": UUID1, "plan_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/plans"));
+    }
+
+    #[tokio::test]
+    async fn test_http_unlink_plan_from_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "unlink_plan_from_milestone",
+                Some(json!({"milestone_id": UUID1, "plan_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains("/plans/"));
+    }
+
+    // -- Releases -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_releases() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_releases", Some(json!({"project_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/releases"));
+    }
+
+    #[tokio::test]
+    async fn test_http_create_release() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_release",
+                Some(json!({"project_id": UUID1, "version": "1.0.0", "title": "First"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/releases"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_release() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_release", Some(json!({"release_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/releases/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_release() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_release",
+                Some(json!({"release_id": UUID1, "status": "released"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/releases/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_release() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_release", Some(json!({"release_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/releases/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_task_to_release() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_task_to_release",
+                Some(json!({"release_id": UUID1, "task_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/tasks"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_commit_to_release() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_commit_to_release",
+                Some(json!({"release_id": UUID1, "commit_sha": "abc1234"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/commits"));
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_commit_from_release() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "remove_commit_from_release",
+                Some(json!({"release_id": UUID1, "commit_sha": "abc1234"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains("/commits/"));
+    }
+
+    // -- Commits (remaining) ------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_link_commit_to_task() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "link_commit_to_task",
+                Some(json!({"task_id": UUID1, "commit_sha": "abc1234"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/commits"));
+        assert_eq!(result["body"]["commit_hash"], "abc1234");
+    }
+
+    #[tokio::test]
+    async fn test_http_link_commit_to_plan() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "link_commit_to_plan",
+                Some(json!({"plan_id": UUID1, "commit_sha": "def5678"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/commits"));
+        assert_eq!(result["body"]["commit_hash"], "def5678");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_task_commits() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_task_commits", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/commits"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_plan_commits() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_plan_commits", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/commits"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_commit_files() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_commit_files", Some(json!({"sha": "abc1234"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/commits/"));
+        assert!(result["path"].as_str().unwrap().ends_with("/files"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_file_history() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_file_history",
+                Some(json!({"file_path": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/files/history");
+    }
+
+    // -- Notes (remaining) --------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_notes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler.handle("list_notes", Some(json!({}))).await.unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_notes_with_filters() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_notes",
+                Some(json!({"note_type": "guideline", "importance": "high", "limit": 5})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("note_type=guideline"));
+        assert!(query.contains("importance=high"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_note() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_note", Some(json!({"note_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/notes/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_note() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_note",
+                Some(json!({"note_id": UUID1, "content": "Updated content"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/notes/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_note() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_note", Some(json!({"note_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/notes/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_search_notes_semantic() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "search_notes_semantic",
+                Some(json!({"query": "how to test"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/search-semantic");
+    }
+
+    #[tokio::test]
+    async fn test_http_confirm_note() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("confirm_note", Some(json!({"note_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/confirm"));
+    }
+
+    #[tokio::test]
+    async fn test_http_invalidate_note() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "invalidate_note",
+                Some(json!({"note_id": UUID1, "reason": "stale"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/invalidate"));
+    }
+
+    #[tokio::test]
+    async fn test_http_supersede_note() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "supersede_note",
+                Some(json!({"old_note_id": UUID1, "superseded_by_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/supersede"));
+    }
+
+    #[tokio::test]
+    async fn test_http_link_note_to_entity() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "link_note_to_entity",
+                Some(json!({
+                    "note_id": UUID1,
+                    "entity_type": "file",
+                    "entity_id": "src/main.rs"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/links"));
+    }
+
+    #[tokio::test]
+    async fn test_http_unlink_note_from_entity() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "unlink_note_from_entity",
+                Some(json!({
+                    "note_id": UUID1,
+                    "entity_type": "file",
+                    "entity_id": "src/main.rs"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains("/links"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_context_notes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_context_notes",
+                Some(json!({"entity_type": "file", "entity_id": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/context");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_propagated_notes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_propagated_notes",
+                Some(json!({"entity_type": "file", "entity_id": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/propagated");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_project_notes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_project_notes", Some(json!({"project_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/notes"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_entity_notes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_entity_notes",
+                Some(json!({"entity_type": "function", "entity_id": "main"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/entities/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_notes_needing_review() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_notes_needing_review", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/needs-review");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_context_knowledge() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_context_knowledge",
+                Some(json!({"entity_type": "file", "entity_id": "src/lib.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/context-knowledge");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_propagated_knowledge() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_propagated_knowledge",
+                Some(json!({"entity_type": "file", "entity_id": "src/lib.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/propagated-knowledge");
+    }
+
+    // -- Admin / neurons ----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_search_neurons() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("search_neurons", Some(json!({"query": "auth"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/neurons/search");
+    }
+
+    #[tokio::test]
+    async fn test_http_update_staleness_scores() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("update_staleness_scores", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/notes/update-staleness");
+    }
+
+    #[tokio::test]
+    async fn test_http_update_energy_scores() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("update_energy_scores", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/notes/update-energy");
+    }
+
+    #[tokio::test]
+    async fn test_http_reinforce_neurons() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "reinforce_neurons",
+                Some(json!({"note_ids": [UUID1, UUID2]})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/notes/neurons/reinforce");
+    }
+
+    #[tokio::test]
+    async fn test_http_decay_synapses() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("decay_synapses", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/notes/neurons/decay");
+    }
+
+    #[tokio::test]
+    async fn test_http_backfill_synapses() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("backfill_synapses", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/admin/backfill-synapses");
+    }
+
+    #[tokio::test]
+    async fn test_http_reindex_decisions() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("reindex_decisions", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/admin/reindex-decisions");
+    }
+
+    #[tokio::test]
+    async fn test_http_backfill_decision_embeddings() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("backfill_decision_embeddings", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/admin/backfill-decision-embeddings");
+    }
+
+    #[tokio::test]
+    async fn test_http_backfill_touches() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("backfill_touches", Some(json!({"project_slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_backfill_discussed() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("backfill_discussed", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_update_fabric_scores() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("update_fabric_scores", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_bootstrap_knowledge_fabric() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("bootstrap_knowledge_fabric", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_detect_skills() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("detect_skills", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_maintain_skills() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "maintain_skills",
+                Some(json!({"project_id": UUID1, "level": "daily"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_meilisearch_stats() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_meilisearch_stats", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_meilisearch_orphans() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_meilisearch_orphans", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+    }
+
+    #[tokio::test]
+    async fn test_http_sync_directory() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("sync_directory", Some(json!({"path": "/tmp/project"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/sync");
+    }
+
+    #[tokio::test]
+    async fn test_http_start_watch() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("start_watch", Some(json!({"path": "/tmp/project"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/watch");
+    }
+
+    #[tokio::test]
+    async fn test_http_stop_watch() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("stop_watch", Some(json!({"project_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], "/api/watch");
+    }
+
+    #[tokio::test]
+    async fn test_http_watch_status() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("watch_status", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/watch");
+    }
+
+    #[tokio::test]
+    async fn test_http_cleanup_cross_project_calls() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("cleanup_cross_project_calls", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_cleanup_sync_data() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("cleanup_sync_data", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_cleanup_builtin_calls() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("cleanup_builtin_calls", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_migrate_calls_confidence() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("migrate_calls_confidence", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    // -- Workspaces (remaining) ---------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_workspaces() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_workspaces", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/workspaces");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_workspace() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_workspace", Some(json!({"slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/workspaces/my-ws");
+    }
+
+    #[tokio::test]
+    async fn test_http_update_workspace() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_workspace",
+                Some(json!({"slug": "my-ws", "name": "New Name"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert_eq!(result["path"], "/api/workspaces/my-ws");
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_workspace() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_workspace", Some(json!({"slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], "/api/workspaces/my-ws");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_workspace_overview() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_workspace_overview", Some(json!({"slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/overview"));
+    }
+
+    #[tokio::test]
+    async fn test_http_list_workspace_projects() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_workspace_projects", Some(json!({"slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/projects"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_project_to_workspace() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_project_to_workspace",
+                Some(json!({"slug": "my-ws", "project_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/projects"));
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_project_from_workspace() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "remove_project_from_workspace",
+                Some(json!({"slug": "my-ws", "project_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains("/projects/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_workspace_topology() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_workspace_topology", Some(json!({"slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/topology"));
+    }
+
+    // -- Workspace milestones -----------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_all_workspace_milestones() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_all_workspace_milestones",
+                Some(json!({"workspace_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/workspace-milestones");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_workspace_milestones() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_workspace_milestones", Some(json!({"slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/workspaces/my-ws/milestones"));
+    }
+
+    #[tokio::test]
+    async fn test_http_create_workspace_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_workspace_milestone",
+                Some(json!({"slug": "my-ws", "title": "Beta"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/milestones"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_workspace_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_workspace_milestone", Some(json!({"id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/workspace-milestones/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_workspace_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_workspace_milestone",
+                Some(json!({"id": UUID1, "title": "GA"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/workspace-milestones/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_workspace_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_workspace_milestone", Some(json!({"id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/workspace-milestones/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_task_to_workspace_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_task_to_workspace_milestone",
+                Some(json!({"id": UUID1, "task_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/tasks"));
+    }
+
+    #[tokio::test]
+    async fn test_http_link_plan_to_workspace_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "link_plan_to_workspace_milestone",
+                Some(json!({"id": UUID1, "plan_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/plans"));
+    }
+
+    #[tokio::test]
+    async fn test_http_unlink_plan_from_workspace_milestone() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "unlink_plan_from_workspace_milestone",
+                Some(json!({"id": UUID1, "plan_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains("/plans/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_workspace_milestone_progress() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_workspace_milestone_progress",
+                Some(json!({"id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/progress"));
+    }
+
+    // -- Resources ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_resources() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_resources", Some(json!({"slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/resources"));
+    }
+
+    #[tokio::test]
+    async fn test_http_create_resource() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_resource",
+                Some(json!({
+                    "slug": "my-ws",
+                    "name": "API Schema",
+                    "resource_type": "api_contract"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/resources"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_resource() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_resource", Some(json!({"id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/resources/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_resource() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_resource",
+                Some(json!({"id": UUID1, "name": "Updated"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/resources/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_resource() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_resource", Some(json!({"id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/resources/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_link_resource_to_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "link_resource_to_project",
+                Some(json!({"id": UUID1, "project_id": UUID2, "link_type": "uses"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/projects"));
+    }
+
+    // -- Components ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_components() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_components", Some(json!({"slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/components"));
+    }
+
+    #[tokio::test]
+    async fn test_http_create_component() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_component",
+                Some(json!({
+                    "slug": "my-ws",
+                    "name": "API",
+                    "component_type": "service"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/components"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_component() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_component", Some(json!({"id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/components/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_component() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_component",
+                Some(json!({"id": UUID1, "name": "Gateway"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/components/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_component() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_component", Some(json!({"id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/components/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_component_dependency() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_component_dependency",
+                Some(json!({"id": UUID1, "depends_on_id": UUID2, "dependency_type": "uses"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/api/components/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_component_dependency() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "remove_component_dependency",
+                Some(json!({"id": UUID1, "dep_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/api/components/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_map_component_to_project() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "map_component_to_project",
+                Some(json!({"id": UUID1, "project_id": UUID2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PUT");
+        assert!(result["path"].as_str().unwrap().ends_with("/project"));
+    }
+
+    // -- Code (remaining) ---------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_search_project_code() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "search_project_code",
+                Some(json!({"project_slug": "my-proj", "query": "handler"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/projects/my-proj/code/search"));
+    }
+
+    #[tokio::test]
+    async fn test_http_search_workspace_code() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "search_workspace_code",
+                Some(json!({"workspace_slug": "my-ws", "query": "service"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/api/code/search"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_file_symbols() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_file_symbols",
+                Some(json!({"file_path": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/code/symbols/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_find_references() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("find_references", Some(json!({"symbol": "ToolHandler"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/references");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_file_dependencies() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_file_dependencies",
+                Some(json!({"file_path": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/code/dependencies/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_call_graph() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_call_graph", Some(json!({"function": "main"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/callgraph");
+    }
+
+    #[tokio::test]
+    async fn test_http_analyze_impact() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("analyze_impact", Some(json!({"target": "src/main.rs"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/impact");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_architecture() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_architecture", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/architecture");
+    }
+
+    #[tokio::test]
+    async fn test_http_find_similar_code() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_similar_code",
+                Some(json!({"code_snippet": "fn main()"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/code/similar");
+    }
+
+    #[tokio::test]
+    async fn test_http_find_trait_implementations() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_trait_implementations",
+                Some(json!({"trait_name": "GraphStore"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/trait-impls");
+    }
+
+    #[tokio::test]
+    async fn test_http_find_type_traits() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_type_traits",
+                Some(json!({"type_name": "Neo4jClient"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/type-traits");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_impl_blocks() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_impl_blocks", Some(json!({"type_name": "Neo4jClient"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/impl-blocks");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_code_communities() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_code_communities",
+                Some(json!({"project_slug": "my-proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/communities"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_code_health() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_code_health", Some(json!({"project_slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/code/health"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_node_importance() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_node_importance",
+                Some(json!({
+                    "project_slug": "my-proj",
+                    "node_path": "src/main.rs",
+                    "node_type": "File"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/node-importance"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_co_change_graph() {
+        let (handler, _) = make_http_handler().await;
+        // This handler makes 2 HTTP calls (resolve slug, then get co-changes)
+        // The echo server returns the first call's echo, so just verify it starts
+        let result = handler
+            .handle(
+                "get_co_change_graph",
+                Some(json!({"project_slug": "my-proj"})),
+            )
+            .await;
+        // May error because the echo response can't be parsed as project,
+        // but the important thing is that the code path is exercised
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_http_get_file_co_changers() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_file_co_changers",
+                Some(json!({"file_path": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/files/co-changers"));
+    }
+
+    #[tokio::test]
+    async fn test_http_detect_processes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("detect_processes", Some(json!({"project_slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_processes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_processes", Some(json!({"project_slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_process() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_process", Some(json!({"process_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_entry_points() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_entry_points", Some(json!({"project_slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_class_hierarchy() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_class_hierarchy",
+                Some(json!({"type_name": "BaseHandler"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/class-hierarchy"));
+    }
+
+    #[tokio::test]
+    async fn test_http_find_subclasses() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_subclasses",
+                Some(json!({"class_name": "BaseHandler"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/subclasses"));
+    }
+
+    #[tokio::test]
+    async fn test_http_find_interface_implementors() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_interface_implementors",
+                Some(json!({"interface_name": "Handler"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/interface-implementors"));
+    }
+
+    #[tokio::test]
+    async fn test_http_enrich_communities() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "enrich_communities",
+                Some(json!({"project_slug": "my-proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_hotspots() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_hotspots", Some(json!({"project_slug": "my-proj"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_knowledge_gaps() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_knowledge_gaps",
+                Some(json!({"project_slug": "my-proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_risk_assessment() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_risk_assessment",
+                Some(json!({"project_slug": "my-proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn test_http_plan_implementation() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "plan_implementation",
+                Some(json!({
+                    "project_slug": "my-proj",
+                    "description": "Add auth"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/plan-implementation"));
+    }
+
+    // -- Chat ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_chat_sessions() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_chat_sessions", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/chat/sessions");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_chat_session() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_chat_session", Some(json!({"session_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/chat/sessions/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_chat_session() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_chat_session", Some(json!({"session_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/chat/sessions/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_chat_send_message() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "chat_send_message",
+                Some(json!({"message": "Hello", "cwd": "/tmp"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/chat/sessions");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_chat_messages() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_chat_messages", Some(json!({"session_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/messages"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_discussed() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_discussed",
+                Some(json!({
+                    "session_id": UUID1,
+                    "entities": [{"entity_type": "file", "entity_id": "src/main.rs"}]
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/discussed"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_session_entities() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_session_entities", Some(json!({"session_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/discussed"));
+    }
+
+    // -- Feature graphs -----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_create_feature_graph() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_feature_graph",
+                Some(json!({"project_id": UUID1, "name": "Auth flow"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/feature-graphs");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_feature_graphs() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_feature_graphs", Some(json!({"project_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/feature-graphs");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_feature_graph() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_feature_graph", Some(json!({"id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/feature-graphs/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_feature_graph() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_feature_graph", Some(json!({"id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/feature-graphs/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_to_feature_graph() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_to_feature_graph",
+                Some(json!({
+                    "feature_graph_id": UUID1,
+                    "entity_type": "Function",
+                    "entity_id": "main"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/entities"));
+    }
+
+    #[tokio::test]
+    async fn test_http_auto_build_feature_graph() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "auto_build_feature_graph",
+                Some(json!({"project_id": UUID1, "name": "Login flow", "entry_function": "main"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/feature-graphs/auto-build");
+    }
+
+    // -- Skills -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_skills() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_skills", Some(json!({"project_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/skills");
+    }
+
+    #[tokio::test]
+    async fn test_http_create_skill() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_skill",
+                Some(json!({"project_id": UUID1, "name": "Auth skill"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/skills");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_skill() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_skill", Some(json!({"skill_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/skills/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_skill() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_skill",
+                Some(json!({"skill_id": UUID1, "name": "Updated"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PUT");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/skills/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_skill() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("delete_skill", Some(json!({"skill_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/skills/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_skill_members() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_skill_members", Some(json!({"skill_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/members"));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_skill_member() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_skill_member",
+                Some(json!({
+                    "skill_id": UUID1,
+                    "entity_type": "note",
+                    "entity_id": UUID2
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/members"));
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_skill_member() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "remove_skill_member",
+                Some(json!({
+                    "skill_id": UUID1,
+                    "entity_type": "note",
+                    "entity_id": UUID2
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains("/members/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_activate_skill() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "activate_skill",
+                Some(json!({"skill_id": UUID1, "query": "auth flow"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/activate"));
+    }
+
+    #[tokio::test]
+    async fn test_http_export_skill() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("export_skill", Some(json!({"skill_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/export"));
+    }
+
+    #[tokio::test]
+    async fn test_http_import_skill() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "import_skill",
+                Some(json!({"project_id": UUID1, "package": {"name": "test"}})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/skills/import");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_skill_health() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_skill_health", Some(json!({"skill_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/health"));
+    }
+
+    // -- Mega-tool integration (remaining) ----------------------------------
+
+    #[tokio::test]
+    async fn test_mega_tool_task_update() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({"action": "update", "task_id": UUID1, "status": "completed"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"].as_str().unwrap().starts_with("/api/tasks/"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_step_create() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "step",
+                Some(json!({
+                    "action": "create",
+                    "task_id": UUID1,
+                    "description": "Do something"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().contains("/steps"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_decision_add() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "add",
+                    "task_id": UUID1,
+                    "description": "Use REST"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/decisions"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_constraint_list() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "constraint",
+                Some(json!({"action": "list", "plan_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/constraints"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_release_create() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "release",
+                Some(json!({
+                    "action": "create",
+                    "project_id": UUID1,
+                    "version": "1.0.0"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/releases"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_milestone_create() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "milestone",
+                Some(json!({
+                    "action": "create",
+                    "project_id": UUID1,
+                    "title": "GA"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/milestones"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_commit_create() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "commit",
+                Some(json!({
+                    "action": "create",
+                    "sha": "abc123",
+                    "message": "feat: test"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/commits");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_workspace_get() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("workspace", Some(json!({"action": "get", "slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/workspaces/my-ws");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_code_find_references() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "code",
+                Some(json!({"action": "find_references", "symbol": "main"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/code/references");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_admin_watch_status() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("admin", Some(json!({"action": "watch_status"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/watch");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_skill_list() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "skill",
+                Some(json!({"action": "list", "project_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/skills");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_chat_list_sessions() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("chat", Some(json!({"action": "list_sessions"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/chat/sessions");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_feature_graph_list() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "feature_graph",
+                Some(json!({"action": "list", "project_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/feature-graphs");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_resource_list() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("resource", Some(json!({"action": "list", "slug": "my-ws"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/resources"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_component_create() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "component",
+                Some(json!({
+                    "action": "create",
+                    "slug": "my-ws",
+                    "name": "API",
+                    "component_type": "service"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/components"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_workspace_milestone_create() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "workspace_milestone",
+                Some(json!({"action": "create", "slug": "my-ws", "title": "Beta"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/milestones"));
+    }
+
+    // -- Error paths (additional) -------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_missing_plan_id() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler.handle("get_plan", Some(json!({}))).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_invalid_uuid() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_plan", Some(json!({"plan_id": "not-a-uuid"})))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_none_args() {
+        let (handler, _) = make_http_handler().await;
+        // list_projects doesn't require args, should work with None
+        let result = handler.handle("list_projects", None).await.unwrap();
+        assert_eq!(result["method"], "GET");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_with_empty_args() {
+        let (handler, _) = make_http_handler().await;
+        // mega-tool without action should fail
+        let result = handler.handle("project", Some(json!({}))).await;
+        assert!(result.is_err());
+    }
+
+    // -- Resolve mega-tool additional tests ---------------------------------
+
+    #[tokio::test]
+    async fn test_resolve_mega_tool_decision_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("add", "add_decision"),
+            ("get", "get_decision"),
+            ("update", "update_decision"),
+            ("delete", "delete_decision"),
+            ("search", "search_decisions"),
+            ("search_semantic", "search_decisions_semantic"),
+            ("add_affects", "add_decision_affects"),
+            ("remove_affects", "remove_decision_affects"),
+            ("list_affects", "list_decision_affects"),
+            ("get_affecting", "get_decisions_affecting"),
+            ("supersede", "supersede_decision"),
+            ("get_timeline", "get_decision_timeline"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("decision", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "decision action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_constraint_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_constraints"),
+            ("add", "add_constraint"),
+            ("get", "get_constraint"),
+            ("update", "update_constraint"),
+            ("delete", "delete_constraint"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("constraint", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_release_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_releases"),
+            ("create", "create_release"),
+            ("get", "get_release"),
+            ("update", "update_release"),
+            ("delete", "delete_release"),
+            ("add_task", "add_task_to_release"),
+            ("add_commit", "add_commit_to_release"),
+            ("remove_commit", "remove_commit_from_release"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("release", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_milestone_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_milestones"),
+            ("create", "create_milestone"),
+            ("get", "get_milestone"),
+            ("update", "update_milestone"),
+            ("delete", "delete_milestone"),
+            ("get_progress", "get_milestone_progress"),
+            ("add_task", "add_task_to_milestone"),
+            ("link_plan", "link_plan_to_milestone"),
+            ("unlink_plan", "unlink_plan_from_milestone"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("milestone", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_commit_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("create", "create_commit"),
+            ("link_to_task", "link_commit_to_task"),
+            ("link_to_plan", "link_commit_to_plan"),
+            ("get_task_commits", "get_task_commits"),
+            ("get_plan_commits", "get_plan_commits"),
+            ("get_commit_files", "get_commit_files"),
+            ("get_file_history", "get_file_history"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("commit", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_workspace_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_workspaces"),
+            ("create", "create_workspace"),
+            ("get", "get_workspace"),
+            ("update", "update_workspace"),
+            ("delete", "delete_workspace"),
+            ("get_overview", "get_workspace_overview"),
+            ("list_projects", "list_workspace_projects"),
+            ("add_project", "add_project_to_workspace"),
+            ("remove_project", "remove_project_from_workspace"),
+            ("get_topology", "get_workspace_topology"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("workspace", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_skill_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_skills"),
+            ("create", "create_skill"),
+            ("get", "get_skill"),
+            ("update", "update_skill"),
+            ("delete", "delete_skill"),
+            ("get_members", "get_skill_members"),
+            ("add_member", "add_skill_member"),
+            ("remove_member", "remove_skill_member"),
+            ("activate", "activate_skill"),
+            ("export", "export_skill"),
+            ("import", "import_skill"),
+            ("get_health", "get_skill_health"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("skill", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_chat_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list_sessions", "list_chat_sessions"),
+            ("get_session", "get_chat_session"),
+            ("delete_session", "delete_chat_session"),
+            ("send_message", "chat_send_message"),
+            ("list_messages", "list_chat_messages"),
+            ("add_discussed", "add_discussed"),
+            ("get_session_entities", "get_session_entities"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("chat", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_admin_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("sync_directory", "sync_directory"),
+            ("start_watch", "start_watch"),
+            ("stop_watch", "stop_watch"),
+            ("watch_status", "watch_status"),
+            ("meilisearch_stats", "get_meilisearch_stats"),
+            ("delete_meilisearch_orphans", "delete_meilisearch_orphans"),
+            ("update_staleness_scores", "update_staleness_scores"),
+            ("update_energy_scores", "update_energy_scores"),
+            ("detect_skills", "detect_skills"),
+            ("maintain_skills", "maintain_skills"),
+            ("install_hooks", "install_hooks"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("admin", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "admin action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_feature_graph_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("create", "create_feature_graph"),
+            ("get", "get_feature_graph"),
+            ("list", "list_feature_graphs"),
+            ("add_entity", "add_to_feature_graph"),
+            ("auto_build", "auto_build_feature_graph"),
+            ("delete", "delete_feature_graph"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("feature_graph", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
 }

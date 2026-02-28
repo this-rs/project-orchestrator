@@ -1891,4 +1891,325 @@ mod tests {
         assert_eq!(query.pagination.offset, 10);
         assert_eq!(query.status_filter.status, Some("closed".to_string()));
     }
+
+    // ================================================================
+    // Async CRUD integration tests (mock backends)
+    // ================================================================
+
+    fn auth_post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn auth_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_list_workspaces_empty() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/workspaces")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_workspace() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/workspaces",
+                serde_json::json!({
+                    "name": "Test Workspace",
+                    "description": "A test workspace"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "Test Workspace");
+        assert!(!json["slug"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_workspace() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        let slug = ws.slug.clone();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/workspaces/{}", slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["slug"], slug);
+    }
+
+    #[tokio::test]
+    async fn test_get_workspace_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/workspaces/nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_workspace() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        let slug = ws.slug.clone();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_delete(&format!("/api/workspaces/{}", slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_get_workspace_overview() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        let slug = ws.slug.clone();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/workspaces/{}/overview", slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_empty() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        let slug = ws.slug.clone();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/workspaces/{}/resources", slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_components_empty() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        let slug = ws.slug.clone();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/workspaces/{}/components", slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_workspace_topology() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        let slug = ws.slug.clone();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/workspaces/{}/topology", slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_milestones_empty() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        let slug = ws.slug.clone();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/workspaces/{}/milestones", slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 0);
+    }
 }
