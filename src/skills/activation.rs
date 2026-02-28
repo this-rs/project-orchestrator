@@ -1286,11 +1286,11 @@ pub async fn auto_anchor_note(
 /// `auto_anchor_notes`. It loads the project's `root_path` and all project notes,
 /// then runs `auto_anchor_note` on each with path resolution.
 ///
-/// Returns `(notes_processed, anchors_created)`.
+/// Returns `AutoAnchorResult` with debug info for diagnostics.
 pub async fn auto_anchor_notes_for_project(
     graph_store: &dyn GraphStore,
     project_id: Uuid,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<AutoAnchorResult> {
     use crate::notes::models::NoteFilters;
 
     // Resolve project root_path for absolute file path matching.
@@ -1311,8 +1311,25 @@ pub async fn auto_anchor_notes_for_project(
 
     let notes_count = notes.len();
     let mut total_anchors = 0;
+    let mut sample_paths: Vec<String> = Vec::new();
 
     for note in &notes {
+        // Collect sample resolved paths for diagnostics (first 5)
+        if sample_paths.len() < 5 {
+            let extracted = extract_file_paths_from_content(&note.content);
+            for path in &extracted {
+                let resolved = if let Some(ref root) = root_path {
+                    let root = root.trim_end_matches('/');
+                    format!("{}/{}", root, path)
+                } else {
+                    path.clone()
+                };
+                if sample_paths.len() < 5 {
+                    sample_paths.push(resolved);
+                }
+            }
+        }
+
         let anchored = auto_anchor_note(graph_store, note, root_path.as_deref()).await?;
         total_anchors += anchored;
     }
@@ -1325,7 +1342,20 @@ pub async fn auto_anchor_notes_for_project(
         "Auto-anchoring completed"
     );
 
-    Ok((notes_count, total_anchors))
+    Ok(AutoAnchorResult {
+        notes_processed: notes_count,
+        anchors_created: total_anchors,
+        root_path_resolved: root_path,
+        sample_resolved_paths: sample_paths,
+    })
+}
+
+/// Result of batch auto-anchoring with debug info.
+pub struct AutoAnchorResult {
+    pub notes_processed: usize,
+    pub anchors_created: usize,
+    pub root_path_resolved: Option<String>,
+    pub sample_resolved_paths: Vec<String>,
 }
 
 // ============================================================================

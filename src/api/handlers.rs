@@ -2113,20 +2113,21 @@ pub async fn auto_anchor_notes(
 
     let start = std::time::Instant::now();
 
-    let (notes_processed, anchors_created) =
-        crate::skills::activation::auto_anchor_notes_for_project(
-            state.orchestrator.neo4j(),
-            project_id,
-        )
-        .await
-        .map_err(AppError::Internal)?;
+    let result = crate::skills::activation::auto_anchor_notes_for_project(
+        state.orchestrator.neo4j(),
+        project_id,
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(Json(serde_json::json!({
-        "notes_processed": notes_processed,
-        "anchors_created": anchors_created,
+        "notes_processed": result.notes_processed,
+        "anchors_created": result.anchors_created,
         "elapsed_ms": elapsed_ms,
+        "root_path_resolved": result.root_path_resolved,
+        "sample_resolved_paths": result.sample_resolved_paths,
     })))
 }
 
