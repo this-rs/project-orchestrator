@@ -1263,6 +1263,19 @@ pub async fn get_feature_graph(
             })
         })
         .collect();
+    let relations: Vec<serde_json::Value> = detail
+        .relations
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "source_type": r.source_type,
+                "source_id": r.source_id,
+                "target_type": r.target_type,
+                "target_id": r.target_id,
+                "relation_type": r.relation_type,
+            })
+        })
+        .collect();
     Ok(Json(serde_json::json!({
         "id": detail.graph.id.to_string(),
         "name": detail.graph.name,
@@ -1270,6 +1283,7 @@ pub async fn get_feature_graph(
         "project_id": detail.graph.project_id.to_string(),
         "entities": entities,
         "entity_count": entities.len(),
+        "relations": relations,
     })))
 }
 
@@ -1347,6 +1361,19 @@ pub async fn auto_build_feature_graph(
             })
         })
         .collect();
+    let relations: Vec<serde_json::Value> = detail
+        .relations
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "source_type": r.source_type,
+                "source_id": r.source_id,
+                "target_type": r.target_type,
+                "target_id": r.target_id,
+                "relation_type": r.relation_type,
+            })
+        })
+        .collect();
     Ok(Json(serde_json::json!({
         "id": detail.graph.id.to_string(),
         "name": detail.graph.name,
@@ -1354,6 +1381,7 @@ pub async fn auto_build_feature_graph(
         "project_id": detail.graph.project_id.to_string(),
         "entities": entities,
         "entity_count": entities.len(),
+        "relations": relations,
     })))
 }
 

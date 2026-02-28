@@ -104,9 +104,36 @@ impl Neo4jClient {
             })
             .collect();
 
+        // Fetch intra-graph relations (CALLS, IMPORTS, EXTENDS, IMPLEMENTS etc.)
+        let rel_q = query(
+            "MATCH (fg:FeatureGraph {id: $id})-[:INCLUDES_ENTITY]->(a)
+             MATCH (fg)-[:INCLUDES_ENTITY]->(b)
+             WHERE a <> b
+             MATCH (a)-[r:CALLS|IMPORTS|EXTENDS|IMPLEMENTS|IMPLEMENTS_TRAIT|IMPLEMENTS_FOR]->(b)
+             RETURN labels(a)[0] AS source_type,
+                    COALESCE(a.path, a.name, a.id) AS source_id,
+                    labels(b)[0] AS target_type,
+                    COALESCE(b.path, b.name, b.id) AS target_id,
+                    type(r) AS relation_type",
+        )
+        .param("id", id.to_string());
+
+        let rel_rows = self.execute_with_params(rel_q).await?;
+        let relations = rel_rows
+            .iter()
+            .map(|row| FeatureGraphRelation {
+                source_type: row.get::<String>("source_type").unwrap_or_default(),
+                source_id: row.get::<String>("source_id").unwrap_or_default(),
+                target_type: row.get::<String>("target_type").unwrap_or_default(),
+                target_id: row.get::<String>("target_id").unwrap_or_default(),
+                relation_type: row.get::<String>("relation_type").unwrap_or_default(),
+            })
+            .collect();
+
         Ok(Some(FeatureGraphDetail {
             graph: fg,
             entities,
+            relations,
         }))
     }
 
@@ -857,9 +884,11 @@ impl Neo4jClient {
             });
         }
 
+        // Relations will be populated when fetching via get_feature_graph_detail
         Ok(FeatureGraphDetail {
             graph: fg,
             entities,
+            relations: vec![],
         })
     }
 
