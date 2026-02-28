@@ -878,6 +878,119 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                             );
                         }
                     });
+
+                    // Spawn background skill warm-up (non-blocking)
+                    // For each project: if no skills exist → run detect_skills_pipeline
+                    // (which includes auto-anchor prelude). If skills are stale (>24h),
+                    // refresh them. Both instances (8080/6600) may run this concurrently
+                    // — all operations are idempotent (MERGE-based).
+                    let orch_skills = orchestrator.clone();
+                    let skill_project_ids: Vec<_> = projects
+                        .iter()
+                        .filter(|p| {
+                            let expanded = expand_tilde(&p.root_path);
+                            std::path::Path::new(&expanded).exists()
+                        })
+                        .map(|p| (p.id, p.slug.clone()))
+                        .collect();
+                    tokio::spawn(async move {
+                        use crate::skills::detection::{
+                            detect_skills_pipeline, SkillDetectionConfig,
+                        };
+
+                        let config = SkillDetectionConfig::default();
+                        let mut bootstrapped = 0usize;
+                        let mut refreshed = 0usize;
+                        let mut skipped = 0usize;
+                        let stale_threshold =
+                            chrono::Utc::now() - chrono::Duration::hours(24);
+
+                        for (pid, slug) in &skill_project_ids {
+                            let needs_run = match orch_skills
+                                .neo4j()
+                                .get_skills_for_project(*pid)
+                                .await
+                            {
+                                Ok(skills) if skills.is_empty() => {
+                                    tracing::debug!(
+                                        "Skill warm-up: '{}' has no skills, bootstrapping...",
+                                        slug
+                                    );
+                                    Some(true) // bootstrap
+                                }
+                                Ok(skills) => {
+                                    // Check if any skill is stale (updated_at > 24h ago)
+                                    let oldest = skills
+                                        .iter()
+                                        .map(|s| s.updated_at)
+                                        .min()
+                                        .unwrap_or(chrono::Utc::now());
+                                    if oldest < stale_threshold {
+                                        tracing::debug!(
+                                            "Skill warm-up: '{}' has stale skills, refreshing...",
+                                            slug
+                                        );
+                                        Some(false) // refresh
+                                    } else {
+                                        None // fresh, skip
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Skill warm-up: failed to check skills for '{}': {}",
+                                        slug,
+                                        e
+                                    );
+                                    None
+                                }
+                            };
+
+                            if let Some(is_bootstrap) = needs_run {
+                                match detect_skills_pipeline(
+                                    orch_skills.neo4j(),
+                                    *pid,
+                                    &config,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        tracing::info!(
+                                            "Skill warm-up: '{}' — status={:?}, anchors={}, skills_created={}",
+                                            slug,
+                                            result.status,
+                                            result.anchors_created,
+                                            result.skills_created,
+                                        );
+                                        if is_bootstrap {
+                                            bootstrapped += 1;
+                                        } else {
+                                            refreshed += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Skill warm-up: pipeline failed for '{}': {}",
+                                            slug,
+                                            e
+                                        );
+                                        skipped += 1;
+                                    }
+                                }
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+
+                        if bootstrapped > 0 || refreshed > 0 {
+                            tracing::info!(
+                                "Skill warm-up: bootstrapped {}, refreshed {}, skipped {} / {} projects",
+                                bootstrapped,
+                                refreshed,
+                                skipped,
+                                skill_project_ids.len()
+                            );
+                        }
+                    });
                 }
             }
             Err(e) => {
