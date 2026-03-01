@@ -671,6 +671,81 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Batch-update structural DNA vectors on File nodes.
+    ///
+    /// Uses UNWIND in chunks of 1000 to write `structural_dna` as a list of floats.
+    /// DNA = K-dimensional distance vector to PageRank anchor nodes, normalized [0,1].
+    pub async fn batch_update_structural_dna(
+        &self,
+        updates: &[crate::graph::models::StructuralDnaUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        const CHUNK_SIZE: usize = 1000;
+
+        for chunk in updates.chunks(CHUNK_SIZE) {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
+                .iter()
+                .map(|u| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("path".into(), u.path.clone().into());
+                    // Convert Vec<f64> to BoltType list
+                    let dna_list: Vec<neo4rs::BoltType> =
+                        u.dna.iter().map(|&v| v.into()).collect();
+                    m.insert("dna".into(), neo4rs::BoltType::List(neo4rs::BoltList::from(dna_list)));
+                    m
+                })
+                .collect();
+
+            let q = query(
+                r#"
+                UNWIND $items AS u
+                MATCH (f:File {path: u.path})
+                SET f.structural_dna = u.dna,
+                    f.structural_dna_updated_at = datetime()
+                "#,
+            )
+            .param("items", items);
+
+            self.graph.run(q).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Read structural DNA vectors for all File nodes in a project.
+    ///
+    /// Returns (file_path, dna_vector) pairs for files that have DNA computed.
+    pub async fn get_project_structural_dna(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Vec<f64>)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.structural_dna IS NOT NULL
+            RETURN f.path AS path, f.structural_dna AS dna
+            "#,
+        )
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut dna_list = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(path), Ok(dna)) = (
+                row.get::<String>("path"),
+                row.get::<Vec<f64>>("dna"),
+            ) {
+                dna_list.push((path, dna));
+            }
+        }
+
+        Ok(dna_list)
+    }
+
     /// Get SYNAPSE edges bridged from Note-level to File-level for the GDS graph.
     ///
     /// Bridges the neural SYNAPSE connections between Notes to the Files they are

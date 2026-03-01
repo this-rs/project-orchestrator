@@ -475,6 +475,36 @@ pub struct FabricFileAnalyticsUpdate {
     pub fabric_clustering_coefficient: f64,
 }
 
+/// Batch update payload for structural DNA persistence.
+///
+/// Each entry maps a node path to its DNA vector (K-dimensional distance vector
+/// to anchor nodes, normalized [0,1]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralDnaUpdate {
+    /// File path (matches the `path` property on File nodes)
+    pub path: String,
+    /// Structural DNA vector — distances to K anchor nodes, normalized [0,1]
+    pub dna: Vec<f64>,
+}
+
+/// Result of K-means clustering on structural DNA vectors.
+///
+/// Each cluster represents a group of structurally similar files that play
+/// a similar architectural role (e.g., handlers, models, utilities).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnaCluster {
+    /// Cluster index (0-based)
+    pub id: usize,
+    /// Centroid vector (average DNA of all members)
+    pub centroid: Vec<f64>,
+    /// File paths in this cluster
+    pub members: Vec<String>,
+    /// Auto-inferred label based on dominant file patterns
+    pub label: String,
+    /// Intra-cluster cohesion: average cosine similarity between members
+    pub cohesion: f64,
+}
+
 // ============================================================================
 // Fabric layer weights — configurable per-relation weights for multi-layer graph
 // ============================================================================

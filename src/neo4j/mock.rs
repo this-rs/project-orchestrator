@@ -6740,6 +6740,22 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn batch_update_structural_dna(
+        &self,
+        _updates: &[crate::graph::models::StructuralDnaUpdate],
+    ) -> anyhow::Result<()> {
+        // Mock: structural DNA not stored separately in tests
+        Ok(())
+    }
+
+    async fn get_project_structural_dna(
+        &self,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
+        // Mock: no structural DNA in tests by default
+        Ok(vec![])
+    }
+
     async fn get_project_synapse_edges(
         &self,
         _project_id: Uuid,

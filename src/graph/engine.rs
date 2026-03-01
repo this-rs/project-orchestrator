@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::algorithms::compute_all;
+use super::algorithms::{compute_all, structural_dna};
 use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
@@ -159,8 +159,39 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             );
         }
 
-        // 3. Persist
+        // 3. Persist base analytics
         self.writer.write_analytics(&analytics, &graph).await?;
+
+        // 4. Compute and persist Structural DNA (depends on PageRank scores)
+        let pr_scores: std::collections::HashMap<String, f64> = analytics
+            .metrics
+            .iter()
+            .map(|(id, m)| (id.clone(), m.pagerank))
+            .collect();
+
+        match structural_dna(&graph, &pr_scores, 10) {
+            Ok(dna_map) if !dna_map.is_empty() => {
+                if let Err(e) = self.writer.write_structural_dna(&dna_map, &graph).await {
+                    tracing::warn!(
+                        "Failed to persist structural DNA for project {}: {}",
+                        project_id,
+                        e
+                    );
+                } else {
+                    tracing::debug!(
+                        project_id = %project_id,
+                        dna_count = dna_map.len(),
+                        "Structural DNA computed and persisted"
+                    );
+                }
+            }
+            Ok(_) => {
+                tracing::debug!("Structural DNA: empty graph, skipping");
+            }
+            Err(e) => {
+                tracing::warn!("Structural DNA computation failed: {}", e);
+            }
+        }
 
         Ok(analytics)
     }

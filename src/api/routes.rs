@@ -604,6 +604,25 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(code_handlers::check_file_topology),
         )
         // ================================================================
+        // Structural DNA
+        // ================================================================
+        .route(
+            "/api/code/structural-profile",
+            post(code_handlers::get_structural_profile),
+        )
+        .route(
+            "/api/code/structural-twins",
+            post(code_handlers::find_structural_twins),
+        )
+        .route(
+            "/api/code/structural-clusters",
+            post(code_handlers::cluster_dna),
+        )
+        .route(
+            "/api/code/structural-twins/cross-project",
+            post(code_handlers::find_cross_project_twins),
+        )
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(

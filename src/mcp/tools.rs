@@ -240,6 +240,10 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "get_hotspots" => Some(("code", "get_hotspots")),
         "get_knowledge_gaps" => Some(("code", "get_knowledge_gaps")),
         "get_risk_assessment" => Some(("code", "get_risk_assessment")),
+        "get_structural_profile" => Some(("code", "get_structural_profile")),
+        "find_structural_twins" => Some(("code", "find_structural_twins")),
+        "cluster_dna" => Some(("code", "cluster_dna")),
+        "find_cross_project_twins" => Some(("code", "find_cross_project_twins")),
 
         // Skill
         "list_skills" => Some(("skill", "list")),
@@ -758,7 +762,7 @@ fn code_tool() -> ToolDefinition {
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment"],
+                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins"],
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
@@ -783,6 +787,9 @@ fn code_tool() -> ToolDefinition {
                 "auto_create_plan": {"type": "boolean", "description": "Auto-create plan (plan_implementation)"},
                 "path_prefix": {"type": "string", "description": "Path prefix filter (search)"},
                 "min_size": {"type": "integer", "description": "Min community size (get_communities)"},
+                "top_n": {"type": "integer", "description": "Max twins to return (find_structural_twins/find_cross_project_twins, default 10)"},
+                "n_clusters": {"type": "integer", "description": "Number of clusters for K-means (cluster_dna, default 5)"},
+                "source_project_slug": {"type": "string", "description": "Source project slug (find_cross_project_twins)"},
                 "limit": {"type": "integer", "description": "Max results / depth (search/get_call_graph)"}
             })),
             required: Some(vec!["action".to_string()]),
@@ -1105,6 +1112,10 @@ mod tests {
             "get_hotspots",
             "get_knowledge_gaps",
             "get_risk_assessment",
+            "get_structural_profile",
+            "find_structural_twins",
+            "cluster_dna",
+            "find_cross_project_twins",
         ];
 
         for name in &old_names {

@@ -1200,6 +1200,295 @@ pub fn find_structural_twins(
 }
 
 // ============================================================================
+// Structural DNA — K-means Clustering
+// ============================================================================
+
+/// K-means clustering on structural DNA vectors.
+///
+/// Groups files by structural similarity into `n_clusters` clusters.
+/// Each cluster represents an architectural role (e.g., handlers, models, utils).
+///
+/// Algorithm:
+/// 1. Initialize centroids via K-means++ (spread-out initial seeds)
+/// 2. Iterate assignment + update steps until convergence (max 100 iterations)
+/// 3. Auto-label each cluster based on dominant file name patterns
+///
+/// Returns empty vec if dna_map has fewer entries than n_clusters.
+pub fn cluster_dna_vectors(
+    dna_map: &HashMap<String, Vec<f64>>,
+    n_clusters: usize,
+) -> Vec<super::models::DnaCluster> {
+    if dna_map.is_empty() || n_clusters == 0 || dna_map.len() < n_clusters {
+        return vec![];
+    }
+
+    let paths: Vec<&String> = dna_map.keys().collect();
+    let vectors: Vec<&Vec<f64>> = paths.iter().map(|p| &dna_map[*p]).collect();
+    let n = vectors.len();
+    let dim = vectors[0].len();
+
+    if dim == 0 {
+        return vec![];
+    }
+
+    // --- K-means++ initialization ---
+    let mut centroids: Vec<Vec<f64>> = Vec::with_capacity(n_clusters);
+
+    // First centroid: pick the first vector (deterministic for reproducibility)
+    centroids.push(vectors[0].clone());
+
+    for _ in 1..n_clusters {
+        // For each point, compute min squared distance to nearest centroid
+        let mut distances: Vec<f64> = vectors
+            .iter()
+            .map(|v| {
+                centroids
+                    .iter()
+                    .map(|c| squared_euclidean(v, c))
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .collect();
+
+        // Pick the point with max distance (deterministic K-means++)
+        let max_idx = distances
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        centroids.push(vectors[max_idx].clone());
+        // Zero out to avoid picking same point
+        distances[max_idx] = 0.0;
+    }
+
+    // --- K-means iterations ---
+    let mut assignments = vec![0usize; n];
+    let max_iter = 100;
+
+    for _ in 0..max_iter {
+        let mut changed = false;
+
+        // Assignment step: assign each vector to nearest centroid
+        for (i, v) in vectors.iter().enumerate() {
+            let nearest = centroids
+                .iter()
+                .enumerate()
+                .map(|(ci, c)| (ci, squared_euclidean(v, c)))
+                .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(ci, _)| ci)
+                .unwrap_or(0);
+
+            if assignments[i] != nearest {
+                assignments[i] = nearest;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        // Update step: recompute centroids as mean of assigned vectors
+        let mut new_centroids = vec![vec![0.0; dim]; n_clusters];
+        let mut counts = vec![0usize; n_clusters];
+
+        for (i, v) in vectors.iter().enumerate() {
+            let ci = assignments[i];
+            counts[ci] += 1;
+            for (d, val) in v.iter().enumerate() {
+                new_centroids[ci][d] += val;
+            }
+        }
+
+        for ci in 0..n_clusters {
+            if counts[ci] > 0 {
+                for d in 0..dim {
+                    new_centroids[ci][d] /= counts[ci] as f64;
+                }
+            }
+        }
+
+        centroids = new_centroids;
+    }
+
+    // --- Build clusters ---
+    let mut clusters: Vec<super::models::DnaCluster> = Vec::with_capacity(n_clusters);
+
+    for ci in 0..n_clusters {
+        let member_indices: Vec<usize> = assignments
+            .iter()
+            .enumerate()
+            .filter(|(_, &a)| a == ci)
+            .map(|(i, _)| i)
+            .collect();
+
+        if member_indices.is_empty() {
+            continue; // Skip empty clusters
+        }
+
+        let members: Vec<String> = member_indices
+            .iter()
+            .map(|&i| paths[i].clone())
+            .collect();
+
+        // Compute intra-cluster cohesion (average pairwise cosine similarity)
+        let cohesion = if members.len() <= 1 {
+            1.0
+        } else {
+            let mut sum = 0.0;
+            let mut count = 0;
+            for i in 0..member_indices.len() {
+                for j in (i + 1)..member_indices.len() {
+                    sum += cosine_similarity(vectors[member_indices[i]], vectors[member_indices[j]]);
+                    count += 1;
+                }
+            }
+            if count > 0 { sum / count as f64 } else { 1.0 }
+        };
+
+        let label = infer_cluster_label(&members);
+
+        clusters.push(super::models::DnaCluster {
+            id: ci,
+            centroid: centroids[ci].clone(),
+            members,
+            label,
+            cohesion,
+        });
+    }
+
+    // Sort by cluster size descending
+    clusters.sort_by(|a, b| b.members.len().cmp(&a.members.len()));
+
+    clusters
+}
+
+/// Squared Euclidean distance between two vectors.
+fn squared_euclidean(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum()
+}
+
+/// Infer a human-readable label for a cluster based on dominant file name patterns.
+///
+/// Looks for common suffixes/patterns like `handler`, `model`, `service`, `test`, etc.
+fn infer_cluster_label(paths: &[String]) -> String {
+    let patterns: &[(&str, &str)] = &[
+        ("handler", "Handlers"),
+        ("controller", "Controllers"),
+        ("route", "Routes"),
+        ("model", "Models"),
+        ("schema", "Schemas"),
+        ("service", "Services"),
+        ("repository", "Repositories"),
+        ("store", "Stores"),
+        ("client", "Clients"),
+        ("test", "Tests"),
+        ("spec", "Tests"),
+        ("mock", "Mocks"),
+        ("util", "Utilities"),
+        ("helper", "Helpers"),
+        ("config", "Configuration"),
+        ("middleware", "Middleware"),
+        ("trait", "Traits"),
+        ("interface", "Interfaces"),
+        ("mod.rs", "Modules"),
+        ("index", "Index/Entry"),
+        ("lib", "Library"),
+        ("main", "Entry Points"),
+        ("error", "Error Handling"),
+        ("types", "Types"),
+        ("api", "API"),
+    ];
+
+    // Count matches for each pattern
+    let mut scores: Vec<(&str, usize)> = patterns
+        .iter()
+        .map(|(pattern, label)| {
+            let count = paths
+                .iter()
+                .filter(|p| {
+                    let lower = p.to_lowercase();
+                    let filename = lower.rsplit('/').next().unwrap_or(&lower);
+                    filename.contains(pattern)
+                })
+                .count();
+            (*label, count)
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+
+    scores.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if let Some((label, count)) = scores.first() {
+        if *count * 3 >= paths.len() {
+            // At least 1/3 of files match this pattern → use it
+            return label.to_string();
+        }
+    }
+
+    // Fallback: try to find common directory prefix
+    if let Some(common_dir) = find_common_directory(paths) {
+        return common_dir;
+    }
+
+    format!("Cluster ({})", paths.len())
+}
+
+/// Find the most specific common directory among paths.
+fn find_common_directory(paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+
+    // Extract directory parts from each path
+    let dirs: Vec<Vec<&str>> = paths
+        .iter()
+        .filter_map(|p| {
+            let parts: Vec<&str> = p.split('/').collect();
+            if parts.len() > 1 {
+                Some(parts[..parts.len() - 1].to_vec())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if dirs.is_empty() {
+        return None;
+    }
+
+    // Find longest common prefix
+    let first = &dirs[0];
+    let mut common_len = 0;
+
+    for i in 0..first.len() {
+        if dirs.iter().all(|d| d.len() > i && d[i] == first[i]) {
+            common_len = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Use the deepest common directory component as label
+    if common_len > 0 {
+        let deepest = first[common_len - 1];
+        if !["src", "lib", "app", "pkg"].contains(&deepest) {
+            return Some(deepest.to_string());
+        }
+        // If the deepest is too generic, try one level deeper if possible
+        if common_len >= 2 {
+            return Some(first[common_len - 2..common_len].join("/"));
+        }
+    }
+
+    None
+}
+
+// ============================================================================
 // GraIL algorithms — WL Subgraph Hash (Plan 7)
 // ============================================================================
 
@@ -3166,5 +3455,277 @@ mod tests {
         assert_eq!(compute_bridge_density(0, 0), 0.0);
         assert_eq!(compute_bridge_density(1, 0), 0.0);
         assert_eq!(compute_bridge_density(2, 1), 0.5);
+    }
+
+    // ========================================================================
+    // Structural DNA tests
+    // ========================================================================
+
+    #[test]
+    fn test_cosine_similarity_identical_vectors() {
+        assert!((cosine_similarity(&[1.0, 1.0], &[1.0, 1.0]) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal_vectors() {
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cosine_similarity_zero_vector() {
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_different_lengths() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_empty() {
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn test_structural_dna_empty_graph() {
+        let g = CodeGraph::new();
+        let pr = HashMap::new();
+        let dna = structural_dna(&g, &pr, 5).unwrap();
+        assert!(dna.is_empty());
+    }
+
+    #[test]
+    fn test_structural_dna_chain_graph() {
+        // Chain: node_0 → node_1 → node_2 → node_3 → node_4
+        let g = make_chain_graph(5);
+        let config = AnalyticsConfig::default();
+        let pr = pagerank(&g, &config);
+
+        let dna = structural_dna(&g, &pr, 2).unwrap();
+
+        // All 5 nodes should have DNA
+        assert_eq!(dna.len(), 5);
+
+        // Each DNA vector should have K=2 dimensions
+        for v in dna.values() {
+            assert_eq!(v.len(), 2);
+        }
+
+        // All values should be in [0, 1]
+        for v in dna.values() {
+            for &d in v {
+                assert!(d >= 0.0 && d <= 1.0, "DNA value out of range: {}", d);
+            }
+        }
+    }
+
+    #[test]
+    fn test_structural_dna_symmetric_nodes_similar() {
+        // Complete graph K5: all nodes are structurally equivalent
+        let g = make_complete_graph(5);
+        let config = AnalyticsConfig::default();
+        let pr = pagerank(&g, &config);
+
+        let dna = structural_dna(&g, &pr, 2).unwrap();
+        assert_eq!(dna.len(), 5);
+
+        // In K5, anchor nodes have dist=0 to themselves → DNA like [0,1] or [1,0].
+        // Non-anchor nodes have dist=1 to all anchors → DNA like [1,1].
+        // So non-anchor nodes should be perfectly similar (cosine = 1.0),
+        // while anchor-to-non-anchor similarity is ~0.707 (cos([0,1],[1,1])).
+        // Filter to non-anchor nodes only (those with DNA [1.0, 1.0] normalized)
+        let non_anchor_vecs: Vec<&Vec<f64>> = dna
+            .values()
+            .filter(|v| v.iter().all(|d| *d > 0.0)) // exclude anchors (have a 0.0 dim)
+            .collect();
+
+        assert!(
+            non_anchor_vecs.len() >= 2,
+            "Expected at least 2 non-anchor nodes"
+        );
+        for i in 0..non_anchor_vecs.len() {
+            for j in (i + 1)..non_anchor_vecs.len() {
+                let sim = cosine_similarity(non_anchor_vecs[i], non_anchor_vecs[j]);
+                assert!(
+                    sim > 0.99,
+                    "Expected near-perfect similarity between non-anchor K5 nodes, got {}",
+                    sim
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_structural_dna_two_cliques_distinct() {
+        // Two cliques of size 4 connected by a single bridge
+        let g = make_two_cliques(4);
+        let config = AnalyticsConfig::default();
+        let pr = pagerank(&g, &config);
+
+        let dna = structural_dna(&g, &pr, 3).unwrap();
+        assert_eq!(dna.len(), 8); // 4+4 nodes
+
+        // Nodes within the same clique should be more similar than across cliques
+        let a0 = &dna["a_0"];
+        let a1 = &dna["a_1"];
+        let b2 = &dna["b_2"];
+
+        let intra_sim = cosine_similarity(a0, a1);
+        let inter_sim = cosine_similarity(a0, b2);
+
+        // Intra-clique similarity should be higher than inter-clique
+        assert!(
+            intra_sim > inter_sim,
+            "Expected intra({}) > inter({})",
+            intra_sim,
+            inter_sim
+        );
+    }
+
+    #[test]
+    fn test_structural_dna_no_pagerank_scores() {
+        let g = make_chain_graph(3);
+        let pr = HashMap::new(); // empty PageRank
+        let result = structural_dna(&g, &pr, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_structural_twins_basic() {
+        // Use a chain graph where middle nodes have similar structural positions
+        let g = make_chain_graph(7);
+        let config = AnalyticsConfig::default();
+        let pr = pagerank(&g, &config);
+        let dna = structural_dna(&g, &pr, 2).unwrap();
+
+        // Ask for twins of node_3 (center of chain)
+        let twins = find_structural_twins(&dna, "node_3", 3);
+        assert_eq!(twins.len(), 3);
+
+        // All results should have valid similarity scores in [0, 1]
+        for (_, sim) in &twins {
+            assert!(
+                *sim >= 0.0 && *sim <= 1.0,
+                "Similarity out of range: {}",
+                sim
+            );
+        }
+
+        // Results should be sorted descending by similarity
+        for i in 0..twins.len() - 1 {
+            assert!(twins[i].1 >= twins[i + 1].1);
+        }
+    }
+
+    #[test]
+    fn test_find_structural_twins_nonexistent_target() {
+        let dna: HashMap<String, Vec<f64>> = HashMap::new();
+        let twins = find_structural_twins(&dna, "nonexistent", 5);
+        assert!(twins.is_empty());
+    }
+
+    #[test]
+    fn test_find_structural_twins_top_n_truncation() {
+        let g = make_star_graph(10);
+        let config = AnalyticsConfig::default();
+        let pr = pagerank(&g, &config);
+        let dna = structural_dna(&g, &pr, 2).unwrap();
+
+        let twins = find_structural_twins(&dna, "leaf_0", 3);
+        assert_eq!(twins.len(), 3);
+
+        // Results should be sorted by similarity desc
+        for i in 0..twins.len() - 1 {
+            assert!(twins[i].1 >= twins[i + 1].1);
+        }
+    }
+
+    // ========================================================================
+    // cluster_dna_vectors tests
+    // ========================================================================
+
+    #[test]
+    fn test_cluster_dna_empty() {
+        let dna: HashMap<String, Vec<f64>> = HashMap::new();
+        let clusters = cluster_dna_vectors(&dna, 3);
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_dna_too_few_points() {
+        let mut dna = HashMap::new();
+        dna.insert("a".to_string(), vec![1.0, 0.0]);
+        dna.insert("b".to_string(), vec![0.0, 1.0]);
+        // 2 points but 3 clusters → should return empty
+        let clusters = cluster_dna_vectors(&dna, 3);
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_dna_two_clear_groups() {
+        // Two tight groups with distinct directions (cosine-similar within group)
+        let mut dna = HashMap::new();
+        // Group A: direction ~ (1, 0) — low second dimension
+        dna.insert("src/handlers/auth.rs".to_string(), vec![0.9, 0.1]);
+        dna.insert("src/handlers/user.rs".to_string(), vec![0.95, 0.12]);
+        dna.insert("src/handlers/api.rs".to_string(), vec![0.88, 0.08]);
+        // Group B: direction ~ (0, 1) — low first dimension
+        dna.insert("src/models/user.rs".to_string(), vec![0.1, 0.9]);
+        dna.insert("src/models/schema.rs".to_string(), vec![0.12, 0.95]);
+        dna.insert("src/models/types.rs".to_string(), vec![0.08, 0.88]);
+
+        let clusters = cluster_dna_vectors(&dna, 2);
+        assert_eq!(clusters.len(), 2);
+
+        // Each cluster should have 3 members
+        let sizes: Vec<usize> = clusters.iter().map(|c| c.members.len()).collect();
+        assert!(sizes.contains(&3));
+
+        // Check that handlers are grouped together and models together
+        let handler_cluster = clusters
+            .iter()
+            .find(|c| c.members.iter().any(|m| m.contains("handlers")))
+            .unwrap();
+        assert!(
+            handler_cluster.members.iter().all(|m| m.contains("handlers")),
+            "All handler files should be in the same cluster"
+        );
+
+        // Cohesion should be high within tight clusters
+        for c in &clusters {
+            assert!(c.cohesion > 0.9, "Tight clusters should have high cohesion: {}", c.cohesion);
+        }
+    }
+
+    #[test]
+    fn test_cluster_dna_labels_inferred() {
+        let mut dna = HashMap::new();
+        dna.insert("src/handlers/auth_handler.rs".to_string(), vec![0.0, 0.0]);
+        dna.insert("src/handlers/user_handler.rs".to_string(), vec![0.01, 0.01]);
+        dna.insert("src/models/user.rs".to_string(), vec![1.0, 1.0]);
+        dna.insert("src/models/schema.rs".to_string(), vec![0.99, 0.99]);
+
+        let clusters = cluster_dna_vectors(&dna, 2);
+        assert_eq!(clusters.len(), 2);
+
+        let labels: Vec<&str> = clusters.iter().map(|c| c.label.as_str()).collect();
+        // At least one should have a recognized label (not "Cluster (N)")
+        assert!(
+            labels.iter().any(|l| *l == "Handlers" || *l == "Models"),
+            "At least one cluster should have a recognized label, got: {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn test_cluster_dna_single_cluster() {
+        let mut dna = HashMap::new();
+        dna.insert("a.rs".to_string(), vec![0.5, 0.5]);
+        dna.insert("b.rs".to_string(), vec![0.6, 0.4]);
+        dna.insert("c.rs".to_string(), vec![0.4, 0.6]);
+
+        let clusters = cluster_dna_vectors(&dna, 1);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].members.len(), 3);
     }
 }

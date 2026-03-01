@@ -2207,6 +2207,20 @@ impl GraphStore for Neo4jClient {
         self.batch_update_fabric_file_analytics(updates).await
     }
 
+    async fn batch_update_structural_dna(
+        &self,
+        updates: &[crate::graph::models::StructuralDnaUpdate],
+    ) -> anyhow::Result<()> {
+        self.batch_update_structural_dna(updates).await
+    }
+
+    async fn get_project_structural_dna(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
+        self.get_project_structural_dna(project_id).await
+    }
+
     async fn get_project_synapse_edges(
         &self,
         project_id: Uuid,

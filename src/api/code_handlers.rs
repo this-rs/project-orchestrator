@@ -2856,6 +2856,315 @@ pub async fn check_file_topology(
     })))
 }
 
+// ============================================================================
+// Structural DNA: Profile & Twins
+// ============================================================================
+
+/// Request body for structural DNA endpoints.
+#[derive(Deserialize)]
+pub struct StructuralDnaBody {
+    pub project_slug: String,
+    pub file_path: String,
+    /// Max results for find_structural_twins (default 10)
+    pub top_n: Option<usize>,
+}
+
+/// POST /api/code/structural-profile
+///
+/// Returns the structural DNA vector for a single file within a project.
+/// The DNA is a K-dimensional distance vector from the file node to K anchor
+/// nodes (highest PageRank), normalized to [0,1]. Requires prior analytics run.
+pub async fn get_structural_profile(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<StructuralDnaBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let all_dna = state
+        .orchestrator
+        .neo4j()
+        .get_project_structural_dna(&project.id.to_string())
+        .await?;
+
+    // Find the target file's DNA
+    let target_dna = all_dna
+        .iter()
+        .find(|(path, _)| path == &body.file_path)
+        .map(|(_, dna)| dna.clone());
+
+    match target_dna {
+        Some(dna) => Ok(Json(serde_json::json!({
+            "file_path": body.file_path,
+            "dna": dna,
+            "dimensions": dna.len(),
+            "has_dna": true,
+        }))),
+        None => Ok(Json(serde_json::json!({
+            "file_path": body.file_path,
+            "dna": null,
+            "dimensions": 0,
+            "has_dna": false,
+            "hint": "Run project sync + analytics first to compute structural DNA",
+        }))),
+    }
+}
+
+/// POST /api/code/structural-twins
+///
+/// Finds files structurally similar to a target file using cosine similarity
+/// on their structural DNA vectors. Returns ranked results sorted by
+/// descending similarity.
+pub async fn find_structural_twins(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<StructuralDnaBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::cosine_similarity;
+
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let all_dna = state
+        .orchestrator
+        .neo4j()
+        .get_project_structural_dna(&project.id.to_string())
+        .await?;
+
+    if all_dna.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "file_path": body.file_path,
+            "twins": [],
+            "total": 0,
+            "hint": "No structural DNA found. Run project sync + analytics first.",
+        })));
+    }
+
+    // Build HashMap for find_structural_twins
+    let dna_map: std::collections::HashMap<String, Vec<f64>> =
+        all_dna.into_iter().collect();
+
+    let target_dna = match dna_map.get(&body.file_path) {
+        Some(dna) => dna,
+        None => {
+            return Ok(Json(serde_json::json!({
+                "file_path": body.file_path,
+                "twins": [],
+                "total": 0,
+                "hint": format!("File '{}' has no structural DNA", body.file_path),
+            })));
+        }
+    };
+
+    let top_n = body.top_n.unwrap_or(10);
+
+    // Compute similarities (skip self)
+    let mut twins: Vec<serde_json::Value> = dna_map
+        .iter()
+        .filter(|(path, _)| path.as_str() != body.file_path)
+        .map(|(path, dna)| {
+            let similarity = cosine_similarity(target_dna, dna);
+            serde_json::json!({
+                "file_path": path,
+                "similarity": similarity,
+            })
+        })
+        .collect();
+
+    // Sort by descending similarity
+    twins.sort_by(|a, b| {
+        let sa = a["similarity"].as_f64().unwrap_or(0.0);
+        let sb = b["similarity"].as_f64().unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let total = twins.len();
+    twins.truncate(top_n);
+
+    Ok(Json(serde_json::json!({
+        "file_path": body.file_path,
+        "twins": twins,
+        "total": total,
+        "returned": twins.len(),
+    })))
+}
+
+/// Request body for DNA clustering endpoint.
+#[derive(Deserialize)]
+pub struct ClusterDnaBody {
+    pub project_slug: String,
+    /// Number of clusters (default 5)
+    pub n_clusters: Option<usize>,
+}
+
+/// POST /api/code/structural-clusters
+///
+/// Performs K-means clustering on structural DNA vectors to discover
+/// architectural roles (handlers, models, services, etc.) within a project.
+pub async fn cluster_dna(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<ClusterDnaBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::cluster_dna_vectors;
+
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let all_dna = state
+        .orchestrator
+        .neo4j()
+        .get_project_structural_dna(&project.id.to_string())
+        .await?;
+
+    if all_dna.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "clusters": [],
+            "total_files": 0,
+            "hint": "No structural DNA found. Run project sync + analytics first.",
+        })));
+    }
+
+    let dna_map: std::collections::HashMap<String, Vec<f64>> =
+        all_dna.into_iter().collect();
+
+    let n_clusters = body.n_clusters.unwrap_or(5).min(dna_map.len());
+    let clusters = cluster_dna_vectors(&dna_map, n_clusters);
+
+    let total_files: usize = clusters.iter().map(|c| c.members.len()).sum();
+
+    Ok(Json(serde_json::json!({
+        "clusters": clusters,
+        "total_files": total_files,
+        "n_clusters": clusters.len(),
+    })))
+}
+
+/// Request body for cross-project structural twins.
+#[derive(Deserialize)]
+pub struct CrossProjectTwinsBody {
+    pub workspace_slug: String,
+    pub source_project_slug: String,
+    pub file_path: String,
+    /// Max results (default 10)
+    pub top_n: Option<usize>,
+}
+
+/// POST /api/code/structural-twins/cross-project
+///
+/// Finds structurally similar files across other projects in the same workspace.
+/// Enables knowledge transfer: notes from a twin file in project B can be
+/// suggested for the source file in project A.
+pub async fn find_cross_project_twins(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<CrossProjectTwinsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::cosine_similarity;
+
+    let neo4j = state.orchestrator.neo4j();
+
+    // Resolve workspace
+    let workspace = neo4j
+        .get_workspace_by_slug(&body.workspace_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Workspace '{}' not found", body.workspace_slug))
+        })?;
+
+    // Get all projects in workspace
+    let projects = neo4j.list_workspace_projects(workspace.id).await?;
+
+    // Resolve source project
+    let source_project = neo4j
+        .get_project_by_slug(&body.source_project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.source_project_slug))
+        })?;
+
+    // Get source file DNA
+    let source_dna_all = neo4j
+        .get_project_structural_dna(&source_project.id.to_string())
+        .await?;
+
+    let source_dna_map: std::collections::HashMap<String, Vec<f64>> =
+        source_dna_all.into_iter().collect();
+
+    let source_dna = match source_dna_map.get(&body.file_path) {
+        Some(dna) => dna,
+        None => {
+            return Ok(Json(serde_json::json!({
+                "file_path": body.file_path,
+                "twins": [],
+                "total": 0,
+                "hint": format!("File '{}' has no structural DNA in project '{}'", body.file_path, body.source_project_slug),
+            })));
+        }
+    };
+
+    let top_n = body.top_n.unwrap_or(10);
+    let mut all_twins: Vec<serde_json::Value> = Vec::new();
+
+    // Search DNA in all other projects
+    for project in &projects {
+        if project.id == source_project.id {
+            continue; // Skip source project
+        }
+
+        let other_dna = neo4j
+            .get_project_structural_dna(&project.id.to_string())
+            .await?;
+
+        for (path, dna) in &other_dna {
+            // DNA dimensions must match
+            if dna.len() != source_dna.len() {
+                continue;
+            }
+            let sim = cosine_similarity(source_dna, dna);
+            all_twins.push(serde_json::json!({
+                "file_path": path,
+                "project_slug": project.slug,
+                "project_name": project.name,
+                "similarity": sim,
+            }));
+        }
+    }
+
+    // Sort by descending similarity
+    all_twins.sort_by(|a, b| {
+        let sa = a["similarity"].as_f64().unwrap_or(0.0);
+        let sb = b["similarity"].as_f64().unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let total = all_twins.len();
+    all_twins.truncate(top_n);
+
+    Ok(Json(serde_json::json!({
+        "file_path": body.file_path,
+        "source_project": body.source_project_slug,
+        "twins": all_twins,
+        "total": total,
+        "returned": all_twins.len(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

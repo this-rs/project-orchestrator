@@ -297,6 +297,10 @@ impl ToolHandler {
             ("code", "list_topology_rules") => "list_topology_rules",
             ("code", "delete_topology_rule") => "delete_topology_rule",
             ("code", "check_file_topology") => "check_file_topology",
+            ("code", "get_structural_profile") => "get_structural_profile",
+            ("code", "find_structural_twins") => "find_structural_twins",
+            ("code", "cluster_dna") => "cluster_dna",
+            ("code", "find_cross_project_twins") => "find_cross_project_twins",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -3085,6 +3089,29 @@ impl ToolHandler {
                 body.insert("new_imports".to_string(), json!(new_imports));
                 let result = http
                     .post("/api/code/topology/check-file", &json!(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            // --- Structural DNA (2) ---
+            "get_structural_profile" => {
+                let result = http.post("/api/code/structural-profile", args).await?;
+                Ok(Some(result))
+            }
+
+            "find_structural_twins" => {
+                let result = http.post("/api/code/structural-twins", args).await?;
+                Ok(Some(result))
+            }
+
+            "cluster_dna" => {
+                let result = http.post("/api/code/structural-clusters", args).await?;
+                Ok(Some(result))
+            }
+
+            "find_cross_project_twins" => {
+                let result = http
+                    .post("/api/code/structural-twins/cross-project", args)
                     .await?;
                 Ok(Some(result))
             }
@@ -6365,6 +6392,69 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "GET");
         assert!(result["path"].as_str().unwrap().ends_with("/discussed"));
+    }
+
+    // -- Structural DNA -------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_get_structural_profile() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_structural_profile",
+                Some(json!({"project_slug": "my-project", "file_path": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/code/structural-profile");
+    }
+
+    #[tokio::test]
+    async fn test_http_find_structural_twins() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_structural_twins",
+                Some(json!({"project_slug": "my-project", "file_path": "src/main.rs", "top_n": 5})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/code/structural-twins");
+    }
+
+    #[tokio::test]
+    async fn test_http_cluster_dna() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "cluster_dna",
+                Some(json!({"project_slug": "my-project", "n_clusters": 5})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/code/structural-clusters");
+    }
+
+    #[tokio::test]
+    async fn test_http_find_cross_project_twins() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_cross_project_twins",
+                Some(json!({
+                    "workspace_slug": "main",
+                    "source_project_slug": "my-project",
+                    "file_path": "src/main.rs",
+                    "top_n": 5
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/code/structural-twins/cross-project");
     }
 
     // -- Feature graphs -----------------------------------------------------
