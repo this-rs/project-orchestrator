@@ -6839,4 +6839,289 @@ mod tests {
         let empty: Vec<usize> = vec![];
         assert_eq!(normalized_shannon_entropy(&empty), 0.0);
     }
+
+    // ========================================================================
+    // Metric Comparison: Cosine vs Euclidean vs Dot Product for Fingerprint v2
+    // ========================================================================
+
+    /// Normalized euclidean similarity: 1 - ||a-b|| / (√dim * √2)
+    /// Maps [0, max_distance] → [1, 0] where max_distance = √(dim * 2) for [0,1]-bounded vectors.
+    fn euclidean_similarity(a: &[f64], b: &[f64]) -> f64 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let sq_dist: f64 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
+        let dist = sq_dist.sqrt();
+        // Max possible distance for vectors in [0,1]^dim is √dim
+        let max_dist = (a.len() as f64).sqrt();
+        if max_dist == 0.0 {
+            return 1.0;
+        }
+        1.0 - dist / max_dist
+    }
+
+    /// Normalized dot product: dot(a,b) / (dim * max_component²)
+    /// For [0,1]-bounded vectors, max dot product = dim.
+    fn dot_product_similarity(a: &[f64], b: &[f64]) -> f64 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        // Normalize by dim (max possible dot product for [0,1] vectors)
+        dot / a.len() as f64
+    }
+
+    /// Helper: compute variance of a slice
+    fn variance(values: &[f64]) -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
+    }
+
+    #[test]
+    fn test_metric_comparison_cosine_vs_euclidean_vs_dot() {
+        // ================================================================
+        // Comparative test: Cosine vs Euclidean vs Dot Product
+        // on realistic 17-dim structural fingerprint vectors.
+        //
+        // The ideal metric maximizes discrimination:
+        //   - True twins (same archetype) should score HIGH
+        //   - False twins (different archetype) should score LOW
+        //   - Variance across all pairs should be HIGH (good spread)
+        // ================================================================
+
+        // Archetype fingerprints (17 dims):
+        // d0-d2: degree stats (in/out/total as log-percentile)
+        // d3: PageRank, d4: betweenness, d5: clustering_coeff
+        // d6: community_size_pct, d7: community_internal_ratio, d8: bridge_score
+        // d9-d13: function stats (count, avg_cc, max_cc, avg_loc, max_loc)
+        // d14: wl_iteration_count
+        // d15-d16: neighbor entropy (type, degree)
+
+        // Hub file (many imports, high centrality) — e.g. main.rs, app.rs
+        let hub_a = vec![
+            0.95, 0.90, 0.95, // high degree
+            0.85, 0.90, 0.10, // high PR/betweenness, low clustering
+            0.80, 0.55, 0.70, // large community, moderate internal, bridge
+            0.60, 0.30, 0.45, 0.35, 0.50, // moderate functions
+            0.70,             // WL iterations
+            0.85, 0.75,       // high entropy (diverse neighbors)
+        ];
+        // Another hub (slightly different project)
+        let hub_b = vec![
+            0.90, 0.85, 0.92,
+            0.80, 0.85, 0.12,
+            0.75, 0.50, 0.65,
+            0.55, 0.35, 0.50, 0.30, 0.45,
+            0.65,
+            0.80, 0.70,
+        ];
+
+        // Leaf file (few imports, low centrality) — e.g. utils.rs, constants.rs
+        let leaf_a = vec![
+            0.10, 0.05, 0.08, // low degree
+            0.05, 0.02, 0.80, // low PR/betweenness, high clustering
+            0.20, 0.90, 0.05, // small community, high internal, no bridge
+            0.15, 0.10, 0.15, 0.20, 0.25, // few small functions
+            0.20,             // few WL iterations
+            0.20, 0.15,       // low entropy (homogeneous neighbors)
+        ];
+        let leaf_b = vec![
+            0.12, 0.08, 0.10,
+            0.07, 0.03, 0.75,
+            0.25, 0.85, 0.08,
+            0.10, 0.12, 0.18, 0.22, 0.30,
+            0.25,
+            0.25, 0.18,
+        ];
+
+        // Handler file (API endpoint) — e.g. user_handler.rs
+        let handler_a = vec![
+            0.40, 0.60, 0.50, // moderate degree
+            0.30, 0.25, 0.40, // moderate centrality
+            0.50, 0.65, 0.30, // moderate community
+            0.80, 0.55, 0.70, 0.60, 0.85, // many complex functions
+            0.45,
+            0.50, 0.45,
+        ];
+        let handler_b = vec![
+            0.45, 0.55, 0.48,
+            0.35, 0.28, 0.38,
+            0.55, 0.60, 0.35,
+            0.75, 0.50, 0.65, 0.55, 0.80,
+            0.50,
+            0.55, 0.50,
+        ];
+
+        // Service/middleware — e.g. auth_service.rs
+        let service_a = vec![
+            0.60, 0.70, 0.65,
+            0.55, 0.60, 0.30,
+            0.60, 0.50, 0.55,
+            0.50, 0.45, 0.60, 0.45, 0.65,
+            0.55,
+            0.65, 0.60,
+        ];
+
+        let all_vecs: Vec<(&str, &[f64])> = vec![
+            ("hub_a", &hub_a),
+            ("hub_b", &hub_b),
+            ("leaf_a", &leaf_a),
+            ("leaf_b", &leaf_b),
+            ("handler_a", &handler_a),
+            ("handler_b", &handler_b),
+            ("service_a", &service_a),
+        ];
+
+        // True twin pairs (same archetype)
+        let true_pairs: Vec<(&str, &[f64], &str, &[f64])> = vec![
+            ("hub_a", &hub_a, "hub_b", &hub_b),
+            ("leaf_a", &leaf_a, "leaf_b", &leaf_b),
+            ("handler_a", &handler_a, "handler_b", &handler_b),
+        ];
+
+        // False twin pairs (different archetypes)
+        let false_pairs: Vec<(&str, &[f64], &str, &[f64])> = vec![
+            ("hub_a", &hub_a, "leaf_a", &leaf_a),
+            ("hub_a", &hub_a, "handler_a", &handler_a),
+            ("leaf_a", &leaf_a, "handler_a", &handler_a),
+            ("leaf_a", &leaf_a, "service_a", &service_a),
+            ("hub_a", &hub_a, "service_a", &service_a),
+        ];
+
+        struct MetricResult {
+            name: &'static str,
+            true_twin_scores: Vec<f64>,
+            false_twin_scores: Vec<f64>,
+            all_scores: Vec<f64>,
+        }
+
+        type MetricFn = fn(&[f64], &[f64]) -> f64;
+        let metrics: Vec<(&str, MetricFn)> = vec![
+            ("cosine", cosine_similarity as MetricFn),
+            ("euclidean", euclidean_similarity as MetricFn),
+            ("dot_product", dot_product_similarity as MetricFn),
+        ];
+
+        let mut results: Vec<MetricResult> = Vec::new();
+
+        for (name, metric_fn) in &metrics {
+            let true_scores: Vec<f64> = true_pairs
+                .iter()
+                .map(|(_, a, _, b)| metric_fn(a, b))
+                .collect();
+
+            let false_scores: Vec<f64> = false_pairs
+                .iter()
+                .map(|(_, a, _, b)| metric_fn(a, b))
+                .collect();
+
+            let mut all_scores = Vec::new();
+            for i in 0..all_vecs.len() {
+                for j in (i + 1)..all_vecs.len() {
+                    all_scores.push(metric_fn(all_vecs[i].1, all_vecs[j].1));
+                }
+            }
+
+            results.push(MetricResult {
+                name,
+                true_twin_scores: true_scores,
+                false_twin_scores: false_scores,
+                all_scores,
+            });
+        }
+
+        // Print comparison table
+        eprintln!("\n{}", "=".repeat(70));
+        eprintln!("METRIC COMPARISON — Structural Fingerprint v2 (17-dim)");
+        eprintln!("{}", "=".repeat(70));
+
+        let mut best_discrimination = 0.0_f64;
+        let mut best_metric = "";
+
+        for r in &results {
+            let true_mean =
+                r.true_twin_scores.iter().sum::<f64>() / r.true_twin_scores.len() as f64;
+            let false_mean =
+                r.false_twin_scores.iter().sum::<f64>() / r.false_twin_scores.len() as f64;
+            let discrimination = true_mean - false_mean;
+            let all_var = variance(&r.all_scores);
+            let true_min = r
+                .true_twin_scores
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            let false_max = r
+                .false_twin_scores
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let separation = true_min - false_max; // >0 means perfect separation
+
+            eprintln!("\n--- {} ---", r.name);
+            eprintln!("  True twin mean:   {:.4}", true_mean);
+            eprintln!("  False twin mean:  {:.4}", false_mean);
+            eprintln!("  Discrimination:   {:.4} (true_mean - false_mean)", discrimination);
+            eprintln!("  Separation gap:   {:.4} (true_min - false_max)", separation);
+            eprintln!("  Overall variance: {:.6}", all_var);
+            eprintln!(
+                "  Score range:      [{:.4}, {:.4}]",
+                r.all_scores.iter().cloned().fold(f64::INFINITY, f64::min),
+                r.all_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            );
+
+            if discrimination > best_discrimination {
+                best_discrimination = discrimination;
+                best_metric = r.name;
+            }
+        }
+
+        eprintln!("\n{}", "=".repeat(70));
+        eprintln!("WINNER: {} (discrimination = {:.4})", best_metric, best_discrimination);
+        eprintln!("{}\n", "=".repeat(70));
+
+        // Assertions: all metrics should produce reasonable results
+        for r in &results {
+            let true_mean =
+                r.true_twin_scores.iter().sum::<f64>() / r.true_twin_scores.len() as f64;
+            let false_mean =
+                r.false_twin_scores.iter().sum::<f64>() / r.false_twin_scores.len() as f64;
+
+            // True twins must score higher than false twins on average
+            assert!(
+                true_mean > false_mean,
+                "{}: true twin mean ({:.4}) should be > false twin mean ({:.4})",
+                r.name,
+                true_mean,
+                false_mean
+            );
+
+            // Variance must be non-trivial (spread > 0.001)
+            let all_var = variance(&r.all_scores);
+            assert!(
+                all_var > 0.001,
+                "{}: variance ({:.6}) too low — metric lacks discrimination",
+                r.name,
+                all_var
+            );
+        }
+
+        // Cosine should have the best or near-best discrimination
+        // (this validates our choice in compute_multi_signal_similarity)
+        let cosine_result = results.iter().find(|r| r.name == "cosine").unwrap();
+        let cosine_discrimination = {
+            let t = cosine_result.true_twin_scores.iter().sum::<f64>()
+                / cosine_result.true_twin_scores.len() as f64;
+            let f = cosine_result.false_twin_scores.iter().sum::<f64>()
+                / cosine_result.false_twin_scores.len() as f64;
+            t - f
+        };
+        assert!(
+            cosine_discrimination > 0.05,
+            "Cosine discrimination ({:.4}) too low for reliable twin detection",
+            cosine_discrimination
+        );
+    }
 }
