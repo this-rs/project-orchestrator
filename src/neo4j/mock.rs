@@ -1271,6 +1271,15 @@ impl GraphStore for MockGraphStore {
         Ok(pf.get(&project_id).map(|p| p.len() as i64).unwrap_or(0))
     }
 
+    async fn invalidate_computed_properties(
+        &self,
+        _project_id: Uuid,
+        paths: &[String],
+    ) -> Result<u64> {
+        // Mock: return the number of paths as stale count (simplified)
+        Ok(paths.len() as u64)
+    }
+
     // ========================================================================
     // Symbol operations
     // ========================================================================

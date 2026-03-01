@@ -19,7 +19,7 @@
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::models::{
     AnalyticsConfig, CodeGraph, CodeHealthReport, ComputeAllResult, ComputeMode, CommunityInfo,
@@ -903,10 +903,37 @@ pub fn compute_all_extended(
     graph: &CodeGraph,
     config: &AnalyticsConfig,
     grail: &GrailConfig,
+    stale_node_ids: Option<&HashSet<String>>,
 ) -> ComputeAllResult {
     let wall_start = std::time::Instant::now();
     let mut timings: Vec<StepTiming> = Vec::with_capacity(10);
     let mut grail_stats = GrailStats::default();
+
+    // Determine compute mode: incremental if stale < 30% of total, else full
+    let total_nodes = graph.graph.node_count();
+    let (mode, incremental_targets) = match stale_node_ids {
+        Some(stale) if !stale.is_empty() && total_nodes > 0 => {
+            let stale_ratio = stale.len() as f64 / total_nodes as f64;
+            if stale_ratio < 0.30 {
+                tracing::info!(
+                    stale_count = stale.len(),
+                    total = total_nodes,
+                    ratio = format!("{:.1}%", stale_ratio * 100.0),
+                    "Incremental mode: recalculating only stale nodes + neighborhood"
+                );
+                (ComputeMode::Incremental, Some(stale.clone()))
+            } else {
+                tracing::info!(
+                    stale_count = stale.len(),
+                    total = total_nodes,
+                    ratio = format!("{:.1}%", stale_ratio * 100.0),
+                    "Full recalc: stale ratio >= 30%"
+                );
+                (ComputeMode::Full, None)
+            }
+        }
+        _ => (ComputeMode::Full, None),
+    };
 
     // --- Step 0 (optional): Apply profile weights ---
     let working_graph: CodeGraph;
@@ -948,7 +975,12 @@ pub fn compute_all_extended(
 
     // --- Step 5: Structural DNA (depends on PageRank) ---
     let (dna_result, dna_timing) = timed_step("structural_dna", || {
-        structural_dna(&working_graph, &pagerank_scores, grail.dna_k)
+        let mut dna = structural_dna(&working_graph, &pagerank_scores, grail.dna_k)?;
+        // In incremental mode, only keep stale nodes (caller will merge with existing)
+        if let Some(ref targets) = incremental_targets {
+            dna.retain(|id, _| targets.contains(id));
+        }
+        Ok(dna)
     });
     timings.push(dna_timing);
 
@@ -957,7 +989,12 @@ pub fn compute_all_extended(
 
     // --- Step 6: WL Subgraph Hash ---
     let (wl_result, wl_timing) = timed_step("wl_subgraph_hash", || {
-        wl_subgraph_hash_all(&working_graph, grail.wl_radius, grail.wl_iterations)
+        let mut hashes = wl_subgraph_hash_all(&working_graph, grail.wl_radius, grail.wl_iterations)?;
+        // In incremental mode, only keep stale nodes
+        if let Some(ref targets) = incremental_targets {
+            hashes.retain(|id, _| targets.contains(id));
+        }
+        Ok(hashes)
     });
     timings.push(wl_timing);
 
@@ -1012,7 +1049,7 @@ pub fn compute_all_extended(
         grail_stats,
         structural_dna: structural_dna_map,
         wl_hashes,
-        mode: ComputeMode::Full,
+        mode,
         total_ms,
     }
 }

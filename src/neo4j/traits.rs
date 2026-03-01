@@ -335,6 +335,19 @@ pub trait GraphStore: Send + Sync {
     /// Count files for a project (lightweight, no data transfer)
     async fn count_project_files(&self, project_id: Uuid) -> Result<i64>;
 
+    /// Invalidate pre-computed GraIL properties on changed files and their neighbors.
+    ///
+    /// Sets `*_version = -1` on:
+    /// - Direct files: `cc_version`, `structural_dna_version`, `wl_hash_version`
+    /// - 1-2 hop neighbors: `cc_version` (1-hop), `wl_hash_version` (2-hop)
+    ///
+    /// Returns the total number of File nodes marked as stale.
+    async fn invalidate_computed_properties(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> Result<u64>;
+
     // ========================================================================
     // Symbol operations
     // ========================================================================

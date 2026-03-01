@@ -430,6 +430,14 @@ impl GraphStore for Neo4jClient {
         self.count_project_files(project_id).await
     }
 
+    async fn invalidate_computed_properties(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> anyhow::Result<u64> {
+        self.invalidate_computed_properties(project_id, paths).await
+    }
+
     // ========================================================================
     // Symbol operations
     // ========================================================================

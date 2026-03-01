@@ -577,6 +577,34 @@ async fn flush_pending_files(
             }
         }
 
+        // Invalidate GraIL computed properties on changed files + neighbors
+        {
+            let invalidation_paths: Vec<String> = files
+                .iter()
+                .map(|p| super::runner::normalize_path(&p.to_string_lossy()))
+                .collect();
+            match orchestrator
+                .neo4j()
+                .invalidate_computed_properties(pid, &invalidation_paths)
+                .await
+            {
+                Ok(stale_count) if stale_count > 0 => {
+                    tracing::info!(
+                        stale_count,
+                        project = %ctx.project_slug,
+                        "Invalidated GraIL computed properties after file sync"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        project = %ctx.project_slug,
+                        "Failed to invalidate computed properties: {}", e
+                    );
+                }
+            }
+        }
+
         // Trigger analytics debouncer once per project (will be further
         // debounced by the AnalyticsDebouncer's own quiet period)
         orchestrator.analytics_debouncer().trigger(pid);
@@ -641,6 +669,34 @@ async fn flush_pending_files(
                 deleted,
                 errors,
             );
+        }
+
+        // Invalidate GraIL computed properties on deleted files + neighbors
+        {
+            let deletion_paths: Vec<String> = files
+                .iter()
+                .map(|p| super::runner::normalize_path(&p.to_string_lossy()))
+                .collect();
+            match orchestrator
+                .neo4j()
+                .invalidate_computed_properties(pid, &deletion_paths)
+                .await
+            {
+                Ok(stale_count) if stale_count > 0 => {
+                    tracing::info!(
+                        stale_count,
+                        project = %ctx.project_slug,
+                        "Invalidated GraIL computed properties after file deletion"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        project = %ctx.project_slug,
+                        "Failed to invalidate computed properties after deletion: {}", e
+                    );
+                }
+            }
         }
 
         // Trigger analytics debouncer (graph changed)

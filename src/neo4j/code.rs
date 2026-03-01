@@ -3748,4 +3748,106 @@ impl Neo4jClient {
             Ok(0)
         }
     }
+
+    // ========================================================================
+    // GraIL — Computed property invalidation
+    // ========================================================================
+
+    /// Invalidate pre-computed GraIL properties on changed files and their neighbors.
+    ///
+    /// Two-phase invalidation:
+    /// 1. Direct files: mark all 3 versions as stale (cc, DNA, WL)
+    /// 2. Neighbors: 1-hop gets cc_version=-1, up to 2-hop gets wl_hash_version=-1
+    ///
+    /// Returns total number of File nodes marked as stale.
+    pub async fn invalidate_computed_properties(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> anyhow::Result<u64> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+
+        let pid = project_id.to_string();
+        let path_list: Vec<String> = paths.to_vec();
+
+        // Phase 1: Mark directly changed files — all 3 versions stale
+        let q1 = neo4rs::query(
+            r#"
+            UNWIND $paths AS p
+            MATCH (f:File {path: p, project_id: $pid})
+            SET f.cc_version = -1,
+                f.structural_dna_version = -1,
+                f.wl_hash_version = -1,
+                f.invalidated_at = datetime()
+            RETURN count(f) AS updated
+            "#,
+        )
+        .param("paths", path_list.clone())
+        .param("pid", pid.clone());
+
+        let mut result1 = self.graph.execute(q1).await?;
+        let direct_count: i64 = if let Some(row) = result1.next().await? {
+            row.get("updated")?
+        } else {
+            0
+        };
+
+        // Phase 2: Mark 1-hop neighbors — cc_version + wl_hash_version stale
+        let q2 = neo4rs::query(
+            r#"
+            UNWIND $paths AS p
+            MATCH (f:File {path: p, project_id: $pid})-[*1]-(neighbor:File)
+            WHERE neighbor.project_id = $pid AND NOT neighbor.path IN $paths
+            SET neighbor.cc_version = -1,
+                neighbor.wl_hash_version = -1,
+                neighbor.invalidated_at = datetime()
+            RETURN count(DISTINCT neighbor) AS updated
+            "#,
+        )
+        .param("paths", path_list.clone())
+        .param("pid", pid.clone());
+
+        let mut result2 = self.graph.execute(q2).await?;
+        let hop1_count: i64 = if let Some(row) = result2.next().await? {
+            row.get("updated")?
+        } else {
+            0
+        };
+
+        // Phase 3: Mark 2-hop only neighbors — wl_hash_version stale only
+        let q3 = neo4rs::query(
+            r#"
+            UNWIND $paths AS p
+            MATCH (f:File {path: p, project_id: $pid})-[*2]-(neighbor:File)
+            WHERE neighbor.project_id = $pid
+              AND NOT neighbor.path IN $paths
+              AND neighbor.cc_version <> -1
+            SET neighbor.wl_hash_version = -1,
+                neighbor.invalidated_at = datetime()
+            RETURN count(DISTINCT neighbor) AS updated
+            "#,
+        )
+        .param("paths", path_list)
+        .param("pid", pid);
+
+        let mut result3 = self.graph.execute(q3).await?;
+        let hop2_count: i64 = if let Some(row) = result3.next().await? {
+            row.get("updated")?
+        } else {
+            0
+        };
+
+        let total = (direct_count + hop1_count + hop2_count) as u64;
+        tracing::info!(
+            direct = direct_count,
+            hop1 = hop1_count,
+            hop2 = hop2_count,
+            total = total,
+            "Invalidated GraIL computed properties"
+        );
+
+        Ok(total)
+    }
 }
