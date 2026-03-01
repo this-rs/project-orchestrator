@@ -1502,6 +1502,10 @@ impl Neo4jClient {
                     let co_changers_json =
                         serde_json::to_string(&c.cc_co_changers_top5).unwrap_or_default();
                     m.insert("cc_co_changers_top5".into(), co_changers_json.into());
+                    // Fingerprint vector stored as JSON string (nested arrays not supported in UNWIND)
+                    let fp_json =
+                        serde_json::to_string(&c.cc_fingerprint).unwrap_or_default();
+                    m.insert("cc_fingerprint".into(), fp_json.into());
                     m.insert("cc_version".into(), (c.cc_version as i64).into());
                     m.insert("cc_computed_at".into(), c.cc_computed_at.clone().into());
                     m
@@ -1524,6 +1528,7 @@ impl Neo4jClient {
                     f.cc_structural_dna = row.cc_structural_dna,
                     f.cc_wl_hash = row.cc_wl_hash,
                     f.cc_co_changers_top5 = row.cc_co_changers_top5,
+                    f.cc_fingerprint = row.cc_fingerprint,
                     f.cc_version = row.cc_version,
                     f.cc_computed_at = row.cc_computed_at
                 "#,
@@ -1592,6 +1597,7 @@ impl Neo4jClient {
                    COALESCE(f.cc_structural_dna, '[]') AS cc_structural_dna,
                    COALESCE(f.cc_wl_hash, 0) AS cc_wl_hash,
                    COALESCE(f.cc_co_changers_top5, '[]') AS cc_co_changers_top5,
+                   COALESCE(f.cc_fingerprint, '[]') AS cc_fingerprint,
                    COALESCE(f.cc_version, 0) AS cc_version,
                    COALESCE(f.cc_computed_at, '') AS cc_computed_at
             "#,
@@ -1660,6 +1666,7 @@ impl Neo4jClient {
                    COALESCE(f.cc_structural_dna, '[]') AS cc_structural_dna,
                    COALESCE(f.cc_wl_hash, 0) AS cc_wl_hash,
                    COALESCE(f.cc_co_changers_top5, '[]') AS cc_co_changers_top5,
+                   COALESCE(f.cc_fingerprint, '[]') AS cc_fingerprint,
                    COALESCE(f.cc_version, 0) AS cc_version,
                    COALESCE(f.cc_computed_at, '') AS cc_computed_at
             "#,
