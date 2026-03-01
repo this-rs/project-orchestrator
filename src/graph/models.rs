@@ -544,6 +544,80 @@ pub struct StressTestResult {
     pub critical_edges: Vec<(String, String)>,
 }
 
+/// Batch update payload for structural fingerprint persistence.
+///
+/// Each entry maps a file path to its fingerprint vector (17-dimensional
+/// universal feature vector with project-independent semantics).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralFingerprintUpdate {
+    /// File path (matches the `path` property on File nodes)
+    pub path: String,
+    /// Structural fingerprint vector — 17 dimensions, all in [0,1]
+    pub fingerprint: Vec<f64>,
+}
+
+/// Per-signal breakdown of a multi-signal similarity score between two files.
+///
+/// Used by `find_cross_project_twins` and `find_structural_twins` to provide
+/// transparency into how the fused similarity score was computed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimilaritySignals {
+    /// Cosine similarity between fingerprint vectors (weight: 0.50)
+    pub fingerprint_similarity: f64,
+    /// WL hash exact match bonus (weight: 0.20) — 1.0 if match, 0.0 otherwise
+    pub wl_hash_match: f64,
+    /// File name pattern similarity (weight: 0.20) — Jaro-Winkler on stems
+    pub name_similarity: f64,
+    /// Log-size similarity (weight: 0.10) — ratio of function counts
+    pub size_similarity: f64,
+}
+
+/// Result of a multi-signal similarity computation between two files.
+///
+/// Combines structural fingerprint cosine, WL hash match, file name similarity,
+/// and size similarity into a single fused score with per-signal transparency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FingerprintSimilarity {
+    /// Source file path
+    pub source: String,
+    /// Target file path
+    pub target: String,
+    /// Fused similarity score (0.0 - 1.0)
+    pub similarity: f64,
+    /// Per-signal breakdown
+    pub signals: SimilaritySignals,
+    /// Shared structural role label (if both files have the same role)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_role: Option<String>,
+}
+
+/// Dimension labels for the 17-dimensional structural fingerprint vector.
+///
+/// Each dimension has a fixed, project-independent semantic meaning,
+/// enabling cross-project comparison via cosine similarity.
+pub const FINGERPRINT_DIMS: usize = 17;
+
+/// Human-readable labels for each fingerprint dimension.
+pub const FINGERPRINT_LABELS: [&str; FINGERPRINT_DIMS] = [
+    "imports_in_pct",        // d0: popularity as dependency (log-percentile)
+    "imports_out_pct",       // d1: dependency on others (log-percentile)
+    "calls_in_pct",          // d2: incoming calls / API surface (log-percentile)
+    "calls_out_pct",         // d3: outgoing calls / orchestration (log-percentile)
+    "pagerank_pct",          // d4: global graph importance (log-percentile)
+    "betweenness_pct",       // d5: bridge/bottleneck role (linear percentile)
+    "clustering_coeff",      // d6: local clique degree (raw 0-1)
+    "function_count_pct",    // d7: functional size (log-percentile)
+    "type_count_pct",        // d8: type richness (linear percentile)
+    "avg_complexity_pct",    // d9: cyclomatic complexity (linear percentile)
+    "ratio_public",          // d10: public function ratio (raw 0-1)
+    "ratio_async",           // d11: async function ratio (raw 0-1)
+    "fan_ratio",             // d12: in / (in+out) — consumer vs producer
+    "co_changer_count_pct",  // d13: temporal coupling (linear percentile)
+    "community_role",        // d14: hub(0.0) / bridge(0.5) / peripheral(1.0)
+    "neighbor_type_entropy", // d15: Shannon entropy of neighbor node types
+    "neighbor_degree_entropy", // d16: Shannon entropy of neighbor degrees (struc2vec-inspired)
+];
+
 /// A group of files sharing the same WL subgraph hash (isomorphic neighborhoods).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsomorphicGroup {
@@ -614,6 +688,9 @@ pub struct ContextCard {
     /// Weisfeiler-Leman hash (Plan 7)
     #[serde(default)]
     pub cc_wl_hash: u64,
+    /// Structural fingerprint vector (17-dim, universal cross-project)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cc_fingerprint: Vec<f64>,
     /// Top-5 co-changers (file paths that frequently change together)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cc_co_changers_top5: Vec<String>,
@@ -640,6 +717,7 @@ impl Default for ContextCard {
             cc_calls_in: 0,
             cc_structural_dna: Vec::new(),
             cc_wl_hash: 0,
+            cc_fingerprint: Vec::new(),
             cc_co_changers_top5: Vec::new(),
             cc_version: 0,
             cc_computed_at: String::new(),
@@ -1117,6 +1195,9 @@ pub struct ComputeAllResult {
     /// WL hashes per node ID (Plan 7)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub wl_hashes: HashMap<String, u64>,
+    /// Structural fingerprint vectors per file path (17-dim, universal)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub structural_fingerprints: HashMap<String, Vec<f64>>,
     /// Top predicted missing links (Plan 9)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub predicted_links: Vec<LinkPrediction>,

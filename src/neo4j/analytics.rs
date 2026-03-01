@@ -1498,6 +1498,10 @@ impl Neo4jClient {
                 cc_calls_in: row.get::<i64>("cc_calls_in").unwrap_or(0) as usize,
                 cc_structural_dna: serde_json::from_str(&dna_json).unwrap_or_default(),
                 cc_wl_hash: row.get::<i64>("cc_wl_hash").unwrap_or(0) as u64,
+                cc_fingerprint: {
+                    let fp_json: String = row.get("cc_fingerprint").unwrap_or_default();
+                    serde_json::from_str(&fp_json).unwrap_or_default()
+                },
                 cc_co_changers_top5: serde_json::from_str(&co_changers_json).unwrap_or_default(),
                 cc_version: row.get::<i64>("cc_version").unwrap_or(0) as i32,
                 cc_computed_at: row.get("cc_computed_at").unwrap_or_default(),
@@ -1564,6 +1568,10 @@ impl Neo4jClient {
                 cc_calls_in: row.get::<i64>("cc_calls_in").unwrap_or(0) as usize,
                 cc_structural_dna: serde_json::from_str(&dna_json).unwrap_or_default(),
                 cc_wl_hash: row.get::<i64>("cc_wl_hash").unwrap_or(0) as u64,
+                cc_fingerprint: {
+                    let fp_json: String = row.get("cc_fingerprint").unwrap_or_default();
+                    serde_json::from_str(&fp_json).unwrap_or_default()
+                },
                 cc_co_changers_top5: serde_json::from_str(&co_changers_json).unwrap_or_default(),
                 cc_version: row.get::<i64>("cc_version").unwrap_or(0) as i32,
                 cc_computed_at: row.get("cc_computed_at").unwrap_or_default(),

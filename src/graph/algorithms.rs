@@ -1064,6 +1064,7 @@ pub fn compute_all_extended(
         grail_stats,
         structural_dna: structural_dna_map,
         wl_hashes,
+        structural_fingerprints: HashMap::new(),
         predicted_links,
         context_cards,
         mode,
@@ -1173,6 +1174,336 @@ pub fn structural_dna(
     }
 
     Ok(dna_map)
+}
+
+// ============================================================================
+// Structural Fingerprint v2 — Universal cross-project similarity
+// ============================================================================
+
+/// Convert raw values to log-percentiles for power-law distributed metrics.
+///
+/// Uses `log(rank+1) / log(N+1)` instead of `rank/N` to preserve discrimination
+/// in the tail of power-law distributions (inspired by bibliometrics research).
+fn to_log_percentiles(values: &[f64]) -> Vec<f64> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let n = values.len();
+    if n == 1 {
+        return vec![0.5]; // single element gets median percentile
+    }
+
+    // Create (original_index, value) pairs and sort by value
+    let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut percentiles = vec![0.0; n];
+    let log_n = (n as f64 + 1.0).ln();
+
+    for (rank, (orig_idx, _)) in indexed.iter().enumerate() {
+        percentiles[*orig_idx] = (rank as f64 + 1.0).ln() / log_n;
+    }
+
+    percentiles
+}
+
+/// Convert raw values to linear percentiles (rank/N).
+///
+/// Used for metrics with roughly uniform distributions (betweenness, type_count, etc.).
+fn to_linear_percentiles(values: &[f64]) -> Vec<f64> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let n = values.len();
+    if n == 1 {
+        return vec![0.5];
+    }
+
+    let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut percentiles = vec![0.0; n];
+    for (rank, (orig_idx, _)) in indexed.iter().enumerate() {
+        percentiles[*orig_idx] = rank as f64 / (n - 1).max(1) as f64;
+    }
+
+    percentiles
+}
+
+/// Shannon entropy of a distribution, normalized to [0, 1].
+///
+/// Returns 0.0 for empty/single-element distributions, 1.0 for uniform distribution.
+fn normalized_shannon_entropy(counts: &[usize]) -> f64 {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let n_categories = counts.iter().filter(|&&c| c > 0).count();
+    if n_categories <= 1 {
+        return 0.0;
+    }
+    let total_f = total as f64;
+    let entropy: f64 = counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / total_f;
+            -p * p.ln()
+        })
+        .sum();
+    let max_entropy = (n_categories as f64).ln();
+    if max_entropy == 0.0 {
+        0.0
+    } else {
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    }
+}
+
+/// Compute structural fingerprints for all File nodes in the graph.
+///
+/// Returns a 17-dimensional feature vector per file with project-independent
+/// semantics, enabling cross-project comparison. See `FINGERPRINT_LABELS`
+/// for the meaning of each dimension.
+///
+/// Uses log-percentiles for power-law metrics (degree, pagerank) and
+/// linear percentiles for uniform metrics (betweenness, type_count).
+///
+/// Dimensions requiring Neo4j-only data (d9: avg_complexity, d10: ratio_public,
+/// d11: ratio_async) are set to 0.0 and enriched later in the pipeline.
+pub fn compute_structural_fingerprint(
+    graph: &CodeGraph,
+    analytics: &GraphAnalytics,
+) -> HashMap<String, Vec<f64>> {
+    use super::models::{CodeEdgeType, CodeNodeType, FINGERPRINT_DIMS};
+
+    let g = &graph.graph;
+
+    // Phase 1: Collect raw metrics per File node
+    struct RawMetrics {
+        imports_in: f64,
+        imports_out: f64,
+        calls_in: f64,
+        calls_out: f64,
+        pagerank: f64,
+        betweenness: f64,
+        clustering: f64,
+        function_count: f64,
+        type_count: f64,
+        // d9 (avg_complexity), d10 (ratio_public), d11 (ratio_async) = 0.0
+        // (enriched from Neo4j in pipeline step)
+        fan_ratio: f64,
+        co_changer_count: f64,
+        community_role_raw: f64,    // will be encoded as 0.0/0.5/1.0
+        neighbor_type_entropy: f64, // d15
+        neighbor_degree_entropy: f64, // d16 (struc2vec-inspired)
+    }
+
+    let mut file_ids: Vec<String> = Vec::new();
+    let mut raw_metrics: Vec<RawMetrics> = Vec::new();
+
+    // Pre-compute co-change data
+    let co_change_data = extract_co_change_data(graph);
+
+    for (node_id, node_idx) in &graph.id_to_index {
+        let node = &g[*node_idx];
+        if node.node_type != CodeNodeType::File {
+            continue;
+        }
+
+        // Get analytics metrics
+        let metrics = analytics.metrics.get(node_id);
+        let pagerank = metrics.map(|m| m.pagerank).unwrap_or(0.0);
+        let betweenness = metrics.map(|m| m.betweenness).unwrap_or(0.0);
+        let clustering = metrics.map(|m| m.clustering_coefficient).unwrap_or(0.0);
+        let _community_id = metrics.map(|m| m.community_id).unwrap_or(0);
+
+        // Count edges by type (imports/calls in/out)
+        let mut imports_out = 0usize;
+        let mut imports_in = 0usize;
+        let mut calls_out = 0usize;
+        let mut calls_in = 0usize;
+        let mut function_count = 0usize;
+        let mut type_count = 0usize; // structs + traits + enums
+
+        // Outgoing edges
+        for edge_ref in g.edges(*node_idx) {
+            match edge_ref.weight().edge_type {
+                CodeEdgeType::Imports => imports_out += 1,
+                CodeEdgeType::Calls => calls_out += 1,
+                CodeEdgeType::Defines => {
+                    // Count children by type
+                    let target = &g[edge_ref.target()];
+                    match target.node_type {
+                        CodeNodeType::Function => function_count += 1,
+                        CodeNodeType::Struct | CodeNodeType::Trait | CodeNodeType::Enum => {
+                            type_count += 1
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Incoming edges
+        for edge_ref in g.edges_directed(*node_idx, petgraph::Direction::Incoming) {
+            match edge_ref.weight().edge_type {
+                CodeEdgeType::Imports => imports_in += 1,
+                CodeEdgeType::Calls => calls_in += 1,
+                _ => {}
+            }
+        }
+
+        // d12: fan_ratio = imports_in / (imports_in + imports_out)
+        let total_imports = imports_in + imports_out;
+        let fan_ratio = if total_imports > 0 {
+            imports_in as f64 / total_imports as f64
+        } else {
+            0.5 // neutral
+        };
+
+        // d13: co-changer count (number of files that co-change with this one)
+        let co_changer_count = co_change_data
+            .keys()
+            .filter(|(a, b)| a == node_id || b == node_id)
+            .count() as f64;
+
+        // d14: community role — hub/bridge/peripheral (encoded later via percentiles)
+        // For now, store raw total_degree for percentile-based encoding
+        let total_degree = (imports_in + imports_out + calls_in + calls_out) as f64;
+
+        // d15: neighbor type entropy — Shannon entropy over CodeNodeType of neighbors
+        let mut neighbor_type_counts = [0usize; 5]; // File, Function, Struct, Trait, Enum
+        for neighbor_idx in g
+            .neighbors_undirected(*node_idx)
+        {
+            let neighbor = &g[neighbor_idx];
+            match neighbor.node_type {
+                CodeNodeType::File => neighbor_type_counts[0] += 1,
+                CodeNodeType::Function => neighbor_type_counts[1] += 1,
+                CodeNodeType::Struct => neighbor_type_counts[2] += 1,
+                CodeNodeType::Trait => neighbor_type_counts[3] += 1,
+                CodeNodeType::Enum => neighbor_type_counts[4] += 1,
+            }
+        }
+        let neighbor_type_entropy = normalized_shannon_entropy(&neighbor_type_counts);
+
+        // d16: neighbor degree entropy (struc2vec-inspired)
+        // Shannon entropy of the degree distribution of neighbors
+        let mut neighbor_degrees: HashMap<usize, usize> = HashMap::new();
+        for neighbor_idx in g.neighbors_undirected(*node_idx) {
+            let deg = g.edges(neighbor_idx).count()
+                + g.edges_directed(neighbor_idx, petgraph::Direction::Incoming).count();
+            *neighbor_degrees.entry(deg).or_insert(0) += 1;
+        }
+        let degree_counts: Vec<usize> = neighbor_degrees.values().copied().collect();
+        let neighbor_degree_entropy = normalized_shannon_entropy(&degree_counts);
+
+        file_ids.push(node_id.clone());
+        raw_metrics.push(RawMetrics {
+            imports_in: imports_in as f64,
+            imports_out: imports_out as f64,
+            calls_in: calls_in as f64,
+            calls_out: calls_out as f64,
+            pagerank,
+            betweenness,
+            clustering,
+            function_count: function_count as f64,
+            type_count: type_count as f64,
+            fan_ratio,
+            co_changer_count,
+            community_role_raw: total_degree,
+            neighbor_type_entropy,
+            neighbor_degree_entropy,
+        });
+    }
+
+    let n = file_ids.len();
+    if n == 0 {
+        return HashMap::new();
+    }
+
+    // Phase 2: Convert raw metrics to percentiles
+
+    // Extract raw value vectors for each percentile-based dimension
+    let imports_in_vals: Vec<f64> = raw_metrics.iter().map(|m| m.imports_in).collect();
+    let imports_out_vals: Vec<f64> = raw_metrics.iter().map(|m| m.imports_out).collect();
+    let calls_in_vals: Vec<f64> = raw_metrics.iter().map(|m| m.calls_in).collect();
+    let calls_out_vals: Vec<f64> = raw_metrics.iter().map(|m| m.calls_out).collect();
+    let pagerank_vals: Vec<f64> = raw_metrics.iter().map(|m| m.pagerank).collect();
+    let betweenness_vals: Vec<f64> = raw_metrics.iter().map(|m| m.betweenness).collect();
+    let function_count_vals: Vec<f64> = raw_metrics.iter().map(|m| m.function_count).collect();
+    let type_count_vals: Vec<f64> = raw_metrics.iter().map(|m| m.type_count).collect();
+    let co_changer_vals: Vec<f64> = raw_metrics.iter().map(|m| m.co_changer_count).collect();
+    let degree_vals: Vec<f64> = raw_metrics.iter().map(|m| m.community_role_raw).collect();
+
+    // Log-percentiles for power-law metrics
+    let imports_in_pct = to_log_percentiles(&imports_in_vals);
+    let imports_out_pct = to_log_percentiles(&imports_out_vals);
+    let calls_in_pct = to_log_percentiles(&calls_in_vals);
+    let calls_out_pct = to_log_percentiles(&calls_out_vals);
+    let pagerank_pct = to_log_percentiles(&pagerank_vals);
+    let function_count_pct = to_log_percentiles(&function_count_vals);
+
+    // Linear percentiles for more uniform metrics
+    let betweenness_pct = to_linear_percentiles(&betweenness_vals);
+    let type_count_pct = to_linear_percentiles(&type_count_vals);
+    let co_changer_pct = to_linear_percentiles(&co_changer_vals);
+    let degree_pct = to_linear_percentiles(&degree_vals);
+    let betweenness_raw_pct = to_linear_percentiles(&betweenness_vals);
+
+    // Phase 3: Assemble fingerprint vectors
+    let mut result = HashMap::with_capacity(n);
+
+    for i in 0..n {
+        let mut fingerprint = vec![0.0f64; FINGERPRINT_DIMS];
+
+        // d0-d3: degree percentiles (log)
+        fingerprint[0] = imports_in_pct[i];
+        fingerprint[1] = imports_out_pct[i];
+        fingerprint[2] = calls_in_pct[i];
+        fingerprint[3] = calls_out_pct[i];
+
+        // d4-d6: centrality
+        fingerprint[4] = pagerank_pct[i];
+        fingerprint[5] = betweenness_pct[i];
+        fingerprint[6] = raw_metrics[i].clustering; // raw 0-1
+
+        // d7-d8: code content (d9 = avg_complexity left at 0.0, enriched from Neo4j)
+        fingerprint[7] = function_count_pct[i];
+        fingerprint[8] = type_count_pct[i];
+        // fingerprint[9] = 0.0; // avg_complexity_pct — enriched later
+
+        // d10-d11: code style (left at 0.0, enriched from Neo4j)
+        // fingerprint[10] = 0.0; // ratio_public — enriched later
+        // fingerprint[11] = 0.0; // ratio_async — enriched later
+
+        // d12: fan ratio (raw 0-1)
+        fingerprint[12] = raw_metrics[i].fan_ratio;
+
+        // d13: co-changer count percentile
+        fingerprint[13] = co_changer_pct[i];
+
+        // d14: community role — hub(0.0) / bridge(0.5) / peripheral(1.0)
+        // Hub = top 10% by degree, bridge = top 20% by betweenness, else peripheral
+        fingerprint[14] = if degree_pct[i] >= 0.9 {
+            0.0 // hub
+        } else if betweenness_raw_pct[i] >= 0.8 {
+            0.5 // bridge
+        } else {
+            1.0 // peripheral
+        };
+
+        // d15: neighbor type entropy (raw 0-1)
+        fingerprint[15] = raw_metrics[i].neighbor_type_entropy;
+
+        // d16: neighbor degree entropy (raw 0-1, struc2vec-inspired)
+        fingerprint[16] = raw_metrics[i].neighbor_degree_entropy;
+
+        result.insert(file_ids[i].clone(), fingerprint);
+    }
+
+    result
 }
 
 /// Compute cosine similarity between two DNA vectors.
@@ -2472,6 +2803,7 @@ pub fn compute_context_cards(
             cc_calls_in: calls_in,
             cc_structural_dna: dna,
             cc_wl_hash: wl,
+            cc_fingerprint: Vec::new(),
             cc_co_changers_top5,
             cc_version: 1,
             cc_computed_at: now.clone(),
@@ -5671,5 +6003,280 @@ mod tests {
             6,
             "Star with 4 leaves: 6 leaf-leaf pairs at distance 2"
         );
+    }
+
+    // ========================================================================
+    // Structural Fingerprint v2 tests
+    // ========================================================================
+
+    /// Build a file-centric graph for fingerprint testing.
+    /// Creates File nodes with Defines edges to Function/Struct children,
+    /// and Import edges between files.
+    fn make_fingerprint_test_graph() -> (CodeGraph, GraphAnalytics) {
+        let mut g = CodeGraph::new();
+
+        // Hub file: imported by many, defines many functions
+        g.add_node(CodeNode {
+            id: "hub.rs".into(),
+            node_type: CodeNodeType::File,
+            path: Some("hub.rs".into()),
+            name: "hub.rs".into(),
+            project_id: None,
+        });
+        for i in 0..5 {
+            let fname = format!("hub_fn_{}", i);
+            g.add_node(CodeNode {
+                id: fname.clone(),
+                node_type: CodeNodeType::Function,
+                path: Some("hub.rs".into()),
+                name: fname.clone(),
+                project_id: None,
+            });
+            g.add_edge("hub.rs", &fname, CodeEdge {
+                edge_type: CodeEdgeType::Defines,
+                weight: 1.0,
+            });
+        }
+        // Hub also defines a struct
+        g.add_node(CodeNode {
+            id: "HubStruct".into(),
+            node_type: CodeNodeType::Struct,
+            path: Some("hub.rs".into()),
+            name: "HubStruct".into(),
+            project_id: None,
+        });
+        g.add_edge("hub.rs", "HubStruct", CodeEdge {
+            edge_type: CodeEdgeType::Defines,
+            weight: 1.0,
+        });
+
+        // 5 leaf files: each imports hub
+        for i in 0..5 {
+            let leaf = format!("leaf_{}.rs", i);
+            g.add_node(CodeNode {
+                id: leaf.clone(),
+                node_type: CodeNodeType::File,
+                path: Some(leaf.clone()),
+                name: leaf.clone(),
+                project_id: None,
+            });
+            g.add_edge(&leaf, "hub.rs", CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            });
+            // Each leaf defines 1 function
+            let fn_name = format!("leaf_fn_{}", i);
+            g.add_node(CodeNode {
+                id: fn_name.clone(),
+                node_type: CodeNodeType::Function,
+                path: Some(leaf.clone()),
+                name: fn_name.clone(),
+                project_id: None,
+            });
+            g.add_edge(&leaf, &fn_name, CodeEdge {
+                edge_type: CodeEdgeType::Defines,
+                weight: 1.0,
+            });
+        }
+
+        // Peripheral file: no imports, 1 function
+        g.add_node(CodeNode {
+            id: "orphan.rs".into(),
+            node_type: CodeNodeType::File,
+            path: Some("orphan.rs".into()),
+            name: "orphan.rs".into(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "orphan_fn".into(),
+            node_type: CodeNodeType::Function,
+            path: Some("orphan.rs".into()),
+            name: "orphan_fn".into(),
+            project_id: None,
+        });
+        g.add_edge("orphan.rs", "orphan_fn", CodeEdge {
+            edge_type: CodeEdgeType::Defines,
+            weight: 1.0,
+        });
+
+        // Compute analytics
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+
+        (g, analytics)
+    }
+
+    #[test]
+    fn test_fingerprint_empty_graph() {
+        let g = CodeGraph::new();
+        let analytics = GraphAnalytics {
+            metrics: HashMap::new(),
+            communities: Vec::new(),
+            components: Vec::new(),
+            health: Default::default(),
+            modularity: 0.0,
+            node_count: 0,
+            edge_count: 0,
+            computation_ms: 0,
+            profile_name: None,
+        };
+        let fp = compute_structural_fingerprint(&g, &analytics);
+        assert!(fp.is_empty(), "Empty graph should produce empty fingerprint map");
+    }
+
+    #[test]
+    fn test_fingerprint_dimensions_and_range() {
+        use crate::graph::models::{FINGERPRINT_DIMS, FINGERPRINT_LABELS};
+
+        let (g, analytics) = make_fingerprint_test_graph();
+        let fp = compute_structural_fingerprint(&g, &analytics);
+
+        // Should have fingerprints for all 7 File nodes (hub + 5 leaves + orphan)
+        assert_eq!(fp.len(), 7, "Should have 7 file fingerprints");
+
+        // Each fingerprint should have 17 dimensions, all in [0, 1]
+        for (path, vec) in &fp {
+            assert_eq!(
+                vec.len(),
+                FINGERPRINT_DIMS,
+                "File {} should have {} dims, got {}",
+                path,
+                FINGERPRINT_DIMS,
+                vec.len()
+            );
+            for (dim_idx, &val) in vec.iter().enumerate() {
+                assert!(
+                    (0.0..=1.0).contains(&val),
+                    "File {} dim {} ({}) = {} out of [0,1]",
+                    path,
+                    dim_idx,
+                    FINGERPRINT_LABELS[dim_idx],
+                    val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fingerprint_hub_vs_leaf_discrimination() {
+        let (g, analytics) = make_fingerprint_test_graph();
+        let fp = compute_structural_fingerprint(&g, &analytics);
+
+        let hub = fp.get("hub.rs").expect("hub should have fingerprint");
+        let leaf = fp.get("leaf_0.rs").expect("leaf should have fingerprint");
+        let orphan = fp.get("orphan.rs").expect("orphan should have fingerprint");
+
+        // Hub should have HIGH imports_in percentile (d0) — it's imported by 5 files
+        assert!(
+            hub[0] > leaf[0],
+            "Hub imports_in_pct ({}) should be > leaf ({}) — hub is imported by 5 files",
+            hub[0], leaf[0]
+        );
+
+        // Hub should have HIGH function_count percentile (d7) — 5 functions vs 1
+        assert!(
+            hub[7] > leaf[7],
+            "Hub function_count_pct ({}) should be > leaf ({})",
+            hub[7], leaf[7]
+        );
+
+        // Hub should be a hub (d14 = 0.0) or at least not peripheral
+        // Orphan should be peripheral (d14 = 1.0)
+        assert!(
+            hub[14] < orphan[14],
+            "Hub community_role ({}) should be < orphan ({}) — hub is more central",
+            hub[14], orphan[14]
+        );
+
+        // Cosine similarity between hub and leaf should be < 0.85
+        // (proves discrimination between roles)
+        let sim = cosine_similarity(hub, leaf);
+        assert!(
+            sim < 0.85,
+            "Hub-leaf cosine similarity ({}) should be < 0.85 — different roles",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_symmetric_leaves_similar() {
+        let (g, analytics) = make_fingerprint_test_graph();
+        let fp = compute_structural_fingerprint(&g, &analytics);
+
+        let leaf0 = fp.get("leaf_0.rs").unwrap();
+        let leaf1 = fp.get("leaf_1.rs").unwrap();
+
+        // Two leaves with identical structure should have very similar fingerprints
+        // (not perfect 1.0 because percentile ranking may break ties differently)
+        let sim = cosine_similarity(leaf0, leaf1);
+        assert!(
+            sim > 0.90,
+            "Symmetric leaves should have cosine > 0.90, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_log_percentile_power_law_spread() {
+        // Simulate a power-law distribution (many small, few large)
+        let values = vec![1.0, 1.0, 2.0, 5.0, 20.0, 100.0];
+
+        let log_pct = to_log_percentiles(&values);
+        let lin_pct = to_linear_percentiles(&values);
+
+        // Log-percentile design: spread low values MORE, compress high values.
+        // This is exactly what we want for power-law metrics (degree, pagerank)
+        // where discrimination among low values matters most.
+
+        // Bottom pair (1.0 vs 2.0 = indices 1 vs 2): log should spread MORE
+        let log_low_spread = log_pct[2] - log_pct[1]; // 2.0 vs 1.0
+        let lin_low_spread = lin_pct[2] - lin_pct[1]; // 2.0 vs 1.0
+        assert!(
+            log_low_spread > lin_low_spread,
+            "Log percentile should spread low values MORE than linear: log={}, lin={}",
+            log_low_spread, lin_low_spread
+        );
+
+        // Top pair (20 vs 100 = indices 4 vs 5): log should COMPRESS
+        let log_high_spread = log_pct[5] - log_pct[4]; // 100 vs 20
+        let lin_high_spread = lin_pct[5] - lin_pct[4]; // 100 vs 20
+        assert!(
+            log_high_spread < lin_high_spread,
+            "Log percentile should compress high values: log={}, lin={}",
+            log_high_spread, lin_high_spread
+        );
+
+        // All values should be in [0, 1]
+        for &v in &log_pct {
+            assert!((0.0..=1.0).contains(&v), "Log percentile {} out of range", v);
+        }
+        for &v in &lin_pct {
+            assert!((0.0..=1.0).contains(&v), "Lin percentile {} out of range", v);
+        }
+    }
+
+    #[test]
+    fn test_normalized_shannon_entropy() {
+        // Uniform distribution → max entropy = 1.0
+        let uniform = vec![10, 10, 10, 10];
+        let h = normalized_shannon_entropy(&uniform);
+        assert!(
+            (h - 1.0).abs() < 0.01,
+            "Uniform distribution should have entropy ~1.0, got {}",
+            h
+        );
+
+        // Single category → zero entropy
+        let single = vec![42, 0, 0, 0];
+        let h = normalized_shannon_entropy(&single);
+        assert!(
+            h.abs() < 0.01,
+            "Single category should have entropy ~0.0, got {}",
+            h
+        );
+
+        // Empty → zero
+        let empty: Vec<usize> = vec![];
+        assert_eq!(normalized_shannon_entropy(&empty), 0.0);
     }
 }
