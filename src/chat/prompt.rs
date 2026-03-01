@@ -711,7 +711,7 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | get_hotspots | `project_slug` (req) | Get code hotspots |
 | get_knowledge_gaps | `project_slug` (req) | Get knowledge gaps |
 | get_risk_assessment | `project_slug` (req) | Get risk assessment |
-| get_bridge | `project_slug` (req), `file_path` (req), `max_hops`, `top_bottlenecks` | Get bridge subgraph around a node (bottlenecks, bridge score) |
+| get_bridge | `project_slug` (req), `source` (req), `target` (req), `max_hops`, `top_bottlenecks` | Get bridge subgraph between two nodes (bottlenecks, bridge score) |
 | check_topology | `project_slug` (req) | Check all topology rule violations |
 | list_topology_rules | `project_slug` (req) | List topology rules |
 | create_topology_rule | `project_slug` (req), `rule_type` (req: must_not_import/must_not_call/max_distance/max_fan_out/no_circular), `source_pattern`, `target_pattern`, `threshold`, `severity` (error/warning) | Create topology rule |

@@ -329,7 +329,7 @@ tests/
 - `GET /api/code/impl-blocks?type_name=...` - Get impl blocks for a type
 
 ### Bridge Subgraph & Topology Firewall
-- `GET /api/code/bridge?file_path=...&project_slug=...` - Bridge subgraph around a node (bottlenecks, bridge score)
+- `GET /api/code/bridge?source=...&target=...&project_slug=...` - Bridge subgraph between two nodes (bottlenecks, bridge score)
 - `GET /api/code/topology/check?project_slug=...` - Check all topology rule violations
 - `GET /api/code/topology/rules?project_slug=...` - List topology rules
 - `POST /api/code/topology/rules` - Create topology rule (must_not_import, must_not_call, max_distance, max_fan_out, no_circular)

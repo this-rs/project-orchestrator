@@ -403,7 +403,7 @@ Code exploration, search, and analytics (36 actions).
 
 | Action | Description | Key Parameters |
 |--------|-------------|----------------|
-| `get_bridge` | Bridge subgraph around a node (bottlenecks, bridge score) | `project_slug`, `file_path`, `max_hops`, `top_bottlenecks` |
+| `get_bridge` | Bridge subgraph between two nodes (bottlenecks, bridge score) | `project_slug`, `source`, `target`, `max_hops`, `top_bottlenecks` |
 | `check_topology` | Check all topology rule violations | `project_slug` |
 | `list_topology_rules` | List topology rules | `project_slug` |
 | `create_topology_rule` | Create topology rule | `project_slug`, `rule_type` (must_not_import/must_not_call/max_distance/max_fan_out/no_circular), `source_pattern`, `target_pattern`, `threshold`, `severity` (error/warning) |
