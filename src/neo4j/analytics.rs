@@ -799,6 +799,48 @@ impl Neo4jClient {
         Ok(fp_list)
     }
 
+    /// Read all file signals needed for multi-signal structural similarity.
+    ///
+    /// Single query returns fingerprint, WL hash, and function count for each file.
+    /// Scoped by project_id. Only returns files that have a computed fingerprint.
+    pub async fn get_project_file_signals(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::graph::models::FileSignalRecord>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.structural_fingerprint IS NOT NULL
+            OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)
+            WITH f, count(fn) AS func_count
+            RETURN f.path AS path,
+                   f.structural_fingerprint AS fingerprint,
+                   COALESCE(f.cc_wl_hash, 0) AS wl_hash,
+                   func_count AS function_count
+            "#,
+        )
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut records = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(path) = row.get::<String>("path") {
+                let fingerprint: Vec<f64> = row.get("fingerprint").unwrap_or_default();
+                let wl_hash = row.get::<i64>("wl_hash").unwrap_or(0) as u64;
+                let function_count = row.get::<i64>("function_count").unwrap_or(0) as usize;
+                records.push(crate::graph::models::FileSignalRecord {
+                    path,
+                    fingerprint,
+                    wl_hash,
+                    function_count,
+                });
+            }
+        }
+
+        Ok(records)
+    }
+
     /// Write predicted missing links for a project.
     ///
     /// First removes old PREDICTED_LINK edges for this project, then creates new ones.

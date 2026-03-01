@@ -2940,14 +2940,15 @@ pub async fn get_structural_profile(
 
 /// POST /api/code/structural-twins
 ///
-/// Finds files structurally similar to a target file using cosine similarity
-/// on their structural DNA vectors. Returns ranked results sorted by
-/// descending similarity.
+/// Finds files structurally similar to a target file within the same project.
+/// Uses multi-signal fusion (fingerprint cosine + WL hash match + file name
+/// similarity + size similarity) with backward-compatible DNA fallback.
+/// Returns ranked results sorted by descending similarity.
 pub async fn find_structural_twins(
     State(state): State<OrchestratorState>,
     Json(body): Json<StructuralDnaBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::graph::algorithms::cosine_similarity;
+    use crate::graph::algorithms::{compute_multi_signal_similarity, FileSignals};
 
     let project = state
         .orchestrator
@@ -2964,6 +2965,84 @@ pub async fn find_structural_twins(
         body.file_path.clone()
     };
 
+    // Try fingerprint-based multi-signal comparison first
+    let file_signals = state
+        .orchestrator
+        .neo4j()
+        .get_project_file_signals(&project.id.to_string())
+        .await?;
+
+    if !file_signals.is_empty() {
+        // Find source file signals
+        let source_record = match file_signals.iter().find(|r| r.path == resolved_path) {
+            Some(r) => r,
+            None => {
+                return Ok(Json(serde_json::json!({
+                    "file_path": body.file_path,
+                    "twins": [],
+                    "total": 0,
+                    "hint": format!("File '{}' has no structural fingerprint", body.file_path),
+                })));
+            }
+        };
+
+        let source_file = FileSignals {
+            path: source_record.path.clone(),
+            fingerprint: source_record.fingerprint.clone(),
+            wl_hash: if source_record.wl_hash != 0 { Some(source_record.wl_hash) } else { None },
+            function_count: source_record.function_count,
+        };
+
+        let top_n = body.top_n.unwrap_or(10);
+
+        // Compute multi-signal similarities (skip self)
+        let mut twins: Vec<serde_json::Value> = file_signals
+            .iter()
+            .filter(|r| r.path != resolved_path)
+            .map(|record| {
+                let target_file = FileSignals {
+                    path: record.path.clone(),
+                    fingerprint: record.fingerprint.clone(),
+                    wl_hash: if record.wl_hash != 0 { Some(record.wl_hash) } else { None },
+                    function_count: record.function_count,
+                };
+                let sim = compute_multi_signal_similarity(&source_file, &target_file);
+                serde_json::json!({
+                    "file_path": record.path,
+                    "similarity": sim.similarity,
+                    "signals": {
+                        "fingerprint_similarity": sim.signals.fingerprint_similarity,
+                        "wl_hash_match": sim.signals.wl_hash_match,
+                        "name_similarity": sim.signals.name_similarity,
+                        "size_similarity": sim.signals.size_similarity,
+                    },
+                    "shared_role": sim.shared_role,
+                })
+            })
+            .collect();
+
+        // Sort by descending similarity
+        twins.sort_by(|a, b| {
+            let sa = a["similarity"].as_f64().unwrap_or(0.0);
+            let sb = b["similarity"].as_f64().unwrap_or(0.0);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let total = twins.len();
+        twins.truncate(top_n);
+
+        return Ok(Json(serde_json::json!({
+            "file_path": body.file_path,
+            "twins": twins,
+            "total": total,
+            "returned": twins.len(),
+            "method": "fingerprint_v2",
+        })));
+    }
+
+    // Fallback: DNA-based cosine similarity (backward compatibility)
+    use crate::graph::algorithms::cosine_similarity;
+
     let all_dna = state
         .orchestrator
         .neo4j()
@@ -2975,11 +3054,10 @@ pub async fn find_structural_twins(
             "file_path": body.file_path,
             "twins": [],
             "total": 0,
-            "hint": "No structural DNA found. Run project sync + analytics first.",
+            "hint": "No structural data found. Run project sync + analytics first.",
         })));
     }
 
-    // Build HashMap for find_structural_twins
     let dna_map: std::collections::HashMap<String, Vec<f64>> = all_dna.into_iter().collect();
 
     let target_dna = match dna_map.get(&resolved_path) {
@@ -2996,10 +3074,9 @@ pub async fn find_structural_twins(
 
     let top_n = body.top_n.unwrap_or(10);
 
-    // Compute similarities (skip self)
     let mut twins: Vec<serde_json::Value> = dna_map
         .iter()
-        .filter(|(path, _)| path.as_str() != body.file_path)
+        .filter(|(path, _)| path.as_str() != resolved_path)
         .map(|(path, dna)| {
             let similarity = cosine_similarity(target_dna, dna);
             serde_json::json!({
@@ -3009,7 +3086,6 @@ pub async fn find_structural_twins(
         })
         .collect();
 
-    // Sort by descending similarity
     twins.sort_by(|a, b| {
         let sa = a["similarity"].as_f64().unwrap_or(0.0);
         let sb = b["similarity"].as_f64().unwrap_or(0.0);
@@ -3024,6 +3100,7 @@ pub async fn find_structural_twins(
         "twins": twins,
         "total": total,
         "returned": twins.len(),
+        "method": "dna_legacy",
     })))
 }
 
@@ -3093,13 +3170,16 @@ pub struct CrossProjectTwinsBody {
 /// POST /api/code/structural-twins/cross-project
 ///
 /// Finds structurally similar files across other projects in the same workspace.
+/// Uses multi-signal fusion (fingerprint cosine + WL hash match + file name
+/// similarity + size similarity) instead of raw DNA cosine.
+///
 /// Enables knowledge transfer: notes from a twin file in project B can be
 /// suggested for the source file in project A.
 pub async fn find_cross_project_twins(
     State(state): State<OrchestratorState>,
     Json(body): Json<CrossProjectTwinsBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::graph::algorithms::cosine_similarity;
+    use crate::graph::algorithms::{compute_multi_signal_similarity, FileSignals};
 
     let neo4j = state.orchestrator.neo4j();
 
@@ -3130,55 +3210,80 @@ pub async fn find_cross_project_twins(
         body.file_path.clone()
     };
 
-    // Get source file DNA
-    let source_dna_all = neo4j
-        .get_project_structural_dna(&source_project.id.to_string())
+    // Get source project file signals (fingerprints + WL hashes + function counts)
+    let source_signals = neo4j
+        .get_project_file_signals(&source_project.id.to_string())
         .await?;
 
-    let source_dna_map: std::collections::HashMap<String, Vec<f64>> =
-        source_dna_all.into_iter().collect();
-
-    let source_dna = match source_dna_map.get(&resolved_path) {
-        Some(dna) => dna,
+    // Find the source file's signals
+    let source_record = match source_signals.iter().find(|r| r.path == resolved_path) {
+        Some(r) => r,
         None => {
             return Ok(Json(serde_json::json!({
                 "file_path": body.file_path,
                 "twins": [],
                 "total": 0,
-                "hint": format!("File '{}' has no structural DNA in project '{}'", body.file_path, body.source_project_slug),
+                "hint": format!("File '{}' has no structural fingerprint in project '{}'. Run analytics first.", body.file_path, body.source_project_slug),
             })));
         }
     };
 
+    let source_file = FileSignals {
+        path: source_record.path.clone(),
+        fingerprint: source_record.fingerprint.clone(),
+        wl_hash: if source_record.wl_hash != 0 { Some(source_record.wl_hash) } else { None },
+        function_count: source_record.function_count,
+    };
+
+    // Detect source language (extension) for hard filter
+    let source_ext = resolved_path.rsplit('.').next().unwrap_or("");
+
     let top_n = body.top_n.unwrap_or(10);
     let mut all_twins: Vec<serde_json::Value> = Vec::new();
 
-    // Search DNA in all other projects
+    // Search across all other projects using multi-signal fusion
     for project in &projects {
         if project.id == source_project.id {
             continue; // Skip source project
         }
 
-        let other_dna = neo4j
-            .get_project_structural_dna(&project.id.to_string())
+        let other_signals = neo4j
+            .get_project_file_signals(&project.id.to_string())
             .await?;
 
-        for (path, dna) in &other_dna {
-            // DNA dimensions must match
-            if dna.len() != source_dna.len() {
+        for record in &other_signals {
+            // Language hard filter: skip files with different extensions
+            let target_ext = record.path.rsplit('.').next().unwrap_or("");
+            if target_ext != source_ext {
                 continue;
             }
-            let sim = cosine_similarity(source_dna, dna);
+
+            let target_file = FileSignals {
+                path: record.path.clone(),
+                fingerprint: record.fingerprint.clone(),
+                wl_hash: if record.wl_hash != 0 { Some(record.wl_hash) } else { None },
+                function_count: record.function_count,
+            };
+
+            let sim = compute_multi_signal_similarity(&source_file, &target_file);
+
             all_twins.push(serde_json::json!({
-                "file_path": path,
+                "file_path": record.path,
                 "project_slug": project.slug,
                 "project_name": project.name,
-                "similarity": sim,
+                "similarity": sim.similarity,
+                "signals": {
+                    "fingerprint_similarity": sim.signals.fingerprint_similarity,
+                    "wl_hash_match": sim.signals.wl_hash_match,
+                    "name_similarity": sim.signals.name_similarity,
+                    "size_similarity": sim.signals.size_similarity,
+                },
+                "shared_role": sim.shared_role,
             }));
         }
     }
 
-    // Sort by descending similarity
+    // Sort by descending fused similarity
     all_twins.sort_by(|a, b| {
         let sa = a["similarity"].as_f64().unwrap_or(0.0);
         let sb = b["similarity"].as_f64().unwrap_or(0.0);

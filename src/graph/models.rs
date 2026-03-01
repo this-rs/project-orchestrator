@@ -544,6 +544,23 @@ pub struct StressTestResult {
     pub critical_edges: Vec<(String, String)>,
 }
 
+/// Database-level record containing all signals needed for multi-signal
+/// structural similarity comparison.
+///
+/// Retrieved from Neo4j in a single query per project. The handler converts
+/// these to `FileSignals` (algorithms.rs) for the fusion algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSignalRecord {
+    /// File path (absolute)
+    pub path: String,
+    /// 17-dim structural fingerprint vector
+    pub fingerprint: Vec<f64>,
+    /// Weisfeiler-Leman subgraph hash (0 = not computed)
+    pub wl_hash: u64,
+    /// Number of functions defined in this file
+    pub function_count: usize,
+}
+
 /// Batch update payload for structural fingerprint persistence.
 ///
 /// Each entry maps a file path to its fingerprint vector (17-dimensional

@@ -1847,6 +1847,15 @@ pub trait GraphStore: Send + Sync {
     async fn get_project_structural_fingerprints(&self, project_id: &str)
         -> Result<Vec<(String, Vec<f64>)>>;
 
+    /// Read all file signals needed for multi-signal structural similarity.
+    ///
+    /// Returns fingerprint, WL hash, and function count for each file in one query.
+    /// Used by `find_cross_project_twins` and `find_structural_twins` handlers.
+    async fn get_project_file_signals(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::graph::models::FileSignalRecord>>;
+
     // ========================================================================
     // SYNAPSE (neural connections bridged to file-level)
     // ========================================================================

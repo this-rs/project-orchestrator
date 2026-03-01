@@ -6770,6 +6770,14 @@ impl GraphStore for MockGraphStore {
         Ok(vec![])
     }
 
+    async fn get_project_file_signals(
+        &self,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::FileSignalRecord>> {
+        // Mock: no file signals in tests by default
+        Ok(vec![])
+    }
+
     async fn write_predicted_links(
         &self,
         _project_id: &str,

@@ -2243,6 +2243,13 @@ impl GraphStore for Neo4jClient {
         self.get_project_structural_fingerprints(project_id).await
     }
 
+    async fn get_project_file_signals(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::FileSignalRecord>> {
+        self.get_project_file_signals(project_id).await
+    }
+
     async fn get_project_synapse_edges(
         &self,
         project_id: Uuid,
