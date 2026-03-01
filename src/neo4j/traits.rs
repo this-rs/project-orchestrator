@@ -1834,6 +1834,19 @@ pub trait GraphStore: Send + Sync {
     async fn get_project_structural_dna(&self, project_id: &str)
         -> Result<Vec<(String, Vec<f64>)>>;
 
+    /// Batch-update structural fingerprint vectors on File nodes.
+    /// Writes the `structural_fingerprint` property (Vec<f64>, 17 dims) via UNWIND in chunks of 1000.
+    /// Fingerprint = universal feature vector with fixed semantics, project-independent.
+    async fn batch_update_structural_fingerprints(
+        &self,
+        updates: &[crate::graph::models::StructuralFingerprintUpdate],
+    ) -> Result<()>;
+
+    /// Read structural fingerprint vectors for all File nodes in a project.
+    /// Returns (file_path, fingerprint_vector) pairs.
+    async fn get_project_structural_fingerprints(&self, project_id: &str)
+        -> Result<Vec<(String, Vec<f64>)>>;
+
     // ========================================================================
     // SYNAPSE (neural connections bridged to file-level)
     // ========================================================================

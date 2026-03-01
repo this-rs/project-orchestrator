@@ -1165,6 +1165,8 @@ pub struct StepTiming {
 pub struct GrailStats {
     /// Number of nodes with structural DNA computed
     pub dna_computed: usize,
+    /// Number of nodes with structural fingerprint computed
+    pub fingerprints_computed: usize,
     /// Number of nodes with WL hash computed
     pub wl_computed: usize,
     /// Number of context cards generated

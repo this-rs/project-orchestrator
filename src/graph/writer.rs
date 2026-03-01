@@ -187,6 +187,41 @@ impl AnalyticsWriter {
         Ok(())
     }
 
+    /// Write structural fingerprint vectors to Neo4j.
+    ///
+    /// Converts the in-memory fingerprint HashMap (from `compute_structural_fingerprint()`) to
+    /// `StructuralFingerprintUpdate` payloads and persists via batch UNWIND.
+    /// Only writes fingerprints for File-type nodes.
+    pub async fn write_structural_fingerprints(
+        &self,
+        fp_map: &std::collections::HashMap<String, Vec<f64>>,
+        graph: &CodeGraph,
+    ) -> Result<()> {
+        use super::models::StructuralFingerprintUpdate;
+
+        let updates: Vec<StructuralFingerprintUpdate> = fp_map
+            .iter()
+            .filter(|(id, _)| {
+                graph
+                    .get_node(id)
+                    .map(|n| n.node_type == CodeNodeType::File)
+                    .unwrap_or(false)
+            })
+            .map(|(path, fp)| StructuralFingerprintUpdate {
+                path: path.clone(),
+                fingerprint: fp.clone(),
+            })
+            .collect();
+
+        if !updates.is_empty() {
+            self.store
+                .batch_update_structural_fingerprints(&updates)
+                .await?;
+        }
+
+        Ok(())
+    }
+
     /// Write predicted missing links to Neo4j.
     ///
     /// Persists top-N link predictions as PREDICTED_LINK relationships.

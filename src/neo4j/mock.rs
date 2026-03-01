@@ -6754,6 +6754,22 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn batch_update_structural_fingerprints(
+        &self,
+        _updates: &[crate::graph::models::StructuralFingerprintUpdate],
+    ) -> anyhow::Result<()> {
+        // Mock: structural fingerprints not stored separately in tests
+        Ok(())
+    }
+
+    async fn get_project_structural_fingerprints(
+        &self,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
+        // Mock: no structural fingerprints in tests by default
+        Ok(vec![])
+    }
+
     async fn write_predicted_links(
         &self,
         _project_id: &str,

@@ -989,6 +989,19 @@ pub fn compute_all_extended(
     let structural_dna_map = dna_result.unwrap_or_default();
     grail_stats.dna_computed = structural_dna_map.len();
 
+    // --- Step 5b: Structural Fingerprint (depends on analytics) ---
+    let (fp_result, fp_timing) = timed_step("structural_fingerprint", || {
+        let mut fps = compute_structural_fingerprint(&working_graph, &analytics);
+        if let Some(ref targets) = incremental_targets {
+            fps.retain(|id, _| targets.contains(id));
+        }
+        Ok(fps)
+    });
+    timings.push(fp_timing);
+
+    let structural_fingerprint_map = fp_result.unwrap_or_default();
+    grail_stats.fingerprints_computed = structural_fingerprint_map.len();
+
     // --- Step 6: WL Subgraph Hash ---
     let (wl_result, wl_timing) = timed_step("wl_subgraph_hash", || {
         let mut hashes =
@@ -1041,7 +1054,7 @@ pub fn compute_all_extended(
 
     // --- Step 9: Context Cards (aggregates ALL above) ---
     let (cards_result, cards_timing) = timed_step("context_cards", || {
-        let cards = compute_context_cards(graph, &analytics, &structural_dna_map, &wl_hashes);
+        let cards = compute_context_cards(graph, &analytics, &structural_dna_map, &wl_hashes, &structural_fingerprint_map);
         grail_stats.cards_computed = cards.len();
         Ok(cards)
     });
@@ -1064,7 +1077,7 @@ pub fn compute_all_extended(
         grail_stats,
         structural_dna: structural_dna_map,
         wl_hashes,
-        structural_fingerprints: HashMap::new(),
+        structural_fingerprints: structural_fingerprint_map,
         predicted_links,
         context_cards,
         mode,
@@ -2710,6 +2723,7 @@ pub fn compute_context_cards(
     analytics: &GraphAnalytics,
     dna_map: &HashMap<String, Vec<f64>>,
     wl_hashes: &HashMap<String, u64>,
+    fp_map: &HashMap<String, Vec<f64>>,
 ) -> Vec<super::models::ContextCard> {
     use super::models::{CodeEdgeType, CodeNodeType, ContextCard};
 
@@ -2803,7 +2817,7 @@ pub fn compute_context_cards(
             cc_calls_in: calls_in,
             cc_structural_dna: dna,
             cc_wl_hash: wl,
-            cc_fingerprint: Vec::new(),
+            cc_fingerprint: fp_map.get(node_id).cloned().unwrap_or_default(),
             cc_co_changers_top5,
             cc_version: 1,
             cc_computed_at: now.clone(),
@@ -5578,7 +5592,7 @@ mod tests {
         let dna_map = HashMap::new();
         let wl_hashes = HashMap::new();
 
-        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes);
+        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes, &HashMap::new());
 
         assert_eq!(cards.len(), 5, "Should produce 1 card per file node");
 
@@ -5640,7 +5654,7 @@ mod tests {
         use super::super::models::AnalyticsConfig;
         let config = AnalyticsConfig::default();
         let analytics = compute_all(&g, &config);
-        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new());
+        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new(), &HashMap::new());
 
         assert_eq!(cards.len(), 1, "Only File nodes should get context cards");
         assert_eq!(cards[0].path, "src/main.rs");
@@ -5658,7 +5672,7 @@ mod tests {
         let mut wl_hashes = HashMap::new();
         wl_hashes.insert("A".to_string(), 12345u64);
 
-        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes);
+        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes, &HashMap::new());
         let a_card = cards.iter().find(|c| c.path == "A").unwrap();
         assert_eq!(a_card.cc_structural_dna, vec![1.0, 0.5, 0.0]);
         assert_eq!(a_card.cc_wl_hash, 12345);
@@ -5675,7 +5689,7 @@ mod tests {
         let g = CodeGraph::new();
         let config = AnalyticsConfig::default();
         let analytics = compute_all(&g, &config);
-        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new());
+        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert!(cards.is_empty());
     }
 

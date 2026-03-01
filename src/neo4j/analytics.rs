@@ -722,6 +722,83 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Batch-update structural fingerprint vectors on File nodes.
+    ///
+    /// Uses UNWIND in chunks of 1000 to write `structural_fingerprint` as a list of floats.
+    /// Fingerprint = 17-dimensional universal feature vector, project-independent.
+    pub async fn batch_update_structural_fingerprints(
+        &self,
+        updates: &[crate::graph::models::StructuralFingerprintUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        const CHUNK_SIZE: usize = 1000;
+
+        for chunk in updates.chunks(CHUNK_SIZE) {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
+                .iter()
+                .map(|u| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("path".into(), u.path.clone().into());
+                    let fp_list: Vec<neo4rs::BoltType> =
+                        u.fingerprint.iter().map(|&v| v.into()).collect();
+                    m.insert(
+                        "fingerprint".into(),
+                        neo4rs::BoltType::List(neo4rs::BoltList::from(fp_list)),
+                    );
+                    m
+                })
+                .collect();
+
+            let q = query(
+                r#"
+                UNWIND $items AS u
+                MATCH (f:File {path: u.path})
+                SET f.structural_fingerprint = u.fingerprint,
+                    f.structural_fingerprint_updated_at = datetime()
+                "#,
+            )
+            .param("items", items);
+
+            self.graph.run(q).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Read structural fingerprint vectors for all File nodes in a project.
+    ///
+    /// Returns (file_path, fingerprint_vector) pairs.
+    pub async fn get_project_structural_fingerprints(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Vec<f64>)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.structural_fingerprint IS NOT NULL
+            RETURN f.path AS path, f.structural_fingerprint AS fingerprint
+            "#,
+        )
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut fp_list = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(path), Ok(fp)) = (
+                row.get::<String>("path"),
+                row.get::<Vec<f64>>("fingerprint"),
+            ) {
+                fp_list.push((path, fp));
+            }
+        }
+
+        Ok(fp_list)
+    }
+
     /// Write predicted missing links for a project.
     ///
     /// First removes old PREDICTED_LINK edges for this project, then creates new ones.

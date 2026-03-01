@@ -2229,6 +2229,20 @@ impl GraphStore for Neo4jClient {
         self.get_project_structural_dna(project_id).await
     }
 
+    async fn batch_update_structural_fingerprints(
+        &self,
+        updates: &[crate::graph::models::StructuralFingerprintUpdate],
+    ) -> anyhow::Result<()> {
+        self.batch_update_structural_fingerprints(updates).await
+    }
+
+    async fn get_project_structural_fingerprints(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
+        self.get_project_structural_fingerprints(project_id).await
+    }
+
     async fn get_project_synapse_edges(
         &self,
         project_id: Uuid,

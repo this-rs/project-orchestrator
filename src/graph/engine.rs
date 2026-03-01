@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::algorithms::{compute_all, compute_context_cards, structural_dna, wl_subgraph_hash_all};
+use super::algorithms::{compute_all, compute_context_cards, compute_structural_fingerprint, structural_dna, wl_subgraph_hash_all};
 use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
@@ -196,6 +196,28 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             }
         }
 
+        // 4b. Compute and persist Structural Fingerprints (depends on analytics)
+        let fp_map = compute_structural_fingerprint(&graph, &analytics);
+        let fp_map_for_cards = if !fp_map.is_empty() {
+            if let Err(e) = self.writer.write_structural_fingerprints(&fp_map, &graph).await {
+                tracing::warn!(
+                    "Failed to persist structural fingerprints for project {}: {}",
+                    project_id,
+                    e
+                );
+            } else {
+                tracing::debug!(
+                    project_id = %project_id,
+                    fp_count = fp_map.len(),
+                    "Structural fingerprints computed and persisted"
+                );
+            }
+            fp_map
+        } else {
+            tracing::debug!("Structural fingerprints: empty graph, skipping");
+            std::collections::HashMap::new()
+        };
+
         // 5. Compute WL subgraph hashes (Plan 7)
         let wl_hashes = match wl_subgraph_hash_all(&graph, 2, 3) {
             Ok(hashes) => {
@@ -214,7 +236,7 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
 
         // 6. Compute and persist Context Cards (aggregates analytics + DNA + WL hash)
         let context_cards =
-            compute_context_cards(&graph, &analytics, &dna_map_for_cards, &wl_hashes);
+            compute_context_cards(&graph, &analytics, &dna_map_for_cards, &wl_hashes, &fp_map_for_cards);
         if !context_cards.is_empty() {
             if let Err(e) = self.store.batch_save_context_cards(&context_cards).await {
                 tracing::warn!(
