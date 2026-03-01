@@ -36,7 +36,7 @@ impl Default for SkillDetectionConfig {
         Self {
             min_synapse_weight: 0.1,
             min_cluster_size: 3,
-            min_cohesion: 0.3,
+            min_cohesion: 0.5,
             louvain_resolution: 1.5,
             overlap_threshold: 0.7,
             min_notes_for_detection: 15,
@@ -87,6 +87,99 @@ pub struct SkillCandidate {
     pub size: usize,
     /// Auto-generated label from common path prefix heuristic.
     pub label: String,
+}
+
+// ============================================================================
+// Post-filtering: prune weakly-connected members
+// ============================================================================
+
+/// Minimum average internal SYNAPSE weight for a note to stay in a cluster.
+/// Notes below this threshold are considered "noise" — they got pulled into
+/// the community by transitive synapse chains but aren't semantically core.
+const MIN_INTERNAL_WEIGHT: f64 = 0.2;
+
+/// Filter out cluster members whose average SYNAPSE weight to other members
+/// is below `MIN_INTERNAL_WEIGHT`.
+///
+/// This removes notes that Louvain assigned to a community transitively
+/// but that have weak direct connections to other cluster members.
+///
+/// After filtering, clusters that drop below `min_cluster_size` are removed entirely.
+pub fn filter_weak_members(
+    candidates: Vec<SkillCandidate>,
+    edges: &[(String, String, f64)],
+    min_cluster_size: usize,
+) -> Vec<SkillCandidate> {
+    // Build edge weight lookup: (from, to) → weight (bidirectional)
+    let mut weight_map: HashMap<(&str, &str), f64> = HashMap::new();
+    for (from, to, w) in edges {
+        weight_map.insert((from.as_str(), to.as_str()), *w);
+        weight_map.insert((to.as_str(), from.as_str()), *w);
+    }
+
+    candidates
+        .into_iter()
+        .filter_map(|mut candidate| {
+            if candidate.member_note_ids.len() <= min_cluster_size {
+                // Too small to prune — keep as-is (Louvain already validated cohesion)
+                return Some(candidate);
+            }
+
+            let members: std::collections::HashSet<&str> =
+                candidate.member_note_ids.iter().map(|s| s.as_str()).collect();
+
+            // Compute average internal weight for each member
+            let strong_members: Vec<String> = candidate
+                .member_note_ids
+                .iter()
+                .filter(|note_id| {
+                    let other_members: Vec<&&str> = members
+                        .iter()
+                        .filter(|m| **m != note_id.as_str())
+                        .collect();
+
+                    if other_members.is_empty() {
+                        return true; // single-member cluster, keep
+                    }
+
+                    let total_weight: f64 = other_members
+                        .iter()
+                        .map(|other| {
+                            weight_map
+                                .get(&(note_id.as_str(), **other))
+                                .copied()
+                                .unwrap_or(0.0)
+                        })
+                        .sum();
+
+                    let avg_weight = total_weight / other_members.len() as f64;
+                    avg_weight >= MIN_INTERNAL_WEIGHT
+                })
+                .cloned()
+                .collect();
+
+            let pruned = candidate.member_note_ids.len() - strong_members.len();
+            if pruned > 0 {
+                tracing::debug!(
+                    community = candidate.community_id,
+                    pruned,
+                    remaining = strong_members.len(),
+                    "Pruned {} weakly-connected members from cluster #{}",
+                    pruned,
+                    candidate.community_id
+                );
+            }
+
+            if strong_members.len() < min_cluster_size {
+                // Cluster too small after pruning — discard
+                None
+            } else {
+                candidate.size = strong_members.len();
+                candidate.member_note_ids = strong_members;
+                Some(candidate)
+            }
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -459,6 +552,9 @@ pub fn detect_skill_candidates(
             })
         })
         .collect();
+
+    // Post-filter: prune weakly-connected members from each cluster
+    let candidates = filter_weak_members(candidates, edges, config.min_cluster_size);
 
     let n_candidates = candidates.len();
     ClusterDetectionResult {
@@ -841,7 +937,7 @@ mod tests {
         let config = SkillDetectionConfig::default();
         assert_eq!(config.min_synapse_weight, 0.1);
         assert_eq!(config.min_cluster_size, 3);
-        assert_eq!(config.min_cohesion, 0.3);
+        assert_eq!(config.min_cohesion, 0.5);
         assert_eq!(config.louvain_resolution, 1.5);
         assert_eq!(config.overlap_threshold, 0.7);
         assert_eq!(config.min_notes_for_detection, 15);
@@ -1199,6 +1295,114 @@ mod tests {
         let anchors = store.get_note_anchors(note.id).await.unwrap();
         assert_eq!(anchors.len(), 1, "Note should have 1 anchor");
         assert_eq!(anchors[0].entity_id, "/tmp/anchor-test/src/main.rs");
+    }
+
+    // ================================================================
+    // filter_weak_members tests
+    // ================================================================
+
+    #[test]
+    fn test_filter_weak_members_prunes_loosely_connected() {
+        // Cluster of 5 notes: n1-n4 are strongly connected (weight 0.9),
+        // n5 is only weakly connected to n1 (weight 0.05), no edges to n2-n4.
+        let edges = vec![
+            ("n1".into(), "n2".into(), 0.9),
+            ("n1".into(), "n3".into(), 0.9),
+            ("n1".into(), "n4".into(), 0.9),
+            ("n2".into(), "n3".into(), 0.9),
+            ("n2".into(), "n4".into(), 0.9),
+            ("n3".into(), "n4".into(), 0.9),
+            // n5 weakly connected — only to n1, low weight
+            ("n1".into(), "n5".into(), 0.05),
+        ];
+
+        let candidates = vec![SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec!["n1".into(), "n2".into(), "n3".into(), "n4".into(), "n5".into()],
+            cohesion: 0.7,
+            size: 5,
+            label: "test".into(),
+        }];
+
+        let result = filter_weak_members(candidates, &edges, 3);
+        assert_eq!(result.len(), 1);
+        // n5 should be pruned (avg internal weight = 0.05/4 = 0.0125 < 0.2)
+        assert!(
+            !result[0].member_note_ids.contains(&"n5".to_string()),
+            "n5 should be pruned, members: {:?}",
+            result[0].member_note_ids
+        );
+        assert_eq!(result[0].size, 4);
+    }
+
+    #[test]
+    fn test_filter_weak_members_keeps_strong_cluster() {
+        // All notes strongly connected — nothing to prune
+        let edges = vec![
+            ("n1".into(), "n2".into(), 0.8),
+            ("n1".into(), "n3".into(), 0.7),
+            ("n2".into(), "n3".into(), 0.9),
+        ];
+
+        let candidates = vec![SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec!["n1".into(), "n2".into(), "n3".into()],
+            cohesion: 0.8,
+            size: 3,
+            label: "strong".into(),
+        }];
+
+        let result = filter_weak_members(candidates, &edges, 3);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].size, 3); // nothing pruned
+    }
+
+    #[test]
+    fn test_filter_weak_members_removes_cluster_below_min_size() {
+        // Cluster of 4 notes, 2 are weak → after pruning only 2 remain → below min_cluster_size=3
+        let edges = vec![
+            ("n1".into(), "n2".into(), 0.9),
+            // n3 and n4 only weakly connected
+            ("n1".into(), "n3".into(), 0.02),
+            ("n1".into(), "n4".into(), 0.01),
+        ];
+
+        let candidates = vec![SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec!["n1".into(), "n2".into(), "n3".into(), "n4".into()],
+            cohesion: 0.5,
+            size: 4,
+            label: "fragile".into(),
+        }];
+
+        let result = filter_weak_members(candidates, &edges, 3);
+        // After pruning n3 and n4, only 2 remain → below min_cluster_size → cluster removed
+        assert!(
+            result.is_empty(),
+            "Cluster should be removed after pruning, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_filter_weak_members_skips_small_clusters() {
+        // Cluster at min_cluster_size — don't prune (too small to risk)
+        let edges = vec![
+            ("n1".into(), "n2".into(), 0.05), // weak, but cluster is at min size
+            ("n2".into(), "n3".into(), 0.9),
+        ];
+
+        let candidates = vec![SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec!["n1".into(), "n2".into(), "n3".into()],
+            cohesion: 0.6,
+            size: 3,
+            label: "tiny".into(),
+        }];
+
+        let result = filter_weak_members(candidates, &edges, 3);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].size, 3); // kept as-is, no pruning
     }
 
     #[tokio::test]

@@ -1925,6 +1925,9 @@ impl ToolHandler {
                 if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
                     body.insert("project_id".to_string(), Value::String(pid.to_string()));
                 }
+                if let Some(force) = args.get("force").and_then(|v| v.as_bool()) {
+                    body.insert("force".to_string(), Value::Bool(force));
+                }
                 let result = http
                     .post("/api/admin/detect-skills", &Value::Object(body))
                     .await?;

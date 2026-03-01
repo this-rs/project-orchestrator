@@ -2205,6 +2205,10 @@ pub async fn reinforce_isomorphic_synapses(
 #[derive(Deserialize)]
 pub struct DetectSkillsRequest {
     pub project_id: Uuid,
+    /// When true, delete all existing skills before re-detecting from scratch.
+    /// Default: false (incremental deduplication via Jaccard overlap).
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Run the full skill detection pipeline for a project
@@ -2222,6 +2226,29 @@ pub async fn detect_skills(
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    // Force mode: delete all existing skills before re-detecting from scratch
+    if body.force {
+        let existing_skills = state
+            .orchestrator
+            .neo4j()
+            .get_skills_for_project(project_id)
+            .await
+            .map_err(AppError::Internal)?;
+        for skill in &existing_skills {
+            let _ = state
+                .orchestrator
+                .neo4j()
+                .delete_skill(skill.id)
+                .await;
+        }
+        tracing::info!(
+            %project_id,
+            deleted = existing_skills.len(),
+            "Force mode: deleted {} existing skills before re-detection",
+            existing_skills.len()
+        );
+    }
 
     let config = crate::skills::SkillDetectionConfig::default();
     let start = std::time::Instant::now();

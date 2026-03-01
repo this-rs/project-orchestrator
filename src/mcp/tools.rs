@@ -886,7 +886,8 @@ fn admin_tool() -> ToolDefinition {
                 "decay_amount": {"type": "number", "description": "Amount to subtract from each synapse weight (decay_synapses, default 0.01)"},
                 "prune_threshold": {"type": "number", "description": "Prune synapses below this weight (decay_synapses, default 0.1)"},
                 "limit": {"type": "integer", "description": "Max items (search_neurons)"},
-                "level": {"type": "string", "enum": ["hourly", "daily", "weekly", "full"], "description": "Maintenance level (maintain_skills, default: daily)"}
+                "level": {"type": "string", "enum": ["hourly", "daily", "weekly", "full"], "description": "Maintenance level (maintain_skills, default: daily)"},
+                "force": {"type": "boolean", "description": "Force re-detection from scratch, deleting all existing skills first (detect_skills, default: false)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
