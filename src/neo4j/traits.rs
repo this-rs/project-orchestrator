@@ -2016,6 +2016,30 @@ pub trait GraphStore: Send + Sync {
     async fn delete_analysis_profile(&self, id: &str) -> Result<()>;
 
     // ========================================================================
+    // Bridge subgraph extraction (GraIL Plan 1)
+    // ========================================================================
+
+    /// Extract the enclosing bridge subgraph between two nodes via bidirectional
+    /// BFS intersection. Returns raw nodes and edges; double-radius labeling
+    /// and bottleneck detection are done in Rust (see graph/algorithms.rs).
+    ///
+    /// - `source`/`target`: file paths within the project
+    /// - `max_hops`: BFS radius (1..=5)
+    /// - `relation_types`: edge types to traverse (e.g. ["IMPORTS", "CALLS"])
+    /// - `project_id`: project UUID for scoping
+    async fn find_bridge_subgraph(
+        &self,
+        source: &str,
+        target: &str,
+        max_hops: u32,
+        relation_types: &[String],
+        project_id: &str,
+    ) -> Result<(
+        Vec<crate::graph::models::BridgeRawNode>,
+        Vec<crate::graph::models::BridgeRawEdge>,
+    )>;
+
+    // ========================================================================
     // Multi-signal impact queries
     // ========================================================================
 

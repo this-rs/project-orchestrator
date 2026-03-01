@@ -2354,6 +2354,21 @@ impl GraphStore for Neo4jClient {
         self.get_bridge_proximity(file_path, project_id).await
     }
 
+    async fn find_bridge_subgraph(
+        &self,
+        source: &str,
+        target: &str,
+        max_hops: u32,
+        relation_types: &[String],
+        project_id: &str,
+    ) -> anyhow::Result<(
+        Vec<crate::graph::models::BridgeRawNode>,
+        Vec<crate::graph::models::BridgeRawEdge>,
+    )> {
+        self.find_bridge_subgraph(source, target, max_hops, relation_types, project_id)
+            .await
+    }
+
     async fn get_avg_multi_signal_score(
         &self,
         project_id: Uuid,

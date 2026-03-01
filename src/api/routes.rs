@@ -577,6 +577,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(code_handlers::enrich_communities),
         )
         // ================================================================
+        // Bridge Subgraph (GraIL)
+        // ================================================================
+        .route("/api/code/bridge", get(code_handlers::get_bridge))
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(

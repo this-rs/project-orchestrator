@@ -6953,6 +6953,38 @@ impl GraphStore for MockGraphStore {
         Ok(0.0)
     }
 
+    async fn find_bridge_subgraph(
+        &self,
+        source: &str,
+        target: &str,
+        _max_hops: u32,
+        _relation_types: &[String],
+        _project_id: &str,
+    ) -> anyhow::Result<(
+        Vec<crate::graph::models::BridgeRawNode>,
+        Vec<crate::graph::models::BridgeRawEdge>,
+    )> {
+        use crate::graph::models::{BridgeRawEdge, BridgeRawNode};
+
+        // Mock: return source and target as nodes with a direct IMPORTS edge
+        let nodes = vec![
+            BridgeRawNode {
+                path: source.to_string(),
+                node_type: "File".to_string(),
+            },
+            BridgeRawNode {
+                path: target.to_string(),
+                node_type: "File".to_string(),
+            },
+        ];
+        let edges = vec![BridgeRawEdge {
+            from_path: source.to_string(),
+            to_path: target.to_string(),
+            rel_type: "IMPORTS".to_string(),
+        }];
+        Ok((nodes, edges))
+    }
+
     // ========================================================================
     // Skill operations (Neural Skills)
     // ========================================================================

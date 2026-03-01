@@ -2465,6 +2465,172 @@ pub async fn enrich_communities(
     })))
 }
 
+// ============================================================================
+// Bridge Subgraph (Plan 1 — GraIL)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct BridgeQuery {
+    /// Source node path (file or function)
+    pub source: String,
+    /// Target node path (file or function)
+    pub target: String,
+    /// Project slug (required for scoping)
+    pub project_slug: String,
+    /// Max BFS hops (default 3, clamped 1-5)
+    pub max_hops: Option<u32>,
+    /// Number of bottleneck nodes to return (default 3)
+    pub top_bottlenecks: Option<usize>,
+}
+
+/// GET /api/code/bridge — Extract the GraIL-style bridge subgraph between two nodes.
+///
+/// Returns an enriched `BridgeSubgraph` with double-radius labeling,
+/// density, and bottleneck detection (Brandes' betweenness centrality).
+pub async fn get_bridge(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<BridgeQuery>,
+) -> Result<Json<crate::graph::models::BridgeSubgraph>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    // Resolve project
+    let project = neo4j
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", params.project_slug)))?;
+    let project_id_str = project.id.to_string();
+
+    // Resolve paths (relative → absolute)
+    let root = crate::expand_tilde(&project.root_path);
+    let root = root.trim_end_matches('/');
+    let source = if !params.source.starts_with('/') {
+        format!("{}/{}", root, &params.source)
+    } else {
+        params.source.clone()
+    };
+    let target = if !params.target.starts_with('/') {
+        format!("{}/{}", root, &params.target)
+    } else {
+        params.target.clone()
+    };
+
+    let max_hops = params.max_hops.unwrap_or(3).clamp(1, 5);
+    let top_n = params.top_bottlenecks.unwrap_or(3);
+
+    // Default relation types for bridge extraction
+    let relation_types: Vec<String> = vec![
+        "IMPORTS".to_string(),
+        "CALLS".to_string(),
+        "CO_CHANGED".to_string(),
+        "EXTENDS".to_string(),
+        "IMPLEMENTS".to_string(),
+    ];
+
+    // Phase 1: Extract raw bridge subgraph from Neo4j
+    let (raw_nodes, raw_edges) = neo4j
+        .find_bridge_subgraph(&source, &target, max_hops, &relation_types, &project_id_str)
+        .await?;
+
+    if raw_nodes.is_empty() {
+        return Err(AppError::NotFound(format!(
+            "No bridge subgraph found between '{}' and '{}' within {} hops",
+            source, target, max_hops
+        )));
+    }
+
+    // Phase 2: Enrich with algorithms (double-radius labeling + bottleneck detection)
+    let node_paths: Vec<String> = raw_nodes.iter().map(|n| n.path.clone()).collect();
+    let edge_tuples: Vec<(String, String)> = raw_edges
+        .iter()
+        .map(|e| (e.from_path.clone(), e.to_path.clone()))
+        .collect();
+
+    let labels =
+        crate::graph::algorithms::double_radius_label(&node_paths, &edge_tuples, &source, &target);
+    let bottleneck_nodes = crate::graph::algorithms::find_bottleneck_nodes(
+        &node_paths,
+        &edge_tuples,
+        &source,
+        &target,
+        top_n,
+    );
+    let density =
+        crate::graph::algorithms::compute_bridge_density(raw_nodes.len(), raw_edges.len());
+
+    // Phase 3: Assemble enriched BridgeSubgraph
+    let nodes: Vec<crate::graph::models::BridgeNode> = raw_nodes
+        .iter()
+        .map(|n| {
+            let (d_s, d_t) = labels.get(&n.path).copied().unwrap_or((u32::MAX, u32::MAX));
+            crate::graph::models::BridgeNode {
+                path: n.path.clone(),
+                node_type: n.node_type.clone(),
+                distance_to_source: d_s,
+                distance_to_target: d_t,
+            }
+        })
+        .collect();
+
+    let edges: Vec<crate::graph::models::BridgeEdge> = raw_edges
+        .iter()
+        .map(|e| crate::graph::models::BridgeEdge {
+            from_path: e.from_path.clone(),
+            to_path: e.to_path.clone(),
+            rel_type: e.rel_type.clone(),
+        })
+        .collect();
+
+    let result = crate::graph::models::BridgeSubgraph {
+        source,
+        target,
+        nodes,
+        edges,
+        density,
+        bottleneck_nodes,
+    };
+
+    // Phase 4: Hebbian synapse reinforcement (fire-and-forget)
+    // "Notes that bridge together, wire together"
+    // Collect notes linked to bridge nodes and reinforce synapses between them.
+    let bridge_node_paths: Vec<String> = node_paths;
+    let neo4j_bg = state.orchestrator.neo4j_arc();
+    tokio::spawn(async move {
+        let mut all_note_ids: Vec<uuid::Uuid> = Vec::new();
+        for path in &bridge_node_paths {
+            if let Ok(notes) = neo4j_bg
+                .get_notes_for_entity(&crate::notes::EntityType::File, path)
+                .await
+            {
+                for note in &notes {
+                    all_note_ids.push(note.id);
+                }
+            }
+        }
+        all_note_ids.sort();
+        all_note_ids.dedup();
+        if all_note_ids.len() >= 2 {
+            match neo4j_bg.reinforce_synapses(&all_note_ids, 0.05).await {
+                Ok(count) => {
+                    tracing::debug!(
+                        reinforced = count,
+                        bridge_nodes = bridge_node_paths.len(),
+                        notes = all_note_ids.len(),
+                        "Bridge subgraph: Hebbian synapse reinforcement completed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Bridge subgraph: Hebbian synapse reinforcement failed"
+                    );
+                }
+            }
+        }
+    });
+
+    Ok(Json(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

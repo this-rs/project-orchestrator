@@ -1535,6 +1535,207 @@ pub fn into_ranked<T: Serialize + Clone>(
 }
 
 // ============================================================================
+// Bridge Subgraph — Double-radius labeling & bottleneck detection (GraIL Plan 1)
+// ============================================================================
+
+/// Compute BFS distances from a single source node to all reachable nodes
+/// in the bridge subgraph. Works on an adjacency list built from raw edges.
+///
+/// Returns a map of `path -> distance`. Unreachable nodes are not included.
+fn bfs_distances(
+    adj: &HashMap<&str, Vec<&str>>,
+    source: &str,
+) -> HashMap<String, u32> {
+    use std::collections::VecDeque;
+    let mut distances = HashMap::new();
+    distances.insert(source.to_string(), 0u32);
+    let mut queue = VecDeque::new();
+    queue.push_back(source);
+
+    while let Some(current) = queue.pop_front() {
+        let current_dist = distances[current];
+        if let Some(neighbors) = adj.get(current) {
+            for &neighbor in neighbors {
+                if !distances.contains_key(neighbor) {
+                    distances.insert(neighbor.to_string(), current_dist + 1);
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+    }
+    distances
+}
+
+/// Compute double-radius labels for each node in the bridge subgraph.
+///
+/// For each node, returns `(distance_to_source, distance_to_target)`.
+/// Unreachable nodes get `u32::MAX` for the unreachable direction.
+///
+/// ## Arguments
+/// - `node_paths`: paths of all nodes in the bridge subgraph
+/// - `edges`: list of `(from_path, to_path)` tuples (directed edges)
+/// - `source`: source node path
+/// - `target`: target node path
+///
+/// ## Example
+/// Linear graph A→B→C with source=A, target=C:
+/// - A = (0, 2), B = (1, 1), C = (2, 0)
+pub fn double_radius_label(
+    node_paths: &[String],
+    edges: &[(String, String)],
+    source: &str,
+    target: &str,
+) -> HashMap<String, (u32, u32)> {
+    // Build undirected adjacency list for BFS traversal
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for path in node_paths {
+        adj.entry(path.as_str()).or_default();
+    }
+    for (from, to) in edges {
+        adj.entry(from.as_str()).or_default().push(to.as_str());
+        adj.entry(to.as_str()).or_default().push(from.as_str());
+    }
+
+    let dist_from_source = bfs_distances(&adj, source);
+    let dist_from_target = bfs_distances(&adj, target);
+
+    let mut labels = HashMap::with_capacity(node_paths.len());
+    for path in node_paths {
+        let d_s = dist_from_source.get(path.as_str()).copied().unwrap_or(u32::MAX);
+        let d_t = dist_from_target.get(path.as_str()).copied().unwrap_or(u32::MAX);
+        labels.insert(path.clone(), (d_s, d_t));
+    }
+    labels
+}
+
+/// Find bottleneck nodes in the bridge subgraph using Brandes' betweenness
+/// centrality algorithm on the local subgraph. Returns top-N node paths
+/// sorted by betweenness descending.
+///
+/// Excludes source and target from the results (they're anchors, not bottlenecks).
+///
+/// ## Arguments
+/// - `node_paths`: paths of all nodes in the bridge subgraph
+/// - `edges`: list of `(from_path, to_path)` tuples
+/// - `source`: source node path (excluded from results)
+/// - `target`: target node path (excluded from results)
+/// - `top_n`: number of bottleneck nodes to return
+pub fn find_bottleneck_nodes(
+    node_paths: &[String],
+    edges: &[(String, String)],
+    source: &str,
+    target: &str,
+    top_n: usize,
+) -> Vec<String> {
+    use std::collections::VecDeque;
+
+    if node_paths.len() < 3 {
+        return Vec::new(); // Need at least source + target + 1 intermediate
+    }
+
+    // Map paths to indices for efficient computation
+    let path_to_idx: HashMap<&str, usize> = node_paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.as_str(), i))
+        .collect();
+    let n = node_paths.len();
+
+    // Build undirected adjacency list (by index)
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (from, to) in edges {
+        if let (Some(&fi), Some(&ti)) = (path_to_idx.get(from.as_str()), path_to_idx.get(to.as_str())) {
+            if !adj[fi].contains(&ti) {
+                adj[fi].push(ti);
+            }
+            if !adj[ti].contains(&fi) {
+                adj[ti].push(fi);
+            }
+        }
+    }
+
+    // Brandes' algorithm for betweenness centrality on undirected graph
+    let mut betweenness = vec![0.0f64; n];
+
+    for s in 0..n {
+        let mut stack = Vec::new();
+        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut sigma = vec![0.0f64; n]; // number of shortest paths
+        sigma[s] = 1.0;
+        let mut dist: Vec<i64> = vec![-1; n];
+        dist[s] = 0;
+
+        let mut queue = VecDeque::new();
+        queue.push_back(s);
+
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            for &w in &adj[v] {
+                // w found for the first time?
+                if dist[w] < 0 {
+                    queue.push_back(w);
+                    dist[w] = dist[v] + 1;
+                }
+                // shortest path to w via v?
+                if dist[w] == dist[v] + 1 {
+                    sigma[w] += sigma[v];
+                    predecessors[w].push(v);
+                }
+            }
+        }
+
+        let mut delta = vec![0.0f64; n];
+        while let Some(w) = stack.pop() {
+            for &v in &predecessors[w] {
+                delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
+            }
+            if w != s {
+                betweenness[w] += delta[w];
+            }
+        }
+    }
+
+    // Normalize (undirected: divide by 2)
+    for b in betweenness.iter_mut() {
+        *b /= 2.0;
+    }
+
+    // Collect intermediate nodes (exclude source and target), sort by betweenness
+    let mut candidates: Vec<(usize, f64)> = betweenness
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            let path = &node_paths[*i];
+            path != source && path != target
+        })
+        .map(|(i, &b)| (i, b))
+        .collect();
+
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.truncate(top_n);
+
+    candidates
+        .into_iter()
+        .filter(|(_, b)| *b > 0.0)
+        .map(|(i, _)| node_paths[i].clone())
+        .collect()
+}
+
+/// Compute the density of the bridge subgraph.
+///
+/// Density = directed_edges / (nodes * (nodes - 1))
+/// For undirected interpretation: density = edges / (nodes * (nodes - 1) / 2)
+///
+/// Returns 0.0 if nodes <= 1.
+pub fn compute_bridge_density(node_count: usize, edge_count: usize) -> f64 {
+    if node_count <= 1 {
+        return 0.0;
+    }
+    let max_edges = node_count * (node_count - 1);
+    edge_count as f64 / max_edges as f64
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2833,5 +3034,126 @@ mod tests {
             "into_ranked(1000) took {}ms, expected < 50ms",
             elapsed.as_millis()
         );
+    }
+
+    // ========================================================================
+    // Bridge subgraph tests (GraIL Plan 1)
+    // ========================================================================
+
+    #[test]
+    fn test_double_radius_label_linear_graph() {
+        // A → B → C, source=A, target=C
+        let nodes = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let edges = vec![
+            ("A".to_string(), "B".to_string()),
+            ("B".to_string(), "C".to_string()),
+        ];
+        let labels = double_radius_label(&nodes, &edges, "A", "C");
+
+        assert_eq!(labels["A"], (0, 2)); // A: 0 from source, 2 from target
+        assert_eq!(labels["B"], (1, 1)); // B: 1 from both
+        assert_eq!(labels["C"], (2, 0)); // C: 2 from source, 0 from target
+    }
+
+    #[test]
+    fn test_double_radius_label_diamond_graph() {
+        // S → A → T
+        // S → B → T
+        let nodes = vec![
+            "S".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "T".to_string(),
+        ];
+        let edges = vec![
+            ("S".to_string(), "A".to_string()),
+            ("S".to_string(), "B".to_string()),
+            ("A".to_string(), "T".to_string()),
+            ("B".to_string(), "T".to_string()),
+        ];
+        let labels = double_radius_label(&nodes, &edges, "S", "T");
+
+        assert_eq!(labels["S"], (0, 2));
+        assert_eq!(labels["A"], (1, 1));
+        assert_eq!(labels["B"], (1, 1));
+        assert_eq!(labels["T"], (2, 0));
+    }
+
+    #[test]
+    fn test_double_radius_label_unreachable_node() {
+        // A → B, C is isolated
+        let nodes = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let edges = vec![("A".to_string(), "B".to_string())];
+        let labels = double_radius_label(&nodes, &edges, "A", "B");
+
+        assert_eq!(labels["A"], (0, 1));
+        assert_eq!(labels["B"], (1, 0));
+        assert_eq!(labels["C"], (u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn test_find_bottleneck_diamond() {
+        // S → A → T, S → B → T: A and B are bottlenecks
+        let nodes = vec![
+            "S".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "T".to_string(),
+        ];
+        let edges = vec![
+            ("S".to_string(), "A".to_string()),
+            ("S".to_string(), "B".to_string()),
+            ("A".to_string(), "T".to_string()),
+            ("B".to_string(), "T".to_string()),
+        ];
+        let bottlenecks = find_bottleneck_nodes(&nodes, &edges, "S", "T", 3);
+
+        // A and B should both be bottlenecks with equal betweenness
+        assert_eq!(bottlenecks.len(), 2);
+        assert!(bottlenecks.contains(&"A".to_string()));
+        assert!(bottlenecks.contains(&"B".to_string()));
+    }
+
+    #[test]
+    fn test_find_bottleneck_chain() {
+        // A → B → C → D → E, source=A, target=E
+        // B, C, D are intermediate; C has highest betweenness (center)
+        let nodes: Vec<String> = vec!["A", "B", "C", "D", "E"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let edges = vec![
+            ("A".to_string(), "B".to_string()),
+            ("B".to_string(), "C".to_string()),
+            ("C".to_string(), "D".to_string()),
+            ("D".to_string(), "E".to_string()),
+        ];
+        let bottlenecks = find_bottleneck_nodes(&nodes, &edges, "A", "E", 1);
+
+        // C has highest betweenness in a chain
+        assert_eq!(bottlenecks.len(), 1);
+        assert_eq!(bottlenecks[0], "C");
+    }
+
+    #[test]
+    fn test_find_bottleneck_too_few_nodes() {
+        let nodes = vec!["A".to_string(), "B".to_string()];
+        let edges = vec![("A".to_string(), "B".to_string())];
+        let bottlenecks = find_bottleneck_nodes(&nodes, &edges, "A", "B", 3);
+        assert!(bottlenecks.is_empty());
+    }
+
+    #[test]
+    fn test_compute_bridge_density() {
+        // 4 nodes, 6 directed edges → density = 6 / (4*3) = 0.5
+        assert!((compute_bridge_density(4, 6) - 0.5).abs() < f64::EPSILON);
+
+        // 3 nodes, 6 edges (fully connected directed) → 6 / 6 = 1.0
+        assert!((compute_bridge_density(3, 6) - 1.0).abs() < f64::EPSILON);
+
+        // Edge cases
+        assert_eq!(compute_bridge_density(0, 0), 0.0);
+        assert_eq!(compute_bridge_density(1, 0), 0.0);
+        assert_eq!(compute_bridge_density(2, 1), 0.5);
     }
 }

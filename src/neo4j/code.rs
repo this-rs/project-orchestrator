@@ -3969,6 +3969,131 @@ impl Neo4jClient {
         Ok(scores)
     }
 
+    /// Extract the enclosing bridge subgraph between two nodes via bidirectional
+    /// BFS intersection (GraIL-inspired).
+    ///
+    /// Phase 1: BFS from source and target, intersect neighborhoods.
+    /// Phase 2: Get edges between bridge nodes.
+    /// `max_hops` controls BFS radius (1..=5). `relation_types` filters edge types.
+    pub async fn find_bridge_subgraph(
+        &self,
+        source: &str,
+        target: &str,
+        max_hops: u32,
+        relation_types: &[String],
+        project_id: &str,
+    ) -> Result<(
+        Vec<crate::graph::models::BridgeRawNode>,
+        Vec<crate::graph::models::BridgeRawEdge>,
+    )> {
+        use crate::graph::models::{BridgeRawEdge, BridgeRawNode};
+        use std::collections::HashSet;
+
+        // Build relationship pattern from whitelisted types
+        let allowed = ["IMPORTS", "CALLS", "CO_CHANGED", "EXTENDS", "IMPLEMENTS"];
+        let rel_pattern = if relation_types.is_empty() {
+            "IMPORTS".to_string()
+        } else {
+            let filtered: Vec<&str> = relation_types
+                .iter()
+                .filter_map(|t| {
+                    let upper = t.to_uppercase();
+                    allowed.iter().find(|a| **a == upper).copied()
+                })
+                .collect();
+            if filtered.is_empty() {
+                "IMPORTS".to_string()
+            } else {
+                filtered.join("|")
+            }
+        };
+
+        // max_hops is a validated u32 (1..=5), safe for format!
+        // Relationship types are whitelisted above, no injection risk
+        let hops = max_hops.clamp(1, 5);
+
+        // Phase 1: BFS intersection to find bridge node paths
+        let node_cypher = format!(
+            r#"
+            MATCH (s:File {{path: $source}})<-[:CONTAINS]-(p:Project {{id: $project_id}})
+            MATCH (t:File {{path: $target}})<-[:CONTAINS]-(p)
+            CALL {{
+              WITH s, p
+              MATCH (s)-[:{rel}*1..{hops}]-(n)
+              WHERE (n:File OR n:Function)
+                AND EXISTS {{ MATCH (n)<-[:CONTAINS*1..2]-(p) }}
+              RETURN collect(DISTINCT n) AS src_nbrs
+            }}
+            CALL {{
+              WITH t, p
+              MATCH (t)-[:{rel}*1..{hops}]-(n)
+              WHERE (n:File OR n:Function)
+                AND EXISTS {{ MATCH (n)<-[:CONTAINS*1..2]-(p) }}
+              RETURN collect(DISTINCT n) AS tgt_nbrs
+            }}
+            WITH s, t, [x IN src_nbrs WHERE x IN tgt_nbrs] + [s, t] AS bridge_list
+            UNWIND bridge_list AS bn
+            WITH DISTINCT bn
+            RETURN bn.path AS path,
+                   CASE WHEN 'Function' IN labels(bn) THEN 'Function' ELSE 'File' END AS node_type
+            "#,
+            rel = rel_pattern,
+            hops = hops
+        );
+
+        let q = neo4rs::query(&node_cypher)
+            .param("source", source)
+            .param("target", target)
+            .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut nodes = Vec::new();
+        let mut node_paths = HashSet::new();
+
+        while let Some(row) = result.next().await? {
+            let path: String = row.get("path").unwrap_or_default();
+            let node_type: String = row.get("node_type").unwrap_or_else(|_| "File".to_string());
+            if node_paths.insert(path.clone()) {
+                nodes.push(BridgeRawNode { path, node_type });
+            }
+        }
+
+        // Phase 2: Get edges between bridge nodes
+        if nodes.len() < 2 {
+            return Ok((nodes, Vec::new()));
+        }
+
+        let paths_list: Vec<&str> = node_paths.iter().map(|s| s.as_str()).collect();
+
+        let edge_cypher = format!(
+            r#"
+            UNWIND $paths AS p1
+            MATCH (n1 {{path: p1}})-[r:{rel}]->(n2)
+            WHERE n2.path IN $paths
+            RETURN DISTINCT n1.path AS from_path, type(r) AS rel_type, n2.path AS to_path
+            "#,
+            rel = rel_pattern
+        );
+
+        let eq = neo4rs::query(&edge_cypher).param("paths", paths_list);
+
+        let mut edge_result = self.graph.execute(eq).await?;
+        let mut edges = Vec::new();
+
+        while let Some(row) = edge_result.next().await? {
+            let from_path: String = row.get("from_path").unwrap_or_default();
+            let to_path: String = row.get("to_path").unwrap_or_default();
+            let rel_type: String = row.get("rel_type").unwrap_or_default();
+            edges.push(BridgeRawEdge {
+                from_path,
+                to_path,
+                rel_type,
+            });
+        }
+
+        Ok((nodes, edges))
+    }
+
     /// Compute average multi-signal impact score for top-10 files by PageRank.
     /// Single Cypher query that approximates the 5-signal fusion:
     ///   structural (normalized degree), co_change (churn_score), knowledge (knowledge_density),

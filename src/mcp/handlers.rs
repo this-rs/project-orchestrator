@@ -291,6 +291,7 @@ impl ToolHandler {
             ("code", "get_hotspots") => "get_hotspots",
             ("code", "get_knowledge_gaps") => "get_knowledge_gaps",
             ("code", "get_risk_assessment") => "get_risk_assessment",
+            ("code", "get_bridge") => "get_bridge",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -2999,6 +3000,25 @@ impl ToolHandler {
                 let result = http
                     .get_with_query("/api/code/risk-assessment", &query)
                     .await?;
+                Ok(Some(result))
+            }
+
+            "get_bridge" => {
+                let source = extract_string(args, "source")?;
+                let target = extract_string(args, "target")?;
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![
+                    ("source".to_string(), source),
+                    ("target".to_string(), target),
+                    ("project_slug".to_string(), project_slug),
+                ];
+                if let Some(v) = args.get("max_hops").and_then(|v| v.as_i64()) {
+                    query.push(("max_hops".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("top_bottlenecks").and_then(|v| v.as_i64()) {
+                    query.push(("top_bottlenecks".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/bridge", &query).await?;
                 Ok(Some(result))
             }
 

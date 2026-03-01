@@ -1007,6 +1007,74 @@ pub struct RankedList<T: Serialize> {
 }
 
 // ============================================================================
+// Bridge Subgraph — raw Neo4j results (Plan 1 GraIL)
+// ============================================================================
+
+/// Raw node from the bridge subgraph extraction (pre-labeling).
+/// The double-radius labeling (distance_to_source, distance_to_target) is computed
+/// in Rust after extraction (see Task 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeRawNode {
+    /// File path (unique identifier within the bridge)
+    pub path: String,
+    /// Node type: "File" or "Function"
+    pub node_type: String,
+}
+
+/// Raw edge from the bridge subgraph extraction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeRawEdge {
+    /// Source node path
+    pub from_path: String,
+    /// Target node path
+    pub to_path: String,
+    /// Relationship type (IMPORTS, CALLS, etc.)
+    pub rel_type: String,
+}
+
+/// A node in the enriched bridge subgraph (post double-radius labeling).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeNode {
+    /// File or function path
+    pub path: String,
+    /// Node type: "File" or "Function"
+    pub node_type: String,
+    /// BFS distance from source
+    pub distance_to_source: u32,
+    /// BFS distance from target
+    pub distance_to_target: u32,
+}
+
+/// An edge in the enriched bridge subgraph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeEdge {
+    /// Source node path
+    pub from_path: String,
+    /// Target node path
+    pub to_path: String,
+    /// Relationship type (IMPORTS, CALLS, etc.)
+    pub rel_type: String,
+}
+
+/// Complete bridge subgraph between two nodes, enriched with GraIL-style
+/// double-radius labeling, density, and bottleneck detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeSubgraph {
+    /// Source node path
+    pub source: String,
+    /// Target node path
+    pub target: String,
+    /// All nodes in the bridge subgraph (with double-radius labels)
+    pub nodes: Vec<BridgeNode>,
+    /// All edges in the bridge subgraph
+    pub edges: Vec<BridgeEdge>,
+    /// Graph density: edges / (nodes * (nodes - 1))
+    pub density: f64,
+    /// Top bottleneck nodes (highest betweenness centrality in the subgraph)
+    pub bottleneck_nodes: Vec<String>,
+}
+
+// ============================================================================
 // Multi-signal Impact Fusion (Plan 4)
 // ============================================================================
 
