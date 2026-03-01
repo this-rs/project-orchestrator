@@ -246,6 +246,10 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "find_cross_project_twins" => Some(("code", "find_cross_project_twins")),
         "predict_missing_links" => Some(("code", "predict_missing_links")),
         "check_link_plausibility" => Some(("code", "check_link_plausibility")),
+        "stress_test_node" => Some(("code", "stress_test_node")),
+        "stress_test_edge" => Some(("code", "stress_test_edge")),
+        "stress_test_cascade" => Some(("code", "stress_test_cascade")),
+        "find_bridges" => Some(("code", "find_bridges")),
 
         // Skill
         "list_skills" => Some(("skill", "list")),
@@ -758,13 +762,13 @@ fn feature_graph_tool() -> ToolDefinition {
 fn code_tool() -> ToolDefinition {
     ToolDefinition {
         name: "code".to_string(),
-        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, predict_missing_links, check_link_plausibility".to_string(),
+        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, predict_missing_links, check_link_plausibility, stress_test_node, stress_test_edge, stress_test_cascade, find_bridges".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility"],
+                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility", "stress_test_node", "stress_test_edge", "stress_test_cascade", "find_bridges"],
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
@@ -795,6 +799,10 @@ fn code_tool() -> ToolDefinition {
                 "min_plausibility": {"type": "number", "description": "Minimum plausibility score (0-1) for predicted links"},
                 "source": {"type": "string", "description": "Source node path (check_link_plausibility)"},
                 "target": {"type": "string", "description": "Target node path (check_link_plausibility)"},
+                "target_id": {"type": "string", "description": "Target node ID (stress_test_node/stress_test_cascade)"},
+                "from_id": {"type": "string", "description": "Source node ID (stress_test_edge)"},
+                "to_id": {"type": "string", "description": "Target node ID (stress_test_edge)"},
+                "max_iterations": {"type": "integer", "description": "Max cascade iterations (stress_test_cascade, default 10)"},
                 "limit": {"type": "integer", "description": "Max results / depth (search/get_call_graph)"}
             })),
             required: Some(vec!["action".to_string()]),
@@ -1123,6 +1131,10 @@ mod tests {
             "find_cross_project_twins",
             "predict_missing_links",
             "check_link_plausibility",
+            "stress_test_node",
+            "stress_test_edge",
+            "stress_test_cascade",
+            "find_bridges",
         ];
 
         for name in &old_names {

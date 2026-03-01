@@ -634,6 +634,25 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(code_handlers::check_link_plausibility),
         )
         // ================================================================
+        // Stress Testing
+        // ================================================================
+        .route(
+            "/api/code/stress-test-node",
+            post(code_handlers::stress_test_node),
+        )
+        .route(
+            "/api/code/stress-test-edge",
+            post(code_handlers::stress_test_edge),
+        )
+        .route(
+            "/api/code/stress-test-cascade",
+            post(code_handlers::stress_test_cascade),
+        )
+        .route(
+            "/api/code/find-bridges",
+            post(code_handlers::find_bridges),
+        )
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(

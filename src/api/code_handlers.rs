@@ -3301,6 +3301,173 @@ pub async fn check_link_plausibility(
     Ok(Json(serde_json::json!(prediction)))
 }
 
+// ============================================================================
+// Stress Testing (Plan 5)
+// ============================================================================
+
+/// Request body for stress_test_node endpoint.
+#[derive(Debug, Deserialize)]
+pub struct StressTestNodeBody {
+    pub project_slug: String,
+    pub target_id: String,
+}
+
+/// POST /api/code/stress-test-node
+///
+/// Simulates removing a node from the project's file graph and measures the
+/// impact: orphaned nodes, blast radius, resilience score, etc.
+pub async fn stress_test_node(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<StressTestNodeBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::stress_test_node_removal;
+    use crate::graph::extraction::GraphExtractor;
+
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let graph = extractor.extract_file_graph(project.id).await?;
+
+    let result = stress_test_node_removal(&graph, &body.target_id).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "Target node '{}' not found in graph",
+            body.target_id
+        ))
+    })?;
+
+    Ok(Json(serde_json::json!(result)))
+}
+
+/// Request body for stress_test_edge endpoint.
+#[derive(Debug, Deserialize)]
+pub struct StressTestEdgeBody {
+    pub project_slug: String,
+    pub from_id: String,
+    pub to_id: String,
+}
+
+/// POST /api/code/stress-test-edge
+///
+/// Simulates removing an edge from the project's file graph and measures
+/// whether it is a bridge (increases connected components).
+pub async fn stress_test_edge(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<StressTestEdgeBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::stress_test_edge_removal;
+    use crate::graph::extraction::GraphExtractor;
+
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let graph = extractor.extract_file_graph(project.id).await?;
+
+    let result = stress_test_edge_removal(&graph, &body.from_id, &body.to_id).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "Edge '{}' -> '{}' not found in graph",
+            body.from_id, body.to_id
+        ))
+    })?;
+
+    Ok(Json(serde_json::json!(result)))
+}
+
+/// Request body for stress_test_cascade endpoint.
+#[derive(Debug, Deserialize)]
+pub struct StressTestCascadeBody {
+    pub project_slug: String,
+    pub target_id: String,
+    pub max_iterations: Option<usize>,
+}
+
+/// POST /api/code/stress-test-cascade
+///
+/// Simulates a cascading removal starting from a target node: removes the node,
+/// then iteratively removes nodes whose incoming dependencies are all removed,
+/// until no new orphans appear or max_iterations is reached.
+pub async fn stress_test_cascade(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<StressTestCascadeBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::stress_test_cascade;
+    use crate::graph::extraction::GraphExtractor;
+
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let graph = extractor.extract_file_graph(project.id).await?;
+
+    let max_iterations = body.max_iterations.unwrap_or(10);
+
+    let result =
+        stress_test_cascade(&graph, &body.target_id, max_iterations).ok_or_else(|| {
+            AppError::NotFound(format!(
+                "Target node '{}' not found in graph",
+                body.target_id
+            ))
+        })?;
+
+    Ok(Json(serde_json::json!(result)))
+}
+
+/// Request body for find_bridges endpoint.
+#[derive(Debug, Deserialize)]
+pub struct FindBridgesBody {
+    pub project_slug: String,
+}
+
+/// POST /api/code/find-bridges
+///
+/// Finds all bridge edges in the project's file graph. A bridge is an edge
+/// whose removal increases the number of connected components.
+pub async fn find_bridges(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FindBridgesBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::find_bridges;
+    use crate::graph::extraction::GraphExtractor;
+
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let graph = extractor.extract_file_graph(project.id).await?;
+
+    let bridges = find_bridges(&graph);
+
+    Ok(Json(serde_json::json!({
+        "bridges": bridges,
+        "total": bridges.len(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

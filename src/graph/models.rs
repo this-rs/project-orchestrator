@@ -506,6 +506,44 @@ pub struct LinkPrediction {
     pub suggested_relation: String,
 }
 
+/// Mode of stress test simulation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StressTestMode {
+    /// Remove a single node and measure impact
+    NodeRemoval,
+    /// Remove a single edge and measure impact
+    EdgeRemoval,
+    /// Cascade removal: iteratively remove orphaned dependents
+    Cascade,
+}
+
+/// Result of a stress test simulation.
+///
+/// Measures the impact of removing a node or edge from the graph:
+/// blast radius, orphaned nodes, resilience score, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StressTestResult {
+    /// Target node/edge that was removed
+    pub target: String,
+    /// Type of stress test performed
+    pub mode: StressTestMode,
+    /// Resilience score (0.0 = catastrophic, 1.0 = no impact)
+    pub resilience_score: f64,
+    /// Number of nodes that became orphaned (unreachable)
+    pub orphaned_nodes: usize,
+    /// Total blast radius (nodes affected by removal)
+    pub blast_radius: usize,
+    /// Depth of cascade (for cascade mode)
+    pub cascade_depth: usize,
+    /// Number of connected components before removal
+    pub components_before: usize,
+    /// Number of connected components after removal
+    pub components_after: usize,
+    /// List of critical edges (bridges) found near the target
+    pub critical_edges: Vec<(String, String)>,
+}
+
 /// Result of K-means clustering on structural DNA vectors.
 ///
 /// Each cluster represents a group of structurally similar files that play

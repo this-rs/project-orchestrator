@@ -2041,6 +2041,334 @@ pub fn compute_bridge_density(node_count: usize, edge_count: usize) -> f64 {
 }
 
 // ============================================================================
+// GraIL algorithms — Stress Testing (Plan 5)
+// ============================================================================
+
+/// Build an undirected petgraph from our directed CodeGraph.
+///
+/// Creates a `UnGraph<(), ()>` where node indices match the original graph.
+/// An optional `exclude_edge` predicate can filter specific edges.
+fn build_undirected<F>(
+    g: &petgraph::Graph<super::models::CodeNode, super::models::CodeEdge, petgraph::Directed>,
+    exclude_edge: F,
+) -> petgraph::graph::UnGraph<(), ()>
+where
+    F: Fn(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex) -> bool,
+{
+    let mut ug = petgraph::graph::UnGraph::<(), ()>::with_capacity(
+        g.node_count(),
+        g.edge_count(),
+    );
+    // Add nodes in index order so indices match
+    for _ in g.node_indices() {
+        ug.add_node(());
+    }
+    // Add edges (skip excluded)
+    for e in g.edge_indices() {
+        if let Some((s, t)) = g.edge_endpoints(e) {
+            if !exclude_edge(s, t) {
+                let s_new = petgraph::graph::NodeIndex::new(s.index());
+                let t_new = petgraph::graph::NodeIndex::new(t.index());
+                ug.add_edge(s_new, t_new, ());
+            }
+        }
+    }
+    ug
+}
+
+/// Simulate removing a node from the graph and measure impact.
+///
+/// Computes WCC before and after removal. Orphaned nodes are those
+/// that were in the same component as the target but end up in a
+/// singleton component after removal.
+///
+/// Returns `StressTestResult` with resilience_score = 1.0 - (orphans / total).
+pub fn stress_test_node_removal(
+    graph: &CodeGraph,
+    target_id: &str,
+) -> Option<super::models::StressTestResult> {
+    use petgraph::algo::connected_components;
+
+    let g = &graph.graph;
+    let target_idx = graph.id_to_index.get(target_id)?;
+
+    let total_nodes = g.node_count();
+    if total_nodes <= 1 {
+        return Some(super::models::StressTestResult {
+            target: target_id.to_string(),
+            mode: super::models::StressTestMode::NodeRemoval,
+            resilience_score: 0.0,
+            orphaned_nodes: 0,
+            blast_radius: 0,
+            cascade_depth: 0,
+            components_before: 1,
+            components_after: 0,
+            critical_edges: vec![],
+        });
+    }
+
+    // Convert to undirected for WCC
+    let undirected = build_undirected(g, |_, _| false);
+    let components_before = connected_components(&undirected);
+
+    // BFS on undirected graph, skipping target node, to compute:
+    // - components_after (number of WCC excluding target)
+    // - orphaned_nodes (singleton components created by removal)
+    let target_ug = petgraph::graph::NodeIndex::<u32>::new(target_idx.index());
+    let mut component_sizes: Vec<usize> = Vec::new();
+    let mut visited = vec![false; undirected.node_count()];
+    visited[target_ug.index()] = true; // mark target as visited so we skip it
+
+    for start in undirected.node_indices() {
+        if visited[start.index()] {
+            continue;
+        }
+        // BFS to find component size
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start);
+        visited[start.index()] = true;
+        let mut size = 0usize;
+        while let Some(current) = queue.pop_front() {
+            size += 1;
+            for neighbor in undirected.neighbors(current) {
+                if !visited[neighbor.index()] {
+                    visited[neighbor.index()] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        component_sizes.push(size);
+    }
+
+    let components_after = component_sizes.len();
+    let orphaned_nodes = component_sizes.iter().filter(|&&s| s == 1).count();
+    let blast_radius = components_after.saturating_sub(components_before);
+
+    let resilience_score = if total_nodes > 1 {
+        1.0 - (orphaned_nodes as f64 / (total_nodes - 1) as f64)
+    } else {
+        0.0
+    };
+
+    Some(super::models::StressTestResult {
+        target: target_id.to_string(),
+        mode: super::models::StressTestMode::NodeRemoval,
+        resilience_score: resilience_score.max(0.0),
+        orphaned_nodes,
+        blast_radius,
+        cascade_depth: 0,
+        components_before,
+        components_after,
+        critical_edges: vec![],
+    })
+}
+
+/// Find bridge edges using Tarjan's algorithm.
+///
+/// A bridge is an edge whose removal increases the number of connected components.
+/// Uses DFS with discovery time and low-link values.
+///
+/// Returns Vec<(source_id, target_id)> for all bridges in the graph.
+pub fn find_bridges(graph: &CodeGraph) -> Vec<(String, String)> {
+    let g = &graph.graph;
+    let n = g.node_count();
+    if n == 0 {
+        return vec![];
+    }
+
+    let mut disc = vec![0u32; n];
+    let mut low = vec![0u32; n];
+    let mut visited = vec![false; n];
+    let mut timer: u32 = 1;
+    let mut bridges: Vec<(NodeIndex, NodeIndex)> = Vec::new();
+
+    // Build undirected adjacency (merge both directions)
+    let mut adj: Vec<Vec<NodeIndex>> = vec![Vec::new(); n];
+    for edge_idx in g.edge_indices() {
+        if let Some((s, t)) = g.edge_endpoints(edge_idx) {
+            adj[s.index()].push(t);
+            adj[t.index()].push(s);
+        }
+    }
+    // Deduplicate adjacency lists
+    for neighbors in &mut adj {
+        neighbors.sort_by_key(|n| n.index());
+        neighbors.dedup();
+    }
+
+    fn dfs_bridge(
+        u: NodeIndex,
+        parent: Option<NodeIndex>,
+        adj: &[Vec<NodeIndex>],
+        disc: &mut [u32],
+        low: &mut [u32],
+        visited: &mut [bool],
+        timer: &mut u32,
+        bridges: &mut Vec<(NodeIndex, NodeIndex)>,
+    ) {
+        visited[u.index()] = true;
+        disc[u.index()] = *timer;
+        low[u.index()] = *timer;
+        *timer += 1;
+
+        for &v in &adj[u.index()] {
+            if Some(v) == parent {
+                continue;
+            }
+            if visited[v.index()] {
+                low[u.index()] = low[u.index()].min(disc[v.index()]);
+            } else {
+                dfs_bridge(v, Some(u), adj, disc, low, visited, timer, bridges);
+                low[u.index()] = low[u.index()].min(low[v.index()]);
+                if low[v.index()] > disc[u.index()] {
+                    bridges.push((u, v));
+                }
+            }
+        }
+    }
+
+    // Run DFS from each unvisited node (handles disconnected graphs)
+    for node in g.node_indices() {
+        if !visited[node.index()] {
+            dfs_bridge(
+                node,
+                None,
+                &adj,
+                &mut disc,
+                &mut low,
+                &mut visited,
+                &mut timer,
+                &mut bridges,
+            );
+        }
+    }
+
+    // Convert to ID strings
+    bridges
+        .into_iter()
+        .map(|(u, v)| (g[u].id.clone(), g[v].id.clone()))
+        .collect()
+}
+
+/// Simulate cascade removal: iteratively remove orphaned dependents.
+///
+/// Starting from the target node, removes it, then finds all nodes
+/// whose incoming dependencies are ALL in the removed set, removes them too,
+/// repeating until no new orphans are found or max_iterations is reached.
+///
+/// Returns blast_radius (total removed) and cascade_depth.
+pub fn stress_test_cascade(
+    graph: &CodeGraph,
+    target_id: &str,
+    max_iterations: usize,
+) -> Option<super::models::StressTestResult> {
+    let g = &graph.graph;
+    let target_idx = *graph.id_to_index.get(target_id)?;
+    let total_nodes = g.node_count();
+
+    let mut removed: HashSet<NodeIndex> = HashSet::new();
+    removed.insert(target_idx);
+
+    let mut cascade_depth = 0;
+
+    for _ in 0..max_iterations {
+        let mut new_orphans: Vec<NodeIndex> = Vec::new();
+
+        for node in g.node_indices() {
+            if removed.contains(&node) {
+                continue;
+            }
+            // Check if ALL incoming edges come from removed nodes
+            let incoming: Vec<NodeIndex> = g
+                .neighbors_directed(node, Direction::Incoming)
+                .collect();
+
+            if !incoming.is_empty() && incoming.iter().all(|n| removed.contains(n)) {
+                new_orphans.push(node);
+            }
+        }
+
+        if new_orphans.is_empty() {
+            break;
+        }
+
+        for orphan in &new_orphans {
+            removed.insert(*orphan);
+        }
+        cascade_depth += 1;
+    }
+
+    let blast_radius = removed.len();
+    let orphaned_nodes = blast_radius.saturating_sub(1); // exclude the target itself
+
+    let resilience_score = if total_nodes > 1 {
+        1.0 - (orphaned_nodes as f64 / (total_nodes - 1) as f64)
+    } else {
+        0.0
+    };
+
+    // Compute WCC before
+    let undirected = build_undirected(g, |_, _| false);
+    let components_before = petgraph::algo::connected_components(&undirected);
+
+    Some(super::models::StressTestResult {
+        target: target_id.to_string(),
+        mode: super::models::StressTestMode::Cascade,
+        resilience_score: resilience_score.max(0.0),
+        orphaned_nodes,
+        blast_radius,
+        cascade_depth,
+        components_before,
+        components_after: 0, // Not trivially computed for cascade
+        critical_edges: vec![],
+    })
+}
+
+/// Simulate removing an edge from the graph and measure impact.
+///
+/// Checks if the edge is a bridge (increases WCC count by 1).
+pub fn stress_test_edge_removal(
+    graph: &CodeGraph,
+    from_id: &str,
+    to_id: &str,
+) -> Option<super::models::StressTestResult> {
+    let g = &graph.graph;
+    let _from_idx = graph.id_to_index.get(from_id)?;
+    let _to_idx = graph.id_to_index.get(to_id)?;
+
+    // Build undirected and count components before
+    let undirected_before = build_undirected(g, |_, _| false);
+    let components_before = petgraph::algo::connected_components(&undirected_before);
+
+    // Build undirected WITHOUT the target edge
+    let from_idx = *_from_idx;
+    let to_idx = *_to_idx;
+    let undirected_after = build_undirected(g, |s, t| {
+        (s == from_idx && t == to_idx) || (s == to_idx && t == from_idx)
+    });
+    let components_after = petgraph::algo::connected_components(&undirected_after);
+
+    let is_bridge = components_after > components_before;
+    let resilience_score = if is_bridge { 0.0 } else { 1.0 };
+
+    Some(super::models::StressTestResult {
+        target: format!("{} -> {}", from_id, to_id),
+        mode: super::models::StressTestMode::EdgeRemoval,
+        resilience_score,
+        orphaned_nodes: 0,
+        blast_radius: if is_bridge { 1 } else { 0 },
+        cascade_depth: 0,
+        components_before,
+        components_after,
+        critical_edges: if is_bridge {
+            vec![(from_id.to_string(), to_id.to_string())]
+        } else {
+            vec![]
+        },
+    })
+}
+
+// ============================================================================
 // GraIL algorithms — Missing Link Prediction (Plan 9)
 // ============================================================================
 
@@ -4368,5 +4696,248 @@ mod tests {
         let g = make_chain_abc(); // Only IMPORTS edges
         let data = extract_co_change_data(&g);
         assert!(data.is_empty(), "IMPORTS edges should not be extracted as co-change");
+    }
+
+    // ========================================================================
+    // Stress Testing (Plan 5) tests
+    // ========================================================================
+
+    /// Helper: build a star graph (center + N leaves).
+    /// All edges are center → leaf_i.
+    fn make_star_stress(n: usize) -> CodeGraph {
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "center".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("center".to_string()),
+            name: "center".to_string(),
+            project_id: None,
+        });
+        for i in 0..n {
+            let id = format!("leaf_{}", i);
+            g.add_node(CodeNode {
+                id: id.clone(),
+                node_type: CodeNodeType::File,
+                path: Some(id.clone()),
+                name: id.clone(),
+                project_id: None,
+            });
+            g.add_edge(
+                "center",
+                &id,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Imports,
+                    weight: 1.0,
+                },
+            );
+        }
+        g
+    }
+
+    /// Helper: A-B-C-D chain.
+    fn make_chain_stress() -> CodeGraph {
+        let mut g = CodeGraph::new();
+        for id in &["A", "B", "C", "D"] {
+            g.add_node(CodeNode {
+                id: id.to_string(),
+                node_type: CodeNodeType::File,
+                path: Some(id.to_string()),
+                name: id.to_string(),
+                project_id: None,
+            });
+        }
+        g.add_edge("A", "B", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("B", "C", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("C", "D", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g
+    }
+
+    // -- stress_test_node_removal --
+
+    #[test]
+    fn test_stress_node_removal_star_center() {
+        let g = make_star_stress(4);
+        let result = stress_test_node_removal(&g, "center").unwrap();
+        assert_eq!(result.mode, super::super::models::StressTestMode::NodeRemoval);
+        assert_eq!(result.target, "center");
+        // Removing the center should orphan all 4 leaves
+        assert_eq!(result.orphaned_nodes, 4);
+        assert_eq!(result.components_before, 1);
+        assert_eq!(result.components_after, 4);
+        assert!(result.resilience_score < 0.1, "Resilience should be very low");
+    }
+
+    #[test]
+    fn test_stress_node_removal_leaf() {
+        let g = make_star_stress(4);
+        let result = stress_test_node_removal(&g, "leaf_0").unwrap();
+        // Removing a leaf should have minimal impact
+        assert_eq!(result.orphaned_nodes, 0);
+        assert_eq!(result.components_before, 1);
+        assert_eq!(result.components_after, 1);
+        assert!(result.resilience_score > 0.9, "Resilience should be high");
+    }
+
+    #[test]
+    fn test_stress_node_removal_chain_middle() {
+        let g = make_chain_stress(); // A-B-C-D
+        let result = stress_test_node_removal(&g, "B").unwrap();
+        // Removing B splits: A alone, C-D together
+        assert_eq!(result.components_before, 1);
+        assert_eq!(result.components_after, 2);
+        assert_eq!(result.orphaned_nodes, 1); // A becomes singleton
+    }
+
+    #[test]
+    fn test_stress_node_removal_unknown() {
+        let g = make_chain_stress();
+        assert!(stress_test_node_removal(&g, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_stress_node_removal_single_node() {
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "alone".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("alone".to_string()),
+            name: "alone".to_string(),
+            project_id: None,
+        });
+        let result = stress_test_node_removal(&g, "alone").unwrap();
+        assert_eq!(result.resilience_score, 0.0);
+        assert_eq!(result.components_before, 1);
+        assert_eq!(result.components_after, 0);
+    }
+
+    // -- find_bridges --
+
+    #[test]
+    fn test_find_bridges_chain() {
+        let g = make_chain_stress(); // A-B-C-D
+        let bridges = find_bridges(&g);
+        // In a chain, every edge is a bridge
+        assert_eq!(bridges.len(), 3, "Chain of 4 should have 3 bridges");
+    }
+
+    #[test]
+    fn test_find_bridges_cycle() {
+        // A-B-C-A: no bridges (cycle)
+        let mut g = CodeGraph::new();
+        for id in &["A", "B", "C"] {
+            g.add_node(CodeNode {
+                id: id.to_string(),
+                node_type: CodeNodeType::File,
+                path: Some(id.to_string()),
+                name: id.to_string(),
+                project_id: None,
+            });
+        }
+        g.add_edge("A", "B", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("B", "C", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("C", "A", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        let bridges = find_bridges(&g);
+        assert!(bridges.is_empty(), "Cycle should have no bridges");
+    }
+
+    #[test]
+    fn test_find_bridges_star() {
+        let g = make_star_stress(3);
+        let bridges = find_bridges(&g);
+        // Star: every edge is a bridge
+        assert_eq!(bridges.len(), 3, "Star with 3 leaves should have 3 bridges");
+    }
+
+    #[test]
+    fn test_find_bridges_empty() {
+        let g = CodeGraph::new();
+        let bridges = find_bridges(&g);
+        assert!(bridges.is_empty());
+    }
+
+    // -- stress_test_cascade --
+
+    #[test]
+    fn test_stress_cascade_chain() {
+        // A→B→C→D: removing A should cascade: A removed → B has no incoming
+        // but depends on direction. In cascade, we remove nodes with NO remaining incoming edges.
+        let g = make_chain_stress(); // A→B→C→D
+        let result = stress_test_cascade(&g, "A", 10).unwrap();
+        assert_eq!(result.mode, super::super::models::StressTestMode::Cascade);
+        // A removed → B loses its only incoming → B removed → C removed → D removed
+        assert_eq!(result.blast_radius, 4, "Full cascade should remove all 4 nodes");
+        assert!(result.cascade_depth >= 1, "Should have at least 1 cascade round");
+    }
+
+    #[test]
+    fn test_stress_cascade_star_center() {
+        let g = make_star_stress(3); // center→leaf_0, center→leaf_1, center→leaf_2
+        let result = stress_test_cascade(&g, "center", 10).unwrap();
+        // center removed → all leaves lose incoming → all removed
+        assert_eq!(result.blast_radius, 4); // center + 3 leaves
+    }
+
+    #[test]
+    fn test_stress_cascade_leaf() {
+        let g = make_star_stress(3);
+        let result = stress_test_cascade(&g, "leaf_0", 10).unwrap();
+        // Removing a leaf shouldn't cascade
+        assert_eq!(result.blast_radius, 1); // only the leaf itself
+        assert_eq!(result.cascade_depth, 0);
+    }
+
+    #[test]
+    fn test_stress_cascade_unknown() {
+        let g = make_chain_stress();
+        assert!(stress_test_cascade(&g, "nonexistent", 10).is_none());
+    }
+
+    #[test]
+    fn test_stress_cascade_max_iterations() {
+        let g = make_chain_stress(); // A→B→C→D
+        // With max_iterations=1, cascade should stop after 1 round
+        let result = stress_test_cascade(&g, "A", 1).unwrap();
+        assert!(result.cascade_depth <= 1);
+    }
+
+    // -- stress_test_edge_removal --
+
+    #[test]
+    fn test_stress_edge_removal_bridge() {
+        let g = make_chain_stress(); // A-B-C-D
+        let result = stress_test_edge_removal(&g, "B", "C").unwrap();
+        assert_eq!(result.mode, super::super::models::StressTestMode::EdgeRemoval);
+        // B-C is a bridge in the chain
+        assert_eq!(result.resilience_score, 0.0, "Bridge removal should give 0 resilience");
+        assert!(result.components_after > result.components_before);
+        assert_eq!(result.critical_edges.len(), 1);
+    }
+
+    #[test]
+    fn test_stress_edge_removal_non_bridge() {
+        // A-B-C-A cycle: no edge is a bridge
+        let mut g = CodeGraph::new();
+        for id in &["A", "B", "C"] {
+            g.add_node(CodeNode {
+                id: id.to_string(),
+                node_type: CodeNodeType::File,
+                path: Some(id.to_string()),
+                name: id.to_string(),
+                project_id: None,
+            });
+        }
+        g.add_edge("A", "B", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("B", "C", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("C", "A", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        let result = stress_test_edge_removal(&g, "A", "B").unwrap();
+        assert_eq!(result.resilience_score, 1.0, "Non-bridge should give 1.0 resilience");
+        assert_eq!(result.components_before, result.components_after);
+        assert!(result.critical_edges.is_empty());
+    }
+
+    #[test]
+    fn test_stress_edge_removal_unknown() {
+        let g = make_chain_stress();
+        assert!(stress_test_edge_removal(&g, "A", "nonexistent").is_none());
     }
 }

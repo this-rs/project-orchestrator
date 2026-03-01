@@ -303,6 +303,10 @@ impl ToolHandler {
             ("code", "find_cross_project_twins") => "find_cross_project_twins",
             ("code", "predict_missing_links") => "predict_missing_links",
             ("code", "check_link_plausibility") => "check_link_plausibility",
+            ("code", "stress_test_node") => "stress_test_node",
+            ("code", "stress_test_edge") => "stress_test_edge",
+            ("code", "stress_test_cascade") => "stress_test_cascade",
+            ("code", "find_bridges") => "find_bridges",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -3125,6 +3129,28 @@ impl ToolHandler {
 
             "check_link_plausibility" => {
                 let result = http.post("/api/code/link-plausibility", args).await?;
+                Ok(Some(result))
+            }
+
+            // ── P5: Stress Testing (4 tools) ──────────────────────────────
+
+            "stress_test_node" => {
+                let result = http.post("/api/code/stress-test-node", args).await?;
+                Ok(Some(result))
+            }
+
+            "stress_test_edge" => {
+                let result = http.post("/api/code/stress-test-edge", args).await?;
+                Ok(Some(result))
+            }
+
+            "stress_test_cascade" => {
+                let result = http.post("/api/code/stress-test-cascade", args).await?;
+                Ok(Some(result))
+            }
+
+            "find_bridges" => {
+                let result = http.post("/api/code/find-bridges", args).await?;
                 Ok(Some(result))
             }
 
@@ -6499,6 +6525,22 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "POST");
         assert_eq!(result["path"], "/api/code/link-plausibility");
+    }
+
+    // -- Stress testing -----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_stress_test_node() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "stress_test_node",
+                Some(json!({"project_slug": "my-project", "target_id": "src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/code/stress-test-node");
     }
 
     // -- Feature graphs -----------------------------------------------------
