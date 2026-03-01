@@ -10,6 +10,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::handlers::{AppError, OrchestratorState};
+use crate::graph::algorithms::into_ranked;
+use crate::graph::models::RankedList;
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
 
 // ============================================================================
@@ -30,20 +32,40 @@ pub struct CodeSearchQuery {
     pub workspace_slug: Option<String>,
 }
 
+/// Search response with both legacy hits and ranked view (Plan 10).
+#[derive(Serialize)]
+pub struct CodeSearchResult {
+    /// Legacy: flat list of SearchHit (retro-compatible)
+    pub hits: Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>,
+    /// Ranked view with margins and natural clusters.
+    /// Uses CodeDocument directly (Meilisearch score as ranking score).
+    pub ranked: RankedList<crate::meilisearch::indexes::CodeDocument>,
+}
+
+/// Build a CodeSearchResult from raw Meilisearch hits
+fn build_search_result(
+    hits: Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>,
+) -> CodeSearchResult {
+    let scored: Vec<(crate::meilisearch::indexes::CodeDocument, f64)> = hits
+        .iter()
+        .map(|h| (h.document.clone(), h.score))
+        .collect();
+    let total = scored.len();
+    let ranked = into_ranked(scored, total);
+    CodeSearchResult { hits, ranked }
+}
+
 /// Search code semantically across the codebase
 ///
-/// Returns `SearchHit<CodeDocument>` directly so the frontend gets
-/// the `{ document, score }` shape it expects.
+/// Returns a `CodeSearchResult` with both legacy `hits` array and
+/// `ranked` view with margins and clusters (Plan 10).
 ///
 /// When `workspace_slug` is provided (and `project_slug` is not), searches all
 /// projects in the workspace, merges results by score, and truncates to `limit`.
 pub async fn search_code(
     State(state): State<OrchestratorState>,
     Query(params): Query<CodeSearchQuery>,
-) -> Result<
-    Json<Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>>,
-    AppError,
-> {
+) -> Result<Json<CodeSearchResult>, AppError> {
     let limit = params.limit.unwrap_or(10);
 
     // If project_slug is given, use it directly (backward compat)
@@ -59,7 +81,7 @@ pub async fn search_code(
                 None,
             )
             .await?;
-        return Ok(Json(hits));
+        return Ok(Json(build_search_result(hits)));
     }
 
     // If workspace_slug is given, resolve to project slugs and merge results
@@ -102,7 +124,7 @@ pub async fn search_code(
         });
         all_hits.truncate(limit);
 
-        return Ok(Json(all_hits));
+        return Ok(Json(build_search_result(all_hits)));
     }
 
     // No filter — global search
@@ -112,7 +134,7 @@ pub async fn search_code(
         .search_code_with_scores(&params.query, limit, params.language.as_deref(), None, None)
         .await?;
 
-    Ok(Json(hits))
+    Ok(Json(build_search_result(hits)))
 }
 
 // ============================================================================
@@ -227,7 +249,7 @@ pub struct FindReferencesQuery {
     pub project_slug: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolReference {
     pub file_path: String,
     pub line: u32,
@@ -235,11 +257,21 @@ pub struct SymbolReference {
     pub reference_type: String, // "call", "import", "type_usage"
 }
 
+/// Response for find_references with both legacy array and ranked view.
+#[derive(Serialize)]
+pub struct FindReferencesResult {
+    /// Legacy: flat list of references (retro-compatible)
+    pub references: Vec<SymbolReference>,
+    /// Ranked view with margins and clusters (Plan 10).
+    /// Calls scored 1.0, imports 0.7, type_usage 0.5.
+    pub ranked: RankedList<SymbolReference>,
+}
+
 /// Find all references to a symbol across the codebase
 pub async fn find_references(
     State(state): State<OrchestratorState>,
     Query(query): Query<FindReferencesQuery>,
-) -> Result<Json<Vec<SymbolReference>>, AppError> {
+) -> Result<Json<FindReferencesResult>, AppError> {
     let limit = query.limit.unwrap_or(20);
 
     let project_id = if let Some(ref slug) = query.project_slug {
@@ -272,7 +304,23 @@ pub async fn find_references(
         })
         .collect();
 
-    Ok(Json(references))
+    // Score references by type: calls are most important, then imports, then type_usage
+    let scored: Vec<(SymbolReference, f64)> = references
+        .iter()
+        .map(|r| {
+            let type_score = match r.reference_type.as_str() {
+                "call" => 1.0,
+                "import" => 0.7,
+                "type_usage" => 0.5,
+                _ => 0.3,
+            };
+            (r.clone(), type_score)
+        })
+        .collect();
+    let total = scored.len();
+    let ranked = into_ranked(scored, total);
+
+    Ok(Json(FindReferencesResult { references, ranked }))
 }
 
 // ============================================================================
@@ -482,6 +530,13 @@ pub struct ImpactQuery {
     pub project_slug: Option<String>,
 }
 
+/// A single affected file with its path — used as the item type for `RankedList`.
+/// The `#[serde(flatten)]` on `RankedResult<AffectedFile>` puts `path` at top level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedFile {
+    pub path: String,
+}
+
 #[derive(Serialize)]
 pub struct ImpactAnalysis {
     pub target: String,
@@ -503,6 +558,9 @@ pub struct ImpactAnalysis {
     /// Architectural decisions that AFFECT the target or its impacted files
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub affecting_decisions: Vec<DecisionNode>,
+    /// Ranked view of all affected files with margins and natural clusters (Plan 10).
+    /// Direct files score 1.0, transitive-only files score 0.33.
+    pub ranked_affected: RankedList<AffectedFile>,
 }
 
 /// Analyze impact of changing a file or function
@@ -727,6 +785,24 @@ pub async fn analyze_impact(
         decisions
     };
 
+    // Build ranked view: direct files score 1.0, transitive-only score 0.33
+    let ranked_affected = {
+        let mut scored: Vec<(AffectedFile, f64)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for path in &directly_affected {
+            if seen.insert(path.clone()) {
+                scored.push((AffectedFile { path: path.clone() }, 1.0));
+            }
+        }
+        for path in &transitively_affected {
+            if seen.insert(path.clone()) {
+                scored.push((AffectedFile { path: path.clone() }, 0.33));
+            }
+        }
+        let total = scored.len();
+        into_ranked(scored, total)
+    };
+
     Ok(Json(ImpactAnalysis {
         target,
         directly_affected,
@@ -739,6 +815,7 @@ pub async fn analyze_impact(
         betweenness_score,
         risk_formula,
         affecting_decisions,
+        ranked_affected,
     }))
 }
 
@@ -2270,8 +2347,11 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.is_array());
-        assert_eq!(json.as_array().unwrap().len(), 0);
+        // Response is now a CodeSearchResult wrapper (Plan 10)
+        assert!(json.is_object());
+        assert!(json["hits"].is_array());
+        assert_eq!(json["hits"].as_array().unwrap().len(), 0);
+        assert!(json["ranked"]["items"].is_array());
     }
 
     #[tokio::test]
@@ -2287,14 +2367,16 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.is_array());
-        let results = json.as_array().unwrap();
+        // Response is now a CodeSearchResult wrapper (Plan 10)
+        let results = json["hits"].as_array().unwrap();
         assert!(!results.is_empty());
         // Verify SearchHit<CodeDocument> shape: { document, score }
         let first = &results[0];
         assert!(first["document"].is_object());
         assert!(first["score"].is_number());
         assert_eq!(first["document"]["path"], "src/main.rs");
+        // Verify ranked view is present
+        assert!(json["ranked"]["items"].is_array());
     }
 
     #[tokio::test]
@@ -2312,7 +2394,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let results = json.as_array().unwrap();
+        let results = json["hits"].as_array().unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0]["document"]["language"], "rust");
     }
@@ -2332,7 +2414,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json.as_array().unwrap().len(), 0);
+        assert_eq!(json["hits"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -2533,7 +2615,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let results = json.as_array().unwrap();
+        let results = json["hits"].as_array().unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0]["document"]["path"], "src/main.rs");
     }
@@ -3563,8 +3645,12 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.is_array());
-        assert_eq!(json.as_array().unwrap().len(), 0);
+        // Response is now a FindReferencesResult wrapper (Plan 10)
+        assert!(json.is_object());
+        assert!(json["references"].is_array());
+        assert_eq!(json["references"].as_array().unwrap().len(), 0);
+        assert!(json["ranked"]["items"].is_array());
+        assert_eq!(json["ranked"]["items"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -3634,11 +3720,18 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let refs = json.as_array().unwrap();
+        // Response is now a FindReferencesResult wrapper (Plan 10)
+        let refs = json["references"].as_array().unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0]["file_path"], "src/caller.rs");
         assert_eq!(refs[0]["reference_type"], "call");
         assert_eq!(refs[0]["line"], 5);
+        // Verify ranked view is also present
+        let ranked_items = json["ranked"]["items"].as_array().unwrap();
+        assert_eq!(ranked_items.len(), 1);
+        assert_eq!(ranked_items[0]["file_path"], "src/caller.rs");
+        assert_eq!(ranked_items[0]["rank"], 1);
+        assert_eq!(ranked_items[0]["score"], 1.0); // call type → 1.0
     }
 
     #[tokio::test]
