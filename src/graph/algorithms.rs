@@ -4998,7 +4998,7 @@ mod tests {
         assert!((log_size_similarity(0, 0) - 1.0).abs() < 1e-10);
         // One zero, one nonzero → still produces a valid [0,1] value
         let sim = log_size_similarity(0, 10);
-        assert!(sim >= 0.0 && sim <= 1.0, "Should be in [0,1]: {sim}");
+        assert!((0.0..=1.0).contains(&sim), "Should be in [0,1]: {sim}");
     }
 
     #[test]
