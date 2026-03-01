@@ -6929,6 +6929,7 @@ impl GraphStore for MockGraphStore {
 
         let rules = self.topology_rules.read().await;
         let mut violations = Vec::new();
+        let fallback_re = regex::Regex::new("^$").unwrap();
 
         for rule in rules.values() {
             if rule.project_id != project_id {
@@ -6942,14 +6943,14 @@ impl GraphStore for MockGraphStore {
             }
 
             let source_re = regex::Regex::new(&glob_to_regex(&rule.source_pattern))
-                .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+                .unwrap_or_else(|_| fallback_re.clone());
             if !source_re.is_match(file_path) {
                 continue;
             }
 
             let target_pattern = rule.target_pattern.as_deref().unwrap_or("**");
             let target_re = regex::Regex::new(&glob_to_regex(target_pattern))
-                .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+                .unwrap_or_else(|_| fallback_re.clone());
 
             for import_path in new_imports {
                 if target_re.is_match(import_path) {

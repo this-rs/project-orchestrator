@@ -1313,10 +1313,10 @@ pub fn cluster_dna_vectors(
             }
         }
 
-        for ci in 0..n_clusters {
+        for (ci, centroid) in new_centroids.iter_mut().enumerate().take(n_clusters) {
             if counts[ci] > 0 {
-                for d in 0..dim {
-                    new_centroids[ci][d] /= counts[ci] as f64;
+                for val in centroid.iter_mut().take(dim) {
+                    *val /= counts[ci] as f64;
                 }
             }
         }
@@ -1327,7 +1327,7 @@ pub fn cluster_dna_vectors(
     // --- Build clusters ---
     let mut clusters: Vec<super::models::DnaCluster> = Vec::with_capacity(n_clusters);
 
-    for ci in 0..n_clusters {
+    for (ci, _centroid) in centroids.iter().enumerate().take(n_clusters) {
         let member_indices: Vec<usize> = assignments
             .iter()
             .enumerate()
@@ -2190,6 +2190,7 @@ pub fn find_bridges(graph: &CodeGraph) -> Vec<(String, String)> {
         neighbors.dedup();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dfs_bridge(
         u: NodeIndex,
         parent: Option<NodeIndex>,
@@ -4218,7 +4219,11 @@ mod tests {
         // All values should be in [0, 1]
         for v in dna.values() {
             for &d in v {
-                assert!(d >= 0.0 && d <= 1.0, "DNA value out of range: {}", d);
+                assert!(
+                    (0.0..=1.0).contains(&d),
+                    "DNA value out of range: {}",
+                    d
+                );
             }
         }
     }
