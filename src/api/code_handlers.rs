@@ -3567,6 +3567,96 @@ pub async fn refresh_context_cards(
     })))
 }
 
+// ============================================================================
+// WL Fingerprint & Isomorphic Groups (Plan 7)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct FingerprintQuery {
+    /// File path (required)
+    pub path: String,
+    /// Project slug (required)
+    pub project_slug: String,
+}
+
+/// Get the WL subgraph fingerprint (hash) for a single file.
+/// Reads from the pre-computed cc_wl_hash stored via context cards.
+pub async fn get_fingerprint(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<FingerprintQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&query.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
+
+    // Resolve relative path
+    let path = if !query.path.starts_with('/') {
+        let expanded = crate::expand_tilde(&project.root_path);
+        format!("{}/{}", expanded.trim_end_matches('/'), &query.path)
+    } else {
+        query.path.clone()
+    };
+
+    let card = state
+        .orchestrator
+        .neo4j()
+        .get_context_card(&path, &project.id.to_string())
+        .await?;
+
+    match card {
+        Some(c) => Ok(Json(serde_json::json!({
+            "path": c.path,
+            "wl_hash": c.cc_wl_hash,
+            "structural_dna": c.cc_structural_dna,
+            "project_slug": query.project_slug,
+        }))),
+        None => Ok(Json(serde_json::json!({
+            "path": path,
+            "wl_hash": null,
+            "message": "No fingerprint computed yet. Run analytics or refresh context cards.",
+            "project_slug": query.project_slug,
+        }))),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct IsomorphicQuery {
+    /// Project slug (required)
+    pub project_slug: String,
+    /// Minimum group size (default: 2)
+    pub min_group_size: Option<usize>,
+}
+
+/// Find groups of files with identical WL subgraph hash (isomorphic neighborhoods).
+pub async fn find_isomorphic(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<IsomorphicQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&query.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
+
+    let min_size = query.min_group_size.unwrap_or(2);
+    let groups = state
+        .orchestrator
+        .neo4j()
+        .find_isomorphic_groups(&project.id.to_string(), min_size)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "project_slug": query.project_slug,
+        "min_group_size": min_size,
+        "groups_count": groups.len(),
+        "groups": groups,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

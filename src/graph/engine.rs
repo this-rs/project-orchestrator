@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::algorithms::{compute_all, compute_context_cards, structural_dna};
+use super::algorithms::{compute_all, compute_context_cards, structural_dna, wl_subgraph_hash_all};
 use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
@@ -196,8 +196,23 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             }
         }
 
-        // 5. Compute and persist Context Cards (aggregates analytics + DNA + WL hash)
-        let wl_hashes = std::collections::HashMap::new(); // WL hash not yet in engine pipeline (Plan 7)
+        // 5. Compute WL subgraph hashes (Plan 7)
+        let wl_hashes = match wl_subgraph_hash_all(&graph, 2, 3) {
+            Ok(hashes) => {
+                tracing::debug!(
+                    project_id = %project_id,
+                    wl_count = hashes.len(),
+                    "WL subgraph hashes computed (R=2, iterations=3)"
+                );
+                hashes
+            }
+            Err(e) => {
+                tracing::warn!("WL subgraph hash computation failed: {}", e);
+                std::collections::HashMap::new()
+            }
+        };
+
+        // 6. Compute and persist Context Cards (aggregates analytics + DNA + WL hash)
         let context_cards = compute_context_cards(&graph, &analytics, &dna_map_for_cards, &wl_hashes);
         if !context_cards.is_empty() {
             if let Err(e) = self.store.batch_save_context_cards(&context_cards).await {

@@ -2557,4 +2557,29 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<()> {
         self.invalidate_context_cards(paths, project_id).await
     }
+
+    async fn get_context_card(
+        &self,
+        path: &str,
+        project_id: &str,
+    ) -> anyhow::Result<Option<crate::graph::models::ContextCard>> {
+        self.get_context_card(path, project_id).await
+    }
+
+    async fn get_context_cards_batch(
+        &self,
+        paths: &[String],
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::ContextCard>> {
+        self.get_context_cards_batch(paths, project_id).await
+    }
+
+    async fn find_isomorphic_groups(
+        &self,
+        project_id: &str,
+        min_group_size: usize,
+    ) -> anyhow::Result<Vec<crate::graph::models::IsomorphicGroup>> {
+        self.find_isomorphic_groups(project_id, min_group_size)
+            .await
+    }
 }

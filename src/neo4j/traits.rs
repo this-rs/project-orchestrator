@@ -2157,4 +2157,27 @@ pub trait GraphStore: Send + Sync {
         paths: &[String],
         project_id: &str,
     ) -> Result<()>;
+
+    /// Read a single context card from Neo4j cc_* properties.
+    /// Returns None if the file doesn't exist or has no cc_* properties.
+    async fn get_context_card(
+        &self,
+        path: &str,
+        project_id: &str,
+    ) -> Result<Option<crate::graph::models::ContextCard>>;
+
+    /// Batch-read context cards for multiple files.
+    async fn get_context_cards_batch(
+        &self,
+        paths: &[String],
+        project_id: &str,
+    ) -> Result<Vec<crate::graph::models::ContextCard>>;
+
+    /// Find groups of files with identical WL hash (isomorphic neighborhoods).
+    /// Returns groups with at least `min_group_size` members.
+    async fn find_isomorphic_groups(
+        &self,
+        project_id: &str,
+        min_group_size: usize,
+    ) -> Result<Vec<crate::graph::models::IsomorphicGroup>>;
 }

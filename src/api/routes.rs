@@ -653,6 +653,28 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(code_handlers::find_bridges),
         )
         // ================================================================
+        // Context Cards (GraIL Plan 8)
+        // ================================================================
+        .route(
+            "/api/code/context-card",
+            get(code_handlers::get_context_card),
+        )
+        .route(
+            "/api/code/context-cards/refresh",
+            post(code_handlers::refresh_context_cards),
+        )
+        // ================================================================
+        // WL Fingerprint & Isomorphic Groups (GraIL Plan 7)
+        // ================================================================
+        .route(
+            "/api/code/fingerprint",
+            get(code_handlers::get_fingerprint),
+        )
+        .route(
+            "/api/code/isomorphic",
+            get(code_handlers::find_isomorphic),
+        )
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(

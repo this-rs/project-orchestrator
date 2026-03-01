@@ -309,6 +309,8 @@ impl ToolHandler {
             ("code", "find_bridges") => "find_bridges",
             ("code", "get_context_card") => "get_context_card",
             ("code", "refresh_context_cards") => "refresh_context_cards",
+            ("code", "get_fingerprint") => "get_fingerprint",
+            ("code", "find_isomorphic") => "find_isomorphic",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -3180,6 +3182,33 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── P7: WL Fingerprint & Isomorphic (2 tools) ──────────────
+
+            "get_fingerprint" => {
+                let path = extract_string(args, "path")?;
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![
+                    ("path".to_string(), path),
+                    ("project_slug".to_string(), project_slug),
+                ];
+                let result = http
+                    .get_with_query("/api/code/fingerprint", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "find_isomorphic" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("min_group_size").and_then(|v| v.as_i64()) {
+                    query.push(("min_group_size".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/code/isomorphic", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
             "get_meilisearch_stats" => {
                 let result = http.get("/api/meilisearch/stats").await?;
                 Ok(Some(result))
@@ -5416,6 +5445,40 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("/code/context-cards/refresh"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_fingerprint() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_fingerprint",
+                Some(json!({"path": "src/main.rs", "project_slug": "my-proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn test_http_find_isomorphic() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_isomorphic",
+                Some(json!({"project_slug": "my-proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/isomorphic"));
     }
 
     #[tokio::test]

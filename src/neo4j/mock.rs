@@ -7451,6 +7451,33 @@ impl GraphStore for MockGraphStore {
         // Mock: no-op (no context cards to invalidate in mock store)
         Ok(())
     }
+
+    async fn get_context_card(
+        &self,
+        _path: &str,
+        _project_id: &str,
+    ) -> anyhow::Result<Option<crate::graph::models::ContextCard>> {
+        // Mock: no context cards stored
+        Ok(None)
+    }
+
+    async fn get_context_cards_batch(
+        &self,
+        _paths: &[String],
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::ContextCard>> {
+        // Mock: no context cards stored
+        Ok(Vec::new())
+    }
+
+    async fn find_isomorphic_groups(
+        &self,
+        _project_id: &str,
+        _min_group_size: usize,
+    ) -> anyhow::Result<Vec<crate::graph::models::IsomorphicGroup>> {
+        // Mock: no isomorphic groups
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

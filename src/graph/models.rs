@@ -544,6 +544,17 @@ pub struct StressTestResult {
     pub critical_edges: Vec<(String, String)>,
 }
 
+/// A group of files sharing the same WL subgraph hash (isomorphic neighborhoods).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IsomorphicGroup {
+    /// The shared WL hash value
+    pub wl_hash: u64,
+    /// File paths in this group
+    pub members: Vec<String>,
+    /// Group size
+    pub size: usize,
+}
+
 /// Pre-computed structural profile for a file node (Context Card).
 ///
 /// Aggregates all analytics metrics into a single, self-contained summary

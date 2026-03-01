@@ -250,6 +250,10 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "stress_test_edge" => Some(("code", "stress_test_edge")),
         "stress_test_cascade" => Some(("code", "stress_test_cascade")),
         "find_bridges" => Some(("code", "find_bridges")),
+        "get_context_card" => Some(("code", "get_context_card")),
+        "refresh_context_cards" => Some(("code", "refresh_context_cards")),
+        "get_fingerprint" => Some(("code", "get_fingerprint")),
+        "find_isomorphic" => Some(("code", "find_isomorphic")),
 
         // Skill
         "list_skills" => Some(("skill", "list")),
@@ -768,7 +772,7 @@ fn code_tool() -> ToolDefinition {
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility", "stress_test_node", "stress_test_edge", "stress_test_cascade", "find_bridges"],
+                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility", "stress_test_node", "stress_test_edge", "stress_test_cascade", "find_bridges", "get_context_card", "refresh_context_cards", "get_fingerprint", "find_isomorphic"],
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
