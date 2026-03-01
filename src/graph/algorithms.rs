@@ -1040,16 +1040,13 @@ pub fn compute_all_extended(
     let predicted_links = links_result.unwrap_or_default();
 
     // --- Step 9: Context Cards (aggregates ALL above) ---
-    if wl_hashes.is_empty() {
-        tracing::warn!("context_cards will set cc_wl_hash = None — WL hash unavailable");
-    }
-    let (_cards_result, cards_timing) = timed_step("context_cards", || {
-        // TODO(Plan 8): compute_context_cards(&analytics, &structural_dna_map, &wl_hashes, ...)
-        // When wl_hashes is empty, cards set cc_wl_hash = None
-        grail_stats.cards_computed = 0;
-        Ok(())
+    let (cards_result, cards_timing) = timed_step("context_cards", || {
+        let cards = compute_context_cards(graph, &analytics, &structural_dna_map, &wl_hashes);
+        grail_stats.cards_computed = cards.len();
+        Ok(cards)
     });
     timings.push(cards_timing);
+    let context_cards = cards_result.unwrap_or_default();
 
     // --- Step 10: Topology Rule Check (post-validation) ---
     let (_topo_result, topo_timing) = timed_step("topology_check", || {
@@ -1068,6 +1065,7 @@ pub fn compute_all_extended(
         structural_dna: structural_dna_map,
         wl_hashes,
         predicted_links,
+        context_cards,
         mode,
         total_ms,
     }
@@ -2366,6 +2364,125 @@ pub fn stress_test_edge_removal(
             vec![]
         },
     })
+}
+
+// ============================================================================
+// GraIL algorithms — Context Cards (Plan 8)
+// ============================================================================
+
+/// Compute context cards for all File nodes in the graph.
+///
+/// Aggregates analytics metrics (PageRank, betweenness, clustering, community),
+/// structural DNA, WL hash, and edge counts (imports/calls in/out) into a
+/// self-contained `ContextCard` for each file.
+///
+/// Co-change data is extracted from CO_CHANGED edges. The top-5 co-changers
+/// are included in each card.
+pub fn compute_context_cards(
+    graph: &CodeGraph,
+    analytics: &GraphAnalytics,
+    dna_map: &HashMap<String, Vec<f64>>,
+    wl_hashes: &HashMap<String, u64>,
+) -> Vec<super::models::ContextCard> {
+    use super::models::{CodeEdgeType, CodeNodeType, ContextCard};
+
+    let g = &graph.graph;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Build community_id → label lookup
+    let community_labels: HashMap<u32, &str> = analytics
+        .communities
+        .iter()
+        .map(|c| (c.id, c.label.as_str()))
+        .collect();
+
+    // Extract co-change data for top-5 co-changers
+    let co_change_data = extract_co_change_data(graph);
+
+    let mut cards = Vec::new();
+
+    for (node_id, node_idx) in &graph.id_to_index {
+        let node = &g[*node_idx];
+        if node.node_type != CodeNodeType::File {
+            continue;
+        }
+
+        // Get analytics metrics
+        let metrics = analytics.metrics.get(node_id);
+        let pagerank = metrics.map(|m| m.pagerank).unwrap_or(0.0);
+        let betweenness = metrics.map(|m| m.betweenness).unwrap_or(0.0);
+        let clustering = metrics.map(|m| m.clustering_coefficient).unwrap_or(0.0);
+        let community_id = metrics.map(|m| m.community_id).unwrap_or(0);
+        let community_label = community_labels
+            .get(&community_id)
+            .unwrap_or(&"unknown")
+            .to_string();
+
+        // Count imports in/out and calls in/out
+        let mut imports_out = 0usize;
+        let mut imports_in = 0usize;
+        let mut calls_out = 0usize;
+        let mut calls_in = 0usize;
+
+        // Outgoing edges
+        for edge_ref in g.edges(*node_idx) {
+            match edge_ref.weight().edge_type {
+                CodeEdgeType::Imports => imports_out += 1,
+                CodeEdgeType::Calls => calls_out += 1,
+                _ => {}
+            }
+        }
+
+        // Incoming edges
+        for edge_ref in g.edges_directed(*node_idx, petgraph::Direction::Incoming) {
+            match edge_ref.weight().edge_type {
+                CodeEdgeType::Imports => imports_in += 1,
+                CodeEdgeType::Calls => calls_in += 1,
+                _ => {}
+            }
+        }
+
+        // Top-5 co-changers
+        let mut co_changers: Vec<(String, f64)> = co_change_data
+            .iter()
+            .filter_map(|((a, b), &weight)| {
+                if a == node_id {
+                    Some((b.clone(), weight))
+                } else if b == node_id {
+                    Some((a.clone(), weight))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        co_changers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        co_changers.truncate(5);
+        let cc_co_changers_top5: Vec<String> = co_changers.into_iter().map(|(p, _)| p).collect();
+
+        // DNA & WL hash
+        let dna = dna_map.get(node_id).cloned().unwrap_or_default();
+        let wl = wl_hashes.get(node_id).copied().unwrap_or(0);
+
+        cards.push(ContextCard {
+            path: node_id.clone(),
+            cc_pagerank: pagerank,
+            cc_betweenness: betweenness,
+            cc_clustering: clustering,
+            cc_community_id: community_id,
+            cc_community_label: community_label,
+            cc_imports_out: imports_out,
+            cc_imports_in: imports_in,
+            cc_calls_out: calls_out,
+            cc_calls_in: calls_in,
+            cc_structural_dna: dna,
+            cc_wl_hash: wl,
+            cc_co_changers_top5,
+            cc_version: 1,
+            cc_computed_at: now.clone(),
+        });
+    }
+
+    cards
 }
 
 // ============================================================================
@@ -4939,5 +5056,136 @@ mod tests {
     fn test_stress_edge_removal_unknown() {
         let g = make_chain_stress();
         assert!(stress_test_edge_removal(&g, "A", "nonexistent").is_none());
+    }
+
+    // ========================================================================
+    // Context Cards (Plan 8) tests
+    // ========================================================================
+
+    /// Helper: 5-file graph for context card tests.
+    fn make_file_graph_cc() -> CodeGraph {
+        let mut g = CodeGraph::new();
+        let files = ["src/main.rs", "src/lib.rs", "src/api/mod.rs", "src/api/handlers.rs", "src/api/routes.rs"];
+        for path in &files {
+            g.add_node(CodeNode {
+                id: path.to_string(),
+                node_type: CodeNodeType::File,
+                path: Some(path.to_string()),
+                name: path.rsplit('/').next().unwrap_or(path).to_string(),
+                project_id: None,
+            });
+        }
+        g.add_edge("src/main.rs", "src/lib.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("src/main.rs", "src/api/mod.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("src/api/mod.rs", "src/api/handlers.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("src/api/mod.rs", "src/api/routes.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge("src/api/routes.rs", "src/api/handlers.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g
+    }
+
+    #[test]
+    fn test_context_cards_file_graph() {
+        use super::super::models::AnalyticsConfig;
+        // 5-file graph: main → lib, main → api/mod, api/mod → handlers, api/mod → routes, routes → handlers
+        let g = make_file_graph_cc();
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+        let dna_map = HashMap::new();
+        let wl_hashes = HashMap::new();
+
+        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes);
+
+        assert_eq!(cards.len(), 5, "Should produce 1 card per file node");
+
+        // All cards should have positive pagerank (connected graph)
+        for card in &cards {
+            assert!(card.cc_pagerank > 0.0, "PageRank should be > 0 for {}", card.path);
+            assert_eq!(card.cc_version, 1);
+            assert!(!card.cc_computed_at.is_empty());
+        }
+
+        // Check main.rs has 2 outgoing imports (lib + api/mod) and 0 incoming
+        let main_card = cards.iter().find(|c| c.path == "src/main.rs").unwrap();
+        assert_eq!(main_card.cc_imports_out, 2, "main.rs should import 2 files");
+        assert_eq!(main_card.cc_imports_in, 0, "main.rs should have 0 importers");
+
+        // Check handlers has 0 outgoing and 2 incoming (api/mod + routes)
+        let handlers_card = cards.iter().find(|c| c.path == "src/api/handlers.rs").unwrap();
+        assert_eq!(handlers_card.cc_imports_out, 0);
+        assert_eq!(handlers_card.cc_imports_in, 2);
+    }
+
+    #[test]
+    fn test_context_cards_only_files() {
+        // Mix of File + Function nodes: only File nodes get cards
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "src/main.rs".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("src/main.rs".to_string()),
+            name: "main.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "my_func".to_string(),
+            node_type: CodeNodeType::Function,
+            path: None,
+            name: "my_func".to_string(),
+            project_id: None,
+        });
+        g.add_edge("src/main.rs", "my_func", CodeEdge {
+            edge_type: CodeEdgeType::Defines,
+            weight: 1.0,
+        });
+
+        use super::super::models::AnalyticsConfig;
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(cards.len(), 1, "Only File nodes should get context cards");
+        assert_eq!(cards[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn test_context_cards_with_dna_and_wl() {
+        let g = make_chain_abc(); // A→B→C
+        use super::super::models::AnalyticsConfig;
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+
+        let mut dna_map = HashMap::new();
+        dna_map.insert("A".to_string(), vec![1.0, 0.5, 0.0]);
+        let mut wl_hashes = HashMap::new();
+        wl_hashes.insert("A".to_string(), 12345u64);
+
+        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes);
+        let a_card = cards.iter().find(|c| c.path == "A").unwrap();
+        assert_eq!(a_card.cc_structural_dna, vec![1.0, 0.5, 0.0]);
+        assert_eq!(a_card.cc_wl_hash, 12345);
+
+        // B should have no DNA or WL
+        let b_card = cards.iter().find(|c| c.path == "B").unwrap();
+        assert!(b_card.cc_structural_dna.is_empty());
+        assert_eq!(b_card.cc_wl_hash, 0);
+    }
+
+    #[test]
+    fn test_context_cards_empty_graph() {
+        use super::super::models::AnalyticsConfig;
+        let g = CodeGraph::new();
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new());
+        assert!(cards.is_empty());
+    }
+
+    #[test]
+    fn test_context_cards_default() {
+        use super::super::models::ContextCard;
+        let card = ContextCard::default();
+        assert_eq!(card.cc_version, 0);
+        assert_eq!(card.cc_pagerank, 0.0);
+        assert!(card.path.is_empty());
     }
 }

@@ -544,6 +544,81 @@ pub struct StressTestResult {
     pub critical_edges: Vec<(String, String)>,
 }
 
+/// Pre-computed structural profile for a file node (Context Card).
+///
+/// Aggregates all analytics metrics into a single, self-contained summary
+/// that can be stored as Neo4j node properties (cc_* prefix) and served
+/// instantly without recomputation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCard {
+    /// File path (matches the File node's path property)
+    pub path: String,
+    /// PageRank centrality score
+    #[serde(default)]
+    pub cc_pagerank: f64,
+    /// Betweenness centrality score
+    #[serde(default)]
+    pub cc_betweenness: f64,
+    /// Clustering coefficient
+    #[serde(default)]
+    pub cc_clustering: f64,
+    /// Community ID from Louvain clustering
+    #[serde(default)]
+    pub cc_community_id: u32,
+    /// Community label (human-readable)
+    #[serde(default)]
+    pub cc_community_label: String,
+    /// Number of files this file imports
+    #[serde(default)]
+    pub cc_imports_out: usize,
+    /// Number of files that import this file
+    #[serde(default)]
+    pub cc_imports_in: usize,
+    /// Number of outgoing function calls from this file
+    #[serde(default)]
+    pub cc_calls_out: usize,
+    /// Number of incoming function calls to this file
+    #[serde(default)]
+    pub cc_calls_in: usize,
+    /// Structural DNA vector (Plan 2)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cc_structural_dna: Vec<f64>,
+    /// Weisfeiler-Leman hash (Plan 7)
+    #[serde(default)]
+    pub cc_wl_hash: u64,
+    /// Top-5 co-changers (file paths that frequently change together)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cc_co_changers_top5: Vec<String>,
+    /// Card version (incremented on recompute, -1 = invalidated)
+    #[serde(default)]
+    pub cc_version: i32,
+    /// Timestamp of last computation (ISO 8601)
+    #[serde(default)]
+    pub cc_computed_at: String,
+}
+
+impl Default for ContextCard {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            cc_pagerank: 0.0,
+            cc_betweenness: 0.0,
+            cc_clustering: 0.0,
+            cc_community_id: 0,
+            cc_community_label: String::new(),
+            cc_imports_out: 0,
+            cc_imports_in: 0,
+            cc_calls_out: 0,
+            cc_calls_in: 0,
+            cc_structural_dna: Vec::new(),
+            cc_wl_hash: 0,
+            cc_co_changers_top5: Vec::new(),
+            cc_version: 0,
+            cc_computed_at: String::new(),
+        }
+    }
+}
+
 /// Result of K-means clustering on structural DNA vectors.
 ///
 /// Each cluster represents a group of structurally similar files that play
@@ -1017,6 +1092,9 @@ pub struct ComputeAllResult {
     /// Top predicted missing links (Plan 9)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub predicted_links: Vec<LinkPrediction>,
+    /// Pre-computed context cards for file nodes (Plan 8)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_cards: Vec<ContextCard>,
     /// Whether incremental mode was used (vs full recompute)
     #[serde(default)]
     pub mode: ComputeMode,

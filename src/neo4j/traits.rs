@@ -2139,4 +2139,22 @@ pub trait GraphStore: Send + Sync {
     /// Check connectivity to the graph database.
     /// Returns Ok(true) if the database is reachable, Ok(false) if not.
     async fn health_check(&self) -> Result<bool>;
+
+    // ========================================================================
+    // Context Cards persistence
+    // ========================================================================
+
+    /// Batch-write context cards as cc_* properties on File nodes.
+    async fn batch_save_context_cards(
+        &self,
+        cards: &[crate::graph::models::ContextCard],
+    ) -> Result<()>;
+
+    /// Invalidate context cards for given file paths + their 1-hop neighbors.
+    /// Sets cc_version = -1 on the target files and their direct neighbors.
+    async fn invalidate_context_cards(
+        &self,
+        paths: &[String],
+        project_id: &str,
+    ) -> Result<()>;
 }

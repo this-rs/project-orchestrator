@@ -2542,4 +2542,19 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<(String, String, f64)>> {
         self.get_synapse_graph(project_id, min_weight).await
     }
+
+    async fn batch_save_context_cards(
+        &self,
+        cards: &[crate::graph::models::ContextCard],
+    ) -> anyhow::Result<()> {
+        self.batch_save_context_cards(cards).await
+    }
+
+    async fn invalidate_context_cards(
+        &self,
+        paths: &[String],
+        project_id: &str,
+    ) -> anyhow::Result<()> {
+        self.invalidate_context_cards(paths, project_id).await
+    }
 }

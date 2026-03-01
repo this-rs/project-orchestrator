@@ -1558,6 +1558,23 @@ pub async fn create_commit(
         let file_paths: Vec<String> = files_changed.iter().map(|f| f.path.clone()).collect();
         let paths_for_boost = file_paths.clone();
 
+        // Side-effect 0: Invalidate context cards for changed files + 1-hop neighbors
+        let paths_for_invalidate = file_paths.clone();
+        let orch_invalidate = orchestrator.clone();
+        let pid_str = pid.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = orch_invalidate
+                .neo4j()
+                .invalidate_context_cards(&paths_for_invalidate, &pid_str)
+                .await
+            {
+                tracing::warn!(
+                    project_id = %pid,
+                    "Failed to invalidate context cards: {}", e
+                );
+            }
+        });
+
         // Side-effect 1 & 2: Incremental sync + analytics debounce
         let orch2 = orchestrator.clone();
         tokio::spawn(async move {

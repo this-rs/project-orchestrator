@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::algorithms::{compute_all, structural_dna};
+use super::algorithms::{compute_all, compute_context_cards, structural_dna};
 use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
@@ -169,6 +169,8 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             .map(|(id, m)| (id.clone(), m.pagerank))
             .collect();
 
+        let mut dna_map_for_cards = std::collections::HashMap::new();
+
         match structural_dna(&graph, &pr_scores, 10) {
             Ok(dna_map) if !dna_map.is_empty() => {
                 if let Err(e) = self.writer.write_structural_dna(&dna_map, &graph).await {
@@ -184,12 +186,32 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
                         "Structural DNA computed and persisted"
                     );
                 }
+                dna_map_for_cards = dna_map;
             }
             Ok(_) => {
                 tracing::debug!("Structural DNA: empty graph, skipping");
             }
             Err(e) => {
                 tracing::warn!("Structural DNA computation failed: {}", e);
+            }
+        }
+
+        // 5. Compute and persist Context Cards (aggregates analytics + DNA + WL hash)
+        let wl_hashes = std::collections::HashMap::new(); // WL hash not yet in engine pipeline (Plan 7)
+        let context_cards = compute_context_cards(&graph, &analytics, &dna_map_for_cards, &wl_hashes);
+        if !context_cards.is_empty() {
+            if let Err(e) = self.store.batch_save_context_cards(&context_cards).await {
+                tracing::warn!(
+                    "Failed to persist context cards for project {}: {}",
+                    project_id,
+                    e
+                );
+            } else {
+                tracing::debug!(
+                    project_id = %project_id,
+                    cards_count = context_cards.len(),
+                    "Context cards computed and persisted"
+                );
             }
         }
 

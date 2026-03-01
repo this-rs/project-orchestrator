@@ -1337,4 +1337,115 @@ impl Neo4jClient {
             Ok(serde_json::json!(null))
         }
     }
+
+    /// Batch-write context cards as cc_* properties on File nodes.
+    ///
+    /// Uses UNWIND with chunks of 1000 for efficient batch writes.
+    /// DNA vectors and co_changers are stored as serialized JSON strings
+    /// since Neo4j doesn't support nested arrays in UNWIND.
+    pub async fn batch_save_context_cards(
+        &self,
+        cards: &[crate::graph::models::ContextCard],
+    ) -> Result<()> {
+        if cards.is_empty() {
+            return Ok(());
+        }
+
+        const CHUNK_SIZE: usize = 1000;
+
+        for chunk in cards.chunks(CHUNK_SIZE) {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
+                .iter()
+                .map(|c| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("path".into(), c.path.clone().into());
+                    m.insert("cc_pagerank".into(), c.cc_pagerank.into());
+                    m.insert("cc_betweenness".into(), c.cc_betweenness.into());
+                    m.insert("cc_clustering".into(), c.cc_clustering.into());
+                    m.insert("cc_community_id".into(), (c.cc_community_id as i64).into());
+                    m.insert(
+                        "cc_community_label".into(),
+                        c.cc_community_label.clone().into(),
+                    );
+                    m.insert("cc_imports_out".into(), (c.cc_imports_out as i64).into());
+                    m.insert("cc_imports_in".into(), (c.cc_imports_in as i64).into());
+                    m.insert("cc_calls_out".into(), (c.cc_calls_out as i64).into());
+                    m.insert("cc_calls_in".into(), (c.cc_calls_in as i64).into());
+                    // DNA vector stored as JSON string (nested arrays not supported in UNWIND)
+                    let dna_json =
+                        serde_json::to_string(&c.cc_structural_dna).unwrap_or_default();
+                    m.insert("cc_structural_dna".into(), dna_json.into());
+                    m.insert("cc_wl_hash".into(), (c.cc_wl_hash as i64).into());
+                    // co_changers stored as JSON string
+                    let co_changers_json =
+                        serde_json::to_string(&c.cc_co_changers_top5).unwrap_or_default();
+                    m.insert("cc_co_changers_top5".into(), co_changers_json.into());
+                    m.insert("cc_version".into(), (c.cc_version as i64).into());
+                    m.insert("cc_computed_at".into(), c.cc_computed_at.clone().into());
+                    m
+                })
+                .collect();
+
+            let q = query(
+                r#"
+                UNWIND $items AS row
+                MATCH (f:File {path: row.path})
+                SET f.cc_pagerank = row.cc_pagerank,
+                    f.cc_betweenness = row.cc_betweenness,
+                    f.cc_clustering = row.cc_clustering,
+                    f.cc_community_id = row.cc_community_id,
+                    f.cc_community_label = row.cc_community_label,
+                    f.cc_imports_out = row.cc_imports_out,
+                    f.cc_imports_in = row.cc_imports_in,
+                    f.cc_calls_out = row.cc_calls_out,
+                    f.cc_calls_in = row.cc_calls_in,
+                    f.cc_structural_dna = row.cc_structural_dna,
+                    f.cc_wl_hash = row.cc_wl_hash,
+                    f.cc_co_changers_top5 = row.cc_co_changers_top5,
+                    f.cc_version = row.cc_version,
+                    f.cc_computed_at = row.cc_computed_at
+                "#,
+            )
+            .param("items", items);
+
+            self.graph.run(q).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Invalidate context cards for given file paths and their 1-hop neighbors.
+    ///
+    /// Sets `cc_version = -1` on the target files and any direct neighbor
+    /// connected via IMPORTS or CALLS relationships. This ensures stale cards
+    /// are recomputed on next analytics run.
+    pub async fn invalidate_context_cards(
+        &self,
+        paths: &[String],
+        project_id: &str,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let path_list: Vec<neo4rs::BoltType> =
+            paths.iter().map(|p| p.clone().into()).collect();
+
+        let q = query(
+            r#"
+            UNWIND $paths AS path
+            MATCH (f:File {path: path})-[:BELONGS_TO]->(:Project {id: $project_id})
+            SET f.cc_version = -1
+            WITH f
+            OPTIONAL MATCH (f)-[:IMPORTS|CALLS]-(neighbor:File)
+            SET neighbor.cc_version = -1
+            "#,
+        )
+        .param("paths", path_list)
+        .param("project_id", project_id);
+
+        self.graph.run(q).await?;
+
+        Ok(())
+    }
 }

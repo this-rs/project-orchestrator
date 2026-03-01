@@ -7430,6 +7430,27 @@ impl GraphStore for MockGraphStore {
         // Mock: return empty synapse graph (no synapses in mock store)
         Ok(Vec::new())
     }
+
+    // ========================================================================
+    // Context Cards persistence
+    // ========================================================================
+
+    async fn batch_save_context_cards(
+        &self,
+        _cards: &[crate::graph::models::ContextCard],
+    ) -> anyhow::Result<()> {
+        // Mock: no-op (context cards not persisted in mock store)
+        Ok(())
+    }
+
+    async fn invalidate_context_cards(
+        &self,
+        _paths: &[String],
+        _project_id: &str,
+    ) -> anyhow::Result<()> {
+        // Mock: no-op (no context cards to invalidate in mock store)
+        Ok(())
+    }
 }
 
 #[cfg(test)]
