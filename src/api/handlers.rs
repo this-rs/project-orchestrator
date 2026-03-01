@@ -2236,11 +2236,7 @@ pub async fn detect_skills(
             .await
             .map_err(AppError::Internal)?;
         for skill in &existing_skills {
-            let _ = state
-                .orchestrator
-                .neo4j()
-                .delete_skill(skill.id)
-                .await;
+            let _ = state.orchestrator.neo4j().delete_skill(skill.id).await;
         }
         tracing::info!(
             %project_id,

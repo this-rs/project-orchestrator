@@ -29,7 +29,10 @@ use std::sync::LazyLock;
 /// but `src/graph/**` gets high distinctiveness if only this skill concentrates there.
 ///
 /// `all_project_notes` enables cross-skill distinctiveness. If empty, falls back to local only.
-pub fn generate_file_glob_triggers(notes: &[Note], all_project_notes: &[Note]) -> Vec<SkillTrigger> {
+pub fn generate_file_glob_triggers(
+    notes: &[Note],
+    all_project_notes: &[Note],
+) -> Vec<SkillTrigger> {
     // Extract file paths from this skill's notes
     let file_paths: Vec<&str> = notes
         .iter()
@@ -63,7 +66,7 @@ pub fn generate_file_glob_triggers(notes: &[Note], all_project_notes: &[Note]) -
 }
 
 /// Compute prefix counts: for each directory prefix, how many paths fall under it.
-fn compute_prefix_counts<'a>(paths: &[&'a str]) -> HashMap<String, usize> {
+fn compute_prefix_counts(paths: &[&str]) -> HashMap<String, usize> {
     let mut dir_counts: HashMap<&str, usize> = HashMap::new();
     for path in paths {
         if let Some(last_slash) = path.rfind('/') {
@@ -135,7 +138,11 @@ fn find_common_glob_patterns(paths: &[&str], all_project_paths: &[&str]) -> Vec<
         let score_b = b.1 * b.2;
         depth_b
             .cmp(&depth_a) // deeper first
-            .then(score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
 
     // Select results: prefer distinctive prefixes (ratio > 1.5)
@@ -220,9 +227,8 @@ const STOP_WORDS: &[&str] = &[
     "use", "used", "using", "new", "get", "set", "add", "update", "delete", "create", "file",
     "function", "method", "class", "type", "value", "data", "note", "notes",
     // --- Additional generic programming noise (too common to be discriminative in any project) ---
-    "error", "bug", "fix", "issue", "impl", "config", "setup", "check", "test",
-    "handle", "return", "result", "path", "name", "info", "log", "src",
-    "code", "based", "related", "via", "key",
+    "error", "bug", "fix", "issue", "impl", "config", "setup", "check", "test", "handle", "return",
+    "result", "path", "name", "info", "log", "src", "code", "based", "related", "via", "key",
 ];
 
 /// Pre-built HashSet for O(1) stop-word lookups (built once via LazyLock).
@@ -1027,7 +1033,10 @@ mod tests {
         }
 
         let triggers = generate_regex_triggers(&skill_notes, &all_project_notes);
-        assert!(!triggers.is_empty(), "Should generate at least one regex trigger");
+        assert!(
+            !triggers.is_empty(),
+            "Should generate at least one regex trigger"
+        );
 
         let pattern = &triggers[0].pattern_value;
 
@@ -1071,9 +1080,11 @@ mod tests {
     #[test]
     fn test_stop_set_contains_generic_noise_words() {
         // Only truly language-agnostic programming terms should be in STOP_SET
-        let generic_noise = ["via", "code", "src", "fix", "key", "based", "related",
-                             "error", "bug", "issue", "impl", "config", "setup", "check", "test",
-                             "handle", "return", "result", "path", "name", "info", "log"];
+        let generic_noise = [
+            "via", "code", "src", "fix", "key", "based", "related", "error", "bug", "issue",
+            "impl", "config", "setup", "check", "test", "handle", "return", "result", "path",
+            "name", "info", "log",
+        ];
         for word in &generic_noise {
             assert!(
                 STOP_SET.contains(word),
@@ -1379,8 +1390,16 @@ mod tests {
         // Skill A: notes in src/graph/ — should get src/graph/**
         let skill_a_notes = vec![
             make_note_with_anchors(vec!["graph"], "A1", vec![file_anchor("src/graph/algo.rs")]),
-            make_note_with_anchors(vec!["graph"], "A2", vec![file_anchor("src/graph/community.rs")]),
-            make_note_with_anchors(vec!["graph"], "A3", vec![file_anchor("src/graph/pagerank.rs")]),
+            make_note_with_anchors(
+                vec!["graph"],
+                "A2",
+                vec![file_anchor("src/graph/community.rs")],
+            ),
+            make_note_with_anchors(
+                vec!["graph"],
+                "A3",
+                vec![file_anchor("src/graph/pagerank.rs")],
+            ),
         ];
 
         // Skill B: notes in src/chat/ — should get src/chat/**
@@ -1395,7 +1414,10 @@ mod tests {
 
         // Skill A should get src/graph/**, NOT src/** (src/ covers B too)
         let triggers_a = generate_file_glob_triggers(&skill_a_notes, &all_notes);
-        assert!(!triggers_a.is_empty(), "Skill A should have file glob triggers");
+        assert!(
+            !triggers_a.is_empty(),
+            "Skill A should have file glob triggers"
+        );
         let pattern_a = &triggers_a[0].pattern_value;
         assert!(
             pattern_a.contains("src/graph"),
@@ -1405,7 +1427,10 @@ mod tests {
 
         // Skill B should get src/chat/**, NOT src/**
         let triggers_b = generate_file_glob_triggers(&skill_b_notes, &all_notes);
-        assert!(!triggers_b.is_empty(), "Skill B should have file glob triggers");
+        assert!(
+            !triggers_b.is_empty(),
+            "Skill B should have file glob triggers"
+        );
         let pattern_b = &triggers_b[0].pattern_value;
         assert!(
             pattern_b.contains("src/chat"),
@@ -1438,12 +1463,17 @@ mod tests {
         assert!(!triggers.is_empty());
 
         // Should get src/neo4j/**, not the broad src/**
-        let has_neo4j = triggers.iter().any(|t| t.pattern_value.contains("src/neo4j"));
+        let has_neo4j = triggers
+            .iter()
+            .any(|t| t.pattern_value.contains("src/neo4j"));
         let has_broad_src = triggers.iter().any(|t| t.pattern_value == "src/**");
         assert!(
             has_neo4j,
             "Expected src/neo4j/** in triggers, got: {:?}",
-            triggers.iter().map(|t| &t.pattern_value).collect::<Vec<_>>()
+            triggers
+                .iter()
+                .map(|t| &t.pattern_value)
+                .collect::<Vec<_>>()
         );
         assert!(
             !has_broad_src,
@@ -1758,11 +1788,7 @@ mod tests {
                 "Topology community detection",
                 vec![],
             ),
-            make_note_with_anchors(
-                vec!["grail", "neo4j"],
-                "GraIL graph patterns",
-                vec![],
-            ),
+            make_note_with_anchors(vec!["grail", "neo4j"], "GraIL graph patterns", vec![]),
         ];
 
         // Simulate a project with 20 notes, 18 of which have "neo4j"
@@ -1834,11 +1860,7 @@ mod tests {
                 "Rust FFI bindings for Python",
                 vec![],
             ),
-            make_note_with_anchors(
-                vec!["rust", "bindings"],
-                "Building Rust extensions",
-                vec![],
-            ),
+            make_note_with_anchors(vec!["rust", "bindings"], "Building Rust extensions", vec![]),
             make_note_with_anchors(
                 vec!["rust", "ffi"],
                 "Rust memory safety in bindings",

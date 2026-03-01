@@ -510,7 +510,7 @@ pub(crate) fn glob_depth_boost(glob_pattern: &str) -> f64 {
     // Count path segments before the wildcard: "src/graph/**" → 2 segments
     let prefix = glob_pattern.trim_end_matches("/**").trim_end_matches("/*");
     let depth = prefix.matches('/').count() + 1; // "src" = 1, "src/graph" = 2
-    // Scale: depth=1 → 0.7, depth=2 → 0.85, depth=3+ → 1.0
+                                                 // Scale: depth=1 → 0.7, depth=2 → 0.85, depth=3+ → 1.0
     (0.55 + 0.15 * (depth as f64).min(3.0)).min(1.0)
 }
 
@@ -550,9 +550,7 @@ pub fn evaluate_skill_match(
                     false
                 }
             }
-            TriggerType::Semantic => {
-                false
-            }
+            TriggerType::Semantic => false,
         };
 
         if matched {
@@ -1482,8 +1480,12 @@ mod tests {
         let confidence = evaluate_skill_match(&skill, None, Some("src/neo4j/client.rs"));
         // "src/neo4j/**" depth=2 → boost=0.85 → effective = 0.8 * 0.85 = 0.68
         let expected = 0.8 * glob_depth_boost("src/neo4j/**");
-        assert!((confidence - expected).abs() < f64::EPSILON,
-            "Expected {}, got {}", expected, confidence);
+        assert!(
+            (confidence - expected).abs() < f64::EPSILON,
+            "Expected {}, got {}",
+            expected,
+            confidence
+        );
     }
 
     #[test]
@@ -1494,8 +1496,12 @@ mod tests {
         // file_context is None, but pattern is a file path (from Read tool)
         let confidence = evaluate_skill_match(&skill, Some("src/neo4j/client.rs"), None);
         let expected = 0.8 * glob_depth_boost("src/neo4j/**");
-        assert!((confidence - expected).abs() < f64::EPSILON,
-            "Expected {}, got {}", expected, confidence);
+        assert!(
+            (confidence - expected).abs() < f64::EPSILON,
+            "Expected {}, got {}",
+            expected,
+            confidence
+        );
     }
 
     #[test]
@@ -1574,7 +1580,8 @@ mod tests {
         generic_skill.trigger_patterns = vec![SkillTrigger::file_glob("src/**", 0.8)];
 
         let mut specific_skill = SkillNode::new(Uuid::new_v4(), "Specific");
-        specific_skill.trigger_patterns = vec![SkillTrigger::file_glob("src/skills/activation/**", 0.8)];
+        specific_skill.trigger_patterns =
+            vec![SkillTrigger::file_glob("src/skills/activation/**", 0.8)];
 
         let file = "src/skills/activation/hook.rs";
 
@@ -1586,11 +1593,12 @@ mod tests {
         assert!(
             specific_score > generic_score,
             "Specific glob ({}) should beat generic glob ({})",
-            specific_score, generic_score
+            specific_score,
+            generic_score
         );
 
         // Also verify via cached path (mirror consistency)
-        use crate::skills::cache::{CachedSkill, evaluate_cached_skill};
+        use crate::skills::cache::{evaluate_cached_skill, CachedSkill};
         let cached_generic = CachedSkill::from_skill(generic_skill);
         let cached_specific = CachedSkill::from_skill(specific_skill);
 
@@ -1600,17 +1608,22 @@ mod tests {
         assert!(
             cached_specific_score > cached_generic_score,
             "Cached: specific ({}) should beat generic ({})",
-            cached_specific_score, cached_generic_score
+            cached_specific_score,
+            cached_generic_score
         );
 
         // Verify cached and uncached produce the same scores
         assert!(
             (generic_score - cached_generic_score).abs() < f64::EPSILON,
-            "Generic: uncached ({}) != cached ({})", generic_score, cached_generic_score
+            "Generic: uncached ({}) != cached ({})",
+            generic_score,
+            cached_generic_score
         );
         assert!(
             (specific_score - cached_specific_score).abs() < f64::EPSILON,
-            "Specific: uncached ({}) != cached ({})", specific_score, cached_specific_score
+            "Specific: uncached ({}) != cached ({})",
+            specific_score,
+            cached_specific_score
         );
     }
 

@@ -125,18 +125,19 @@ pub fn filter_weak_members(
                 return Some(candidate);
             }
 
-            let members: std::collections::HashSet<&str> =
-                candidate.member_note_ids.iter().map(|s| s.as_str()).collect();
+            let members: std::collections::HashSet<&str> = candidate
+                .member_note_ids
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
 
             // Compute average internal weight for each member
             let strong_members: Vec<String> = candidate
                 .member_note_ids
                 .iter()
                 .filter(|note_id| {
-                    let other_members: Vec<&&str> = members
-                        .iter()
-                        .filter(|m| **m != note_id.as_str())
-                        .collect();
+                    let other_members: Vec<&&str> =
+                        members.iter().filter(|m| **m != note_id.as_str()).collect();
 
                     if other_members.is_empty() {
                         return true; // single-member cluster, keep
@@ -1318,7 +1319,13 @@ mod tests {
 
         let candidates = vec![SkillCandidate {
             community_id: 0,
-            member_note_ids: vec!["n1".into(), "n2".into(), "n3".into(), "n4".into(), "n5".into()],
+            member_note_ids: vec![
+                "n1".into(),
+                "n2".into(),
+                "n3".into(),
+                "n4".into(),
+                "n5".into(),
+            ],
             cohesion: 0.7,
             size: 5,
             label: "test".into(),
