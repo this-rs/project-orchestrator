@@ -307,6 +307,8 @@ impl ToolHandler {
             ("code", "stress_test_edge") => "stress_test_edge",
             ("code", "stress_test_cascade") => "stress_test_cascade",
             ("code", "find_bridges") => "find_bridges",
+            ("code", "get_context_card") => "get_context_card",
+            ("code", "refresh_context_cards") => "refresh_context_cards",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -3154,6 +3156,30 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── P8: Context Cards (2 tools) ─────────────────────────────
+
+            "get_context_card" => {
+                let path = extract_string(args, "path")?;
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![
+                    ("path".to_string(), path),
+                    ("project_slug".to_string(), project_slug),
+                ];
+                let result = http
+                    .get_with_query("/api/code/context-card", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "refresh_context_cards" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let body = serde_json::json!({"project_slug": project_slug});
+                let result = http
+                    .post("/api/code/context-cards/refresh", &body)
+                    .await?;
+                Ok(Some(result))
+            }
+
             "get_meilisearch_stats" => {
                 let result = http.get("/api/meilisearch/stats").await?;
                 Ok(Some(result))
@@ -5354,6 +5380,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "POST");
+    }
+
+    // -- Context Cards -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_get_context_card() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_context_card",
+                Some(json!({"path": "src/main.rs", "project_slug": "my-proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/context-card"));
+    }
+
+    #[tokio::test]
+    async fn test_http_refresh_context_cards() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "refresh_context_cards",
+                Some(json!({"project_slug": "my-proj"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/code/context-cards/refresh"));
     }
 
     #[tokio::test]

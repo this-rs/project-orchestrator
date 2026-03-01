@@ -3468,6 +3468,88 @@ pub async fn find_bridges(
     })))
 }
 
+// ============================================================================
+// Context Cards (GraIL Plan 8)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct ContextCardQuery {
+    /// File path (absolute or relative — resolved with project root)
+    pub path: String,
+    /// Project slug (required for scoping)
+    pub project_slug: String,
+}
+
+/// Get pre-computed context card for a single file.
+///
+/// Returns the cached cc_* properties from Neo4j. If `cc_version == -1`,
+/// the card is stale and should be refreshed via analytics re-run.
+pub async fn get_context_card(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ContextCardQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&query.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
+
+    // Resolve relative path to absolute
+    let path = if !query.path.starts_with('/') {
+        let expanded = crate::expand_tilde(&project.root_path);
+        format!("{}/{}", expanded.trim_end_matches('/'), &query.path)
+    } else {
+        query.path.clone()
+    };
+
+    let card = state
+        .orchestrator
+        .neo4j()
+        .get_context_card(&path, &project.id.to_string())
+        .await?;
+
+    match card {
+        Some(c) => Ok(Json(serde_json::to_value(c).unwrap_or_default())),
+        None => Ok(Json(serde_json::json!({
+            "path": path,
+            "error": "no_context_card",
+            "message": "No context card found. Run analytics (sync project) to compute context cards."
+        }))),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RefreshContextCardsBody {
+    /// Project slug (required)
+    pub project_slug: String,
+}
+
+/// Force refresh of all context cards for a project by triggering analytics.
+///
+/// This triggers the analytics debouncer which will re-run compute_all
+/// and persist updated context cards.
+pub async fn refresh_context_cards(
+    State(state): State<OrchestratorState>,
+    Json(query): Json<RefreshContextCardsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&query.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
+
+    // Trigger analytics debouncer (will recompute all cards)
+    state.orchestrator.analytics_debouncer().trigger(project.id);
+
+    Ok(Json(serde_json::json!({
+        "status": "triggered",
+        "project_slug": query.project_slug,
+        "message": "Analytics refresh triggered. Context cards will be recomputed shortly."
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
