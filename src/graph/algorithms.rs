@@ -941,11 +941,9 @@ pub fn compute_all_extended(
 
     // --- Step 0 (optional): Apply profile weights ---
     let working_graph: CodeGraph;
-    if let Some(ref _profile) = grail.profile {
+    if let Some(ref profile) = grail.profile {
         let (result, timing) = timed_step("apply_profile_weights", || {
-            // TODO(Plan 6): apply_profile_weights(graph, profile)
-            // For now, return the graph unchanged
-            Ok(graph.clone())
+            Ok(apply_profile_weights(graph, profile))
         });
         timings.push(timing);
         working_graph = result.unwrap_or_else(|| graph.clone());

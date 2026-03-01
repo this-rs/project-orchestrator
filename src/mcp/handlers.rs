@@ -62,6 +62,7 @@ impl ToolHandler {
             "code",
             "admin",
             "skill",
+            "analysis_profile",
         ];
 
         if !mega_tools.contains(&name) {
