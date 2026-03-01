@@ -7480,6 +7480,11 @@ impl GraphStore for MockGraphStore {
         // Mock: no isomorphic groups
         Ok(Vec::new())
     }
+
+    async fn has_context_cards(&self, _project_id: &str) -> anyhow::Result<bool> {
+        // Mock: no context cards
+        Ok(false)
+    }
 }
 
 #[cfg(test)]

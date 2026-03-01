@@ -2171,4 +2171,8 @@ pub trait GraphStore: Send + Sync {
         project_id: &str,
         min_group_size: usize,
     ) -> Result<Vec<crate::graph::models::IsomorphicGroup>>;
+
+    /// Check if any file in the project has GraIL analytics (context cards) computed.
+    /// Used by staleness check to detect pre-GraIL projects needing first computation.
+    async fn has_context_cards(&self, project_id: &str) -> Result<bool>;
 }

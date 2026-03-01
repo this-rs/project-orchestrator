@@ -2582,4 +2582,8 @@ impl GraphStore for Neo4jClient {
         self.find_isomorphic_groups(project_id, min_group_size)
             .await
     }
+
+    async fn has_context_cards(&self, project_id: &str) -> anyhow::Result<bool> {
+        self.has_context_cards(project_id).await
+    }
 }

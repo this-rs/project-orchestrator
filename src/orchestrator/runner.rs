@@ -703,7 +703,7 @@ impl Orchestrator {
         let analytics_computed_at = project.analytics_computed_at;
         let last_synced = project.last_synced;
 
-        let is_stale = match (analytics_computed_at, last_synced) {
+        let mut is_stale = match (analytics_computed_at, last_synced) {
             // Never computed → stale
             (None, _) => true,
             // Computed but never synced → not stale (edge case, analytics exist but no code)
@@ -711,6 +711,33 @@ impl Orchestrator {
             // Both exist → stale if synced after analytics
             (Some(analytics), Some(synced)) => synced > analytics,
         };
+
+        // Even if timestamps say "fresh", check if GraIL analytics (context cards,
+        // structural DNA, WL hash) have ever been computed. Projects that were
+        // last analyzed before GraIL was deployed will have analytics_computed_at
+        // set but no cc_version on any file.
+        if !is_stale {
+            match self
+                .neo4j()
+                .has_context_cards(&project_id.to_string())
+                .await
+            {
+                Ok(false) => {
+                    tracing::info!(
+                        project_id = %project_id,
+                        "Analytics timestamps fresh but no GraIL context cards found — marking stale"
+                    );
+                    is_stale = true;
+                }
+                Ok(true) => {} // GraIL analytics present, truly fresh
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to check context cards for {}: {}, assuming fresh",
+                        project_id, e
+                    );
+                }
+            }
+        }
 
         let analytics_age = analytics_computed_at.map(|at| {
             let now = chrono::Utc::now();

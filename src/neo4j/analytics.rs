@@ -1609,4 +1609,26 @@ impl Neo4jClient {
 
         Ok(groups)
     }
+
+    /// Check if any file in the project has GraIL analytics computed (cc_version).
+    /// Returns `true` if at least one file has context cards, `false` otherwise.
+    /// Used by staleness check to detect projects that were synced before GraIL
+    /// was deployed and need their first analytics computation.
+    pub async fn has_context_cards(&self, project_id: &str) -> Result<bool> {
+        let q = query(
+            r#"
+            MATCH (f:File {project_id: $project_id})
+            WHERE f.cc_version IS NOT NULL AND f.cc_version > 0
+            RETURN count(f) > 0 AS has_cards
+            "#,
+        )
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<bool>("has_cards").unwrap_or(false))
+        } else {
+            Ok(false)
+        }
+    }
 }
