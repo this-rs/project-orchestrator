@@ -3787,7 +3787,9 @@ impl Neo4jClient {
         .param("paths", path_list.clone())
         .param("pid", pid.clone());
 
+        let start1 = std::time::Instant::now();
         let mut result1 = self.graph.execute(q1).await?;
+        self.log_slow_query("invalidate_direct", start1);
         let direct_count: i64 = if let Some(row) = result1.next().await? {
             row.get("updated")?
         } else {
@@ -3809,7 +3811,9 @@ impl Neo4jClient {
         .param("paths", path_list.clone())
         .param("pid", pid.clone());
 
+        let start2 = std::time::Instant::now();
         let mut result2 = self.graph.execute(q2).await?;
+        self.log_slow_query("invalidate_1hop", start2);
         let hop1_count: i64 = if let Some(row) = result2.next().await? {
             row.get("updated")?
         } else {
@@ -3832,7 +3836,9 @@ impl Neo4jClient {
         .param("paths", path_list)
         .param("pid", pid);
 
+        let start3 = std::time::Instant::now();
         let mut result3 = self.graph.execute(q3).await?;
+        self.log_slow_query("invalidate_2hop", start3);
         let hop2_count: i64 = if let Some(row) = result3.next().await? {
             row.get("updated")?
         } else {

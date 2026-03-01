@@ -162,6 +162,40 @@ impl Neo4jClient {
         Ok(client)
     }
 
+    // ========================================================================
+    // Query performance monitoring
+    // ========================================================================
+
+    /// Log a warning if a Neo4j query exceeded the slow query threshold.
+    ///
+    /// Usage:
+    /// ```rust,ignore
+    /// let start = std::time::Instant::now();
+    /// let mut result = self.graph.execute(q).await?;
+    /// self.log_slow_query("my_query_label", start);
+    /// ```
+    ///
+    /// Threshold is configurable via env `NEO4J_SLOW_QUERY_THRESHOLD_MS` (default 100ms).
+    pub fn log_slow_query(&self, label: &str, start: std::time::Instant) {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        let threshold: u64 = std::env::var("NEO4J_SLOW_QUERY_THRESHOLD_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
+        if elapsed_ms > threshold {
+            tracing::warn!(
+                query_ms = elapsed_ms,
+                threshold_ms = threshold,
+                label,
+                "Slow Neo4j query detected"
+            );
+        } else {
+            tracing::trace!(query_ms = elapsed_ms, label, "Neo4j query completed");
+        }
+    }
+
     /// Initialize the graph schema with constraints and indexes
     async fn init_schema(&self) -> Result<()> {
         let constraints = vec![
