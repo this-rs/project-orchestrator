@@ -5355,4 +5355,321 @@ mod tests {
         assert_eq!(card.cc_pagerank, 0.0);
         assert!(card.path.is_empty());
     }
+
+    // ── WL Subgraph Hash tests ──────────────────────────────────────
+
+    #[test]
+    fn test_wl_node_hash_single_node() {
+        let mut g = CodeGraph::new();
+        g.graph.add_node(CodeNode {
+            id: "A".into(),
+            node_type: CodeNodeType::Function,
+            name: "a".into(),
+            path: None,
+            project_id: None,
+        });
+        let idx = g.graph.node_indices().next().unwrap();
+        let hash = wl_node_hash(&g, idx, 2, 3);
+        assert_ne!(hash, 0, "Hash of a single node should be non-zero");
+    }
+
+    #[test]
+    fn test_wl_node_hash_deterministic() {
+        let g = make_chain_graph(5);
+        let idx = g.graph.node_indices().next().unwrap();
+        let h1 = wl_node_hash(&g, idx, 2, 3);
+        let h2 = wl_node_hash(&g, idx, 2, 3);
+        assert_eq!(h1, h2, "WL hash should be deterministic");
+    }
+
+    #[test]
+    fn test_wl_node_hash_symmetric_nodes_same_hash() {
+        // Star graph: center + leaves. All leaves should have the same hash.
+        let g = make_star_graph(4);
+        let leaf_indices: Vec<_> = g
+            .graph
+            .node_indices()
+            .filter(|&i| g.graph[i].id != "center")
+            .collect();
+        let hashes: Vec<u64> = leaf_indices
+            .iter()
+            .map(|&i| wl_node_hash(&g, i, 2, 3))
+            .collect();
+        assert!(
+            hashes.windows(2).all(|w| w[0] == w[1]),
+            "Symmetric leaf nodes in star graph should have identical WL hashes"
+        );
+    }
+
+    #[test]
+    fn test_wl_node_hash_different_positions_differ() {
+        // In a chain A-B-C-D-E, endpoint A and center C should have different hashes
+        let g = make_chain_graph(5);
+        let indices: Vec<_> = g.graph.node_indices().collect();
+        let hash_first = wl_node_hash(&g, indices[0], 2, 3);
+        let hash_middle = wl_node_hash(&g, indices[2], 2, 3);
+        assert_ne!(
+            hash_first, hash_middle,
+            "Endpoint and center of a chain should have different WL hashes"
+        );
+    }
+
+    #[test]
+    fn test_wl_node_hash_radius_affects_result() {
+        let g = make_chain_graph(10);
+        let idx = g.graph.node_indices().nth(5).unwrap();
+        let h_r1 = wl_node_hash(&g, idx, 1, 3);
+        let h_r3 = wl_node_hash(&g, idx, 3, 3);
+        // Different radius = different neighborhood = different hash
+        // (unless the graph is trivially small, which 10 nodes is not)
+        assert_ne!(
+            h_r1, h_r3,
+            "Different radii should generally produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_wl_subgraph_hash_all_basic() {
+        let g = make_chain_graph(5);
+        let hashes = wl_subgraph_hash_all(&g, 2, 3).unwrap();
+        assert_eq!(hashes.len(), 5, "Should have a hash for every node");
+        for hash in hashes.values() {
+            assert_ne!(*hash, 0, "No hash should be zero");
+        }
+    }
+
+    #[test]
+    fn test_wl_subgraph_hash_all_empty_graph() {
+        let g = CodeGraph::new();
+        let hashes = wl_subgraph_hash_all(&g, 2, 3).unwrap();
+        assert!(hashes.is_empty(), "Empty graph should produce no hashes");
+    }
+
+    #[test]
+    fn test_wl_subgraph_hash_all_star_leaves_same() {
+        let g = make_star_graph(5);
+        // radius=1 so center sees all leaves but each leaf only sees center
+        let hashes = wl_subgraph_hash_all(&g, 1, 3).unwrap();
+        let leaf_hashes: Vec<u64> = hashes
+            .iter()
+            .filter(|(k, _)| *k != "center")
+            .map(|(_, &v)| v)
+            .collect();
+        assert!(
+            leaf_hashes.windows(2).all(|w| w[0] == w[1]),
+            "All leaf hashes in a star should be identical"
+        );
+        // Center should differ from leaves (different neighborhood structure at radius=1)
+        let center_hash = hashes["center"];
+        assert_ne!(
+            center_hash, leaf_hashes[0],
+            "Center hash should differ from leaf hash"
+        );
+    }
+
+    // ── find_isomorphic_groups tests ────────────────────────────────
+
+    #[test]
+    fn test_find_isomorphic_groups_basic() {
+        let mut hashes = HashMap::new();
+        hashes.insert("A".to_string(), 100u64);
+        hashes.insert("B".to_string(), 100u64);
+        hashes.insert("C".to_string(), 200u64);
+        hashes.insert("D".to_string(), 200u64);
+        hashes.insert("E".to_string(), 300u64);
+
+        let groups = find_isomorphic_groups(&hashes);
+        assert_eq!(
+            groups.len(),
+            2,
+            "Should have 2 groups (singletons excluded)"
+        );
+        assert_eq!(groups[&100].len(), 2);
+        assert_eq!(groups[&200].len(), 2);
+    }
+
+    #[test]
+    fn test_find_isomorphic_groups_no_duplicates() {
+        let mut hashes = HashMap::new();
+        hashes.insert("A".to_string(), 1u64);
+        hashes.insert("B".to_string(), 2u64);
+        hashes.insert("C".to_string(), 3u64);
+
+        let groups = find_isomorphic_groups(&hashes);
+        assert!(
+            groups.is_empty(),
+            "All unique hashes should produce no groups"
+        );
+    }
+
+    #[test]
+    fn test_find_isomorphic_groups_all_same() {
+        let mut hashes = HashMap::new();
+        for i in 0..5 {
+            hashes.insert(format!("node_{}", i), 42u64);
+        }
+        let groups = find_isomorphic_groups(&hashes);
+        assert_eq!(groups.len(), 1, "All same hash → one group");
+        assert_eq!(groups[&42].len(), 5);
+    }
+
+    #[test]
+    fn test_find_isomorphic_groups_empty() {
+        let hashes: HashMap<String, u64> = HashMap::new();
+        let groups = find_isomorphic_groups(&hashes);
+        assert!(groups.is_empty());
+    }
+
+    // ── double_radius_label tests ───────────────────────────────────
+
+    #[test]
+    fn test_double_radius_label_linear() {
+        // A → B → C, source=A, target=C
+        let paths: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
+        let edges = vec![
+            ("A".to_string(), "B".to_string()),
+            ("B".to_string(), "C".to_string()),
+        ];
+        let labels = double_radius_label(&paths, &edges, "A", "C");
+        assert_eq!(labels["A"], (0, 2)); // dist(A,A)=0, dist(A,C)=2
+        assert_eq!(labels["B"], (1, 1)); // dist(B,A)=1, dist(B,C)=1
+        assert_eq!(labels["C"], (2, 0)); // dist(C,A)=2, dist(C,C)=0
+    }
+
+    #[test]
+    fn test_double_radius_label_star() {
+        // Center connected to A, B, C. source=A, target=B
+        let paths: Vec<String> = vec!["center".into(), "A".into(), "B".into(), "C".into()];
+        let edges = vec![
+            ("center".to_string(), "A".to_string()),
+            ("center".to_string(), "B".to_string()),
+            ("center".to_string(), "C".to_string()),
+        ];
+        let labels = double_radius_label(&paths, &edges, "A", "B");
+        assert_eq!(labels["A"], (0, 2));
+        assert_eq!(labels["B"], (2, 0));
+        assert_eq!(labels["center"], (1, 1));
+        assert_eq!(labels["C"], (2, 2)); // equidistant
+    }
+
+    #[test]
+    fn test_double_radius_label_disconnected() {
+        // A-B and C (disconnected), source=A, target=C
+        let paths: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
+        let edges = vec![("A".to_string(), "B".to_string())];
+        let labels = double_radius_label(&paths, &edges, "A", "C");
+        assert_eq!(labels["A"].0, 0); // dist to source = 0
+        assert_eq!(labels["A"].1, u32::MAX); // unreachable to target
+        assert_eq!(labels["C"].0, u32::MAX); // unreachable from source
+        assert_eq!(labels["C"].1, 0); // dist to target = 0
+    }
+
+    // ── find_bottleneck_nodes tests ─────────────────────────────────
+
+    #[test]
+    fn test_bottleneck_chain() {
+        // A - B - C - D - E, source=A, target=E
+        let paths: Vec<String> = (0..5).map(|i| format!("n{}", i)).collect();
+        let edges: Vec<(String, String)> = (0..4)
+            .map(|i| (format!("n{}", i), format!("n{}", i + 1)))
+            .collect();
+        let bottlenecks = find_bottleneck_nodes(&paths, &edges, "n0", "n4", 3);
+        // Middle node n2 should be highest betweenness
+        assert!(
+            !bottlenecks.is_empty(),
+            "Chain should have bottleneck nodes"
+        );
+        assert_eq!(
+            bottlenecks[0], "n2",
+            "Center of chain should be top bottleneck"
+        );
+    }
+
+    #[test]
+    fn test_bottleneck_too_small() {
+        // Only 2 nodes: source + target, no intermediates
+        let paths = vec!["A".to_string(), "B".to_string()];
+        let edges = vec![("A".to_string(), "B".to_string())];
+        let bottlenecks = find_bottleneck_nodes(&paths, &edges, "A", "B", 5);
+        assert!(bottlenecks.is_empty(), "2 nodes = no intermediates");
+    }
+
+    #[test]
+    fn test_bottleneck_star_center() {
+        // Star: center - A, center - B, center - C, center - D
+        // source=A, target=B → center is the bottleneck
+        let paths: Vec<String> = vec![
+            "center".into(),
+            "A".into(),
+            "B".into(),
+            "C".into(),
+            "D".into(),
+        ];
+        let edges: Vec<(String, String)> = vec![
+            ("center".into(), "A".into()),
+            ("center".into(), "B".into()),
+            ("center".into(), "C".into()),
+            ("center".into(), "D".into()),
+        ];
+        let bottlenecks = find_bottleneck_nodes(&paths, &edges, "A", "B", 1);
+        assert_eq!(bottlenecks.len(), 1);
+        assert_eq!(bottlenecks[0], "center");
+    }
+
+    #[test]
+    fn test_bottleneck_excludes_source_target() {
+        let paths: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
+        let edges = vec![
+            ("A".to_string(), "B".to_string()),
+            ("B".to_string(), "C".to_string()),
+        ];
+        let bottlenecks = find_bottleneck_nodes(&paths, &edges, "A", "C", 10);
+        // Should not contain A or C
+        assert!(!bottlenecks.contains(&"A".to_string()));
+        assert!(!bottlenecks.contains(&"C".to_string()));
+    }
+
+    // ── find_distance_2_3_pairs tests ───────────────────────────────
+
+    #[test]
+    fn test_distance_2_3_pairs_chain() {
+        // Chain A-B-C-D: distance-2 pairs = (A,C) and (B,D)
+        let g = make_chain_graph(4);
+        let pairs = find_distance_2_3_pairs(&g);
+        assert!(!pairs.is_empty(), "Chain of 4 should have distance-2 pairs");
+        // A-C and B-D are at distance 2 (not directly connected)
+        // A-D is distance 3, NOT captured by 2-hop BFS
+        assert_eq!(pairs.len(), 2, "A-C and B-D at distance 2");
+    }
+
+    #[test]
+    fn test_distance_2_3_pairs_complete_graph() {
+        // In a complete graph (clique), every node is directly connected,
+        // so there are no distance-2 pairs
+        let g = make_two_cliques(3); // creates 2 cliques connected by a bridge
+        let pairs = find_distance_2_3_pairs(&g);
+        // Two cliques connected → there will be cross-clique distance-2 pairs
+        assert!(!pairs.is_empty());
+    }
+
+    #[test]
+    fn test_distance_2_3_pairs_empty() {
+        let g = CodeGraph::new();
+        let pairs = find_distance_2_3_pairs(&g);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_distance_2_3_pairs_star() {
+        // Star: center - L1, center - L2, center - L3
+        // All leaves are distance 2 from each other (through center)
+        let g = make_star_graph(4);
+        let pairs = find_distance_2_3_pairs(&g);
+        // 4 leaves → C(4,2) = 6 distance-2 pairs
+        assert_eq!(
+            pairs.len(),
+            6,
+            "Star with 4 leaves: 6 leaf-leaf pairs at distance 2"
+        );
+    }
 }

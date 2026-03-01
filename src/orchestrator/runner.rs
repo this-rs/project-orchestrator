@@ -6746,7 +6746,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_staleness_computed_after_sync_is_fresh() {
-        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        use crate::neo4j::mock::MockGraphStore;
+        let mock_store = Arc::new(MockGraphStore::new());
+        // Simulate that GraIL context cards have been computed
+        mock_store
+            .mock_has_context_cards
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let state = mock_app_state_with_graph(mock_store);
+        let orch = Orchestrator::new(state).await.unwrap();
         let mut project = test_project();
         project.last_synced = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
         orch.create_project(&project).await.unwrap();
@@ -6781,6 +6788,40 @@ mod tests {
             "Project synced after analytics should be stale"
         );
         assert!(report.analytics_age.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_staleness_fresh_timestamps_but_no_context_cards_is_stale() {
+        // Simulates a pre-GraIL project: analytics_computed_at is set (from before
+        // GraIL was deployed) but no files have cc_version — should be stale.
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let mut project = test_project();
+        project.last_synced = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        project.analytics_computed_at = Some(chrono::Utc::now()); // set AFTER sync → timestamps say fresh
+        orch.create_project(&project).await.unwrap();
+
+        // MockGraphStore.has_context_cards() always returns false → should detect as stale
+        let report = orch.check_analytics_staleness(project.id).await.unwrap();
+        assert!(
+            report.is_stale,
+            "Fresh timestamps but no context cards (pre-GraIL) should be stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_staleness_never_computed_remains_stale() {
+        // analytics_computed_at = None → stale regardless of context cards check
+        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        let mut project = test_project();
+        project.last_synced = Some(chrono::Utc::now());
+        orch.create_project(&project).await.unwrap();
+
+        let report = orch.check_analytics_staleness(project.id).await.unwrap();
+        assert!(
+            report.is_stale,
+            "Never computed should be stale (context cards check not even needed)"
+        );
+        assert!(report.analytics_computed_at.is_none());
     }
 
     #[tokio::test]

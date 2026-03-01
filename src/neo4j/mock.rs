@@ -133,6 +133,10 @@ pub struct MockGraphStore {
 
     // Topology rules (keyed by rule id String)
     pub topology_rules: RwLock<HashMap<String, crate::graph::models::TopologyRule>>,
+
+    // Test flags
+    /// Controls what `has_context_cards()` returns (default: false)
+    pub mock_has_context_cards: std::sync::atomic::AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -209,6 +213,7 @@ impl MockGraphStore {
             skill_members: RwLock::new(HashMap::new()),
             analysis_profiles: RwLock::new(HashMap::new()),
             topology_rules: RwLock::new(HashMap::new()),
+            mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -7482,8 +7487,9 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn has_context_cards(&self, _project_id: &str) -> anyhow::Result<bool> {
-        // Mock: no context cards
-        Ok(false)
+        Ok(self
+            .mock_has_context_cards
+            .load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
