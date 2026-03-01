@@ -1556,6 +1556,225 @@ pub fn find_structural_twins(
 }
 
 // ============================================================================
+// Multi-signal Structural Similarity (Fingerprint v2)
+// ============================================================================
+
+/// Fusion weights for multi-signal similarity.
+const W_FINGERPRINT: f64 = 0.50;
+const W_WL_HASH: f64 = 0.20;
+const W_NAME: f64 = 0.20;
+const W_SIZE: f64 = 0.10;
+
+/// Compute Jaro similarity between two strings.
+///
+/// Returns a value in [0.0, 1.0] where 1.0 means identical.
+/// This is the base for Jaro-Winkler and works well for short file-stem comparisons.
+fn jaro_similarity(s1: &str, s2: &str) -> f64 {
+    if s1 == s2 {
+        return 1.0;
+    }
+    let len1 = s1.len();
+    let len2 = s2.len();
+    if len1 == 0 || len2 == 0 {
+        return 0.0;
+    }
+
+    let match_distance = (std::cmp::max(len1, len2) / 2).saturating_sub(1);
+
+    let s1_bytes = s1.as_bytes();
+    let s2_bytes = s2.as_bytes();
+    let mut s1_matched = vec![false; len1];
+    let mut s2_matched = vec![false; len2];
+
+    let mut matches = 0usize;
+    let mut transpositions = 0usize;
+
+    // Count matching characters
+    for i in 0..len1 {
+        let start = i.saturating_sub(match_distance);
+        let end = std::cmp::min(i + match_distance + 1, len2);
+        for j in start..end {
+            if s2_matched[j] || s1_bytes[i] != s2_bytes[j] {
+                continue;
+            }
+            s1_matched[i] = true;
+            s2_matched[j] = true;
+            matches += 1;
+            break;
+        }
+    }
+
+    if matches == 0 {
+        return 0.0;
+    }
+
+    // Count transpositions
+    let mut k = 0usize;
+    for i in 0..len1 {
+        if !s1_matched[i] {
+            continue;
+        }
+        while !s2_matched[k] {
+            k += 1;
+        }
+        if s1_bytes[i] != s2_bytes[k] {
+            transpositions += 1;
+        }
+        k += 1;
+    }
+
+    let m = matches as f64;
+    let t = transpositions as f64 / 2.0;
+    (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+}
+
+/// Compute Jaro-Winkler similarity between two strings.
+///
+/// Boosts the Jaro score when the strings share a common prefix (up to 4 chars).
+/// Good for file names that often share prefixes like "user_", "auth_", etc.
+fn jaro_winkler_similarity(s1: &str, s2: &str) -> f64 {
+    let jaro = jaro_similarity(s1, s2);
+    if jaro == 0.0 {
+        return 0.0;
+    }
+
+    // Count common prefix (max 4 characters)
+    let prefix_len = s1
+        .chars()
+        .zip(s2.chars())
+        .take(4)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Winkler scaling factor p = 0.1 (standard)
+    jaro + prefix_len as f64 * 0.1 * (1.0 - jaro)
+}
+
+/// Extract the file stem (name without extension and path).
+///
+/// "src/api/handlers.rs" → "handlers"
+/// "components/UserProfile.tsx" → "UserProfile"
+fn file_stem(path: &str) -> &str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.split('.').next().unwrap_or(name)
+}
+
+/// Compute log-size similarity between two function counts.
+///
+/// Uses `1 - |log(a+1) - log(b+1)| / log(max+1)` to produce a value in [0, 1].
+/// Files with similar function counts (scale-wise) get high scores.
+fn log_size_similarity(count_a: usize, count_b: usize) -> f64 {
+    let la = (count_a as f64 + 1.0).ln();
+    let lb = (count_b as f64 + 1.0).ln();
+    let max_log = la.max(lb);
+    if max_log == 0.0 {
+        return 1.0; // Both zero → identical
+    }
+    1.0 - (la - lb).abs() / max_log
+}
+
+/// Input data for one file in multi-signal similarity computation.
+#[derive(Debug, Clone)]
+pub struct FileSignals {
+    /// File path (used as identifier)
+    pub path: String,
+    /// 17-dim structural fingerprint vector (from `compute_structural_fingerprint`)
+    pub fingerprint: Vec<f64>,
+    /// WL subgraph hash (from `wl_subgraph_hash_all`), None if unavailable
+    pub wl_hash: Option<u64>,
+    /// Number of functions defined in this file (d7 raw value)
+    pub function_count: usize,
+}
+
+/// Compute multi-signal fused similarity between two files.
+///
+/// Combines four independent signals with fixed weights:
+/// - **Fingerprint cosine** (0.50): 17-dim structural role vector comparison
+/// - **WL hash match** (0.20): exact topological neighborhood match bonus
+/// - **Name similarity** (0.20): Jaro-Winkler on file stems (cross-project naming patterns)
+/// - **Size similarity** (0.10): log-ratio of function counts
+///
+/// Returns a `FingerprintSimilarity` with the fused score and per-signal breakdown.
+pub fn compute_multi_signal_similarity(
+    source: &FileSignals,
+    target: &FileSignals,
+) -> super::models::FingerprintSimilarity {
+    // Signal 1: Fingerprint cosine similarity (weight 0.50)
+    let fp_sim = if source.fingerprint.is_empty() || target.fingerprint.is_empty() {
+        0.0
+    } else {
+        cosine_similarity(&source.fingerprint, &target.fingerprint)
+    };
+
+    // Signal 2: WL hash exact match (weight 0.20)
+    let wl_match = match (source.wl_hash, target.wl_hash) {
+        (Some(a), Some(b)) if a == b => 1.0,
+        _ => 0.0,
+    };
+
+    // Signal 3: File name Jaro-Winkler similarity (weight 0.20)
+    let name_sim = jaro_winkler_similarity(file_stem(&source.path), file_stem(&target.path));
+
+    // Signal 4: Log-size similarity (weight 0.10)
+    let size_sim = log_size_similarity(source.function_count, target.function_count);
+
+    // Fused score
+    let fused = W_FINGERPRINT * fp_sim + W_WL_HASH * wl_match + W_NAME * name_sim + W_SIZE * size_sim;
+
+    super::models::FingerprintSimilarity {
+        source: source.path.clone(),
+        target: target.path.clone(),
+        similarity: fused,
+        signals: super::models::SimilaritySignals {
+            fingerprint_similarity: fp_sim,
+            wl_hash_match: wl_match,
+            name_similarity: name_sim,
+            size_similarity: size_sim,
+        },
+        shared_role: None, // Caller can enrich this based on community/cluster labels
+    }
+}
+
+/// Find cross-project structural twins using multi-signal fusion.
+///
+/// Given a source file's signals and a collection of candidate files from other projects,
+/// computes fused similarity for each candidate and returns the top-N most similar.
+///
+/// This replaces the old DNA-only cosine approach which suffered from project-specific
+/// anchor bias (all similarities ≈ 0.999).
+pub fn find_cross_project_twins_multi_signal(
+    source: &FileSignals,
+    candidates: &[FileSignals],
+    top_n: usize,
+) -> Vec<super::models::FingerprintSimilarity> {
+    let mut results: Vec<super::models::FingerprintSimilarity> = candidates
+        .iter()
+        .filter(|c| c.path != source.path)
+        .map(|candidate| compute_multi_signal_similarity(source, candidate))
+        .collect();
+
+    results.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(top_n);
+    results
+}
+
+/// Find intra-project structural twins using multi-signal fusion.
+///
+/// Same as cross-project but operates within a single project's file set.
+/// Uses fingerprints instead of DNA to avoid the anchor-bias problem.
+pub fn find_structural_twins_multi_signal(
+    source: &FileSignals,
+    project_files: &[FileSignals],
+    top_n: usize,
+) -> Vec<super::models::FingerprintSimilarity> {
+    find_cross_project_twins_multi_signal(source, project_files, top_n)
+}
+
+// ============================================================================
 // Structural DNA — K-means Clustering
 // ============================================================================
 
@@ -4689,6 +4908,331 @@ mod tests {
         for i in 0..twins.len() - 1 {
             assert!(twins[i].1 >= twins[i + 1].1);
         }
+    }
+
+    // ========================================================================
+    // Multi-signal similarity tests
+    // ========================================================================
+
+    #[test]
+    fn test_jaro_winkler_identical() {
+        assert!((jaro_winkler_similarity("handlers", "handlers") - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_jaro_winkler_similar_names() {
+        let sim = jaro_winkler_similarity("handlers", "handler");
+        assert!(sim > 0.9, "Similar names should have high similarity: {sim}");
+    }
+
+    #[test]
+    fn test_jaro_winkler_different_names() {
+        let sim = jaro_winkler_similarity("handlers", "models");
+        assert!(sim < 0.7, "Different names should have low similarity: {sim}");
+    }
+
+    #[test]
+    fn test_jaro_winkler_empty() {
+        assert_eq!(jaro_winkler_similarity("", "test"), 0.0);
+        assert_eq!(jaro_winkler_similarity("test", ""), 0.0);
+        assert_eq!(jaro_winkler_similarity("", ""), 1.0);
+    }
+
+    #[test]
+    fn test_jaro_winkler_prefix_boost() {
+        // "user_profile" vs "user_settings" share "user_" prefix → boosted
+        let with_prefix = jaro_winkler_similarity("user_profile", "user_settings");
+        // "profile_user" vs "settings_user" share no prefix → not boosted
+        let without_prefix = jaro_winkler_similarity("profile_user", "settings_user");
+        assert!(
+            with_prefix > without_prefix,
+            "Common prefix should boost: {with_prefix} vs {without_prefix}"
+        );
+    }
+
+    #[test]
+    fn test_file_stem() {
+        assert_eq!(file_stem("src/api/handlers.rs"), "handlers");
+        assert_eq!(file_stem("components/UserProfile.tsx"), "UserProfile");
+        assert_eq!(file_stem("Makefile"), "Makefile");
+        assert_eq!(file_stem("src/mod.rs"), "mod");
+        assert_eq!(file_stem("a/b/c/deep.file.ext"), "deep");
+    }
+
+    #[test]
+    fn test_log_size_similarity_identical() {
+        let sim = log_size_similarity(10, 10);
+        assert!(
+            (sim - 1.0).abs() < 1e-10,
+            "Same size should be 1.0: {sim}"
+        );
+    }
+
+    #[test]
+    fn test_log_size_similarity_close() {
+        let sim = log_size_similarity(10, 12);
+        assert!(
+            sim > 0.9,
+            "Close sizes should have high similarity: {sim}"
+        );
+    }
+
+    #[test]
+    fn test_log_size_similarity_different() {
+        let sim = log_size_similarity(1, 100);
+        assert!(
+            sim < 0.5,
+            "Very different sizes should have low similarity: {sim}"
+        );
+    }
+
+    #[test]
+    fn test_log_size_similarity_zero() {
+        // Both zero → identical
+        assert!((log_size_similarity(0, 0) - 1.0).abs() < 1e-10);
+        // One zero, one nonzero → still produces a valid [0,1] value
+        let sim = log_size_similarity(0, 10);
+        assert!(sim >= 0.0 && sim <= 1.0, "Should be in [0,1]: {sim}");
+    }
+
+    #[test]
+    fn test_compute_multi_signal_identical_files() {
+        let source = FileSignals {
+            path: "src/handlers.rs".to_string(),
+            fingerprint: vec![0.5, 0.3, 0.8, 0.1, 0.9, 0.2, 0.4, 0.6, 0.7, 0.3, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.9],
+            wl_hash: Some(12345),
+            function_count: 10,
+        };
+        let target = source.clone();
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        assert!(
+            (result.similarity - 1.0).abs() < 1e-10,
+            "Identical files should have similarity 1.0: {}",
+            result.similarity
+        );
+        assert!((result.signals.fingerprint_similarity - 1.0).abs() < 1e-10);
+        assert!((result.signals.wl_hash_match - 1.0).abs() < 1e-10);
+        assert!((result.signals.name_similarity - 1.0).abs() < 1e-10);
+        assert!((result.signals.size_similarity - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_multi_signal_completely_different() {
+        let source = FileSignals {
+            path: "src/handlers.rs".to_string(),
+            fingerprint: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            wl_hash: Some(111),
+            function_count: 1,
+        };
+        let target = FileSignals {
+            path: "lib/models.py".to_string(),
+            fingerprint: vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            wl_hash: Some(999),
+            function_count: 100,
+        };
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        assert!(
+            result.similarity < 0.3,
+            "Completely different files should have low similarity: {}",
+            result.similarity
+        );
+        assert!((result.signals.wl_hash_match).abs() < 1e-10); // No WL match
+    }
+
+    #[test]
+    fn test_compute_multi_signal_same_role_different_project() {
+        // Two "handlers.rs" files from different projects with similar structure
+        let source = FileSignals {
+            path: "project-a/src/api/handlers.rs".to_string(),
+            fingerprint: vec![0.5, 0.3, 0.8, 0.1, 0.7, 0.2, 0.4, 0.6, 0.3, 0.2, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.7],
+            wl_hash: Some(555),
+            function_count: 15,
+        };
+        let target = FileSignals {
+            path: "project-b/src/api/handlers.rs".to_string(),
+            fingerprint: vec![0.5, 0.35, 0.75, 0.12, 0.72, 0.18, 0.38, 0.58, 0.28, 0.22, 0.48, 0.12, 0.78, 0.22, 0.58, 0.42, 0.68],
+            wl_hash: Some(555), // Same WL hash = same topology
+            function_count: 18,
+        };
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        assert!(
+            result.similarity > 0.8,
+            "Same-role cross-project files should be very similar: {}",
+            result.similarity
+        );
+        assert!((result.signals.wl_hash_match - 1.0).abs() < 1e-10); // WL match!
+        assert!(result.signals.name_similarity > 0.9); // Same file name
+    }
+
+    #[test]
+    fn test_compute_multi_signal_no_wl_hash() {
+        let source = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![0.5; 17],
+            wl_hash: None, // No WL hash available
+            function_count: 5,
+        };
+        let target = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![0.5; 17],
+            wl_hash: None,
+            function_count: 5,
+        };
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        // WL hash should be 0.0 (missing), but other signals should compensate
+        assert!((result.signals.wl_hash_match).abs() < 1e-10);
+        // Fingerprint (1.0 * 0.5) + WL (0.0 * 0.2) + name (1.0 * 0.2) + size (1.0 * 0.1) = 0.8
+        assert!(
+            (result.similarity - 0.8).abs() < 1e-10,
+            "Without WL hash: 0.5*1.0 + 0.2*0.0 + 0.2*1.0 + 0.1*1.0 = 0.8, got {}",
+            result.similarity
+        );
+    }
+
+    #[test]
+    fn test_compute_multi_signal_empty_fingerprint() {
+        let source = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![],
+            wl_hash: Some(123),
+            function_count: 5,
+        };
+        let target = FileSignals {
+            path: "lib/main.rs".to_string(),
+            fingerprint: vec![],
+            wl_hash: Some(123),
+            function_count: 5,
+        };
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        assert!((result.signals.fingerprint_similarity).abs() < 1e-10); // No fingerprint
+        // WL match (0.2) + name match (0.2) + size match (0.1) = 0.5
+        assert!(
+            (result.similarity - 0.5).abs() < 0.01,
+            "Without fingerprint but with matching WL + name + size: ~0.5, got {}",
+            result.similarity
+        );
+    }
+
+    #[test]
+    fn test_find_cross_project_twins_multi_signal_ordering() {
+        let source = FileSignals {
+            path: "project-a/src/handlers.rs".to_string(),
+            fingerprint: vec![0.8, 0.3, 0.7, 0.1, 0.9, 0.2, 0.4, 0.6, 0.3, 0.2, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.7],
+            wl_hash: Some(100),
+            function_count: 10,
+        };
+
+        let candidates = vec![
+            FileSignals {
+                path: "project-b/src/handlers.rs".to_string(), // Same name, same WL, similar FP
+                fingerprint: vec![0.78, 0.32, 0.68, 0.12, 0.88, 0.22, 0.38, 0.58, 0.28, 0.22, 0.48, 0.12, 0.78, 0.22, 0.58, 0.42, 0.68],
+                wl_hash: Some(100),
+                function_count: 12,
+            },
+            FileSignals {
+                path: "project-c/src/models.rs".to_string(), // Different name, different WL
+                fingerprint: vec![0.1, 0.9, 0.2, 0.8, 0.1, 0.7, 0.3, 0.5, 0.8, 0.6, 0.2, 0.9, 0.1, 0.7, 0.3, 0.8, 0.2],
+                wl_hash: Some(200),
+                function_count: 25,
+            },
+            FileSignals {
+                path: "project-d/src/routes.rs".to_string(), // Different name, same WL hash
+                fingerprint: vec![0.75, 0.35, 0.65, 0.15, 0.85, 0.25, 0.35, 0.55, 0.35, 0.25, 0.45, 0.15, 0.75, 0.25, 0.55, 0.45, 0.65],
+                wl_hash: Some(100),
+                function_count: 11,
+            },
+        ];
+
+        let results = find_cross_project_twins_multi_signal(&source, &candidates, 10);
+        assert_eq!(results.len(), 3);
+
+        // Should be sorted by similarity descending
+        for i in 0..results.len() - 1 {
+            assert!(
+                results[i].similarity >= results[i + 1].similarity,
+                "Results should be sorted: {} >= {}",
+                results[i].similarity,
+                results[i + 1].similarity
+            );
+        }
+
+        // project-b/handlers.rs should be #1 (same name + same WL + similar FP)
+        assert!(
+            results[0].target.contains("handlers"),
+            "Best match should be handlers.rs, got: {}",
+            results[0].target
+        );
+        // project-c/models.rs should be last (different everything)
+        assert!(
+            results[2].target.contains("models"),
+            "Worst match should be models.rs, got: {}",
+            results[2].target
+        );
+    }
+
+    #[test]
+    fn test_find_cross_project_twins_multi_signal_top_n() {
+        let source = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![0.5; 17],
+            wl_hash: Some(1),
+            function_count: 5,
+        };
+
+        let candidates: Vec<FileSignals> = (0..20)
+            .map(|i| FileSignals {
+                path: format!("project-{i}/src/file_{i}.rs"),
+                fingerprint: vec![0.5 + (i as f64) * 0.01; 17],
+                wl_hash: Some(i as u64),
+                function_count: 5 + i,
+            })
+            .collect();
+
+        let results = find_cross_project_twins_multi_signal(&source, &candidates, 5);
+        assert_eq!(results.len(), 5, "Should truncate to top_n=5");
+    }
+
+    #[test]
+    fn test_find_cross_project_twins_skips_self() {
+        let source = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![0.5; 17],
+            wl_hash: Some(1),
+            function_count: 5,
+        };
+
+        // Include the source path in candidates
+        let candidates = vec![
+            FileSignals {
+                path: "src/main.rs".to_string(), // Same path → should be skipped
+                fingerprint: vec![0.5; 17],
+                wl_hash: Some(1),
+                function_count: 5,
+            },
+            FileSignals {
+                path: "src/other.rs".to_string(),
+                fingerprint: vec![0.4; 17],
+                wl_hash: Some(2),
+                function_count: 3,
+            },
+        ];
+
+        let results = find_cross_project_twins_multi_signal(&source, &candidates, 10);
+        assert_eq!(results.len(), 1, "Should skip self-match");
+        assert_eq!(results[0].target, "src/other.rs");
+    }
+
+    #[test]
+    fn test_weight_sum_is_one() {
+        assert!(
+            (W_FINGERPRINT + W_WL_HASH + W_NAME + W_SIZE - 1.0).abs() < 1e-10,
+            "Weights should sum to 1.0"
+        );
     }
 
     // ========================================================================
