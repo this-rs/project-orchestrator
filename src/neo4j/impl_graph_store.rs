@@ -2338,11 +2338,7 @@ impl GraphStore for Neo4jClient {
         self.get_knowledge_density(file_path, project_id).await
     }
 
-    async fn get_node_pagerank(
-        &self,
-        file_path: &str,
-        project_id: &str,
-    ) -> anyhow::Result<f64> {
+    async fn get_node_pagerank(&self, file_path: &str, project_id: &str) -> anyhow::Result<f64> {
         self.get_node_pagerank(file_path, project_id).await
     }
 
@@ -2369,10 +2365,7 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
-    async fn get_avg_multi_signal_score(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<f64> {
+    async fn get_avg_multi_signal_score(&self, project_id: Uuid) -> anyhow::Result<f64> {
         self.get_avg_multi_signal_score(project_id).await
     }
 

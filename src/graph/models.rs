@@ -562,12 +562,24 @@ pub struct GrailConfig {
     pub wl_iterations: usize,
 }
 
-fn default_stress_top_n() -> usize { 20 }
-fn default_missing_links_top_n() -> usize { 50 }
-fn default_min_plausibility() -> f64 { 0.3 }
-fn default_dna_k() -> usize { 10 }
-fn default_wl_radius() -> usize { 2 }
-fn default_wl_iterations() -> usize { 3 }
+fn default_stress_top_n() -> usize {
+    20
+}
+fn default_missing_links_top_n() -> usize {
+    50
+}
+fn default_min_plausibility() -> f64 {
+    0.3
+}
+fn default_dna_k() -> usize {
+    10
+}
+fn default_wl_radius() -> usize {
+    2
+}
+fn default_wl_iterations() -> usize {
+    3
+}
 
 impl Default for GrailConfig {
     fn default() -> Self {
@@ -654,7 +666,10 @@ pub fn profile_refactoring() -> AnalysisProfile {
         id: "00000000-0000-0000-0000-000000000002".to_string(),
         project_id: None,
         name: "refactoring".to_string(),
-        description: Some("Optimized for safe code restructuring — imports and co-change are emphasized".to_string()),
+        description: Some(
+            "Optimized for safe code restructuring — imports and co-change are emphasized"
+                .to_string(),
+        ),
         edge_weights: HashMap::from([
             ("IMPORTS".to_string(), 0.8),
             ("CALLS".to_string(), 0.5),
@@ -682,7 +697,10 @@ pub fn profile_security() -> AnalysisProfile {
         id: "00000000-0000-0000-0000-000000000003".to_string(),
         project_id: None,
         name: "security".to_string(),
-        description: Some("Optimized for security review — call chains and inheritance are prioritized".to_string()),
+        description: Some(
+            "Optimized for security review — call chains and inheritance are prioritized"
+                .to_string(),
+        ),
         edge_weights: HashMap::from([
             ("IMPORTS".to_string(), 0.4),
             ("CALLS".to_string(), 0.9),
@@ -710,7 +728,10 @@ pub fn profile_onboarding() -> AnalysisProfile {
         id: "00000000-0000-0000-0000-000000000004".to_string(),
         project_id: None,
         name: "onboarding".to_string(),
-        description: Some("Optimized for onboarding — definitions and knowledge documentation are emphasized".to_string()),
+        description: Some(
+            "Optimized for onboarding — definitions and knowledge documentation are emphasized"
+                .to_string(),
+        ),
         edge_weights: HashMap::from([
             ("IMPORTS".to_string(), 0.5),
             ("CALLS".to_string(), 0.3),
@@ -804,16 +825,28 @@ impl FusionWeights {
     pub fn validate(&self) -> Result<(), String> {
         // Check for negative weights
         if self.structural < 0.0 {
-            return Err(format!("structural weight must be >= 0, got {}", self.structural));
+            return Err(format!(
+                "structural weight must be >= 0, got {}",
+                self.structural
+            ));
         }
         if self.co_change < 0.0 {
-            return Err(format!("co_change weight must be >= 0, got {}", self.co_change));
+            return Err(format!(
+                "co_change weight must be >= 0, got {}",
+                self.co_change
+            ));
         }
         if self.knowledge < 0.0 {
-            return Err(format!("knowledge weight must be >= 0, got {}", self.knowledge));
+            return Err(format!(
+                "knowledge weight must be >= 0, got {}",
+                self.knowledge
+            ));
         }
         if self.pagerank < 0.0 {
-            return Err(format!("pagerank weight must be >= 0, got {}", self.pagerank));
+            return Err(format!(
+                "pagerank weight must be >= 0, got {}",
+                self.pagerank
+            ));
         }
         if self.bridge < 0.0 {
             return Err(format!("bridge weight must be >= 0, got {}", self.bridge));
@@ -1460,8 +1493,16 @@ mod tests {
                 profile.name,
                 profile.fusion_weights.validate().err()
             );
-            assert!(profile.is_builtin, "Profile '{}' should be builtin", profile.name);
-            assert!(profile.project_id.is_none(), "Built-in profile '{}' should be global", profile.name);
+            assert!(
+                profile.is_builtin,
+                "Profile '{}' should be builtin",
+                profile.name
+            );
+            assert!(
+                profile.project_id.is_none(),
+                "Built-in profile '{}' should be global",
+                profile.name
+            );
         }
     }
 

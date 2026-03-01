@@ -463,10 +463,7 @@ impl Neo4jClient {
                     );
                 }
             }
-            tracing::info!(
-                count = profiles.len(),
-                "Seeded built-in analysis profiles"
-            );
+            tracing::info!(count = profiles.len(), "Seeded built-in analysis profiles");
         }
 
         // Vector indexes — optional, don't fail startup if Neo4j doesn't support them

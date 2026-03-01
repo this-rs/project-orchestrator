@@ -6927,11 +6927,7 @@ impl GraphStore for MockGraphStore {
         Ok((count as f64 / 10.0).min(1.0))
     }
 
-    async fn get_node_pagerank(
-        &self,
-        _file_path: &str,
-        _project_id: &str,
-    ) -> anyhow::Result<f64> {
+    async fn get_node_pagerank(&self, _file_path: &str, _project_id: &str) -> anyhow::Result<f64> {
         // Mock: return 0.0 (no GDS in tests)
         Ok(0.0)
     }
@@ -6945,10 +6941,7 @@ impl GraphStore for MockGraphStore {
         Ok(Vec::new())
     }
 
-    async fn get_avg_multi_signal_score(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<f64> {
+    async fn get_avg_multi_signal_score(&self, _project_id: Uuid) -> anyhow::Result<f64> {
         // Mock: no GDS metrics in tests, return 0.0
         Ok(0.0)
     }

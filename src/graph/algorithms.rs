@@ -24,9 +24,9 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use super::models::{
-    AnalysisProfile, AnalyticsConfig, CodeGraph, CodeHealthReport, ComputeAllResult,
-    ComputeMode, CommunityInfo, ComponentInfo, GrailConfig, GrailStats, GraphAnalytics,
-    NodeMetrics, RankCluster, RankConfidence, RankedList, RankedResult, StepTiming,
+    AnalysisProfile, AnalyticsConfig, CodeGraph, CodeHealthReport, CommunityInfo, ComponentInfo,
+    ComputeAllResult, ComputeMode, GrailConfig, GrailStats, GraphAnalytics, NodeMetrics,
+    RankCluster, RankConfidence, RankedList, RankedResult, StepTiming,
 };
 
 // ============================================================================
@@ -952,9 +952,8 @@ pub fn compute_all_extended(
     }
 
     // --- Steps 1-8: Base analytics (PageRank, Betweenness, Louvain, Health) ---
-    let (base_analytics, base_timing) = timed_step("base_analytics", || {
-        Ok(compute_all(&working_graph, config))
-    });
+    let (base_analytics, base_timing) =
+        timed_step("base_analytics", || Ok(compute_all(&working_graph, config)));
     timings.push(base_timing);
 
     let analytics = base_analytics.unwrap_or_else(|| GraphAnalytics {
@@ -992,7 +991,8 @@ pub fn compute_all_extended(
 
     // --- Step 6: WL Subgraph Hash ---
     let (wl_result, wl_timing) = timed_step("wl_subgraph_hash", || {
-        let mut hashes = wl_subgraph_hash_all(&working_graph, grail.wl_radius, grail.wl_iterations)?;
+        let mut hashes =
+            wl_subgraph_hash_all(&working_graph, grail.wl_radius, grail.wl_iterations)?;
         // In incremental mode, only keep stale nodes
         if let Some(ref targets) = incremental_targets {
             hashes.retain(|id, _| targets.contains(id));
@@ -1014,7 +1014,9 @@ pub fn compute_all_extended(
 
     // --- Step 8: Missing Link Prediction (depends on DNA) ---
     if structural_dna_map.is_empty() {
-        tracing::warn!("missing_links will run with 4 signals instead of 5 — structural DNA unavailable");
+        tracing::warn!(
+            "missing_links will run with 4 signals instead of 5 — structural DNA unavailable"
+        );
     }
     let (_links_result, links_timing) = timed_step("missing_links", || {
         // TODO(Plan 9): suggest_missing_links(&working_graph, &structural_dna_map, ...)
@@ -1292,9 +1294,7 @@ pub fn wl_subgraph_hash_all(
 }
 
 /// Find groups of nodes with identical WL hash (isomorphic neighborhoods).
-pub fn find_isomorphic_groups(
-    wl_hashes: &HashMap<String, u64>,
-) -> HashMap<u64, Vec<String>> {
+pub fn find_isomorphic_groups(wl_hashes: &HashMap<String, u64>) -> HashMap<u64, Vec<String>> {
     let mut groups: HashMap<u64, Vec<String>> = HashMap::new();
     for (id, hash) in wl_hashes {
         groups.entry(*hash).or_default().push(id.clone());
@@ -1387,10 +1387,7 @@ pub fn cluster_label(index: usize) -> String {
 ///
 /// # Returns
 /// A list of `RankCluster` with 1-based ranks, average scores, and labels.
-pub fn detect_natural_clusters(
-    scores: &[(String, f64)],
-    min_gap_ratio: f64,
-) -> Vec<RankCluster> {
+pub fn detect_natural_clusters(scores: &[(String, f64)], min_gap_ratio: f64) -> Vec<RankCluster> {
     if scores.len() < 2 {
         if scores.len() == 1 {
             return vec![RankCluster {
@@ -1542,10 +1539,7 @@ pub fn into_ranked<T: Serialize + Clone>(
 /// in the bridge subgraph. Works on an adjacency list built from raw edges.
 ///
 /// Returns a map of `path -> distance`. Unreachable nodes are not included.
-fn bfs_distances(
-    adj: &HashMap<&str, Vec<&str>>,
-    source: &str,
-) -> HashMap<String, u32> {
+fn bfs_distances(adj: &HashMap<&str, Vec<&str>>, source: &str) -> HashMap<String, u32> {
     use std::collections::VecDeque;
     let mut distances = HashMap::new();
     distances.insert(source.to_string(), 0u32);
@@ -1601,8 +1595,14 @@ pub fn double_radius_label(
 
     let mut labels = HashMap::with_capacity(node_paths.len());
     for path in node_paths {
-        let d_s = dist_from_source.get(path.as_str()).copied().unwrap_or(u32::MAX);
-        let d_t = dist_from_target.get(path.as_str()).copied().unwrap_or(u32::MAX);
+        let d_s = dist_from_source
+            .get(path.as_str())
+            .copied()
+            .unwrap_or(u32::MAX);
+        let d_t = dist_from_target
+            .get(path.as_str())
+            .copied()
+            .unwrap_or(u32::MAX);
         labels.insert(path.clone(), (d_s, d_t));
     }
     labels
@@ -1644,7 +1644,9 @@ pub fn find_bottleneck_nodes(
     // Build undirected adjacency list (by index)
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (from, to) in edges {
-        if let (Some(&fi), Some(&ti)) = (path_to_idx.get(from.as_str()), path_to_idx.get(to.as_str())) {
+        if let (Some(&fi), Some(&ti)) =
+            (path_to_idx.get(from.as_str()), path_to_idx.get(to.as_str()))
+        {
             if !adj[fi].contains(&ti) {
                 adj[fi].push(ti);
             }
@@ -2874,7 +2876,12 @@ mod tests {
             ("e".into(), 0.1),
         ];
         let clusters = detect_natural_clusters(&scores, 0.15);
-        assert_eq!(clusters.len(), 3, "Expected 3 clusters, got {}", clusters.len());
+        assert_eq!(
+            clusters.len(),
+            3,
+            "Expected 3 clusters, got {}",
+            clusters.len()
+        );
 
         // Cluster 1: ranks 1-2, avg ~0.875
         assert_eq!(clusters[0].start_rank, 1);
@@ -2913,11 +2920,8 @@ mod tests {
 
     #[test]
     fn test_detect_natural_clusters_all_equal() {
-        let scores: Vec<(String, f64)> = vec![
-            ("a".into(), 0.5),
-            ("b".into(), 0.5),
-            ("c".into(), 0.5),
-        ];
+        let scores: Vec<(String, f64)> =
+            vec![("a".into(), 0.5), ("b".into(), 0.5), ("c".into(), 0.5)];
         let clusters = detect_natural_clusters(&scores, 0.15);
         assert_eq!(clusters.len(), 1, "Equal scores → single cluster");
     }
@@ -2976,7 +2980,7 @@ mod tests {
         // Item with zero margin → Tied
         let items: Vec<(String, f64)> = vec![
             ("a".into(), 1.0),
-            ("b".into(), 0.5),  // margin_to_prev=0.5 (High), margin_to_next=0.5 (High)
+            ("b".into(), 0.5), // margin_to_prev=0.5 (High), margin_to_next=0.5 (High)
             ("c".into(), 0.0),
         ];
         let ranked = into_ranked(items, 3);
@@ -2996,8 +3000,18 @@ mod tests {
         }
 
         let items: Vec<(TestItem, f64)> = vec![
-            (TestItem { path: "file_a.rs".into() }, 0.95),
-            (TestItem { path: "file_b.rs".into() }, 0.30),
+            (
+                TestItem {
+                    path: "file_a.rs".into(),
+                },
+                0.95,
+            ),
+            (
+                TestItem {
+                    path: "file_b.rs".into(),
+                },
+                0.30,
+            ),
         ];
         let ranked = into_ranked(items, 50);
         let json = serde_json::to_value(&ranked).unwrap();

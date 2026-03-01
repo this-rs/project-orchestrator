@@ -2528,10 +2528,7 @@ impl ToolHandler {
             "analyze_impact" => {
                 let target = extract_string(args, "target")?;
                 // multi=true → use multi-signal fusion endpoint (Plan 4)
-                let use_multi = args
-                    .get("multi")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let use_multi = args.get("multi").and_then(|v| v.as_bool()).unwrap_or(false);
                 if use_multi {
                     let mut query = vec![("target".to_string(), target)];
                     // project_slug is required for multi-signal
@@ -2541,7 +2538,9 @@ impl ToolHandler {
                     if let Some(v) = args.get("profile").and_then(|v| v.as_str()) {
                         query.push(("profile".to_string(), v.to_string()));
                     }
-                    let result = http.get_with_query("/api/code/impact/multi", &query).await?;
+                    let result = http
+                        .get_with_query("/api/code/impact/multi", &query)
+                        .await?;
                     Ok(Some(result))
                 } else {
                     let mut query = vec![("target".to_string(), target)];
@@ -3106,7 +3105,8 @@ impl ToolHandler {
                 let result = if query.is_empty() {
                     http.get("/api/analysis-profiles").await?
                 } else {
-                    http.get_with_query("/api/analysis-profiles", &query).await?
+                    http.get_with_query("/api/analysis-profiles", &query)
+                        .await?
                 };
                 Ok(Some(result))
             }
@@ -3118,9 +3118,7 @@ impl ToolHandler {
 
             "get_analysis_profile" => {
                 let id = extract_string(args, "id")?;
-                let result = http
-                    .get(&format!("/api/analysis-profiles/{}", id))
-                    .await?;
+                let result = http.get(&format!("/api/analysis-profiles/{}", id)).await?;
                 Ok(Some(result))
             }
 

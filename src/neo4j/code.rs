@@ -3863,11 +3863,7 @@ impl Neo4jClient {
 
     /// Knowledge density for a file: (notes LINKED_TO + decisions AFFECTS) / max across project.
     /// Returns f64 in [0, 1]. 0.0 if no knowledge exists in the project.
-    pub async fn get_knowledge_density(
-        &self,
-        file_path: &str,
-        project_id: &str,
-    ) -> Result<f64> {
+    pub async fn get_knowledge_density(&self, file_path: &str, project_id: &str) -> Result<f64> {
         let q = query(
             r#"
             // Count notes + decisions linked to the target file
@@ -3907,11 +3903,7 @@ impl Neo4jClient {
 
     /// Read the PageRank score (cc_pagerank) from a File node.
     /// Falls back to 0.0 if the property is absent or the file doesn't exist.
-    pub async fn get_node_pagerank(
-        &self,
-        file_path: &str,
-        project_id: &str,
-    ) -> Result<f64> {
+    pub async fn get_node_pagerank(&self, file_path: &str, project_id: &str) -> Result<f64> {
         let q = query(
             r#"
             MATCH (f:File {path: $path})<-[:CONTAINS]-(p:Project {id: $project_id})
@@ -4099,10 +4091,7 @@ impl Neo4jClient {
     ///   structural (normalized degree), co_change (churn_score), knowledge (knowledge_density),
     ///   pagerank (cc_pagerank normalized), bridge (cc_betweenness normalized).
     /// Default weights: structural=0.35, co_change=0.25, knowledge=0.15, pagerank=0.10, bridge=0.15
-    pub async fn get_avg_multi_signal_score(
-        &self,
-        project_id: impl Into<String>,
-    ) -> Result<f64> {
+    pub async fn get_avg_multi_signal_score(&self, project_id: impl Into<String>) -> Result<f64> {
         let project_id = project_id.into();
         let q = query(
             r#"

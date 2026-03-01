@@ -44,7 +44,10 @@ impl Neo4jClient {
 
         Ok(AnalysisProfile {
             id: node.get("id")?,
-            project_id: node.get::<String>("project_id").ok().filter(|s| !s.is_empty()),
+            project_id: node
+                .get::<String>("project_id")
+                .ok()
+                .filter(|s| !s.is_empty()),
             name: node.get("name")?,
             description: node
                 .get::<String>("description")

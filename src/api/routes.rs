@@ -479,7 +479,10 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Analyze impact of changes
         .route("/api/code/impact", get(code_handlers::analyze_impact))
         // Multi-signal impact fusion (Plan 4)
-        .route("/api/code/impact/multi", get(code_handlers::analyze_impact_v2))
+        .route(
+            "/api/code/impact/multi",
+            get(code_handlers::analyze_impact_v2),
+        )
         // Get architecture overview
         .route(
             "/api/code/architecture",

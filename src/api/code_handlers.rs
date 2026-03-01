@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::handlers::{AppError, OrchestratorState};
 use crate::graph::algorithms::into_ranked;
-use crate::graph::models::{
-    FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList,
-};
+use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
 
 // ============================================================================
@@ -38,7 +36,8 @@ pub struct CodeSearchQuery {
 #[derive(Serialize)]
 pub struct CodeSearchResult {
     /// Legacy: flat list of SearchHit (retro-compatible)
-    pub hits: Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>,
+    pub hits:
+        Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>,
     /// Ranked view with margins and natural clusters.
     /// Uses CodeDocument directly (Meilisearch score as ranking score).
     pub ranked: RankedList<crate::meilisearch::indexes::CodeDocument>,
@@ -48,10 +47,8 @@ pub struct CodeSearchResult {
 fn build_search_result(
     hits: Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>,
 ) -> CodeSearchResult {
-    let scored: Vec<(crate::meilisearch::indexes::CodeDocument, f64)> = hits
-        .iter()
-        .map(|h| (h.document.clone(), h.score))
-        .collect();
+    let scored: Vec<(crate::meilisearch::indexes::CodeDocument, f64)> =
+        hits.iter().map(|h| (h.document.clone(), h.score)).collect();
     let total = scored.len();
     let ranked = into_ranked(scored, total);
     CodeSearchResult { hits, ranked }
@@ -718,7 +715,11 @@ pub async fn analyze_impact(
         let fw = &p.fusion_weights;
         let total = fw.bridge + fw.co_change + fw.structural;
         if total > 0.0 {
-            (fw.bridge / total, fw.co_change / total, fw.structural / total)
+            (
+                fw.bridge / total,
+                fw.co_change / total,
+                fw.structural / total,
+            )
         } else {
             (0.5, 0.3, 0.2)
         }
@@ -964,10 +965,12 @@ pub async fn analyze_impact_v2(
 
     // Signal 1: Structural (1.0 for direct, 0.33 for transitive)
     for (i, path) in structural.iter().enumerate() {
-        let entry = scores.entry(path.clone()).or_insert_with(|| MultiSignalScore {
-            path: path.clone(),
-            ..Default::default()
-        });
+        let entry = scores
+            .entry(path.clone())
+            .or_insert_with(|| MultiSignalScore {
+                path: path.clone(),
+                ..Default::default()
+            });
         // First file is direct (1.0), rest attenuated by position
         entry.structural_score = if i < 5 { 1.0 } else { 0.33 };
         entry.signals.push("structural".to_string());
@@ -981,10 +984,12 @@ pub async fn analyze_impact_v2(
         .unwrap_or(1)
         .max(1) as f64;
     for co in &co_changers {
-        let entry = scores.entry(co.path.clone()).or_insert_with(|| MultiSignalScore {
-            path: co.path.clone(),
-            ..Default::default()
-        });
+        let entry = scores
+            .entry(co.path.clone())
+            .or_insert_with(|| MultiSignalScore {
+                path: co.path.clone(),
+                ..Default::default()
+            });
         entry.co_change_score = co.count as f64 / max_co_change;
         entry.signals.push("co_change".to_string());
     }
@@ -1013,10 +1018,12 @@ pub async fn analyze_impact_v2(
 
     // Signal 5: Bridge proximity (per-file score from co-changer distance)
     for (path, proximity) in &bridge_scores {
-        let entry = scores.entry(path.clone()).or_insert_with(|| MultiSignalScore {
-            path: path.clone(),
-            ..Default::default()
-        });
+        let entry = scores
+            .entry(path.clone())
+            .or_insert_with(|| MultiSignalScore {
+                path: path.clone(),
+                ..Default::default()
+            });
         entry.bridge_score = *proximity;
         entry.signals.push("bridge".to_string());
     }
