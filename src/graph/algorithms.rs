@@ -4219,11 +4219,7 @@ mod tests {
         // All values should be in [0, 1]
         for v in dna.values() {
             for &d in v {
-                assert!(
-                    (0.0..=1.0).contains(&d),
-                    "DNA value out of range: {}",
-                    d
-                );
+                assert!((0.0..=1.0).contains(&d), "DNA value out of range: {}", d);
             }
         }
     }
