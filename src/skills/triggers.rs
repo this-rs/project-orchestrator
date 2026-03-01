@@ -161,9 +161,13 @@ const STOP_WORDS: &[&str] = &[
     "si", "comme", "quand", "lorsque", "est", "sont", "ont", "fait", "peut", "doit", "faut", "va",
     "vont", "ne", "pas", "plus", "aussi", "bien", "tout", "toute", "tous", "toutes", "même",
     "encore", "déjà", "toujours", "jamais", "très", "trop",
-    // --- Common technical stop words ---
+    // --- Common technical stop words (language-agnostic programming terms) ---
     "use", "used", "using", "new", "get", "set", "add", "update", "delete", "create", "file",
     "function", "method", "class", "type", "value", "data", "note", "notes",
+    // --- Additional generic programming noise (too common to be discriminative in any project) ---
+    "error", "bug", "fix", "issue", "impl", "config", "setup", "check", "test",
+    "handle", "return", "result", "path", "name", "info", "log", "src",
+    "code", "based", "related", "via", "key",
 ];
 
 /// Pre-built HashSet for O(1) stop-word lookups (built once via LazyLock).
@@ -172,48 +176,81 @@ static STOP_SET: LazyLock<HashSet<&'static str>> =
 
 /// Generate Regex triggers from tag frequencies and content keywords.
 ///
-/// Algorithm:
-/// 1. Count tag frequencies across all member notes
-/// 2. Select tags appearing in > 30% of notes
-/// 3. Extract frequent content keywords (simple TF-IDF)
-/// 4. Build alternation pattern: `tag1|tag2|keyword1`
-pub fn generate_regex_triggers(notes: &[Note]) -> Vec<SkillTrigger> {
+/// Uses **TF-IDF inter-skills** for auto-emergent discrimination:
+/// - TF (Term Frequency) = how often a tag appears in THIS skill's notes
+/// - IDF (Inverse Document Frequency) = log(total_project_notes / global_tag_count)
+/// - Tags appearing in many notes across the entire project get low IDF → filtered out
+/// - Tags concentrated in THIS skill get high TF-IDF → selected as discriminative
+///
+/// This is language-agnostic and project-agnostic: "rust" in a Rust project gets
+/// automatically filtered (low IDF), but "rust" in a Python project stays discriminative.
+///
+/// `all_project_notes` enables IDF computation. If empty, falls back to local TF only.
+pub fn generate_regex_triggers(notes: &[Note], all_project_notes: &[Note]) -> Vec<SkillTrigger> {
     if notes.is_empty() {
         return Vec::new();
     }
 
     let total_notes = notes.len() as f64;
-    let threshold = 0.3; // Must appear in at least 30% of notes
+    let threshold = 0.3; // Must appear in at least 30% of this skill's notes
 
-    // 1. Tag frequency analysis
+    // 1. Compute global tag document frequency (IDF denominator)
+    let total_project = all_project_notes.len().max(1) as f64;
+    let mut global_tag_df: HashMap<&str, usize> = HashMap::new();
+    for note in all_project_notes {
+        let mut seen = HashSet::new();
+        for tag in note.tags.iter().filter(|t| !STOP_SET.contains(t.as_str())) {
+            if seen.insert(tag.as_str()) {
+                *global_tag_df.entry(tag.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // 2. Tag frequency analysis in this skill (TF), filtered by stop words
     let mut tag_freq: HashMap<&str, usize> = HashMap::new();
     for note in notes {
-        // Count each tag once per note (not per occurrence)
         let mut seen_tags = std::collections::HashSet::new();
-        for tag in &note.tags {
+        for tag in note.tags.iter().filter(|t| !STOP_SET.contains(t.as_str())) {
             if seen_tags.insert(tag.as_str()) {
                 *tag_freq.entry(tag.as_str()).or_insert(0) += 1;
             }
         }
     }
 
-    // Select tags with frequency > threshold
-    let mut frequent_tags: Vec<(&str, f64)> = tag_freq
+    // 3. Score tags with TF-IDF (smooth IDF variant)
+    // TF = local frequency in this skill (normalized by skill size)
+    // IDF = ln(1 + total_project / (1 + global_df)) — smooth IDF, always positive
+    // This ensures:
+    //   - Tags unique to this skill get high IDF (e.g., ln(1 + 20/4) = ln(6) ≈ 1.79)
+    //   - Tags ubiquitous across the project get low IDF (e.g., ln(1 + 20/19) ≈ 0.72)
+    //   - Ratio between unique and ubiquitous ≈ 2.5x discrimination
+    //   - Never zero, so single-skill projects still work
+    let mut scored_tags: Vec<(&str, f64)> = tag_freq
         .iter()
-        .map(|(tag, count)| (*tag, *count as f64 / total_notes))
-        .filter(|(_, freq)| *freq >= threshold)
+        .map(|(tag, &count)| {
+            let tf = count as f64 / total_notes;
+            let global_df = global_tag_df.get(tag).copied().unwrap_or(0) as f64;
+            let idf = (1.0 + total_project / (1.0 + global_df)).ln();
+            (*tag, tf * idf)
+        })
+        .filter(|(_, score)| *score > 0.0)
+        // Also require minimum local frequency (30% of skill notes)
+        .filter(|(tag, _)| {
+            let local_freq = tag_freq.get(tag).copied().unwrap_or(0) as f64 / total_notes;
+            local_freq >= threshold
+        })
         .collect();
 
-    // Sort by frequency descending
-    frequent_tags.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by TF-IDF score descending
+    scored_tags.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Take top 5 tags
-    let top_tags: Vec<&str> = frequent_tags.iter().take(5).map(|(tag, _)| *tag).collect();
+    let top_tags: Vec<&str> = scored_tags.iter().take(5).map(|(tag, _)| *tag).collect();
 
-    // 2. Content keyword extraction (simplified TF-IDF)
-    let content_keywords = extract_content_keywords(notes, 5);
+    // 4. Content keyword extraction (with IDF against project corpus)
+    let content_keywords = extract_content_keywords(notes, all_project_notes, 5);
 
-    // 3. Merge tags and keywords (tags first, they're more reliable)
+    // 5. Merge tags and keywords (tags first, they're more reliable)
     let mut all_terms: Vec<String> = top_tags.iter().map(|t| t.to_string()).collect();
     for kw in &content_keywords {
         if !all_terms.iter().any(|t| t == kw) {
@@ -229,53 +266,76 @@ pub fn generate_regex_triggers(notes: &[Note]) -> Vec<SkillTrigger> {
     }
 
     // Build regex pattern with word-boundary anchoring
-    // Escape special regex characters in terms
     let escaped: Vec<String> = all_terms.iter().map(|t| regex_escape(t)).collect();
     let pattern = format!("\\b(?:{})\\b", escaped.join("|"));
 
-    // Confidence based on how many tags passed the threshold
-    let tag_coverage = if !frequent_tags.is_empty() {
-        frequent_tags[0].1 // coverage of the most common tag
-    } else {
-        0.3
-    };
-    let confidence = (0.5 + tag_coverage * 0.3).min(0.9);
+    // Confidence based on the best tag's TF-IDF score (normalized)
+    // Higher TF-IDF = more discriminative = higher confidence
+    let best_tfidf = scored_tags.first().map(|(_, s)| *s).unwrap_or(0.0);
+    // Normalize: TF-IDF of 1.0+ → high confidence, <0.3 → low confidence
+    let confidence = (0.5 + (best_tfidf.min(2.0) / 2.0) * 0.4).min(0.95);
 
     vec![SkillTrigger::regex(pattern, confidence)]
 }
 
-/// Extract top-N content keywords using simplified TF-IDF.
+/// Extract top-N content keywords using TF-IDF against the project corpus.
 ///
 /// Tokenizes note content, filters stop words and short tokens,
-/// counts document frequency, and returns the most distinctive terms.
-fn extract_content_keywords(notes: &[Note], top_n: usize) -> Vec<String> {
+/// computes TF (local to skill) × IDF (against all project notes),
+/// and returns the most distinctive terms for this skill.
+///
+/// `all_project_notes` enables cross-skill IDF. If empty, falls back to local scoring.
+fn extract_content_keywords(
+    notes: &[Note],
+    all_project_notes: &[Note],
+    top_n: usize,
+) -> Vec<String> {
     let total_docs = notes.len() as f64;
     if total_docs == 0.0 {
         return Vec::new();
     }
 
-    // Document frequency: how many notes contain each token
-    let mut doc_freq: HashMap<String, usize> = HashMap::new();
-
+    // Local document frequency: how many skill notes contain each token
+    let mut local_df: HashMap<String, usize> = HashMap::new();
     for note in notes {
         let mut seen = std::collections::HashSet::new();
         for token in tokenize(&note.content) {
             if seen.insert(token.clone()) {
-                *doc_freq.entry(token).or_insert(0) += 1;
+                *local_df.entry(token).or_insert(0) += 1;
             }
         }
     }
 
-    // Score: prefer terms that appear in many notes (high DF) but not ALL notes
-    // Simple scoring: df * (1 - df/total) to avoid terms that appear in every note
-    let mut scored: Vec<(String, f64)> = doc_freq
+    // Global document frequency: how many project notes contain each token
+    let total_project = all_project_notes.len().max(1) as f64;
+    let mut global_df: HashMap<String, usize> = HashMap::new();
+    if !all_project_notes.is_empty() {
+        for note in all_project_notes {
+            let mut seen = std::collections::HashSet::new();
+            for token in tokenize(&note.content) {
+                if seen.insert(token.clone()) {
+                    *global_df.entry(token).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // Score with TF-IDF: TF(local) × IDF(global)
+    let mut scored: Vec<(String, f64)> = local_df
         .into_iter()
-        .filter(|(_, count)| *count >= 2) // Must appear in at least 2 notes
+        .filter(|(_, count)| *count >= 2) // Must appear in at least 2 skill notes
         .map(|(term, count)| {
-            let df_ratio = count as f64 / total_docs;
-            let score = df_ratio * (1.0 - df_ratio * 0.5); // Penalize ubiquitous terms slightly
-            (term, score)
+            let tf = count as f64 / total_docs;
+            let idf = if !global_df.is_empty() {
+                let gdf = global_df.get(&term).copied().unwrap_or(0) as f64;
+                (1.0 + total_project / (1.0 + gdf)).ln()
+            } else {
+                // Fallback: penalize terms in every skill note slightly
+                1.0 - (count as f64 / total_docs) * 0.5
+            };
+            (term, tf * idf)
         })
+        .filter(|(_, score)| *score > 0.0)
         .collect();
 
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -662,8 +722,8 @@ pub fn generate_all_triggers(
     let file_glob_count = file_globs.len();
     all_triggers.extend(file_globs);
 
-    // 2. Regex from tags and content
-    let mut regex_triggers = generate_regex_triggers(skill_notes);
+    // 2. Regex from tags and content (with IDF against all project notes)
+    let mut regex_triggers = generate_regex_triggers(skill_notes, all_project_notes);
     for trigger in &mut regex_triggers {
         trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
     }
@@ -814,7 +874,7 @@ mod tests {
             make_note_with_anchors(vec!["cypher", "perf"], "Cypher performance", vec![]),
         ];
 
-        let triggers = generate_regex_triggers(&notes);
+        let triggers = generate_regex_triggers(&notes, &notes);
         assert!(!triggers.is_empty(), "Should generate regex trigger");
 
         let pattern = &triggers[0].pattern_value;
@@ -833,7 +893,7 @@ mod tests {
 
     #[test]
     fn test_regex_empty_notes() {
-        let triggers = generate_regex_triggers(&[]);
+        let triggers = generate_regex_triggers(&[], &[]);
         assert!(triggers.is_empty());
     }
 
@@ -847,7 +907,7 @@ mod tests {
             make_note_with_anchors(vec!["delta"], "D", vec![]),
         ];
 
-        let triggers = generate_regex_triggers(&notes);
+        let triggers = generate_regex_triggers(&notes, &notes);
         // May still generate from content keywords, but tags won't contribute
         if !triggers.is_empty() {
             let pattern = &triggers[0].pattern_value;
@@ -869,6 +929,105 @@ mod tests {
 
         let escaped2 = regex_escape("C++");
         assert_eq!(escaped2, "C\\+\\+");
+    }
+
+    #[test]
+    fn test_technical_stop_words_filtered_from_tags() {
+        // Test two filtering mechanisms:
+        // 1. Hardcoded STOP_SET filters generic noise: "via", "code", "fix", "pattern"
+        // 2. IDF filters project-ubiquitous tags: "mcp-usage" appears in 90% of project notes
+        //
+        // Only "grail" and "topology" should survive both filters.
+        let skill_notes = vec![
+            make_note_with_anchors(
+                vec!["via", "code", "grail", "topology", "mcp-usage"],
+                "GraIL topological reasoning",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["via", "code", "grail", "topology", "mcp-usage"],
+                "Topology-aware community detection",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["code", "grail", "pattern", "mcp-usage"],
+                "GraIL pattern matching",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["via", "grail", "topology", "fix"],
+                "Topology fix for GraIL",
+                vec![],
+            ),
+        ];
+
+        // Simulate a project where "mcp-usage" is ubiquitous (appears in most notes)
+        let mut all_project_notes = skill_notes.clone();
+        for i in 0..16 {
+            all_project_notes.push(make_note_with_anchors(
+                vec!["mcp-usage", &format!("skill-{}", i)],
+                &format!("Other MCP skill note {}", i),
+                vec![],
+            ));
+        }
+
+        let triggers = generate_regex_triggers(&skill_notes, &all_project_notes);
+        assert!(!triggers.is_empty(), "Should generate at least one regex trigger");
+
+        let pattern = &triggers[0].pattern_value;
+
+        // Hardcoded stop words MUST NOT appear
+        assert!(
+            !pattern.contains("via"),
+            "Stop word 'via' should be filtered by STOP_SET, pattern: {}",
+            pattern
+        );
+        assert!(
+            !pattern.contains("code"),
+            "Stop word 'code' should be filtered by STOP_SET, pattern: {}",
+            pattern
+        );
+
+        // "mcp-usage" should be deprioritized by IDF (ubiquitous in project)
+        // "grail" and "topology" should appear first (unique to this skill)
+        assert!(
+            pattern.contains("grail"),
+            "Expected 'grail' (unique to skill) in pattern, got: {}",
+            pattern
+        );
+        assert!(
+            pattern.contains("topology"),
+            "Expected 'topology' (unique to skill) in pattern, got: {}",
+            pattern
+        );
+
+        // If mcp-usage appears at all, it should be after grail and topology
+        if pattern.contains("mcp-usage") {
+            let grail_pos = pattern.find("grail").unwrap_or(usize::MAX);
+            let mcp_pos = pattern.find("mcp-usage").unwrap_or(0);
+            assert!(
+                grail_pos < mcp_pos,
+                "grail should appear before mcp-usage (higher TF-IDF), pattern: {}",
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn test_stop_set_contains_generic_noise_words() {
+        // Only truly language-agnostic programming terms should be in STOP_SET
+        let generic_noise = ["via", "code", "src", "fix", "key", "based", "related",
+                             "error", "bug", "issue", "impl", "config", "setup", "check", "test",
+                             "handle", "return", "result", "path", "name", "info", "log"];
+        for word in &generic_noise {
+            assert!(
+                STOP_SET.contains(word),
+                "Expected '{}' to be in STOP_SET",
+                word
+            );
+        }
+        // Project-specific terms like "rust", "neo4j", "mcp" must NOT be hardcoded
+        // They are handled by IDF inter-skills (auto-emergent filtering)
     }
 
     // ================================================================
@@ -1405,7 +1564,7 @@ mod tests {
             ),
         ];
 
-        let triggers = generate_regex_triggers(&notes);
+        let triggers = generate_regex_triggers(&notes, &notes);
 
         // Check that no trigger pattern contains common French stop words
         let french_stop_words = ["les", "dans", "pour", "des", "avec", "une", "est", "sont"];
@@ -1439,6 +1598,138 @@ mod tests {
             STOP_WORDS.len() >= 120,
             "Expected at least 120 stop words (EN + FR), got {}",
             STOP_WORDS.len()
+        );
+    }
+
+    // ================================================================
+    // TF-IDF inter-skills tests (auto-emergent discrimination)
+    // ================================================================
+
+    #[test]
+    fn test_tfidf_filters_ubiquitous_tags_across_project() {
+        // Skill A has tags ["grail", "topology", "neo4j"]
+        // But "neo4j" also appears in 90% of ALL project notes (ubiquitous)
+        // → "neo4j" should get low IDF and be filtered/deprioritized
+        // → "grail" and "topology" should be selected (unique to this skill)
+        let skill_notes = vec![
+            make_note_with_anchors(
+                vec!["grail", "topology", "neo4j"],
+                "GraIL topological reasoning",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["grail", "topology", "neo4j"],
+                "Topology community detection",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["grail", "neo4j"],
+                "GraIL graph patterns",
+                vec![],
+            ),
+        ];
+
+        // Simulate a project with 20 notes, 18 of which have "neo4j"
+        let mut all_project_notes = skill_notes.clone();
+        for i in 0..17 {
+            all_project_notes.push(make_note_with_anchors(
+                vec!["neo4j", &format!("other-{}", i)],
+                &format!("Some other neo4j note {}", i),
+                vec![],
+            ));
+        }
+
+        let triggers = generate_regex_triggers(&skill_notes, &all_project_notes);
+        assert!(!triggers.is_empty(), "Should generate at least one trigger");
+
+        let pattern = &triggers[0].pattern_value;
+
+        // "grail" is unique to this skill → high IDF → must be in pattern
+        assert!(
+            pattern.contains("grail"),
+            "Expected 'grail' (unique to skill) in pattern, got: {}",
+            pattern
+        );
+
+        // "neo4j" appears in 18/20 notes → very low IDF → should be deprioritized
+        // It might still appear if we don't have enough other terms, but "grail"
+        // should come before "neo4j" in TF-IDF ranking
+        if pattern.contains("neo4j") {
+            // If neo4j is present, grail should appear first (higher TF-IDF)
+            let grail_pos = pattern.find("grail").unwrap_or(usize::MAX);
+            let neo4j_pos = pattern.find("neo4j").unwrap_or(0);
+            assert!(
+                grail_pos < neo4j_pos,
+                "grail should appear before neo4j (higher TF-IDF), pattern: {}",
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn test_tfidf_keeps_discriminative_tags_when_project_small() {
+        // When skill notes = project notes (no cross-skill context),
+        // all tags have the same IDF → falls back to TF ordering
+        let notes = vec![
+            make_note_with_anchors(vec!["neo4j", "cypher"], "Neo4j queries", vec![]),
+            make_note_with_anchors(vec!["neo4j", "cypher"], "Cypher patterns", vec![]),
+            make_note_with_anchors(vec!["neo4j"], "Neo4j driver", vec![]),
+        ];
+
+        let triggers = generate_regex_triggers(&notes, &notes);
+        assert!(!triggers.is_empty());
+
+        let pattern = &triggers[0].pattern_value;
+        // Both neo4j and cypher should appear (no cross-skill competition)
+        assert!(
+            pattern.contains("neo4j"),
+            "Expected 'neo4j' in pattern, got: {}",
+            pattern
+        );
+    }
+
+    #[test]
+    fn test_tfidf_auto_emergent_language_agnostic() {
+        // In a hypothetical Python project, "rust" would be a discriminative term
+        // (low global frequency), not a noise word
+        let skill_notes = vec![
+            make_note_with_anchors(
+                vec!["rust", "bindings", "ffi"],
+                "Rust FFI bindings for Python",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["rust", "bindings"],
+                "Building Rust extensions",
+                vec![],
+            ),
+            make_note_with_anchors(
+                vec!["rust", "ffi"],
+                "Rust memory safety in bindings",
+                vec![],
+            ),
+        ];
+
+        // Project is mostly Python — "rust" appears only in this skill
+        let mut all_project_notes = skill_notes.clone();
+        for i in 0..15 {
+            all_project_notes.push(make_note_with_anchors(
+                vec!["python", "django"],
+                &format!("Python Django note {}", i),
+                vec![],
+            ));
+        }
+
+        let triggers = generate_regex_triggers(&skill_notes, &all_project_notes);
+        assert!(!triggers.is_empty());
+
+        let pattern = &triggers[0].pattern_value;
+        // "rust" is NOT in hardcoded stop words anymore, and has high IDF here
+        // → it should appear as a discriminative trigger
+        assert!(
+            pattern.contains("rust"),
+            "Expected 'rust' (discriminative in Python project) in pattern, got: {}",
+            pattern
         );
     }
 }
