@@ -17,15 +17,20 @@ use std::sync::LazyLock;
 
 /// Generate FileGlob triggers from file paths anchored to member notes.
 ///
-/// Algorithm:
-/// 1. Extract all file paths from note anchors (entity_type == File)
-/// 2. Group paths by directory prefix
-/// 3. Find the longest common prefix(es) with sufficient coverage
-/// 4. Generate glob patterns (e.g., `src/api/**`)
+/// Uses **distinctiveness scoring** against all project notes:
+/// - Extracts file paths from this skill's note anchors AND all project note anchors
+/// - For each candidate directory prefix, computes:
+///   - `local_coverage` = fraction of THIS skill's paths under this prefix
+///   - `global_coverage` = fraction of ALL project paths under this prefix
+///   - `distinctiveness` = local_coverage / max(global_coverage, 0.01)
+/// - Selects the most specific prefixes with good local coverage AND high distinctiveness
 ///
-/// Returns empty vec if no file anchors found.
-pub fn generate_file_glob_triggers(notes: &[Note]) -> Vec<SkillTrigger> {
-    // Extract all file paths from anchors
+/// This is auto-emergent: `src/**` gets low distinctiveness when many skills have src/ paths,
+/// but `src/graph/**` gets high distinctiveness if only this skill concentrates there.
+///
+/// `all_project_notes` enables cross-skill distinctiveness. If empty, falls back to local only.
+pub fn generate_file_glob_triggers(notes: &[Note], all_project_notes: &[Note]) -> Vec<SkillTrigger> {
+    // Extract file paths from this skill's notes
     let file_paths: Vec<&str> = notes
         .iter()
         .flat_map(|n| n.anchors.iter())
@@ -37,8 +42,15 @@ pub fn generate_file_glob_triggers(notes: &[Note]) -> Vec<SkillTrigger> {
         return Vec::new();
     }
 
-    // Group by directory prefixes and find common patterns
-    let globs = find_common_glob_patterns(&file_paths);
+    // Extract file paths from ALL project notes (for distinctiveness)
+    let all_paths: Vec<&str> = all_project_notes
+        .iter()
+        .flat_map(|n| n.anchors.iter())
+        .filter(|a| a.entity_type == EntityType::File)
+        .map(|a| a.entity_id.as_str())
+        .collect();
+
+    let globs = find_common_glob_patterns(&file_paths, &all_paths);
 
     globs
         .into_iter()
@@ -50,83 +62,126 @@ pub fn generate_file_glob_triggers(notes: &[Note]) -> Vec<SkillTrigger> {
         .collect()
 }
 
-/// Find common glob patterns from a set of file paths.
-///
-/// Returns (glob_pattern, coverage_ratio) pairs where coverage_ratio
-/// is the fraction of input paths matched by the glob.
-fn find_common_glob_patterns(paths: &[&str]) -> Vec<(String, f64)> {
-    if paths.is_empty() {
-        return Vec::new();
-    }
-
-    let total = paths.len() as f64;
-
-    // Count files per directory
+/// Compute prefix counts: for each directory prefix, how many paths fall under it.
+fn compute_prefix_counts<'a>(paths: &[&'a str]) -> HashMap<String, usize> {
     let mut dir_counts: HashMap<&str, usize> = HashMap::new();
     for path in paths {
-        // Extract directory part
         if let Some(last_slash) = path.rfind('/') {
             let dir = &path[..last_slash];
             *dir_counts.entry(dir).or_insert(0) += 1;
         }
     }
 
-    if dir_counts.is_empty() {
-        return Vec::new();
-    }
-
-    // Find the most specific common prefix(es) with good coverage
-    // Strategy: merge child dirs into parent when parent has higher total coverage
     let mut prefix_counts: HashMap<String, usize> = HashMap::new();
     for (dir, count) in &dir_counts {
-        // Accumulate counts up the directory tree
         let parts: Vec<&str> = dir.split('/').collect();
         for depth in 1..=parts.len() {
             let prefix = parts[..depth].join("/");
             *prefix_counts.entry(prefix).or_insert(0) += count;
         }
     }
+    prefix_counts
+}
 
-    // Select prefixes where:
-    // - Coverage >= 50% of paths (this prefix covers enough files)
-    // - It's the most specific prefix that still has good coverage
-    let mut results: Vec<(String, f64)> = Vec::new();
+/// Find common glob patterns from a set of file paths, with distinctiveness scoring.
+///
+/// `all_project_paths` is the complete set of file paths across ALL skills in the project.
+/// When non-empty, prefixes that cover many project-wide paths get lower scores (not distinctive).
+///
+/// Returns (glob_pattern, coverage_ratio) pairs sorted by distinctiveness × coverage.
+fn find_common_glob_patterns(paths: &[&str], all_project_paths: &[&str]) -> Vec<(String, f64)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
 
-    // Sort by depth (most specific first), then by coverage descending
-    let mut candidates: Vec<(String, f64)> = prefix_counts
+    let total_local = paths.len() as f64;
+
+    // Local prefix counts (this skill)
+    let local_prefix_counts = compute_prefix_counts(paths);
+
+    if local_prefix_counts.is_empty() {
+        return Vec::new();
+    }
+
+    // Global prefix counts (all project notes) — for distinctiveness
+    let total_global = all_project_paths.len().max(1) as f64;
+    let global_prefix_counts = if !all_project_paths.is_empty() {
+        compute_prefix_counts(all_project_paths)
+    } else {
+        HashMap::new()
+    };
+
+    // Score each prefix: distinctiveness = local_coverage / global_coverage
+    // A prefix that covers 80% of this skill but only 10% of the project → score 8.0 (great!)
+    // A prefix that covers 80% of this skill AND 80% of the project → score 1.0 (useless)
+    let mut candidates: Vec<(String, f64, f64)> = local_prefix_counts
         .iter()
-        .map(|(prefix, count)| (prefix.clone(), *count as f64 / total))
-        .filter(|(_, coverage)| *coverage >= 0.4) // At least 40% coverage
+        .map(|(prefix, &local_count)| {
+            let local_coverage = local_count as f64 / total_local;
+            let global_count = global_prefix_counts.get(prefix).copied().unwrap_or(0) as f64;
+            let global_coverage = global_count / total_global;
+            // Smooth distinctiveness: avoid division by zero
+            let distinctiveness = local_coverage / (global_coverage + 0.01);
+            (prefix.clone(), local_coverage, distinctiveness)
+        })
+        .filter(|(_, local_cov, _)| *local_cov >= 0.4) // At least 40% local coverage
         .collect();
 
+    // Sort by: deeper paths first, then by distinctiveness × coverage (combined score)
     candidates.sort_by(|a, b| {
         let depth_a = a.0.matches('/').count();
         let depth_b = b.0.matches('/').count();
+        let score_a = a.1 * a.2; // coverage × distinctiveness
+        let score_b = b.1 * b.2;
         depth_b
             .cmp(&depth_a) // deeper first
-            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    // Take the most specific prefix that covers the most paths
-    let mut covered = std::collections::HashSet::new();
-    for (prefix, coverage) in candidates {
+    // Select results: prefer distinctive prefixes (ratio > 1.5)
+    let mut results: Vec<(String, f64)> = Vec::new();
+    let mut covered = HashSet::new();
+
+    for (prefix, local_coverage, distinctiveness) in &candidates {
         // Skip if a more specific prefix already covers these paths
         let dominated = results
             .iter()
-            .any(|(existing, _)| existing.starts_with(&prefix));
+            .any(|(existing, _)| existing.starts_with(prefix.as_str()));
         if dominated {
             continue;
         }
 
-        // Check this prefix isn't redundant
-        if !covered.contains(&prefix) {
-            results.push((format!("{}/**", prefix), coverage));
-            covered.insert(prefix);
+        if covered.contains(prefix) {
+            continue;
         }
 
-        // Max 3 glob triggers
+        // Only accept if reasonably distinctive (or no global context available)
+        if *distinctiveness >= 1.5 || global_prefix_counts.is_empty() {
+            results.push((format!("{}/**", prefix), *local_coverage));
+            covered.insert(prefix.clone());
+        }
+
         if results.len() >= 3 {
             break;
+        }
+    }
+
+    // Fallback: if no distinctive prefix found, take the top 3 most specific
+    // with local coverage ≥60% (better than one broad `src/**`)
+    if results.is_empty() {
+        for (prefix, local_coverage, _) in &candidates {
+            if *local_coverage >= 0.6 && !covered.contains(prefix) {
+                let dominated = results
+                    .iter()
+                    .any(|(existing, _)| existing.starts_with(prefix.as_str()));
+                if !dominated {
+                    results.push((format!("{}/**", prefix), *local_coverage));
+                    covered.insert(prefix.clone());
+                }
+                if results.len() >= 3 {
+                    break;
+                }
+            }
         }
     }
 
@@ -714,8 +769,8 @@ pub fn generate_all_triggers(
 ) -> TriggerGenerationResult {
     let mut all_triggers = Vec::new();
 
-    // 1. FileGlob from file anchors
-    let mut file_globs = generate_file_glob_triggers(skill_notes);
+    // 1. FileGlob from file anchors (with distinctiveness against project)
+    let mut file_globs = generate_file_glob_triggers(skill_notes, all_project_notes);
     for trigger in &mut file_globs {
         trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
     }
@@ -817,7 +872,7 @@ mod tests {
             ),
         ];
 
-        let triggers = generate_file_glob_triggers(&notes);
+        let triggers = generate_file_glob_triggers(&notes, &notes);
         assert!(!triggers.is_empty(), "Should generate at least one glob");
 
         let glob_values: Vec<&str> = triggers.iter().map(|t| t.pattern_value.as_str()).collect();
@@ -839,7 +894,7 @@ mod tests {
             vec![],
         )];
 
-        let triggers = generate_file_glob_triggers(&notes);
+        let triggers = generate_file_glob_triggers(&notes, &notes);
         assert!(triggers.is_empty());
     }
 
@@ -854,7 +909,7 @@ mod tests {
             )],
         )];
 
-        let triggers = generate_file_glob_triggers(&notes);
+        let triggers = generate_file_glob_triggers(&notes, &notes);
         assert!(triggers.is_empty());
     }
 
@@ -1299,7 +1354,7 @@ mod tests {
             "src/api/handlers.rs",
             "src/api/routes.rs",
         ];
-        let globs = find_common_glob_patterns(&paths);
+        let globs = find_common_glob_patterns(&paths, &paths);
         assert!(!globs.is_empty());
         assert!(
             globs.iter().any(|(g, _)| g.contains("src/api")),
@@ -1311,8 +1366,89 @@ mod tests {
     #[test]
     fn test_find_common_glob_empty() {
         let paths: Vec<&str> = vec![];
-        let globs = find_common_glob_patterns(&paths);
+        let globs = find_common_glob_patterns(&paths, &paths);
         assert!(globs.is_empty());
+    }
+
+    // ================================================================
+    // FileGlob distinctiveness tests (cross-skill)
+    // ================================================================
+
+    #[test]
+    fn test_file_glob_distinctive_across_skills() {
+        // Skill A: notes in src/graph/ — should get src/graph/**
+        let skill_a_notes = vec![
+            make_note_with_anchors(vec!["graph"], "A1", vec![file_anchor("src/graph/algo.rs")]),
+            make_note_with_anchors(vec!["graph"], "A2", vec![file_anchor("src/graph/community.rs")]),
+            make_note_with_anchors(vec!["graph"], "A3", vec![file_anchor("src/graph/pagerank.rs")]),
+        ];
+
+        // Skill B: notes in src/chat/ — should get src/chat/**
+        let skill_b_notes = vec![
+            make_note_with_anchors(vec!["chat"], "B1", vec![file_anchor("src/chat/manager.rs")]),
+            make_note_with_anchors(vec!["chat"], "B2", vec![file_anchor("src/chat/session.rs")]),
+        ];
+
+        // All project notes = A + B
+        let mut all_notes = skill_a_notes.clone();
+        all_notes.extend(skill_b_notes.clone());
+
+        // Skill A should get src/graph/**, NOT src/** (src/ covers B too)
+        let triggers_a = generate_file_glob_triggers(&skill_a_notes, &all_notes);
+        assert!(!triggers_a.is_empty(), "Skill A should have file glob triggers");
+        let pattern_a = &triggers_a[0].pattern_value;
+        assert!(
+            pattern_a.contains("src/graph"),
+            "Skill A should get src/graph/**, got: {}",
+            pattern_a
+        );
+
+        // Skill B should get src/chat/**, NOT src/**
+        let triggers_b = generate_file_glob_triggers(&skill_b_notes, &all_notes);
+        assert!(!triggers_b.is_empty(), "Skill B should have file glob triggers");
+        let pattern_b = &triggers_b[0].pattern_value;
+        assert!(
+            pattern_b.contains("src/chat"),
+            "Skill B should get src/chat/**, got: {}",
+            pattern_b
+        );
+    }
+
+    #[test]
+    fn test_file_glob_no_broad_src_when_distinctive_exists() {
+        // 3 skill notes in src/neo4j/, 15 other project notes spread across src/
+        let skill_notes = vec![
+            make_note_with_anchors(vec![], "N1", vec![file_anchor("src/neo4j/client.rs")]),
+            make_note_with_anchors(vec![], "N2", vec![file_anchor("src/neo4j/queries.rs")]),
+            make_note_with_anchors(vec![], "N3", vec![file_anchor("src/neo4j/models.rs")]),
+        ];
+
+        let mut all_notes = skill_notes.clone();
+        for dir in &["chat", "api", "mcp", "skills", "graph"] {
+            for j in 0..3 {
+                all_notes.push(make_note_with_anchors(
+                    vec![],
+                    &format!("Other {}/{}", dir, j),
+                    vec![file_anchor(&format!("src/{}/file{}.rs", dir, j))],
+                ));
+            }
+        }
+
+        let triggers = generate_file_glob_triggers(&skill_notes, &all_notes);
+        assert!(!triggers.is_empty());
+
+        // Should get src/neo4j/**, not the broad src/**
+        let has_neo4j = triggers.iter().any(|t| t.pattern_value.contains("src/neo4j"));
+        let has_broad_src = triggers.iter().any(|t| t.pattern_value == "src/**");
+        assert!(
+            has_neo4j,
+            "Expected src/neo4j/** in triggers, got: {:?}",
+            triggers.iter().map(|t| &t.pattern_value).collect::<Vec<_>>()
+        );
+        assert!(
+            !has_broad_src,
+            "Should NOT have broad src/** when distinctive src/neo4j/** exists"
+        );
     }
 
     // ================================================================
