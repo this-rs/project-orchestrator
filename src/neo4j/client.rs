@@ -207,6 +207,12 @@ impl Neo4jClient {
             "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
             // RefreshToken constraint
             "CREATE CONSTRAINT refresh_token_hash IF NOT EXISTS FOR (rt:RefreshToken) REQUIRE rt.token_hash IS UNIQUE",
+            // GraIL — TopologyRule constraint
+            "CREATE CONSTRAINT topology_rule_id IF NOT EXISTS FOR (r:TopologyRule) REQUIRE r.id IS UNIQUE",
+            // GraIL — PredictedLink constraint
+            "CREATE CONSTRAINT predicted_link_id IF NOT EXISTS FOR (l:PredictedLink) REQUIRE l.id IS UNIQUE",
+            // GraIL — AnalysisProfile constraint
+            "CREATE CONSTRAINT analysis_profile_id IF NOT EXISTS FOR (p:AnalysisProfile) REQUIRE p.id IS UNIQUE",
         ];
 
         let indexes = vec![
@@ -295,6 +301,21 @@ impl Neo4jClient {
             "CREATE INDEX skill_status IF NOT EXISTS FOR (s:Skill) ON (s.status)",
             "CREATE INDEX skill_project_status IF NOT EXISTS FOR (s:Skill) ON (s.project_id, s.status)",
             "CREATE INDEX skill_energy IF NOT EXISTS FOR (s:Skill) ON (s.energy)",
+            // GraIL — File computed properties (Plans 2, 7, 8)
+            "CREATE INDEX file_wl_hash IF NOT EXISTS FOR (f:File) ON (f.wl_hash)",
+            "CREATE INDEX file_cc_version IF NOT EXISTS FOR (f:File) ON (f.cc_version)",
+            "CREATE INDEX file_cc_pagerank IF NOT EXISTS FOR (f:File) ON (f.cc_pagerank)",
+            "CREATE INDEX file_cc_risk_score IF NOT EXISTS FOR (f:File) ON (f.cc_risk_score)",
+            // GraIL — TopologyRule indexes (Plan 3)
+            "CREATE INDEX topology_rule_project IF NOT EXISTS FOR (r:TopologyRule) ON (r.project_id)",
+            "CREATE INDEX topology_rule_project_type IF NOT EXISTS FOR (r:TopologyRule) ON (r.project_id, r.rule_type)",
+            // GraIL — PredictedLink indexes (Plan 9)
+            "CREATE INDEX predicted_link_project IF NOT EXISTS FOR (l:PredictedLink) ON (l.project_id)",
+            "CREATE INDEX predicted_link_plausibility IF NOT EXISTS FOR (l:PredictedLink) ON (l.project_id, l.plausibility)",
+            // GraIL — AnalysisProfile indexes (Plan 6)
+            "CREATE INDEX analysis_profile_project IF NOT EXISTS FOR (p:AnalysisProfile) ON (p.project_id)",
+            // GraIL — PREDICTED_LINK relationship index (Plan 9)
+            "CREATE INDEX predicted_link_rel_idx IF NOT EXISTS FOR ()-[r:PREDICTED_LINK]->() ON (r.plausibility)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)
@@ -412,6 +433,10 @@ impl Neo4jClient {
             "feature_graph_id",
             "user_id",
             "refresh_token_hash",
+            // GraIL node labels
+            "topology_rule_id",
+            "predicted_link_id",
+            "analysis_profile_id",
         ];
         match self
             .graph

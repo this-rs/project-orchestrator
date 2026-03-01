@@ -526,6 +526,177 @@ impl Default for FabricWeights {
 }
 
 // ============================================================================
+// GraIL — Extended pipeline types
+// ============================================================================
+
+/// Configuration for the extended `compute_all` pipeline (GraIL algorithms).
+///
+/// When `grail` is `Some`, the pipeline runs the additional GraIL stages
+/// after the base analytics (PageRank, Betweenness, Louvain, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrailConfig {
+    /// Optional analysis profile to weight edges before computation.
+    /// When set, `apply_profile_weights()` runs BEFORE PageRank.
+    #[serde(default)]
+    pub profile: Option<AnalysisProfile>,
+    /// Number of top-PageRank nodes to stress-test (default: 20)
+    #[serde(default = "default_stress_top_n")]
+    pub stress_top_n: usize,
+    /// Number of missing link predictions to keep (default: 50)
+    #[serde(default = "default_missing_links_top_n")]
+    pub missing_links_top_n: usize,
+    /// Minimum plausibility score for predicted links (default: 0.3)
+    #[serde(default = "default_min_plausibility")]
+    pub min_plausibility: f64,
+    /// Number of K anchors for structural DNA (default: 10)
+    #[serde(default = "default_dna_k")]
+    pub dna_k: usize,
+    /// WL hash neighborhood radius (default: 2)
+    #[serde(default = "default_wl_radius")]
+    pub wl_radius: usize,
+    /// WL hash iterations (default: 3)
+    #[serde(default = "default_wl_iterations")]
+    pub wl_iterations: usize,
+}
+
+fn default_stress_top_n() -> usize { 20 }
+fn default_missing_links_top_n() -> usize { 50 }
+fn default_min_plausibility() -> f64 { 0.3 }
+fn default_dna_k() -> usize { 10 }
+fn default_wl_radius() -> usize { 2 }
+fn default_wl_iterations() -> usize { 3 }
+
+impl Default for GrailConfig {
+    fn default() -> Self {
+        Self {
+            profile: None,
+            stress_top_n: default_stress_top_n(),
+            missing_links_top_n: default_missing_links_top_n(),
+            min_plausibility: default_min_plausibility(),
+            dna_k: default_dna_k(),
+            wl_radius: default_wl_radius(),
+            wl_iterations: default_wl_iterations(),
+        }
+    }
+}
+
+/// An analysis profile that weights edge types for contextual analytics.
+///
+/// Inspired by R-GCN basis decomposition from GraIL — different contexts
+/// (refactoring, security, onboarding) weight relationships differently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisProfile {
+    /// Profile name (e.g., "default", "refactoring", "security", "onboarding")
+    pub name: String,
+    /// Optional description
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Edge type weights — multiplied against edge weights before analytics.
+    /// Missing edge types use weight 1.0 (unchanged).
+    pub edge_weights: HashMap<String, f64>,
+    /// Fusion weights for multi-signal impact analysis (Plan 4).
+    #[serde(default)]
+    pub fusion_weights: Option<FusionWeights>,
+}
+
+/// Weights for multi-signal impact fusion (Plan 4).
+///
+/// Each weight controls the contribution of one signal in the combined
+/// impact score. They should sum to ~1.0 for normalized results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionWeights {
+    /// Structural impact (imports/calls graph traversal)
+    pub structural: f64,
+    /// Co-change signal (temporal coupling from TOUCHES/CO_CHANGED)
+    pub co_change: f64,
+    /// Knowledge density signal (linked notes + decisions)
+    pub knowledge: f64,
+    /// PageRank importance signal
+    pub pagerank: f64,
+    /// Bridge proximity signal (betweenness / bridge detection)
+    pub bridge: f64,
+}
+
+impl Default for FusionWeights {
+    fn default() -> Self {
+        Self {
+            structural: 0.30,
+            co_change: 0.25,
+            knowledge: 0.15,
+            pagerank: 0.15,
+            bridge: 0.15,
+        }
+    }
+}
+
+/// Timing information for a single pipeline step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepTiming {
+    /// Step name (e.g., "pagerank", "structural_dna")
+    pub name: String,
+    /// Duration in milliseconds
+    pub duration_ms: u64,
+    /// Whether the step succeeded
+    pub success: bool,
+    /// Error message if the step failed (None if success)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Statistics from the extended compute_all pipeline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrailStats {
+    /// Number of nodes with structural DNA computed
+    pub dna_computed: usize,
+    /// Number of nodes with WL hash computed
+    pub wl_computed: usize,
+    /// Number of context cards generated
+    pub cards_computed: usize,
+    /// Number of missing links predicted
+    pub links_predicted: usize,
+    /// Number of topology violations found
+    pub violations_found: usize,
+    /// Number of nodes stress-tested
+    pub stress_tested: usize,
+}
+
+/// Result of the extended `compute_all` pipeline with GraIL algorithms.
+///
+/// Extends `GraphAnalytics` with per-step timing, error collection,
+/// and GraIL-specific data (DNA vectors, WL hashes, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeAllResult {
+    /// Base analytics (PageRank, Betweenness, Louvain, Health, etc.)
+    pub analytics: GraphAnalytics,
+    /// Per-step timing information
+    pub timings: Vec<StepTiming>,
+    /// GraIL-specific statistics (only populated if grail config was provided)
+    pub grail_stats: GrailStats,
+    /// Structural DNA vectors per node ID (Plan 2)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub structural_dna: HashMap<String, Vec<f64>>,
+    /// WL hashes per node ID (Plan 7)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub wl_hashes: HashMap<String, u64>,
+    /// Whether incremental mode was used (vs full recompute)
+    #[serde(default)]
+    pub mode: ComputeMode,
+    /// Total duration in milliseconds (wall clock)
+    pub total_ms: u64,
+}
+
+/// Computation mode: full recompute or incremental (stale nodes only).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeMode {
+    /// Full recompute of all nodes
+    #[default]
+    Full,
+    /// Incremental recompute of stale nodes only
+    Incremental,
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
