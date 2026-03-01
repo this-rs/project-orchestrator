@@ -2214,6 +2214,14 @@ impl GraphStore for Neo4jClient {
         self.batch_update_structural_dna(updates).await
     }
 
+    async fn write_predicted_links(
+        &self,
+        project_id: &str,
+        links: &[crate::graph::models::LinkPrediction],
+    ) -> anyhow::Result<()> {
+        self.write_predicted_links(project_id, links).await
+    }
+
     async fn get_project_structural_dna(
         &self,
         project_id: &str,

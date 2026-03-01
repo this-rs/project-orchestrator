@@ -487,6 +487,25 @@ pub struct StructuralDnaUpdate {
     pub dna: Vec<f64>,
 }
 
+/// A predicted missing link between two nodes in the code graph.
+///
+/// Each prediction includes a plausibility score (0-1) and the individual
+/// signals that contributed to the score (Jaccard, co-change, proximity,
+/// Adamic-Adar, DNA similarity).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkPrediction {
+    /// Source node ID (file path or function name)
+    pub source: String,
+    /// Target node ID
+    pub target: String,
+    /// Combined plausibility score (0.0 - 1.0)
+    pub plausibility: f64,
+    /// Individual signal scores: (signal_name, score)
+    pub signals: Vec<(String, f64)>,
+    /// Suggested relationship type (IMPORTS, CALLS, etc.)
+    pub suggested_relation: String,
+}
+
 /// Result of K-means clustering on structural DNA vectors.
 ///
 /// Each cluster represents a group of structurally similar files that play
@@ -957,6 +976,9 @@ pub struct ComputeAllResult {
     /// WL hashes per node ID (Plan 7)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub wl_hashes: HashMap<String, u64>,
+    /// Top predicted missing links (Plan 9)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predicted_links: Vec<LinkPrediction>,
     /// Whether incremental mode was used (vs full recompute)
     #[serde(default)]
     pub mode: ComputeMode,

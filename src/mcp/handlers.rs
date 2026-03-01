@@ -301,6 +301,8 @@ impl ToolHandler {
             ("code", "find_structural_twins") => "find_structural_twins",
             ("code", "cluster_dna") => "cluster_dna",
             ("code", "find_cross_project_twins") => "find_cross_project_twins",
+            ("code", "predict_missing_links") => "predict_missing_links",
+            ("code", "check_link_plausibility") => "check_link_plausibility",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -3113,6 +3115,16 @@ impl ToolHandler {
                 let result = http
                     .post("/api/code/structural-twins/cross-project", args)
                     .await?;
+                Ok(Some(result))
+            }
+
+            "predict_missing_links" => {
+                let result = http.post("/api/code/predict-links", args).await?;
+                Ok(Some(result))
+            }
+
+            "check_link_plausibility" => {
+                let result = http.post("/api/code/link-plausibility", args).await?;
                 Ok(Some(result))
             }
 
@@ -6455,6 +6467,38 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "POST");
         assert_eq!(result["path"], "/api/code/structural-twins/cross-project");
+    }
+
+    #[tokio::test]
+    async fn test_http_predict_missing_links() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "predict_missing_links",
+                Some(json!({"project_slug": "my-project", "top_n": 10, "min_plausibility": 0.3})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/code/predict-links");
+    }
+
+    #[tokio::test]
+    async fn test_http_check_link_plausibility() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "check_link_plausibility",
+                Some(json!({
+                    "project_slug": "my-project",
+                    "source": "src/main.rs",
+                    "target": "src/lib.rs"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/code/link-plausibility");
     }
 
     // -- Feature graphs -----------------------------------------------------

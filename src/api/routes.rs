@@ -623,6 +623,17 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(code_handlers::find_cross_project_twins),
         )
         // ================================================================
+        // Link Prediction
+        // ================================================================
+        .route(
+            "/api/code/predict-links",
+            post(code_handlers::predict_missing_links),
+        )
+        .route(
+            "/api/code/link-plausibility",
+            post(code_handlers::check_link_plausibility),
+        )
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(

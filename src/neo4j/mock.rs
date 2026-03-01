@@ -6748,6 +6748,15 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn write_predicted_links(
+        &self,
+        _project_id: &str,
+        _links: &[crate::graph::models::LinkPrediction],
+    ) -> anyhow::Result<()> {
+        // Mock: predicted links not stored in tests
+        Ok(())
+    }
+
     async fn get_project_structural_dna(
         &self,
         _project_id: &str,

@@ -186,6 +186,19 @@ impl AnalyticsWriter {
 
         Ok(())
     }
+
+    /// Write predicted missing links to Neo4j.
+    ///
+    /// Persists top-N link predictions as PREDICTED_LINK relationships.
+    /// Old predictions are replaced on each call (idempotent).
+    pub async fn write_predicted_links(
+        &self,
+        project_id: &str,
+        links: &[super::models::LinkPrediction],
+    ) -> Result<()> {
+        self.store.write_predicted_links(project_id, links).await?;
+        Ok(())
+    }
 }
 
 // ============================================================================

@@ -3165,6 +3165,142 @@ pub async fn find_cross_project_twins(
     })))
 }
 
+// ============================================================================
+// Link Prediction
+// ============================================================================
+
+/// Request body for predict_missing_links endpoint.
+#[derive(Debug, Deserialize)]
+pub struct PredictMissingLinksBody {
+    pub project_slug: String,
+    pub top_n: Option<usize>,
+    pub min_plausibility: Option<f64>,
+}
+
+/// POST /api/code/predict-links
+///
+/// Suggests the top-N most plausible missing links in the project's file graph.
+/// Uses 5 signals (Jaccard, co-change, proximity, Adamic-Adar, DNA similarity)
+/// to score candidate pairs at distance 2-3 that are not directly connected.
+pub async fn predict_missing_links(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<PredictMissingLinksBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::{extract_co_change_data, suggest_missing_links};
+    use crate::graph::extraction::GraphExtractor;
+
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let project_id = project.id.to_string();
+
+    // Get structural DNA (optional, used as signal if available)
+    let all_dna = state
+        .orchestrator
+        .neo4j()
+        .get_project_structural_dna(&project_id)
+        .await?;
+
+    let dna_map: std::collections::HashMap<String, Vec<f64>> =
+        all_dna.into_iter().collect();
+    let dna_ref = if dna_map.is_empty() {
+        None
+    } else {
+        Some(&dna_map)
+    };
+
+    // Extract file graph
+    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let graph = extractor.extract_file_graph(project.id).await?;
+
+    // Extract co-change data from CoChanged edges
+    let co_change = extract_co_change_data(&graph);
+
+    let top_n = body.top_n.unwrap_or(20);
+    let min_plausibility = body.min_plausibility.unwrap_or(0.0);
+
+    let predictions = suggest_missing_links(&graph, &co_change, dna_ref, top_n, min_plausibility);
+
+    Ok(Json(serde_json::json!({
+        "predictions": predictions,
+        "total": predictions.len(),
+        "top_n": top_n,
+        "min_plausibility": min_plausibility,
+    })))
+}
+
+/// Request body for check_link_plausibility endpoint.
+#[derive(Debug, Deserialize)]
+pub struct CheckLinkPlausibilityBody {
+    pub project_slug: String,
+    pub source: String,
+    pub target: String,
+}
+
+/// POST /api/code/link-plausibility
+///
+/// Checks how plausible a specific link between two nodes would be.
+/// Returns a single LinkPrediction with the combined score and individual
+/// signal values (Jaccard, co-change, proximity, Adamic-Adar, DNA similarity).
+pub async fn check_link_plausibility(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<CheckLinkPlausibilityBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::algorithms::{extract_co_change_data, link_plausibility};
+    use crate::graph::extraction::GraphExtractor;
+
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let project_id = project.id.to_string();
+
+    // Get structural DNA (optional)
+    let all_dna = state
+        .orchestrator
+        .neo4j()
+        .get_project_structural_dna(&project_id)
+        .await?;
+
+    let dna_map: std::collections::HashMap<String, Vec<f64>> =
+        all_dna.into_iter().collect();
+    let dna_ref = if dna_map.is_empty() {
+        None
+    } else {
+        Some(&dna_map)
+    };
+
+    // Extract file graph
+    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let graph = extractor.extract_file_graph(project.id).await?;
+
+    // Look up source and target in the graph
+    let source_idx = graph.id_to_index.get(&body.source).ok_or_else(|| {
+        AppError::NotFound(format!("Source node '{}' not found in graph", body.source))
+    })?;
+    let target_idx = graph.id_to_index.get(&body.target).ok_or_else(|| {
+        AppError::NotFound(format!("Target node '{}' not found in graph", body.target))
+    })?;
+
+    // Extract co-change data
+    let co_change = extract_co_change_data(&graph);
+
+    let prediction = link_plausibility(&graph, *source_idx, *target_idx, &co_change, dna_ref);
+
+    Ok(Json(serde_json::json!(prediction)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1821,6 +1821,14 @@ pub trait GraphStore: Send + Sync {
         updates: &[crate::graph::models::StructuralDnaUpdate],
     ) -> Result<()>;
 
+    /// Write predicted missing links for a project.
+    /// Persists top-N link predictions as PREDICTED_LINK relationships in Neo4j.
+    async fn write_predicted_links(
+        &self,
+        project_id: &str,
+        links: &[crate::graph::models::LinkPrediction],
+    ) -> Result<()>;
+
     /// Read structural DNA vectors for all File nodes in a project.
     /// Returns (file_path, dna_vector) pairs.
     async fn get_project_structural_dna(

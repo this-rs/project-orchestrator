@@ -1018,13 +1018,26 @@ pub fn compute_all_extended(
             "missing_links will run with 4 signals instead of 5 — structural DNA unavailable"
         );
     }
-    let (_links_result, links_timing) = timed_step("missing_links", || {
-        // TODO(Plan 9): suggest_missing_links(&working_graph, &structural_dna_map, ...)
-        // When structural_dna_map is empty, prediction uses 4 signals instead of 5
-        grail_stats.links_predicted = 0;
-        Ok(())
+    let (links_result, links_timing) = timed_step("missing_links", || {
+        let co_change_data = extract_co_change_data(&working_graph);
+        let dna_ref = if structural_dna_map.is_empty() {
+            None
+        } else {
+            Some(&structural_dna_map)
+        };
+        let predictions = suggest_missing_links(
+            &working_graph,
+            &co_change_data,
+            dna_ref,
+            grail.missing_links_top_n,
+            grail.min_plausibility,
+        );
+        grail_stats.links_predicted = predictions.len();
+        Ok(predictions)
     });
     timings.push(links_timing);
+
+    let predicted_links = links_result.unwrap_or_default();
 
     // --- Step 9: Context Cards (aggregates ALL above) ---
     if wl_hashes.is_empty() {
@@ -1054,6 +1067,7 @@ pub fn compute_all_extended(
         grail_stats,
         structural_dna: structural_dna_map,
         wl_hashes,
+        predicted_links,
         mode,
         total_ms,
     }
@@ -2024,6 +2038,261 @@ pub fn compute_bridge_density(node_count: usize, edge_count: usize) -> f64 {
     }
     let max_edges = node_count * (node_count - 1);
     edge_count as f64 / max_edges as f64
+}
+
+// ============================================================================
+// GraIL algorithms — Missing Link Prediction (Plan 9)
+// ============================================================================
+
+/// Find all pairs of nodes at distance exactly 2 (not directly connected).
+///
+/// Algorithm: for each node, BFS 1-hop → for each neighbor, BFS 1-hop →
+/// collect pairs (node, hop2) where hop2 is NOT directly connected to node.
+/// Deduplicate by storing (min_index, max_index).
+///
+/// Complexity: O(V × avg_degree²) — for 10K nodes with avg_degree=5 → ~250K pairs.
+pub fn find_distance_2_3_pairs(graph: &CodeGraph) -> Vec<(NodeIndex, NodeIndex)> {
+    let g = &graph.graph;
+    let mut pairs: HashSet<(usize, usize)> = HashSet::new();
+
+    for node in g.node_indices() {
+        let neighbors: HashSet<NodeIndex> =
+            undirected_neighbors(g, node).into_iter().collect();
+
+        // For each neighbor, look at THEIR neighbors (distance 2 from node)
+        for &neighbor in &neighbors {
+            for hop2 in undirected_neighbors(g, neighbor) {
+                // Skip if hop2 is the source node itself
+                if hop2 == node {
+                    continue;
+                }
+                // Skip if hop2 is directly connected to node (distance 1, not 2)
+                if neighbors.contains(&hop2) {
+                    continue;
+                }
+                // Deduplicate: store as (min, max) index pair
+                let pair = if node.index() < hop2.index() {
+                    (node.index(), hop2.index())
+                } else {
+                    (hop2.index(), node.index())
+                };
+                pairs.insert(pair);
+            }
+        }
+    }
+
+    pairs
+        .into_iter()
+        .map(|(a, b)| (NodeIndex::new(a), NodeIndex::new(b)))
+        .collect()
+}
+
+/// Compute plausibility score for a potential link between two nodes.
+///
+/// Uses 5 signals with weighted fusion:
+/// - **Jaccard** (0.25): neighbor set overlap — high = similar connectivity
+/// - **Co-change** (0.30): temporal coupling from commit history — strongest signal
+/// - **Proximity** (0.15): inverse shortest-path distance — closer = more likely
+/// - **Adamic-Adar** (0.15): weighted common neighbors (1/ln(degree)) — penalizes hubs
+/// - **DNA similarity** (0.15): structural role similarity via cosine on DNA vectors
+///
+/// Returns a `LinkPrediction` with the combined score and individual signal values.
+pub fn link_plausibility(
+    graph: &CodeGraph,
+    source: NodeIndex,
+    target: NodeIndex,
+    co_change_data: &HashMap<(String, String), f64>,
+    dna_map: Option<&HashMap<String, Vec<f64>>>,
+) -> super::models::LinkPrediction {
+    let g = &graph.graph;
+
+    // --- Signal 1: Jaccard coefficient (common neighbors / union neighbors) ---
+    let source_neighbors: HashSet<NodeIndex> =
+        undirected_neighbors(g, source).into_iter().collect();
+    let target_neighbors: HashSet<NodeIndex> =
+        undirected_neighbors(g, target).into_iter().collect();
+    let common_count = source_neighbors.intersection(&target_neighbors).count();
+    let union_count = source_neighbors.union(&target_neighbors).count();
+    let jaccard = if union_count > 0 {
+        common_count as f64 / union_count as f64
+    } else {
+        0.0
+    };
+
+    // --- Signal 2: Co-change weight (temporal coupling from commits) ---
+    let source_id = &g[source].id;
+    let target_id = &g[target].id;
+    let co_change_weight = co_change_data
+        .get(&(source_id.clone(), target_id.clone()))
+        .or_else(|| co_change_data.get(&(target_id.clone(), source_id.clone())))
+        .copied()
+        .unwrap_or(0.0)
+        .min(1.0); // Clamp to [0, 1]
+
+    // --- Signal 3: Proximity (inverse shortest-path distance via BFS) ---
+    let proximity = {
+        // BFS from source to target (unweighted, undirected)
+        let mut visited = vec![false; g.node_count()];
+        let mut queue = std::collections::VecDeque::new();
+        visited[source.index()] = true;
+        queue.push_back((source, 0u32));
+        let mut distance = u32::MAX;
+
+        while let Some((current, dist)) = queue.pop_front() {
+            if current == target {
+                distance = dist;
+                break;
+            }
+            if dist >= 10 {
+                break; // Cap search depth
+            }
+            for neighbor in undirected_neighbors(g, current) {
+                if !visited[neighbor.index()] {
+                    visited[neighbor.index()] = true;
+                    queue.push_back((neighbor, dist + 1));
+                }
+            }
+        }
+
+        if distance > 0 && distance < u32::MAX {
+            1.0 / distance as f64
+        } else {
+            0.0
+        }
+    };
+
+    // --- Signal 4: Adamic-Adar index (penalizes high-degree common neighbors) ---
+    let adamic_adar: f64 = source_neighbors
+        .intersection(&target_neighbors)
+        .map(|&common_node| {
+            let degree = undirected_neighbors(g, common_node).len();
+            if degree > 1 {
+                1.0 / (degree as f64).ln()
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    // Normalize Adamic-Adar to [0, 1] range (cap at reasonable max)
+    let adamic_adar_norm = (adamic_adar / 5.0).min(1.0);
+
+    // --- Signal 5: Structural DNA cosine similarity ---
+    let dna_similarity = dna_map
+        .and_then(|dm| {
+            let s_dna = dm.get(source_id)?;
+            let t_dna = dm.get(target_id)?;
+            Some(cosine_similarity(s_dna, t_dna))
+        })
+        .unwrap_or(0.0);
+
+    // --- Weighted fusion ---
+    let plausibility = 0.25 * jaccard
+        + 0.30 * co_change_weight
+        + 0.15 * proximity
+        + 0.15 * adamic_adar_norm
+        + 0.15 * dna_similarity;
+
+    let suggested_relation = infer_relation_type(graph, source, target);
+
+    super::models::LinkPrediction {
+        source: source_id.clone(),
+        target: target_id.clone(),
+        plausibility,
+        signals: vec![
+            ("jaccard".to_string(), jaccard),
+            ("co_change".to_string(), co_change_weight),
+            ("proximity".to_string(), proximity),
+            ("adamic_adar".to_string(), adamic_adar_norm),
+            ("dna_similarity".to_string(), dna_similarity),
+        ],
+        suggested_relation,
+    }
+}
+
+/// Suggest the top-N most plausible missing links in the graph.
+///
+/// Algorithm:
+/// 1. Find all pairs at distance 2 (not directly connected)
+/// 2. Optionally pre-filter by co-change weight > 0 for efficiency
+/// 3. Score each pair with `link_plausibility` (5 signals)
+/// 4. Filter by `min_plausibility`, sort descending, truncate to `top_n`
+///
+/// # Performance
+/// O(V × avg_degree²) for candidate finding + O(candidates × avg_degree) for scoring.
+/// For 10K nodes with avg_degree=5: ~250K candidates → ~1s total.
+pub fn suggest_missing_links(
+    graph: &CodeGraph,
+    co_change_data: &HashMap<(String, String), f64>,
+    dna_map: Option<&HashMap<String, Vec<f64>>>,
+    top_n: usize,
+    min_plausibility: f64,
+) -> Vec<super::models::LinkPrediction> {
+    let candidates = find_distance_2_3_pairs(graph);
+
+    let mut predictions: Vec<super::models::LinkPrediction> = candidates
+        .into_iter()
+        .map(|(s, t)| link_plausibility(graph, s, t, co_change_data, dna_map))
+        .filter(|p| p.plausibility >= min_plausibility)
+        .collect();
+
+    predictions.sort_by(|a, b| {
+        b.plausibility
+            .partial_cmp(&a.plausibility)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    predictions.truncate(top_n);
+    predictions
+}
+
+/// Extract co-change weights from CoChanged edges in the graph.
+///
+/// Returns a HashMap of (source_id, target_id) → weight for all CO_CHANGED edges.
+/// Both directions are stored for O(1) bidirectional lookup.
+pub fn extract_co_change_data(graph: &CodeGraph) -> HashMap<(String, String), f64> {
+    use super::models::CodeEdgeType;
+
+    let g = &graph.graph;
+    let mut data = HashMap::new();
+
+    for edge_idx in g.edge_indices() {
+        if let Some(edge) = g.edge_weight(edge_idx) {
+            if edge.edge_type == CodeEdgeType::CoChanged {
+                if let Some((source_idx, target_idx)) = g.edge_endpoints(edge_idx) {
+                    let source_id = g[source_idx].id.clone();
+                    let target_id = g[target_idx].id.clone();
+                    data.insert((source_id.clone(), target_id.clone()), edge.weight);
+                    data.insert((target_id, source_id), edge.weight);
+                }
+            }
+        }
+    }
+
+    data
+}
+
+/// Infer the most likely relation type for a predicted link.
+///
+/// Uses node types: File→File = IMPORTS, Function→Function = CALLS,
+/// mixed or other = RELATED.
+pub fn infer_relation_type(
+    graph: &CodeGraph,
+    source: NodeIndex,
+    target: NodeIndex,
+) -> String {
+    use super::models::CodeNodeType;
+
+    let source_type = &graph.graph[source].node_type;
+    let target_type = &graph.graph[target].node_type;
+
+    match (source_type, target_type) {
+        (CodeNodeType::File, CodeNodeType::File) => "IMPORTS".to_string(),
+        (CodeNodeType::Function, CodeNodeType::Function) => "CALLS".to_string(),
+        (CodeNodeType::File, CodeNodeType::Function)
+        | (CodeNodeType::Function, CodeNodeType::File) => "DEFINES".to_string(),
+        (CodeNodeType::Struct, CodeNodeType::Trait)
+        | (CodeNodeType::Trait, CodeNodeType::Struct) => "IMPLEMENTS_TRAIT".to_string(),
+        _ => "RELATED".to_string(),
+    }
 }
 
 // ============================================================================
@@ -3727,5 +3996,377 @@ mod tests {
         let clusters = cluster_dna_vectors(&dna, 1);
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].members.len(), 3);
+    }
+
+    // ====================================================================
+    // Missing Link Prediction (Plan 9)
+    // ====================================================================
+
+    /// Build a chain graph: A → B → C (A and C are NOT directly connected)
+    fn make_chain_abc() -> CodeGraph {
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "A".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("src/a.rs".to_string()),
+            name: "a.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "B".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("src/b.rs".to_string()),
+            name: "b.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "C".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("src/c.rs".to_string()),
+            name: "c.rs".to_string(),
+            project_id: None,
+        });
+        g.add_edge("A", "B", CodeEdge {
+            edge_type: CodeEdgeType::Imports,
+            weight: 1.0,
+        });
+        g.add_edge("B", "C", CodeEdge {
+            edge_type: CodeEdgeType::Imports,
+            weight: 1.0,
+        });
+        g
+    }
+
+    #[test]
+    fn test_find_distance_2_pairs_chain() {
+        // A → B → C : (A, C) should be at distance 2
+        let g = make_chain_abc();
+        let pairs = find_distance_2_3_pairs(&g);
+        assert_eq!(pairs.len(), 1, "Expected exactly 1 distance-2 pair");
+        let pair = &pairs[0];
+        let ids: HashSet<String> = [
+            g.graph[pair.0].id.clone(),
+            g.graph[pair.1].id.clone(),
+        ]
+        .into_iter()
+        .collect();
+        assert!(ids.contains("A"), "Pair should contain A");
+        assert!(ids.contains("C"), "Pair should contain C");
+    }
+
+    #[test]
+    fn test_find_distance_2_pairs_triangle_none() {
+        // Triangle: A → B → C, A → C → directly connected, no distance-2 pairs
+        let mut g = make_chain_abc();
+        g.add_edge("A", "C", CodeEdge {
+            edge_type: CodeEdgeType::Imports,
+            weight: 1.0,
+        });
+        let pairs = find_distance_2_3_pairs(&g);
+        assert!(pairs.is_empty(), "Triangle should have no distance-2 pairs");
+    }
+
+    #[test]
+    fn test_find_distance_2_pairs_star_graph() {
+        // Star: center → leaf_0, center → leaf_1, center → leaf_2
+        // All leaves are at distance 2 from each other (through center)
+        let g = make_star_graph(3);
+        let pairs = find_distance_2_3_pairs(&g);
+        // 3 leaves → C(3,2) = 3 pairs at distance 2
+        assert_eq!(pairs.len(), 3, "Star with 3 leaves should have 3 distance-2 pairs");
+    }
+
+    #[test]
+    fn test_find_distance_2_pairs_empty() {
+        let g = CodeGraph::new();
+        let pairs = find_distance_2_3_pairs(&g);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_find_distance_2_pairs_disconnected() {
+        // Two disconnected nodes — no edges, no pairs
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "X".to_string(),
+            node_type: CodeNodeType::File,
+            path: None,
+            name: "x.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "Y".to_string(),
+            node_type: CodeNodeType::File,
+            path: None,
+            name: "y.rs".to_string(),
+            project_id: None,
+        });
+        let pairs = find_distance_2_3_pairs(&g);
+        assert!(pairs.is_empty(), "Disconnected nodes have no distance-2 pairs");
+    }
+
+    #[test]
+    fn test_link_plausibility_high_score() {
+        // Diamond: A → B, A → C, B → D, C → D
+        // B and C share common neighbors (A, D) → high Jaccard + Adamic-Adar
+        let mut g = CodeGraph::new();
+        for id in &["A", "B", "C", "D"] {
+            g.add_node(CodeNode {
+                id: id.to_string(),
+                node_type: CodeNodeType::Function,
+                path: Some(format!("src/{}.rs", id.to_lowercase())),
+                name: id.to_string(),
+                project_id: None,
+            });
+        }
+        g.add_edge("A", "B", CodeEdge::default());
+        g.add_edge("A", "C", CodeEdge::default());
+        g.add_edge("B", "D", CodeEdge::default());
+        g.add_edge("C", "D", CodeEdge::default());
+
+        let b_idx = g.id_to_index["B"];
+        let c_idx = g.id_to_index["C"];
+
+        // Add co-change data
+        let mut co_change = HashMap::new();
+        co_change.insert(("B".to_string(), "C".to_string()), 0.8);
+
+        let prediction = link_plausibility(&g, b_idx, c_idx, &co_change, None);
+
+        assert!(
+            prediction.plausibility > 0.4,
+            "B-C with 2 common neighbors + high co-change should have plausibility > 0.4, got {}",
+            prediction.plausibility
+        );
+        assert_eq!(prediction.signals.len(), 5, "Should have 5 signals");
+        assert_eq!(prediction.suggested_relation, "CALLS"); // Function-Function
+    }
+
+    #[test]
+    fn test_link_plausibility_zero_score() {
+        // Two nodes far apart, no common neighbors, no co-change
+        let mut g = CodeGraph::new();
+        for id in &["A", "B", "C", "D", "E"] {
+            g.add_node(CodeNode {
+                id: id.to_string(),
+                node_type: CodeNodeType::File,
+                path: None,
+                name: format!("{}.rs", id.to_lowercase()),
+                project_id: None,
+            });
+        }
+        // Chain: A → B → C → D → E
+        g.add_edge("A", "B", CodeEdge::default());
+        g.add_edge("B", "C", CodeEdge::default());
+        g.add_edge("C", "D", CodeEdge::default());
+        g.add_edge("D", "E", CodeEdge::default());
+
+        let a_idx = g.id_to_index["A"];
+        let e_idx = g.id_to_index["E"];
+        let co_change: HashMap<(String, String), f64> = HashMap::new();
+
+        let prediction = link_plausibility(&g, a_idx, e_idx, &co_change, None);
+
+        // Jaccard = 0 (no common neighbors), co_change = 0, proximity = 1/4 = 0.25
+        assert!(
+            prediction.plausibility < 0.1,
+            "A-E far apart with no co-change should have low plausibility, got {}",
+            prediction.plausibility
+        );
+    }
+
+    #[test]
+    fn test_link_plausibility_with_dna() {
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "X".to_string(),
+            node_type: CodeNodeType::File,
+            path: None,
+            name: "x.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "Y".to_string(),
+            node_type: CodeNodeType::File,
+            path: None,
+            name: "y.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "M".to_string(),
+            node_type: CodeNodeType::File,
+            path: None,
+            name: "m.rs".to_string(),
+            project_id: None,
+        });
+        // X → M → Y (X and Y at distance 2)
+        g.add_edge("X", "M", CodeEdge::default());
+        g.add_edge("M", "Y", CodeEdge::default());
+
+        let x_idx = g.id_to_index["X"];
+        let y_idx = g.id_to_index["Y"];
+        let co_change: HashMap<(String, String), f64> = HashMap::new();
+
+        // Very similar DNA vectors
+        let mut dna = HashMap::new();
+        dna.insert("X".to_string(), vec![0.9, 0.1, 0.5]);
+        dna.insert("Y".to_string(), vec![0.85, 0.15, 0.5]);
+
+        let pred_with_dna = link_plausibility(&g, x_idx, y_idx, &co_change, Some(&dna));
+        let pred_no_dna = link_plausibility(&g, x_idx, y_idx, &co_change, None);
+
+        assert!(
+            pred_with_dna.plausibility > pred_no_dna.plausibility,
+            "DNA similarity should boost plausibility: with={} > without={}",
+            pred_with_dna.plausibility,
+            pred_no_dna.plausibility
+        );
+    }
+
+    #[test]
+    fn test_link_plausibility_five_signals() {
+        // Verify all 5 signals are present and named correctly
+        let g = make_chain_abc();
+        let a_idx = g.id_to_index["A"];
+        let c_idx = g.id_to_index["C"];
+        let co_change: HashMap<(String, String), f64> = HashMap::new();
+
+        let prediction = link_plausibility(&g, a_idx, c_idx, &co_change, None);
+        let signal_names: Vec<&str> = prediction.signals.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert_eq!(signal_names, vec![
+            "jaccard", "co_change", "proximity", "adamic_adar", "dna_similarity"
+        ]);
+    }
+
+    #[test]
+    fn test_infer_relation_type_file_file() {
+        let g = make_chain_abc(); // All File nodes
+        let a_idx = g.id_to_index["A"];
+        let c_idx = g.id_to_index["C"];
+        assert_eq!(infer_relation_type(&g, a_idx, c_idx), "IMPORTS");
+    }
+
+    #[test]
+    fn test_infer_relation_type_function_function() {
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "fn_a".to_string(),
+            node_type: CodeNodeType::Function,
+            path: None,
+            name: "fn_a".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "fn_b".to_string(),
+            node_type: CodeNodeType::Function,
+            path: None,
+            name: "fn_b".to_string(),
+            project_id: None,
+        });
+        let a_idx = g.id_to_index["fn_a"];
+        let b_idx = g.id_to_index["fn_b"];
+        assert_eq!(infer_relation_type(&g, a_idx, b_idx), "CALLS");
+    }
+
+    #[test]
+    fn test_infer_relation_type_struct_trait() {
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "MyStruct".to_string(),
+            node_type: CodeNodeType::Struct,
+            path: None,
+            name: "MyStruct".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "MyTrait".to_string(),
+            node_type: CodeNodeType::Trait,
+            path: None,
+            name: "MyTrait".to_string(),
+            project_id: None,
+        });
+        let s_idx = g.id_to_index["MyStruct"];
+        let t_idx = g.id_to_index["MyTrait"];
+        assert_eq!(infer_relation_type(&g, s_idx, t_idx), "IMPLEMENTS_TRAIT");
+    }
+
+    #[test]
+    fn test_suggest_missing_links_co_change_boosts() {
+        // A → B → C, co-change between A and C → A-C should be top prediction
+        let g = make_chain_abc();
+        let mut co_change = HashMap::new();
+        co_change.insert(("A".to_string(), "C".to_string()), 0.9);
+
+        let predictions = suggest_missing_links(&g, &co_change, None, 10, 0.0);
+        assert_eq!(predictions.len(), 1, "Only 1 distance-2 pair: (A, C)");
+        assert!(
+            predictions[0].plausibility > 0.3,
+            "A-C with high co-change should have plausibility > 0.3, got {}",
+            predictions[0].plausibility
+        );
+    }
+
+    #[test]
+    fn test_suggest_missing_links_min_plausibility_filter() {
+        let g = make_chain_abc();
+        let co_change: HashMap<(String, String), f64> = HashMap::new();
+
+        // With very high min_plausibility, no predictions should pass
+        let predictions = suggest_missing_links(&g, &co_change, None, 10, 0.99);
+        assert!(
+            predictions.is_empty(),
+            "No predictions should pass min_plausibility=0.99"
+        );
+    }
+
+    #[test]
+    fn test_suggest_missing_links_top_n_limit() {
+        // Star graph: center → leaf_0, center → leaf_1, center → leaf_2
+        // 3 distance-2 pairs: (leaf_0, leaf_1), (leaf_0, leaf_2), (leaf_1, leaf_2)
+        let g = make_star_graph(3);
+        let co_change: HashMap<(String, String), f64> = HashMap::new();
+
+        let predictions = suggest_missing_links(&g, &co_change, None, 2, 0.0);
+        assert_eq!(predictions.len(), 2, "top_n=2 should limit to 2 predictions");
+    }
+
+    #[test]
+    fn test_extract_co_change_data() {
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "X".to_string(),
+            node_type: CodeNodeType::File,
+            path: None,
+            name: "x.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "Y".to_string(),
+            node_type: CodeNodeType::File,
+            path: None,
+            name: "y.rs".to_string(),
+            project_id: None,
+        });
+        g.add_edge(
+            "X",
+            "Y",
+            CodeEdge {
+                edge_type: CodeEdgeType::CoChanged,
+                weight: 0.75,
+            },
+        );
+
+        let data = extract_co_change_data(&g);
+        // Both directions should be present
+        assert_eq!(data.get(&("X".to_string(), "Y".to_string())), Some(&0.75));
+        assert_eq!(data.get(&("Y".to_string(), "X".to_string())), Some(&0.75));
+    }
+
+    #[test]
+    fn test_extract_co_change_data_ignores_other_edges() {
+        let g = make_chain_abc(); // Only IMPORTS edges
+        let data = extract_co_change_data(&g);
+        assert!(data.is_empty(), "IMPORTS edges should not be extracted as co-change");
     }
 }

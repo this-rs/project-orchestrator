@@ -715,6 +715,72 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Write predicted missing links for a project.
+    ///
+    /// First removes old PREDICTED_LINK edges for this project, then creates new ones.
+    /// Each prediction becomes a relationship: (source)-[:PREDICTED_LINK]->(target)
+    /// with properties: plausibility, suggested_relation, signals (as JSON string), computed_at.
+    pub async fn write_predicted_links(
+        &self,
+        project_id: &str,
+        links: &[crate::graph::models::LinkPrediction],
+    ) -> Result<()> {
+        // 1. Remove old predicted links for this project
+        let delete_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)-[r:PREDICTED_LINK]->()
+            DELETE r
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+        self.graph.run(delete_q).await?;
+
+        if links.is_empty() {
+            return Ok(());
+        }
+
+        // 2. Create new predicted links in batch
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = links
+            .iter()
+            .map(|l| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("source".into(), l.source.clone().into());
+                m.insert("target".into(), l.target.clone().into());
+                m.insert("plausibility".into(), l.plausibility.into());
+                m.insert(
+                    "suggested_relation".into(),
+                    l.suggested_relation.clone().into(),
+                );
+                // Store signals as a JSON string for simplicity
+                let signals_str: String = l
+                    .signals
+                    .iter()
+                    .map(|(name, val)| format!("{}={:.4}", name, val))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                m.insert("signals".into(), signals_str.into());
+                m
+            })
+            .collect();
+
+        let create_q = query(
+            r#"
+            UNWIND $items AS item
+            MATCH (s {path: item.source}), (t {path: item.target})
+            MERGE (s)-[r:PREDICTED_LINK]->(t)
+            SET r.plausibility = item.plausibility,
+                r.suggested_relation = item.suggested_relation,
+                r.signals = item.signals,
+                r.computed_at = datetime()
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(create_q).await?;
+
+        Ok(())
+    }
+
     /// Read structural DNA vectors for all File nodes in a project.
     ///
     /// Returns (file_path, dna_vector) pairs for files that have DNA computed.

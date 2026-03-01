@@ -244,6 +244,8 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "find_structural_twins" => Some(("code", "find_structural_twins")),
         "cluster_dna" => Some(("code", "cluster_dna")),
         "find_cross_project_twins" => Some(("code", "find_cross_project_twins")),
+        "predict_missing_links" => Some(("code", "predict_missing_links")),
+        "check_link_plausibility" => Some(("code", "check_link_plausibility")),
 
         // Skill
         "list_skills" => Some(("skill", "list")),
@@ -756,13 +758,13 @@ fn feature_graph_tool() -> ToolDefinition {
 fn code_tool() -> ToolDefinition {
     ToolDefinition {
         name: "code".to_string(),
-        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment".to_string(),
+        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, predict_missing_links, check_link_plausibility".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins"],
+                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility"],
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
@@ -790,6 +792,9 @@ fn code_tool() -> ToolDefinition {
                 "top_n": {"type": "integer", "description": "Max twins to return (find_structural_twins/find_cross_project_twins, default 10)"},
                 "n_clusters": {"type": "integer", "description": "Number of clusters for K-means (cluster_dna, default 5)"},
                 "source_project_slug": {"type": "string", "description": "Source project slug (find_cross_project_twins)"},
+                "min_plausibility": {"type": "number", "description": "Minimum plausibility score (0-1) for predicted links"},
+                "source": {"type": "string", "description": "Source node path (check_link_plausibility)"},
+                "target": {"type": "string", "description": "Target node path (check_link_plausibility)"},
                 "limit": {"type": "integer", "description": "Max results / depth (search/get_call_graph)"}
             })),
             required: Some(vec!["action".to_string()]),
@@ -1116,6 +1121,8 @@ mod tests {
             "find_structural_twins",
             "cluster_dna",
             "find_cross_project_twins",
+            "predict_missing_links",
+            "check_link_plausibility",
         ];
 
         for name in &old_names {
