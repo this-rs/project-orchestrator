@@ -1503,8 +1503,7 @@ impl Neo4jClient {
                         serde_json::to_string(&c.cc_co_changers_top5).unwrap_or_default();
                     m.insert("cc_co_changers_top5".into(), co_changers_json.into());
                     // Fingerprint vector stored as JSON string (nested arrays not supported in UNWIND)
-                    let fp_json =
-                        serde_json::to_string(&c.cc_fingerprint).unwrap_or_default();
+                    let fp_json = serde_json::to_string(&c.cc_fingerprint).unwrap_or_default();
                     m.insert("cc_fingerprint".into(), fp_json.into());
                     m.insert("cc_version".into(), (c.cc_version as i64).into());
                     m.insert("cc_computed_at".into(), c.cc_computed_at.clone().into());
