@@ -3684,12 +3684,16 @@ pub struct FingerprintQuery {
     pub project_slug: String,
 }
 
-/// Get the WL subgraph fingerprint (hash) for a single file.
-/// Reads from the pre-computed cc_wl_hash stored via context cards.
+/// Get the structural fingerprint for a single file.
+///
+/// Returns the 17-dim universal fingerprint vector with dimension labels,
+/// plus the WL hash and legacy structural DNA for backward compatibility.
 pub async fn get_fingerprint(
     State(state): State<OrchestratorState>,
     Query(query): Query<FingerprintQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::graph::models::{FINGERPRINT_DIMS, FINGERPRINT_LABELS};
+
     let project = state
         .orchestrator
         .neo4j()
@@ -3712,17 +3716,37 @@ pub async fn get_fingerprint(
         .await?;
 
     match card {
-        Some(c) => Ok(Json(serde_json::json!({
-            "path": c.path,
-            "wl_hash": c.cc_wl_hash,
-            "structural_dna": c.cc_structural_dna,
-            "project_slug": query.project_slug,
-        }))),
+        Some(c) => {
+            // Build labeled fingerprint dimensions for readability
+            let labeled_fingerprint: serde_json::Value = if c.cc_fingerprint.len() == FINGERPRINT_DIMS {
+                let dims: Vec<serde_json::Value> = FINGERPRINT_LABELS
+                    .iter()
+                    .zip(c.cc_fingerprint.iter())
+                    .map(|(label, &val)| {
+                        serde_json::json!({ "label": label, "value": val })
+                    })
+                    .collect();
+                serde_json::json!(dims)
+            } else {
+                serde_json::json!(null)
+            };
+
+            Ok(Json(serde_json::json!({
+                "path": c.path,
+                "project_slug": query.project_slug,
+                "fingerprint": c.cc_fingerprint,
+                "fingerprint_dims": FINGERPRINT_DIMS,
+                "fingerprint_labeled": labeled_fingerprint,
+                "wl_hash": c.cc_wl_hash,
+                "structural_dna": c.cc_structural_dna,
+            })))
+        }
         None => Ok(Json(serde_json::json!({
             "path": path,
+            "project_slug": query.project_slug,
+            "fingerprint": null,
             "wl_hash": null,
             "message": "No fingerprint computed yet. Run analytics or refresh context cards.",
-            "project_slug": query.project_slug,
         }))),
     }
 }
