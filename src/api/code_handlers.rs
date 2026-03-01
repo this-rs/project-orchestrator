@@ -3658,6 +3658,182 @@ pub async fn find_isomorphic(
     })))
 }
 
+// ============================================================================
+// Structural Templates
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct StructuralTemplateQuery {
+    pub project_slug: String,
+    /// Minimum number of files sharing the same WL hash to form a template (default: 3)
+    pub min_occurrences: Option<usize>,
+}
+
+/// GET /api/code/structural-templates — Suggest reusable structural templates
+/// from isomorphic groups (files sharing the same WL hash fingerprint).
+pub async fn suggest_structural_templates(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<StructuralTemplateQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&query.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
+
+    let min_occ = query.min_occurrences.unwrap_or(3);
+
+    // Get isomorphic groups with min_size = min_occurrences
+    let groups = state
+        .orchestrator
+        .neo4j()
+        .find_isomorphic_groups(&project.id.to_string(), min_occ)
+        .await?;
+
+    // For each group, try to derive a description from common path patterns and structural DNA
+    let mut templates: Vec<crate::graph::models::StructuralTemplate> = Vec::new();
+
+    for group in groups {
+        // Derive description from common path pattern
+        let description = derive_pattern_description(&group.members);
+
+        // Find common DNA prefix from context cards
+        let exemplars: Vec<String> = group.members.iter().take(5).cloned().collect();
+
+        // Try to get context cards for DNA info — convert Vec<f64> to string for comparison
+        let mut dna_strings: Vec<String> = Vec::new();
+        for path in exemplars.iter().take(3) {
+            if let Ok(Some(card)) = state
+                .orchestrator
+                .neo4j()
+                .get_context_card(path, &project.id.to_string())
+                .await
+            {
+                if !card.cc_structural_dna.is_empty() {
+                    // Format DNA as compact string: "0.12,0.45,0.78,..."
+                    let dna_str: String = card.cc_structural_dna
+                        .iter()
+                        .map(|v| format!("{:.2}", v))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    dna_strings.push(dna_str);
+                }
+            }
+        }
+
+        let common_dna_prefix = if dna_strings.len() >= 2 {
+            find_common_prefix(&dna_strings)
+        } else {
+            None
+        };
+
+        templates.push(crate::graph::models::StructuralTemplate {
+            wl_hash: group.wl_hash,
+            occurrences: group.size,
+            exemplars,
+            description,
+            common_dna_prefix,
+        });
+    }
+
+    // Sort by occurrences descending
+    templates.sort_by(|a, b| b.occurrences.cmp(&a.occurrences));
+
+    Ok(Json(serde_json::json!({
+        "project_slug": query.project_slug,
+        "min_occurrences": min_occ,
+        "template_count": templates.len(),
+        "templates": templates,
+    })))
+}
+
+/// Derive a human-readable description from file path patterns
+fn derive_pattern_description(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return "Unknown pattern".to_string();
+    }
+
+    // Find common directory
+    let parts: Vec<Vec<&str>> = paths.iter().map(|p| p.split('/').collect()).collect();
+
+    // Find common prefix length
+    let min_len = parts.iter().map(|p| p.len()).min().unwrap_or(0);
+    let mut common_depth = 0;
+    for i in 0..min_len {
+        if parts.iter().all(|p| p[i] == parts[0][i]) {
+            common_depth = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Find common file suffixes (e.g., all end in "_handler.rs", "_test.rs")
+    let filenames: Vec<&str> = paths.iter().filter_map(|p| p.rsplit('/').next()).collect();
+    let common_suffix = find_common_filename_suffix(&filenames);
+
+    let dir_prefix = if common_depth > 0 {
+        parts[0][..common_depth].join("/")
+    } else {
+        String::new()
+    };
+
+    match (dir_prefix.is_empty(), common_suffix.is_empty()) {
+        (false, false) => format!("Files in {dir_prefix}/ matching *{common_suffix} ({} files)", paths.len()),
+        (false, true) => format!("Files in {dir_prefix}/ with identical topology ({} files)", paths.len()),
+        (true, false) => format!("Files matching *{common_suffix} with identical topology ({} files)", paths.len()),
+        (true, true) => format!("Structurally identical files ({} files)", paths.len()),
+    }
+}
+
+/// Find common suffix in filenames (e.g., "_handler.rs", "_test.rs")
+fn find_common_filename_suffix(names: &[&str]) -> String {
+    if names.len() < 2 {
+        return String::new();
+    }
+    let first: Vec<char> = names[0].chars().rev().collect();
+    let mut common_len = 0;
+    for i in 0..first.len() {
+        if names.iter().all(|n| {
+            let chars: Vec<char> = n.chars().rev().collect();
+            chars.len() > i && chars[i] == first[i]
+        }) {
+            common_len = i + 1;
+        } else {
+            break;
+        }
+    }
+    if common_len > 3 {
+        // Only return if meaningful
+        first[..common_len].iter().rev().collect()
+    } else {
+        String::new()
+    }
+}
+
+/// Find common prefix among DNA strings
+fn find_common_prefix(values: &[String]) -> Option<String> {
+    if values.is_empty() {
+        return None;
+    }
+    let first = &values[0];
+    let mut prefix_len = first.len();
+    for v in &values[1..] {
+        prefix_len = prefix_len.min(v.len());
+        for (i, (a, b)) in first.chars().zip(v.chars()).enumerate() {
+            if a != b {
+                prefix_len = prefix_len.min(i);
+                break;
+            }
+        }
+    }
+    if prefix_len > 5 {
+        Some(first[..prefix_len].to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

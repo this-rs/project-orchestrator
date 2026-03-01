@@ -555,6 +555,23 @@ pub struct IsomorphicGroup {
     pub size: usize,
 }
 
+/// A structural template derived from isomorphic groups.
+/// Files with the same WL hash share the same structural neighborhood topology,
+/// making them candidates for reusable patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralTemplate {
+    /// The shared WL hash fingerprint
+    pub wl_hash: u64,
+    /// Number of files following this pattern
+    pub occurrences: usize,
+    /// Example file paths (up to 5)
+    pub exemplars: Vec<String>,
+    /// Human-readable description of the pattern (e.g. "Handler → Service → Repository chain")
+    pub description: String,
+    /// Common structural DNA prefix shared by exemplars (if any)
+    pub common_dna_prefix: Option<String>,
+}
+
 /// Pre-computed structural profile for a file node (Context Card).
 ///
 /// Aggregates all analytics metrics into a single, self-contained summary

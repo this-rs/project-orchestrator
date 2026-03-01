@@ -311,6 +311,7 @@ impl ToolHandler {
             ("code", "refresh_context_cards") => "refresh_context_cards",
             ("code", "get_fingerprint") => "get_fingerprint",
             ("code", "find_isomorphic") => "find_isomorphic",
+            ("code", "suggest_structural_templates") => "suggest_structural_templates",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -3220,6 +3221,18 @@ impl ToolHandler {
                 }
                 let result = http
                     .get_with_query("/api/code/isomorphic", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "suggest_structural_templates" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("min_occurrences").and_then(|v| v.as_i64()) {
+                    query.push(("min_occurrences".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/code/structural-templates", &query)
                     .await?;
                 Ok(Some(result))
             }

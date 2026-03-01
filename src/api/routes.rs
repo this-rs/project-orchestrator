@@ -674,6 +674,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/isomorphic",
             get(code_handlers::find_isomorphic),
         )
+        .route(
+            "/api/code/structural-templates",
+            get(code_handlers::suggest_structural_templates),
+        )
         // ================================================================
         // Implementation Planner
         // ================================================================
