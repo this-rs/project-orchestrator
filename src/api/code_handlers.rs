@@ -2989,7 +2989,11 @@ pub async fn find_structural_twins(
         let source_file = FileSignals {
             path: source_record.path.clone(),
             fingerprint: source_record.fingerprint.clone(),
-            wl_hash: if source_record.wl_hash != 0 { Some(source_record.wl_hash) } else { None },
+            wl_hash: if source_record.wl_hash != 0 {
+                Some(source_record.wl_hash)
+            } else {
+                None
+            },
             function_count: source_record.function_count,
         };
 
@@ -3003,7 +3007,11 @@ pub async fn find_structural_twins(
                 let target_file = FileSignals {
                     path: record.path.clone(),
                     fingerprint: record.fingerprint.clone(),
-                    wl_hash: if record.wl_hash != 0 { Some(record.wl_hash) } else { None },
+                    wl_hash: if record.wl_hash != 0 {
+                        Some(record.wl_hash)
+                    } else {
+                        None
+                    },
                     function_count: record.function_count,
                 };
                 let sim = compute_multi_signal_similarity(&source_file, &target_file);
@@ -3231,7 +3239,11 @@ pub async fn find_cross_project_twins(
     let source_file = FileSignals {
         path: source_record.path.clone(),
         fingerprint: source_record.fingerprint.clone(),
-        wl_hash: if source_record.wl_hash != 0 { Some(source_record.wl_hash) } else { None },
+        wl_hash: if source_record.wl_hash != 0 {
+            Some(source_record.wl_hash)
+        } else {
+            None
+        },
         function_count: source_record.function_count,
     };
 
@@ -3261,7 +3273,11 @@ pub async fn find_cross_project_twins(
             let target_file = FileSignals {
                 path: record.path.clone(),
                 fingerprint: record.fingerprint.clone(),
-                wl_hash: if record.wl_hash != 0 { Some(record.wl_hash) } else { None },
+                wl_hash: if record.wl_hash != 0 {
+                    Some(record.wl_hash)
+                } else {
+                    None
+                },
                 function_count: record.function_count,
             };
 
@@ -3718,18 +3734,17 @@ pub async fn get_fingerprint(
     match card {
         Some(c) => {
             // Build labeled fingerprint dimensions for readability
-            let labeled_fingerprint: serde_json::Value = if c.cc_fingerprint.len() == FINGERPRINT_DIMS {
-                let dims: Vec<serde_json::Value> = FINGERPRINT_LABELS
-                    .iter()
-                    .zip(c.cc_fingerprint.iter())
-                    .map(|(label, &val)| {
-                        serde_json::json!({ "label": label, "value": val })
-                    })
-                    .collect();
-                serde_json::json!(dims)
-            } else {
-                serde_json::json!(null)
-            };
+            let labeled_fingerprint: serde_json::Value =
+                if c.cc_fingerprint.len() == FINGERPRINT_DIMS {
+                    let dims: Vec<serde_json::Value> = FINGERPRINT_LABELS
+                        .iter()
+                        .zip(c.cc_fingerprint.iter())
+                        .map(|(label, &val)| serde_json::json!({ "label": label, "value": val }))
+                        .collect();
+                    serde_json::json!(dims)
+                } else {
+                    serde_json::json!(null)
+                };
 
             Ok(Json(serde_json::json!({
                 "path": c.path,

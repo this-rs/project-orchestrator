@@ -1844,8 +1844,10 @@ pub trait GraphStore: Send + Sync {
 
     /// Read structural fingerprint vectors for all File nodes in a project.
     /// Returns (file_path, fingerprint_vector) pairs.
-    async fn get_project_structural_fingerprints(&self, project_id: &str)
-        -> Result<Vec<(String, Vec<f64>)>>;
+    async fn get_project_structural_fingerprints(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Vec<f64>)>>;
 
     /// Read all file signals needed for multi-signal structural similarity.
     ///

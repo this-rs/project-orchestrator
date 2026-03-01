@@ -1054,7 +1054,13 @@ pub fn compute_all_extended(
 
     // --- Step 9: Context Cards (aggregates ALL above) ---
     let (cards_result, cards_timing) = timed_step("context_cards", || {
-        let cards = compute_context_cards(graph, &analytics, &structural_dna_map, &wl_hashes, &structural_fingerprint_map);
+        let cards = compute_context_cards(
+            graph,
+            &analytics,
+            &structural_dna_map,
+            &wl_hashes,
+            &structural_fingerprint_map,
+        );
         grail_stats.cards_computed = cards.len();
         Ok(cards)
     });
@@ -1306,8 +1312,8 @@ pub fn compute_structural_fingerprint(
         // (enriched from Neo4j in pipeline step)
         fan_ratio: f64,
         co_changer_count: f64,
-        community_role_raw: f64,    // will be encoded as 0.0/0.5/1.0
-        neighbor_type_entropy: f64, // d15
+        community_role_raw: f64,      // will be encoded as 0.0/0.5/1.0
+        neighbor_type_entropy: f64,   // d15
         neighbor_degree_entropy: f64, // d16 (struc2vec-inspired)
     }
 
@@ -1387,9 +1393,7 @@ pub fn compute_structural_fingerprint(
 
         // d15: neighbor type entropy — Shannon entropy over CodeNodeType of neighbors
         let mut neighbor_type_counts = [0usize; 5]; // File, Function, Struct, Trait, Enum
-        for neighbor_idx in g
-            .neighbors_undirected(*node_idx)
-        {
+        for neighbor_idx in g.neighbors_undirected(*node_idx) {
             let neighbor = &g[neighbor_idx];
             match neighbor.node_type {
                 CodeNodeType::File => neighbor_type_counts[0] += 1,
@@ -1406,7 +1410,8 @@ pub fn compute_structural_fingerprint(
         let mut neighbor_degrees: HashMap<usize, usize> = HashMap::new();
         for neighbor_idx in g.neighbors_undirected(*node_idx) {
             let deg = g.edges(neighbor_idx).count()
-                + g.edges_directed(neighbor_idx, petgraph::Direction::Incoming).count();
+                + g.edges_directed(neighbor_idx, petgraph::Direction::Incoming)
+                    .count();
             *neighbor_degrees.entry(deg).or_insert(0) += 1;
         }
         let degree_counts: Vec<usize> = neighbor_degrees.values().copied().collect();
@@ -1719,7 +1724,8 @@ pub fn compute_multi_signal_similarity(
     let size_sim = log_size_similarity(source.function_count, target.function_count);
 
     // Fused score
-    let fused = W_FINGERPRINT * fp_sim + W_WL_HASH * wl_match + W_NAME * name_sim + W_SIZE * size_sim;
+    let fused =
+        W_FINGERPRINT * fp_sim + W_WL_HASH * wl_match + W_NAME * name_sim + W_SIZE * size_sim;
 
     super::models::FingerprintSimilarity {
         source: source.path.clone(),
@@ -4922,13 +4928,19 @@ mod tests {
     #[test]
     fn test_jaro_winkler_similar_names() {
         let sim = jaro_winkler_similarity("handlers", "handler");
-        assert!(sim > 0.9, "Similar names should have high similarity: {sim}");
+        assert!(
+            sim > 0.9,
+            "Similar names should have high similarity: {sim}"
+        );
     }
 
     #[test]
     fn test_jaro_winkler_different_names() {
         let sim = jaro_winkler_similarity("handlers", "models");
-        assert!(sim < 0.7, "Different names should have low similarity: {sim}");
+        assert!(
+            sim < 0.7,
+            "Different names should have low similarity: {sim}"
+        );
     }
 
     #[test]
@@ -4962,19 +4974,13 @@ mod tests {
     #[test]
     fn test_log_size_similarity_identical() {
         let sim = log_size_similarity(10, 10);
-        assert!(
-            (sim - 1.0).abs() < 1e-10,
-            "Same size should be 1.0: {sim}"
-        );
+        assert!((sim - 1.0).abs() < 1e-10, "Same size should be 1.0: {sim}");
     }
 
     #[test]
     fn test_log_size_similarity_close() {
         let sim = log_size_similarity(10, 12);
-        assert!(
-            sim > 0.9,
-            "Close sizes should have high similarity: {sim}"
-        );
+        assert!(sim > 0.9, "Close sizes should have high similarity: {sim}");
     }
 
     #[test]
@@ -4999,7 +5005,9 @@ mod tests {
     fn test_compute_multi_signal_identical_files() {
         let source = FileSignals {
             path: "src/handlers.rs".to_string(),
-            fingerprint: vec![0.5, 0.3, 0.8, 0.1, 0.9, 0.2, 0.4, 0.6, 0.7, 0.3, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.9],
+            fingerprint: vec![
+                0.5, 0.3, 0.8, 0.1, 0.9, 0.2, 0.4, 0.6, 0.7, 0.3, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.9,
+            ],
             wl_hash: Some(12345),
             function_count: 10,
         };
@@ -5021,13 +5029,17 @@ mod tests {
     fn test_compute_multi_signal_completely_different() {
         let source = FileSignals {
             path: "src/handlers.rs".to_string(),
-            fingerprint: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            fingerprint: vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
             wl_hash: Some(111),
             function_count: 1,
         };
         let target = FileSignals {
             path: "lib/models.py".to_string(),
-            fingerprint: vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            fingerprint: vec![
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
             wl_hash: Some(999),
             function_count: 100,
         };
@@ -5046,13 +5058,18 @@ mod tests {
         // Two "handlers.rs" files from different projects with similar structure
         let source = FileSignals {
             path: "project-a/src/api/handlers.rs".to_string(),
-            fingerprint: vec![0.5, 0.3, 0.8, 0.1, 0.7, 0.2, 0.4, 0.6, 0.3, 0.2, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.7],
+            fingerprint: vec![
+                0.5, 0.3, 0.8, 0.1, 0.7, 0.2, 0.4, 0.6, 0.3, 0.2, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.7,
+            ],
             wl_hash: Some(555),
             function_count: 15,
         };
         let target = FileSignals {
             path: "project-b/src/api/handlers.rs".to_string(),
-            fingerprint: vec![0.5, 0.35, 0.75, 0.12, 0.72, 0.18, 0.38, 0.58, 0.28, 0.22, 0.48, 0.12, 0.78, 0.22, 0.58, 0.42, 0.68],
+            fingerprint: vec![
+                0.5, 0.35, 0.75, 0.12, 0.72, 0.18, 0.38, 0.58, 0.28, 0.22, 0.48, 0.12, 0.78, 0.22,
+                0.58, 0.42, 0.68,
+            ],
             wl_hash: Some(555), // Same WL hash = same topology
             function_count: 18,
         };
@@ -5110,7 +5127,7 @@ mod tests {
 
         let result = compute_multi_signal_similarity(&source, &target);
         assert!((result.signals.fingerprint_similarity).abs() < 1e-10); // No fingerprint
-        // WL match (0.2) + name match (0.2) + size match (0.1) = 0.5
+                                                                        // WL match (0.2) + name match (0.2) + size match (0.1) = 0.5
         assert!(
             (result.similarity - 0.5).abs() < 0.01,
             "Without fingerprint but with matching WL + name + size: ~0.5, got {}",
@@ -5122,7 +5139,9 @@ mod tests {
     fn test_find_cross_project_twins_multi_signal_ordering() {
         let source = FileSignals {
             path: "project-a/src/handlers.rs".to_string(),
-            fingerprint: vec![0.8, 0.3, 0.7, 0.1, 0.9, 0.2, 0.4, 0.6, 0.3, 0.2, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.7],
+            fingerprint: vec![
+                0.8, 0.3, 0.7, 0.1, 0.9, 0.2, 0.4, 0.6, 0.3, 0.2, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.7,
+            ],
             wl_hash: Some(100),
             function_count: 10,
         };
@@ -5130,19 +5149,28 @@ mod tests {
         let candidates = vec![
             FileSignals {
                 path: "project-b/src/handlers.rs".to_string(), // Same name, same WL, similar FP
-                fingerprint: vec![0.78, 0.32, 0.68, 0.12, 0.88, 0.22, 0.38, 0.58, 0.28, 0.22, 0.48, 0.12, 0.78, 0.22, 0.58, 0.42, 0.68],
+                fingerprint: vec![
+                    0.78, 0.32, 0.68, 0.12, 0.88, 0.22, 0.38, 0.58, 0.28, 0.22, 0.48, 0.12, 0.78,
+                    0.22, 0.58, 0.42, 0.68,
+                ],
                 wl_hash: Some(100),
                 function_count: 12,
             },
             FileSignals {
                 path: "project-c/src/models.rs".to_string(), // Different name, different WL
-                fingerprint: vec![0.1, 0.9, 0.2, 0.8, 0.1, 0.7, 0.3, 0.5, 0.8, 0.6, 0.2, 0.9, 0.1, 0.7, 0.3, 0.8, 0.2],
+                fingerprint: vec![
+                    0.1, 0.9, 0.2, 0.8, 0.1, 0.7, 0.3, 0.5, 0.8, 0.6, 0.2, 0.9, 0.1, 0.7, 0.3, 0.8,
+                    0.2,
+                ],
                 wl_hash: Some(200),
                 function_count: 25,
             },
             FileSignals {
                 path: "project-d/src/routes.rs".to_string(), // Different name, same WL hash
-                fingerprint: vec![0.75, 0.35, 0.65, 0.15, 0.85, 0.25, 0.35, 0.55, 0.35, 0.25, 0.45, 0.15, 0.75, 0.25, 0.55, 0.45, 0.65],
+                fingerprint: vec![
+                    0.75, 0.35, 0.65, 0.15, 0.85, 0.25, 0.35, 0.55, 0.35, 0.25, 0.45, 0.15, 0.75,
+                    0.25, 0.55, 0.45, 0.65,
+                ],
                 wl_hash: Some(100),
                 function_count: 11,
             },
@@ -6198,7 +6226,13 @@ mod tests {
         use super::super::models::AnalyticsConfig;
         let config = AnalyticsConfig::default();
         let analytics = compute_all(&g, &config);
-        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let cards = compute_context_cards(
+            &g,
+            &analytics,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(cards.len(), 1, "Only File nodes should get context cards");
         assert_eq!(cards[0].path, "src/main.rs");
@@ -6233,7 +6267,13 @@ mod tests {
         let g = CodeGraph::new();
         let config = AnalyticsConfig::default();
         let analytics = compute_all(&g, &config);
-        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let cards = compute_context_cards(
+            &g,
+            &analytics,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(cards.is_empty());
     }
 
@@ -6590,10 +6630,14 @@ mod tests {
                 name: fname.clone(),
                 project_id: None,
             });
-            g.add_edge("hub.rs", &fname, CodeEdge {
-                edge_type: CodeEdgeType::Defines,
-                weight: 1.0,
-            });
+            g.add_edge(
+                "hub.rs",
+                &fname,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Defines,
+                    weight: 1.0,
+                },
+            );
         }
         // Hub also defines a struct
         g.add_node(CodeNode {
@@ -6603,10 +6647,14 @@ mod tests {
             name: "HubStruct".into(),
             project_id: None,
         });
-        g.add_edge("hub.rs", "HubStruct", CodeEdge {
-            edge_type: CodeEdgeType::Defines,
-            weight: 1.0,
-        });
+        g.add_edge(
+            "hub.rs",
+            "HubStruct",
+            CodeEdge {
+                edge_type: CodeEdgeType::Defines,
+                weight: 1.0,
+            },
+        );
 
         // 5 leaf files: each imports hub
         for i in 0..5 {
@@ -6618,10 +6666,14 @@ mod tests {
                 name: leaf.clone(),
                 project_id: None,
             });
-            g.add_edge(&leaf, "hub.rs", CodeEdge {
-                edge_type: CodeEdgeType::Imports,
-                weight: 1.0,
-            });
+            g.add_edge(
+                &leaf,
+                "hub.rs",
+                CodeEdge {
+                    edge_type: CodeEdgeType::Imports,
+                    weight: 1.0,
+                },
+            );
             // Each leaf defines 1 function
             let fn_name = format!("leaf_fn_{}", i);
             g.add_node(CodeNode {
@@ -6631,10 +6683,14 @@ mod tests {
                 name: fn_name.clone(),
                 project_id: None,
             });
-            g.add_edge(&leaf, &fn_name, CodeEdge {
-                edge_type: CodeEdgeType::Defines,
-                weight: 1.0,
-            });
+            g.add_edge(
+                &leaf,
+                &fn_name,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Defines,
+                    weight: 1.0,
+                },
+            );
         }
 
         // Peripheral file: no imports, 1 function
@@ -6652,10 +6708,14 @@ mod tests {
             name: "orphan_fn".into(),
             project_id: None,
         });
-        g.add_edge("orphan.rs", "orphan_fn", CodeEdge {
-            edge_type: CodeEdgeType::Defines,
-            weight: 1.0,
-        });
+        g.add_edge(
+            "orphan.rs",
+            "orphan_fn",
+            CodeEdge {
+                edge_type: CodeEdgeType::Defines,
+                weight: 1.0,
+            },
+        );
 
         // Compute analytics
         let config = AnalyticsConfig::default();
@@ -6679,7 +6739,10 @@ mod tests {
             profile_name: None,
         };
         let fp = compute_structural_fingerprint(&g, &analytics);
-        assert!(fp.is_empty(), "Empty graph should produce empty fingerprint map");
+        assert!(
+            fp.is_empty(),
+            "Empty graph should produce empty fingerprint map"
+        );
     }
 
     #[test]
@@ -6728,14 +6791,16 @@ mod tests {
         assert!(
             hub[0] > leaf[0],
             "Hub imports_in_pct ({}) should be > leaf ({}) — hub is imported by 5 files",
-            hub[0], leaf[0]
+            hub[0],
+            leaf[0]
         );
 
         // Hub should have HIGH function_count percentile (d7) — 5 functions vs 1
         assert!(
             hub[7] > leaf[7],
             "Hub function_count_pct ({}) should be > leaf ({})",
-            hub[7], leaf[7]
+            hub[7],
+            leaf[7]
         );
 
         // Hub should be a hub (d14 = 0.0) or at least not peripheral
@@ -6743,7 +6808,8 @@ mod tests {
         assert!(
             hub[14] < orphan[14],
             "Hub community_role ({}) should be < orphan ({}) — hub is more central",
-            hub[14], orphan[14]
+            hub[14],
+            orphan[14]
         );
 
         // Cosine similarity between hub and leaf should be < 0.95
@@ -6794,7 +6860,8 @@ mod tests {
         assert!(
             log_low_spread > lin_low_spread,
             "Log percentile should spread low values MORE than linear: log={}, lin={}",
-            log_low_spread, lin_low_spread
+            log_low_spread,
+            lin_low_spread
         );
 
         // Top pair (20 vs 100 = indices 4 vs 5): log should COMPRESS
@@ -6803,15 +6870,24 @@ mod tests {
         assert!(
             log_high_spread < lin_high_spread,
             "Log percentile should compress high values: log={}, lin={}",
-            log_high_spread, lin_high_spread
+            log_high_spread,
+            lin_high_spread
         );
 
         // All values should be in [0, 1]
         for &v in &log_pct {
-            assert!((0.0..=1.0).contains(&v), "Log percentile {} out of range", v);
+            assert!(
+                (0.0..=1.0).contains(&v),
+                "Log percentile {} out of range",
+                v
+            );
         }
         for &v in &lin_pct {
-            assert!((0.0..=1.0).contains(&v), "Lin percentile {} out of range", v);
+            assert!(
+                (0.0..=1.0).contains(&v),
+                "Lin percentile {} out of range",
+                v
+            );
         }
     }
 
@@ -6906,17 +6982,13 @@ mod tests {
             0.85, 0.90, 0.10, // high PR/betweenness, low clustering
             0.80, 0.55, 0.70, // large community, moderate internal, bridge
             0.60, 0.30, 0.45, 0.35, 0.50, // moderate functions
-            0.70,             // WL iterations
-            0.85, 0.75,       // high entropy (diverse neighbors)
+            0.70, // WL iterations
+            0.85, 0.75, // high entropy (diverse neighbors)
         ];
         // Another hub (slightly different project)
         let hub_b = vec![
-            0.90, 0.85, 0.92,
-            0.80, 0.85, 0.12,
-            0.75, 0.50, 0.65,
-            0.55, 0.35, 0.50, 0.30, 0.45,
-            0.65,
-            0.80, 0.70,
+            0.90, 0.85, 0.92, 0.80, 0.85, 0.12, 0.75, 0.50, 0.65, 0.55, 0.35, 0.50, 0.30, 0.45,
+            0.65, 0.80, 0.70,
         ];
 
         // Leaf file (few imports, low centrality) — e.g. utils.rs, constants.rs
@@ -6925,16 +6997,12 @@ mod tests {
             0.05, 0.02, 0.80, // low PR/betweenness, high clustering
             0.20, 0.90, 0.05, // small community, high internal, no bridge
             0.15, 0.10, 0.15, 0.20, 0.25, // few small functions
-            0.20,             // few WL iterations
-            0.20, 0.15,       // low entropy (homogeneous neighbors)
+            0.20, // few WL iterations
+            0.20, 0.15, // low entropy (homogeneous neighbors)
         ];
         let leaf_b = vec![
-            0.12, 0.08, 0.10,
-            0.07, 0.03, 0.75,
-            0.25, 0.85, 0.08,
-            0.10, 0.12, 0.18, 0.22, 0.30,
-            0.25,
-            0.25, 0.18,
+            0.12, 0.08, 0.10, 0.07, 0.03, 0.75, 0.25, 0.85, 0.08, 0.10, 0.12, 0.18, 0.22, 0.30,
+            0.25, 0.25, 0.18,
         ];
 
         // Handler file (API endpoint) — e.g. user_handler.rs
@@ -6943,26 +7011,17 @@ mod tests {
             0.30, 0.25, 0.40, // moderate centrality
             0.50, 0.65, 0.30, // moderate community
             0.80, 0.55, 0.70, 0.60, 0.85, // many complex functions
-            0.45,
-            0.50, 0.45,
+            0.45, 0.50, 0.45,
         ];
         let handler_b = vec![
-            0.45, 0.55, 0.48,
-            0.35, 0.28, 0.38,
-            0.55, 0.60, 0.35,
-            0.75, 0.50, 0.65, 0.55, 0.80,
-            0.50,
-            0.55, 0.50,
+            0.45, 0.55, 0.48, 0.35, 0.28, 0.38, 0.55, 0.60, 0.35, 0.75, 0.50, 0.65, 0.55, 0.80,
+            0.50, 0.55, 0.50,
         ];
 
         // Service/middleware — e.g. auth_service.rs
         let service_a = vec![
-            0.60, 0.70, 0.65,
-            0.55, 0.60, 0.30,
-            0.60, 0.50, 0.55,
-            0.50, 0.45, 0.60, 0.45, 0.65,
-            0.55,
-            0.65, 0.60,
+            0.60, 0.70, 0.65, 0.55, 0.60, 0.30, 0.60, 0.50, 0.55, 0.50, 0.45, 0.60, 0.45, 0.65,
+            0.55, 0.65, 0.60,
         ];
 
         let all_vecs: Vec<(&str, &[f64])> = vec![
@@ -7063,13 +7122,22 @@ mod tests {
             eprintln!("\n--- {} ---", r.name);
             eprintln!("  True twin mean:   {:.4}", true_mean);
             eprintln!("  False twin mean:  {:.4}", false_mean);
-            eprintln!("  Discrimination:   {:.4} (true_mean - false_mean)", discrimination);
-            eprintln!("  Separation gap:   {:.4} (true_min - false_max)", separation);
+            eprintln!(
+                "  Discrimination:   {:.4} (true_mean - false_mean)",
+                discrimination
+            );
+            eprintln!(
+                "  Separation gap:   {:.4} (true_min - false_max)",
+                separation
+            );
             eprintln!("  Overall variance: {:.6}", all_var);
             eprintln!(
                 "  Score range:      [{:.4}, {:.4}]",
                 r.all_scores.iter().cloned().fold(f64::INFINITY, f64::min),
-                r.all_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                r.all_scores
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, f64::max)
             );
 
             if discrimination > best_discrimination {
@@ -7079,7 +7147,10 @@ mod tests {
         }
 
         eprintln!("\n{}", "=".repeat(70));
-        eprintln!("WINNER: {} (discrimination = {:.4})", best_metric, best_discrimination);
+        eprintln!(
+            "WINNER: {} (discrimination = {:.4})",
+            best_metric, best_discrimination
+        );
         eprintln!("{}\n", "=".repeat(70));
 
         // Assertions: all metrics should produce reasonable results

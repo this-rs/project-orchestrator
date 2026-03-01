@@ -616,22 +616,22 @@ pub const FINGERPRINT_DIMS: usize = 17;
 
 /// Human-readable labels for each fingerprint dimension.
 pub const FINGERPRINT_LABELS: [&str; FINGERPRINT_DIMS] = [
-    "imports_in_pct",        // d0: popularity as dependency (log-percentile)
-    "imports_out_pct",       // d1: dependency on others (log-percentile)
-    "calls_in_pct",          // d2: incoming calls / API surface (log-percentile)
-    "calls_out_pct",         // d3: outgoing calls / orchestration (log-percentile)
-    "pagerank_pct",          // d4: global graph importance (log-percentile)
-    "betweenness_pct",       // d5: bridge/bottleneck role (linear percentile)
-    "clustering_coeff",      // d6: local clique degree (raw 0-1)
-    "function_count_pct",    // d7: functional size (log-percentile)
-    "type_count_pct",        // d8: type richness (linear percentile)
-    "avg_complexity_pct",    // d9: cyclomatic complexity (linear percentile)
-    "ratio_public",          // d10: public function ratio (raw 0-1)
-    "ratio_async",           // d11: async function ratio (raw 0-1)
-    "fan_ratio",             // d12: in / (in+out) — consumer vs producer
-    "co_changer_count_pct",  // d13: temporal coupling (linear percentile)
-    "community_role",        // d14: hub(0.0) / bridge(0.5) / peripheral(1.0)
-    "neighbor_type_entropy", // d15: Shannon entropy of neighbor node types
+    "imports_in_pct",          // d0: popularity as dependency (log-percentile)
+    "imports_out_pct",         // d1: dependency on others (log-percentile)
+    "calls_in_pct",            // d2: incoming calls / API surface (log-percentile)
+    "calls_out_pct",           // d3: outgoing calls / orchestration (log-percentile)
+    "pagerank_pct",            // d4: global graph importance (log-percentile)
+    "betweenness_pct",         // d5: bridge/bottleneck role (linear percentile)
+    "clustering_coeff",        // d6: local clique degree (raw 0-1)
+    "function_count_pct",      // d7: functional size (log-percentile)
+    "type_count_pct",          // d8: type richness (linear percentile)
+    "avg_complexity_pct",      // d9: cyclomatic complexity (linear percentile)
+    "ratio_public",            // d10: public function ratio (raw 0-1)
+    "ratio_async",             // d11: async function ratio (raw 0-1)
+    "fan_ratio",               // d12: in / (in+out) — consumer vs producer
+    "co_changer_count_pct",    // d13: temporal coupling (linear percentile)
+    "community_role",          // d14: hub(0.0) / bridge(0.5) / peripheral(1.0)
+    "neighbor_type_entropy",   // d15: Shannon entropy of neighbor node types
     "neighbor_degree_entropy", // d16: Shannon entropy of neighbor degrees (struc2vec-inspired)
 ];
 
