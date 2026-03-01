@@ -566,6 +566,10 @@ pub struct ImpactAnalysis {
     /// Ranked view of all affected files with margins and natural clusters (Plan 10).
     /// Direct files score 1.0, transitive-only files score 0.33.
     pub ranked_affected: RankedList<AffectedFile>,
+    /// Pre-computed context cards for directly affected files (Plan 8).
+    /// Each card contains PageRank, betweenness, DNA, WL hash, co-changers, etc.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_cards: Vec<crate::graph::models::ContextCard>,
 }
 
 /// Analyze impact of changing a file or function
@@ -833,6 +837,18 @@ pub async fn analyze_impact(
         decisions
     };
 
+    // Batch-read context cards for directly affected files (best-effort)
+    let context_cards = if let Some(ref pid) = project_id {
+        state
+            .orchestrator
+            .neo4j()
+            .get_context_cards_batch(&directly_affected, &pid.to_string())
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     // Build ranked view: direct files score 1.0, transitive-only score 0.33
     let ranked_affected = {
         let mut scored: Vec<(AffectedFile, f64)> = Vec::new();
@@ -865,6 +881,7 @@ pub async fn analyze_impact(
         risk_formula,
         affecting_decisions,
         ranked_affected,
+        context_cards,
     }))
 }
 
