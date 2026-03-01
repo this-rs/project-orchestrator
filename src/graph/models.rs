@@ -697,6 +697,100 @@ pub enum ComputeMode {
 }
 
 // ============================================================================
+// Margin Ranking — Universal relative ranking (Plan 10 / GraIL)
+// ============================================================================
+
+/// Confidence level of a ranking position, based on the margin to the
+/// next/previous item. Inspired by GraIL's MarginRankingLoss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RankConfidence {
+    /// Margin > 0.2 — strong separation from neighbors
+    High,
+    /// 0.05 < margin ≤ 0.2 — moderate separation
+    Medium,
+    /// 0.0 < margin ≤ 0.05 — nearly tied
+    Low,
+    /// Margin = 0.0 — exact tie
+    Tied,
+}
+
+impl RankConfidence {
+    /// Determine confidence from a margin value.
+    pub fn from_margin(margin: f64) -> Self {
+        if margin <= 0.0 {
+            Self::Tied
+        } else if margin <= 0.05 {
+            Self::Low
+        } else if margin <= 0.2 {
+            Self::Medium
+        } else {
+            Self::High
+        }
+    }
+}
+
+/// A single ranked result with score, position, and margin information.
+///
+/// Generic over T so it can wrap any result type (ImpactedFile, Reference, etc.).
+/// Uses `#[serde(flatten)]` on `item` to maintain JSON retro-compatibility:
+/// existing fields stay at top-level, new ranking fields are added alongside.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedResult<T: Serialize> {
+    /// The ranked item
+    #[serde(flatten)]
+    pub item: T,
+    /// 1-based rank position
+    pub rank: usize,
+    /// Absolute score (higher = more relevant)
+    pub score: f64,
+    /// Score difference to the next-ranked item (None for last)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin_to_next: Option<f64>,
+    /// Score difference to the previous-ranked item (None for first)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin_to_prev: Option<f64>,
+    /// Confidence in this ranking position
+    pub confidence: RankConfidence,
+    /// Breakdown of contributing signals (signal_name, signal_value)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<(String, f64)>,
+}
+
+/// A natural cluster detected by gap analysis in a ranked list.
+///
+/// When scores have significant gaps, items naturally group into clusters
+/// (e.g., "critical", "high", "moderate", "low", "peripheral").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankCluster {
+    /// Start rank (1-based, inclusive)
+    pub start_rank: usize,
+    /// End rank (1-based, inclusive)
+    pub end_rank: usize,
+    /// Average score within this cluster
+    pub avg_score: f64,
+    /// Human-readable label (e.g., "critical", "high", "moderate")
+    pub label: String,
+}
+
+/// A ranked list with metadata: score range, total candidates, and natural clusters.
+///
+/// Wraps `Vec<RankedResult<T>>` with ranking-level metadata. Inspired by
+/// GraIL's MRR/Hits@K metrics and MarginRankingLoss.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedList<T: Serialize> {
+    /// Ranked items, sorted by score descending
+    pub items: Vec<RankedResult<T>>,
+    /// Total number of candidates before any filtering/truncation
+    pub total_candidates: usize,
+    /// Score range: (min_score, max_score)
+    pub score_range: (f64, f64),
+    /// Natural clusters detected by gap analysis
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub natural_clusters: Vec<RankCluster>,
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

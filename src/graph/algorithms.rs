@@ -21,9 +21,12 @@ use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
+
 use super::models::{
     AnalyticsConfig, CodeGraph, CodeHealthReport, ComputeAllResult, ComputeMode, CommunityInfo,
-    ComponentInfo, GrailConfig, GrailStats, GraphAnalytics, NodeMetrics, StepTiming,
+    ComponentInfo, GrailConfig, GrailStats, GraphAnalytics, NodeMetrics, RankCluster,
+    RankConfidence, RankedList, RankedResult, StepTiming,
 };
 
 // ============================================================================
@@ -1302,6 +1305,181 @@ pub fn find_isomorphic_groups(
 }
 
 // ============================================================================
+// Margin Ranking — Universal relative ranking (Plan 10 / GraIL)
+// ============================================================================
+
+/// Returns a human-readable cluster label based on cluster index (0-based).
+///
+/// Labels follow a severity gradient: critical → high → moderate → low → peripheral.
+pub fn cluster_label(index: usize) -> String {
+    match index {
+        0 => "critical".to_string(),
+        1 => "high".to_string(),
+        2 => "moderate".to_string(),
+        3 => "low".to_string(),
+        _ => "peripheral".to_string(),
+    }
+}
+
+/// Detect natural clusters in a sorted (descending) list of scored items.
+///
+/// Uses gap analysis: when the score gap between consecutive items exceeds
+/// `min_gap_ratio × score_range`, a cluster boundary is created.
+///
+/// # Arguments
+/// * `scores` — Items with their scores, **must be sorted descending by score**
+/// * `min_gap_ratio` — Minimum relative gap to trigger a cluster boundary (e.g., 0.15 = 15%)
+///
+/// # Returns
+/// A list of `RankCluster` with 1-based ranks, average scores, and labels.
+pub fn detect_natural_clusters(
+    scores: &[(String, f64)],
+    min_gap_ratio: f64,
+) -> Vec<RankCluster> {
+    if scores.len() < 2 {
+        if scores.len() == 1 {
+            return vec![RankCluster {
+                start_rank: 1,
+                end_rank: 1,
+                avg_score: scores[0].1,
+                label: cluster_label(0),
+            }];
+        }
+        return vec![];
+    }
+
+    let range = scores.first().unwrap().1 - scores.last().unwrap().1;
+    if range <= 0.0 {
+        // All scores are identical → single cluster
+        let avg = scores.iter().map(|s| s.1).sum::<f64>() / scores.len() as f64;
+        return vec![RankCluster {
+            start_rank: 1,
+            end_rank: scores.len(),
+            avg_score: avg,
+            label: cluster_label(0),
+        }];
+    }
+
+    let threshold = min_gap_ratio * range;
+
+    let mut clusters = Vec::new();
+    let mut cluster_start = 0usize;
+
+    for i in 0..scores.len() - 1 {
+        let gap = scores[i].1 - scores[i + 1].1;
+        if gap > threshold {
+            // Close current cluster (1-based ranks)
+            let slice = &scores[cluster_start..=i];
+            let avg = slice.iter().map(|s| s.1).sum::<f64>() / slice.len() as f64;
+            clusters.push(RankCluster {
+                start_rank: cluster_start + 1,
+                end_rank: i + 1,
+                avg_score: avg,
+                label: cluster_label(clusters.len()),
+            });
+            cluster_start = i + 1;
+        }
+    }
+
+    // Close the last cluster
+    let slice = &scores[cluster_start..];
+    let avg = slice.iter().map(|s| s.1).sum::<f64>() / slice.len() as f64;
+    clusters.push(RankCluster {
+        start_rank: cluster_start + 1,
+        end_rank: scores.len(),
+        avg_score: avg,
+        label: cluster_label(clusters.len()),
+    });
+
+    clusters
+}
+
+/// Transform a list of scored items into a `RankedList<T>` with margins,
+/// confidence levels, and natural clusters.
+///
+/// Items are sorted by score descending. For each item, the margin to the
+/// next and previous items is computed, and confidence is derived from the
+/// minimum margin (how "safe" is this ranking position).
+///
+/// # Arguments
+/// * `items` — Vec of (item, score) pairs
+/// * `total_candidates` — Total number of candidates before any filtering
+///
+/// # Performance
+/// O(n log n) for sort + O(n) for margins + O(n) for clusters = O(n log n) total.
+pub fn into_ranked<T: Serialize + Clone>(
+    mut items: Vec<(T, f64)>,
+    total_candidates: usize,
+) -> RankedList<T> {
+    if items.is_empty() {
+        return RankedList {
+            items: vec![],
+            total_candidates,
+            score_range: (0.0, 0.0),
+            natural_clusters: vec![],
+        };
+    }
+
+    // Sort by score descending (stable sort to preserve input order for ties)
+    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let min_score = items.last().unwrap().1;
+    let max_score = items.first().unwrap().1;
+
+    // Build scored labels for cluster detection
+    let scored_labels: Vec<(String, f64)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (_, score))| (format!("item_{}", i), *score))
+        .collect();
+
+    let natural_clusters = detect_natural_clusters(&scored_labels, 0.15);
+
+    // Build ranked results with margins and confidence
+    let n = items.len();
+    let ranked_items: Vec<RankedResult<T>> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, (item, score))| {
+            let margin_to_next = if i + 1 < n {
+                Some(score - scored_labels[i + 1].1)
+            } else {
+                None
+            };
+            let margin_to_prev = if i > 0 {
+                Some(scored_labels[i - 1].1 - score)
+            } else {
+                None
+            };
+
+            // Confidence = based on the minimum margin (weakest separation)
+            let min_margin = match (margin_to_next, margin_to_prev) {
+                (Some(mn), Some(mp)) => mn.min(mp),
+                (Some(m), None) | (None, Some(m)) => m,
+                (None, None) => 0.0,
+            };
+
+            RankedResult {
+                item,
+                rank: i + 1,
+                score,
+                margin_to_next,
+                margin_to_prev,
+                confidence: RankConfidence::from_margin(min_margin),
+                signals: vec![],
+            }
+        })
+        .collect();
+
+    RankedList {
+        items: ranked_items,
+        total_candidates,
+        score_range: (min_score, max_score),
+        natural_clusters,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2241,5 +2419,193 @@ mod tests {
                 comm.id
             );
         }
+    }
+
+    // --- Margin Ranking (Plan 10) ---
+
+    #[test]
+    fn test_cluster_label_gradient() {
+        assert_eq!(cluster_label(0), "critical");
+        assert_eq!(cluster_label(1), "high");
+        assert_eq!(cluster_label(2), "moderate");
+        assert_eq!(cluster_label(3), "low");
+        assert_eq!(cluster_label(4), "peripheral");
+        assert_eq!(cluster_label(99), "peripheral");
+    }
+
+    #[test]
+    fn test_detect_natural_clusters_three_groups() {
+        // Scores: [0.9, 0.85, 0.5, 0.45, 0.1]
+        // Range = 0.8, threshold = 0.15 * 0.8 = 0.12
+        // Gaps: 0.05 (no), 0.35 (yes!), 0.05 (no), 0.35 (yes!)
+        // → 3 clusters: [0.9, 0.85], [0.5, 0.45], [0.1]
+        let scores: Vec<(String, f64)> = vec![
+            ("a".into(), 0.9),
+            ("b".into(), 0.85),
+            ("c".into(), 0.5),
+            ("d".into(), 0.45),
+            ("e".into(), 0.1),
+        ];
+        let clusters = detect_natural_clusters(&scores, 0.15);
+        assert_eq!(clusters.len(), 3, "Expected 3 clusters, got {}", clusters.len());
+
+        // Cluster 1: ranks 1-2, avg ~0.875
+        assert_eq!(clusters[0].start_rank, 1);
+        assert_eq!(clusters[0].end_rank, 2);
+        assert!((clusters[0].avg_score - 0.875).abs() < 0.001);
+        assert_eq!(clusters[0].label, "critical");
+
+        // Cluster 2: ranks 3-4, avg ~0.475
+        assert_eq!(clusters[1].start_rank, 3);
+        assert_eq!(clusters[1].end_rank, 4);
+        assert!((clusters[1].avg_score - 0.475).abs() < 0.001);
+        assert_eq!(clusters[1].label, "high");
+
+        // Cluster 3: rank 5, avg 0.1
+        assert_eq!(clusters[2].start_rank, 5);
+        assert_eq!(clusters[2].end_rank, 5);
+        assert!((clusters[2].avg_score - 0.1).abs() < 0.001);
+        assert_eq!(clusters[2].label, "moderate");
+    }
+
+    #[test]
+    fn test_detect_natural_clusters_single_item() {
+        let scores: Vec<(String, f64)> = vec![("a".into(), 0.5)];
+        let clusters = detect_natural_clusters(&scores, 0.15);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].start_rank, 1);
+        assert_eq!(clusters[0].end_rank, 1);
+    }
+
+    #[test]
+    fn test_detect_natural_clusters_empty() {
+        let scores: Vec<(String, f64)> = vec![];
+        let clusters = detect_natural_clusters(&scores, 0.15);
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn test_detect_natural_clusters_all_equal() {
+        let scores: Vec<(String, f64)> = vec![
+            ("a".into(), 0.5),
+            ("b".into(), 0.5),
+            ("c".into(), 0.5),
+        ];
+        let clusters = detect_natural_clusters(&scores, 0.15);
+        assert_eq!(clusters.len(), 1, "Equal scores → single cluster");
+    }
+
+    #[test]
+    fn test_into_ranked_basic() {
+        // 5 items with varying scores
+        let items: Vec<(String, f64)> = vec![
+            ("c".into(), 0.5),
+            ("a".into(), 0.9),
+            ("e".into(), 0.1),
+            ("b".into(), 0.85),
+            ("d".into(), 0.45),
+        ];
+        let ranked = into_ranked(items, 100);
+
+        assert_eq!(ranked.items.len(), 5);
+        assert_eq!(ranked.total_candidates, 100);
+        assert!((ranked.score_range.0 - 0.1).abs() < 0.001); // min
+        assert!((ranked.score_range.1 - 0.9).abs() < 0.001); // max
+
+        // Verify sorted descending
+        assert_eq!(ranked.items[0].rank, 1);
+        assert_eq!(ranked.items[0].item, "a"); // score 0.9
+        assert_eq!(ranked.items[1].rank, 2);
+        assert_eq!(ranked.items[1].item, "b"); // score 0.85
+        assert_eq!(ranked.items[2].rank, 3);
+        assert_eq!(ranked.items[2].item, "c"); // score 0.5
+        assert_eq!(ranked.items[3].rank, 4);
+        assert_eq!(ranked.items[3].item, "d"); // score 0.45
+        assert_eq!(ranked.items[4].rank, 5);
+        assert_eq!(ranked.items[4].item, "e"); // score 0.1
+
+        // Verify margins
+        let m0 = ranked.items[0].margin_to_next.unwrap();
+        assert!((m0 - 0.05).abs() < 0.001, "margin 0.9→0.85 = 0.05");
+        assert!(ranked.items[0].margin_to_prev.is_none()); // first item
+
+        let m4 = ranked.items[4].margin_to_prev.unwrap();
+        assert!((m4 - 0.35).abs() < 0.001, "margin 0.45→0.1 = 0.35");
+        assert!(ranked.items[4].margin_to_next.is_none()); // last item
+    }
+
+    #[test]
+    fn test_into_ranked_empty() {
+        let items: Vec<(String, f64)> = vec![];
+        let ranked = into_ranked(items, 0);
+        assert!(ranked.items.is_empty());
+        assert!(ranked.natural_clusters.is_empty());
+    }
+
+    #[test]
+    fn test_into_ranked_confidence_levels() {
+        // Item with large margin → High confidence
+        // Item with small margin → Low confidence
+        // Item with zero margin → Tied
+        let items: Vec<(String, f64)> = vec![
+            ("a".into(), 1.0),
+            ("b".into(), 0.5),  // margin_to_prev=0.5 (High), margin_to_next=0.5 (High)
+            ("c".into(), 0.0),
+        ];
+        let ranked = into_ranked(items, 3);
+
+        assert_eq!(ranked.items[0].confidence, RankConfidence::High); // margin_to_next=0.5
+        assert_eq!(ranked.items[1].confidence, RankConfidence::High); // min(0.5, 0.5)=0.5
+        assert_eq!(ranked.items[2].confidence, RankConfidence::High); // margin_to_prev=0.5
+    }
+
+    #[test]
+    fn test_into_ranked_serde_json() {
+        // Note: #[serde(flatten)] requires T to be a struct/map, not a primitive.
+        // Use a simple test struct to verify JSON serialization.
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        struct TestItem {
+            path: String,
+        }
+
+        let items: Vec<(TestItem, f64)> = vec![
+            (TestItem { path: "file_a.rs".into() }, 0.95),
+            (TestItem { path: "file_b.rs".into() }, 0.30),
+        ];
+        let ranked = into_ranked(items, 50);
+        let json = serde_json::to_value(&ranked).unwrap();
+
+        // Verify top-level structure
+        assert!(json["items"].is_array());
+        assert_eq!(json["total_candidates"], 50);
+        assert!(json["score_range"].is_array());
+
+        // Verify first item has ranking fields flattened with item fields
+        let first = &json["items"][0];
+        assert_eq!(first["rank"], 1);
+        assert_eq!(first["score"], 0.95);
+        assert!(first["margin_to_next"].is_number());
+        assert!(first["confidence"].is_string());
+        // Flattened: item fields at top level
+        assert_eq!(first["path"], "file_a.rs");
+    }
+
+    #[test]
+    fn test_into_ranked_performance_1000_items() {
+        // Verify that into_ranked with 1000 items completes quickly
+        let items: Vec<(String, f64)> = (0..1000)
+            .map(|i| (format!("item_{}", i), i as f64 / 1000.0))
+            .collect();
+
+        let start = std::time::Instant::now();
+        let ranked = into_ranked(items, 10000);
+        let elapsed = start.elapsed();
+
+        assert_eq!(ranked.items.len(), 1000);
+        assert!(
+            elapsed.as_millis() < 50,
+            "into_ranked(1000) took {}ms, expected < 50ms",
+            elapsed.as_millis()
+        );
     }
 }
