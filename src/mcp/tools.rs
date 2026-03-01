@@ -777,9 +777,9 @@ fn code_tool() -> ToolDefinition {
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
-                "workspace_slug": {"type": "string", "description": "Workspace slug (search_workspace)"},
-                "project_slug": {"type": "string", "description": "Project slug (search_project/get_communities/get_health/get_node_importance/plan_implementation/get_architecture)"},
-                "file_path": {"type": "string", "description": "File path (get_file_symbols/get_file_dependencies)"},
+                "workspace_slug": {"type": "string", "description": "Workspace slug (search_workspace/find_cross_project_twins)"},
+                "project_slug": {"type": "string", "description": "Project slug (search_project/get_communities/get_health/get_node_importance/plan_implementation/get_architecture/get_context_card/get_fingerprint/find_isomorphic/get_structural_profile/find_structural_twins/cluster_dna/find_bridges/predict_missing_links/stress_test_node/stress_test_edge/stress_test_cascade/refresh_context_cards)"},
+                "file_path": {"type": "string", "description": "File path (get_file_symbols/get_file_dependencies/get_context_card/get_fingerprint/get_structural_profile/find_structural_twins/find_cross_project_twins)"},
                 "symbol": {"type": "string", "description": "Symbol name (find_references)"},
                 "function": {"type": "string", "description": "Function name (get_call_graph)"},
                 "target": {"type": "string", "description": "Target for impact analysis (analyze_impact)"},

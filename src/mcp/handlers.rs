@@ -3172,7 +3172,9 @@ impl ToolHandler {
 
             // ── P8: Context Cards (2 tools) ─────────────────────────────
             "get_context_card" => {
-                let path = extract_string(args, "path")?;
+                let path = extract_string(args, "path")
+                    .or_else(|_| extract_string(args, "file_path"))
+                    .or_else(|_| extract_string(args, "node_path"))?;
                 let project_slug = extract_string(args, "project_slug")?;
                 let query = vec![
                     ("path".to_string(), path),
@@ -3193,7 +3195,9 @@ impl ToolHandler {
 
             // ── P7: WL Fingerprint & Isomorphic (2 tools) ──────────────
             "get_fingerprint" => {
-                let path = extract_string(args, "path")?;
+                let path = extract_string(args, "path")
+                    .or_else(|_| extract_string(args, "file_path"))
+                    .or_else(|_| extract_string(args, "node_path"))?;
                 let project_slug = extract_string(args, "project_slug")?;
                 let query = vec![
                     ("path".to_string(), path),

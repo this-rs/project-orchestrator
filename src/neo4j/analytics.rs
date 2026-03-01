@@ -1432,7 +1432,7 @@ impl Neo4jClient {
         let q = query(
             r#"
             UNWIND $paths AS path
-            MATCH (f:File {path: path})-[:BELONGS_TO]->(:Project {id: $project_id})
+            MATCH (f:File {path: path, project_id: $project_id})
             SET f.cc_version = -1
             WITH f
             OPTIONAL MATCH (f)-[:IMPORTS|CALLS]-(neighbor:File)
@@ -1458,7 +1458,7 @@ impl Neo4jClient {
     ) -> Result<Option<crate::graph::models::ContextCard>> {
         let q = query(
             r#"
-            MATCH (f:File {path: $path})-[:BELONGS_TO]->(:Project {id: $project_id})
+            MATCH (f:File {path: $path, project_id: $project_id})
             WHERE f.cc_version IS NOT NULL
             RETURN f.path AS path,
                    COALESCE(f.cc_pagerank, 0.0) AS cc_pagerank,
@@ -1522,7 +1522,7 @@ impl Neo4jClient {
         let q = query(
             r#"
             UNWIND $paths AS path
-            MATCH (f:File {path: path})-[:BELONGS_TO]->(:Project {id: $project_id})
+            MATCH (f:File {path: path, project_id: $project_id})
             WHERE f.cc_version IS NOT NULL
             RETURN f.path AS path,
                    COALESCE(f.cc_pagerank, 0.0) AS cc_pagerank,
@@ -1582,7 +1582,7 @@ impl Neo4jClient {
     ) -> Result<Vec<crate::graph::models::IsomorphicGroup>> {
         let q = query(
             r#"
-            MATCH (f:File)-[:BELONGS_TO]->(:Project {id: $project_id})
+            MATCH (f:File {project_id: $project_id})
             WHERE f.cc_wl_hash IS NOT NULL AND f.cc_wl_hash <> 0
             WITH f.cc_wl_hash AS wl_hash, COLLECT(f.path) AS members
             WHERE SIZE(members) >= $min_size

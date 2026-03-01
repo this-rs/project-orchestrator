@@ -2901,6 +2901,14 @@ pub async fn get_structural_profile(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
+    // Resolve relative path to absolute
+    let resolved_path = if !body.file_path.starts_with('/') {
+        let expanded = crate::expand_tilde(&project.root_path);
+        format!("{}/{}", expanded.trim_end_matches('/'), &body.file_path)
+    } else {
+        body.file_path.clone()
+    };
+
     let all_dna = state
         .orchestrator
         .neo4j()
@@ -2910,7 +2918,7 @@ pub async fn get_structural_profile(
     // Find the target file's DNA
     let target_dna = all_dna
         .iter()
-        .find(|(path, _)| path == &body.file_path)
+        .find(|(path, _)| path == &resolved_path)
         .map(|(_, dna)| dna.clone());
 
     match target_dna {
@@ -2948,6 +2956,14 @@ pub async fn find_structural_twins(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
+    // Resolve relative path to absolute
+    let resolved_path = if !body.file_path.starts_with('/') {
+        let expanded = crate::expand_tilde(&project.root_path);
+        format!("{}/{}", expanded.trim_end_matches('/'), &body.file_path)
+    } else {
+        body.file_path.clone()
+    };
+
     let all_dna = state
         .orchestrator
         .neo4j()
@@ -2966,7 +2982,7 @@ pub async fn find_structural_twins(
     // Build HashMap for find_structural_twins
     let dna_map: std::collections::HashMap<String, Vec<f64>> = all_dna.into_iter().collect();
 
-    let target_dna = match dna_map.get(&body.file_path) {
+    let target_dna = match dna_map.get(&resolved_path) {
         Some(dna) => dna,
         None => {
             return Ok(Json(serde_json::json!({
@@ -3106,6 +3122,14 @@ pub async fn find_cross_project_twins(
             AppError::NotFound(format!("Project '{}' not found", body.source_project_slug))
         })?;
 
+    // Resolve relative path to absolute
+    let resolved_path = if !body.file_path.starts_with('/') {
+        let expanded = crate::expand_tilde(&source_project.root_path);
+        format!("{}/{}", expanded.trim_end_matches('/'), &body.file_path)
+    } else {
+        body.file_path.clone()
+    };
+
     // Get source file DNA
     let source_dna_all = neo4j
         .get_project_structural_dna(&source_project.id.to_string())
@@ -3114,7 +3138,7 @@ pub async fn find_cross_project_twins(
     let source_dna_map: std::collections::HashMap<String, Vec<f64>> =
         source_dna_all.into_iter().collect();
 
-    let source_dna = match source_dna_map.get(&body.file_path) {
+    let source_dna = match source_dna_map.get(&resolved_path) {
         Some(dna) => dna,
         None => {
             return Ok(Json(serde_json::json!({
