@@ -2740,7 +2740,6 @@ mod tests {
     #[test]
     fn test_apply_profile_weights_zeroes_imports() {
         use super::super::models::profile_security;
-        use petgraph::visit::EdgeRef;
 
         let g = build_profile_test_graph();
         // Security profile has IMPORTS=0.4, CALLS=0.9
@@ -2779,7 +2778,6 @@ mod tests {
     #[test]
     fn test_apply_profile_weights_default_for_unknown_edge_type() {
         use super::super::models::{AnalysisProfile, FusionWeights};
-        use petgraph::visit::EdgeRef;
 
         let g = build_profile_test_graph();
         // Profile with NO edge weights — all should use default 0.5
@@ -2816,7 +2814,6 @@ mod tests {
     #[test]
     fn test_compute_all_with_profile_weighted_graph_differs() {
         use super::super::models::{profile_default, profile_security};
-        use petgraph::visit::EdgeRef;
 
         // Verify that apply_profile_weights produces different edge weights
         // for different profiles (which is the precondition for weighted

@@ -911,14 +911,10 @@ pub async fn analyze_impact_v2(
     // Resolve analysis profile (built-in first, then Neo4j)
     let profile = if let Some(ref profile_ref) = query.profile {
         let builtins = crate::graph::models::builtin_profiles();
+        // TODO: fallback to async Neo4j profile lookup when not found in builtins
         builtins
             .into_iter()
             .find(|p| p.name == *profile_ref || p.id == *profile_ref)
-            .or_else(|| {
-                // Blocking lookup not ideal but profiles are cached; alternatively
-                // we could use a separate async call. For now, use the default.
-                None
-            })
     } else {
         None
     };
