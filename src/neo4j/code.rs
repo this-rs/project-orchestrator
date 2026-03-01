@@ -3856,4 +3856,174 @@ impl Neo4jClient {
 
         Ok(total)
     }
+
+    // ========================================================================
+    // Multi-signal impact queries
+    // ========================================================================
+
+    /// Knowledge density for a file: (notes LINKED_TO + decisions AFFECTS) / max across project.
+    /// Returns f64 in [0, 1]. 0.0 if no knowledge exists in the project.
+    pub async fn get_knowledge_density(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> Result<f64> {
+        let q = query(
+            r#"
+            // Count notes + decisions linked to the target file
+            MATCH (f:File {path: $path})<-[:CONTAINS]-(p:Project {id: $project_id})
+            OPTIONAL MATCH (n:Note)-[:LINKED_TO]->(f)
+            WHERE n.status IN ['active', 'needs_review']
+            WITH f, p, count(DISTINCT n) AS note_count
+            OPTIONAL MATCH (d:Decision)-[:AFFECTS]->(f)
+            WHERE d.status IN ['proposed', 'accepted']
+            WITH f, p, note_count + count(DISTINCT d) AS target_count
+
+            // Find max knowledge count across all files in the project
+            OPTIONAL MATCH (p)-[:CONTAINS]->(af:File)
+            OPTIONAL MATCH (an:Note)-[:LINKED_TO]->(af)
+            WHERE an.status IN ['active', 'needs_review']
+            WITH f, target_count, af, count(DISTINCT an) AS af_note_count
+            OPTIONAL MATCH (ad:Decision)-[:AFFECTS]->(af)
+            WHERE ad.status IN ['proposed', 'accepted']
+            WITH target_count, af_note_count + count(DISTINCT ad) AS af_total
+            WITH target_count, max(af_total) AS max_count
+
+            RETURN target_count,
+                   CASE WHEN max_count > 0 THEN toFloat(target_count) / max_count ELSE 0.0 END AS density
+            "#,
+        )
+        .param("path", file_path)
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let density: f64 = row.get("density").unwrap_or(0.0);
+            Ok(density)
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// Read the PageRank score (cc_pagerank) from a File node.
+    /// Falls back to 0.0 if the property is absent or the file doesn't exist.
+    pub async fn get_node_pagerank(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> Result<f64> {
+        let q = query(
+            r#"
+            MATCH (f:File {path: $path})<-[:CONTAINS]-(p:Project {id: $project_id})
+            RETURN coalesce(f.cc_pagerank, 0.0) AS pagerank
+            "#,
+        )
+        .param("path", file_path)
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let pr: f64 = row.get("pagerank").unwrap_or(0.0);
+            Ok(pr)
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// Bridge proximity: for the top-10 co-changers of a file, compute
+    /// 1.0 / shortestPath_length as a proximity score.
+    /// Returns Vec<(path, score)> sorted by score descending.
+    pub async fn get_bridge_proximity(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> Result<Vec<(String, f64)>> {
+        let q = query(
+            r#"
+            // Get top-10 co-changers
+            MATCH (f:File {path: $path})<-[:CONTAINS]-(p:Project {id: $project_id})
+            MATCH (f)-[r:CO_CHANGED]-(co:File)
+            WHERE EXISTS { MATCH (co)<-[:CONTAINS]-(p) }
+            WITH f, co ORDER BY r.count DESC LIMIT 10
+
+            // For each co-changer, find shortest structural path (IMPORTS|CALLS between files)
+            OPTIONAL MATCH sp = shortestPath((f)-[:IMPORTS|CALLS*1..5]-(co))
+            WITH co.path AS co_path,
+                 CASE WHEN sp IS NOT NULL THEN 1.0 / length(sp) ELSE 0.0 END AS proximity
+            RETURN co_path, proximity
+            ORDER BY proximity DESC
+            "#,
+        )
+        .param("path", file_path)
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut scores = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let path: String = row.get("co_path")?;
+            let score: f64 = row.get("proximity").unwrap_or(0.0);
+            scores.push((path, score));
+        }
+
+        Ok(scores)
+    }
+
+    /// Compute average multi-signal impact score for top-10 files by PageRank.
+    /// Single Cypher query that approximates the 5-signal fusion:
+    ///   structural (normalized degree), co_change (churn_score), knowledge (knowledge_density),
+    ///   pagerank (cc_pagerank normalized), bridge (cc_betweenness normalized).
+    /// Default weights: structural=0.35, co_change=0.25, knowledge=0.15, pagerank=0.10, bridge=0.15
+    pub async fn get_avg_multi_signal_score(
+        &self,
+        project_id: impl Into<String>,
+    ) -> Result<f64> {
+        let project_id = project_id.into();
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.cc_pagerank IS NOT NULL
+            WITH collect(f) AS all_files,
+                 max(f.cc_pagerank) AS max_pr,
+                 max(f.cc_betweenness) AS max_bt
+            // No GDS data → return 0
+            WITH all_files, max_pr, max_bt
+            WHERE size(all_files) > 0
+            UNWIND all_files AS f
+            WITH f, max_pr, max_bt
+            ORDER BY f.cc_pagerank DESC LIMIT 10
+
+            // Count structural connections (IMPORTS in/out)
+            OPTIONAL MATCH (f)-[:IMPORTS]->(imp_out:File)
+            WITH f, max_pr, max_bt, count(DISTINCT imp_out) AS out_deg
+            OPTIONAL MATCH (imp_in:File)-[:IMPORTS]->(f)
+            WITH f, max_pr, max_bt, out_deg + count(DISTINCT imp_in) AS total_degree
+
+            // Normalize each signal to 0-1
+            WITH f, max_pr, max_bt,
+                 CASE WHEN total_degree >= 20 THEN 1.0
+                      ELSE toFloat(total_degree) / 20.0 END AS structural,
+                 coalesce(f.churn_score, 0.0) AS co_change,
+                 coalesce(f.knowledge_density, 0.0) AS knowledge,
+                 CASE WHEN max_pr > 0 THEN toFloat(f.cc_pagerank) / max_pr ELSE 0.0 END AS pagerank,
+                 CASE WHEN max_bt > 0 THEN toFloat(f.cc_betweenness) / max_bt ELSE 0.0 END AS bridge
+
+            // Weighted fusion (default profile weights)
+            WITH (0.35 * structural + 0.25 * co_change + 0.15 * knowledge
+                  + 0.10 * pagerank + 0.15 * bridge) AS combined
+
+            RETURN avg(combined) AS avg_score
+            "#,
+        )
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+
+        if let Some(row) = result.next().await? {
+            let score: f64 = row.get("avg_score").unwrap_or(0.0);
+            Ok(score)
+        } else {
+            Ok(0.0)
+        }
+    }
 }

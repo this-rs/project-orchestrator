@@ -2330,6 +2330,37 @@ impl GraphStore for Neo4jClient {
         self.delete_analysis_profile(id).await
     }
 
+    async fn get_knowledge_density(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> anyhow::Result<f64> {
+        self.get_knowledge_density(file_path, project_id).await
+    }
+
+    async fn get_node_pagerank(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> anyhow::Result<f64> {
+        self.get_node_pagerank(file_path, project_id).await
+    }
+
+    async fn get_bridge_proximity(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<(String, f64)>> {
+        self.get_bridge_proximity(file_path, project_id).await
+    }
+
+    async fn get_avg_multi_signal_score(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<f64> {
+        self.get_avg_multi_signal_score(project_id).await
+    }
+
     async fn health_check(&self) -> anyhow::Result<bool> {
         match self.execute("RETURN 1 AS ping").await {
             Ok(_) => Ok(true),

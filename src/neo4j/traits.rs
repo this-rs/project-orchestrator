@@ -2016,6 +2016,44 @@ pub trait GraphStore: Send + Sync {
     async fn delete_analysis_profile(&self, id: &str) -> Result<()>;
 
     // ========================================================================
+    // Multi-signal impact queries
+    // ========================================================================
+
+    /// Get the knowledge density for a file: count of notes LINKED_TO + decisions AFFECTS,
+    /// normalized by max count across all files in the project. Returns f64 in [0, 1].
+    async fn get_knowledge_density(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> Result<f64>;
+
+    /// Get the PageRank score for a file node.
+    /// Reads the `cc_pagerank` property set by GDS projection. Falls back to 0.0.
+    async fn get_node_pagerank(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> Result<f64>;
+
+    /// Get bridge proximity scores for a file's top co-changers.
+    /// For each co-changer, computes 1.0 / shortestPath distance to the target.
+    /// Returns Vec<(path, score)> sorted by score descending.
+    async fn get_bridge_proximity(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> Result<Vec<(String, f64)>>;
+
+    /// Compute the average multi-signal impact score across the top-10 files
+    /// by PageRank. Uses GDS properties (pagerank, betweenness, churn_score,
+    /// knowledge_density) to approximate the 5-signal fusion in a single query.
+    /// Returns 0.0 if no files have GDS metrics computed.
+    async fn get_avg_multi_signal_score(
+        &self,
+        project_id: Uuid,
+    ) -> Result<f64>;
+
+    // ========================================================================
     // Health check
     // ========================================================================
 

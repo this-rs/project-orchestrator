@@ -2526,15 +2526,36 @@ impl ToolHandler {
             // --- Analysis (3) ---
             "analyze_impact" => {
                 let target = extract_string(args, "target")?;
-                let mut query = vec![("target".to_string(), target)];
-                if let Some(v) = args.get("target_type").and_then(|v| v.as_str()) {
-                    query.push(("target_type".to_string(), v.to_string()));
+                // multi=true → use multi-signal fusion endpoint (Plan 4)
+                let use_multi = args
+                    .get("multi")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if use_multi {
+                    let mut query = vec![("target".to_string(), target)];
+                    // project_slug is required for multi-signal
+                    if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                        query.push(("project_slug".to_string(), v.to_string()));
+                    }
+                    if let Some(v) = args.get("profile").and_then(|v| v.as_str()) {
+                        query.push(("profile".to_string(), v.to_string()));
+                    }
+                    let result = http.get_with_query("/api/code/impact/multi", &query).await?;
+                    Ok(Some(result))
+                } else {
+                    let mut query = vec![("target".to_string(), target)];
+                    if let Some(v) = args.get("target_type").and_then(|v| v.as_str()) {
+                        query.push(("target_type".to_string(), v.to_string()));
+                    }
+                    if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
+                        query.push(("project_slug".to_string(), v.to_string()));
+                    }
+                    if let Some(v) = args.get("profile").and_then(|v| v.as_str()) {
+                        query.push(("profile".to_string(), v.to_string()));
+                    }
+                    let result = http.get_with_query("/api/code/impact", &query).await?;
+                    Ok(Some(result))
                 }
-                if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
-                    query.push(("project_slug".to_string(), v.to_string()));
-                }
-                let result = http.get_with_query("/api/code/impact", &query).await?;
-                Ok(Some(result))
             }
 
             "get_architecture" => {

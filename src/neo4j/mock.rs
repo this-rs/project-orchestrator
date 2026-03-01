@@ -6905,6 +6905,55 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
+    // Multi-signal impact queries
+    // ========================================================================
+
+    async fn get_knowledge_density(
+        &self,
+        file_path: &str,
+        _project_id: &str,
+    ) -> anyhow::Result<f64> {
+        // In mock: count notes linked to this file path via anchors
+        let notes = self.notes.read().await;
+        let count = notes
+            .values()
+            .filter(|n| {
+                n.anchors.iter().any(|a| {
+                    a.entity_type == crate::notes::EntityType::File && a.entity_id == file_path
+                })
+            })
+            .count();
+        // Simple normalization: max 10 => density 1.0
+        Ok((count as f64 / 10.0).min(1.0))
+    }
+
+    async fn get_node_pagerank(
+        &self,
+        _file_path: &str,
+        _project_id: &str,
+    ) -> anyhow::Result<f64> {
+        // Mock: return 0.0 (no GDS in tests)
+        Ok(0.0)
+    }
+
+    async fn get_bridge_proximity(
+        &self,
+        _file_path: &str,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<(String, f64)>> {
+        // Mock: return empty (no graph traversal in tests)
+        Ok(Vec::new())
+    }
+
+    async fn get_avg_multi_signal_score(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<f64> {
+        // Mock: no GDS metrics in tests, return 0.0
+        Ok(0.0)
+    }
+
+    // ========================================================================
     // Skill operations (Neural Skills)
     // ========================================================================
 

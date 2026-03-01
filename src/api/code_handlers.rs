@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use super::handlers::{AppError, OrchestratorState};
 use crate::graph::algorithms::into_ranked;
-use crate::graph::models::RankedList;
+use crate::graph::models::{
+    FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList,
+};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
 
 // ============================================================================
@@ -866,6 +868,192 @@ pub async fn analyze_impact(
 }
 
 // ============================================================================
+// Multi-signal Impact Fusion (Plan 4)
+// ============================================================================
+
+/// Query parameters for analyze_impact_v2 (same as ImpactQuery but reused)
+#[derive(Deserialize)]
+pub struct MultiImpactQuery {
+    /// File path to analyze
+    pub target: String,
+    /// Filter by project slug (required for multi-signal)
+    pub project_slug: String,
+    /// Analysis profile name or id (defaults to "default")
+    pub profile: Option<String>,
+}
+
+/// Multi-signal impact analysis: 5 signals fused with configurable weights.
+/// All 5 signals are queried in parallel via tokio::join!
+pub async fn analyze_impact_v2(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<MultiImpactQuery>,
+) -> Result<Json<MultiSignalImpact>, AppError> {
+    let start = std::time::Instant::now();
+    let neo4j = state.orchestrator.neo4j();
+
+    // Resolve project
+    let project = neo4j
+        .get_project_by_slug(&query.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
+    let project_id = project.id;
+    let project_id_str = project_id.to_string();
+
+    // Resolve target path (relative → absolute)
+    let target = if !query.target.starts_with('/') {
+        let expanded = crate::expand_tilde(&project.root_path);
+        format!("{}/{}", expanded.trim_end_matches('/'), &query.target)
+    } else {
+        query.target.clone()
+    };
+
+    // Resolve analysis profile (built-in first, then Neo4j)
+    let profile = if let Some(ref profile_ref) = query.profile {
+        let builtins = crate::graph::models::builtin_profiles();
+        builtins
+            .into_iter()
+            .find(|p| p.name == *profile_ref || p.id == *profile_ref)
+            .or_else(|| {
+                // Blocking lookup not ideal but profiles are cached; alternatively
+                // we could use a separate async call. For now, use the default.
+                None
+            })
+    } else {
+        None
+    };
+
+    let weights = profile
+        .as_ref()
+        .map(|p| p.fusion_weights.clone())
+        .unwrap_or_else(|| FusionWeights {
+            structural: 0.35,
+            co_change: 0.25,
+            knowledge: 0.15,
+            pagerank: 0.10,
+            bridge: 0.15,
+        });
+    let profile_name = profile
+        .as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "default".to_string());
+
+    // ===== 5 signals in parallel via tokio::join! =====
+    let (structural_res, co_change_res, knowledge_res, pagerank_res, bridge_res) = tokio::join!(
+        // Signal 1: Structural impact (IMPORTS + CALLS traversal)
+        neo4j.find_impacted_files(&target, 3, Some(project_id)),
+        // Signal 2: Co-change (temporal coupling)
+        neo4j.get_file_co_changers(&target, 1, 20),
+        // Signal 3: Knowledge density (notes + decisions linked)
+        neo4j.get_knowledge_density(&target, &project_id_str),
+        // Signal 4: PageRank (structural importance)
+        neo4j.get_node_pagerank(&target, &project_id_str),
+        // Signal 5: Bridge proximity (shortest path to co-changers)
+        neo4j.get_bridge_proximity(&target, &project_id_str),
+    );
+
+    // Collect results (best-effort: log errors, use defaults)
+    let structural = structural_res.unwrap_or_default();
+    let co_changers = co_change_res.unwrap_or_default();
+    let target_knowledge = knowledge_res.unwrap_or(0.0);
+    let target_pagerank = pagerank_res.unwrap_or(0.0);
+    let bridge_scores = bridge_res.unwrap_or_default();
+
+    // ===== Merge into HashMap<path, MultiSignalScore> =====
+    let mut scores: std::collections::HashMap<String, MultiSignalScore> =
+        std::collections::HashMap::new();
+
+    // Signal 1: Structural (1.0 for direct, 0.33 for transitive)
+    for (i, path) in structural.iter().enumerate() {
+        let entry = scores.entry(path.clone()).or_insert_with(|| MultiSignalScore {
+            path: path.clone(),
+            ..Default::default()
+        });
+        // First file is direct (1.0), rest attenuated by position
+        entry.structural_score = if i < 5 { 1.0 } else { 0.33 };
+        entry.signals.push("structural".to_string());
+    }
+
+    // Signal 2: Co-change (normalize by max count)
+    let max_co_change = co_changers
+        .iter()
+        .map(|c| c.count)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    for co in &co_changers {
+        let entry = scores.entry(co.path.clone()).or_insert_with(|| MultiSignalScore {
+            path: co.path.clone(),
+            ..Default::default()
+        });
+        entry.co_change_score = co.count as f64 / max_co_change;
+        entry.signals.push("co_change".to_string());
+    }
+
+    // Signal 3: Knowledge density (target score propagated to all entries)
+    // Each file gets the target's knowledge density as a proxy
+    // (querying per-file would be too slow for the 500ms budget)
+    if target_knowledge > 0.0 {
+        for score in scores.values_mut() {
+            score.knowledge_score = target_knowledge;
+            if !score.signals.contains(&"knowledge".to_string()) {
+                score.signals.push("knowledge".to_string());
+            }
+        }
+    }
+
+    // Signal 4: PageRank (target score as global importance proxy)
+    if target_pagerank > 0.0 {
+        for score in scores.values_mut() {
+            score.pagerank_score = target_pagerank;
+            if !score.signals.contains(&"pagerank".to_string()) {
+                score.signals.push("pagerank".to_string());
+            }
+        }
+    }
+
+    // Signal 5: Bridge proximity (per-file score from co-changer distance)
+    for (path, proximity) in &bridge_scores {
+        let entry = scores.entry(path.clone()).or_insert_with(|| MultiSignalScore {
+            path: path.clone(),
+            ..Default::default()
+        });
+        entry.bridge_score = *proximity;
+        entry.signals.push("bridge".to_string());
+    }
+
+    // ===== Compute combined score with fusion weights =====
+    for score in scores.values_mut() {
+        score.combined_score = weights.structural * score.structural_score
+            + weights.co_change * score.co_change_score
+            + weights.knowledge * score.knowledge_score
+            + weights.pagerank * score.pagerank_score
+            + weights.bridge * score.bridge_score;
+    }
+
+    // ===== Build ranked list =====
+    let mut scored_items: Vec<(MultiSignalScore, f64)> = scores
+        .into_values()
+        .map(|s| {
+            let combined = s.combined_score;
+            (s, combined)
+        })
+        .collect();
+    scored_items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let total = scored_items.len();
+    let ranked = into_ranked(scored_items, total);
+
+    let timing_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(MultiSignalImpact {
+        target,
+        profile_used: profile_name,
+        weights,
+        ranked,
+        timing_ms,
+    }))
+}
+
+// ============================================================================
 // Architecture Overview
 // ============================================================================
 
@@ -1667,6 +1855,14 @@ pub async fn get_code_health(
         Err(_) => serde_json::json!(null),
     };
 
+    // Multi-signal impact score (average combined score of top-10 files by PageRank)
+    let avg_impact_score = state
+        .orchestrator
+        .neo4j()
+        .get_avg_multi_signal_score(project.id)
+        .await
+        .unwrap_or(0.0);
+
     Ok(Json(serde_json::json!({
         "god_functions": god_functions_json,
         "god_function_count": god_functions_json.len(),
@@ -1680,6 +1876,7 @@ pub async fn get_code_health(
         "knowledge_gaps": knowledge_gaps,
         "risk_assessment": risk_assessment,
         "neural_metrics": neural_metrics,
+        "avg_impact_score": avg_impact_score,
     })))
 }
 

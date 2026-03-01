@@ -1007,6 +1007,46 @@ pub struct RankedList<T: Serialize> {
 }
 
 // ============================================================================
+// Multi-signal Impact Fusion (Plan 4)
+// ============================================================================
+
+/// Individual file score with 5 signal components for multi-signal impact fusion.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MultiSignalScore {
+    /// File path
+    pub path: String,
+    /// Structural impact score (from IMPORTS + CALLS traversal, 1.0/distance)
+    pub structural_score: f64,
+    /// Co-change score (temporal coupling frequency, normalized)
+    pub co_change_score: f64,
+    /// Knowledge density score (notes + decisions linked to this file, [0,1])
+    pub knowledge_score: f64,
+    /// PageRank importance score (from GDS projection)
+    pub pagerank_score: f64,
+    /// Bridge proximity score (1.0/shortest_path_distance to co-changers)
+    pub bridge_score: f64,
+    /// Weighted combined score (using FusionWeights from profile)
+    pub combined_score: f64,
+    /// Which signals contributed (non-zero) to this score
+    pub signals: Vec<String>,
+}
+
+/// Full multi-signal impact analysis response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiSignalImpact {
+    /// The target file/function being analyzed
+    pub target: String,
+    /// Analysis profile used for weighting
+    pub profile_used: String,
+    /// Fusion weights applied
+    pub weights: FusionWeights,
+    /// Ranked list of impacted files with per-signal scores
+    pub ranked: RankedList<MultiSignalScore>,
+    /// Execution timing in milliseconds
+    pub timing_ms: u64,
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
