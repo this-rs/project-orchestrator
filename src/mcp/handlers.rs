@@ -292,6 +292,11 @@ impl ToolHandler {
             ("code", "get_knowledge_gaps") => "get_knowledge_gaps",
             ("code", "get_risk_assessment") => "get_risk_assessment",
             ("code", "get_bridge") => "get_bridge",
+            ("code", "check_topology") => "check_topology",
+            ("code", "create_topology_rule") => "create_topology_rule",
+            ("code", "list_topology_rules") => "list_topology_rules",
+            ("code", "delete_topology_rule") => "delete_topology_rule",
+            ("code", "check_file_topology") => "check_file_topology",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -3018,6 +3023,69 @@ impl ToolHandler {
                     query.push(("top_bottlenecks".to_string(), v.to_string()));
                 }
                 let result = http.get_with_query("/api/code/bridge", &query).await?;
+                Ok(Some(result))
+            }
+
+            // Topological Firewall (GraIL Plan 3)
+            "check_topology" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![("project_slug".to_string(), project_slug)];
+                let result = http
+                    .get_with_query("/api/code/topology/check", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_topology_rules" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![("project_slug".to_string(), project_slug)];
+                let result = http
+                    .get_with_query("/api/code/topology/rules", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "create_topology_rule" => {
+                let body = serde_json::json!({
+                    "project_slug": extract_string(args, "project_slug")?,
+                    "rule_type": extract_string(args, "rule_type")?,
+                    "source_pattern": extract_string(args, "source_pattern")?,
+                    "target_pattern": args.get("target_pattern").and_then(|v| v.as_str()),
+                    "threshold": args.get("threshold").and_then(|v| v.as_u64()).map(|v| v as u32),
+                    "severity": args.get("severity").and_then(|v| v.as_str()),
+                    "description": extract_string(args, "description")?,
+                });
+                let result = http.post("/api/code/topology/rules", &body).await?;
+                Ok(Some(result))
+            }
+
+            "delete_topology_rule" => {
+                let rule_id = extract_string(args, "rule_id")?;
+                let result = http
+                    .delete(&format!("/api/code/topology/rules/{}", rule_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "check_file_topology" => {
+                let mut body = serde_json::Map::new();
+                body.insert(
+                    "project_slug".to_string(),
+                    json!(extract_string(args, "project_slug")?),
+                );
+                body.insert(
+                    "file_path".to_string(),
+                    json!(extract_string(args, "file_path")?),
+                );
+                let new_imports = args
+                    .get("new_imports")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                body.insert("new_imports".to_string(), json!(new_imports));
+                let result = http
+                    .post("/api/code/topology/check-file", &json!(body))
+                    .await?;
                 Ok(Some(result))
             }
 

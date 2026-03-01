@@ -1866,6 +1866,28 @@ pub async fn get_code_health(
         .await
         .unwrap_or(0.0);
 
+    // Topology violations (best-effort — returns null if no rules defined)
+    let topology_violations = match state
+        .orchestrator
+        .neo4j()
+        .check_topology_rules(&project.id.to_string())
+        .await
+    {
+        Ok(violations) => {
+            let errors = violations
+                .iter()
+                .filter(|v| v.severity == crate::graph::models::TopologySeverity::Error)
+                .count();
+            let warnings = violations.len() - errors;
+            serde_json::json!({
+                "errors": errors,
+                "warnings": warnings,
+                "total": violations.len(),
+            })
+        }
+        Err(_) => serde_json::json!(null),
+    };
+
     Ok(Json(serde_json::json!({
         "god_functions": god_functions_json,
         "god_function_count": god_functions_json.len(),
@@ -1880,6 +1902,7 @@ pub async fn get_code_health(
         "risk_assessment": risk_assessment,
         "neural_metrics": neural_metrics,
         "avg_impact_score": avg_impact_score,
+        "topology_violations": topology_violations,
     })))
 }
 
@@ -2632,6 +2655,205 @@ pub async fn get_bridge(
     });
 
     Ok(Json(result))
+}
+
+// ============================================================================
+// Topological Firewall (Plan 3 — GraIL)
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct TopologyCheckQuery {
+    /// Project slug (required for scoping)
+    pub project_slug: String,
+}
+
+/// GET /api/code/topology/check — Check all topology rules for violations.
+///
+/// Returns a `TopologyCheckResult` with all violations found, sorted by
+/// violation_score descending (most dangerous first).
+pub async fn check_topology(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<TopologyCheckQuery>,
+) -> Result<Json<crate::graph::models::TopologyCheckResult>, AppError> {
+    let start = std::time::Instant::now();
+    let neo4j = state.orchestrator.neo4j();
+
+    // Resolve project
+    let project = neo4j
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", params.project_slug)))?;
+    let project_id_str = project.id.to_string();
+
+    // Count rules
+    let rules = neo4j.list_topology_rules(&project_id_str).await?;
+    let rules_checked = rules.len();
+
+    // Check all rules
+    let violations = neo4j.check_topology_rules(&project_id_str).await?;
+
+    let error_count = violations
+        .iter()
+        .filter(|v| v.severity == crate::graph::models::TopologySeverity::Error)
+        .count();
+    let warning_count = violations
+        .iter()
+        .filter(|v| v.severity == crate::graph::models::TopologySeverity::Warning)
+        .count();
+
+    let timing_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(crate::graph::models::TopologyCheckResult {
+        project_id: project_id_str,
+        rules_checked,
+        violations,
+        error_count,
+        warning_count,
+        timing_ms,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct TopologyRulesQuery {
+    /// Project slug (required for scoping)
+    pub project_slug: String,
+}
+
+/// GET /api/code/topology/rules — List all topology rules for a project.
+pub async fn list_topology_rules(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<TopologyRulesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    let project = neo4j
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", params.project_slug)))?;
+
+    let rules = neo4j.list_topology_rules(&project.id.to_string()).await?;
+
+    Ok(Json(serde_json::json!({
+        "rules": rules,
+        "total": rules.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTopologyRuleBody {
+    /// Project slug
+    pub project_slug: String,
+    /// Rule type: must_not_import, must_not_call, max_distance, max_fan_out, no_circular
+    pub rule_type: String,
+    /// Glob pattern for source files (e.g. "src/neo4j/**")
+    pub source_pattern: String,
+    /// Glob pattern for target files (e.g. "src/api/**") — optional for MaxFanOut, NoCircular
+    pub target_pattern: Option<String>,
+    /// Numeric threshold (for MaxDistance, MaxFanOut)
+    pub threshold: Option<u32>,
+    /// Severity: "error" or "warning" (default: "error")
+    pub severity: Option<String>,
+    /// Human-readable description
+    pub description: String,
+}
+
+/// POST /api/code/topology/rules — Create a new topology rule.
+pub async fn create_topology_rule(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<CreateTopologyRuleBody>,
+) -> Result<Json<crate::graph::models::TopologyRule>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    let project = neo4j
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", body.project_slug)))?;
+
+    let rule_type = crate::graph::models::TopologyRuleType::from_str_loose(&body.rule_type)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Invalid rule_type: {}. Valid: must_not_import, must_not_call, max_distance, max_fan_out, no_circular",
+                body.rule_type
+            ))
+        })?;
+
+    let severity = body
+        .severity
+        .as_deref()
+        .map(crate::graph::models::TopologySeverity::from_str_loose)
+        .unwrap_or(Some(crate::graph::models::TopologySeverity::Error))
+        .ok_or_else(|| {
+            AppError::BadRequest("Invalid severity. Valid: error, warning".to_string())
+        })?;
+
+    let rule = crate::graph::models::TopologyRule {
+        id: uuid::Uuid::new_v4().to_string(),
+        project_id: project.id.to_string(),
+        rule_type,
+        source_pattern: body.source_pattern,
+        target_pattern: body.target_pattern,
+        threshold: body.threshold,
+        severity,
+        description: body.description,
+    };
+
+    neo4j.create_topology_rule(&rule).await?;
+
+    Ok(Json(rule))
+}
+
+/// DELETE /api/code/topology/rules/:rule_id — Delete a topology rule.
+pub async fn delete_topology_rule(
+    State(state): State<OrchestratorState>,
+    Path(rule_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    neo4j.delete_topology_rule(&rule_id).await?;
+    Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+// ============================================================================
+// Topology: Single-file check (real-time pre-write validation)
+// ============================================================================
+
+/// Request body for checking a single file's imports against topology rules.
+#[derive(Deserialize)]
+pub struct CheckFileTopologyBody {
+    pub project_slug: String,
+    pub file_path: String,
+    pub new_imports: Vec<String>,
+}
+
+/// POST /api/code/topology/check-file
+///
+/// Real-time pre-write validation: checks if the given `new_imports` for
+/// `file_path` would violate any MustNotImport/MustNotCall topology rules.
+/// Designed for <50ms response time (in-memory regex matching after 1 Neo4j query).
+pub async fn check_file_topology(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<CheckFileTopologyBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
+        })?;
+
+    let violations = state
+        .orchestrator
+        .neo4j()
+        .check_file_topology(&project.id.to_string(), &body.file_path, &body.new_imports)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "file_path": body.file_path,
+        "violations": violations,
+        "violation_count": violations.len(),
+        "has_violations": !violations.is_empty(),
+    })))
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
 
 use crate::graph::models::{
     AnalysisProfile, FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate,
+    TopologyRule, TopologyViolation,
 };
 use crate::neo4j::models::*;
 use crate::notes::{
@@ -2065,6 +2066,48 @@ pub trait GraphStore: Send + Sync {
     /// knowledge_density) to approximate the 5-signal fusion in a single query.
     /// Returns 0.0 if no files have GDS metrics computed.
     async fn get_avg_multi_signal_score(&self, project_id: Uuid) -> Result<f64>;
+
+    // ========================================================================
+    // Topology Firewall (GraIL Plan 3)
+    // ========================================================================
+
+    /// Create a topology rule.
+    ///
+    /// Stores the rule as a `TopologyRule` node in Neo4j with the given
+    /// project_id, rule_type, source/target patterns, threshold, and severity.
+    async fn create_topology_rule(&self, rule: &TopologyRule) -> Result<()>;
+
+    /// List all topology rules for a project.
+    async fn list_topology_rules(&self, project_id: &str) -> Result<Vec<TopologyRule>>;
+
+    /// Delete a topology rule by id.
+    async fn delete_topology_rule(&self, rule_id: &str) -> Result<()>;
+
+    /// Check all topology rules for a project and return violations.
+    ///
+    /// Iterates over all rules for the project and runs type-specific Cypher
+    /// queries to detect violations:
+    /// - `MustNotImport`: files matching source_pattern that IMPORTS files matching target_pattern
+    /// - `MustNotCall`: functions matching source_pattern that CALLS functions matching target_pattern
+    /// - `MaxFanOut`: files matching source_pattern with more than threshold IMPORTS
+    /// - `NoCircular`: circular import chains (depth 2..6) among files matching source_pattern
+    /// - `MaxDistance`: shortest path between source and target patterns >= threshold
+    async fn check_topology_rules(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<TopologyViolation>>;
+
+    /// Check if a specific file's new imports would violate any topology rules.
+    ///
+    /// Designed for real-time pre-write validation (<50ms target).
+    /// Only checks `MustNotImport` rules where `file_path` matches the source pattern
+    /// and any of `new_imports` matches the target pattern.
+    async fn check_file_topology(
+        &self,
+        project_id: &str,
+        file_path: &str,
+        new_imports: &[String],
+    ) -> Result<Vec<TopologyViolation>>;
 
     // ========================================================================
     // Health check

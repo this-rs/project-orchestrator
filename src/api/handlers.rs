@@ -964,6 +964,7 @@ pub async fn sync_directory(
 
         // Spawn auto-anchor in background: link notes to newly synced files
         let neo4j = state.orchestrator.neo4j_arc();
+        let neo4j_topo = neo4j.clone();
         tokio::spawn(async move {
             match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
                 .await
@@ -979,6 +980,37 @@ pub async fn sync_directory(
                 Ok(_) => {} // no new anchors needed
                 Err(e) => {
                     tracing::warn!(%pid, "Post-sync auto-anchor failed: {}", e);
+                }
+            }
+        });
+
+        // Spawn topology firewall check in background: detect violations and create gotcha notes
+        tokio::spawn(async move {
+            match crate::orchestrator::topology_hook::check_topology_post_sync(neo4j_topo, pid)
+                .await
+            {
+                Ok(r) if r.notes_created > 0 => {
+                    tracing::info!(
+                        %pid,
+                        violations = r.violations_found,
+                        new_notes = r.notes_created,
+                        skipped = r.already_captured,
+                        "Post-sync topology check: {} violations, {} new gotcha notes",
+                        r.violations_found,
+                        r.notes_created,
+                    );
+                }
+                Ok(r) if r.violations_found > 0 => {
+                    tracing::debug!(
+                        %pid,
+                        violations = r.violations_found,
+                        "Post-sync topology check: {} violations (all already captured)",
+                        r.violations_found,
+                    );
+                }
+                Ok(_) => {} // no violations
+                Err(e) => {
+                    tracing::warn!(%pid, "Post-sync topology check failed: {}", e);
                 }
             }
         });

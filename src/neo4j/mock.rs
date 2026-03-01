@@ -130,6 +130,9 @@ pub struct MockGraphStore {
 
     // Analysis profiles (keyed by profile id String)
     pub analysis_profiles: RwLock<HashMap<String, crate::graph::models::AnalysisProfile>>,
+
+    // Topology rules (keyed by rule id String)
+    pub topology_rules: RwLock<HashMap<String, crate::graph::models::TopologyRule>>,
 }
 
 #[allow(dead_code)]
@@ -205,6 +208,7 @@ impl MockGraphStore {
             skills: RwLock::new(HashMap::new()),
             skill_members: RwLock::new(HashMap::new()),
             analysis_profiles: RwLock::new(HashMap::new()),
+            topology_rules: RwLock::new(HashMap::new()),
         }
     }
 
@@ -6835,6 +6839,116 @@ impl GraphStore for MockGraphStore {
 
     async fn delete_project_processes(&self, _project_id: Uuid) -> anyhow::Result<u64> {
         Ok(0)
+    }
+
+    // ========================================================================
+    // Topology Firewall operations
+    // ========================================================================
+
+    async fn create_topology_rule(
+        &self,
+        rule: &crate::graph::models::TopologyRule,
+    ) -> anyhow::Result<()> {
+        let mut rules = self.topology_rules.write().await;
+        rules.insert(rule.id.clone(), rule.clone());
+        Ok(())
+    }
+
+    async fn list_topology_rules(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyRule>> {
+        let rules = self.topology_rules.read().await;
+        let mut result: Vec<_> = rules
+            .values()
+            .filter(|r| r.project_id == project_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| {
+            a.rule_type
+                .to_string()
+                .cmp(&b.rule_type.to_string())
+                .then(a.source_pattern.cmp(&b.source_pattern))
+        });
+        Ok(result)
+    }
+
+    async fn delete_topology_rule(&self, rule_id: &str) -> anyhow::Result<()> {
+        let mut rules = self.topology_rules.write().await;
+        rules.remove(rule_id);
+        Ok(())
+    }
+
+    async fn check_topology_rules(
+        &self,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyViolation>> {
+        // Mock: no graph traversal, return empty violations
+        Ok(Vec::new())
+    }
+
+    async fn check_file_topology(
+        &self,
+        project_id: &str,
+        file_path: &str,
+        new_imports: &[String],
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyViolation>> {
+        use crate::graph::models::{
+            glob_to_regex, TopologyRuleType, TopologySeverity, TopologyViolation,
+        };
+
+        if new_imports.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rules = self.topology_rules.read().await;
+        let mut violations = Vec::new();
+
+        for rule in rules.values() {
+            if rule.project_id != project_id {
+                continue;
+            }
+            if !matches!(
+                rule.rule_type,
+                TopologyRuleType::MustNotImport | TopologyRuleType::MustNotCall
+            ) {
+                continue;
+            }
+
+            let source_re = regex::Regex::new(&glob_to_regex(&rule.source_pattern))
+                .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+            if !source_re.is_match(file_path) {
+                continue;
+            }
+
+            let target_pattern = rule.target_pattern.as_deref().unwrap_or("**");
+            let target_re = regex::Regex::new(&glob_to_regex(target_pattern))
+                .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+
+            for import_path in new_imports {
+                if target_re.is_match(import_path) {
+                    let severity_weight = match rule.severity {
+                        TopologySeverity::Error => 1.0,
+                        TopologySeverity::Warning => 0.5,
+                    };
+                    violations.push(TopologyViolation {
+                        rule_id: rule.id.clone(),
+                        rule_description: rule.description.clone(),
+                        rule_type: rule.rule_type.clone(),
+                        violator_path: file_path.to_string(),
+                        target_path: Some(import_path.clone()),
+                        severity: rule.severity.clone(),
+                        details: format!(
+                            "{} would import {} which violates rule: {}",
+                            file_path, import_path, rule.description
+                        ),
+                        violation_score: severity_weight,
+                    });
+                }
+            }
+        }
+
+        Ok(violations)
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {

@@ -2369,6 +2369,45 @@ impl GraphStore for Neo4jClient {
         self.get_avg_multi_signal_score(project_id).await
     }
 
+    // ========================================================================
+    // Topology Firewall (delegates to neo4j/topology.rs)
+    // ========================================================================
+
+    async fn create_topology_rule(
+        &self,
+        rule: &crate::graph::models::TopologyRule,
+    ) -> anyhow::Result<()> {
+        self.create_topology_rule(rule).await
+    }
+
+    async fn list_topology_rules(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyRule>> {
+        self.list_topology_rules(project_id).await
+    }
+
+    async fn delete_topology_rule(&self, rule_id: &str) -> anyhow::Result<()> {
+        self.delete_topology_rule(rule_id).await
+    }
+
+    async fn check_topology_rules(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyViolation>> {
+        self.check_topology_rules(project_id).await
+    }
+
+    async fn check_file_topology(
+        &self,
+        project_id: &str,
+        file_path: &str,
+        new_imports: &[String],
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyViolation>> {
+        self.check_file_topology(project_id, file_path, new_imports)
+            .await
+    }
+
     async fn health_check(&self) -> anyhow::Result<bool> {
         match self.execute("RETURN 1 AS ping").await {
             Ok(_) => Ok(true),

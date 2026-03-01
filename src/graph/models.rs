@@ -1040,6 +1040,213 @@ pub struct RankedList<T: Serialize> {
 }
 
 // ============================================================================
+// Topological Firewall — topology rules & violations (Plan 3 GraIL)
+// ============================================================================
+
+/// Type of topological rule, inspired by GraIL negative triples.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyRuleType {
+    /// Source files must not import target files (layer separation)
+    MustNotImport,
+    /// Source functions must not call target functions
+    MustNotCall,
+    /// Shortest path between source and target must be >= threshold
+    MaxDistance,
+    /// No file matching the pattern may have more than threshold imports
+    MaxFanOut,
+    /// No circular imports within the matching files
+    NoCircular,
+}
+
+impl std::fmt::Display for TopologyRuleType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MustNotImport => write!(f, "must_not_import"),
+            Self::MustNotCall => write!(f, "must_not_call"),
+            Self::MaxDistance => write!(f, "max_distance"),
+            Self::MaxFanOut => write!(f, "max_fan_out"),
+            Self::NoCircular => write!(f, "no_circular"),
+        }
+    }
+}
+
+impl TopologyRuleType {
+    /// Parse from string (case-insensitive).
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "must_not_import" | "mustnotimport" => Some(Self::MustNotImport),
+            "must_not_call" | "mustnotcall" => Some(Self::MustNotCall),
+            "max_distance" | "maxdistance" => Some(Self::MaxDistance),
+            "max_fan_out" | "maxfanout" => Some(Self::MaxFanOut),
+            "no_circular" | "nocircular" => Some(Self::NoCircular),
+            _ => None,
+        }
+    }
+}
+
+/// Severity level of a topology rule violation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologySeverity {
+    /// Hard constraint — must be fixed
+    Error,
+    /// Soft constraint — should be reviewed
+    Warning,
+}
+
+impl std::fmt::Display for TopologySeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Error => write!(f, "error"),
+            Self::Warning => write!(f, "warning"),
+        }
+    }
+}
+
+impl TopologySeverity {
+    /// Parse from string (case-insensitive).
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "error" => Some(Self::Error),
+            "warning" => Some(Self::Warning),
+            _ => None,
+        }
+    }
+}
+
+/// A topological constraint rule stored in the knowledge graph.
+///
+/// Inspired by GraIL's negative triples — encodes relationships that
+/// SHOULD NOT exist in the graph (architectural boundaries).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyRule {
+    /// Unique identifier (UUID)
+    pub id: String,
+    /// Project scope
+    pub project_id: String,
+    /// Type of rule
+    pub rule_type: TopologyRuleType,
+    /// Glob pattern for source files/functions (e.g. "src/neo4j/**")
+    pub source_pattern: String,
+    /// Glob pattern for target files/functions (e.g. "src/api/**")
+    /// Not used for MaxFanOut and NoCircular
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pattern: Option<String>,
+    /// Numeric threshold (for MaxDistance, MaxFanOut)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
+    /// Severity level
+    pub severity: TopologySeverity,
+    /// Human-readable description of the rule
+    pub description: String,
+}
+
+/// A violation detected by the topological firewall.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyViolation {
+    /// The rule that was violated
+    pub rule_id: String,
+    /// Human-readable description of the rule
+    pub rule_description: String,
+    /// Rule type
+    pub rule_type: TopologyRuleType,
+    /// The file/function that violates the rule
+    pub violator_path: String,
+    /// The target involved (if applicable)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    /// Severity level
+    pub severity: TopologySeverity,
+    /// Additional details about the violation
+    pub details: String,
+    /// Violation score: structural_plausibility × forbidden_weight
+    /// High score = dangerous (structurally tempting but architecturally forbidden)
+    #[serde(default)]
+    pub violation_score: f64,
+}
+
+/// Result of a topology check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyCheckResult {
+    /// Project ID checked
+    pub project_id: String,
+    /// Number of rules checked
+    pub rules_checked: usize,
+    /// All violations found, sorted by violation_score descending
+    pub violations: Vec<TopologyViolation>,
+    /// Count of error-level violations
+    pub error_count: usize,
+    /// Count of warning-level violations
+    pub warning_count: usize,
+    /// Execution time in milliseconds
+    pub timing_ms: u64,
+}
+
+/// Convert a glob pattern to a regex pattern suitable for Neo4j.
+///
+/// Supports:
+/// - `**` → `.*` (match any depth)
+/// - `*` → `[^/]*` (match within one directory level)
+/// - `.` → `\\.` (literal dot)
+/// - `?` → `.` (single character)
+///
+/// # Examples
+/// ```
+/// use project_orchestrator::graph::models::glob_to_regex;
+/// assert_eq!(glob_to_regex("src/neo4j/**"), "^src/neo4j/.*$");
+/// assert_eq!(glob_to_regex("src/*.rs"), "^src/[^/]*\\.rs$");
+/// assert_eq!(glob_to_regex("src/api/?.rs"), "^src/api/.\\.rs$");
+/// ```
+pub fn glob_to_regex(pattern: &str) -> String {
+    let mut regex = String::with_capacity(pattern.len() * 2 + 2);
+    regex.push('^');
+
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    // ** → match any depth
+                    regex.push_str(".*");
+                    i += 2;
+                    // Skip trailing slash after **
+                    if i < chars.len() && chars[i] == '/' {
+                        // .* already matches the slash
+                        i += 1;
+                    }
+                } else {
+                    // * → match within one directory level
+                    regex.push_str("[^/]*");
+                    i += 1;
+                }
+            }
+            '?' => {
+                regex.push('.');
+                i += 1;
+            }
+            '.' => {
+                regex.push_str("\\.");
+                i += 1;
+            }
+            '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                regex.push('\\');
+                regex.push(chars[i]);
+                i += 1;
+            }
+            c => {
+                regex.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    regex.push('$');
+    regex
+}
+
+// ============================================================================
 // Bridge Subgraph — raw Neo4j results (Plan 1 GraIL)
 // ============================================================================
 
@@ -1561,5 +1768,136 @@ mod tests {
         assert!(p.fusion_weights.bridge > p.fusion_weights.knowledge);
         // AFFECTS should be high (architectural decisions)
         assert!(p.edge_weights["AFFECTS"] >= 0.7);
+    }
+
+    // --- Topology Firewall ---
+
+    #[test]
+    fn test_glob_to_regex_double_star() {
+        assert_eq!(glob_to_regex("src/neo4j/**"), "^src/neo4j/.*$");
+    }
+
+    #[test]
+    fn test_glob_to_regex_single_star() {
+        assert_eq!(glob_to_regex("src/*.rs"), "^src/[^/]*\\.rs$");
+    }
+
+    #[test]
+    fn test_glob_to_regex_question_mark() {
+        assert_eq!(glob_to_regex("src/api/?.rs"), "^src/api/.\\.rs$");
+    }
+
+    #[test]
+    fn test_glob_to_regex_nested_double_star() {
+        assert_eq!(glob_to_regex("**/test_*.rs"), "^.*test_[^/]*\\.rs$");
+    }
+
+    #[test]
+    fn test_glob_to_regex_literal_dots() {
+        assert_eq!(glob_to_regex("src/main.rs"), "^src/main\\.rs$");
+    }
+
+    #[test]
+    fn test_glob_to_regex_special_chars() {
+        assert_eq!(glob_to_regex("src/foo+bar.rs"), "^src/foo\\+bar\\.rs$");
+    }
+
+    #[test]
+    fn test_topology_rule_type_display() {
+        assert_eq!(TopologyRuleType::MustNotImport.to_string(), "must_not_import");
+        assert_eq!(TopologyRuleType::MustNotCall.to_string(), "must_not_call");
+        assert_eq!(TopologyRuleType::MaxDistance.to_string(), "max_distance");
+        assert_eq!(TopologyRuleType::MaxFanOut.to_string(), "max_fan_out");
+        assert_eq!(TopologyRuleType::NoCircular.to_string(), "no_circular");
+    }
+
+    #[test]
+    fn test_topology_rule_type_parse() {
+        assert_eq!(
+            TopologyRuleType::from_str_loose("must_not_import"),
+            Some(TopologyRuleType::MustNotImport)
+        );
+        assert_eq!(
+            TopologyRuleType::from_str_loose("MUST_NOT_IMPORT"),
+            Some(TopologyRuleType::MustNotImport)
+        );
+        assert_eq!(
+            TopologyRuleType::from_str_loose("no_circular"),
+            Some(TopologyRuleType::NoCircular)
+        );
+        assert_eq!(TopologyRuleType::from_str_loose("invalid"), None);
+    }
+
+    #[test]
+    fn test_topology_severity_display() {
+        assert_eq!(TopologySeverity::Error.to_string(), "error");
+        assert_eq!(TopologySeverity::Warning.to_string(), "warning");
+    }
+
+    #[test]
+    fn test_topology_severity_parse() {
+        assert_eq!(
+            TopologySeverity::from_str_loose("error"),
+            Some(TopologySeverity::Error)
+        );
+        assert_eq!(
+            TopologySeverity::from_str_loose("WARNING"),
+            Some(TopologySeverity::Warning)
+        );
+        assert_eq!(TopologySeverity::from_str_loose("critical"), None);
+    }
+
+    #[test]
+    fn test_topology_rule_serde_roundtrip() {
+        let rule = TopologyRule {
+            id: "test-id".to_string(),
+            project_id: "proj-1".to_string(),
+            rule_type: TopologyRuleType::MustNotImport,
+            source_pattern: "src/neo4j/**".to_string(),
+            target_pattern: Some("src/api/**".to_string()),
+            threshold: None,
+            severity: TopologySeverity::Error,
+            description: "Neo4j must not import API".to_string(),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let deserialized: TopologyRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, "test-id");
+        assert_eq!(deserialized.rule_type, TopologyRuleType::MustNotImport);
+        assert_eq!(deserialized.target_pattern, Some("src/api/**".to_string()));
+        assert!(deserialized.threshold.is_none());
+    }
+
+    #[test]
+    fn test_topology_violation_serde() {
+        let violation = TopologyViolation {
+            rule_id: "r1".to_string(),
+            rule_description: "No cross-layer imports".to_string(),
+            rule_type: TopologyRuleType::MustNotImport,
+            violator_path: "src/neo4j/client.rs".to_string(),
+            target_path: Some("src/api/routes.rs".to_string()),
+            severity: TopologySeverity::Error,
+            details: "Direct import detected".to_string(),
+            violation_score: 0.85,
+        };
+        let json = serde_json::to_string(&violation).unwrap();
+        let deserialized: TopologyViolation = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.violator_path, "src/neo4j/client.rs");
+        assert!((deserialized.violation_score - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_topology_check_result_serde() {
+        let result = TopologyCheckResult {
+            project_id: "proj-1".to_string(),
+            rules_checked: 5,
+            violations: vec![],
+            error_count: 0,
+            warning_count: 0,
+            timing_ms: 42,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: TopologyCheckResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.rules_checked, 5);
+        assert_eq!(deserialized.timing_ms, 42);
     }
 }

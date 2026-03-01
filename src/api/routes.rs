@@ -584,6 +584,26 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         .route("/api/code/bridge", get(code_handlers::get_bridge))
         // ================================================================
+        // Topological Firewall (GraIL Plan 3)
+        // ================================================================
+        .route(
+            "/api/code/topology/check",
+            get(code_handlers::check_topology),
+        )
+        .route(
+            "/api/code/topology/rules",
+            get(code_handlers::list_topology_rules)
+                .post(code_handlers::create_topology_rule),
+        )
+        .route(
+            "/api/code/topology/rules/{rule_id}",
+            delete(code_handlers::delete_topology_rule),
+        )
+        .route(
+            "/api/code/topology/check-file",
+            post(code_handlers::check_file_topology),
+        )
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(

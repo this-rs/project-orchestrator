@@ -3,6 +3,7 @@
 pub mod context;
 pub mod planner;
 pub mod runner;
+pub mod topology_hook;
 pub mod watcher;
 
 pub use context::ContextBuilder;
