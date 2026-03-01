@@ -733,7 +733,8 @@ impl Orchestrator {
                 Err(e) => {
                     tracing::warn!(
                         "Failed to check context cards for {}: {}, assuming fresh",
-                        project_id, e
+                        project_id,
+                        e
                     );
                 }
             }
