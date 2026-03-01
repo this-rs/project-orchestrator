@@ -1771,6 +1771,7 @@ pub async fn get_code_communities(
                 "label": c.community_label,
                 "size": c.file_count,
                 "key_files": c.key_files,
+                "unique_fingerprints": c.unique_fingerprints,
             })
         })
         .collect();

@@ -355,6 +355,7 @@ impl ToolHandler {
             ("admin", "backfill_discussed") => "backfill_discussed",
             ("admin", "update_fabric_scores") => "update_fabric_scores",
             ("admin", "bootstrap_knowledge_fabric") => "bootstrap_knowledge_fabric",
+            ("admin", "reinforce_isomorphic") => "reinforce_isomorphic",
             ("admin", "detect_skills") => "detect_skills",
             ("admin", "maintain_skills") => "maintain_skills",
             ("admin", "auto_anchor_notes") => "auto_anchor_notes",
@@ -1901,6 +1902,20 @@ impl ToolHandler {
                 let result = http
                     .post(
                         "/api/admin/bootstrap-knowledge-fabric",
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "reinforce_isomorphic" => {
+                let mut body = serde_json::Map::new();
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), Value::String(pid.to_string()));
+                }
+                let result = http
+                    .post(
+                        "/api/admin/reinforce-isomorphic",
                         &Value::Object(body),
                     )
                     .await?;

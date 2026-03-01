@@ -16,10 +16,12 @@ impl Neo4jClient {
             WHERE f.community_id IS NOT NULL
             WITH f.community_id AS cid, f.community_label AS label,
                  count(f) AS file_count,
-                 collect(f.path) AS all_paths
+                 collect(f.path) AS all_paths,
+                 size([x IN collect(DISTINCT f.cc_wl_hash) WHERE x IS NOT NULL AND x <> 0]) AS unique_fps
             ORDER BY file_count DESC
             RETURN cid, label, file_count,
-                   [p IN all_paths | p][..3] AS key_files
+                   [p IN all_paths | p][..3] AS key_files,
+                   unique_fps
             "#,
         )
         .param("pid", project_id.to_string());
@@ -35,11 +37,14 @@ impl Neo4jClient {
             let file_count = row.get::<i64>("file_count").unwrap_or(0) as usize;
             let key_files: Vec<String> = row.get::<Vec<String>>("key_files").unwrap_or_default();
 
+            let unique_fingerprints = row.get::<i64>("unique_fps").unwrap_or(0) as usize;
+
             communities.push(CommunityRow {
                 community_id,
                 community_label,
                 file_count,
                 key_files,
+                unique_fingerprints,
             });
         }
 

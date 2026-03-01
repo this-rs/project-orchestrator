@@ -987,6 +987,8 @@ pub struct CommunityRow {
     pub file_count: usize,
     /// Top files in this community (by pagerank, up to 3)
     pub key_files: Vec<String>,
+    /// Number of unique WL hash fingerprints in this community (structural diversity)
+    pub unique_fingerprints: usize,
 }
 
 /// A "god function" — a function with too many callers/callees.

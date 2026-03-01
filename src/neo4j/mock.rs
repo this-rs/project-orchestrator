@@ -2224,6 +2224,7 @@ impl GraphStore for MockGraphStore {
                     community_label: label,
                     file_count: paths.len(),
                     key_files,
+                    unique_fingerprints: 0,
                 }
             })
             .collect();

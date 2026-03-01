@@ -2120,6 +2120,87 @@ pub async fn bootstrap_knowledge_fabric(
 }
 
 // ============================================================================
+// Isomorphic Synapse Reinforcement
+// ============================================================================
+
+/// POST /api/admin/reinforce-isomorphic — Reinforce synapses between notes linked to
+/// structurally isomorphic files (same WL hash).
+pub async fn reinforce_isomorphic_synapses(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FabricProjectRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    // Verify project exists
+    let _project = state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let neo4j = state.orchestrator.neo4j();
+
+    // Find isomorphic groups (files sharing same WL hash)
+    let groups = neo4j
+        .find_isomorphic_groups(&project_id.to_string(), 2)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let mut total_groups = 0usize;
+    let mut total_synapses_reinforced = 0u64;
+    let synapse_boost = 0.05;
+
+    for group in &groups {
+        // Collect note IDs linked to files in this group
+        let mut note_ids: Vec<uuid::Uuid> = Vec::new();
+        let entity_type = crate::notes::models::EntityType::File;
+        for file_path in &group.members {
+            if let Ok(notes) = neo4j
+                .get_notes_for_entity(&entity_type, file_path)
+                .await
+            {
+                for note in notes {
+                    if !note_ids.contains(&note.id) {
+                        note_ids.push(note.id);
+                    }
+                }
+            }
+        }
+
+        // Reinforce synapses if >= 2 notes
+        if note_ids.len() >= 2 {
+            // Boost energy for each note
+            for nid in &note_ids {
+                let _ = neo4j.boost_energy(*nid, 0.1).await;
+            }
+            // Reinforce synapses between all note pairs
+            match neo4j.reinforce_synapses(&note_ids, synapse_boost).await {
+                Ok(count) => {
+                    total_synapses_reinforced += count as u64;
+                    total_groups += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        wl_hash = group.wl_hash,
+                        error = %e,
+                        "Failed to reinforce synapses for isomorphic group"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "isomorphic_groups_found": groups.len(),
+        "groups_with_notes": total_groups,
+        "synapses_reinforced": total_synapses_reinforced,
+        "synapse_boost": synapse_boost,
+    })))
+}
+
+// ============================================================================
 // Skill Detection
 // ============================================================================
 
