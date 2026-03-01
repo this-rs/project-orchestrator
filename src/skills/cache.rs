@@ -21,6 +21,7 @@ use regex::{Regex, RegexBuilder};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::skills::activation::glob_depth_boost;
 use crate::skills::models::{SkillNode, TriggerType};
 use crate::skills::{MAX_TRIGGER_PATTERN_LEN, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 
@@ -320,9 +321,15 @@ pub fn evaluate_cached_skill(
         };
 
         if matched {
-            // Use the trigger's confidence_threshold as the match confidence.
-            // Higher-confidence triggers produce higher scores when they match.
-            max_confidence = max_confidence.max(*threshold);
+            // Apply depth boost for FileGlob triggers: deeper globs are more specific
+            // → higher effective confidence. Mirrors evaluate_skill_match() in activation.rs.
+            let effective_confidence = match trigger {
+                CompiledTrigger::FileGlob(glob_pat) => {
+                    threshold * glob_depth_boost(glob_pat.as_str())
+                }
+                _ => *threshold,
+            };
+            max_confidence = max_confidence.max(effective_confidence);
         }
     }
 
@@ -548,12 +555,19 @@ mod tests {
         let cached = CachedSkill::from_skill(skill);
 
         let confidence = evaluate_cached_skill(&cached, None, Some("src/api/handlers.rs"));
+        // "src/api/**" has depth=2 → boost=0.85 → effective = 0.5 * 0.85 = 0.425
+        let expected = 0.5 * glob_depth_boost("src/api/**");
         assert!(
             confidence > 0.0,
             "FileGlob should match, got {}",
             confidence
         );
-        assert!((confidence - 0.5).abs() < f64::EPSILON);
+        assert!(
+            (confidence - expected).abs() < f64::EPSILON,
+            "Expected {}, got {}",
+            expected,
+            confidence
+        );
     }
 
     #[test]
@@ -564,9 +578,11 @@ mod tests {
         // FileGlob falls back to pattern when file_context is None,
         // consistent with uncached path in activation.rs
         let confidence = evaluate_cached_skill(&cached, Some("src/api/test.rs"), None);
+        let expected = 0.5 * glob_depth_boost("src/api/**");
         assert!(
-            confidence > 0.0,
-            "FileGlob should match via pattern fallback, got {}",
+            (confidence - expected).abs() < f64::EPSILON,
+            "FileGlob should match via pattern fallback with depth boost, expected {}, got {}",
+            expected,
             confidence
         );
     }

@@ -498,11 +498,26 @@ pub async fn activate_for_hook_cached(
 // Trigger matching (local, no DB calls)
 // ============================================================================
 
+/// Compute a depth-based boost factor for FileGlob matches.
+///
+/// Deeper globs are more specific → higher confidence:
+/// - depth 1 (`src/**`) → 0.7 (shallow, likely broad)
+/// - depth 2 (`src/graph/**`) → 0.85 (moderate specificity)
+/// - depth 3+ (`src/graph/algo/**`) → 1.0 (very specific)
+///
+/// Used by both `evaluate_skill_match` (uncached) and `evaluate_cached_skill` (cached).
+pub(crate) fn glob_depth_boost(glob_pattern: &str) -> f64 {
+    // Count path segments before the wildcard: "src/graph/**" → 2 segments
+    let prefix = glob_pattern.trim_end_matches("/**").trim_end_matches("/*");
+    let depth = prefix.matches('/').count() + 1; // "src" = 1, "src/graph" = 2
+    // Scale: depth=1 → 0.7, depth=2 → 0.85, depth=3+ → 1.0
+    (0.55 + 0.15 * (depth as f64).min(3.0)).min(1.0)
+}
+
 /// Evaluate how well a skill's triggers match the given pattern and file context.
 ///
 /// Returns the highest confidence score across all reliable triggers.
-/// When a trigger matches, its `confidence_threshold` is used as the score
-/// (consistent with the cached path in `cache::evaluate_cached_skill`).
+/// FileGlob matches are boosted by glob depth (deeper = more specific = higher confidence).
 /// Semantic triggers are skipped in the hot path (per architectural decision).
 pub fn evaluate_skill_match(
     skill: &SkillNode,
@@ -521,8 +536,6 @@ pub fn evaluate_skill_match(
                 }
             }
             TriggerType::FileGlob => {
-                // FileGlob can match against file_context (primary)
-                // or pattern (fallback, e.g., Read tool returns file_path as pattern)
                 let target = file_context.or(pattern);
                 if let Some(file) = target {
                     match_file_glob_trigger(&trigger.pattern_value, file)
@@ -531,8 +544,6 @@ pub fn evaluate_skill_match(
                 }
             }
             TriggerType::McpAction => {
-                // McpAction matches the extracted MCP pattern ("mega_tool action ...")
-                // via prefix check on "mega_tool" or "mega_tool action" (colon → space)
                 if let Some(pat) = pattern {
                     match_mcp_action_trigger(&trigger.pattern_value, pat)
                 } else {
@@ -540,16 +551,19 @@ pub fn evaluate_skill_match(
                 }
             }
             TriggerType::Semantic => {
-                // Semantic matching skipped in hot path
-                // (FastEmbed ~20-50ms = 10-25% of 200ms budget)
                 false
             }
         };
 
         if matched {
-            // Use the trigger's confidence_threshold as the match confidence,
-            // consistent with the cached path (cache.rs evaluate_cached_skill).
-            max_confidence = max_confidence.max(trigger.confidence_threshold);
+            let effective_confidence = match trigger.pattern_type {
+                TriggerType::FileGlob => {
+                    // Boost by glob depth: deeper = more specific = higher score
+                    trigger.confidence_threshold * glob_depth_boost(&trigger.pattern_value)
+                }
+                _ => trigger.confidence_threshold,
+            };
+            max_confidence = max_confidence.max(effective_confidence);
         }
     }
 
@@ -1466,7 +1480,10 @@ mod tests {
         skill.trigger_patterns = vec![SkillTrigger::file_glob("src/neo4j/**", 0.8)];
 
         let confidence = evaluate_skill_match(&skill, None, Some("src/neo4j/client.rs"));
-        assert!((confidence - 0.8).abs() < f64::EPSILON); // returns trigger's confidence_threshold
+        // "src/neo4j/**" depth=2 → boost=0.85 → effective = 0.8 * 0.85 = 0.68
+        let expected = 0.8 * glob_depth_boost("src/neo4j/**");
+        assert!((confidence - expected).abs() < f64::EPSILON,
+            "Expected {}, got {}", expected, confidence);
     }
 
     #[test]
@@ -1476,7 +1493,9 @@ mod tests {
 
         // file_context is None, but pattern is a file path (from Read tool)
         let confidence = evaluate_skill_match(&skill, Some("src/neo4j/client.rs"), None);
-        assert!((confidence - 0.8).abs() < f64::EPSILON); // returns trigger's confidence_threshold
+        let expected = 0.8 * glob_depth_boost("src/neo4j/**");
+        assert!((confidence - expected).abs() < f64::EPSILON,
+            "Expected {}, got {}", expected, confidence);
     }
 
     #[test]
@@ -1531,6 +1550,68 @@ mod tests {
         // using `is_matchable()`. But let's confirm the trigger still evaluates.
         let confidence = evaluate_skill_match(&skill, Some("neo4j"), None);
         assert!((confidence - 0.5).abs() < f64::EPSILON); // returns trigger's confidence_threshold
+    }
+
+    // --- Depth boost ---
+
+    #[test]
+    fn test_glob_depth_boost_values() {
+        // depth=1: "src/**" → 0.55 + 0.15*1.0 = 0.70
+        assert!((glob_depth_boost("src/**") - 0.70).abs() < f64::EPSILON);
+        // depth=2: "src/api/**" → 0.55 + 0.15*2.0 = 0.85
+        assert!((glob_depth_boost("src/api/**") - 0.85).abs() < f64::EPSILON);
+        // depth=3: "src/api/v2/**" → 0.55 + 0.15*3.0 = 1.0
+        assert!((glob_depth_boost("src/api/v2/**") - 1.0).abs() < f64::EPSILON);
+        // depth=4: capped at 1.0
+        assert!((glob_depth_boost("src/api/v2/deep/**") - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_specific_glob_beats_generic() {
+        // Two skills with SAME base confidence (0.8), but different glob depths.
+        // The specific skill should score higher than the generic one.
+        let mut generic_skill = SkillNode::new(Uuid::new_v4(), "Broad");
+        generic_skill.trigger_patterns = vec![SkillTrigger::file_glob("src/**", 0.8)];
+
+        let mut specific_skill = SkillNode::new(Uuid::new_v4(), "Specific");
+        specific_skill.trigger_patterns = vec![SkillTrigger::file_glob("src/skills/activation/**", 0.8)];
+
+        let file = "src/skills/activation/hook.rs";
+
+        let generic_score = evaluate_skill_match(&generic_skill, None, Some(file));
+        let specific_score = evaluate_skill_match(&specific_skill, None, Some(file));
+
+        // generic: 0.8 * 0.70 = 0.56 (depth=1)
+        // specific: 0.8 * 1.0 = 0.80 (depth=3)
+        assert!(
+            specific_score > generic_score,
+            "Specific glob ({}) should beat generic glob ({})",
+            specific_score, generic_score
+        );
+
+        // Also verify via cached path (mirror consistency)
+        use crate::skills::cache::{CachedSkill, evaluate_cached_skill};
+        let cached_generic = CachedSkill::from_skill(generic_skill);
+        let cached_specific = CachedSkill::from_skill(specific_skill);
+
+        let cached_generic_score = evaluate_cached_skill(&cached_generic, None, Some(file));
+        let cached_specific_score = evaluate_cached_skill(&cached_specific, None, Some(file));
+
+        assert!(
+            cached_specific_score > cached_generic_score,
+            "Cached: specific ({}) should beat generic ({})",
+            cached_specific_score, cached_generic_score
+        );
+
+        // Verify cached and uncached produce the same scores
+        assert!(
+            (generic_score - cached_generic_score).abs() < f64::EPSILON,
+            "Generic: uncached ({}) != cached ({})", generic_score, cached_generic_score
+        );
+        assert!(
+            (specific_score - cached_specific_score).abs() < f64::EPSILON,
+            "Specific: uncached ({}) != cached ({})", specific_score, cached_specific_score
+        );
     }
 
     // --- Context assembly ---
