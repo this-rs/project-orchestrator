@@ -6833,7 +6833,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_stale_projects_returns_only_stale() {
-        let orch = Orchestrator::new(mock_app_state()).await.unwrap();
+        use crate::neo4j::mock::MockGraphStore;
+        let mock_store = Arc::new(MockGraphStore::new());
+        // The "fresh" project needs context cards to pass the GraIL check
+        mock_store
+            .mock_has_context_cards
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let state = mock_app_state_with_graph(mock_store);
+        let orch = Orchestrator::new(state).await.unwrap();
 
         // Project 1: never computed → stale
         let p1 = test_project_named("stale-project");
