@@ -592,8 +592,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/api/code/topology/rules",
-            get(code_handlers::list_topology_rules)
-                .post(code_handlers::create_topology_rule),
+            get(code_handlers::list_topology_rules).post(code_handlers::create_topology_rule),
         )
         .route(
             "/api/code/topology/rules/{rule_id}",
@@ -648,10 +647,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/stress-test-cascade",
             post(code_handlers::stress_test_cascade),
         )
-        .route(
-            "/api/code/find-bridges",
-            post(code_handlers::find_bridges),
-        )
+        .route("/api/code/find-bridges", post(code_handlers::find_bridges))
         // ================================================================
         // Context Cards (GraIL Plan 8)
         // ================================================================
@@ -666,14 +662,8 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         // WL Fingerprint & Isomorphic Groups (GraIL Plan 7)
         // ================================================================
-        .route(
-            "/api/code/fingerprint",
-            get(code_handlers::get_fingerprint),
-        )
-        .route(
-            "/api/code/isomorphic",
-            get(code_handlers::find_isomorphic),
-        )
+        .route("/api/code/fingerprint", get(code_handlers::get_fingerprint))
+        .route("/api/code/isomorphic", get(code_handlers::find_isomorphic))
         .route(
             "/api/code/structural-templates",
             get(code_handlers::suggest_structural_templates),

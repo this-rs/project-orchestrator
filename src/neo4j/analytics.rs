@@ -697,9 +697,11 @@ impl Neo4jClient {
                     let mut m = std::collections::HashMap::new();
                     m.insert("path".into(), u.path.clone().into());
                     // Convert Vec<f64> to BoltType list
-                    let dna_list: Vec<neo4rs::BoltType> =
-                        u.dna.iter().map(|&v| v.into()).collect();
-                    m.insert("dna".into(), neo4rs::BoltType::List(neo4rs::BoltList::from(dna_list)));
+                    let dna_list: Vec<neo4rs::BoltType> = u.dna.iter().map(|&v| v.into()).collect();
+                    m.insert(
+                        "dna".into(),
+                        neo4rs::BoltType::List(neo4rs::BoltList::from(dna_list)),
+                    );
                     m
                 })
                 .collect();
@@ -806,10 +808,7 @@ impl Neo4jClient {
         let mut dna_list = Vec::new();
 
         while let Some(row) = result.next().await? {
-            if let (Ok(path), Ok(dna)) = (
-                row.get::<String>("path"),
-                row.get::<Vec<f64>>("dna"),
-            ) {
+            if let (Ok(path), Ok(dna)) = (row.get::<String>("path"), row.get::<Vec<f64>>("dna")) {
                 dna_list.push((path, dna));
             }
         }
@@ -1377,8 +1376,7 @@ impl Neo4jClient {
                     m.insert("cc_calls_out".into(), (c.cc_calls_out as i64).into());
                     m.insert("cc_calls_in".into(), (c.cc_calls_in as i64).into());
                     // DNA vector stored as JSON string (nested arrays not supported in UNWIND)
-                    let dna_json =
-                        serde_json::to_string(&c.cc_structural_dna).unwrap_or_default();
+                    let dna_json = serde_json::to_string(&c.cc_structural_dna).unwrap_or_default();
                     m.insert("cc_structural_dna".into(), dna_json.into());
                     m.insert("cc_wl_hash".into(), (c.cc_wl_hash as i64).into());
                     // co_changers stored as JSON string
@@ -1424,17 +1422,12 @@ impl Neo4jClient {
     /// Sets `cc_version = -1` on the target files and any direct neighbor
     /// connected via IMPORTS or CALLS relationships. This ensures stale cards
     /// are recomputed on next analytics run.
-    pub async fn invalidate_context_cards(
-        &self,
-        paths: &[String],
-        project_id: &str,
-    ) -> Result<()> {
+    pub async fn invalidate_context_cards(&self, paths: &[String], project_id: &str) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
 
-        let path_list: Vec<neo4rs::BoltType> =
-            paths.iter().map(|p| p.clone().into()).collect();
+        let path_list: Vec<neo4rs::BoltType> = paths.iter().map(|p| p.clone().into()).collect();
 
         let q = query(
             r#"
@@ -1524,8 +1517,7 @@ impl Neo4jClient {
             return Ok(Vec::new());
         }
 
-        let path_list: Vec<neo4rs::BoltType> =
-            paths.iter().map(|p| p.clone().into()).collect();
+        let path_list: Vec<neo4rs::BoltType> = paths.iter().map(|p| p.clone().into()).collect();
 
         let q = query(
             r#"

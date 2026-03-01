@@ -2856,9 +2856,7 @@ pub async fn check_file_topology(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let violations = state
         .orchestrator
@@ -2901,9 +2899,7 @@ pub async fn get_structural_profile(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let all_dna = state
         .orchestrator
@@ -2950,9 +2946,7 @@ pub async fn find_structural_twins(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let all_dna = state
         .orchestrator
@@ -2970,8 +2964,7 @@ pub async fn find_structural_twins(
     }
 
     // Build HashMap for find_structural_twins
-    let dna_map: std::collections::HashMap<String, Vec<f64>> =
-        all_dna.into_iter().collect();
+    let dna_map: std::collections::HashMap<String, Vec<f64>> = all_dna.into_iter().collect();
 
     let target_dna = match dna_map.get(&body.file_path) {
         Some(dna) => dna,
@@ -3041,9 +3034,7 @@ pub async fn cluster_dna(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let all_dna = state
         .orchestrator
@@ -3059,8 +3050,7 @@ pub async fn cluster_dna(
         })));
     }
 
-    let dna_map: std::collections::HashMap<String, Vec<f64>> =
-        all_dna.into_iter().collect();
+    let dna_map: std::collections::HashMap<String, Vec<f64>> = all_dna.into_iter().collect();
 
     let n_clusters = body.n_clusters.unwrap_or(5).min(dna_map.len());
     let clusters = cluster_dna_vectors(&dna_map, n_clusters);
@@ -3212,9 +3202,7 @@ pub async fn predict_missing_links(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let project_id = project.id.to_string();
 
@@ -3225,8 +3213,7 @@ pub async fn predict_missing_links(
         .get_project_structural_dna(&project_id)
         .await?;
 
-    let dna_map: std::collections::HashMap<String, Vec<f64>> =
-        all_dna.into_iter().collect();
+    let dna_map: std::collections::HashMap<String, Vec<f64>> = all_dna.into_iter().collect();
     let dna_ref = if dna_map.is_empty() {
         None
     } else {
@@ -3278,9 +3265,7 @@ pub async fn check_link_plausibility(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let project_id = project.id.to_string();
 
@@ -3291,8 +3276,7 @@ pub async fn check_link_plausibility(
         .get_project_structural_dna(&project_id)
         .await?;
 
-    let dna_map: std::collections::HashMap<String, Vec<f64>> =
-        all_dna.into_iter().collect();
+    let dna_map: std::collections::HashMap<String, Vec<f64>> = all_dna.into_iter().collect();
     let dna_ref = if dna_map.is_empty() {
         None
     } else {
@@ -3346,9 +3330,7 @@ pub async fn stress_test_node(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
@@ -3387,9 +3369,7 @@ pub async fn stress_test_edge(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
@@ -3429,22 +3409,19 @@ pub async fn stress_test_cascade(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
 
     let max_iterations = body.max_iterations.unwrap_or(10);
 
-    let result =
-        stress_test_cascade(&graph, &body.target_id, max_iterations).ok_or_else(|| {
-            AppError::NotFound(format!(
-                "Target node '{}' not found in graph",
-                body.target_id
-            ))
-        })?;
+    let result = stress_test_cascade(&graph, &body.target_id, max_iterations).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "Target node '{}' not found in graph",
+            body.target_id
+        ))
+    })?;
 
     Ok(Json(serde_json::json!(result)))
 }
@@ -3471,9 +3448,7 @@ pub async fn find_bridges(
         .neo4j()
         .get_project_by_slug(&body.project_slug)
         .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Project '{}' not found", body.project_slug))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
@@ -3712,7 +3687,8 @@ pub async fn suggest_structural_templates(
             {
                 if !card.cc_structural_dna.is_empty() {
                     // Format DNA as compact string: "0.12,0.45,0.78,..."
-                    let dna_str: String = card.cc_structural_dna
+                    let dna_str: String = card
+                        .cc_structural_dna
                         .iter()
                         .map(|v| format!("{:.2}", v))
                         .collect::<Vec<_>>()
@@ -3779,9 +3755,18 @@ fn derive_pattern_description(paths: &[String]) -> String {
     };
 
     match (dir_prefix.is_empty(), common_suffix.is_empty()) {
-        (false, false) => format!("Files in {dir_prefix}/ matching *{common_suffix} ({} files)", paths.len()),
-        (false, true) => format!("Files in {dir_prefix}/ with identical topology ({} files)", paths.len()),
-        (true, false) => format!("Files matching *{common_suffix} with identical topology ({} files)", paths.len()),
+        (false, false) => format!(
+            "Files in {dir_prefix}/ matching *{common_suffix} ({} files)",
+            paths.len()
+        ),
+        (false, true) => format!(
+            "Files in {dir_prefix}/ with identical topology ({} files)",
+            paths.len()
+        ),
+        (true, false) => format!(
+            "Files matching *{common_suffix} with identical topology ({} files)",
+            paths.len()
+        ),
         (true, true) => format!("Structurally identical files ({} files)", paths.len()),
     }
 }

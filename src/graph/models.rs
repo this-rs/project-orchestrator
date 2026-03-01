@@ -2000,7 +2000,10 @@ mod tests {
 
     #[test]
     fn test_topology_rule_type_display() {
-        assert_eq!(TopologyRuleType::MustNotImport.to_string(), "must_not_import");
+        assert_eq!(
+            TopologyRuleType::MustNotImport.to_string(),
+            "must_not_import"
+        );
         assert_eq!(TopologyRuleType::MustNotCall.to_string(), "must_not_call");
         assert_eq!(TopologyRuleType::MaxDistance.to_string(), "max_distance");
         assert_eq!(TopologyRuleType::MaxFanOut.to_string(), "max_fan_out");

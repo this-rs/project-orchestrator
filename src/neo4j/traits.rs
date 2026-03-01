@@ -1831,10 +1831,8 @@ pub trait GraphStore: Send + Sync {
 
     /// Read structural DNA vectors for all File nodes in a project.
     /// Returns (file_path, dna_vector) pairs.
-    async fn get_project_structural_dna(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<(String, Vec<f64>)>>;
+    async fn get_project_structural_dna(&self, project_id: &str)
+        -> Result<Vec<(String, Vec<f64>)>>;
 
     // ========================================================================
     // SYNAPSE (neural connections bridged to file-level)
@@ -2115,10 +2113,7 @@ pub trait GraphStore: Send + Sync {
     /// - `MaxFanOut`: files matching source_pattern with more than threshold IMPORTS
     /// - `NoCircular`: circular import chains (depth 2..6) among files matching source_pattern
     /// - `MaxDistance`: shortest path between source and target patterns >= threshold
-    async fn check_topology_rules(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<TopologyViolation>>;
+    async fn check_topology_rules(&self, project_id: &str) -> Result<Vec<TopologyViolation>>;
 
     /// Check if a specific file's new imports would violate any topology rules.
     ///
@@ -2152,11 +2147,7 @@ pub trait GraphStore: Send + Sync {
 
     /// Invalidate context cards for given file paths + their 1-hop neighbors.
     /// Sets cc_version = -1 on the target files and their direct neighbors.
-    async fn invalidate_context_cards(
-        &self,
-        paths: &[String],
-        project_id: &str,
-    ) -> Result<()>;
+    async fn invalidate_context_cards(&self, paths: &[String], project_id: &str) -> Result<()>;
 
     /// Read a single context card from Neo4j cc_* properties.
     /// Returns None if the file doesn't exist or has no cc_* properties.

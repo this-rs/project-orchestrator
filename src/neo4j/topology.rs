@@ -126,10 +126,7 @@ impl Neo4jClient {
     ///
     /// Dispatches to rule-type-specific Cypher queries.
     /// All queries are scoped by project_id.
-    pub async fn check_topology_rules(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<TopologyViolation>> {
+    pub async fn check_topology_rules(&self, project_id: &str) -> Result<Vec<TopologyViolation>> {
         let rules = self.list_topology_rules(project_id).await?;
         let mut all_violations = Vec::new();
 
@@ -143,15 +140,9 @@ impl Neo4jClient {
                     self.check_must_not_traverse(rule, project_id, "CALLS")
                         .await?
                 }
-                TopologyRuleType::MaxFanOut => {
-                    self.check_max_fan_out(rule, project_id).await?
-                }
-                TopologyRuleType::NoCircular => {
-                    self.check_no_circular(rule, project_id).await?
-                }
-                TopologyRuleType::MaxDistance => {
-                    self.check_max_distance(rule, project_id).await?
-                }
+                TopologyRuleType::MaxFanOut => self.check_max_fan_out(rule, project_id).await?,
+                TopologyRuleType::NoCircular => self.check_no_circular(rule, project_id).await?,
+                TopologyRuleType::MaxDistance => self.check_max_distance(rule, project_id).await?,
             };
             all_violations.extend(violations);
         }

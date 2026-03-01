@@ -213,7 +213,8 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         };
 
         // 6. Compute and persist Context Cards (aggregates analytics + DNA + WL hash)
-        let context_cards = compute_context_cards(&graph, &analytics, &dna_map_for_cards, &wl_hashes);
+        let context_cards =
+            compute_context_cards(&graph, &analytics, &dna_map_for_cards, &wl_hashes);
         if !context_cards.is_empty() {
             if let Err(e) = self.store.batch_save_context_cards(&context_cards).await {
                 tracing::warn!(

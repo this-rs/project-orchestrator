@@ -1915,10 +1915,7 @@ impl ToolHandler {
                     body.insert("project_id".to_string(), Value::String(pid.to_string()));
                 }
                 let result = http
-                    .post(
-                        "/api/admin/reinforce-isomorphic",
-                        &Value::Object(body),
-                    )
+                    .post("/api/admin/reinforce-isomorphic", &Value::Object(body))
                     .await?;
                 Ok(Some(result))
             }
@@ -3153,7 +3150,6 @@ impl ToolHandler {
             }
 
             // ── P5: Stress Testing (4 tools) ──────────────────────────────
-
             "stress_test_node" => {
                 let result = http.post("/api/code/stress-test-node", args).await?;
                 Ok(Some(result))
@@ -3175,7 +3171,6 @@ impl ToolHandler {
             }
 
             // ── P8: Context Cards (2 tools) ─────────────────────────────
-
             "get_context_card" => {
                 let path = extract_string(args, "path")?;
                 let project_slug = extract_string(args, "project_slug")?;
@@ -3192,14 +3187,11 @@ impl ToolHandler {
             "refresh_context_cards" => {
                 let project_slug = extract_string(args, "project_slug")?;
                 let body = serde_json::json!({"project_slug": project_slug});
-                let result = http
-                    .post("/api/code/context-cards/refresh", &body)
-                    .await?;
+                let result = http.post("/api/code/context-cards/refresh", &body).await?;
                 Ok(Some(result))
             }
 
             // ── P7: WL Fingerprint & Isomorphic (2 tools) ──────────────
-
             "get_fingerprint" => {
                 let path = extract_string(args, "path")?;
                 let project_slug = extract_string(args, "project_slug")?;
@@ -3207,9 +3199,7 @@ impl ToolHandler {
                     ("path".to_string(), path),
                     ("project_slug".to_string(), project_slug),
                 ];
-                let result = http
-                    .get_with_query("/api/code/fingerprint", &query)
-                    .await?;
+                let result = http.get_with_query("/api/code/fingerprint", &query).await?;
                 Ok(Some(result))
             }
 
@@ -3219,9 +3209,7 @@ impl ToolHandler {
                 if let Some(v) = args.get("min_group_size").and_then(|v| v.as_i64()) {
                     query.push(("min_group_size".to_string(), v.to_string()));
                 }
-                let result = http
-                    .get_with_query("/api/code/isomorphic", &query)
-                    .await?;
+                let result = http.get_with_query("/api/code/isomorphic", &query).await?;
                 Ok(Some(result))
             }
 
@@ -5496,10 +5484,7 @@ mod tests {
     async fn test_http_find_isomorphic() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle(
-                "find_isomorphic",
-                Some(json!({"project_slug": "my-proj"})),
-            )
+            .handle("find_isomorphic", Some(json!({"project_slug": "my-proj"})))
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");

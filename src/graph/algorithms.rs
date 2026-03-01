@@ -1339,10 +1339,7 @@ pub fn cluster_dna_vectors(
             continue; // Skip empty clusters
         }
 
-        let members: Vec<String> = member_indices
-            .iter()
-            .map(|&i| paths[i].clone())
-            .collect();
+        let members: Vec<String> = member_indices.iter().map(|&i| paths[i].clone()).collect();
 
         // Compute intra-cluster cohesion (average pairwise cosine similarity)
         let cohesion = if members.len() <= 1 {
@@ -1352,11 +1349,16 @@ pub fn cluster_dna_vectors(
             let mut count = 0;
             for i in 0..member_indices.len() {
                 for j in (i + 1)..member_indices.len() {
-                    sum += cosine_similarity(vectors[member_indices[i]], vectors[member_indices[j]]);
+                    sum +=
+                        cosine_similarity(vectors[member_indices[i]], vectors[member_indices[j]]);
                     count += 1;
                 }
             }
-            if count > 0 { sum / count as f64 } else { 1.0 }
+            if count > 0 {
+                sum / count as f64
+            } else {
+                1.0
+            }
         };
 
         let label = infer_cluster_label(&members);
@@ -1378,10 +1380,7 @@ pub fn cluster_dna_vectors(
 
 /// Squared Euclidean distance between two vectors.
 fn squared_euclidean(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum()
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 
 /// Infer a human-readable label for a cluster based on dominant file name patterns.
@@ -2053,10 +2052,7 @@ fn build_undirected<F>(
 where
     F: Fn(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex) -> bool,
 {
-    let mut ug = petgraph::graph::UnGraph::<(), ()>::with_capacity(
-        g.node_count(),
-        g.edge_count(),
-    );
+    let mut ug = petgraph::graph::UnGraph::<(), ()>::with_capacity(g.node_count(), g.edge_count());
     // Add nodes in index order so indices match
     for _ in g.node_indices() {
         ug.add_node(());
@@ -2277,9 +2273,8 @@ pub fn stress_test_cascade(
                 continue;
             }
             // Check if ALL incoming edges come from removed nodes
-            let incoming: Vec<NodeIndex> = g
-                .neighbors_directed(node, Direction::Incoming)
-                .collect();
+            let incoming: Vec<NodeIndex> =
+                g.neighbors_directed(node, Direction::Incoming).collect();
 
             if !incoming.is_empty() && incoming.iter().all(|n| removed.contains(n)) {
                 new_orphans.push(node);
@@ -2501,8 +2496,7 @@ pub fn find_distance_2_3_pairs(graph: &CodeGraph) -> Vec<(NodeIndex, NodeIndex)>
     let mut pairs: HashSet<(usize, usize)> = HashSet::new();
 
     for node in g.node_indices() {
-        let neighbors: HashSet<NodeIndex> =
-            undirected_neighbors(g, node).into_iter().collect();
+        let neighbors: HashSet<NodeIndex> = undirected_neighbors(g, node).into_iter().collect();
 
         // For each neighbor, look at THEIR neighbors (distance 2 from node)
         for &neighbor in &neighbors {
@@ -2719,11 +2713,7 @@ pub fn extract_co_change_data(graph: &CodeGraph) -> HashMap<(String, String), f6
 ///
 /// Uses node types: File→File = IMPORTS, Function→Function = CALLS,
 /// mixed or other = RELATED.
-pub fn infer_relation_type(
-    graph: &CodeGraph,
-    source: NodeIndex,
-    target: NodeIndex,
-) -> String {
+pub fn infer_relation_type(graph: &CodeGraph, source: NodeIndex, target: NodeIndex) -> String {
     use super::models::CodeNodeType;
 
     let source_type = &graph.graph[source].node_type;
@@ -4401,13 +4391,20 @@ mod tests {
             .find(|c| c.members.iter().any(|m| m.contains("handlers")))
             .unwrap();
         assert!(
-            handler_cluster.members.iter().all(|m| m.contains("handlers")),
+            handler_cluster
+                .members
+                .iter()
+                .all(|m| m.contains("handlers")),
             "All handler files should be in the same cluster"
         );
 
         // Cohesion should be high within tight clusters
         for c in &clusters {
-            assert!(c.cohesion > 0.9, "Tight clusters should have high cohesion: {}", c.cohesion);
+            assert!(
+                c.cohesion > 0.9,
+                "Tight clusters should have high cohesion: {}",
+                c.cohesion
+            );
         }
     }
 
@@ -4471,14 +4468,22 @@ mod tests {
             name: "c.rs".to_string(),
             project_id: None,
         });
-        g.add_edge("A", "B", CodeEdge {
-            edge_type: CodeEdgeType::Imports,
-            weight: 1.0,
-        });
-        g.add_edge("B", "C", CodeEdge {
-            edge_type: CodeEdgeType::Imports,
-            weight: 1.0,
-        });
+        g.add_edge(
+            "A",
+            "B",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "B",
+            "C",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
         g
     }
 
@@ -4489,12 +4494,9 @@ mod tests {
         let pairs = find_distance_2_3_pairs(&g);
         assert_eq!(pairs.len(), 1, "Expected exactly 1 distance-2 pair");
         let pair = &pairs[0];
-        let ids: HashSet<String> = [
-            g.graph[pair.0].id.clone(),
-            g.graph[pair.1].id.clone(),
-        ]
-        .into_iter()
-        .collect();
+        let ids: HashSet<String> = [g.graph[pair.0].id.clone(), g.graph[pair.1].id.clone()]
+            .into_iter()
+            .collect();
         assert!(ids.contains("A"), "Pair should contain A");
         assert!(ids.contains("C"), "Pair should contain C");
     }
@@ -4503,10 +4505,14 @@ mod tests {
     fn test_find_distance_2_pairs_triangle_none() {
         // Triangle: A → B → C, A → C → directly connected, no distance-2 pairs
         let mut g = make_chain_abc();
-        g.add_edge("A", "C", CodeEdge {
-            edge_type: CodeEdgeType::Imports,
-            weight: 1.0,
-        });
+        g.add_edge(
+            "A",
+            "C",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
         let pairs = find_distance_2_3_pairs(&g);
         assert!(pairs.is_empty(), "Triangle should have no distance-2 pairs");
     }
@@ -4518,7 +4524,11 @@ mod tests {
         let g = make_star_graph(3);
         let pairs = find_distance_2_3_pairs(&g);
         // 3 leaves → C(3,2) = 3 pairs at distance 2
-        assert_eq!(pairs.len(), 3, "Star with 3 leaves should have 3 distance-2 pairs");
+        assert_eq!(
+            pairs.len(),
+            3,
+            "Star with 3 leaves should have 3 distance-2 pairs"
+        );
     }
 
     #[test]
@@ -4547,7 +4557,10 @@ mod tests {
             project_id: None,
         });
         let pairs = find_distance_2_3_pairs(&g);
-        assert!(pairs.is_empty(), "Disconnected nodes have no distance-2 pairs");
+        assert!(
+            pairs.is_empty(),
+            "Disconnected nodes have no distance-2 pairs"
+        );
     }
 
     #[test]
@@ -4679,9 +4692,16 @@ mod tests {
         let prediction = link_plausibility(&g, a_idx, c_idx, &co_change, None);
         let signal_names: Vec<&str> = prediction.signals.iter().map(|(n, _)| n.as_str()).collect();
 
-        assert_eq!(signal_names, vec![
-            "jaccard", "co_change", "proximity", "adamic_adar", "dna_similarity"
-        ]);
+        assert_eq!(
+            signal_names,
+            vec![
+                "jaccard",
+                "co_change",
+                "proximity",
+                "adamic_adar",
+                "dna_similarity"
+            ]
+        );
     }
 
     #[test]
@@ -4773,7 +4793,11 @@ mod tests {
         let co_change: HashMap<(String, String), f64> = HashMap::new();
 
         let predictions = suggest_missing_links(&g, &co_change, None, 2, 0.0);
-        assert_eq!(predictions.len(), 2, "top_n=2 should limit to 2 predictions");
+        assert_eq!(
+            predictions.len(),
+            2,
+            "top_n=2 should limit to 2 predictions"
+        );
     }
 
     #[test]
@@ -4812,7 +4836,10 @@ mod tests {
     fn test_extract_co_change_data_ignores_other_edges() {
         let g = make_chain_abc(); // Only IMPORTS edges
         let data = extract_co_change_data(&g);
-        assert!(data.is_empty(), "IMPORTS edges should not be extracted as co-change");
+        assert!(
+            data.is_empty(),
+            "IMPORTS edges should not be extracted as co-change"
+        );
     }
 
     // ========================================================================
@@ -4863,9 +4890,30 @@ mod tests {
                 project_id: None,
             });
         }
-        g.add_edge("A", "B", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("B", "C", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("C", "D", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge(
+            "A",
+            "B",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "B",
+            "C",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "C",
+            "D",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
         g
     }
 
@@ -4875,13 +4923,19 @@ mod tests {
     fn test_stress_node_removal_star_center() {
         let g = make_star_stress(4);
         let result = stress_test_node_removal(&g, "center").unwrap();
-        assert_eq!(result.mode, super::super::models::StressTestMode::NodeRemoval);
+        assert_eq!(
+            result.mode,
+            super::super::models::StressTestMode::NodeRemoval
+        );
         assert_eq!(result.target, "center");
         // Removing the center should orphan all 4 leaves
         assert_eq!(result.orphaned_nodes, 4);
         assert_eq!(result.components_before, 1);
         assert_eq!(result.components_after, 4);
-        assert!(result.resilience_score < 0.1, "Resilience should be very low");
+        assert!(
+            result.resilience_score < 0.1,
+            "Resilience should be very low"
+        );
     }
 
     #[test]
@@ -4950,9 +5004,30 @@ mod tests {
                 project_id: None,
             });
         }
-        g.add_edge("A", "B", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("B", "C", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("C", "A", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge(
+            "A",
+            "B",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "B",
+            "C",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "C",
+            "A",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
         let bridges = find_bridges(&g);
         assert!(bridges.is_empty(), "Cycle should have no bridges");
     }
@@ -4982,8 +5057,14 @@ mod tests {
         let result = stress_test_cascade(&g, "A", 10).unwrap();
         assert_eq!(result.mode, super::super::models::StressTestMode::Cascade);
         // A removed → B loses its only incoming → B removed → C removed → D removed
-        assert_eq!(result.blast_radius, 4, "Full cascade should remove all 4 nodes");
-        assert!(result.cascade_depth >= 1, "Should have at least 1 cascade round");
+        assert_eq!(
+            result.blast_radius, 4,
+            "Full cascade should remove all 4 nodes"
+        );
+        assert!(
+            result.cascade_depth >= 1,
+            "Should have at least 1 cascade round"
+        );
     }
 
     #[test]
@@ -5012,7 +5093,7 @@ mod tests {
     #[test]
     fn test_stress_cascade_max_iterations() {
         let g = make_chain_stress(); // A→B→C→D
-        // With max_iterations=1, cascade should stop after 1 round
+                                     // With max_iterations=1, cascade should stop after 1 round
         let result = stress_test_cascade(&g, "A", 1).unwrap();
         assert!(result.cascade_depth <= 1);
     }
@@ -5023,9 +5104,15 @@ mod tests {
     fn test_stress_edge_removal_bridge() {
         let g = make_chain_stress(); // A-B-C-D
         let result = stress_test_edge_removal(&g, "B", "C").unwrap();
-        assert_eq!(result.mode, super::super::models::StressTestMode::EdgeRemoval);
+        assert_eq!(
+            result.mode,
+            super::super::models::StressTestMode::EdgeRemoval
+        );
         // B-C is a bridge in the chain
-        assert_eq!(result.resilience_score, 0.0, "Bridge removal should give 0 resilience");
+        assert_eq!(
+            result.resilience_score, 0.0,
+            "Bridge removal should give 0 resilience"
+        );
         assert!(result.components_after > result.components_before);
         assert_eq!(result.critical_edges.len(), 1);
     }
@@ -5043,11 +5130,35 @@ mod tests {
                 project_id: None,
             });
         }
-        g.add_edge("A", "B", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("B", "C", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("C", "A", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge(
+            "A",
+            "B",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "B",
+            "C",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "C",
+            "A",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
         let result = stress_test_edge_removal(&g, "A", "B").unwrap();
-        assert_eq!(result.resilience_score, 1.0, "Non-bridge should give 1.0 resilience");
+        assert_eq!(
+            result.resilience_score, 1.0,
+            "Non-bridge should give 1.0 resilience"
+        );
         assert_eq!(result.components_before, result.components_after);
         assert!(result.critical_edges.is_empty());
     }
@@ -5065,7 +5176,13 @@ mod tests {
     /// Helper: 5-file graph for context card tests.
     fn make_file_graph_cc() -> CodeGraph {
         let mut g = CodeGraph::new();
-        let files = ["src/main.rs", "src/lib.rs", "src/api/mod.rs", "src/api/handlers.rs", "src/api/routes.rs"];
+        let files = [
+            "src/main.rs",
+            "src/lib.rs",
+            "src/api/mod.rs",
+            "src/api/handlers.rs",
+            "src/api/routes.rs",
+        ];
         for path in &files {
             g.add_node(CodeNode {
                 id: path.to_string(),
@@ -5075,11 +5192,46 @@ mod tests {
                 project_id: None,
             });
         }
-        g.add_edge("src/main.rs", "src/lib.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("src/main.rs", "src/api/mod.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("src/api/mod.rs", "src/api/handlers.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("src/api/mod.rs", "src/api/routes.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
-        g.add_edge("src/api/routes.rs", "src/api/handlers.rs", CodeEdge { edge_type: CodeEdgeType::Imports, weight: 1.0 });
+        g.add_edge(
+            "src/main.rs",
+            "src/lib.rs",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "src/main.rs",
+            "src/api/mod.rs",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "src/api/mod.rs",
+            "src/api/handlers.rs",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "src/api/mod.rs",
+            "src/api/routes.rs",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g.add_edge(
+            "src/api/routes.rs",
+            "src/api/handlers.rs",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
         g
     }
 
@@ -5099,7 +5251,11 @@ mod tests {
 
         // All cards should have positive pagerank (connected graph)
         for card in &cards {
-            assert!(card.cc_pagerank > 0.0, "PageRank should be > 0 for {}", card.path);
+            assert!(
+                card.cc_pagerank > 0.0,
+                "PageRank should be > 0 for {}",
+                card.path
+            );
             assert_eq!(card.cc_version, 1);
             assert!(!card.cc_computed_at.is_empty());
         }
@@ -5107,10 +5263,16 @@ mod tests {
         // Check main.rs has 2 outgoing imports (lib + api/mod) and 0 incoming
         let main_card = cards.iter().find(|c| c.path == "src/main.rs").unwrap();
         assert_eq!(main_card.cc_imports_out, 2, "main.rs should import 2 files");
-        assert_eq!(main_card.cc_imports_in, 0, "main.rs should have 0 importers");
+        assert_eq!(
+            main_card.cc_imports_in, 0,
+            "main.rs should have 0 importers"
+        );
 
         // Check handlers has 0 outgoing and 2 incoming (api/mod + routes)
-        let handlers_card = cards.iter().find(|c| c.path == "src/api/handlers.rs").unwrap();
+        let handlers_card = cards
+            .iter()
+            .find(|c| c.path == "src/api/handlers.rs")
+            .unwrap();
         assert_eq!(handlers_card.cc_imports_out, 0);
         assert_eq!(handlers_card.cc_imports_in, 2);
     }
@@ -5133,10 +5295,14 @@ mod tests {
             name: "my_func".to_string(),
             project_id: None,
         });
-        g.add_edge("src/main.rs", "my_func", CodeEdge {
-            edge_type: CodeEdgeType::Defines,
-            weight: 1.0,
-        });
+        g.add_edge(
+            "src/main.rs",
+            "my_func",
+            CodeEdge {
+                edge_type: CodeEdgeType::Defines,
+                weight: 1.0,
+            },
+        );
 
         use super::super::models::AnalyticsConfig;
         let config = AnalyticsConfig::default();
