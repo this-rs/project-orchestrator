@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Project Orchestrator
 //!
 //! An AI agent orchestrator with:

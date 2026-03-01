@@ -16,7 +16,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **19 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills.
+You have **20 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -36,7 +36,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 19 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `admin`, `skill`
+The 20 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `admin`, `skill`, `analysis_profile`
 
 ## 3. Data Model
 
@@ -432,7 +432,7 @@ Use `code(action: "get_communities", project_slug)` to segment tasks during plan
 Call `chat(action: "add_discussed", session_id, entities)` for every file/function significantly modified or analyzed during the session. This feeds the DISCUSSED relations in the Knowledge Fabric and improves contextual propagation for future sessions.
 "#;
 
-/// Exhaustive reference of all 19 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 20 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
@@ -677,7 +677,7 @@ Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delet
 | delete | `id` (req) | Delete feature graph |
 
 ## code
-Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment
+Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -711,6 +711,12 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | get_hotspots | `project_slug` (req) | Get code hotspots |
 | get_knowledge_gaps | `project_slug` (req) | Get knowledge gaps |
 | get_risk_assessment | `project_slug` (req) | Get risk assessment |
+| get_bridge | `project_slug` (req), `file_path` (req), `max_hops`, `top_bottlenecks` | Get bridge subgraph around a node (bottlenecks, bridge score) |
+| check_topology | `project_slug` (req) | Check all topology rule violations |
+| list_topology_rules | `project_slug` (req) | List topology rules |
+| create_topology_rule | `project_slug` (req), `rule_type` (req: must_not_import/must_not_call/max_distance/max_fan_out/no_circular), `source_pattern`, `target_pattern`, `threshold`, `severity` (error/warning) | Create topology rule |
+| delete_topology_rule | `rule_id` (req) | Delete topology rule |
+| check_file_topology | `project_slug` (req), `file_path` (req), `new_imports` (req, array) | Check if new imports would violate rules |
 
 ## admin
 Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, detect_skills, maintain_skills, install_hooks
@@ -760,6 +766,16 @@ Manage neural skills (emergent knowledge clusters). Actions: list, create, get, 
 | export | `skill_id` (req), `source_project_name` | Export skill package |
 | import | `project_id` (req), `package` (req), `conflict_strategy` (skip/merge/replace) | Import skill package |
 | get_health | `skill_id` (req) | Get skill health metrics |
+
+## analysis_profile
+Manage analysis profiles (edge/fusion weight presets). Actions: list, create, get, delete
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| list | `project_id` | List analysis profiles |
+| create | `name` (req), `project_slug`, `description`, `edge_weights` (object), `fusion_weights` (object) | Create analysis profile |
+| get | `id` (req) | Get analysis profile by UUID |
+| delete | `id` (req) | Delete analysis profile |
 "#;
 
 use anyhow::Result;
@@ -806,7 +822,7 @@ pub struct ToolGroup {
     pub tools: &'static [ToolRef],
 }
 
-/// Static catalog of all 19 MCP mega-tools organized into semantic groups.
+/// Static catalog of all 20 MCP mega-tools organized into semantic groups.
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
@@ -867,7 +883,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Code Exploration & Analytics ────────────────────────────────
     ToolGroup {
         name: "code_exploration",
-        description: "Semantic search, call graph, impact, GDS analytics, inheritance, process, community, risk",
+        description: "Semantic search, call graph, impact, GDS analytics, inheritance, process, community, risk, bridge, topology firewall, analysis profiles",
         keywords: &[
             "code", "function", "fonction", "struct", "file", "fichier", "import", "call", "appel",
             "architecture", "symbol", "symbole", "trait", "impl", "reference", "référence",
@@ -879,11 +895,19 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             "subclass", "hierarchy", "sous-classe",
             "process", "entry point", "processus", "workflow",
             "co-change", "co_change", "cohesion", "enrichment",
+            "bridge", "bottleneck", "topology", "firewall", "rule", "violation",
+            "analysis profile", "edge weight", "fusion weight",
         ],
-        tools: &[ToolRef {
-            name: "code",
-            description: "Explore code (search/search_project/search_workspace/get_file_symbols/find_references/get_file_dependencies/get_call_graph/analyze_impact/get_architecture/find_similar/find_trait_implementations/find_type_traits/get_impl_blocks/get_communities/get_health/get_node_importance/plan_implementation/get_co_change_graph/get_file_co_changers/detect_processes/get_class_hierarchy/find_subclasses/find_interface_implementors/list_processes/get_process/get_entry_points/enrich_communities/get_hotspots/get_knowledge_gaps/get_risk_assessment)",
-        }],
+        tools: &[
+            ToolRef {
+                name: "code",
+                description: "Explore code (search/search_project/search_workspace/get_file_symbols/find_references/get_file_dependencies/get_call_graph/analyze_impact/get_architecture/find_similar/find_trait_implementations/find_type_traits/get_impl_blocks/get_communities/get_health/get_node_importance/plan_implementation/get_co_change_graph/get_file_co_changers/detect_processes/get_class_hierarchy/find_subclasses/find_interface_implementors/list_processes/get_process/get_entry_points/enrich_communities/get_hotspots/get_knowledge_gaps/get_risk_assessment/get_bridge/check_topology/list_topology_rules/create_topology_rule/delete_topology_rule/check_file_topology)",
+            },
+            ToolRef {
+                name: "analysis_profile",
+                description: "Manage analysis profiles (list/create/get/delete) — edge/fusion weight presets for GDS analytics",
+            },
+        ],
     },
     // ── Knowledge / Notes ───────────────────────────────────────────
     ToolGroup {
@@ -1003,7 +1027,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 19 mega-tools).
+/// Must match the MCP tools.rs count (currently 20 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2031,7 +2055,7 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "create""#));
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "link_to_entity""#));
         // Mega-tools section
-        assert!(BASE_SYSTEM_PROMPT.contains("19 mega-tools"));
+        assert!(BASE_SYSTEM_PROMPT.contains("20 mega-tools"));
         assert!(BASE_SYSTEM_PROMPT.contains("Mega-tools"));
     }
 
@@ -2495,11 +2519,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_19_mega_tools() {
+    fn test_tool_groups_cover_all_20_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 19,
-            "TOOL_GROUPS must cover exactly 19 unique mega-tools (got {}). \
+            count, 20,
+            "TOOL_GROUPS must cover exactly 20 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

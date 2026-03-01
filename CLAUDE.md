@@ -28,7 +28,7 @@ For user-facing documentation, see the `docs/` folder:
 - Meilisearch for semantic search across code and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
-- MCP server for Claude Code integration (19 mega-tools)
+- MCP server for Claude Code integration (20 mega-tools)
 - File watcher for auto-syncing changes
 - Authentication system: Google OAuth2, generic OIDC, password login + JWT, deny-by-default middleware
 - Chat WebSocket for real-time conversational AI (migrated from SSE)
@@ -111,7 +111,7 @@ Or use command-line arguments:
 
 ### Available MCP Mega-Tools
 
-The MCP server exposes **19 mega-tools**, each with an `action` parameter to select the operation:
+The MCP server exposes **20 mega-tools**, each with an `action` parameter to select the operation:
 
 | Mega-Tool | Actions | Description |
 |-----------|---------|-------------|
@@ -131,9 +131,10 @@ The MCP server exposes **19 mega-tools**, each with an `action` parameter to sel
 | `component` | 8 | Service topology and dependencies |
 | `chat` | 7 | Chat sessions, messages, delegation |
 | `feature_graph` | 6 | Feature graphs, auto-build from code |
-| `code` | 30 | Code search, call graphs, impact analysis, communities, health, processes |
-| `admin` | 23 | Sync, watch, Knowledge Fabric, neural maintenance |
+| `code` | 36 | Code search, call graphs, impact analysis, communities, health, processes, bridge, topology firewall |
+| `admin` | 25 | Sync, watch, Knowledge Fabric, neural maintenance, skills |
 | `skill` | 12 | Neural skills detection, activation, export/import |
+| `analysis_profile` | 4 | Edge/fusion weight presets for analysis |
 
 ### Debug Logging
 
@@ -168,7 +169,7 @@ docs/
 │   └── cursor.md            # Cursor IDE setup
 ├── api/
 │   ├── reference.md         # REST API documentation
-│   └── mcp-tools.md         # MCP tools reference (19 mega-tools)
+│   └── mcp-tools.md         # MCP tools reference (20 mega-tools)
 └── guides/
     ├── getting-started.md   # Tutorial for new users
     ├── multi-agent-workflow.md # Multi-agent coordination
@@ -204,7 +205,7 @@ src/
 ├── mcp/
 │   ├── mod.rs           # MCP module exports
 │   ├── protocol.rs      # JSON-RPC 2.0 types
-│   ├── tools.rs         # Mega-tool definitions (19 tools)
+│   ├── tools.rs         # Mega-tool definitions (20 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
 ├── neo4j/
@@ -326,6 +327,20 @@ tests/
 - `GET /api/code/trait-impls?trait_name=...` - Find trait implementations
 - `GET /api/code/type-traits?type_name=...` - Find traits for a type
 - `GET /api/code/impl-blocks?type_name=...` - Get impl blocks for a type
+
+### Bridge Subgraph & Topology Firewall
+- `GET /api/code/bridge?file_path=...&project_slug=...` - Bridge subgraph around a node (bottlenecks, bridge score)
+- `GET /api/code/topology/check?project_slug=...` - Check all topology rule violations
+- `GET /api/code/topology/rules?project_slug=...` - List topology rules
+- `POST /api/code/topology/rules` - Create topology rule (must_not_import, must_not_call, max_distance, max_fan_out, no_circular)
+- `DELETE /api/code/topology/rules/{id}` - Delete topology rule
+- `POST /api/code/topology/check-file` - Check if new imports would violate rules
+
+### Analysis Profiles
+- `GET /api/analysis-profiles?project_id=...` - List analysis profiles (edge/fusion weight presets)
+- `POST /api/analysis-profiles` - Create analysis profile with custom edge_weights and fusion_weights
+- `GET /api/analysis-profiles/{id}` - Get analysis profile details
+- `DELETE /api/analysis-profiles/{id}` - Delete analysis profile
 
 ### Knowledge Notes
 See the [Knowledge Notes Guide](docs/guides/knowledge-notes.md) for detailed documentation.

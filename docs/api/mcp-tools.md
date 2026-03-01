@@ -1,6 +1,6 @@
 # MCP Mega-Tools Reference
 
-Complete documentation for the **19 mega-tools** exposed by Project Orchestrator.
+Complete documentation for the **20 mega-tools** exposed by Project Orchestrator.
 
 ---
 
@@ -41,9 +41,10 @@ Each mega-tool uses an **`action` parameter** to select the operation. This repl
 | [`component`](#component) | 8 | Service topology and dependencies |
 | [`chat`](#chat) | 7 | Chat sessions, messages, delegation |
 | [`feature_graph`](#feature_graph) | 6 | Feature graphs, auto-build |
-| [`code`](#code) | 30 | Code search, analysis, health, processes |
-| [`admin`](#admin) | 23 | Sync, watch, Knowledge Fabric, maintenance |
+| [`code`](#code) | 36 | Code search, analysis, health, processes, bridge, topology firewall |
+| [`admin`](#admin) | 25 | Sync, watch, Knowledge Fabric, maintenance, skills |
 | [`skill`](#skill) | 12 | Neural skills detection, activation |
+| [`analysis_profile`](#analysis_profile) | 4 | Edge/fusion weight presets for analysis |
 
 ---
 
@@ -346,7 +347,7 @@ Manage feature graphs for code analysis.
 
 ## code
 
-Code exploration, search, and analytics (30 actions).
+Code exploration, search, and analytics (36 actions).
 
 ### Search & Navigation
 
@@ -397,6 +398,17 @@ Code exploration, search, and analytics (30 actions).
 | `get_hotspots` | High-churn files | `project_slug` |
 | `get_knowledge_gaps` | Under-documented files | `project_slug` |
 | `get_risk_assessment` | Composite risk scores | `project_slug` |
+
+### Bridge Subgraph & Topology Firewall
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `get_bridge` | Bridge subgraph around a node (bottlenecks, bridge score) | `project_slug`, `file_path`, `max_hops`, `top_bottlenecks` |
+| `check_topology` | Check all topology rule violations | `project_slug` |
+| `list_topology_rules` | List topology rules | `project_slug` |
+| `create_topology_rule` | Create topology rule | `project_slug`, `rule_type` (must_not_import/must_not_call/max_distance/max_fan_out/no_circular), `source_pattern`, `target_pattern`, `threshold`, `severity` (error/warning) |
+| `delete_topology_rule` | Delete topology rule | `rule_id` |
+| `check_file_topology` | Check if new imports would violate rules | `project_slug`, `file_path`, `new_imports` (array) |
 
 ---
 
@@ -476,3 +488,20 @@ Manage neural skills (emergent knowledge clusters).
 **Skill Status:** `emerging`, `active`, `dormant`, `archived`, `imported`
 
 **Trigger Pattern Types:** `regex`, `file_glob`, `semantic`
+
+---
+
+## analysis_profile
+
+Manage analysis profiles (edge/fusion weight presets for GDS analytics).
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List analysis profiles | `project_id` |
+| `create` | Create analysis profile | `name`, `project_slug`, `description`, `edge_weights` (object), `fusion_weights` (object) |
+| `get` | Get analysis profile by ID | `id` |
+| `delete` | Delete analysis profile | `id` |
+
+**Edge Weights:** `{"IMPORTS": 0.7, "CALLS": 0.5, "CO_CHANGED": 0.3, ...}` — relative weight of each edge type in GDS computations.
+
+**Fusion Weights:** `{"structural": 0.3, "temporal": 0.4, "semantic": 0.3}` — how to blend structural, temporal, and semantic signals.
