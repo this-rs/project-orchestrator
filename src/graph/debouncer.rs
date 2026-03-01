@@ -452,6 +452,7 @@ mod tests {
                 node_count: 5,
                 edge_count: 3,
                 computation_ms: 1,
+                profile_name: None,
             };
             Self {
                 call_count,

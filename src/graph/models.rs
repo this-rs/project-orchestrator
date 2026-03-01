@@ -333,6 +333,9 @@ pub struct GraphAnalytics {
     pub edge_count: usize,
     /// Computation time in milliseconds
     pub computation_ms: u64,
+    /// Name of the analysis profile used (None = default/unweighted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
 }
 
 // ============================================================================
@@ -586,6 +589,11 @@ impl Default for GrailConfig {
 /// (refactoring, security, onboarding) weight relationships differently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisProfile {
+    /// Unique identifier (UUID)
+    pub id: String,
+    /// Project scope — None = global profile, Some = project-specific
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Profile name (e.g., "default", "refactoring", "security", "onboarding")
     pub name: String,
     /// Optional description
@@ -594,16 +602,184 @@ pub struct AnalysisProfile {
     /// Edge type weights — multiplied against edge weights before analytics.
     /// Missing edge types use weight 1.0 (unchanged).
     pub edge_weights: HashMap<String, f64>,
-    /// Fusion weights for multi-signal impact analysis (Plan 4).
+    /// Fusion weights for multi-signal impact analysis.
     #[serde(default)]
-    pub fusion_weights: Option<FusionWeights>,
+    pub fusion_weights: FusionWeights,
+    /// Whether this is a built-in profile (cannot be deleted)
+    #[serde(default)]
+    pub is_builtin: bool,
+}
+
+impl Default for AnalysisProfile {
+    fn default() -> Self {
+        profile_default()
+    }
+}
+
+// ============================================================================
+// Built-in Analysis Profiles (Plan 6 / GraIL R-GCN inspired)
+// ============================================================================
+
+/// Default profile — balanced weights for general-purpose analysis.
+pub fn profile_default() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000001".to_string(),
+        project_id: None,
+        name: "default".to_string(),
+        description: Some("Balanced weights for general-purpose analysis".to_string()),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.5),
+            ("CALLS".to_string(), 0.5),
+            ("EXTENDS".to_string(), 0.5),
+            ("IMPLEMENTS".to_string(), 0.5),
+            ("CO_CHANGED".to_string(), 0.5),
+            ("TOUCHES".to_string(), 0.3),
+            ("AFFECTS".to_string(), 0.3),
+            ("SYNAPSE".to_string(), 0.2),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.30,
+            co_change: 0.25,
+            knowledge: 0.15,
+            pagerank: 0.15,
+            bridge: 0.15,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Refactoring profile — emphasizes imports and co-change for safe restructuring.
+pub fn profile_refactoring() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000002".to_string(),
+        project_id: None,
+        name: "refactoring".to_string(),
+        description: Some("Optimized for safe code restructuring — imports and co-change are emphasized".to_string()),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.8),
+            ("CALLS".to_string(), 0.5),
+            ("EXTENDS".to_string(), 0.3),
+            ("IMPLEMENTS".to_string(), 0.3),
+            ("CO_CHANGED".to_string(), 0.7),
+            ("TOUCHES".to_string(), 0.4),
+            ("AFFECTS".to_string(), 0.2),
+            ("SYNAPSE".to_string(), 0.1),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.40,
+            co_change: 0.30,
+            knowledge: 0.05,
+            pagerank: 0.15,
+            bridge: 0.10,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Security profile — emphasizes call chains and inheritance for vulnerability tracing.
+pub fn profile_security() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000003".to_string(),
+        project_id: None,
+        name: "security".to_string(),
+        description: Some("Optimized for security review — call chains and inheritance are prioritized".to_string()),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.4),
+            ("CALLS".to_string(), 0.9),
+            ("EXTENDS".to_string(), 0.8),
+            ("IMPLEMENTS".to_string(), 0.8),
+            ("CO_CHANGED".to_string(), 0.2),
+            ("TOUCHES".to_string(), 0.1),
+            ("AFFECTS".to_string(), 0.6),
+            ("SYNAPSE".to_string(), 0.1),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.45,
+            co_change: 0.10,
+            knowledge: 0.20,
+            pagerank: 0.15,
+            bridge: 0.10,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Onboarding profile — emphasizes definitions and knowledge for new developer orientation.
+pub fn profile_onboarding() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000004".to_string(),
+        project_id: None,
+        name: "onboarding".to_string(),
+        description: Some("Optimized for onboarding — definitions and knowledge documentation are emphasized".to_string()),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.5),
+            ("CALLS".to_string(), 0.3),
+            ("EXTENDS".to_string(), 0.4),
+            ("IMPLEMENTS".to_string(), 0.4),
+            ("CO_CHANGED".to_string(), 0.2),
+            ("TOUCHES".to_string(), 0.2),
+            ("AFFECTS".to_string(), 0.3),
+            ("SYNAPSE".to_string(), 0.7),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.20,
+            co_change: 0.10,
+            knowledge: 0.40,
+            pagerank: 0.15,
+            bridge: 0.15,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Architect profile — emphasizes structure, hierarchies, and bridge nodes for system design.
+pub fn profile_architect() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000005".to_string(),
+        project_id: None,
+        name: "architect".to_string(),
+        description: Some(
+            "Optimized for system design — type hierarchies, module dependencies, \
+             and bridge nodes are prioritized"
+                .to_string(),
+        ),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.7),
+            ("CALLS".to_string(), 0.5),
+            ("EXTENDS".to_string(), 0.9),
+            ("IMPLEMENTS".to_string(), 0.9),
+            ("CO_CHANGED".to_string(), 0.3),
+            ("TOUCHES".to_string(), 0.2),
+            ("AFFECTS".to_string(), 0.7),
+            ("SYNAPSE".to_string(), 0.4),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.35,
+            co_change: 0.10,
+            knowledge: 0.15,
+            pagerank: 0.15,
+            bridge: 0.25,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Returns all built-in analysis profiles.
+pub fn builtin_profiles() -> Vec<AnalysisProfile> {
+    vec![
+        profile_default(),
+        profile_refactoring(),
+        profile_security(),
+        profile_onboarding(),
+        profile_architect(),
+    ]
 }
 
 /// Weights for multi-signal impact fusion (Plan 4).
 ///
 /// Each weight controls the contribution of one signal in the combined
 /// impact score. They should sum to ~1.0 for normalized results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FusionWeights {
     /// Structural impact (imports/calls graph traversal)
     pub structural: f64,
@@ -615,6 +791,46 @@ pub struct FusionWeights {
     pub pagerank: f64,
     /// Bridge proximity signal (betweenness / bridge detection)
     pub bridge: f64,
+}
+
+impl FusionWeights {
+    /// Returns the sum of all weights.
+    pub fn sum(&self) -> f64 {
+        self.structural + self.co_change + self.knowledge + self.pagerank + self.bridge
+    }
+
+    /// Validates that all weights sum to approximately 1.0 (±0.01 tolerance)
+    /// and that no individual weight is negative.
+    pub fn validate(&self) -> Result<(), String> {
+        // Check for negative weights
+        if self.structural < 0.0 {
+            return Err(format!("structural weight must be >= 0, got {}", self.structural));
+        }
+        if self.co_change < 0.0 {
+            return Err(format!("co_change weight must be >= 0, got {}", self.co_change));
+        }
+        if self.knowledge < 0.0 {
+            return Err(format!("knowledge weight must be >= 0, got {}", self.knowledge));
+        }
+        if self.pagerank < 0.0 {
+            return Err(format!("pagerank weight must be >= 0, got {}", self.pagerank));
+        }
+        if self.bridge < 0.0 {
+            return Err(format!("bridge weight must be >= 0, got {}", self.bridge));
+        }
+
+        // Check sum ≈ 1.0
+        let sum = self.sum();
+        if (sum - 1.0).abs() > 0.01 {
+            Err(format!(
+                "FusionWeights must sum to ~1.0 (±0.01), got {:.4} \
+                 (structural={}, co_change={}, knowledge={}, pagerank={}, bridge={})",
+                sum, self.structural, self.co_change, self.knowledge, self.pagerank, self.bridge
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Default for FusionWeights {
@@ -1023,6 +1239,7 @@ mod tests {
             node_count: 100,
             edge_count: 250,
             computation_ms: 42,
+            profile_name: None,
         };
         let json = serde_json::to_string(&analytics).unwrap();
         let deserialized: GraphAnalytics = serde_json::from_str(&json).unwrap();
@@ -1041,5 +1258,159 @@ mod tests {
         assert!(report.orphan_files.is_empty());
         assert!((report.avg_coupling - 0.0).abs() < f64::EPSILON);
         assert!((report.max_coupling - 0.0).abs() < f64::EPSILON);
+    }
+
+    // --- FusionWeights ---
+
+    #[test]
+    fn test_fusion_weights_default_validates() {
+        let w = FusionWeights::default();
+        assert!(w.validate().is_ok());
+        assert!((w.sum() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_fusion_weights_validate_bad_sum() {
+        let w = FusionWeights {
+            structural: 0.5,
+            co_change: 0.5,
+            knowledge: 0.5,
+            pagerank: 0.5,
+            bridge: 0.5,
+        };
+        let err = w.validate().unwrap_err();
+        assert!(err.contains("must sum to ~1.0"));
+        assert!(err.contains("2.5"));
+    }
+
+    #[test]
+    fn test_fusion_weights_validate_negative() {
+        let w = FusionWeights {
+            structural: -0.1,
+            co_change: 0.4,
+            knowledge: 0.3,
+            pagerank: 0.2,
+            bridge: 0.2,
+        };
+        let err = w.validate().unwrap_err();
+        assert!(err.contains("structural weight must be >= 0"));
+    }
+
+    #[test]
+    fn test_fusion_weights_validate_tolerance() {
+        // Sum = 1.005 — within ±0.01 tolerance
+        let w = FusionWeights {
+            structural: 0.305,
+            co_change: 0.25,
+            knowledge: 0.15,
+            pagerank: 0.15,
+            bridge: 0.15,
+        };
+        assert!(w.validate().is_ok());
+
+        // Sum = 1.02 — outside tolerance
+        let w2 = FusionWeights {
+            structural: 0.32,
+            co_change: 0.25,
+            knowledge: 0.15,
+            pagerank: 0.15,
+            bridge: 0.15,
+        };
+        assert!(w2.validate().is_err());
+    }
+
+    // --- AnalysisProfile ---
+
+    #[test]
+    fn test_analysis_profile_default_is_default_profile() {
+        let p = AnalysisProfile::default();
+        assert_eq!(p.name, "default");
+        assert!(p.is_builtin);
+        assert!(p.project_id.is_none());
+        assert!(p.fusion_weights.validate().is_ok());
+    }
+
+    #[test]
+    fn test_builtin_profiles_count_and_names() {
+        let profiles = builtin_profiles();
+        assert_eq!(profiles.len(), 5);
+
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"default"));
+        assert!(names.contains(&"refactoring"));
+        assert!(names.contains(&"security"));
+        assert!(names.contains(&"onboarding"));
+        assert!(names.contains(&"architect"));
+    }
+
+    #[test]
+    fn test_builtin_profiles_all_validate() {
+        for profile in builtin_profiles() {
+            assert!(
+                profile.fusion_weights.validate().is_ok(),
+                "Profile '{}' has invalid fusion_weights: {:?}",
+                profile.name,
+                profile.fusion_weights.validate().err()
+            );
+            assert!(profile.is_builtin, "Profile '{}' should be builtin", profile.name);
+            assert!(profile.project_id.is_none(), "Built-in profile '{}' should be global", profile.name);
+        }
+    }
+
+    #[test]
+    fn test_builtin_profiles_unique_ids() {
+        let profiles = builtin_profiles();
+        let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+        let mut unique_ids = ids.clone();
+        unique_ids.sort();
+        unique_ids.dedup();
+        assert_eq!(ids.len(), unique_ids.len(), "Profile IDs must be unique");
+    }
+
+    #[test]
+    fn test_analysis_profile_serde_roundtrip() {
+        let profile = profile_refactoring();
+        let json = serde_json::to_string(&profile).unwrap();
+        let deserialized: AnalysisProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "refactoring");
+        assert_eq!(deserialized.id, profile.id);
+        assert!(deserialized.is_builtin);
+        assert_eq!(deserialized.fusion_weights, profile.fusion_weights);
+        assert_eq!(deserialized.edge_weights.len(), profile.edge_weights.len());
+    }
+
+    #[test]
+    fn test_profile_security_weights() {
+        let p = profile_security();
+        // CALLS should be highest edge weight for security
+        assert!(p.edge_weights["CALLS"] > p.edge_weights["IMPORTS"]);
+        // EXTENDS/IMPLEMENTS should be high
+        assert!(p.edge_weights["EXTENDS"] >= 0.8);
+        assert!(p.edge_weights["IMPLEMENTS"] >= 0.8);
+        // structural fusion should be highest
+        assert!(p.fusion_weights.structural > p.fusion_weights.co_change);
+    }
+
+    #[test]
+    fn test_profile_onboarding_weights() {
+        let p = profile_onboarding();
+        // Knowledge fusion should be highest for onboarding
+        assert!(p.fusion_weights.knowledge > p.fusion_weights.structural);
+        assert!(p.fusion_weights.knowledge > p.fusion_weights.co_change);
+        // SYNAPSE should be high (knowledge connections)
+        assert!(p.edge_weights["SYNAPSE"] >= 0.7);
+    }
+
+    #[test]
+    fn test_profile_architect_weights() {
+        let p = profile_architect();
+        // Hierarchies should be highest edge weights
+        assert!(p.edge_weights["EXTENDS"] >= 0.9);
+        assert!(p.edge_weights["IMPLEMENTS"] >= 0.9);
+        // Bridge fusion should be highest non-structural
+        assert!(p.fusion_weights.bridge > p.fusion_weights.co_change);
+        assert!(p.fusion_weights.bridge > p.fusion_weights.knowledge);
+        // AFFECTS should be high (architectural decisions)
+        assert!(p.edge_weights["AFFECTS"] >= 0.7);
     }
 }

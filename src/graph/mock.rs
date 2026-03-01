@@ -47,6 +47,7 @@ impl MockAnalyticsEngine {
             node_count: 0,
             edge_count: 0,
             computation_ms: 0,
+            profile_name: None,
         }
     }
 }
@@ -128,6 +129,7 @@ mod tests {
             node_count: 10,
             edge_count: 20,
             computation_ms: 5,
+            profile_name: None,
         };
         let func = GraphAnalytics {
             metrics: HashMap::new(),
@@ -138,6 +140,7 @@ mod tests {
             node_count: 50,
             edge_count: 100,
             computation_ms: 12,
+            profile_name: None,
         };
 
         let mock = MockAnalyticsEngine::with_results(file, func);

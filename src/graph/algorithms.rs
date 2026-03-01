@@ -24,9 +24,9 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use super::models::{
-    AnalyticsConfig, CodeGraph, CodeHealthReport, ComputeAllResult, ComputeMode, CommunityInfo,
-    ComponentInfo, GrailConfig, GrailStats, GraphAnalytics, NodeMetrics, RankCluster,
-    RankConfidence, RankedList, RankedResult, StepTiming,
+    AnalysisProfile, AnalyticsConfig, CodeGraph, CodeHealthReport, ComputeAllResult,
+    ComputeMode, CommunityInfo, ComponentInfo, GrailConfig, GrailStats, GraphAnalytics,
+    NodeMetrics, RankCluster, RankConfidence, RankedList, RankedResult, StepTiming,
 };
 
 // ============================================================================
@@ -843,6 +843,7 @@ pub fn compute_all(graph: &CodeGraph, config: &AnalyticsConfig) -> GraphAnalytic
         node_count: g.node_count(),
         edge_count: g.edge_count(),
         computation_ms: elapsed.as_millis() as u64,
+        profile_name: None,
     }
 }
 
@@ -967,6 +968,7 @@ pub fn compute_all_extended(
         node_count: working_graph.graph.node_count(),
         edge_count: working_graph.graph.edge_count(),
         computation_ms: 0,
+        profile_name: None,
     });
 
     // Extract PageRank scores for downstream use
@@ -1302,6 +1304,61 @@ pub fn find_isomorphic_groups(
     // Keep only groups with 2+ members
     groups.retain(|_, members| members.len() >= 2);
     groups
+}
+
+// ============================================================================
+// Analysis Profiles — Contextual edge weighting (Plan 6 / GraIL R-GCN)
+// ============================================================================
+
+/// Apply an analysis profile's edge weights to a graph, returning a new weighted graph.
+///
+/// For each edge in the graph, the weight is multiplied by the profile's weight
+/// for that edge type. Edge types not present in the profile use `default_weight`
+/// (0.5 = neutral reduction).
+///
+/// This is O(E) — a single pass over all edges.
+///
+/// # Example
+/// ```ignore
+/// let security = profile_security();
+/// let weighted = apply_profile_weights(&graph, &security);
+/// let analytics = compute_all(&weighted, &config);
+/// ```
+pub fn apply_profile_weights(graph: &CodeGraph, profile: &AnalysisProfile) -> CodeGraph {
+    let default_weight = 0.5;
+    let mut weighted = graph.clone();
+
+    for edge_idx in weighted.graph.edge_indices() {
+        if let Some(edge) = weighted.graph.edge_weight_mut(edge_idx) {
+            let edge_type_str = edge.edge_type.to_string();
+            let profile_weight = profile
+                .edge_weights
+                .get(&edge_type_str)
+                .copied()
+                .unwrap_or(default_weight);
+            edge.weight *= profile_weight;
+        }
+    }
+
+    weighted
+}
+
+/// Run the full analytics pipeline on a profile-weighted graph.
+///
+/// 1. Applies profile edge weights via `apply_profile_weights`
+/// 2. Runs `compute_all` (PageRank, Betweenness, Louvain, etc.) on the weighted graph
+///
+/// Returns `GraphAnalytics` computed on the weighted graph. The `profile_name` field
+/// in the result indicates which profile was used.
+pub fn compute_all_with_profile(
+    graph: &CodeGraph,
+    config: &AnalyticsConfig,
+    profile: &AnalysisProfile,
+) -> GraphAnalytics {
+    let weighted = apply_profile_weights(graph, profile);
+    let mut analytics = compute_all(&weighted, config);
+    analytics.profile_name = Some(profile.name.clone());
+    analytics
 }
 
 // ============================================================================
@@ -2419,6 +2476,177 @@ mod tests {
                 comm.id
             );
         }
+    }
+
+    // --- Analysis Profiles (Plan 6) ---
+
+    /// Helper to build a simple test graph with IMPORTS and CALLS edges.
+    fn build_profile_test_graph() -> CodeGraph {
+        use super::super::models::{CodeEdge, CodeEdgeType, CodeNode, CodeNodeType};
+
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "a.rs".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("a.rs".to_string()),
+            name: "a.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "b.rs".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("b.rs".to_string()),
+            name: "b.rs".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "c.rs".to_string(),
+            node_type: CodeNodeType::File,
+            path: Some("c.rs".to_string()),
+            name: "c.rs".to_string(),
+            project_id: None,
+        });
+        // a -> b via IMPORTS (weight 1.0)
+        g.add_edge(
+            "a.rs",
+            "b.rs",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        // b -> c via CALLS (weight 1.0)
+        g.add_edge(
+            "b.rs",
+            "c.rs",
+            CodeEdge {
+                edge_type: CodeEdgeType::Calls,
+                weight: 1.0,
+            },
+        );
+        // c -> a via IMPORTS (weight 1.0) — cycle
+        g.add_edge(
+            "c.rs",
+            "a.rs",
+            CodeEdge {
+                edge_type: CodeEdgeType::Imports,
+                weight: 1.0,
+            },
+        );
+        g
+    }
+
+    #[test]
+    fn test_apply_profile_weights_zeroes_imports() {
+        use super::super::models::profile_security;
+        use petgraph::visit::EdgeRef;
+
+        let g = build_profile_test_graph();
+        // Security profile has IMPORTS=0.4, CALLS=0.9
+        let security = profile_security();
+        let weighted = apply_profile_weights(&g, &security);
+
+        // Check edge weights were multiplied
+        for edge in weighted.graph.edge_references() {
+            let e = edge.weight();
+            match e.edge_type.to_string().as_str() {
+                "IMPORTS" => assert!(
+                    (e.weight - 0.4).abs() < f64::EPSILON,
+                    "IMPORTS edge should be 1.0 * 0.4 = 0.4, got {}",
+                    e.weight
+                ),
+                "CALLS" => assert!(
+                    (e.weight - 0.9).abs() < f64::EPSILON,
+                    "CALLS edge should be 1.0 * 0.9 = 0.9, got {}",
+                    e.weight
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_profile_weights_preserves_node_count() {
+        use super::super::models::profile_refactoring;
+
+        let g = build_profile_test_graph();
+        let weighted = apply_profile_weights(&g, &profile_refactoring());
+        assert_eq!(g.node_count(), weighted.node_count());
+        assert_eq!(g.edge_count(), weighted.edge_count());
+    }
+
+    #[test]
+    fn test_apply_profile_weights_default_for_unknown_edge_type() {
+        use super::super::models::{AnalysisProfile, FusionWeights};
+        use petgraph::visit::EdgeRef;
+
+        let g = build_profile_test_graph();
+        // Profile with NO edge weights — all should use default 0.5
+        let empty_profile = AnalysisProfile {
+            id: "test".to_string(),
+            project_id: None,
+            name: "empty".to_string(),
+            description: None,
+            edge_weights: HashMap::new(),
+            fusion_weights: FusionWeights::default(),
+            is_builtin: false,
+        };
+        let weighted = apply_profile_weights(&g, &empty_profile);
+
+        for edge in weighted.graph.edge_references() {
+            assert!(
+                (edge.weight().weight - 0.5).abs() < f64::EPSILON,
+                "Unknown edge type should use default 0.5, got {}",
+                edge.weight().weight
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_all_with_profile_sets_name() {
+        use super::super::models::profile_security;
+
+        let g = build_profile_test_graph();
+        let config = AnalyticsConfig::default();
+        let result = compute_all_with_profile(&g, &config, &profile_security());
+        assert_eq!(result.profile_name.as_deref(), Some("security"));
+    }
+
+    #[test]
+    fn test_compute_all_with_profile_weighted_graph_differs() {
+        use super::super::models::{profile_default, profile_security};
+        use petgraph::visit::EdgeRef;
+
+        // Verify that apply_profile_weights produces different edge weights
+        // for different profiles (which is the precondition for weighted
+        // algorithms to produce different results).
+        let g = build_profile_test_graph();
+
+        let default_weighted = apply_profile_weights(&g, &profile_default());
+        let security_weighted = apply_profile_weights(&g, &profile_security());
+
+        // Collect edge weights from both
+        let default_weights: Vec<f64> = default_weighted
+            .graph
+            .edge_references()
+            .map(|e| e.weight().weight)
+            .collect();
+        let security_weights: Vec<f64> = security_weighted
+            .graph
+            .edge_references()
+            .map(|e| e.weight().weight)
+            .collect();
+
+        assert_ne!(
+            default_weights, security_weights,
+            "Different profiles must produce different edge weights"
+        );
+
+        // Also verify compute_all_with_profile runs without error
+        let config = AnalyticsConfig::default();
+        let result = compute_all_with_profile(&g, &config, &profile_security());
+        assert_eq!(result.node_count, 3);
+        assert_eq!(result.profile_name.as_deref(), Some("security"));
     }
 
     // --- Margin Ranking (Plan 10) ---
