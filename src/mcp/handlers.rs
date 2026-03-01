@@ -2473,7 +2473,7 @@ impl ToolHandler {
             "search_project_code" => {
                 let project_slug = extract_string(args, "project_slug")?;
                 let query_str = extract_string(args, "query")?;
-                let mut query = vec![("query".to_string(), query_str)];
+                let mut query = vec![("q".to_string(), query_str)];
                 if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
                     query.push(("limit".to_string(), v.to_string()));
                 }

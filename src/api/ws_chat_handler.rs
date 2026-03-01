@@ -718,8 +718,12 @@ async fn handle_ws_chat_loop(
                                         spawn_entity_extraction(&state, &session_id, &content);
 
                                         // 3-branch routing: local → remote (NATS RPC) → fallback resume
+                                        // Track which branch was used so the error handler knows
+                                        // whether a resume_session fallback makes sense.
+                                        let used_send_message;
                                         let result = if chat_manager.is_session_active(&session_id).await {
                                             // Session is local — send directly
+                                            used_send_message = true;
                                             chat_manager.send_message(&session_id, &content).await
                                         } else if chat_manager
                                             .try_remote_send(&session_id, &content, "user_message")
@@ -728,6 +732,7 @@ async fn handle_ws_chat_loop(
                                         {
                                             // Message proxied to remote instance via NATS RPC.
                                             // Ensure we have a NATS subscription to receive the stream.
+                                            used_send_message = false;
                                             if nats_chat_sub.is_none() {
                                                 if let Some(ref nats) = state.nats_emitter {
                                                     if let Ok(sub) = nats.subscribe_chat_events(&session_id).await {
@@ -739,6 +744,7 @@ async fn handle_ws_chat_loop(
                                             Ok(())
                                         } else {
                                             // No instance owns the session — resume locally (spawns new CLI)
+                                            used_send_message = false;
                                             chat_manager.resume_session(&session_id, &content, Some(&claims)).await
                                         };
 
@@ -764,7 +770,7 @@ async fn handle_ws_chat_loop(
                                                     }
                                                 }
                                             }
-                                            Err(e) => {
+                                            Err(e) if used_send_message => {
                                                 // send_message failed — likely dead CLI (ChannelSendError).
                                                 // Fall through to resume_session as a recovery mechanism.
                                                 warn!(
@@ -805,6 +811,20 @@ async fn handle_ws_chat_loop(
                                                         let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                                     }
                                                 }
+                                            }
+                                            Err(e) => {
+                                                // resume_session itself failed (branch 3) — don't retry it again.
+                                                // Show the error directly to the user.
+                                                error!(
+                                                    session_id = %session_id,
+                                                    error = %e,
+                                                    "resume_session failed"
+                                                );
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": format!("Failed to resume session: {}", e),
+                                                });
+                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                             }
                                         }
                                     }
