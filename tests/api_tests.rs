@@ -531,7 +531,17 @@ async fn test_code_search() {
     assert!(resp.status().is_success());
 
     let results: Value = resp.json().await.unwrap();
-    assert!(results.is_array());
+    // CodeSearchResult has `hits` (legacy array) and `ranked` (ranked view)
+    assert!(
+        results["hits"].is_array(),
+        "Expected CodeSearchResult with 'hits' array, got: {}",
+        results
+    );
+    assert!(
+        results["ranked"].is_object(),
+        "Expected CodeSearchResult with 'ranked' object, got: {}",
+        results
+    );
 }
 
 #[tokio::test]
