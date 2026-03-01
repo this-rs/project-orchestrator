@@ -528,6 +528,9 @@ pub struct ImpactQuery {
     pub target_type: Option<String>,
     /// Filter by project slug
     pub project_slug: Option<String>,
+    /// Analysis profile name or id (e.g. "default", "security", "refactoring")
+    /// Used to weight edges differently in impact analysis.
+    pub profile: Option<String>,
 }
 
 /// A single affected file with its path — used as the item type for `RankedList`.
@@ -546,6 +549,9 @@ pub struct ImpactAnalysis {
     pub caller_count: i64,
     pub risk_level: String, // "low", "medium", "high"
     pub suggestion: String,
+    /// Analysis profile used for risk weighting (None = default hardcoded weights)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
     /// Community labels affected by this change (from graph analytics)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub affected_communities: Vec<String>,
@@ -580,6 +586,29 @@ pub async fn analyze_impact(
         (Some(project.id), Some(project.root_path))
     } else {
         (None, None)
+    };
+
+    // Resolve analysis profile (by name or id, optional)
+    let profile = if let Some(ref profile_ref) = query.profile {
+        // Try to find by name among built-in profiles first
+        let builtins = crate::graph::models::builtin_profiles();
+        let found = builtins
+            .into_iter()
+            .find(|p| p.name == *profile_ref || p.id == *profile_ref);
+        match found {
+            Some(p) => Some(p),
+            None => {
+                // Try Neo4j lookup by id
+                state
+                    .orchestrator
+                    .neo4j()
+                    .get_analysis_profile(profile_ref)
+                    .await
+                    .unwrap_or(None)
+            }
+        }
+    } else {
+        None
     };
 
     // Resolve relative file paths to absolute using project root_path
@@ -679,19 +708,35 @@ pub async fn analyze_impact(
         .unwrap_or_default();
 
     // Compute risk level using composite formula when GDS data is available
+    // Profile fusion weights adjust the relative importance of each factor:
+    //   bridge     → betweenness weight
+    //   co_change  → community spread weight
+    //   structural → degree/caller weight
+    let (w_betweenness, w_community, w_degree) = if let Some(ref p) = profile {
+        let fw = &p.fusion_weights;
+        let total = fw.bridge + fw.co_change + fw.structural;
+        if total > 0.0 {
+            (fw.bridge / total, fw.co_change / total, fw.structural / total)
+        } else {
+            (0.5, 0.3, 0.2)
+        }
+    } else {
+        (0.5, 0.3, 0.2)
+    };
+
     let (risk_level, betweenness_score, risk_formula) = if let Some(ref analytics) = node_analytics
     {
         if let Some(betweenness) = analytics.betweenness {
-            // Composite risk formula:
+            // Composite risk formula with profile-weighted coefficients:
             // betweenness_score = clamp(betweenness * 3.0, 0, 1)
             // community_spread = affected_communities / total (use 5 as reasonable estimate)
             // degree_score = clamp(caller_count / 20.0, 0, 1)
-            // risk = betweenness_score * 0.5 + community_spread * 0.3 + degree_score * 0.2
+            // risk = betweenness_score * w_b + community_spread * w_c + degree_score * w_d
             let bs = (betweenness * 3.0).clamp(0.0, 1.0);
             let total_communities = 5.0_f64; // reasonable default
             let cs = (affected_communities.len() as f64 / total_communities).clamp(0.0, 1.0);
             let ds = (caller_count as f64 / 20.0).clamp(0.0, 1.0);
-            let risk_score = bs * 0.5 + cs * 0.3 + ds * 0.2;
+            let risk_score = bs * w_betweenness + cs * w_community + ds * w_degree;
 
             let level = if risk_score > 0.7 {
                 "high"
@@ -811,6 +856,7 @@ pub async fn analyze_impact(
         caller_count,
         risk_level,
         suggestion,
+        profile_name: profile.as_ref().map(|p| p.name.clone()),
         affected_communities,
         betweenness_score,
         risk_formula,

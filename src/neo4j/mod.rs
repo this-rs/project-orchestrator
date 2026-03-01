@@ -14,6 +14,7 @@ mod milestone;
 pub mod models;
 mod note;
 mod plan;
+mod profile;
 mod project;
 mod release;
 mod skill;

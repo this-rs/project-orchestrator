@@ -9,6 +9,7 @@ use super::code_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::hook_handlers;
 use super::note_handlers;
+use super::profile_handlers;
 use super::project_handlers;
 use super::skill_handlers;
 use super::workspace_handlers;
@@ -674,6 +675,19 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/entities/{entity_type}/{entity_id}/notes",
             get(note_handlers::get_entity_notes),
+        )
+        // ================================================================
+        // Analysis Profiles
+        // ================================================================
+        .route(
+            "/api/analysis-profiles",
+            get(profile_handlers::list_analysis_profiles)
+                .post(profile_handlers::create_analysis_profile),
+        )
+        .route(
+            "/api/analysis-profiles/{profile_id}",
+            get(profile_handlers::get_analysis_profile)
+                .delete(profile_handlers::delete_analysis_profile),
         )
         // ================================================================
         // Skills (Neural Skills)

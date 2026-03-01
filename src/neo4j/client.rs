@@ -426,6 +426,49 @@ impl Neo4jClient {
             }
         }
 
+        // Seed built-in analysis profiles (idempotent via MERGE on id)
+        {
+            use crate::graph::models::builtin_profiles;
+            let profiles = builtin_profiles();
+            for profile in &profiles {
+                let edge_weights_json =
+                    serde_json::to_string(&profile.edge_weights).unwrap_or_default();
+                let fusion_weights_json =
+                    serde_json::to_string(&profile.fusion_weights).unwrap_or_default();
+                let q = neo4rs::query(
+                    r#"
+                    MERGE (ap:AnalysisProfile {id: $id})
+                    SET ap.name = $name,
+                        ap.description = $description,
+                        ap.project_id = "",
+                        ap.edge_weights_json = $edge_weights_json,
+                        ap.fusion_weights_json = $fusion_weights_json,
+                        ap.is_builtin = true
+                    "#,
+                )
+                .param("id", profile.id.clone())
+                .param("name", profile.name.clone())
+                .param(
+                    "description",
+                    profile.description.clone().unwrap_or_default(),
+                )
+                .param("edge_weights_json", edge_weights_json)
+                .param("fusion_weights_json", fusion_weights_json);
+
+                if let Err(e) = self.graph.run(q).await {
+                    tracing::warn!(
+                        name = %profile.name,
+                        "Failed to seed built-in profile (non-fatal): {}",
+                        e
+                    );
+                }
+            }
+            tracing::info!(
+                count = profiles.len(),
+                "Seeded built-in analysis profiles"
+            );
+        }
+
         // Vector indexes — optional, don't fail startup if Neo4j doesn't support them
         for vi in vector_indexes {
             if let Err(e) = self.graph.run(query(vi)).await {

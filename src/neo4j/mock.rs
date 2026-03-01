@@ -127,6 +127,9 @@ pub struct MockGraphStore {
     pub skills: RwLock<HashMap<Uuid, crate::skills::SkillNode>>,
     /// skill_id -> Vec<(entity_type, entity_id)>
     pub skill_members: RwLock<HashMap<Uuid, Vec<(String, Uuid)>>>,
+
+    // Analysis profiles (keyed by profile id String)
+    pub analysis_profiles: RwLock<HashMap<String, crate::graph::models::AnalysisProfile>>,
 }
 
 #[allow(dead_code)]
@@ -201,6 +204,7 @@ impl MockGraphStore {
             function_embeddings: RwLock::new(HashMap::new()),
             skills: RwLock::new(HashMap::new()),
             skill_members: RwLock::new(HashMap::new()),
+            analysis_profiles: RwLock::new(HashMap::new()),
         }
     }
 
@@ -6835,6 +6839,69 @@ impl GraphStore for MockGraphStore {
 
     async fn health_check(&self) -> anyhow::Result<bool> {
         Ok(true)
+    }
+
+    // ========================================================================
+    // Analysis Profile operations
+    // ========================================================================
+
+    async fn create_analysis_profile(
+        &self,
+        profile: &crate::graph::models::AnalysisProfile,
+    ) -> anyhow::Result<()> {
+        let mut profiles = self.analysis_profiles.write().await;
+        profiles.insert(profile.id.clone(), profile.clone());
+        Ok(())
+    }
+
+    async fn list_analysis_profiles(
+        &self,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::graph::models::AnalysisProfile>> {
+        let profiles = self.analysis_profiles.read().await;
+        let mut result: Vec<_> = profiles
+            .values()
+            .filter(|p| {
+                // Include global profiles (no project_id)
+                if p.project_id.is_none() {
+                    return true;
+                }
+                // Include project-specific profiles if matching
+                if let Some(pid) = project_id {
+                    if p.project_id.as_deref() == Some(pid) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .cloned()
+            .collect();
+        // Sort: built-in first, then by name
+        result.sort_by(|a, b| {
+            b.is_builtin
+                .cmp(&a.is_builtin)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(result)
+    }
+
+    async fn get_analysis_profile(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::graph::models::AnalysisProfile>> {
+        let profiles = self.analysis_profiles.read().await;
+        Ok(profiles.get(id).cloned())
+    }
+
+    async fn delete_analysis_profile(&self, id: &str) -> anyhow::Result<()> {
+        let mut profiles = self.analysis_profiles.write().await;
+        if let Some(profile) = profiles.get(id) {
+            if profile.is_builtin {
+                anyhow::bail!("Cannot delete built-in profile '{}'", profile.name);
+            }
+        }
+        profiles.remove(id);
+        Ok(())
     }
 
     // ========================================================================

@@ -2301,6 +2301,35 @@ impl GraphStore for Neo4jClient {
         self.delete_project_processes(project_id).await
     }
 
+    // ========================================================================
+    // Analysis Profile operations (delegates to neo4j/profile.rs)
+    // ========================================================================
+
+    async fn create_analysis_profile(
+        &self,
+        profile: &crate::graph::models::AnalysisProfile,
+    ) -> anyhow::Result<()> {
+        self.create_analysis_profile(profile).await
+    }
+
+    async fn list_analysis_profiles(
+        &self,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::graph::models::AnalysisProfile>> {
+        self.list_analysis_profiles(project_id).await
+    }
+
+    async fn get_analysis_profile(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::graph::models::AnalysisProfile>> {
+        self.get_analysis_profile(id).await
+    }
+
+    async fn delete_analysis_profile(&self, id: &str) -> anyhow::Result<()> {
+        self.delete_analysis_profile(id).await
+    }
+
     async fn health_check(&self) -> anyhow::Result<bool> {
         match self.execute("RETURN 1 AS ping").await {
             Ok(_) => Ok(true),

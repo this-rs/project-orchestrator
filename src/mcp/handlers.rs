@@ -305,6 +305,12 @@ impl ToolHandler {
             ("skill", "import") => "import_skill",
             ("skill", "get_health") => "get_skill_health",
 
+            // Analysis Profile
+            ("analysis_profile", "list") => "list_analysis_profiles",
+            ("analysis_profile", "create") => "create_analysis_profile",
+            ("analysis_profile", "get") => "get_analysis_profile",
+            ("analysis_profile", "delete") => "delete_analysis_profile",
+
             // Admin
             ("admin", "sync_directory") => "sync_directory",
             ("admin", "start_watch") => "start_watch",
@@ -3047,6 +3053,45 @@ impl ToolHandler {
                     .post("/api/admin/migrate-calls-confidence", &json!({}))
                     .await?;
                 Ok(Some(result))
+            }
+
+            // ── Analysis Profiles (4 tools) ─────────────────────────────
+            "list_analysis_profiles" => {
+                let mut query = Vec::new();
+                if let Some(pid) = extract_optional_string(args, "project_id") {
+                    query.push(("project_id".to_string(), pid));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/analysis-profiles").await?
+                } else {
+                    http.get_with_query("/api/analysis-profiles", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "create_analysis_profile" => {
+                let result = http.post("/api/analysis-profiles", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_analysis_profile" => {
+                let id = extract_string(args, "id")?;
+                let result = http
+                    .get(&format!("/api/analysis-profiles/{}", id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "delete_analysis_profile" => {
+                let id = extract_string(args, "id")?;
+                let result = http
+                    .delete(&format!("/api/analysis-profiles/{}", id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             // ── P10: Skills (9 tools) ──────────────────────────────────

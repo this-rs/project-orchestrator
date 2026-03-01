@@ -5,7 +5,7 @@
 //! enabling testing with mock implementations and future backend swaps.
 
 use crate::graph::models::{
-    FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate,
+    AnalysisProfile, FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate,
 };
 use crate::neo4j::models::*;
 use crate::notes::{
@@ -1987,6 +1987,33 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
         min_weight: f64,
     ) -> Result<Vec<(String, String, f64)>>;
+
+    // ========================================================================
+    // Analysis Profile operations
+    // ========================================================================
+
+    /// Create or update an analysis profile.
+    ///
+    /// Uses MERGE on `id` so built-in profiles can be upserted idempotently.
+    /// If `project_id` is Some, links the profile to the project via HAS_PROFILE.
+    async fn create_analysis_profile(&self, profile: &AnalysisProfile) -> Result<()>;
+
+    /// List analysis profiles visible to a project.
+    ///
+    /// Returns global profiles (project_id IS NULL) + project-specific profiles.
+    /// If `project_id` is None, returns only global profiles.
+    async fn list_analysis_profiles(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<AnalysisProfile>>;
+
+    /// Get a single analysis profile by id.
+    async fn get_analysis_profile(&self, id: &str) -> Result<Option<AnalysisProfile>>;
+
+    /// Delete an analysis profile by id.
+    ///
+    /// Returns an error if the profile is built-in (`is_builtin = true`).
+    async fn delete_analysis_profile(&self, id: &str) -> Result<()>;
 
     // ========================================================================
     // Health check
