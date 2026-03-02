@@ -36,6 +36,16 @@ pub const IGNORED_PATH_SEGMENTS: &[&str] = &[
     "/coverage/",
     "/.cache/",
     "/.claude/",
+    // Mobile (iOS / Android / React Native)
+    "/Pods/",
+    "/.expo/",
+    "/DerivedData/",
+    "/.gradle/",
+    "/.swiftpm/",
+    "/xcuserdata/",
+    // IDE settings
+    "/.idea/",
+    "/.vscode/",
 ];
 
 /// Check whether a file path should be ignored during sync.
@@ -94,6 +104,43 @@ mod tests {
         assert!(should_ignore_path("/project/.claude/settings.json"));
         // But "claude" without dots/slashes should NOT be caught
         assert!(!should_ignore_path("/project/src/claude/handler.rs"));
+    }
+
+    #[test]
+    fn test_should_ignore_mobile_patterns() {
+        // CocoaPods (iOS)
+        assert!(should_ignore_path(
+            "/project/ios/Pods/GoogleMaps/Maps.framework/Headers/GMSMapView.h"
+        ));
+        // Expo cache
+        assert!(should_ignore_path(
+            "/project/.expo/web/cache/production/images/favicon.png"
+        ));
+        // Xcode build output
+        assert!(should_ignore_path(
+            "/project/DerivedData/App-abc123/Build/Products/Debug/App.app"
+        ));
+        // Gradle cache (Android)
+        assert!(should_ignore_path(
+            "/project/.gradle/8.0/executionHistory/executionHistory.bin"
+        ));
+        // Swift Package Manager
+        assert!(should_ignore_path(
+            "/project/.swiftpm/xcode/xcuserdata/user.xcuserdatad"
+        ));
+        // Xcode user data
+        assert!(should_ignore_path(
+            "/project/App.xcodeproj/xcuserdata/user.xcuserdatad/xcschemes.plist"
+        ));
+    }
+
+    #[test]
+    fn test_should_ignore_ide_settings() {
+        assert!(should_ignore_path("/project/.idea/workspace.xml"));
+        assert!(should_ignore_path("/project/.vscode/settings.json"));
+        // But similar names without dots should NOT be caught
+        assert!(!should_ignore_path("/project/src/idea/module.rs"));
+        assert!(!should_ignore_path("/project/src/vscode/extension.ts"));
     }
 
     #[test]
