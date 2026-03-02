@@ -2877,43 +2877,6 @@ impl ChatManager {
             }
         }
 
-        // Batch-persist all collected events to Neo4j
-        if let Some(uuid) = session_uuid {
-            if !events_to_persist.is_empty() {
-                if let Err(e) = graph.store_chat_events(uuid, events_to_persist).await {
-                    warn!(
-                        "Failed to persist {} chat events for session {}: {}",
-                        0, session_id, e
-                    );
-                }
-            }
-        }
-
-        // Record assistant message and persist to memory store
-        if let Some(ref mm) = memory_manager {
-            let assistant_text = assistant_text_parts.join("");
-            if !assistant_text.is_empty() {
-                let mut mm = mm.lock().await;
-                mm.record_assistant_message(&assistant_text);
-
-                // Store pending messages via ContextInjector
-                if let Some(ref injector) = context_injector {
-                    let pending = mm.take_pending_messages();
-                    if !pending.is_empty() {
-                        if let Err(e) = injector.store_messages(&pending).await {
-                            warn!("Failed to store messages for session {}: {}", session_id, e);
-                        } else {
-                            debug!(
-                                "Stored {} messages for session {}",
-                                pending.len(),
-                                session_id
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
         // If interrupted, emit ToolCancelled for any tools that were still running
         // (ToolUse without ToolResult). The actual CLI interrupt was already sent
         // lock-free via stdin_tx above.
@@ -3045,6 +3008,45 @@ impl ChatManager {
             streaming_text.lock().await.clear();
             streaming_events.lock().await.clear();
             debug!("Stream completed for session {}", session_id);
+        }
+
+        // Batch-persist all collected events to Neo4j.
+        // This runs AFTER is_streaming=false so the frontend gets the signal immediately
+        // even if Neo4j is slow (GC pause, disk I/O, etc.).
+        if let Some(uuid) = session_uuid {
+            if !events_to_persist.is_empty() {
+                if let Err(e) = graph.store_chat_events(uuid, events_to_persist).await {
+                    warn!(
+                        "Failed to persist chat events for session {}: {}",
+                        session_id, e
+                    );
+                }
+            }
+        }
+
+        // Record assistant message and persist to memory store
+        if let Some(ref mm) = memory_manager {
+            let assistant_text = assistant_text_parts.join("");
+            if !assistant_text.is_empty() {
+                let mut mm = mm.lock().await;
+                mm.record_assistant_message(&assistant_text);
+
+                // Store pending messages via ContextInjector
+                if let Some(ref injector) = context_injector {
+                    let pending = mm.take_pending_messages();
+                    if !pending.is_empty() {
+                        if let Err(e) = injector.store_messages(&pending).await {
+                            warn!("Failed to store messages for session {}: {}", session_id, e);
+                        } else {
+                            debug!(
+                                "Stored {} messages for session {}",
+                                pending.len(),
+                                session_id
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Check pending_messages queue — if there are queued messages, process the next one
