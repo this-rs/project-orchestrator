@@ -1472,6 +1472,19 @@ jobs:
           cache-from: type=gha,scope=release-docker
           cache-to: type=gha,mode=max,scope=release-docker
 
+      # GHCR packages default to private, even when the repo is public.
+      # Make the package public after the first push so `docker pull` works
+      # without authentication. This is idempotent — subsequent runs are no-ops.
+      - name: Make GHCR package public
+        if: matrix.variant == 'full'
+        run: |
+          gh api --method PUT \
+            /orgs/${{ github.repository_owner }}/packages/container/project-orchestrator/visibility \
+            -f visibility=public 2>/dev/null \
+          || echo "::warning::Could not set package visibility to public — may need to be done manually in org settings"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # ==========================================================================
   # Update Homebrew tap - Push new formula after release is published
   # ==========================================================================
@@ -1528,15 +1541,15 @@ jobs:
               -e "s/SHA256_MACOS_X86_64_PLACEHOLDER/${{ steps.sha.outputs.macos_x86_64 }}/g" \
               -e "s/SHA256_LINUX_ARM64_PLACEHOLDER/${{ steps.sha.outputs.linux_arm64 }}/g" \
               -e "s/SHA256_LINUX_X86_64_PLACEHOLDER/${{ steps.sha.outputs.linux_x86_64 }}/g" \
-              packaging/homebrew/project-orchestrator.rb > formula.rb
-          cat formula.rb
+              packaging/homebrew/project-orchestrator.rb > project-orchestrator.rb
+          cat project-orchestrator.rb
 
       - name: Push to Homebrew tap
         uses: dmnemec/copy_file_to_another_repo_action@main
         env:
           API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         with:
-          source_file: formula.rb
+          source_file: project-orchestrator.rb
           destination_repo: this-rs/homebrew-tap
           destination_folder: Formula
           destination_branch: main

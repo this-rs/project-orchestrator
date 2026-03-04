@@ -166,10 +166,11 @@ assets = [
 ]
 conf-files = ["/etc/project-orchestrator/config.yaml"]
 
-[package.metadata.deb.systemd-units]
-unit-scripts = "packaging/debian/"
-enable = false
-start = false
+# NOTE: No [package.metadata.deb.systemd-units] section — we handle systemd
+# entirely via the assets entry + custom maintainer-scripts (postinst/prerm/postrm).
+# Having both systemd-units AND an assets entry for the .service file causes
+# a dpkg conflict: systemd-units installs to /usr/lib/systemd/system/ while
+# assets installs to /lib/systemd/system/ (same physical path on merged-/usr).
 
 # Variant for cross-compiled ARM64 builds (dpkg-shlibdeps can't resolve
 # ARM64 shared libraries on an x86_64 runner, so we use explicit depends)
