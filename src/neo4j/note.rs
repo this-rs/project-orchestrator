@@ -1936,7 +1936,7 @@ impl Neo4jClient {
                       WHEN e:Enum THEN 'enum'
                       ELSE 'unknown'
                     END AS entity_type,
-                    COALESCE(e.path, e.id, toString(elementId(e))) AS entity_id"
+                    COALESCE(e.path, e.id, toString(elementId(e))) AS entity_id",
         )
         .param("pid", project_id.to_string());
 
@@ -1964,7 +1964,7 @@ impl Neo4jClient {
             "MATCH (a:Note {project_id: $pid})-[s:SYNAPSE]->(b:Note {project_id: $pid})
              WHERE s.weight >= $min_weight AND a.id < b.id
              RETURN a.id AS source_id, b.id AS target_id, s.weight AS weight
-             ORDER BY s.weight DESC"
+             ORDER BY s.weight DESC",
         )
         .param("pid", project_id.to_string())
         .param("min_weight", min_weight);

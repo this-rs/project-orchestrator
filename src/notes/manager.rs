@@ -589,8 +589,7 @@ impl NoteManager {
             let doc = self.note_to_document(note, None).await?;
             self.meilisearch.index_note(&doc).await?;
 
-            let project_id_str =
-                note.project_id.map(|id| id.to_string()).unwrap_or_default();
+            let project_id_str = note.project_id.map(|id| id.to_string()).unwrap_or_default();
             self.emit(
                 CrudEvent::new(
                     EventEntityType::Note,
@@ -2638,7 +2637,10 @@ mod tests {
 
         assert_eq!(node_event.kind, "graph");
         assert_eq!(node_event.layer, GraphLayer::Knowledge);
-        assert_eq!(node_event.node_id.as_deref(), Some(note.id.to_string().as_str()));
+        assert_eq!(
+            node_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
         assert_eq!(node_event.project_id, pid.to_string());
         assert_eq!(node_event.delta["note_type"], "guideline");
         assert_eq!(node_event.delta["importance"], "high");
@@ -2663,7 +2665,10 @@ mod tests {
             .expect("delete_note should emit NodeUpdated graph event");
 
         assert_eq!(delete_event.layer, GraphLayer::Knowledge);
-        assert_eq!(delete_event.node_id.as_deref(), Some(note.id.to_string().as_str()));
+        assert_eq!(
+            delete_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
         assert_eq!(delete_event.project_id, pid.to_string());
     }
 
@@ -2681,9 +2686,7 @@ mod tests {
             entity_type: EntityType::File,
             entity_id: "src/main.rs".to_string(),
         };
-        mgr.link_note_to_entity(note.id, &link_req)
-            .await
-            .unwrap();
+        mgr.link_note_to_entity(note.id, &link_req).await.unwrap();
 
         let events = recorder.take_graph_events();
         let edge_event = events
@@ -2692,7 +2695,10 @@ mod tests {
             .expect("link_note should emit EdgeCreated graph event");
 
         assert_eq!(edge_event.layer, GraphLayer::Knowledge);
-        assert_eq!(edge_event.node_id.as_deref(), Some(note.id.to_string().as_str()));
+        assert_eq!(
+            edge_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
         assert_eq!(edge_event.target_id.as_deref(), Some("src/main.rs"));
         assert_eq!(edge_event.edge_type.as_deref(), Some("LINKED_TO"));
     }
@@ -2708,9 +2714,7 @@ mod tests {
             entity_type: EntityType::File,
             entity_id: "src/main.rs".to_string(),
         };
-        mgr.link_note_to_entity(note.id, &link_req)
-            .await
-            .unwrap();
+        mgr.link_note_to_entity(note.id, &link_req).await.unwrap();
         recorder.take_graph_events();
 
         // Unlink
@@ -2725,7 +2729,10 @@ mod tests {
             .expect("unlink_note should emit EdgeRemoved graph event");
 
         assert_eq!(edge_event.layer, GraphLayer::Knowledge);
-        assert_eq!(edge_event.node_id.as_deref(), Some(note.id.to_string().as_str()));
+        assert_eq!(
+            edge_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
         assert_eq!(edge_event.target_id.as_deref(), Some("src/main.rs"));
         assert_eq!(edge_event.edge_type.as_deref(), Some("LINKED_TO"));
     }
@@ -2755,7 +2762,11 @@ mod tests {
         );
         // energy_delta should be 0.3 (confirmation boost)
         let delta = reinforce_event.delta["energy_delta"].as_f64().unwrap();
-        assert!((delta - 0.3).abs() < f64::EPSILON, "energy delta should be 0.3, got {}", delta);
+        assert!(
+            (delta - 0.3).abs() < f64::EPSILON,
+            "energy delta should be 0.3, got {}",
+            delta
+        );
     }
 
     #[tokio::test]
@@ -2807,9 +2818,7 @@ mod tests {
             entity_type: EntityType::File,
             entity_id: "src/test.rs".to_string(),
         };
-        mgr.link_note_to_entity(note.id, &link_req)
-            .await
-            .unwrap();
+        mgr.link_note_to_entity(note.id, &link_req).await.unwrap();
         mgr.confirm_note(note.id, "agent-1").await.unwrap();
         mgr.delete_note(note.id).await.unwrap();
     }

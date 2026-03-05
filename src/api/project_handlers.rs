@@ -641,7 +641,12 @@ pub async fn get_project_graph(
                 break;
             }
             let label = if note.content.chars().count() > 40 {
-                let end = note.content.char_indices().nth(40).map(|(i, _)| i).unwrap_or(note.content.len());
+                let end = note
+                    .content
+                    .char_indices()
+                    .nth(40)
+                    .map(|(i, _)| i)
+                    .unwrap_or(note.content.len());
                 format!("{}…", &note.content[..end])
             } else {
                 note.content.clone()
@@ -673,7 +678,12 @@ pub async fn get_project_graph(
                 break;
             }
             let label = if decision.description.chars().count() > 40 {
-                let end = decision.description.char_indices().nth(40).map(|(i, _)| i).unwrap_or(decision.description.len());
+                let end = decision
+                    .description
+                    .char_indices()
+                    .nth(40)
+                    .map(|(i, _)| i)
+                    .unwrap_or(decision.description.len());
                 format!("{}…", &decision.description[..end])
             } else {
                 decision.description.clone()
@@ -801,9 +811,7 @@ pub async fn get_project_graph(
             skills_node_count += 1;
 
             // HAS_MEMBER edges to notes/decisions
-            if let Ok((member_notes, member_decisions)) =
-                neo4j.get_skill_members(skill.id).await
-            {
+            if let Ok((member_notes, member_decisions)) = neo4j.get_skill_members(skill.id).await {
                 for note in &member_notes {
                     if node_ids.contains(&note.id.to_string()) {
                         all_edges.push(GraphEdge {

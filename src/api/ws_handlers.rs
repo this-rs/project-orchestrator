@@ -410,16 +410,22 @@ mod tests {
     #[test]
     fn test_passes_filters_entity_match() {
         let event = make_crud_event(EntityType::Plan, None);
-        let filter: Option<HashSet<String>> =
-            Some(["plan".to_string(), "task".to_string()].into_iter().collect());
+        let filter: Option<HashSet<String>> = Some(
+            ["plan".to_string(), "task".to_string()]
+                .into_iter()
+                .collect(),
+        );
         assert!(passes_filters(&event, &filter, &None));
     }
 
     #[test]
     fn test_passes_filters_entity_no_match() {
         let event = make_crud_event(EntityType::Note, None);
-        let filter: Option<HashSet<String>> =
-            Some(["plan".to_string(), "task".to_string()].into_iter().collect());
+        let filter: Option<HashSet<String>> = Some(
+            ["plan".to_string(), "task".to_string()]
+                .into_iter()
+                .collect(),
+        );
         assert!(!passes_filters(&event, &filter, &None));
     }
 
@@ -476,29 +482,43 @@ mod tests {
     #[test]
     fn test_graph_filters_layer_match() {
         let event = make_graph_event(GraphLayer::Knowledge, "proj-1");
-        let filter: Option<HashSet<String>> =
-            Some(["knowledge".to_string(), "neural".to_string()].into_iter().collect());
+        let filter: Option<HashSet<String>> = Some(
+            ["knowledge".to_string(), "neural".to_string()]
+                .into_iter()
+                .collect(),
+        );
         assert!(passes_graph_filters(&event, &filter, &None));
     }
 
     #[test]
     fn test_graph_filters_layer_no_match() {
         let event = make_graph_event(GraphLayer::Code, "proj-1");
-        let filter: Option<HashSet<String>> =
-            Some(["knowledge".to_string(), "neural".to_string()].into_iter().collect());
+        let filter: Option<HashSet<String>> = Some(
+            ["knowledge".to_string(), "neural".to_string()]
+                .into_iter()
+                .collect(),
+        );
         assert!(!passes_graph_filters(&event, &filter, &None));
     }
 
     #[test]
     fn test_graph_filters_project_match() {
         let event = make_graph_event(GraphLayer::Neural, "proj-1");
-        assert!(passes_graph_filters(&event, &None, &Some("proj-1".to_string())));
+        assert!(passes_graph_filters(
+            &event,
+            &None,
+            &Some("proj-1".to_string())
+        ));
     }
 
     #[test]
     fn test_graph_filters_project_no_match() {
         let event = make_graph_event(GraphLayer::Neural, "proj-1");
-        assert!(!passes_graph_filters(&event, &None, &Some("proj-2".to_string())));
+        assert!(!passes_graph_filters(
+            &event,
+            &None,
+            &Some("proj-2".to_string())
+        ));
     }
 
     #[test]
@@ -516,7 +536,11 @@ mod tests {
         let layer_filter: Option<HashSet<String>> =
             Some(["neural".to_string()].into_iter().collect());
         let project_filter = Some("proj-1".to_string());
-        assert!(!passes_graph_filters(&event, &layer_filter, &project_filter));
+        assert!(!passes_graph_filters(
+            &event,
+            &layer_filter,
+            &project_filter
+        ));
     }
 
     #[test]
@@ -525,7 +549,11 @@ mod tests {
         let layer_filter: Option<HashSet<String>> =
             Some(["neural".to_string()].into_iter().collect());
         let project_filter = Some("proj-1".to_string());
-        assert!(!passes_graph_filters(&event, &layer_filter, &project_filter));
+        assert!(!passes_graph_filters(
+            &event,
+            &layer_filter,
+            &project_filter
+        ));
     }
 
     #[test]
@@ -541,8 +569,7 @@ mod tests {
         ];
         for (name, layer) in layers {
             let event = make_graph_event(layer, "proj-1");
-            let filter: Option<HashSet<String>> =
-                Some([name.to_string()].into_iter().collect());
+            let filter: Option<HashSet<String>> = Some([name.to_string()].into_iter().collect());
             assert!(
                 passes_graph_filters(&event, &filter, &None),
                 "Layer '{}' should pass filter",
@@ -566,7 +593,8 @@ mod tests {
 
     #[test]
     fn test_ws_query_deserialize() {
-        let json = r#"{"entity_types":"plan,task","project_id":"proj-1","layers":"knowledge,neural"}"#;
+        let json =
+            r#"{"entity_types":"plan,task","project_id":"proj-1","layers":"knowledge,neural"}"#;
         let query: WsQuery = serde_json::from_str(json).unwrap();
         assert_eq!(query.entity_types.as_deref(), Some("plan,task"));
         assert_eq!(query.project_id.as_deref(), Some("proj-1"));
@@ -664,8 +692,11 @@ mod tests {
             make_graph_event(GraphLayer::Fabric, "proj-2"),
         ];
 
-        let layer_filter: Option<HashSet<String>> =
-            Some(["knowledge".to_string(), "neural".to_string()].into_iter().collect());
+        let layer_filter: Option<HashSet<String>> = Some(
+            ["knowledge".to_string(), "neural".to_string()]
+                .into_iter()
+                .collect(),
+        );
         let project_filter = Some("proj-1".to_string());
 
         let passed: Vec<_> = events

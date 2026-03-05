@@ -666,7 +666,9 @@ impl Neo4jClient {
                 rationale: row.get("rationale").unwrap_or_default(),
                 alternatives: alts_raw,
                 chosen_option: row.get("chosen_option").ok(),
-                decided_by: row.get("decided_by").unwrap_or_else(|_| "unknown".to_string()),
+                decided_by: row
+                    .get("decided_by")
+                    .unwrap_or_else(|_| "unknown".to_string()),
                 decided_at: decided_at_str
                     .parse()
                     .unwrap_or_else(|_| chrono::Utc::now()),

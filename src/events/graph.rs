@@ -239,7 +239,10 @@ mod tests {
         }
 
         // Verify snake_case
-        assert_eq!(serde_json::to_string(&GraphLayer::Code).unwrap(), "\"code\"");
+        assert_eq!(
+            serde_json::to_string(&GraphLayer::Code).unwrap(),
+            "\"code\""
+        );
         assert_eq!(serde_json::to_string(&GraphLayer::Pm).unwrap(), "\"pm\"");
     }
 

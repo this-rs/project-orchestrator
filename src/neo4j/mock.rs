@@ -5450,10 +5450,8 @@ impl GraphStore for MockGraphStore {
     ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>> {
         // Mock: return all decisions with empty affects (simplified)
         let decisions = self.decisions.read().await;
-        let results: Vec<(DecisionNode, Vec<AffectsRelation>)> = decisions
-            .values()
-            .map(|d| (d.clone(), vec![]))
-            .collect();
+        let results: Vec<(DecisionNode, Vec<AffectsRelation>)> =
+            decisions.values().map(|d| (d.clone(), vec![])).collect();
         Ok(results)
     }
 
