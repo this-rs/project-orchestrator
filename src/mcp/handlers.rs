@@ -5763,7 +5763,10 @@ mod tests {
     async fn test_http_get_workspace_milestone() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle("get_workspace_milestone", Some(json!({"milestone_id": UUID1})))
+            .handle(
+                "get_workspace_milestone",
+                Some(json!({"milestone_id": UUID1})),
+            )
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
@@ -5794,7 +5797,10 @@ mod tests {
     async fn test_http_delete_workspace_milestone() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle("delete_workspace_milestone", Some(json!({"milestone_id": UUID1})))
+            .handle(
+                "delete_workspace_milestone",
+                Some(json!({"milestone_id": UUID1})),
+            )
             .await
             .unwrap();
         assert_eq!(result["method"], "DELETE");
