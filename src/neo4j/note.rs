@@ -1598,17 +1598,23 @@ impl Neo4jClient {
             UNWIND $items AS pair
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
             MERGE (a)-[s1:SYNAPSE]->(b)
-              ON CREATE SET s1.weight = 0.5, s1.created_at = datetime()
+              ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
+                s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1
               ON MATCH SET s1.weight = CASE
                   WHEN s1.weight + $boost > 1.0 THEN 1.0
                   ELSE s1.weight + $boost
-              END
+              END,
+                s1.last_reinforced_at = datetime(),
+                s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1
             MERGE (b)-[s2:SYNAPSE]->(a)
-              ON CREATE SET s2.weight = 0.5, s2.created_at = datetime()
+              ON CREATE SET s2.weight = 0.5, s2.created_at = datetime(),
+                s2.last_reinforced_at = datetime(), s2.reinforcement_count = 1
               ON MATCH SET s2.weight = CASE
                   WHEN s2.weight + $boost > 1.0 THEN 1.0
                   ELSE s2.weight + $boost
-              END
+              END,
+                s2.last_reinforced_at = datetime(),
+                s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1
             "#,
             |q| q.param("boost", boost),
         )

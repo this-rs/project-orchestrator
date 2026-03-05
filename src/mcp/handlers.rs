@@ -2142,7 +2142,7 @@ impl ToolHandler {
             }
 
             "get_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let result = http
                     .get(&format!("/api/workspace-milestones/{}", id))
                     .await?;
@@ -2150,7 +2150,7 @@ impl ToolHandler {
             }
 
             "update_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let mut body = serde_json::Map::new();
                 if let Some(v) = args.get("title") {
                     body.insert("title".to_string(), v.clone());
@@ -2178,7 +2178,7 @@ impl ToolHandler {
             }
 
             "delete_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let result = http
                     .delete(&format!("/api/workspace-milestones/{}", id))
                     .await?;
@@ -2190,7 +2190,7 @@ impl ToolHandler {
             }
 
             "add_task_to_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let task_id = extract_id(args, "task_id")?;
                 let body = json!({"task_id": task_id});
                 let result = http
@@ -2204,7 +2204,7 @@ impl ToolHandler {
             }
 
             "link_plan_to_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let plan_id = extract_id(args, "plan_id")?;
                 let body = json!({"plan_id": plan_id});
                 let result = http
@@ -2218,7 +2218,7 @@ impl ToolHandler {
             }
 
             "unlink_plan_from_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let plan_id = extract_id(args, "plan_id")?;
                 let result = http
                     .delete(&format!(
@@ -2234,7 +2234,7 @@ impl ToolHandler {
             }
 
             "get_workspace_milestone_progress" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let result = http
                     .get(&format!("/api/workspace-milestones/{}/progress", id))
                     .await?;
@@ -5763,7 +5763,10 @@ mod tests {
     async fn test_http_get_workspace_milestone() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle("get_workspace_milestone", Some(json!({"id": UUID1})))
+            .handle(
+                "get_workspace_milestone",
+                Some(json!({"milestone_id": UUID1})),
+            )
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
@@ -5779,7 +5782,7 @@ mod tests {
         let result = handler
             .handle(
                 "update_workspace_milestone",
-                Some(json!({"id": UUID1, "title": "GA"})),
+                Some(json!({"milestone_id": UUID1, "title": "GA"})),
             )
             .await
             .unwrap();
@@ -5794,7 +5797,10 @@ mod tests {
     async fn test_http_delete_workspace_milestone() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle("delete_workspace_milestone", Some(json!({"id": UUID1})))
+            .handle(
+                "delete_workspace_milestone",
+                Some(json!({"milestone_id": UUID1})),
+            )
             .await
             .unwrap();
         assert_eq!(result["method"], "DELETE");
@@ -5810,7 +5816,7 @@ mod tests {
         let result = handler
             .handle(
                 "add_task_to_workspace_milestone",
-                Some(json!({"id": UUID1, "task_id": UUID2})),
+                Some(json!({"milestone_id": UUID1, "task_id": UUID2})),
             )
             .await
             .unwrap();
@@ -5824,7 +5830,7 @@ mod tests {
         let result = handler
             .handle(
                 "link_plan_to_workspace_milestone",
-                Some(json!({"id": UUID1, "plan_id": UUID2})),
+                Some(json!({"milestone_id": UUID1, "plan_id": UUID2})),
             )
             .await
             .unwrap();
@@ -5838,7 +5844,7 @@ mod tests {
         let result = handler
             .handle(
                 "unlink_plan_from_workspace_milestone",
-                Some(json!({"id": UUID1, "plan_id": UUID2})),
+                Some(json!({"milestone_id": UUID1, "plan_id": UUID2})),
             )
             .await
             .unwrap();
@@ -5852,7 +5858,7 @@ mod tests {
         let result = handler
             .handle(
                 "get_workspace_milestone_progress",
-                Some(json!({"id": UUID1})),
+                Some(json!({"milestone_id": UUID1})),
             )
             .await
             .unwrap();
