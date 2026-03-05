@@ -5383,6 +5383,80 @@ impl GraphStore for MockGraphStore {
         Ok((vec![], 0))
     }
 
+    async fn get_project_note_entity_links(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String, String)>> {
+        let notes = self.notes.read().await;
+        let note_anchors = self.note_anchors.read().await;
+
+        let mut links = Vec::new();
+        for note in notes.values() {
+            if note.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(anchors) = note_anchors.get(&note.id) {
+                for anchor in anchors {
+                    let entity_type = format!("{:?}", anchor.entity_type).to_lowercase();
+                    links.push((note.id.to_string(), entity_type, anchor.entity_id.clone()));
+                }
+            }
+        }
+        Ok(links)
+    }
+
+    async fn get_project_note_synapses(
+        &self,
+        project_id: Uuid,
+        min_weight: f64,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+
+        // Collect project note IDs
+        let project_note_ids: std::collections::HashSet<Uuid> = notes
+            .values()
+            .filter(|n| n.project_id == Some(project_id))
+            .map(|n| n.id)
+            .collect();
+
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (&source_id, neighbors) in synapses.iter() {
+            if !project_note_ids.contains(&source_id) {
+                continue;
+            }
+            for (target_id, weight) in neighbors {
+                if !project_note_ids.contains(target_id) || *weight < min_weight {
+                    continue;
+                }
+                // Deduplicate bidirectional
+                let key = if source_id < *target_id {
+                    (source_id, *target_id)
+                } else {
+                    (*target_id, source_id)
+                };
+                if seen.insert(key) {
+                    result.push((source_id.to_string(), target_id.to_string(), *weight));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_project_decisions_for_graph(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>> {
+        // Mock: return all decisions with empty affects (simplified)
+        let decisions = self.decisions.read().await;
+        let results: Vec<(DecisionNode, Vec<AffectsRelation>)> = decisions
+            .values()
+            .map(|d| (d.clone(), vec![]))
+            .collect();
+        Ok(results)
+    }
+
     // ========================================================================
     // Chat session operations
     // ========================================================================

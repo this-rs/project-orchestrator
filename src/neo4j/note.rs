@@ -1914,4 +1914,71 @@ impl Neo4jClient {
             last_assertion_result: None, // Loaded separately if needed
         })
     }
+
+    // ========================================================================
+    // Graph visualization batch queries
+    // ========================================================================
+
+    /// Get all LINKED_TO edges from notes in a project to code entities (batch).
+    /// Returns (note_id, entity_type_label, entity_id).
+    pub async fn get_project_note_entity_links(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String, String)>> {
+        let q = query(
+            "MATCH (n:Note {project_id: $pid})-[:LINKED_TO]->(e)
+             RETURN n.id AS note_id,
+                    CASE
+                      WHEN e:File THEN 'file'
+                      WHEN e:Function THEN 'function'
+                      WHEN e:Struct THEN 'struct'
+                      WHEN e:Trait THEN 'trait'
+                      WHEN e:Enum THEN 'enum'
+                      ELSE 'unknown'
+                    END AS entity_type,
+                    COALESCE(e.path, e.id, toString(elementId(e))) AS entity_id"
+        )
+        .param("pid", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut links = Vec::new();
+        while let Some(row) = result.next().await? {
+            let note_id: String = row.get("note_id").unwrap_or_default();
+            let entity_type: String = row.get("entity_type").unwrap_or_default();
+            let entity_id: String = row.get("entity_id").unwrap_or_default();
+            if !note_id.is_empty() && !entity_id.is_empty() {
+                links.push((note_id, entity_type, entity_id));
+            }
+        }
+        Ok(links)
+    }
+
+    /// Get all SYNAPSE edges between notes in a project (batch, deduplicated).
+    /// Returns (source_note_id, target_note_id, weight).
+    pub async fn get_project_note_synapses(
+        &self,
+        project_id: Uuid,
+        min_weight: f64,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let q = query(
+            "MATCH (a:Note {project_id: $pid})-[s:SYNAPSE]->(b:Note {project_id: $pid})
+             WHERE s.weight >= $min_weight AND a.id < b.id
+             RETURN a.id AS source_id, b.id AS target_id, s.weight AS weight
+             ORDER BY s.weight DESC"
+        )
+        .param("pid", project_id.to_string())
+        .param("min_weight", min_weight);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut synapses = Vec::new();
+        while let Some(row) = result.next().await? {
+            let source: String = row.get("source_id").unwrap_or_default();
+            let target: String = row.get("target_id").unwrap_or_default();
+            let weight: f64 = row.get("weight").unwrap_or(0.0);
+            if !source.is_empty() && !target.is_empty() {
+                synapses.push((source, target, weight));
+            }
+        }
+        Ok(synapses)
+    }
 }

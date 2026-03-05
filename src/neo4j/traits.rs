@@ -1460,6 +1460,36 @@ pub trait GraphStore: Send + Sync {
     async fn delete_synapses(&self, note_id: Uuid) -> Result<usize>;
 
     // ========================================================================
+    // Graph visualization batch queries (Intelligence Visualization)
+    // ========================================================================
+
+    /// Get all LINKED_TO edges from notes in a project to code entities.
+    /// Returns Vec<(note_id_string, entity_type, entity_id)>.
+    /// Used by the graph visualization endpoint to build the Knowledge layer.
+    async fn get_project_note_entity_links(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String, String)>>;
+
+    /// Get all SYNAPSE edges between notes in a project.
+    /// Returns Vec<(source_note_id, target_note_id, weight)>.
+    /// Deduplicates bidirectional synapses (only returns one direction).
+    /// Used by the graph visualization endpoint to build the Neural layer.
+    async fn get_project_note_synapses(
+        &self,
+        project_id: Uuid,
+        min_weight: f64,
+    ) -> Result<Vec<(String, String, f64)>>;
+
+    /// Get all decisions scoped to a project (via Plan→Task→Decision chain).
+    /// Returns decisions with their AFFECTS relations.
+    /// Used by the graph visualization endpoint to build the Knowledge layer.
+    async fn get_project_decisions_for_graph(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>>;
+
+    // ========================================================================
     // Energy operations (Phase 2 — Neural Network)
     // ========================================================================
 

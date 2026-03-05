@@ -620,4 +620,72 @@ impl Neo4jClient {
         self.graph.run(q).await?;
         Ok(())
     }
+
+    // ========================================================================
+    // Graph visualization batch queries
+    // ========================================================================
+
+    /// Get all decisions scoped to a project (via Plan→Task→Decision chain)
+    /// along with their AFFECTS relations. Used by the graph visualization endpoint.
+    pub async fn get_project_decisions_for_graph(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>> {
+        // Step 1: Get all decisions for this project
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})<-[:BELONGS_TO_PROJECT]-(plan:Plan)
+                  <-[:BELONGS_TO_PLAN]-(task:Task)-[:HAS_DECISION]->(d:Decision)
+            RETURN d.id AS id, d.description AS description, d.rationale AS rationale,
+                   d.alternatives AS alternatives, d.chosen_option AS chosen_option,
+                   d.decided_by AS decided_by, d.decided_at AS decided_at,
+                   d.status AS status
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut decisions: Vec<DecisionNode> = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id_str: String = row.get("id").unwrap_or_default();
+            let id = id_str.parse::<Uuid>().unwrap_or_default();
+            if id.is_nil() {
+                continue;
+            }
+            let alts_raw: Vec<String> = row.get("alternatives").unwrap_or_default();
+            let status: DecisionStatus = row
+                .get::<String>("status")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DecisionStatus::Accepted);
+            let decided_at_str: String = row.get("decided_at").unwrap_or_default();
+
+            decisions.push(DecisionNode {
+                id,
+                description: row.get("description").unwrap_or_default(),
+                rationale: row.get("rationale").unwrap_or_default(),
+                alternatives: alts_raw,
+                chosen_option: row.get("chosen_option").ok(),
+                decided_by: row.get("decided_by").unwrap_or_else(|_| "unknown".to_string()),
+                decided_at: decided_at_str
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                status,
+                embedding: None,
+                embedding_model: None,
+            });
+        }
+
+        // Step 2: For each decision, get AFFECTS relations
+        let mut results = Vec::new();
+        for decision in decisions {
+            let affects = self
+                .list_decision_affects(decision.id)
+                .await
+                .unwrap_or_default();
+            results.push((decision, affects));
+        }
+
+        Ok(results)
+    }
 }

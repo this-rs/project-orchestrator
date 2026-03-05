@@ -621,7 +621,228 @@ pub async fn get_project_graph(
         );
     }
 
-    // ---- Knowledge, Neural, Skills layers (TODO: incremental additions) ----
+    // ---- Knowledge Layer (Notes + Decisions + LINKED_TO + AFFECTS edges) ----
+    if requested_layers.contains(&"knowledge".to_string()) {
+        let mut knowledge_node_count = 0usize;
+        let mut knowledge_edge_count = 0usize;
+
+        // Get all project notes (active only)
+        let note_filters = crate::notes::NoteFilters {
+            status: Some(vec![crate::notes::NoteStatus::Active]),
+            ..Default::default()
+        };
+        let (notes, _) = neo4j
+            .list_notes(Some(project.id), None, &note_filters)
+            .await
+            .unwrap_or_default();
+
+        for note in &notes {
+            if knowledge_node_count >= limit {
+                break;
+            }
+            let label = if note.content.chars().count() > 40 {
+                let end = note.content.char_indices().nth(40).map(|(i, _)| i).unwrap_or(note.content.len());
+                format!("{}…", &note.content[..end])
+            } else {
+                note.content.clone()
+            };
+            all_nodes.push(GraphNode {
+                id: note.id.to_string(),
+                node_type: "note".to_string(),
+                label,
+                layer: "knowledge".to_string(),
+                attributes: Some(serde_json::json!({
+                    "note_type": format!("{:?}", note.note_type).to_lowercase(),
+                    "importance": format!("{:?}", note.importance).to_lowercase(),
+                    "energy": note.energy,
+                    "status": format!("{:?}", note.status).to_lowercase(),
+                })),
+            });
+            node_ids.insert(note.id.to_string());
+            knowledge_node_count += 1;
+        }
+
+        // Get decisions for this project
+        let decisions_with_affects = neo4j
+            .get_project_decisions_for_graph(project.id)
+            .await
+            .unwrap_or_default();
+
+        for (decision, affects) in &decisions_with_affects {
+            if knowledge_node_count >= limit {
+                break;
+            }
+            let label = if decision.description.chars().count() > 40 {
+                let end = decision.description.char_indices().nth(40).map(|(i, _)| i).unwrap_or(decision.description.len());
+                format!("{}…", &decision.description[..end])
+            } else {
+                decision.description.clone()
+            };
+            all_nodes.push(GraphNode {
+                id: decision.id.to_string(),
+                node_type: "decision".to_string(),
+                label,
+                layer: "knowledge".to_string(),
+                attributes: Some(serde_json::json!({
+                    "status": format!("{:?}", decision.status).to_lowercase(),
+                    "chosen_option": decision.chosen_option,
+                    "rationale": decision.rationale,
+                })),
+            });
+            node_ids.insert(decision.id.to_string());
+            knowledge_node_count += 1;
+
+            // AFFECTS edges (decision → entity)
+            for affect in affects {
+                let target_id = &affect.entity_id;
+                if node_ids.contains(target_id) {
+                    all_edges.push(GraphEdge {
+                        source: decision.id.to_string(),
+                        target: target_id.clone(),
+                        edge_type: "AFFECTS".to_string(),
+                        layer: "knowledge".to_string(),
+                        attributes: Some(serde_json::json!({
+                            "entity_type": affect.entity_type,
+                            "impact": affect.impact_description,
+                        })),
+                    });
+                    knowledge_edge_count += 1;
+                }
+            }
+        }
+
+        // LINKED_TO edges (note → code entity)
+        let note_links = neo4j
+            .get_project_note_entity_links(project.id)
+            .await
+            .unwrap_or_default();
+
+        for (note_id, _entity_type, entity_id) in &note_links {
+            if node_ids.contains(note_id.as_str()) && node_ids.contains(entity_id.as_str()) {
+                all_edges.push(GraphEdge {
+                    source: note_id.clone(),
+                    target: entity_id.clone(),
+                    edge_type: "LINKED_TO".to_string(),
+                    layer: "knowledge".to_string(),
+                    attributes: None,
+                });
+                knowledge_edge_count += 1;
+            }
+        }
+
+        stats.insert(
+            "knowledge".to_string(),
+            LayerStats {
+                nodes: knowledge_node_count,
+                edges: knowledge_edge_count,
+            },
+        );
+    }
+
+    // ---- Neural Layer (SYNAPSE edges between notes) ----
+    if requested_layers.contains(&"neural".to_string()) {
+        let synapses = neo4j
+            .get_project_note_synapses(project.id, 0.1)
+            .await
+            .unwrap_or_default();
+
+        let mut neural_edge_count = 0usize;
+        for (source, target, weight) in &synapses {
+            // Only include edges where both notes are already in the graph
+            if node_ids.contains(source.as_str()) && node_ids.contains(target.as_str()) {
+                all_edges.push(GraphEdge {
+                    source: source.clone(),
+                    target: target.clone(),
+                    edge_type: "SYNAPSE".to_string(),
+                    layer: "neural".to_string(),
+                    attributes: Some(serde_json::json!({
+                        "weight": weight,
+                    })),
+                });
+                neural_edge_count += 1;
+            }
+        }
+
+        stats.insert(
+            "neural".to_string(),
+            LayerStats {
+                nodes: 0,
+                edges: neural_edge_count,
+            },
+        );
+    }
+
+    // ---- Skills Layer (Skill nodes + HAS_MEMBER edges to notes/decisions) ----
+    if requested_layers.contains(&"skills".to_string()) {
+        let mut skills_node_count = 0usize;
+        let mut skills_edge_count = 0usize;
+
+        let (skills, _) = neo4j
+            .list_skills(project.id, None, limit, 0)
+            .await
+            .unwrap_or_default();
+
+        for skill in &skills {
+            if skills_node_count >= limit {
+                break;
+            }
+            all_nodes.push(GraphNode {
+                id: skill.id.to_string(),
+                node_type: "skill".to_string(),
+                label: skill.name.clone(),
+                layer: "skills".to_string(),
+                attributes: Some(serde_json::json!({
+                    "status": format!("{:?}", skill.status).to_lowercase(),
+                    "energy": skill.energy,
+                    "cohesion": skill.cohesion,
+                })),
+            });
+            node_ids.insert(skill.id.to_string());
+            skills_node_count += 1;
+
+            // HAS_MEMBER edges to notes/decisions
+            if let Ok((member_notes, member_decisions)) =
+                neo4j.get_skill_members(skill.id).await
+            {
+                for note in &member_notes {
+                    if node_ids.contains(&note.id.to_string()) {
+                        all_edges.push(GraphEdge {
+                            source: skill.id.to_string(),
+                            target: note.id.to_string(),
+                            edge_type: "HAS_MEMBER".to_string(),
+                            layer: "skills".to_string(),
+                            attributes: Some(serde_json::json!({
+                                "member_type": "note",
+                            })),
+                        });
+                        skills_edge_count += 1;
+                    }
+                }
+                for decision in &member_decisions {
+                    if node_ids.contains(&decision.id.to_string()) {
+                        all_edges.push(GraphEdge {
+                            source: skill.id.to_string(),
+                            target: decision.id.to_string(),
+                            edge_type: "HAS_MEMBER".to_string(),
+                            layer: "skills".to_string(),
+                            attributes: Some(serde_json::json!({
+                                "member_type": "decision",
+                            })),
+                        });
+                        skills_edge_count += 1;
+                    }
+                }
+            }
+        }
+
+        stats.insert(
+            "skills".to_string(),
+            LayerStats {
+                nodes: skills_node_count,
+                edges: skills_edge_count,
+            },
+        );
+    }
 
     Ok(Json(ProjectGraphResponse {
         nodes: all_nodes,
