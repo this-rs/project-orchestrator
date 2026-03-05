@@ -2142,7 +2142,7 @@ impl ToolHandler {
             }
 
             "get_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let result = http
                     .get(&format!("/api/workspace-milestones/{}", id))
                     .await?;
@@ -2150,7 +2150,7 @@ impl ToolHandler {
             }
 
             "update_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let mut body = serde_json::Map::new();
                 if let Some(v) = args.get("title") {
                     body.insert("title".to_string(), v.clone());
@@ -2178,7 +2178,7 @@ impl ToolHandler {
             }
 
             "delete_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let result = http
                     .delete(&format!("/api/workspace-milestones/{}", id))
                     .await?;
@@ -2190,7 +2190,7 @@ impl ToolHandler {
             }
 
             "add_task_to_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let task_id = extract_id(args, "task_id")?;
                 let body = json!({"task_id": task_id});
                 let result = http
@@ -2204,7 +2204,7 @@ impl ToolHandler {
             }
 
             "link_plan_to_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let plan_id = extract_id(args, "plan_id")?;
                 let body = json!({"plan_id": plan_id});
                 let result = http
@@ -2218,7 +2218,7 @@ impl ToolHandler {
             }
 
             "unlink_plan_from_workspace_milestone" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id(args, "milestone_id")?;
                 let plan_id = extract_id(args, "plan_id")?;
                 let result = http
                     .delete(&format!(
