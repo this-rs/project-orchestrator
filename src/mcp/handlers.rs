@@ -95,6 +95,8 @@ impl ToolHandler {
             ("project", "sync") => "sync_project",
             ("project", "get_roadmap") => "get_project_roadmap",
             ("project", "list_plans") => "list_project_plans",
+            ("project", "get_graph") => "get_project_graph",
+            ("project", "get_intelligence_summary") => "get_intelligence_summary",
 
             // Plan
             ("plan", "list") => "list_plans",
@@ -509,6 +511,35 @@ impl ToolHandler {
                     http.get_with_query(&format!("/api/projects/{}/plans", slug), &query)
                         .await?
                 };
+                Ok(Some(result))
+            }
+
+            "get_project_graph" => {
+                let slug = extract_string(args, "slug")?;
+                let mut query = Vec::new();
+                if let Some(v) = args.get("layers").and_then(|v| v.as_str()) {
+                    query.push(("layers".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("community").and_then(|v| v.as_i64()) {
+                    query.push(("community".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get(&format!("/api/projects/{}/graph", slug)).await?
+                } else {
+                    http.get_with_query(&format!("/api/projects/{}/graph", slug), &query)
+                        .await?
+                };
+                Ok(Some(result))
+            }
+
+            "get_intelligence_summary" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/intelligence/summary", slug))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -3551,6 +3582,23 @@ mod tests {
             resolved_args.get("name").unwrap().as_str().unwrap(),
             "My Project"
         );
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_project_visualization_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("get_graph", "get_project_graph"),
+            ("get_intelligence_summary", "get_intelligence_summary"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("project", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "project action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
     }
 
     #[test]

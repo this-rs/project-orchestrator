@@ -316,24 +316,26 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
 fn project_tool() -> ToolDefinition {
     ToolDefinition {
         name: "project".to_string(),
-        description: "Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans".to_string(),
+        description: "Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "sync", "get_roadmap", "list_plans"],
+                    "enum": ["list", "create", "get", "update", "delete", "sync", "get_roadmap", "list_plans", "get_graph", "get_intelligence_summary"],
                     "description": "Operation to perform"
                 },
-                "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans)"},
+                "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary)"},
                 "name": {"type": "string", "description": "Project name (create/update)"},
                 "root_path": {"type": "string", "description": "Path to codebase root (create/update)"},
                 "description": {"type": "string", "description": "Project description (create/update)"},
                 "search": {"type": "string", "description": "Search filter (list)"},
-                "limit": {"type": "integer", "description": "Max items (list)"},
+                "limit": {"type": "integer", "description": "Max items (list/get_graph)"},
                 "offset": {"type": "integer", "description": "Skip items (list)"},
                 "sort_by": {"type": "string", "description": "Sort field (list)"},
-                "sort_order": {"type": "string", "description": "asc or desc (list)"}
+                "sort_order": {"type": "string", "description": "asc or desc (list)"},
+                "layers": {"type": "string", "description": "Comma-separated layers: code,knowledge,fabric,neural,skills (get_graph, default: code)"},
+                "community": {"type": "integer", "description": "Filter by community_id (get_graph)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
