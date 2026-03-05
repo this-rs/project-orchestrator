@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn test_graph_event_filter_integration() {
         // Simulate the WS filter logic: emit multiple events, filter by layer
-        let events = vec![
+        let events = [
             make_graph_event(GraphLayer::Knowledge, "proj-1"),
             make_graph_event(GraphLayer::Neural, "proj-1"),
             make_graph_event(GraphLayer::Code, "proj-1"),
