@@ -233,6 +233,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/projects/{slug}/intelligence/summary",
             get(project_handlers::get_intelligence_summary),
         )
+        .route(
+            "/api/projects/{slug}/embeddings/projection",
+            get(project_handlers::get_embeddings_projection),
+        )
         // Releases (by project_id)
         .route(
             "/api/projects/{project_id}/releases",

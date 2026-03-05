@@ -2199,4 +2199,16 @@ pub trait GraphStore: Send + Sync {
     /// Check if any file in the project has GraIL analytics (context cards) computed.
     /// Used by staleness check to detect pre-GraIL projects needing first computation.
     async fn has_context_cards(&self, project_id: &str) -> Result<bool>;
+
+    // ========================================================================
+    // Embedding projection (UMAP visualization)
+    // ========================================================================
+
+    /// Get all note embeddings for a project in a single batch query.
+    /// Returns (note_id, embedding_vec, note_type, importance, energy, tags, content_preview).
+    /// Only returns notes that have embeddings. Used for UMAP 2D projection.
+    async fn get_note_embeddings_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<NoteEmbeddingPoint>>;
 }

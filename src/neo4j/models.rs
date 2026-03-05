@@ -1084,6 +1084,19 @@ pub struct NeuralMetrics {
     pub dead_notes_count: i64,
 }
 
+/// A note with its embedding vector, for UMAP 2D projection.
+/// Lightweight struct returned by `get_note_embeddings_for_project`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteEmbeddingPoint {
+    pub id: Uuid,
+    pub embedding: Vec<f32>,
+    pub note_type: String,
+    pub importance: String,
+    pub energy: f64,
+    pub tags: Vec<String>,
+    pub content_preview: String,
+}
+
 /// A feature graph — a named subgraph capturing all code entities related to a feature.
 /// Reusable across sessions to avoid re-exploring the same feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]

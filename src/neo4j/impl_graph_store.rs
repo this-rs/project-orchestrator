@@ -2607,4 +2607,11 @@ impl GraphStore for Neo4jClient {
     async fn has_context_cards(&self, project_id: &str) -> anyhow::Result<bool> {
         self.has_context_cards(project_id).await
     }
+
+    async fn get_note_embeddings_for_project(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<super::models::NoteEmbeddingPoint>> {
+        self.get_note_embeddings_for_project(project_id).await
+    }
 }

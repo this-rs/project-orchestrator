@@ -316,16 +316,16 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
 fn project_tool() -> ToolDefinition {
     ToolDefinition {
         name: "project".to_string(),
-        description: "Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary".to_string(),
+        description: "Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary, get_embeddings_projection".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "sync", "get_roadmap", "list_plans", "get_graph", "get_intelligence_summary"],
+                    "enum": ["list", "create", "get", "update", "delete", "sync", "get_roadmap", "list_plans", "get_graph", "get_intelligence_summary", "get_embeddings_projection"],
                     "description": "Operation to perform"
                 },
-                "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary)"},
+                "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary/get_embeddings_projection)"},
                 "name": {"type": "string", "description": "Project name (create/update)"},
                 "root_path": {"type": "string", "description": "Path to codebase root (create/update)"},
                 "description": {"type": "string", "description": "Project description (create/update)"},

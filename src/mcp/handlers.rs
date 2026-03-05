@@ -97,6 +97,7 @@ impl ToolHandler {
             ("project", "list_plans") => "list_project_plans",
             ("project", "get_graph") => "get_project_graph",
             ("project", "get_intelligence_summary") => "get_intelligence_summary",
+            ("project", "get_embeddings_projection") => "get_embeddings_projection",
 
             // Plan
             ("plan", "list") => "list_plans",
@@ -539,6 +540,14 @@ impl ToolHandler {
                 let slug = extract_string(args, "slug")?;
                 let result = http
                     .get(&format!("/api/projects/{}/intelligence/summary", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_embeddings_projection" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/embeddings/projection", slug))
                     .await?;
                 Ok(Some(result))
             }
@@ -3590,6 +3599,7 @@ mod tests {
         for (action, expected) in [
             ("get_graph", "get_project_graph"),
             ("get_intelligence_summary", "get_intelligence_summary"),
+            ("get_embeddings_projection", "get_embeddings_projection"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("project", &args).unwrap();

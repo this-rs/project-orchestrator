@@ -847,6 +847,213 @@ pub async fn get_intelligence_summary(
 }
 
 // ============================================================================
+// Embeddings 2D projection (UMAP)
+// ============================================================================
+
+/// A point in the 2D projection (note or decision)
+#[derive(Serialize)]
+pub struct ProjectionPoint {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub point_type: String,
+    pub x: f64,
+    pub y: f64,
+    pub energy: f64,
+    pub importance: String,
+    pub tags: Vec<String>,
+    pub content_preview: String,
+}
+
+/// A synapse edge between two notes
+#[derive(Serialize)]
+pub struct ProjectionSynapse {
+    pub source: String,
+    pub target: String,
+    pub weight: f64,
+}
+
+/// A skill cluster with centroid coordinates
+#[derive(Serialize)]
+pub struct ProjectionSkill {
+    pub id: String,
+    pub name: String,
+    pub member_ids: Vec<String>,
+    pub centroid_x: f64,
+    pub centroid_y: f64,
+}
+
+/// Response for GET /api/projects/:slug/embeddings/projection
+#[derive(Serialize)]
+pub struct EmbeddingsProjectionResponse {
+    pub points: Vec<ProjectionPoint>,
+    pub synapses: Vec<ProjectionSynapse>,
+    pub skills: Vec<ProjectionSkill>,
+    pub dimensions: usize,
+    pub method: String,
+}
+
+/// GET /api/projects/:slug/embeddings/projection
+///
+/// Projects note embeddings from high-dimensional space (768d) to 2D
+/// using UMAP for visualization. Returns points, synapses, and skill clusters.
+pub async fn get_embeddings_projection(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<EmbeddingsProjectionResponse>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    // 1. Resolve project
+    let project = neo4j
+        .get_project_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+    let pid = project.id;
+
+    // 2. Get all note embeddings for the project
+    let embedding_points = neo4j.get_note_embeddings_for_project(pid).await?;
+
+    if embedding_points.is_empty() {
+        return Ok(Json(EmbeddingsProjectionResponse {
+            points: vec![],
+            synapses: vec![],
+            skills: vec![],
+            dimensions: 0,
+            method: "none".to_string(),
+        }));
+    }
+
+    // 3. Extract embeddings as Vec<Vec<f64>> for UMAP
+    let embeddings_f64: Vec<Vec<f64>> = embedding_points
+        .iter()
+        .map(|p| p.embedding.iter().map(|&x| x as f64).collect())
+        .collect();
+
+    let dimensions = embeddings_f64.first().map(|v| v.len()).unwrap_or(0);
+
+    // 4. Run UMAP projection (requires >= 4 points for n_neighbors=15)
+    let projected_2d = if embedding_points.len() < 4 {
+        // Too few points for UMAP — use simple normalization
+        embedding_points
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let angle =
+                    2.0 * std::f64::consts::PI * (i as f64) / (embedding_points.len() as f64);
+                vec![angle.cos() * 10.0, angle.sin() * 10.0]
+            })
+            .collect::<Vec<_>>()
+    } else {
+        match rag_umap::convert_to_2d(embeddings_f64) {
+            Ok(coords) => coords,
+            Err(e) => {
+                tracing::warn!(
+                    "UMAP projection failed, falling back to circular layout: {}",
+                    e
+                );
+                embedding_points
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let angle = 2.0 * std::f64::consts::PI * (i as f64)
+                            / (embedding_points.len() as f64);
+                        vec![angle.cos() * 10.0, angle.sin() * 10.0]
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    // 5. Build projection points
+    let points: Vec<ProjectionPoint> = embedding_points
+        .iter()
+        .zip(projected_2d.iter())
+        .map(|(ep, coords)| ProjectionPoint {
+            id: ep.id.to_string(),
+            point_type: "note".to_string(),
+            x: coords.first().copied().unwrap_or(0.0),
+            y: coords.get(1).copied().unwrap_or(0.0),
+            energy: ep.energy,
+            importance: ep.importance.clone(),
+            tags: ep.tags.clone(),
+            content_preview: ep.content_preview.clone(),
+        })
+        .collect();
+
+    // 6. Get synapses and skills in parallel
+    let point_ids: HashSet<String> = points.iter().map(|p| p.id.clone()).collect();
+
+    let (synapse_res, skills_res) = tokio::join!(
+        neo4j.get_synapse_graph(pid, 0.0),
+        neo4j.list_skills(pid, None, 1000, 0),
+    );
+
+    // 7. Build synapses (filter to only include projected points)
+    let synapses: Vec<ProjectionSynapse> = synapse_res
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(src, tgt, _)| point_ids.contains(src) && point_ids.contains(tgt))
+        .map(|(source, target, weight)| ProjectionSynapse {
+            source,
+            target,
+            weight,
+        })
+        .collect();
+
+    // 8. Build skills with centroids
+    let id_to_coords: HashMap<String, (f64, f64)> =
+        points.iter().map(|p| (p.id.clone(), (p.x, p.y))).collect();
+
+    let all_skills = skills_res.map(|(s, _)| s).unwrap_or_default();
+    let mut skills = Vec::new();
+
+    for skill in &all_skills {
+        // Get member note IDs for this skill
+        let members = neo4j.get_skill_members(skill.id).await;
+        let member_notes = members.map(|(notes, _decs)| notes).unwrap_or_default();
+        let member_ids: Vec<String> = member_notes
+            .iter()
+            .map(|n| n.id.to_string())
+            .filter(|id| point_ids.contains(id))
+            .collect();
+
+        if member_ids.is_empty() {
+            continue;
+        }
+
+        // Compute centroid from projected coordinates
+        let (sum_x, sum_y, count) =
+            member_ids
+                .iter()
+                .fold((0.0_f64, 0.0_f64, 0usize), |(sx, sy, c), id| {
+                    if let Some(&(x, y)) = id_to_coords.get(id) {
+                        (sx + x, sy + y, c + 1)
+                    } else {
+                        (sx, sy, c)
+                    }
+                });
+
+        let centroid_x = if count > 0 { sum_x / count as f64 } else { 0.0 };
+        let centroid_y = if count > 0 { sum_y / count as f64 } else { 0.0 };
+
+        skills.push(ProjectionSkill {
+            id: skill.id.to_string(),
+            name: skill.name.clone(),
+            member_ids,
+            centroid_x,
+            centroid_y,
+        });
+    }
+
+    Ok(Json(EmbeddingsProjectionResponse {
+        points,
+        synapses,
+        skills,
+        dimensions,
+        method: "umap".to_string(),
+    }))
+}
+
+// ============================================================================
 // Utilities
 // ============================================================================
 
@@ -1517,6 +1724,128 @@ mod tests {
 
         let resp = app
             .oneshot(authed_get("/api/projects/nonexistent/intelligence/summary"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    // ====================================================================
+    // Embeddings projection tests
+    // ====================================================================
+
+    use crate::notes::NoteType;
+    use crate::test_helpers::test_note;
+
+    /// Helper: seed a project with notes that have embeddings
+    async fn seed_projection_project(app_state: &crate::AppState) -> ProjectNode {
+        let project = test_project_named("embed-proj");
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        // Create 5 notes with fake 4-dimensional embeddings (small for testing)
+        for i in 0..5 {
+            let note = test_note(
+                project.id,
+                NoteType::Context,
+                &format!("Note content {} about some topic", i),
+            );
+            app_state.neo4j.create_note(&note).await.unwrap();
+
+            // Generate a simple embedding: [i, i+1, i+2, i+3] normalized
+            let base = i as f32;
+            let emb = vec![base, base + 1.0, base + 2.0, base + 3.0];
+            app_state
+                .neo4j
+                .set_note_embedding(note.id, &emb, "test-model")
+                .await
+                .unwrap();
+        }
+
+        project
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_projection_empty_project() {
+        let app_state = mock_app_state();
+        let project = test_project_named("empty-embed");
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/embeddings/projection",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["points"].as_array().unwrap().len(), 0);
+        assert_eq!(json["method"], "none");
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_projection_with_notes() {
+        let app_state = mock_app_state();
+        let project = seed_projection_project(&app_state).await;
+
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/embeddings/projection",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should have 5 projected points
+        let points = json["points"].as_array().unwrap();
+        assert_eq!(points.len(), 5);
+
+        // Each point should have x, y coordinates and metadata
+        for point in points {
+            assert!(point["x"].is_f64() || point["x"].is_i64());
+            assert!(point["y"].is_f64() || point["y"].is_i64());
+            assert_eq!(point["type"], "note");
+            assert!(point["content_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Note content"));
+        }
+
+        // Method should be umap (5 points > 4 threshold)
+        assert_eq!(json["method"], "umap");
+        assert_eq!(json["dimensions"], 4);
+
+        // Synapses array should exist (empty since mock has none)
+        assert!(json["synapses"].is_array());
+
+        // Skills array should exist
+        assert!(json["skills"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_projection_not_found() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(
+                "/api/projects/nonexistent/embeddings/projection",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
