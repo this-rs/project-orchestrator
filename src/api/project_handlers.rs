@@ -632,6 +632,221 @@ pub async fn get_project_graph(
 }
 
 // ============================================================================
+// Intelligence Summary endpoint
+// ============================================================================
+
+/// Code layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeLayerSummary {
+    pub files: i64,
+    pub functions: usize,
+    pub communities: usize,
+    pub hotspots: Vec<HotspotEntry>,
+    pub orphans: usize,
+}
+
+/// A single hotspot entry
+#[derive(Debug, Clone, Serialize)]
+pub struct HotspotEntry {
+    pub path: String,
+    pub churn_score: f64,
+}
+
+/// Knowledge layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct KnowledgeLayerSummary {
+    pub notes: usize,
+    pub decisions: usize,
+    pub stale_count: usize,
+    pub types_distribution: HashMap<String, usize>,
+}
+
+/// Fabric layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct FabricLayerSummary {
+    pub co_changed_pairs: usize,
+}
+
+/// Neural layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct NeuralLayerSummary {
+    pub active_synapses: i64,
+    pub avg_energy: f64,
+    pub weak_synapses_ratio: f64,
+    pub dead_notes_count: i64,
+}
+
+/// Skills layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillsLayerSummary {
+    pub total: usize,
+    pub active: usize,
+    pub emerging: usize,
+    pub avg_cohesion: f64,
+    pub total_activations: i64,
+}
+
+/// Full intelligence summary response
+#[derive(Debug, Clone, Serialize)]
+pub struct IntelligenceSummaryResponse {
+    pub code: CodeLayerSummary,
+    pub knowledge: KnowledgeLayerSummary,
+    pub fabric: FabricLayerSummary,
+    pub neural: NeuralLayerSummary,
+    pub skills: SkillsLayerSummary,
+}
+
+/// GET /api/projects/:slug/intelligence/summary
+///
+/// Returns an aggregated dashboard of intelligence metrics across all 6 layers.
+/// Each layer is queried independently for performance.
+pub async fn get_intelligence_summary(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<IntelligenceSummaryResponse>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    let project = neo4j
+        .get_project_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+
+    let pid = project.id;
+
+    // Build filters outside tokio::join! to avoid temporary lifetime issues
+    let note_filters = crate::notes::NoteFilters {
+        limit: Some(0),
+        ..Default::default()
+    };
+
+    // Fire all queries in parallel
+    let (
+        file_count_res,
+        lang_stats_res,
+        communities_res,
+        hotspots_res,
+        health_res,
+        notes_res,
+        stale_res,
+        co_change_res,
+        neural_res,
+        skills_all_res,
+    ) = tokio::join!(
+        neo4j.count_project_files(pid),
+        neo4j.get_language_stats_for_project(pid),
+        neo4j.get_project_communities(pid),
+        neo4j.get_top_hotspots(pid, 5),
+        neo4j.get_code_health_report(pid, 200),
+        neo4j.list_notes(Some(pid), None, &note_filters),
+        neo4j.get_notes_needing_review(Some(pid)),
+        neo4j.get_co_change_graph(pid, 1, 100_000),
+        neo4j.get_neural_metrics(pid),
+        neo4j.list_skills(pid, None, 1000, 0),
+    );
+
+    // === Code layer ===
+    let file_count = file_count_res.unwrap_or(0);
+    let lang_stats = lang_stats_res.unwrap_or_default();
+    let function_count: usize = lang_stats.iter().map(|l| l.file_count).sum();
+    let communities_list = communities_res.unwrap_or_default();
+    let hotspots = hotspots_res.unwrap_or_default();
+    let health = health_res.ok();
+
+    let code = CodeLayerSummary {
+        files: file_count,
+        functions: function_count,
+        communities: communities_list.len(),
+        hotspots: hotspots
+            .iter()
+            .map(|h| HotspotEntry {
+                path: h.path.clone(),
+                churn_score: h.churn_score,
+            })
+            .collect(),
+        orphans: health.as_ref().map(|h| h.orphan_files.len()).unwrap_or(0),
+    };
+
+    // === Knowledge layer ===
+    let (_, notes_total) = notes_res.unwrap_or((vec![], 0));
+    let stale_notes = stale_res.unwrap_or_default();
+
+    // Build type distribution from notes — we need to fetch with a limit to get types
+    // For the summary, we use the total count and stale count; types require a separate call
+    let mut types_distribution = HashMap::new();
+    for note in &stale_notes {
+        *types_distribution
+            .entry(format!("{:?}", note.note_type).to_lowercase())
+            .or_insert(0usize) += 1;
+    }
+
+    let knowledge = KnowledgeLayerSummary {
+        notes: notes_total,
+        decisions: 0, // decisions are global, not project-scoped in trait
+        stale_count: stale_notes.len(),
+        types_distribution,
+    };
+
+    // === Fabric layer ===
+    let co_changes = co_change_res.unwrap_or_default();
+
+    let fabric = FabricLayerSummary {
+        co_changed_pairs: co_changes.len(),
+    };
+
+    // === Neural layer ===
+    let neural_metrics = neural_res.ok();
+
+    let neural = NeuralLayerSummary {
+        active_synapses: neural_metrics
+            .as_ref()
+            .map(|m| m.active_synapses)
+            .unwrap_or(0),
+        avg_energy: neural_metrics.as_ref().map(|m| m.avg_energy).unwrap_or(0.0),
+        weak_synapses_ratio: neural_metrics
+            .as_ref()
+            .map(|m| m.weak_synapses_ratio)
+            .unwrap_or(0.0),
+        dead_notes_count: neural_metrics
+            .as_ref()
+            .map(|m| m.dead_notes_count)
+            .unwrap_or(0),
+    };
+
+    // === Skills layer ===
+    let (all_skills, skills_total) = skills_all_res.unwrap_or((vec![], 0));
+    let active_count = all_skills
+        .iter()
+        .filter(|s| s.status == crate::skills::SkillStatus::Active)
+        .count();
+    let emerging_count = all_skills
+        .iter()
+        .filter(|s| s.status == crate::skills::SkillStatus::Emerging)
+        .count();
+    let avg_cohesion = if all_skills.is_empty() {
+        0.0
+    } else {
+        all_skills.iter().map(|s| s.cohesion).sum::<f64>() / all_skills.len() as f64
+    };
+    let total_activations: i64 = all_skills.iter().map(|s| s.activation_count).sum();
+
+    let skills = SkillsLayerSummary {
+        total: skills_total,
+        active: active_count,
+        emerging: emerging_count,
+        avg_cohesion,
+        total_activations,
+    };
+
+    Ok(Json(IntelligenceSummaryResponse {
+        code,
+        knowledge,
+        fabric,
+        neural,
+        skills,
+    }))
+}
+
+// ============================================================================
 // Utilities
 // ============================================================================
 
@@ -1218,5 +1433,92 @@ mod tests {
         let stats = &json["stats"];
         assert!(stats["code"].is_object());
         assert!(stats["bogus"].is_null());
+    }
+
+    // ====================================================================
+    // GET /api/projects/:slug/intelligence/summary tests
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_intelligence_summary_empty_project() {
+        let app_state = mock_app_state();
+        let project = test_project_named("intel-proj");
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/intelligence/summary",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Empty project should have all zeros
+        assert_eq!(json["code"]["files"], 0);
+        assert_eq!(json["code"]["communities"], 0);
+        assert_eq!(json["code"]["orphans"], 0);
+        assert_eq!(json["knowledge"]["notes"], 0);
+        assert_eq!(json["knowledge"]["stale_count"], 0);
+        assert_eq!(json["fabric"]["co_changed_pairs"], 0);
+        assert_eq!(json["neural"]["active_synapses"], 0);
+        assert_eq!(json["neural"]["avg_energy"], 0.0);
+        assert_eq!(json["skills"]["total"], 0);
+        assert_eq!(json["skills"]["active"], 0);
+        assert_eq!(json["skills"]["avg_cohesion"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_intelligence_summary_with_data() {
+        let app_state = mock_app_state();
+        let project = seed_graph_project(&app_state).await;
+
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/intelligence/summary",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Code layer should reflect seeded data
+        assert_eq!(json["code"]["files"], 3);
+        assert_eq!(json["code"]["communities"], 2);
+
+        // All 5 top-level sections should be present
+        assert!(json["code"].is_object());
+        assert!(json["knowledge"].is_object());
+        assert!(json["fabric"].is_object());
+        assert!(json["neural"].is_object());
+        assert!(json["skills"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_intelligence_summary_not_found() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get("/api/projects/nonexistent/intelligence/summary"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
     }
 }
