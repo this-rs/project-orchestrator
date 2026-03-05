@@ -1704,23 +1704,36 @@ impl Neo4jClient {
             0
         };
 
-        // Step 2: Prune weak synapses
-        let prune_q = query(
+        // Step 2: Prune weak synapses (2-step: count first, then delete)
+        // NOTE: Neo4j RETURN count() after DELETE always returns 0,
+        // so we must count before deleting.
+        let count_q = query(
             r#"
             MATCH ()-[s:SYNAPSE]->()
             WHERE s.weight < $threshold
-            DELETE s
             RETURN count(s) AS pruned
             "#,
         )
         .param("threshold", prune_threshold);
 
-        let mut result = self.graph.execute(prune_q).await?;
+        let mut result = self.graph.execute(count_q).await?;
         let pruned = if let Some(row) = result.next().await? {
             row.get::<i64>("pruned").unwrap_or(0) as usize
         } else {
             0
         };
+
+        if pruned > 0 {
+            let delete_q = query(
+                r#"
+                MATCH ()-[s:SYNAPSE]->()
+                WHERE s.weight < $threshold
+                DELETE s
+                "#,
+            )
+            .param("threshold", prune_threshold);
+            let _ = self.graph.execute(delete_q).await?;
+        }
 
         Ok((decayed, pruned))
     }

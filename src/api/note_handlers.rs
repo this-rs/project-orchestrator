@@ -1152,6 +1152,26 @@ pub async fn decay_synapses(
         .await
         .map_err(AppError::Internal)?;
 
+    // Emit graph events for pruned synapses (batch signal for frontend)
+    if pruned > 0 {
+        // We don't have individual synapse IDs at this level, but the frontend
+        // can use this event to trigger a full refresh of the neural layer.
+        state.event_bus.emit_graph(
+            GraphEvent::node(
+                crate::events::graph::GraphEventType::CommunityChanged,
+                crate::events::graph::GraphLayer::Neural,
+                "decay_synapses",
+                "global",
+            )
+            .with_delta(serde_json::json!({
+                "synapses_pruned": pruned,
+                "synapses_decayed": decayed,
+                "decay_amount": decay_amount,
+                "prune_threshold": prune_threshold,
+            })),
+        );
+    }
+
     Ok(Json(serde_json::json!({
         "synapses_decayed": decayed,
         "synapses_pruned": pruned,
