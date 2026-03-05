@@ -8,6 +8,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::expand_tilde;
@@ -383,6 +384,254 @@ pub async fn search_project_code(
 }
 
 // ============================================================================
+// Graph Visualization Endpoint
+// ============================================================================
+
+/// Allowed layer names (whitelist per security constraint)
+const VALID_LAYERS: &[&str] = &["code", "knowledge", "fabric", "neural", "skills"];
+
+/// A node in the project graph visualization
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub node_type: String,
+    pub label: String,
+    pub layer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<serde_json::Value>,
+}
+
+/// An edge in the project graph visualization
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    #[serde(rename = "type")]
+    pub edge_type: String,
+    pub layer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<serde_json::Value>,
+}
+
+/// A community cluster in the project graph
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphCommunity {
+    pub id: i64,
+    pub label: String,
+    pub file_count: usize,
+    pub key_files: Vec<String>,
+}
+
+/// Per-layer statistics
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerStats {
+    pub nodes: usize,
+    pub edges: usize,
+}
+
+/// Response for GET /api/projects/:slug/graph
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectGraphResponse {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub communities: Vec<GraphCommunity>,
+    pub stats: HashMap<String, LayerStats>,
+}
+
+/// Query parameters for the graph endpoint
+#[derive(Debug, Deserialize)]
+pub struct ProjectGraphQuery {
+    /// Comma-separated layers: code,knowledge,fabric,neural,skills (default: code)
+    pub layers: Option<String>,
+    /// Filter nodes by community_id
+    pub community: Option<i64>,
+    /// Max nodes per layer (default: 5000)
+    pub limit: Option<usize>,
+}
+
+/// Parse and validate the layers query parameter
+fn parse_layers(layers_param: &Option<String>) -> Vec<String> {
+    match layers_param {
+        Some(s) => s
+            .split(',')
+            .map(|l| l.trim().to_lowercase())
+            .filter(|l| VALID_LAYERS.contains(&l.as_str()))
+            .collect(),
+        None => vec!["code".to_string()],
+    }
+}
+
+/// GET /api/projects/:slug/graph — Multi-layer graph export for visualization
+///
+/// Returns a unified {nodes, edges, communities, stats} response.
+/// Each layer is queried independently (no monolithic multi-OPTIONAL-MATCH).
+pub async fn get_project_graph(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+    Query(params): Query<ProjectGraphQuery>,
+) -> Result<Json<ProjectGraphResponse>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    let project = neo4j
+        .get_project_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+
+    let requested_layers = parse_layers(&params.layers);
+    let limit = params.limit.unwrap_or(5000);
+
+    let mut all_nodes = Vec::new();
+    let mut all_edges = Vec::new();
+    let mut communities = Vec::new();
+    let mut stats = HashMap::new();
+
+    // Set of node IDs present in the graph (for edge filtering)
+    let mut node_ids: HashSet<String> = HashSet::new();
+
+    // ---- Code Layer ----
+    if requested_layers.contains(&"code".to_string()) {
+        // Get files with GDS analytics (pagerank, betweenness, community_id)
+        let connected_files = neo4j
+            .get_most_connected_files_for_project(project.id, limit)
+            .await
+            .unwrap_or_default();
+
+        // Build analytics lookup by path
+        let analytics_map: HashMap<&str, _> = connected_files
+            .iter()
+            .map(|f| (f.path.as_str(), f))
+            .collect();
+
+        // Get ALL files for the project (connected_files may miss orphans)
+        let all_files = neo4j
+            .list_project_files(project.id)
+            .await
+            .unwrap_or_default();
+
+        // Build code nodes
+        let mut code_node_count = 0usize;
+        for file in &all_files {
+            let analytics = analytics_map.get(file.path.as_str());
+            let community_id = analytics.and_then(|a| a.community_id);
+
+            // Apply community filter if specified
+            if let Some(filter_community) = params.community {
+                if community_id != Some(filter_community) {
+                    continue;
+                }
+            }
+
+            // Respect limit
+            if code_node_count >= limit {
+                break;
+            }
+
+            let label = file.path.rsplit('/').next().unwrap_or(&file.path);
+
+            all_nodes.push(GraphNode {
+                id: file.path.clone(),
+                node_type: "file".to_string(),
+                label: label.to_string(),
+                layer: "code".to_string(),
+                attributes: Some(serde_json::json!({
+                    "language": file.language,
+                    "pagerank": analytics.and_then(|a| a.pagerank),
+                    "betweenness": analytics.and_then(|a| a.betweenness),
+                    "community_id": community_id,
+                    "community_label": analytics.and_then(|a| a.community_label.clone()),
+                    "imports": analytics.map(|a| a.imports).unwrap_or(0),
+                    "dependents": analytics.map(|a| a.dependents).unwrap_or(0),
+                })),
+            });
+            node_ids.insert(file.path.clone());
+            code_node_count += 1;
+        }
+
+        // Get IMPORTS edges (file-level)
+        let import_edges = neo4j
+            .get_project_import_edges(project.id)
+            .await
+            .unwrap_or_default();
+
+        let mut code_edge_count = 0usize;
+        for (source, target) in &import_edges {
+            if node_ids.contains(source.as_str()) && node_ids.contains(target.as_str()) {
+                all_edges.push(GraphEdge {
+                    source: source.clone(),
+                    target: target.clone(),
+                    edge_type: "IMPORTS".to_string(),
+                    layer: "code".to_string(),
+                    attributes: None,
+                });
+                code_edge_count += 1;
+            }
+        }
+
+        stats.insert(
+            "code".to_string(),
+            LayerStats {
+                nodes: code_node_count,
+                edges: code_edge_count,
+            },
+        );
+
+        // Communities (from GDS Louvain clustering)
+        if let Ok(comms) = neo4j.get_project_communities(project.id).await {
+            communities = comms
+                .into_iter()
+                .map(|c| GraphCommunity {
+                    id: c.community_id,
+                    label: c.community_label,
+                    file_count: c.file_count,
+                    key_files: c.key_files,
+                })
+                .collect();
+        }
+    }
+
+    // ---- Fabric Layer (CO_CHANGED edges between files) ----
+    if requested_layers.contains(&"fabric".to_string()) {
+        let co_changes = neo4j
+            .get_co_change_graph(project.id, 1, limit as i64)
+            .await
+            .unwrap_or_default();
+
+        let mut fabric_edge_count = 0usize;
+        for pair in &co_changes {
+            all_edges.push(GraphEdge {
+                source: pair.file_a.clone(),
+                target: pair.file_b.clone(),
+                edge_type: "CO_CHANGED".to_string(),
+                layer: "fabric".to_string(),
+                attributes: Some(serde_json::json!({
+                    "co_change_count": pair.count,
+                    "last_at": pair.last_at,
+                })),
+            });
+            fabric_edge_count += 1;
+        }
+
+        stats.insert(
+            "fabric".to_string(),
+            LayerStats {
+                nodes: 0,
+                edges: fabric_edge_count,
+            },
+        );
+    }
+
+    // ---- Knowledge, Neural, Skills layers (TODO: incremental additions) ----
+
+    Ok(Json(ProjectGraphResponse {
+        nodes: all_nodes,
+        edges: all_edges,
+        communities,
+        stats,
+    }))
+}
+
+// ============================================================================
 // Utilities
 // ============================================================================
 
@@ -701,5 +950,273 @@ mod tests {
         assert_eq!(json["slug"], "new-project");
         assert_eq!(json["file_count"], 0);
         assert_eq!(json["plan_count"], 0);
+    }
+
+    // ====================================================================
+    // GET /api/projects/:slug/graph tests
+    // ====================================================================
+
+    use crate::graph::models::FileAnalyticsUpdate;
+
+    /// Helper: seed a project with files, import edges, and analytics
+    async fn seed_graph_project(app_state: &crate::AppState) -> ProjectNode {
+        let project = test_project_named("graph-proj");
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        // Create 3 files
+        let paths = vec![
+            "/tmp/graph-proj/src/main.rs",
+            "/tmp/graph-proj/src/lib.rs",
+            "/tmp/graph-proj/src/utils.rs",
+        ];
+        for (i, path) in paths.iter().enumerate() {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: format!("gh{}", i),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            app_state.neo4j.upsert_file(&file).await.unwrap();
+            app_state
+                .neo4j
+                .link_file_to_project(path, project.id)
+                .await
+                .unwrap();
+        }
+
+        // Create import edges: main.rs -> lib.rs, main.rs -> utils.rs
+        app_state
+            .neo4j
+            .create_import_relationship(paths[0], paths[1], "crate::lib")
+            .await
+            .unwrap();
+        app_state
+            .neo4j
+            .create_import_relationship(paths[0], paths[2], "crate::utils")
+            .await
+            .unwrap();
+
+        // Seed file analytics (pagerank, betweenness, community)
+        let analytics = vec![
+            FileAnalyticsUpdate {
+                path: paths[0].to_string(),
+                pagerank: 0.5,
+                betweenness: 0.3,
+                community_id: 0,
+                community_label: "core".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: paths[1].to_string(),
+                pagerank: 0.3,
+                betweenness: 0.1,
+                community_id: 0,
+                community_label: "core".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+            FileAnalyticsUpdate {
+                path: paths[2].to_string(),
+                pagerank: 0.2,
+                betweenness: 0.05,
+                community_id: 1,
+                community_label: "utilities".to_string(),
+                clustering_coefficient: 0.0,
+                component_id: 0,
+            },
+        ];
+        app_state
+            .neo4j
+            .batch_update_file_analytics(&analytics)
+            .await
+            .unwrap();
+
+        project
+    }
+
+    /// Helper: build OrchestratorState from pre-seeded AppState
+    async fn state_from_app(app_state: crate::AppState) -> super::OrchestratorState {
+        let orchestrator = std::sync::Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = std::sync::Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        std::sync::Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: std::sync::Arc::new(crate::events::HybridEmitter::new(std::sync::Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_project_graph_default_code_layer() {
+        let app_state = mock_app_state();
+        let project = seed_graph_project(&app_state).await;
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!("/api/projects/{}/graph", project.slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should have 3 file nodes (code layer)
+        let nodes = json["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3);
+
+        // All nodes should be file type, code layer
+        for node in nodes {
+            assert_eq!(node["type"], "file");
+            assert_eq!(node["layer"], "code");
+        }
+
+        // Should have 2 IMPORTS edges (main->lib, main->utils)
+        let edges = json["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 2);
+        for edge in edges {
+            assert_eq!(edge["type"], "IMPORTS");
+            assert_eq!(edge["layer"], "code");
+        }
+
+        // Stats should show code layer
+        let stats = &json["stats"];
+        assert_eq!(stats["code"]["nodes"], 3);
+        assert_eq!(stats["code"]["edges"], 2);
+
+        // Communities should be present (2 communities: core + utilities)
+        let communities = json["communities"].as_array().unwrap();
+        assert_eq!(communities.len(), 2);
+
+        // Check node attributes include analytics
+        let main_node = nodes
+            .iter()
+            .find(|n| n["id"].as_str().unwrap().ends_with("main.rs"))
+            .unwrap();
+        let attrs = &main_node["attributes"];
+        assert_eq!(attrs["language"], "rust");
+        assert_eq!(attrs["pagerank"], 0.5);
+        assert_eq!(attrs["community_id"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_project_graph_not_found() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get("/api/projects/nonexistent/graph"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_project_graph_community_filter() {
+        let app_state = mock_app_state();
+        let project = seed_graph_project(&app_state).await;
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        // Filter to community 0 (core) — should get main.rs + lib.rs only
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/graph?community=0",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let nodes = json["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        for node in nodes {
+            assert_eq!(node["attributes"]["community_id"], 0);
+        }
+
+        // Edges: only main->lib should remain (main->utils filtered out because utils is community 1)
+        let edges = json["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0]["target"].as_str().unwrap().ends_with("lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_project_graph_multiple_layers() {
+        let app_state = mock_app_state();
+        let project = seed_graph_project(&app_state).await;
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        // Request code + fabric layers
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/graph?layers=code,fabric",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Stats should have both code and fabric layers
+        let stats = &json["stats"];
+        assert!(stats["code"].is_object());
+        assert!(stats["fabric"].is_object());
+        // Fabric edges: mock returns empty vec, so 0 edges
+        assert_eq!(stats["fabric"]["edges"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_project_graph_invalid_layer_ignored() {
+        let app_state = mock_app_state();
+        let project = seed_graph_project(&app_state).await;
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        // "bogus" should be silently ignored, only "code" processed
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/graph?layers=code,bogus",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Only code layer should be in stats
+        let stats = &json["stats"];
+        assert!(stats["code"].is_object());
+        assert!(stats["bogus"].is_null());
     }
 }
