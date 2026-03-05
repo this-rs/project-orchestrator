@@ -1,5 +1,6 @@
 //! CRUD event types for WebSocket notifications
 
+use super::graph::GraphEvent;
 use serde::{Deserialize, Serialize};
 
 /// The type of entity that was mutated
@@ -74,6 +75,12 @@ pub struct CrudEvent {
 pub trait EventEmitter: Send + Sync {
     /// Emit a CrudEvent (fire-and-forget)
     fn emit(&self, event: CrudEvent);
+
+    /// Emit a GraphEvent for real-time visualization (fire-and-forget).
+    ///
+    /// Default implementation is a no-op. Only `HybridEmitter` overrides this
+    /// to broadcast graph events to WebSocket clients.
+    fn emit_graph(&self, _event: GraphEvent) {}
 
     /// Emit a Created event
     fn emit_created(

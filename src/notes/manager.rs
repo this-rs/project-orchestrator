@@ -5,6 +5,7 @@
 
 use super::models::*;
 use crate::embeddings::EmbeddingProvider;
+use crate::events::graph::{GraphEvent, GraphEventType, GraphLayer};
 use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter};
 use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
@@ -92,6 +93,13 @@ impl NoteManager {
         }
     }
 
+    /// Emit a graph event for real-time visualization (no-op if event_emitter is None)
+    fn emit_graph_event(&self, event: crate::events::GraphEvent) {
+        if let Some(emitter) = &self.event_emitter {
+            emitter.emit_graph(event);
+        }
+    }
+
     /// Generate and store an embedding for a note's content.
     ///
     /// This is a best-effort operation: if the embedding provider is not configured
@@ -146,6 +154,7 @@ impl NoteManager {
         };
 
         let neo4j = self.neo4j.clone();
+        let emitter = self.event_emitter.clone();
         let min_weight = self.synapse_config.min_weight;
         let max_neighbors = self.synapse_config.max_neighbors;
         let content = content.to_string();
@@ -206,6 +215,25 @@ impl NoteManager {
                         synapse_count = count,
                         "Auto-synapse: created synapses"
                     );
+                    // Emit graph events for each new synapse edge
+                    if let Some(ref emitter) = emitter {
+                        if let Some(pid) = project_id {
+                            let pid_str = pid.to_string();
+                            for (neighbor_id, weight) in &neighbors {
+                                emitter.emit_graph(
+                                    GraphEvent::edge(
+                                        GraphEventType::EdgeCreated,
+                                        GraphLayer::Neural,
+                                        note_id.to_string(),
+                                        neighbor_id.to_string(),
+                                        "SYNAPSE",
+                                        &pid_str,
+                                    )
+                                    .with_delta(serde_json::json!({"weight": weight})),
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -314,6 +342,7 @@ impl NoteManager {
         // Auto-anchor to files mentioned in content (fire-and-forget)
         self.spawn_auto_anchor(&note);
 
+        let project_id_str = note.project_id.map(|id| id.to_string()).unwrap_or_default();
         self.emit(
             CrudEvent::new(
                 EventEntityType::Note,
@@ -321,8 +350,23 @@ impl NoteManager {
                 note.id.to_string(),
             )
             .with_payload(serde_json::json!({"note_type": note.note_type.to_string()}))
-            .with_project_id(note.project_id.map(|id| id.to_string()).unwrap_or_default()),
+            .with_project_id(project_id_str.clone()),
         );
+        // Graph event: new knowledge node
+        if !project_id_str.is_empty() {
+            self.emit_graph_event(
+                GraphEvent::node(
+                    GraphEventType::NodeCreated,
+                    GraphLayer::Knowledge,
+                    note.id.to_string(),
+                    &project_id_str,
+                )
+                .with_delta(serde_json::json!({
+                    "note_type": note.note_type.to_string(),
+                    "importance": note.importance.to_string(),
+                })),
+            );
+        }
 
         Ok(note)
     }
@@ -393,17 +437,35 @@ impl NoteManager {
 
     /// Delete a note
     pub async fn delete_note(&self, id: Uuid) -> Result<bool> {
+        // Capture project_id before deletion for event emission
+        let project_id_str = if let Ok(Some(note)) = self.neo4j.get_note(id).await {
+            note.project_id.map(|pid| pid.to_string())
+        } else {
+            None
+        };
+
         // Delete from Neo4j (DETACH DELETE also removes SYNAPSE relationships)
         let deleted = self.neo4j.delete_note(id).await?;
 
         // Delete from Meilisearch
         if deleted {
             self.meilisearch.delete_note(&id.to_string()).await?;
-            self.emit(CrudEvent::new(
-                EventEntityType::Note,
-                CrudAction::Deleted,
-                id.to_string(),
-            ));
+            let mut event =
+                CrudEvent::new(EventEntityType::Note, CrudAction::Deleted, id.to_string());
+            if let Some(ref pid) = project_id_str {
+                event = event.with_project_id(pid.clone());
+            }
+            self.emit(event);
+
+            // Graph event: knowledge node removed (synapses implicitly removed via DETACH DELETE)
+            if let Some(pid) = project_id_str {
+                self.emit_graph_event(GraphEvent::node(
+                    GraphEventType::NodeUpdated,
+                    GraphLayer::Knowledge,
+                    id.to_string(),
+                    pid,
+                ));
+            }
         }
 
         Ok(deleted)
@@ -443,6 +505,19 @@ impl NoteManager {
             CrudEvent::new(EventEntityType::Note, CrudAction::Linked, note_id.to_string())
                 .with_payload(serde_json::json!({"entity_type": entity.entity_type.to_string(), "entity_id": &entity.entity_id})),
         );
+        // Graph event: LINKED_TO edge created
+        if let Ok(Some(note)) = self.neo4j.get_note(note_id).await {
+            if let Some(pid) = note.project_id {
+                self.emit_graph_event(GraphEvent::edge(
+                    GraphEventType::EdgeCreated,
+                    GraphLayer::Knowledge,
+                    note_id.to_string(),
+                    &entity.entity_id,
+                    "LINKED_TO",
+                    pid.to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -480,6 +555,19 @@ impl NoteManager {
                 serde_json::json!({"entity_type": entity_type.to_string(), "entity_id": entity_id}),
             ),
         );
+        // Graph event: LINKED_TO edge removed
+        if let Ok(Some(note)) = self.neo4j.get_note(note_id).await {
+            if let Some(pid) = note.project_id {
+                self.emit_graph_event(GraphEvent::edge(
+                    GraphEventType::EdgeRemoved,
+                    GraphLayer::Knowledge,
+                    note_id.to_string(),
+                    entity_id,
+                    "LINKED_TO",
+                    pid.to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -501,6 +589,8 @@ impl NoteManager {
             let doc = self.note_to_document(note, None).await?;
             self.meilisearch.index_note(&doc).await?;
 
+            let project_id_str =
+                note.project_id.map(|id| id.to_string()).unwrap_or_default();
             self.emit(
                 CrudEvent::new(
                     EventEntityType::Note,
@@ -508,8 +598,16 @@ impl NoteManager {
                     note_id.to_string(),
                 )
                 .with_payload(serde_json::json!({"confirmed_by": confirmed_by}))
-                .with_project_id(note.project_id.map(|id| id.to_string()).unwrap_or_default()),
+                .with_project_id(project_id_str.clone()),
             );
+            // Graph event: confirmation boosts energy by +0.3
+            if !project_id_str.is_empty() {
+                self.emit_graph_event(GraphEvent::reinforcement(
+                    note_id.to_string(),
+                    0.3,
+                    &project_id_str,
+                ));
+            }
         }
 
         Ok(note)
@@ -2466,5 +2564,253 @@ mod tests {
                 "all results should belong to the filtered project"
             );
         }
+    }
+
+    // ====================================================================
+    // Graph event emission tests
+    // ====================================================================
+
+    use crate::events::graph::{GraphEvent, GraphEventType, GraphLayer};
+    use std::sync::Mutex;
+
+    /// A test-only EventEmitter that captures both CRUD and Graph events.
+    struct RecordingEmitter {
+        crud_events: Mutex<Vec<crate::events::CrudEvent>>,
+        graph_events: Mutex<Vec<GraphEvent>>,
+    }
+
+    impl RecordingEmitter {
+        fn new() -> Self {
+            Self {
+                crud_events: Mutex::new(Vec::new()),
+                graph_events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_graph_events(&self) -> Vec<GraphEvent> {
+            std::mem::take(&mut *self.graph_events.lock().unwrap())
+        }
+    }
+
+    impl crate::events::EventEmitter for RecordingEmitter {
+        fn emit(&self, event: crate::events::CrudEvent) {
+            self.crud_events.lock().unwrap().push(event);
+        }
+
+        fn emit_graph(&self, event: GraphEvent) {
+            self.graph_events.lock().unwrap().push(event);
+        }
+    }
+
+    /// Helper: build a NoteManager with a RecordingEmitter to capture graph events.
+    /// Returns (NoteManager, project_id, Arc<RecordingEmitter>).
+    async fn create_note_manager_with_recorder() -> (NoteManager, Uuid, Arc<RecordingEmitter>) {
+        let state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        state.neo4j.create_project(&project).await.unwrap();
+        let emitter = Arc::new(RecordingEmitter::new());
+        let manager = NoteManager::with_event_emitter(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            emitter.clone() as Arc<dyn crate::events::EventEmitter>,
+        );
+        (manager, project_id, emitter)
+    }
+
+    #[tokio::test]
+    async fn test_create_note_emits_graph_node_created() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Test graph event emission");
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        let events = recorder.take_graph_events();
+        assert!(
+            !events.is_empty(),
+            "create_note should emit at least one graph event"
+        );
+
+        let node_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::NodeCreated)
+            .expect("should have a NodeCreated event");
+
+        assert_eq!(node_event.kind, "graph");
+        assert_eq!(node_event.layer, GraphLayer::Knowledge);
+        assert_eq!(node_event.node_id.as_deref(), Some(note.id.to_string().as_str()));
+        assert_eq!(node_event.project_id, pid.to_string());
+        assert_eq!(node_event.delta["note_type"], "guideline");
+        assert_eq!(node_event.delta["importance"], "high");
+    }
+
+    #[tokio::test]
+    async fn test_delete_note_emits_graph_node_updated() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Note to delete");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Clear events from creation
+        recorder.take_graph_events();
+
+        // Delete
+        mgr.delete_note(note.id).await.unwrap();
+
+        let events = recorder.take_graph_events();
+        let delete_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::NodeUpdated)
+            .expect("delete_note should emit NodeUpdated graph event");
+
+        assert_eq!(delete_event.layer, GraphLayer::Knowledge);
+        assert_eq!(delete_event.node_id.as_deref(), Some(note.id.to_string().as_str()));
+        assert_eq!(delete_event.project_id, pid.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_link_note_emits_graph_edge_created() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Note to link");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Clear events from creation
+        recorder.take_graph_events();
+
+        // Link to a file
+        let link_req = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/main.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link_req)
+            .await
+            .unwrap();
+
+        let events = recorder.take_graph_events();
+        let edge_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::EdgeCreated)
+            .expect("link_note should emit EdgeCreated graph event");
+
+        assert_eq!(edge_event.layer, GraphLayer::Knowledge);
+        assert_eq!(edge_event.node_id.as_deref(), Some(note.id.to_string().as_str()));
+        assert_eq!(edge_event.target_id.as_deref(), Some("src/main.rs"));
+        assert_eq!(edge_event.edge_type.as_deref(), Some("LINKED_TO"));
+    }
+
+    #[tokio::test]
+    async fn test_unlink_note_emits_graph_edge_removed() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Note to unlink");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Link first, then clear events
+        let link_req = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/main.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link_req)
+            .await
+            .unwrap();
+        recorder.take_graph_events();
+
+        // Unlink
+        mgr.unlink_note_from_entity(note.id, &EntityType::File, "src/main.rs")
+            .await
+            .unwrap();
+
+        let events = recorder.take_graph_events();
+        let edge_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::EdgeRemoved)
+            .expect("unlink_note should emit EdgeRemoved graph event");
+
+        assert_eq!(edge_event.layer, GraphLayer::Knowledge);
+        assert_eq!(edge_event.node_id.as_deref(), Some(note.id.to_string().as_str()));
+        assert_eq!(edge_event.target_id.as_deref(), Some("src/main.rs"));
+        assert_eq!(edge_event.edge_type.as_deref(), Some("LINKED_TO"));
+    }
+
+    #[tokio::test]
+    async fn test_confirm_note_emits_graph_reinforcement() {
+        let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
+        let req = make_create_request(pid, "Note to confirm");
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Clear events from creation
+        recorder.take_graph_events();
+
+        // Confirm
+        mgr.confirm_note(note.id, "agent-1").await.unwrap();
+
+        let events = recorder.take_graph_events();
+        let reinforce_event = events
+            .iter()
+            .find(|e| e.event_type == GraphEventType::Reinforcement)
+            .expect("confirm_note should emit Reinforcement graph event");
+
+        assert_eq!(reinforce_event.layer, GraphLayer::Neural);
+        assert_eq!(
+            reinforce_event.node_id.as_deref(),
+            Some(note.id.to_string().as_str())
+        );
+        // energy_delta should be 0.3 (confirmation boost)
+        let delta = reinforce_event.delta["energy_delta"].as_f64().unwrap();
+        assert!((delta - 0.3).abs() < f64::EPSILON, "energy delta should be 0.3, got {}", delta);
+    }
+
+    #[tokio::test]
+    async fn test_create_note_without_project_no_graph_event() {
+        let state = mock_app_state();
+        let emitter = Arc::new(RecordingEmitter::new());
+        let manager = NoteManager::with_event_emitter(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            emitter.clone() as Arc<dyn crate::events::EventEmitter>,
+        );
+
+        let req = CreateNoteRequest {
+            project_id: None, // No project
+            note_type: NoteType::Tip,
+            content: "Global tip without project".to_string(),
+            importance: Some(NoteImportance::Low),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+        };
+
+        let _note = manager.create_note(req, "agent-1").await.unwrap();
+
+        // Graph events require a project_id — no event should be emitted
+        let events = emitter.take_graph_events();
+        let node_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == GraphEventType::NodeCreated)
+            .collect();
+        assert!(
+            node_events.is_empty(),
+            "no graph NodeCreated event for notes without project_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graph_event_emitter_disabled() {
+        // NoteManager without event emitter should not panic on graph events
+        let (mgr, pid) = create_note_manager().await;
+        let req = make_create_request(pid, "No emitter attached");
+
+        // Should not panic — emit_graph_event is a no-op
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+        assert!(!note.content.is_empty());
+
+        let link_req = LinkNoteRequest {
+            entity_type: EntityType::File,
+            entity_id: "src/test.rs".to_string(),
+        };
+        mgr.link_note_to_entity(note.id, &link_req)
+            .await
+            .unwrap();
+        mgr.confirm_note(note.id, "agent-1").await.unwrap();
+        mgr.delete_note(note.id).await.unwrap();
     }
 }

@@ -7,12 +7,16 @@
 //! with zero overhead — no connection attempts, no errors.
 
 use super::bus::EventBus;
+use super::graph::GraphEvent;
 use super::nats::NatsEmitter;
 use super::types::{CrudEvent, EventEmitter};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
+
+/// Default broadcast channel capacity for graph events
+const GRAPH_BUS_CAPACITY: usize = 512;
 
 /// Hybrid emitter that fans out CrudEvents to both local broadcast and NATS.
 ///
@@ -24,6 +28,10 @@ use tracing::{debug, info, warn};
 #[derive(Clone)]
 pub struct HybridEmitter {
     local_bus: Arc<EventBus>,
+    /// Dedicated broadcast channel for graph visualization events.
+    /// Separate from the CRUD bus to avoid coupling and allow independent
+    /// filtering (by layer) in the WebSocket handler.
+    graph_sender: broadcast::Sender<GraphEvent>,
     nats: Option<Arc<NatsEmitter>>,
 }
 
@@ -32,8 +40,10 @@ impl HybridEmitter {
     ///
     /// Events are broadcast to in-process subscribers only.
     pub fn new(local_bus: Arc<EventBus>) -> Self {
+        let (graph_sender, _) = broadcast::channel(GRAPH_BUS_CAPACITY);
         Self {
             local_bus,
+            graph_sender,
             nats: None,
         }
     }
@@ -42,8 +52,10 @@ impl HybridEmitter {
     ///
     /// Events are emitted to both channels in parallel.
     pub fn with_nats(local_bus: Arc<EventBus>, nats_emitter: Arc<NatsEmitter>) -> Self {
+        let (graph_sender, _) = broadcast::channel(GRAPH_BUS_CAPACITY);
         Self {
             local_bus,
+            graph_sender,
             nats: Some(nats_emitter),
         }
     }
@@ -75,6 +87,42 @@ impl HybridEmitter {
     /// Get a reference to the NatsEmitter, if configured.
     pub fn nats_emitter(&self) -> Option<&Arc<NatsEmitter>> {
         self.nats.as_ref()
+    }
+
+    /// Subscribe to the graph event broadcast channel.
+    ///
+    /// Used by WebSocket handlers to receive graph mutation events
+    /// (node_created, edge_created, reinforcement, etc.) for real-time
+    /// visualization updates.
+    pub fn subscribe_graph(&self) -> broadcast::Receiver<GraphEvent> {
+        self.graph_sender.subscribe()
+    }
+
+    /// Emit a graph event to all subscribers.
+    ///
+    /// Fire-and-forget: if no subscribers are connected, the event is silently dropped.
+    /// Graph events are local-only (not published to NATS) for now.
+    pub fn emit_graph(&self, event: GraphEvent) {
+        let event_type = format!("{:?}", event.event_type);
+        let layer = format!("{:?}", event.layer);
+        match self.graph_sender.send(event) {
+            Ok(n) => {
+                debug!(
+                    event_type = %event_type,
+                    layer = %layer,
+                    subscribers = n,
+                    "GraphEvent emitted"
+                );
+            }
+            Err(_) => {
+                // No subscribers — expected and fine
+            }
+        }
+    }
+
+    /// Number of active graph event subscribers.
+    pub fn graph_subscriber_count(&self) -> usize {
+        self.graph_sender.receiver_count()
     }
 
     /// Start the NATS→local bridge: subscribes to NATS CRUD events and
@@ -166,6 +214,10 @@ impl EventEmitter for HybridEmitter {
         } else {
             debug!("HybridEmitter: NATS not configured, local-only mode");
         }
+    }
+
+    fn emit_graph(&self, event: GraphEvent) {
+        self.emit_graph(event);
     }
 }
 
@@ -277,5 +329,108 @@ mod tests {
         assert!(!hybrid.has_nats());
         assert!(hybrid.nats_emitter().is_none());
         assert!(Arc::ptr_eq(hybrid.local_bus(), &bus));
+    }
+
+    // ================================================================
+    // Graph event bus tests
+    // ================================================================
+
+    use crate::events::graph::{GraphEventType, GraphLayer};
+
+    #[test]
+    fn test_graph_emit_without_subscriber_no_panic() {
+        let bus = Arc::new(EventBus::default());
+        let hybrid = HybridEmitter::new(bus);
+
+        hybrid.emit_graph(GraphEvent::node(
+            GraphEventType::NodeCreated,
+            GraphLayer::Knowledge,
+            "note-1",
+            "proj-1",
+        ));
+        // Should not panic
+        assert_eq!(hybrid.graph_subscriber_count(), 0);
+    }
+
+    #[test]
+    fn test_graph_emit_with_subscriber() {
+        let bus = Arc::new(EventBus::default());
+        let hybrid = HybridEmitter::new(bus);
+        let mut rx = hybrid.subscribe_graph();
+        assert_eq!(hybrid.graph_subscriber_count(), 1);
+
+        hybrid.emit_graph(GraphEvent::node(
+            GraphEventType::NodeCreated,
+            GraphLayer::Knowledge,
+            "note-1",
+            "proj-1",
+        ));
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event_type, GraphEventType::NodeCreated);
+        assert_eq!(event.layer, GraphLayer::Knowledge);
+        assert_eq!(event.node_id.as_deref(), Some("note-1"));
+        assert_eq!(event.project_id, "proj-1");
+    }
+
+    #[test]
+    fn test_graph_emit_multi_subscribers() {
+        let bus = Arc::new(EventBus::default());
+        let hybrid = HybridEmitter::new(bus);
+        let mut rx1 = hybrid.subscribe_graph();
+        let mut rx2 = hybrid.subscribe_graph();
+        assert_eq!(hybrid.graph_subscriber_count(), 2);
+
+        hybrid.emit_graph(GraphEvent::edge(
+            GraphEventType::EdgeCreated,
+            GraphLayer::Neural,
+            "note-1",
+            "note-2",
+            "SYNAPSE",
+            "proj-1",
+        ));
+
+        let e1 = rx1.try_recv().unwrap();
+        let e2 = rx2.try_recv().unwrap();
+        assert_eq!(e1.event_type, GraphEventType::EdgeCreated);
+        assert_eq!(e2.event_type, GraphEventType::EdgeCreated);
+    }
+
+    #[test]
+    fn test_graph_and_crud_buses_independent() {
+        let bus = Arc::new(EventBus::default());
+        let hybrid = HybridEmitter::new(bus);
+        let mut crud_rx = hybrid.subscribe();
+        let mut graph_rx = hybrid.subscribe_graph();
+
+        // Emit a CRUD event — should NOT appear on graph bus
+        hybrid.emit_created(EntityType::Note, "note-1", serde_json::Value::Null, None);
+
+        // Emit a graph event — should NOT appear on CRUD bus
+        hybrid.emit_graph(GraphEvent::reinforcement("note-1", 0.15, "proj-1"));
+
+        // CRUD bus should have exactly 1 CRUD event
+        let crud_event = crud_rx.try_recv().unwrap();
+        assert_eq!(crud_event.entity_type, EntityType::Note);
+        assert!(crud_rx.try_recv().is_err()); // no more
+
+        // Graph bus should have exactly 1 graph event
+        let graph_event = graph_rx.try_recv().unwrap();
+        assert_eq!(graph_event.event_type, GraphEventType::Reinforcement);
+        assert!(graph_rx.try_recv().is_err()); // no more
+    }
+
+    #[test]
+    fn test_graph_clone_shares_channel() {
+        let bus = Arc::new(EventBus::default());
+        let hybrid = HybridEmitter::new(bus);
+        let hybrid2 = hybrid.clone();
+        let mut rx = hybrid.subscribe_graph();
+
+        // Emit from the clone
+        hybrid2.emit_graph(GraphEvent::community_changed("comm-1", 5, "proj-1"));
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event_type, GraphEventType::CommunityChanged);
     }
 }

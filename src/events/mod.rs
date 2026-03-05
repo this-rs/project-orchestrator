@@ -7,12 +7,14 @@
 //! - `HybridEmitter` — combines local broadcast + optional NATS
 
 mod bus;
+pub mod graph;
 mod hybrid;
 pub mod nats;
 mod notifier;
 mod types;
 
 pub use bus::EventBus;
+pub use graph::{ActivationTarget, GraphEvent, GraphEventType, GraphLayer};
 pub use hybrid::HybridEmitter;
 pub use nats::{connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter, StreamingSnapshot};
 #[allow(deprecated)]

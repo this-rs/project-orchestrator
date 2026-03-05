@@ -2171,6 +2171,14 @@ pub async fn reinforce_isomorphic_synapses(
             // Boost energy for each note
             for nid in &note_ids {
                 let _ = neo4j.boost_energy(*nid, 0.1).await;
+                // Emit reinforcement graph event
+                state.event_bus.emit_graph(
+                    crate::events::GraphEvent::reinforcement(
+                        nid.to_string(),
+                        0.1,
+                        project_id.to_string(),
+                    ),
+                );
             }
             // Reinforce synapses between all note pairs
             match neo4j.reinforce_synapses(&note_ids, synapse_boost).await {
