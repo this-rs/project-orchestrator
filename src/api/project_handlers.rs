@@ -1179,7 +1179,7 @@ mod tests {
         app_state.neo4j.create_project(&project).await.unwrap();
 
         // Create 3 files
-        let paths = vec![
+        let paths = [
             "/tmp/graph-proj/src/main.rs",
             "/tmp/graph-proj/src/lib.rs",
             "/tmp/graph-proj/src/utils.rs",
