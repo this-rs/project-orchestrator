@@ -164,6 +164,7 @@ mod tests {
             allowed_email_domain: Some("ffs.holdings".to_string()),
             allowed_emails: None,
             frontend_url: Some("http://localhost:3000".to_string()),
+            additional_origins: vec![],
             allow_registration: false,
             root_account: None,
             oidc: None,

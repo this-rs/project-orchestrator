@@ -95,6 +95,10 @@ impl ServerState {
             if let Some(ref frontend_url) = auth_config.frontend_url {
                 add(frontend_url);
             }
+            // additional_origins from auth config (e.g. dev frontend on a different port)
+            for origin in &auth_config.additional_origins {
+                add(origin);
+            }
         }
 
         origins
@@ -3714,6 +3718,7 @@ mod tests {
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: Some("https://ffs.dev".to_string()),
+            additional_origins: vec![],
             allow_registration: false,
             root_account: None,
             oidc: None,

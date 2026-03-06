@@ -987,6 +987,7 @@ mod tests {
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,
+            additional_origins: vec![],
             allow_registration: false,
             root_account: None,
             oidc: None,
@@ -1545,6 +1546,7 @@ mod tests {
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,
+            additional_origins: vec![],
             allow_registration: false,
             root_account: Some(crate::RootAccountConfig {
                 email: "admin@ffs.holdings".to_string(),
@@ -1996,6 +1998,7 @@ mod tests {
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,
+            additional_origins: vec![],
             allow_registration: false,
             root_account: None,
             oidc: Some(crate::OidcConfig {

@@ -358,6 +358,7 @@ mod tests {
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,
+            additional_origins: vec![],
             allow_registration: false,
             root_account: None,
             oidc: Some(OidcConfig {

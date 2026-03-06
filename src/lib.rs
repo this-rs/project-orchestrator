@@ -241,6 +241,11 @@ pub struct AuthConfig {
     pub allowed_emails: Option<Vec<String>>,
     /// Frontend URL for CORS and redirects (e.g. "http://localhost:3000")
     pub frontend_url: Option<String>,
+    /// Additional allowed origins for CORS and OAuth redirect_uri validation.
+    /// Useful when the frontend dev server runs on a different port than the backend
+    /// (e.g. Vite on port 3000 while backend is on 8080).
+    #[serde(default)]
+    pub additional_origins: Vec<String>,
     /// Allow new user registration via POST /auth/register (default: false)
     #[serde(default)]
     pub allow_registration: bool,
@@ -1721,6 +1726,7 @@ server:
             allowed_email_domain: None,
             allowed_emails: None,
             frontend_url: None,
+            additional_origins: vec![],
             allow_registration: false,
             root_account: None,
             oidc: None,
