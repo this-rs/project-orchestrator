@@ -1079,7 +1079,14 @@ pub async fn get_intelligence_summary(
 // Embeddings 2D projection (UMAP)
 // ============================================================================
 
-/// A point in the 2D projection (note or decision)
+/// Query parameters for the embeddings projection endpoint
+#[derive(Debug, Deserialize)]
+pub struct ProjectionQuery {
+    /// Projection dimensions: 2 (default) or 3
+    pub dimensions: Option<usize>,
+}
+
+/// A point in the UMAP projection (note or decision)
 #[derive(Serialize)]
 pub struct ProjectionPoint {
     pub id: String,
@@ -1087,6 +1094,8 @@ pub struct ProjectionPoint {
     pub point_type: String,
     pub x: f64,
     pub y: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub z: Option<f64>,
     pub energy: f64,
     pub importance: String,
     pub tags: Vec<String>,
@@ -1109,6 +1118,8 @@ pub struct ProjectionSkill {
     pub member_ids: Vec<String>,
     pub centroid_x: f64,
     pub centroid_y: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub centroid_z: Option<f64>,
 }
 
 /// Response for GET /api/projects/:slug/embeddings/projection
@@ -1118,17 +1129,25 @@ pub struct EmbeddingsProjectionResponse {
     pub synapses: Vec<ProjectionSynapse>,
     pub skills: Vec<ProjectionSkill>,
     pub dimensions: usize,
+    pub projection_dimensions: usize,
     pub method: String,
 }
 
-/// GET /api/projects/:slug/embeddings/projection
+/// GET /api/projects/:slug/embeddings/projection?dimensions=2|3
 ///
-/// Projects note embeddings from high-dimensional space (768d) to 2D
+/// Projects note embeddings from high-dimensional space (768d) to 2D or 3D
 /// using UMAP for visualization. Returns points, synapses, and skill clusters.
 pub async fn get_embeddings_projection(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
+    Query(query): Query<ProjectionQuery>,
 ) -> Result<Json<EmbeddingsProjectionResponse>, AppError> {
+    let proj_dims = query.dimensions.unwrap_or(2);
+    if proj_dims != 2 && proj_dims != 3 {
+        return Err(AppError::BadRequest(
+            "dimensions must be 2 or 3".to_string(),
+        ));
+    }
     let neo4j = state.orchestrator.neo4j();
 
     // 1. Resolve project
@@ -1147,6 +1166,7 @@ pub async fn get_embeddings_projection(
             synapses: vec![],
             skills: vec![],
             dimensions: 0,
+            projection_dimensions: proj_dims,
             method: "none".to_string(),
         }));
     }
@@ -1160,34 +1180,42 @@ pub async fn get_embeddings_projection(
     let dimensions = embeddings_f64.first().map(|v| v.len()).unwrap_or(0);
 
     // 4. Run UMAP projection (requires >= 4 points for n_neighbors=15)
-    let projected_2d = if embedding_points.len() < 4 {
-        // Too few points for UMAP — use simple normalization
-        embedding_points
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let angle =
-                    2.0 * std::f64::consts::PI * (i as f64) / (embedding_points.len() as f64);
-                vec![angle.cos() * 10.0, angle.sin() * 10.0]
+    let circular_fallback = |n: usize, dims: usize| -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|i| {
+                let angle = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+                let mut coords = vec![angle.cos() * 10.0, angle.sin() * 10.0];
+                if dims == 3 {
+                    coords.push(0.0);
+                }
+                coords
             })
-            .collect::<Vec<_>>()
+            .collect()
+    };
+
+    let projected = if embedding_points.len() < 4 {
+        // Too few points for UMAP — use simple circular layout
+        circular_fallback(embedding_points.len(), proj_dims)
+    } else if proj_dims == 3 {
+        match rag_umap::convert_to_3d(embeddings_f64) {
+            Ok(coords) => coords,
+            Err(e) => {
+                tracing::warn!(
+                    "UMAP 3D projection failed, falling back to circular layout: {}",
+                    e
+                );
+                circular_fallback(embedding_points.len(), 3)
+            }
+        }
     } else {
         match rag_umap::convert_to_2d(embeddings_f64) {
             Ok(coords) => coords,
             Err(e) => {
                 tracing::warn!(
-                    "UMAP projection failed, falling back to circular layout: {}",
+                    "UMAP 2D projection failed, falling back to circular layout: {}",
                     e
                 );
-                embedding_points
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| {
-                        let angle = 2.0 * std::f64::consts::PI * (i as f64)
-                            / (embedding_points.len() as f64);
-                        vec![angle.cos() * 10.0, angle.sin() * 10.0]
-                    })
-                    .collect()
+                circular_fallback(embedding_points.len(), 2)
             }
         }
     };
@@ -1195,12 +1223,17 @@ pub async fn get_embeddings_projection(
     // 5. Build projection points
     let points: Vec<ProjectionPoint> = embedding_points
         .iter()
-        .zip(projected_2d.iter())
+        .zip(projected.iter())
         .map(|(ep, coords)| ProjectionPoint {
             id: ep.id.to_string(),
             point_type: "note".to_string(),
             x: coords.first().copied().unwrap_or(0.0),
             y: coords.get(1).copied().unwrap_or(0.0),
+            z: if proj_dims == 3 {
+                Some(coords.get(2).copied().unwrap_or(0.0))
+            } else {
+                None
+            },
             energy: ep.energy,
             importance: ep.importance.clone(),
             tags: ep.tags.clone(),
@@ -1229,8 +1262,10 @@ pub async fn get_embeddings_projection(
         .collect();
 
     // 8. Build skills with centroids
-    let id_to_coords: HashMap<String, (f64, f64)> =
-        points.iter().map(|p| (p.id.clone(), (p.x, p.y))).collect();
+    let id_to_coords: HashMap<String, (f64, f64, Option<f64>)> = points
+        .iter()
+        .map(|p| (p.id.clone(), (p.x, p.y, p.z)))
+        .collect();
 
     let all_skills = skills_res.map(|(s, _)| s).unwrap_or_default();
     let mut skills = Vec::new();
@@ -1250,19 +1285,24 @@ pub async fn get_embeddings_projection(
         }
 
         // Compute centroid from projected coordinates
-        let (sum_x, sum_y, count) =
-            member_ids
-                .iter()
-                .fold((0.0_f64, 0.0_f64, 0usize), |(sx, sy, c), id| {
-                    if let Some(&(x, y)) = id_to_coords.get(id) {
-                        (sx + x, sy + y, c + 1)
-                    } else {
-                        (sx, sy, c)
-                    }
-                });
+        let (sum_x, sum_y, sum_z, count) = member_ids.iter().fold(
+            (0.0_f64, 0.0_f64, 0.0_f64, 0usize),
+            |(sx, sy, sz, c), id| {
+                if let Some(&(x, y, z)) = id_to_coords.get(id) {
+                    (sx + x, sy + y, sz + z.unwrap_or(0.0), c + 1)
+                } else {
+                    (sx, sy, sz, c)
+                }
+            },
+        );
 
         let centroid_x = if count > 0 { sum_x / count as f64 } else { 0.0 };
         let centroid_y = if count > 0 { sum_y / count as f64 } else { 0.0 };
+        let centroid_z = if proj_dims == 3 && count > 0 {
+            Some(sum_z / count as f64)
+        } else {
+            None
+        };
 
         skills.push(ProjectionSkill {
             id: skill.id.to_string(),
@@ -1270,6 +1310,7 @@ pub async fn get_embeddings_projection(
             member_ids,
             centroid_x,
             centroid_y,
+            centroid_z,
         });
     }
 
@@ -1278,7 +1319,12 @@ pub async fn get_embeddings_projection(
         synapses,
         skills,
         dimensions,
-        method: "umap".to_string(),
+        projection_dimensions: proj_dims,
+        method: if embedding_points.len() < 4 {
+            "circular_fallback".to_string()
+        } else {
+            "umap".to_string()
+        },
     }))
 }
 
