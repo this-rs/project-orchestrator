@@ -788,7 +788,7 @@ Manage analysis profiles (edge/fusion weight presets). Actions: list, create, ge
 | delete | `id` (req) | Delete analysis profile |
 
 ## protocol
-Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, transition, get_run, list_runs, cancel_run, fail_run, report_progress, route
+Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, transition, get_run, list_runs, cancel_run, fail_run, report_progress, route, compose, simulate
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -812,6 +812,8 @@ Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, d
 | fail_run | `run_id` (req), `error` | Mark a running protocol run as failed with error message |
 | report_progress | `run_id` (req), `state_name` (req), `sub_action` (req), `processed`, `total`, `elapsed_ms` | Report progress during a long-running state (emits WS event for FSM Viewer) |
 | route | `project_id` (req), `plan_id`, `phase`, `domain`, `resource` | Route protocols by context affinity — returns ranked list with scores per dimension and explanation |
+| compose | `project_id` (req), `name` (req), `description`, `category` (system/business), `states` (req, array of {name, state_type, description, action}), `transitions` (req, array of {from_state, to_state, trigger, guard}), `notes` (array of {note_id, state_name}), `relevance_vector`, `triggers` (array of {pattern_type, pattern_value, confidence_threshold}) | One-shot creation: creates Skill + Protocol + States + Transitions + Note→Skill links in a single call. States/transitions use **name-based** references (not UUIDs). Returns protocol_id, skill_id, counts. |
+| simulate | `protocol_id` (req), `context` ({phase, structure, domain, resource, lifecycle}), `plan_id` | Dry-run activation: computes affinity score against the protocol's relevance_vector. Returns score (0-1), would_activate (threshold 0.6), per-dimension breakdown, explanation. If `plan_id` is provided, context is auto-built from plan metrics. |
 
 ### Context Relevance Routing
 
@@ -824,12 +826,49 @@ Each protocol can have a `relevance_vector` with 5 dimensions (all in [0,1]):
 
 Use `protocol(action: "route")` to rank protocols by context affinity. When `plan_id` is provided, the context is auto-built from plan metrics (phase, task count, dependencies, completion %). The response includes per-dimension breakdown and human-readable explanation.
 
-Example workflow:
+Example workflow — routing:
 ```
 // During execution of a complex plan:
 protocol(action: "route", project_id: "...", plan_id: "...")
 // → wave-execution scores 95% (phase match + high structure)
 // → code-review scores 60% (phase mismatch)
+```
+
+### One-Shot Composition (compose + simulate)
+
+`compose` creates a complete protocol in a single call — no need to call create, add_state, add_transition, link_to_skill separately.
+It uses **name-based** state references: transitions reference states by `from_state`/`to_state` name (not UUID).
+
+Example workflow — compose then simulate:
+```
+// 1. Compose a protocol with states, transitions and note bindings:
+protocol(action: "compose", project_id: "...", name: "code-review",
+  category: "business",
+  states: [
+    { name: "analyze", state_type: "start", description: "Analyze code changes" },
+    { name: "review", state_type: "intermediate", description: "Review findings" },
+    { name: "done", state_type: "terminal", description: "Review complete" }
+  ],
+  transitions: [
+    { from_state: "analyze", to_state: "review", trigger: "analysis_complete" },
+    { from_state: "review", to_state: "done", trigger: "approved" }
+  ],
+  notes: [
+    { note_id: "...", state_name: "analyze" }
+  ],
+  relevance_vector: { phase: 0.75, structure: 0.6, domain: 0.5, resource: 0.5, lifecycle: 0.5 }
+)
+// → { protocol_id: "...", skill_id: "...", states_created: 3, transitions_created: 2, notes_linked: 1 }
+
+// 2. Simulate activation to test the relevance vector:
+protocol(action: "simulate", protocol_id: "...",
+  context: { phase: 0.75, structure: 0.7, domain: 0.5, resource: 0.4, lifecycle: 0.5 }
+)
+// → { score: 0.92, would_activate: true, dimensions: [...], explanation: "Strong match on phase (review)" }
+
+// 3. Or simulate with auto-built context from a plan:
+protocol(action: "simulate", protocol_id: "...", plan_id: "...")
+// → context auto-built from plan metrics (completion %, task count, complexity)
 ```
 "#;
 
