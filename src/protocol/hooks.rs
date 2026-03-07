@@ -763,4 +763,184 @@ mod tests {
             .unwrap();
         assert_eq!(total, 0);
     }
+
+    // ====================================================================
+    // Integration tests: Auto mode (Event + Scheduled combined)
+    // ====================================================================
+
+    /// Helper: create a protocol mimicking the "inference" protocol with
+    /// trigger_mode=Auto, events=["post_sync", "post_import"], schedule="daily".
+    async fn setup_inference_protocol(store: &MockGraphStore) -> (Uuid, Protocol) {
+        let project_id = Uuid::new_v4();
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "inference-project".to_string(),
+            slug: "inference-project".to_string(),
+            description: None,
+            root_path: "/tmp/inference".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let protocol_id = Uuid::new_v4();
+        let start_state = ProtocolState::start(protocol_id, "Start");
+        let mid_state = ProtocolState::new(protocol_id, "Processing");
+        let done_state = ProtocolState::terminal(protocol_id, "Done");
+
+        let mut protocol = Protocol::new_full(
+            project_id,
+            "inference",
+            "Code intelligence inference protocol",
+            start_state.id,
+            vec![done_state.id],
+            ProtocolCategory::System,
+        );
+        protocol.id = protocol_id;
+        protocol.trigger_mode = TriggerMode::Auto;
+        protocol.trigger_config = Some(TriggerConfig {
+            events: vec!["post_sync".to_string(), "post_import".to_string()],
+            schedule: Some("daily".to_string()),
+            conditions: vec![],
+        });
+
+        store.upsert_protocol(&protocol).await.unwrap();
+        store.upsert_protocol_state(&start_state).await.unwrap();
+        store.upsert_protocol_state(&mid_state).await.unwrap();
+        store.upsert_protocol_state(&done_state).await.unwrap();
+
+        let t1 = ProtocolTransition::new(
+            protocol_id, start_state.id, mid_state.id, "process",
+        );
+        let t2 = ProtocolTransition::new(
+            protocol_id, mid_state.id, done_state.id, "complete",
+        );
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+
+        (project_id, protocol)
+    }
+
+    /// Integration test 1: sync → auto-triggered event run
+    #[tokio::test]
+    async fn test_integration_sync_triggers_inference() {
+        let store = MockGraphStore::new();
+        let (project_id, protocol) = setup_inference_protocol(&store).await;
+
+        // Simulate a post_sync event (like after admin(sync_directory))
+        trigger_protocols_for_event(&store, project_id, "post_sync")
+            .await
+            .unwrap();
+
+        let (runs, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(runs[0].triggered_by, "event:post_sync");
+
+        // Also verify post_import triggers
+        // First, advance time past debounce window by updating last_triggered_at to 10min ago
+        let mut p = store.get_protocol(protocol.id).await.unwrap().unwrap();
+        p.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+        store.upsert_protocol(&p).await.unwrap();
+
+        trigger_protocols_for_event(&store, project_id, "post_import")
+            .await
+            .unwrap();
+
+        let (runs, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        // Most recent run should be the post_import one
+        let import_run = runs.iter().find(|r| r.triggered_by == "event:post_import");
+        assert!(import_run.is_some(), "Should have a post_import triggered run");
+    }
+
+    /// Integration test 2: schedule → auto-triggered scheduled run
+    #[tokio::test]
+    async fn test_integration_schedule_triggers_inference() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_inference_protocol(&store).await;
+
+        // Protocol has never been triggered → scheduler should trigger it
+        run_scheduled_protocols(&store).await.unwrap();
+
+        let (runs, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(runs[0].triggered_by, "schedule:daily");
+    }
+
+    /// Integration test 3: manual start coexists with auto-triggered runs
+    #[tokio::test]
+    async fn test_integration_manual_coexists_with_auto() {
+        let store = MockGraphStore::new();
+        let (project_id, protocol) = setup_inference_protocol(&store).await;
+
+        // 1. Manual start (via MCP/REST — triggered_by defaults to "manual")
+        let manual_run = engine::start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(manual_run.triggered_by, "manual");
+
+        // 2. Event-triggered start (simulating post_sync)
+        trigger_protocols_for_event(&store, project_id, "post_sync")
+            .await
+            .unwrap();
+
+        // 3. Advance past debounce, then schedule-triggered start
+        let mut p = store.get_protocol(protocol.id).await.unwrap().unwrap();
+        p.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
+        store.upsert_protocol(&p).await.unwrap();
+
+        run_scheduled_protocols(&store).await.unwrap();
+
+        // All 3 runs should coexist
+        let (runs, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 3, "Expected 3 runs (manual + event + schedule)");
+
+        let triggers: Vec<&str> = runs.iter().map(|r| r.triggered_by.as_str()).collect();
+        assert!(triggers.contains(&"manual"), "Should have manual run");
+        assert!(triggers.contains(&"event:post_sync"), "Should have event run");
+        assert!(triggers.contains(&"schedule:daily"), "Should have schedule run");
+    }
+
+    /// Integration test: event debounce prevents double-trigger on rapid syncs
+    #[tokio::test]
+    async fn test_integration_debounce_prevents_rapid_triggers() {
+        let store = MockGraphStore::new();
+        let (project_id, protocol) = setup_inference_protocol(&store).await;
+
+        // First sync triggers
+        trigger_protocols_for_event(&store, project_id, "post_sync")
+            .await
+            .unwrap();
+
+        // Immediate second sync should be debounced
+        trigger_protocols_for_event(&store, project_id, "post_sync")
+            .await
+            .unwrap();
+
+        // Third sync with different event should also be debounced
+        // (debounce is per-protocol, not per-event)
+        trigger_protocols_for_event(&store, project_id, "post_import")
+            .await
+            .unwrap();
+
+        let (_, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "Only the first event should trigger, rest debounced");
+    }
 }
