@@ -2636,4 +2636,76 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<super::models::NoteEmbeddingPoint>> {
         self.get_note_embeddings_for_project(project_id).await
     }
+
+    // ========================================================================
+    // Protocol operations (Pattern Federation)
+    // ========================================================================
+
+    async fn upsert_protocol(
+        &self,
+        protocol: &crate::protocol::Protocol,
+    ) -> anyhow::Result<()> {
+        self.upsert_protocol(protocol).await
+    }
+
+    async fn get_protocol(
+        &self,
+        id: uuid::Uuid,
+    ) -> anyhow::Result<Option<crate::protocol::Protocol>> {
+        self.get_protocol(id).await
+    }
+
+    async fn list_protocols(
+        &self,
+        project_id: uuid::Uuid,
+        category: Option<crate::protocol::ProtocolCategory>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::Protocol>, usize)> {
+        self.list_protocols(project_id, category, limit, offset)
+            .await
+    }
+
+    async fn delete_protocol(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        self.delete_protocol(id).await
+    }
+
+    async fn upsert_protocol_state(
+        &self,
+        state: &crate::protocol::ProtocolState,
+    ) -> anyhow::Result<()> {
+        self.upsert_protocol_state(state).await
+    }
+
+    async fn get_protocol_states(
+        &self,
+        protocol_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolState>> {
+        self.get_protocol_states(protocol_id).await
+    }
+
+    async fn delete_protocol_state(&self, state_id: uuid::Uuid) -> anyhow::Result<bool> {
+        self.delete_protocol_state(state_id).await
+    }
+
+    async fn upsert_protocol_transition(
+        &self,
+        transition: &crate::protocol::ProtocolTransition,
+    ) -> anyhow::Result<()> {
+        self.upsert_protocol_transition(transition).await
+    }
+
+    async fn get_protocol_transitions(
+        &self,
+        protocol_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolTransition>> {
+        self.get_protocol_transitions(protocol_id).await
+    }
+
+    async fn delete_protocol_transition(
+        &self,
+        transition_id: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        self.delete_protocol_transition(transition_id).await
+    }
 }

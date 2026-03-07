@@ -14,6 +14,7 @@ use crate::notes::{
 };
 use crate::parser::FunctionCall;
 use crate::plan::models::{TaskDetails, UpdateTaskRequest};
+use crate::protocol::{Protocol, ProtocolState, ProtocolTransition};
 use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -2241,4 +2242,47 @@ pub trait GraphStore: Send + Sync {
         &self,
         project_id: Uuid,
     ) -> Result<Vec<NoteEmbeddingPoint>>;
+
+    // ========================================================================
+    // Protocol operations (Pattern Federation)
+    // ========================================================================
+
+    /// Create a new protocol with its BELONGS_TO relationship to project.
+    /// Also creates HAS_STATE and HAS_TRANSITION relationships for sub-entities.
+    async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()>;
+
+    /// Get a protocol by ID, including its states and transitions.
+    async fn get_protocol(&self, id: Uuid) -> Result<Option<Protocol>>;
+
+    /// List protocols for a project with optional category filter and pagination.
+    /// Returns (protocols, total_count).
+    async fn list_protocols(
+        &self,
+        project_id: Uuid,
+        category: Option<crate::protocol::ProtocolCategory>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Protocol>, usize)>;
+
+    /// Delete a protocol and all its states, transitions, and relationships.
+    /// Returns true if the protocol existed and was deleted.
+    async fn delete_protocol(&self, id: Uuid) -> Result<bool>;
+
+    /// Upsert a protocol state and create its HAS_STATE relationship.
+    async fn upsert_protocol_state(&self, state: &ProtocolState) -> Result<()>;
+
+    /// Get all states for a protocol.
+    async fn get_protocol_states(&self, protocol_id: Uuid) -> Result<Vec<ProtocolState>>;
+
+    /// Delete a protocol state and its relationships.
+    async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool>;
+
+    /// Upsert a protocol transition and create its HAS_TRANSITION relationship.
+    async fn upsert_protocol_transition(&self, transition: &ProtocolTransition) -> Result<()>;
+
+    /// Get all transitions for a protocol.
+    async fn get_protocol_transitions(&self, protocol_id: Uuid) -> Result<Vec<ProtocolTransition>>;
+
+    /// Delete a protocol transition.
+    async fn delete_protocol_transition(&self, transition_id: Uuid) -> Result<bool>;
 }

@@ -128,6 +128,11 @@ pub struct MockGraphStore {
     /// skill_id -> Vec<(entity_type, entity_id)>
     pub skill_members: RwLock<HashMap<Uuid, Vec<(String, Uuid)>>>,
 
+    // Protocol stores (Pattern Federation)
+    pub protocols: RwLock<HashMap<Uuid, crate::protocol::Protocol>>,
+    pub protocol_states: RwLock<HashMap<Uuid, crate::protocol::ProtocolState>>,
+    pub protocol_transitions: RwLock<HashMap<Uuid, crate::protocol::ProtocolTransition>>,
+
     // Analysis profiles (keyed by profile id String)
     pub analysis_profiles: RwLock<HashMap<String, crate::graph::models::AnalysisProfile>>,
 
@@ -211,6 +216,9 @@ impl MockGraphStore {
             function_embeddings: RwLock::new(HashMap::new()),
             skills: RwLock::new(HashMap::new()),
             skill_members: RwLock::new(HashMap::new()),
+            protocols: RwLock::new(HashMap::new()),
+            protocol_states: RwLock::new(HashMap::new()),
+            protocol_transitions: RwLock::new(HashMap::new()),
             analysis_profiles: RwLock::new(HashMap::new()),
             topology_rules: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
@@ -7612,6 +7620,146 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(points)
+    }
+
+    // ========================================================================
+    // Protocol operations (Pattern Federation)
+    // ========================================================================
+
+    async fn upsert_protocol(
+        &self,
+        protocol: &crate::protocol::Protocol,
+    ) -> anyhow::Result<()> {
+        // Validate project exists
+        let projects = self.projects.read().await;
+        if !projects.is_empty() && !projects.contains_key(&protocol.project_id) {
+            anyhow::bail!(
+                "Project not found: {}. Cannot create protocol in non-existent project.",
+                protocol.project_id
+            );
+        }
+        drop(projects);
+        self.protocols
+            .write()
+            .await
+            .insert(protocol.id, protocol.clone());
+        Ok(())
+    }
+
+    async fn get_protocol(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::protocol::Protocol>> {
+        Ok(self.protocols.read().await.get(&id).cloned())
+    }
+
+    async fn list_protocols(
+        &self,
+        project_id: Uuid,
+        category: Option<crate::protocol::ProtocolCategory>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::Protocol>, usize)> {
+        let store = self.protocols.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|p| {
+                p.project_id == project_id
+                    && category.as_ref().map_or(true, |c| p.protocol_category == *c)
+            })
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn delete_protocol(&self, id: Uuid) -> anyhow::Result<bool> {
+        let existed = self.protocols.write().await.remove(&id).is_some();
+        if existed {
+            // Remove associated states and transitions
+            self.protocol_states
+                .write()
+                .await
+                .retain(|_, s| s.protocol_id != id);
+            self.protocol_transitions
+                .write()
+                .await
+                .retain(|_, t| t.protocol_id != id);
+        }
+        Ok(existed)
+    }
+
+    async fn upsert_protocol_state(
+        &self,
+        state: &crate::protocol::ProtocolState,
+    ) -> anyhow::Result<()> {
+        self.protocol_states
+            .write()
+            .await
+            .insert(state.id, state.clone());
+        Ok(())
+    }
+
+    async fn get_protocol_states(
+        &self,
+        protocol_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolState>> {
+        let store = self.protocol_states.read().await;
+        let mut states: Vec<_> = store
+            .values()
+            .filter(|s| s.protocol_id == protocol_id)
+            .cloned()
+            .collect();
+        states.sort_by(|a, b| a.state_type.to_string().cmp(&b.state_type.to_string()));
+        Ok(states)
+    }
+
+    async fn delete_protocol_state(&self, state_id: Uuid) -> anyhow::Result<bool> {
+        Ok(self
+            .protocol_states
+            .write()
+            .await
+            .remove(&state_id)
+            .is_some())
+    }
+
+    async fn upsert_protocol_transition(
+        &self,
+        transition: &crate::protocol::ProtocolTransition,
+    ) -> anyhow::Result<()> {
+        self.protocol_transitions
+            .write()
+            .await
+            .insert(transition.id, transition.clone());
+        Ok(())
+    }
+
+    async fn get_protocol_transitions(
+        &self,
+        protocol_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolTransition>> {
+        let store = self.protocol_transitions.read().await;
+        let mut transitions: Vec<_> = store
+            .values()
+            .filter(|t| t.protocol_id == protocol_id)
+            .cloned()
+            .collect();
+        transitions.sort_by(|a, b| a.trigger.cmp(&b.trigger));
+        Ok(transitions)
+    }
+
+    async fn delete_protocol_transition(
+        &self,
+        transition_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .protocol_transitions
+            .write()
+            .await
+            .remove(&transition_id)
+            .is_some())
     }
 }
 

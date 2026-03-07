@@ -16,6 +16,7 @@ mod note;
 mod plan;
 mod profile;
 mod project;
+mod protocol;
 mod release;
 mod skill;
 mod step;
