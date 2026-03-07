@@ -1107,7 +1107,7 @@ mod tests {
 
     #[test]
     fn test_step3_sort_by_relevance() {
-        let mut notes = vec![
+        let mut notes = [
             ScoredNote {
                 id: "low".to_string(),
                 note_type: "Tip".to_string(),

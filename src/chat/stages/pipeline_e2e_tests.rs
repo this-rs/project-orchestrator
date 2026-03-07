@@ -100,7 +100,7 @@ mod tests {
             project_id: Some(project_id),
             note_type: parse_note_type(note_type),
             status: NoteStatus::Active,
-            importance: importance.clone(),
+            importance,
             scope: NoteScope::Project,
             content: content.to_string(),
             tags: vec!["test".to_string()],

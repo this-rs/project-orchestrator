@@ -573,6 +573,7 @@ impl ReasoningTreeEngine {
     ///
     /// Groups activated entities by their seed origin, creates hierarchical
     /// ReasoningNodes with children, and generates Action suggestions for leaf nodes.
+    #[allow(clippy::too_many_arguments)]
     async fn phase3_cristallize(
         &self,
         request: &str,
@@ -1036,8 +1037,10 @@ mod tests {
     #[tokio::test]
     async fn test_propagation_respects_max_nodes() {
         let engine = make_engine();
-        let mut config = ReasoningTreeConfig::default();
-        config.max_nodes = 5;
+        let config = ReasoningTreeConfig {
+            max_nodes: 5,
+            ..Default::default()
+        };
 
         // Create many seeds
         let seeds: Vec<SeedNode> = (0..10)
