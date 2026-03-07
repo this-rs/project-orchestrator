@@ -779,6 +779,12 @@ pub trait GraphStore: Send + Sync {
     /// Find critical path in a plan (longest chain of dependencies)
     async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
 
+    /// Compute execution waves for a plan (topological sort + level grouping)
+    async fn compute_waves(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<crate::neo4j::plan::WaveComputationResult>;
+
     /// Get next available task (no unfinished dependencies)
     async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>>;
 

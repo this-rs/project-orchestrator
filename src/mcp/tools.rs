@@ -65,6 +65,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "unlink_plan_from_project" => Some(("plan", "unlink_from_project")),
         "get_dependency_graph" => Some(("plan", "get_dependency_graph")),
         "get_critical_path" => Some(("plan", "get_critical_path")),
+        "get_waves" => Some(("plan", "get_waves")),
 
         // Task
         "list_tasks" => Some(("task", "list")),
@@ -361,16 +362,16 @@ fn project_tool() -> ToolDefinition {
 fn plan_tool() -> ToolDefinition {
     ToolDefinition {
         name: "plan".to_string(),
-        description: "Manage plans. Actions: list, create, get, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path".to_string(),
+        description: "Manage plans. Actions: list, create, get, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update_status", "delete", "link_to_project", "unlink_from_project", "get_dependency_graph", "get_critical_path"],
+                    "enum": ["list", "create", "get", "update_status", "delete", "link_to_project", "unlink_from_project", "get_dependency_graph", "get_critical_path", "get_waves"],
                     "description": "Operation to perform"
                 },
-                "plan_id": {"type": "string", "description": "Plan UUID (get/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path)"},
+                "plan_id": {"type": "string", "description": "Plan UUID (get/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path/get_waves)"},
                 "project_id": {"type": "string", "description": "Project UUID (create/link_to_project/unlink_from_project/list)"},
                 "title": {"type": "string", "description": "Plan title (create)"},
                 "description": {"type": "string", "description": "Plan description (create)"},
@@ -1112,6 +1113,7 @@ mod tests {
             "unlink_plan_from_project",
             "get_dependency_graph",
             "get_critical_path",
+            "get_waves",
             "list_tasks",
             "create_task",
             "get_task",

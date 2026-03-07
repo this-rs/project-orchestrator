@@ -11,6 +11,7 @@ use crate::neo4j::models::{
     DecisionTimelineEntry, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ReleaseNode,
     ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
 };
+use crate::neo4j::plan::{WaveComputationResult};
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use crate::AuthConfig;
@@ -3077,6 +3078,20 @@ pub async fn get_plan_critical_path(
 
     let length = tasks.len();
     Ok(Json(CriticalPathResponse { tasks, length }))
+}
+
+/// Get execution waves for a plan (topological sort + level grouping)
+pub async fn get_plan_waves(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<WaveComputationResult>, AppError> {
+    let result = state
+        .orchestrator
+        .neo4j()
+        .compute_waves(plan_id)
+        .await?;
+
+    Ok(Json(result))
 }
 
 // ============================================================================

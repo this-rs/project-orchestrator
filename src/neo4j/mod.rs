@@ -13,7 +13,7 @@ mod impl_graph_store;
 mod milestone;
 pub mod models;
 mod note;
-mod plan;
+pub mod plan;
 mod profile;
 mod project;
 mod protocol;

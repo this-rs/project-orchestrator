@@ -284,6 +284,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/plans/{plan_id}/critical-path",
             get(handlers::get_plan_critical_path),
         )
+        .route(
+            "/api/plans/{plan_id}/waves",
+            get(handlers::get_plan_waves),
+        )
         // Constraints
         .route(
             "/api/plans/{plan_id}/constraints",

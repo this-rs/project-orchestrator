@@ -2,9 +2,67 @@
 
 use super::client::{pascal_to_snake_case, Neo4jClient, WhereBuilder};
 use super::models::*;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use neo4rs::query;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
+
+// ============================================================================
+// Wave computation types
+// ============================================================================
+
+/// A single wave containing tasks that can be executed in parallel
+#[derive(Debug, Serialize, Clone)]
+pub struct Wave {
+    /// Wave number (1-indexed)
+    pub wave_number: usize,
+    /// Tasks in this wave
+    pub tasks: Vec<WaveTask>,
+    /// Number of tasks in this wave
+    pub task_count: usize,
+    /// Whether this wave was split due to file conflicts
+    pub split_from_conflicts: bool,
+}
+
+/// A task within a wave
+#[derive(Debug, Serialize, Clone)]
+pub struct WaveTask {
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub status: String,
+    pub priority: Option<i32>,
+    pub affected_files: Vec<String>,
+    pub depends_on: Vec<Uuid>,
+}
+
+/// A conflict between two tasks sharing affected_files
+#[derive(Debug, Serialize, Clone)]
+pub struct FileConflict {
+    pub task_a: Uuid,
+    pub task_b: Uuid,
+    pub shared_files: Vec<String>,
+}
+
+/// Summary statistics for wave computation
+#[derive(Debug, Serialize)]
+pub struct WaveSummary {
+    pub total_tasks: usize,
+    pub total_waves: usize,
+    pub max_parallel: usize,
+    pub critical_path_length: usize,
+    pub dependency_edges: usize,
+    pub conflicts_detected: usize,
+}
+
+/// Complete wave computation result
+#[derive(Debug, Serialize)]
+pub struct WaveComputationResult {
+    pub waves: Vec<Wave>,
+    pub summary: WaveSummary,
+    pub conflicts: Vec<FileConflict>,
+    pub edges: Vec<(Uuid, Uuid)>,
+}
 
 impl Neo4jClient {
     // ========================================================================
@@ -405,6 +463,313 @@ impl Neo4jClient {
         }
 
         Ok(tasks)
+    }
+
+    /// Compute execution waves for a plan using topological sort (Kahn's algorithm)
+    ///
+    /// Waves represent groups of tasks that can be executed in parallel.
+    /// Wave 1 contains tasks with no dependencies, wave 2 contains tasks
+    /// that only depend on wave 1, etc.
+    ///
+    /// Returns an error if the dependency graph contains cycles.
+    pub async fn compute_waves(&self, plan_id: Uuid) -> Result<WaveComputationResult> {
+        // 1. Get the DAG: tasks + dependency edges
+        let (tasks, edges) = self.get_plan_dependency_graph(plan_id).await?;
+
+        if tasks.is_empty() {
+            return Ok(WaveComputationResult {
+                waves: vec![],
+                summary: WaveSummary {
+                    total_tasks: 0,
+                    total_waves: 0,
+                    max_parallel: 0,
+                    critical_path_length: 0,
+                    dependency_edges: 0,
+                    conflicts_detected: 0,
+                },
+                conflicts: vec![],
+                edges: vec![],
+            });
+        }
+
+        // 2. Build adjacency list + in-degree map
+        // edges are (from, to) where `from` DEPENDS_ON `to`
+        // meaning `to` must complete before `from` can start
+        let task_map: HashMap<Uuid, &TaskNode> =
+            tasks.iter().map(|t| (t.id, t)).collect();
+
+        // Dependencies: task -> set of tasks it depends on
+        let mut deps_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+        // Reverse: task -> set of tasks that depend on it
+        let mut dependents_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+        // In-degree: number of unresolved dependencies
+        let mut in_degree: HashMap<Uuid, usize> = HashMap::new();
+
+        // Initialize all tasks with zero in-degree
+        for task in &tasks {
+            in_degree.insert(task.id, 0);
+            deps_of.insert(task.id, HashSet::new());
+            dependents_of.insert(task.id, HashSet::new());
+        }
+
+        // Build edges
+        for &(from, to) in &edges {
+            // `from` depends on `to`
+            if task_map.contains_key(&from) && task_map.contains_key(&to) {
+                deps_of.entry(from).or_default().insert(to);
+                dependents_of.entry(to).or_default().insert(from);
+                *in_degree.entry(from).or_default() += 1;
+            }
+        }
+
+        // 3. Kahn's algorithm with level grouping
+        // Start with all tasks that have zero in-degree (no dependencies)
+        let mut queue: VecDeque<Uuid> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg == 0)
+            .map(|(&id, _)| id)
+            .collect();
+
+        // Sort initial queue deterministically: by priority desc, then title asc
+        let mut initial: Vec<Uuid> = queue.drain(..).collect();
+        initial.sort_by(|a, b| {
+            let pa = task_map[a].priority.unwrap_or(0);
+            let pb = task_map[b].priority.unwrap_or(0);
+            pb.cmp(&pa).then_with(|| {
+                let ta = task_map[a].title.as_deref().unwrap_or("");
+                let tb = task_map[b].title.as_deref().unwrap_or("");
+                ta.cmp(tb)
+            })
+        });
+        queue.extend(initial);
+
+        let mut waves: Vec<Wave> = Vec::new();
+        let mut processed_count = 0;
+        let mut task_wave: HashMap<Uuid, usize> = HashMap::new(); // task_id -> wave_number
+
+        while !queue.is_empty() {
+            // All tasks in the current queue form one wave
+            let current_level: Vec<Uuid> = queue.drain(..).collect();
+            let wave_number = waves.len() + 1; // 1-indexed
+
+            let mut wave_tasks: Vec<WaveTask> = Vec::new();
+            let mut next_queue: Vec<Uuid> = Vec::new();
+
+            for &task_id in &current_level {
+                processed_count += 1;
+                task_wave.insert(task_id, wave_number);
+
+                if let Some(task) = task_map.get(&task_id) {
+                    wave_tasks.push(WaveTask {
+                        id: task.id,
+                        title: task.title.clone(),
+                        status: format!("{:?}", task.status),
+                        priority: task.priority,
+                        affected_files: task.affected_files.clone(),
+                        depends_on: deps_of
+                            .get(&task_id)
+                            .map(|s| s.iter().copied().collect())
+                            .unwrap_or_default(),
+                    });
+                }
+
+                // Decrement in-degree for all dependents
+                if let Some(dependents) = dependents_of.get(&task_id) {
+                    for &dep_id in dependents {
+                        if let Some(deg) = in_degree.get_mut(&dep_id) {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                next_queue.push(dep_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sort wave tasks deterministically
+            wave_tasks.sort_by(|a, b| {
+                let pa = a.priority.unwrap_or(0);
+                let pb = b.priority.unwrap_or(0);
+                pb.cmp(&pa).then_with(|| {
+                    let ta = a.title.as_deref().unwrap_or("");
+                    let tb = b.title.as_deref().unwrap_or("");
+                    ta.cmp(tb)
+                })
+            });
+
+            let task_count = wave_tasks.len();
+            waves.push(Wave {
+                wave_number,
+                tasks: wave_tasks,
+                task_count,
+                split_from_conflicts: false,
+            });
+
+            // Sort next queue deterministically before adding
+            next_queue.sort_by(|a, b| {
+                let pa = task_map[a].priority.unwrap_or(0);
+                let pb = task_map[b].priority.unwrap_or(0);
+                pb.cmp(&pa).then_with(|| {
+                    let ta = task_map[a].title.as_deref().unwrap_or("");
+                    let tb = task_map[b].title.as_deref().unwrap_or("");
+                    ta.cmp(tb)
+                })
+            });
+            queue.extend(next_queue);
+        }
+
+        // 4. Cycle detection: if we didn't process all tasks, there's a cycle
+        if processed_count < tasks.len() {
+            let cycle_tasks: Vec<String> = tasks
+                .iter()
+                .filter(|t| !task_wave.contains_key(&t.id))
+                .map(|t| {
+                    format!(
+                        "{} ({})",
+                        t.title.as_deref().unwrap_or("untitled"),
+                        t.id
+                    )
+                })
+                .collect();
+            bail!(
+                "Cycle detected in dependency graph! Tasks involved: {}",
+                cycle_tasks.join(", ")
+            );
+        }
+
+        // 5. Conflict splitting — detect affected_files intersections within each wave
+        let mut all_conflicts: Vec<FileConflict> = Vec::new();
+        let mut split_waves: Vec<Wave> = Vec::new();
+        let mut wave_counter = 0usize;
+
+        for wave in &waves {
+            // Build conflict graph for tasks in this wave
+            let mut conflicts_in_wave: Vec<(usize, usize, Vec<String>)> = Vec::new();
+
+            for i in 0..wave.tasks.len() {
+                let files_a: HashSet<&str> = wave.tasks[i]
+                    .affected_files
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                if files_a.is_empty() {
+                    continue;
+                }
+                for j in (i + 1)..wave.tasks.len() {
+                    let shared: Vec<String> = wave.tasks[j]
+                        .affected_files
+                        .iter()
+                        .filter(|f| files_a.contains(f.as_str()))
+                        .cloned()
+                        .collect();
+                    if !shared.is_empty() {
+                        conflicts_in_wave.push((i, j, shared.clone()));
+                        all_conflicts.push(FileConflict {
+                            task_a: wave.tasks[i].id,
+                            task_b: wave.tasks[j].id,
+                            shared_files: shared,
+                        });
+                    }
+                }
+            }
+
+            if conflicts_in_wave.is_empty() {
+                // No conflicts — keep wave as-is
+                wave_counter += 1;
+                split_waves.push(Wave {
+                    wave_number: wave_counter,
+                    tasks: wave.tasks.clone(),
+                    task_count: wave.task_count,
+                    split_from_conflicts: false,
+                });
+            } else {
+                // Greedy graph coloring to partition into conflict-free groups
+                let n = wave.tasks.len();
+                let mut adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+                for &(i, j, _) in &conflicts_in_wave {
+                    adj[i].insert(j);
+                    adj[j].insert(i);
+                }
+
+                let mut colors: Vec<Option<usize>> = vec![None; n];
+                // Sort by degree descending for better coloring
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|a, b| adj[*b].len().cmp(&adj[*a].len()));
+
+                for idx in order {
+                    let used: HashSet<usize> = adj[idx]
+                        .iter()
+                        .filter_map(|&neighbor| colors[neighbor])
+                        .collect();
+                    let mut color = 0;
+                    while used.contains(&color) {
+                        color += 1;
+                    }
+                    colors[idx] = Some(color);
+                }
+
+                // Group tasks by color → each color = one sub-wave
+                let max_color = colors.iter().filter_map(|c| *c).max().unwrap_or(0);
+                for color in 0..=max_color {
+                    let group_tasks: Vec<WaveTask> = wave
+                        .tasks
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| colors[*i] == Some(color))
+                        .map(|(_, t)| t.clone())
+                        .collect();
+                    if !group_tasks.is_empty() {
+                        wave_counter += 1;
+                        let task_count = group_tasks.len();
+                        split_waves.push(Wave {
+                            wave_number: wave_counter,
+                            tasks: group_tasks,
+                            task_count,
+                            split_from_conflicts: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 6. Compute critical path length (longest chain)
+        let mut longest_path: HashMap<Uuid, usize> = HashMap::new();
+        for wave in &split_waves {
+            for task in &wave.tasks {
+                let max_dep_path = task
+                    .depends_on
+                    .iter()
+                    .filter_map(|dep_id| longest_path.get(dep_id))
+                    .max()
+                    .copied()
+                    .unwrap_or(0);
+                longest_path.insert(task.id, max_dep_path + 1);
+            }
+        }
+        let critical_path_length = longest_path.values().max().copied().unwrap_or(0);
+
+        // 7. Compute summary
+        let max_parallel = split_waves
+            .iter()
+            .map(|w| w.task_count)
+            .max()
+            .unwrap_or(0);
+
+        let summary = WaveSummary {
+            total_tasks: tasks.len(),
+            total_waves: split_waves.len(),
+            max_parallel,
+            critical_path_length,
+            dependency_edges: edges.len(),
+            conflicts_detected: all_conflicts.len(),
+        };
+
+        Ok(WaveComputationResult {
+            waves: split_waves,
+            summary,
+            conflicts: all_conflicts,
+            edges,
+        })
     }
 
     /// List plans with filters and pagination

@@ -986,6 +986,13 @@ impl GraphStore for Neo4jClient {
         self.get_plan_critical_path(plan_id).await
     }
 
+    async fn compute_waves(
+        &self,
+        plan_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::plan::WaveComputationResult> {
+        self.compute_waves(plan_id).await
+    }
+
     async fn get_next_available_task(&self, plan_id: Uuid) -> anyhow::Result<Option<TaskNode>> {
         self.get_next_available_task(plan_id).await
     }

@@ -110,6 +110,7 @@ impl ToolHandler {
             ("plan", "unlink_from_project") => "unlink_plan_from_project",
             ("plan", "get_dependency_graph") => "get_dependency_graph",
             ("plan", "get_critical_path") => "get_critical_path",
+            ("plan", "get_waves") => "get_waves",
 
             // Task
             ("task", "list") => "list_tasks",
@@ -683,6 +684,14 @@ impl ToolHandler {
                 let plan_id = extract_id(args, "plan_id")?;
                 let result = http
                     .get(&format!("/api/plans/{}/critical-path", plan_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_waves" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .get(&format!("/api/plans/{}/waves", plan_id))
                     .await?;
                 Ok(Some(result))
             }
@@ -3826,6 +3835,7 @@ mod tests {
             ("link_to_project", "link_plan_to_project"),
             ("get_dependency_graph", "get_dependency_graph"),
             ("get_critical_path", "get_critical_path"),
+            ("get_waves", "get_waves"),
             ("delete", "delete_plan"),
         ] {
             let args = json!({"action": action});
@@ -4550,6 +4560,17 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "GET");
         assert!(result["path"].as_str().unwrap().ends_with("/critical-path"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_waves() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_waves", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/waves"));
     }
 
     // -- Tasks (remaining) --------------------------------------------------

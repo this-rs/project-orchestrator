@@ -3255,6 +3255,158 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
+    async fn compute_waves(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<crate::neo4j::plan::WaveComputationResult> {
+        use crate::neo4j::plan::*;
+        use std::collections::{HashSet, VecDeque};
+
+        let (tasks, edges) = self.get_plan_dependency_graph(plan_id).await?;
+
+        if tasks.is_empty() {
+            return Ok(WaveComputationResult {
+                waves: vec![],
+                summary: WaveSummary {
+                    total_tasks: 0,
+                    total_waves: 0,
+                    max_parallel: 0,
+                    critical_path_length: 0,
+                    dependency_edges: 0,
+                    conflicts_detected: 0,
+                },
+                conflicts: vec![],
+                edges: vec![],
+            });
+        }
+
+        let task_map: HashMap<Uuid, &TaskNode> = tasks.iter().map(|t| (t.id, t)).collect();
+        let mut deps_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+        let mut dependents_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+        let mut in_degree: HashMap<Uuid, usize> = HashMap::new();
+
+        for task in &tasks {
+            in_degree.insert(task.id, 0);
+            deps_of.insert(task.id, HashSet::new());
+            dependents_of.insert(task.id, HashSet::new());
+        }
+
+        for &(from, to) in &edges {
+            if task_map.contains_key(&from) && task_map.contains_key(&to) {
+                deps_of.entry(from).or_default().insert(to);
+                dependents_of.entry(to).or_default().insert(from);
+                *in_degree.entry(from).or_default() += 1;
+            }
+        }
+
+        let mut queue: VecDeque<Uuid> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg == 0)
+            .map(|(&id, _)| id)
+            .collect();
+
+        let mut waves: Vec<Wave> = Vec::new();
+        let mut processed_count = 0;
+
+        while !queue.is_empty() {
+            let current_level: Vec<Uuid> = queue.drain(..).collect();
+            let wave_number = waves.len() + 1;
+            let mut wave_tasks: Vec<WaveTask> = Vec::new();
+
+            for &task_id in &current_level {
+                processed_count += 1;
+                if let Some(task) = task_map.get(&task_id) {
+                    wave_tasks.push(WaveTask {
+                        id: task.id,
+                        title: task.title.clone(),
+                        status: format!("{:?}", task.status),
+                        priority: task.priority,
+                        affected_files: task.affected_files.clone(),
+                        depends_on: deps_of.get(&task_id).map(|s| s.iter().copied().collect()).unwrap_or_default(),
+                    });
+                }
+                if let Some(dependents) = dependents_of.get(&task_id) {
+                    for &dep_id in dependents {
+                        if let Some(deg) = in_degree.get_mut(&dep_id) {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                queue.push_back(dep_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let task_count = wave_tasks.len();
+            waves.push(Wave { wave_number, tasks: wave_tasks, task_count, split_from_conflicts: false });
+        }
+
+        if processed_count < tasks.len() {
+            anyhow::bail!("Cycle detected in dependency graph!");
+        }
+
+        // Conflict splitting (simplified for mock — same logic as real impl)
+        let mut all_conflicts: Vec<FileConflict> = Vec::new();
+        let mut split_waves: Vec<Wave> = Vec::new();
+        let mut wave_counter = 0usize;
+
+        for wave in &waves {
+            let mut has_conflicts = false;
+            for i in 0..wave.tasks.len() {
+                let files_a: HashSet<&str> = wave.tasks[i].affected_files.iter().map(|s| s.as_str()).collect();
+                if files_a.is_empty() { continue; }
+                for j in (i + 1)..wave.tasks.len() {
+                    let shared: Vec<String> = wave.tasks[j].affected_files.iter()
+                        .filter(|f| files_a.contains(f.as_str())).cloned().collect();
+                    if !shared.is_empty() {
+                        has_conflicts = true;
+                        all_conflicts.push(FileConflict {
+                            task_a: wave.tasks[i].id,
+                            task_b: wave.tasks[j].id,
+                            shared_files: shared,
+                        });
+                    }
+                }
+            }
+            if !has_conflicts {
+                wave_counter += 1;
+                split_waves.push(Wave {
+                    wave_number: wave_counter,
+                    tasks: wave.tasks.clone(),
+                    task_count: wave.task_count,
+                    split_from_conflicts: false,
+                });
+            } else {
+                // Simple split: put each conflicting task in its own sub-wave
+                for t in &wave.tasks {
+                    wave_counter += 1;
+                    split_waves.push(Wave {
+                        wave_number: wave_counter,
+                        tasks: vec![t.clone()],
+                        task_count: 1,
+                        split_from_conflicts: true,
+                    });
+                }
+            }
+        }
+
+        let max_parallel = split_waves.iter().map(|w| w.task_count).max().unwrap_or(0);
+
+        Ok(WaveComputationResult {
+            waves: split_waves.clone(),
+            summary: WaveSummary {
+                total_tasks: tasks.len(),
+                total_waves: split_waves.len(),
+                max_parallel,
+                critical_path_length: split_waves.len(),
+                dependency_edges: edges.len(),
+                conflicts_detected: all_conflicts.len(),
+            },
+            conflicts: all_conflicts,
+            edges,
+        })
+    }
+
     async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>> {
         let task_ids = self
             .plan_tasks
