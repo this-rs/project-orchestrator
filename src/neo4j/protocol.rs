@@ -108,6 +108,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project {id: $project_id})
             MERGE (proto:Protocol {id: $id})
+            ON CREATE SET proto.created_at = $created_at
             SET proto.name = $name,
                 proto.description = $description,
                 proto.project_id = $project_id,
@@ -118,8 +119,7 @@ impl Neo4jClient {
                 proto.trigger_mode = $trigger_mode,
                 proto.trigger_config_json = $trigger_config_json,
                 proto.last_triggered_at = $last_triggered_at,
-                proto.created_at = datetime($created_at),
-                proto.updated_at = datetime($updated_at)
+                proto.updated_at = $updated_at
             MERGE (proto)-[:BELONGS_TO]->(p)
             RETURN proto.id AS created_id
             "#,
@@ -288,13 +288,14 @@ impl Neo4jClient {
             return Ok(false);
         }
 
-        // Delete states and transitions first, then the protocol
+        // Delete runs, states, transitions, then the protocol
         let delete_q = query(
             r#"
             MATCH (proto:Protocol {id: $id})
             OPTIONAL MATCH (proto)-[:HAS_STATE]->(s:ProtocolState)
             OPTIONAL MATCH (proto)-[:HAS_TRANSITION]->(t:ProtocolTransition)
-            DETACH DELETE s, t, proto
+            OPTIONAL MATCH (proto)<-[:INSTANCE_OF]-(r:ProtocolRun)
+            DETACH DELETE s, t, r, proto
             "#,
         )
         .param("id", id.to_string());

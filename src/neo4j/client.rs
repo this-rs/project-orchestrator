@@ -251,6 +251,7 @@ impl Neo4jClient {
             "CREATE CONSTRAINT protocol_id IF NOT EXISTS FOR (p:Protocol) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT protocol_state_id IF NOT EXISTS FOR (ps:ProtocolState) REQUIRE ps.id IS UNIQUE",
             "CREATE CONSTRAINT protocol_transition_id IF NOT EXISTS FOR (pt:ProtocolTransition) REQUIRE pt.id IS UNIQUE",
+            "CREATE CONSTRAINT protocol_run_id IF NOT EXISTS FOR (r:ProtocolRun) REQUIRE r.id IS UNIQUE",
         ];
 
         let indexes = vec![
@@ -302,6 +303,9 @@ impl Neo4jClient {
             "CREATE INDEX chat_session_cli IF NOT EXISTS FOR (s:ChatSession) ON (s.cli_session_id)",
             // ChatSession composite index for DISCUSSED relation queries
             "CREATE INDEX chat_session_project_id IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug, s.id)",
+            // ProtocolRun indexes
+            "CREATE INDEX protocol_run_protocol IF NOT EXISTS FOR (r:ProtocolRun) ON (r.protocol_id)",
+            "CREATE INDEX protocol_run_status IF NOT EXISTS FOR (r:ProtocolRun) ON (r.status)",
             // FeatureGraph indexes
             "CREATE INDEX feature_graph_project IF NOT EXISTS FOR (fg:FeatureGraph) ON (fg.project_id)",
             // User indexes — queried by email, external_id, auth_provider

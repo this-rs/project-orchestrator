@@ -3643,6 +3643,12 @@ impl ToolHandler {
                 if let Some(v) = args.get("protocol_category") {
                     body.insert("protocol_category".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("trigger_mode") {
+                    body.insert("trigger_mode".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("trigger_config") {
+                    body.insert("trigger_config".to_string(), v.clone());
+                }
                 let result = http
                     .put(
                         &format!("/api/protocols/{}", protocol_id),
