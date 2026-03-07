@@ -14,6 +14,7 @@ pub(crate) mod skill_hook;
 pub mod stages;
 pub mod types;
 pub mod viz;
+pub mod viz_builder;
 
 pub use config::{ChatConfig, PermissionConfig};
 pub use entity_extractor::{
