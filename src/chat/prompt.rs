@@ -245,6 +245,7 @@ Example of correct decomposition:
 
 - **ALWAYS** link plans to projects, commits to tasks, tasks to milestones/releases
 - Check `plan(action: "get_dependency_graph", plan_id)` and `plan(action: "get_critical_path", plan_id)` before starting execution
+- Use `plan(action: "get_waves", plan_id)` to compute parallel execution waves (topological sort + conflict splitting by affected_files)
 
 ### Impact Analysis Before Modification
 
@@ -453,7 +454,7 @@ Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, 
 | list_plans | `slug` (req) | List plans for project |
 
 ## plan
-Manage plans. Actions: list, create, get, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path
+Manage plans. Actions: list, create, get, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -466,6 +467,7 @@ Manage plans. Actions: list, create, get, update_status, delete, link_to_project
 | unlink_from_project | `plan_id` (req), `project_id` (req) | Unlink plan from project |
 | get_dependency_graph | `plan_id` (req) | Get task dependency graph |
 | get_critical_path | `plan_id` (req) | Get critical path through tasks |
+| get_waves | `plan_id` (req) | Compute execution waves (topological sort + conflict splitting by affected_files) |
 
 ## task
 Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependencies, remove_dependency, get_blockers, get_blocked_by, get_context, get_prompt
@@ -874,7 +876,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         tools: &[
             ToolRef {
                 name: "plan",
-                description: "Manage plans (list/create/get/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path)",
+                description: "Manage plans (list/create/get/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path/get_waves)",
             },
             ToolRef {
                 name: "task",
