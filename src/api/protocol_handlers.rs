@@ -177,7 +177,9 @@ pub async fn list_protocols(
         .await
         .map_err(AppError::Internal)?;
 
-    Ok(Json(PaginatedResponse::new(protocols, total, limit, offset)))
+    Ok(Json(PaginatedResponse::new(
+        protocols, total, limit, offset,
+    )))
 }
 
 /// Create a new protocol (optionally with inline states and transitions)
@@ -239,9 +241,7 @@ pub async fn create_protocol(
                 ));
             }
             let state_type = match &s.state_type {
-                Some(st) => st
-                    .parse()
-                    .map_err(|e: String| AppError::BadRequest(e))?,
+                Some(st) => st.parse().map_err(|e: String| AppError::BadRequest(e))?,
                 None => crate::protocol::StateType::default(),
             };
             let ps = ProtocolState {
@@ -490,9 +490,7 @@ pub async fn add_state(
     }
 
     let state_type = match &body.state_type {
-        Some(st) => st
-            .parse()
-            .map_err(|e: String| AppError::BadRequest(e))?,
+        Some(st) => st.parse().map_err(|e: String| AppError::BadRequest(e))?,
         None => crate::protocol::StateType::default(),
     };
 
@@ -578,9 +576,7 @@ pub async fn add_transition(
         .ok_or_else(|| AppError::NotFound(format!("Protocol {} not found", protocol_id)))?;
 
     if body.trigger.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "trigger cannot be empty".to_string(),
-        ));
+        return Err(AppError::BadRequest("trigger cannot be empty".to_string()));
     }
     if body.trigger.len() > MAX_TRIGGER_LEN {
         return Err(AppError::BadRequest(format!(
@@ -734,19 +730,16 @@ pub async fn fire_transition(
     Path(run_id): Path<Uuid>,
     Json(body): Json<FireTransitionBody>,
 ) -> Result<Json<TransitionResult>, AppError> {
-    let result = protocol::engine::fire_transition(
-        state.orchestrator.neo4j(),
-        run_id,
-        &body.trigger,
-    )
-    .await
-    .map_err(|e| {
-        if e.to_string().contains("not found") {
-            AppError::NotFound(e.to_string())
-        } else {
-            AppError::Internal(e)
-        }
-    })?;
+    let result =
+        protocol::engine::fire_transition(state.orchestrator.neo4j(), run_id, &body.trigger)
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("not found") {
+                    AppError::NotFound(e.to_string())
+                } else {
+                    AppError::Internal(e)
+                }
+            })?;
 
     // Emit event for successful transitions
     if result.success {
@@ -793,10 +786,7 @@ pub async fn list_runs(
     Path(protocol_id): Path<Uuid>,
     Query(query): Query<RunsListQuery>,
 ) -> Result<Json<PaginatedResponse<ProtocolRun>>, AppError> {
-    let status_filter: Option<RunStatus> = query
-        .status
-        .as_deref()
-        .and_then(|s| s.parse().ok());
+    let status_filter: Option<RunStatus> = query.status.as_deref().and_then(|s| s.parse().ok());
 
     let limit = query.pagination.limit.min(100);
     let offset = query.pagination.offset;
@@ -859,16 +849,15 @@ pub async fn fail_run(
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown error");
 
-    let run =
-        protocol::engine::fail_run(state.orchestrator.neo4j(), run_id, error_msg)
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("not found") {
-                    AppError::NotFound(e.to_string())
-                } else {
-                    AppError::BadRequest(e.to_string())
-                }
-            })?;
+    let run = protocol::engine::fail_run(state.orchestrator.neo4j(), run_id, error_msg)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                AppError::NotFound(e.to_string())
+            } else {
+                AppError::BadRequest(e.to_string())
+            }
+        })?;
 
     state.event_bus.emit_updated(
         crate::events::EntityType::ProtocolRun,

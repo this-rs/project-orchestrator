@@ -2648,10 +2648,7 @@ impl GraphStore for Neo4jClient {
     // Protocol operations (Pattern Federation)
     // ========================================================================
 
-    async fn upsert_protocol(
-        &self,
-        protocol: &crate::protocol::Protocol,
-    ) -> anyhow::Result<()> {
+    async fn upsert_protocol(&self, protocol: &crate::protocol::Protocol) -> anyhow::Result<()> {
         self.upsert_protocol(protocol).await
     }
 
@@ -2709,10 +2706,7 @@ impl GraphStore for Neo4jClient {
         self.get_protocol_transitions(protocol_id).await
     }
 
-    async fn delete_protocol_transition(
-        &self,
-        transition_id: uuid::Uuid,
-    ) -> anyhow::Result<bool> {
+    async fn delete_protocol_transition(&self, transition_id: uuid::Uuid) -> anyhow::Result<bool> {
         self.delete_protocol_transition(transition_id).await
     }
 
@@ -2720,10 +2714,7 @@ impl GraphStore for Neo4jClient {
     // ProtocolRun operations (FSM Runtime)
     // ========================================================================
 
-    async fn create_protocol_run(
-        &self,
-        run: &crate::protocol::ProtocolRun,
-    ) -> anyhow::Result<()> {
+    async fn create_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
         self.create_protocol_run(run).await
     }
 
@@ -2734,10 +2725,7 @@ impl GraphStore for Neo4jClient {
         self.get_protocol_run(run_id).await
     }
 
-    async fn update_protocol_run(
-        &self,
-        run: &crate::protocol::ProtocolRun,
-    ) -> anyhow::Result<()> {
+    async fn update_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
         self.update_protocol_run(run).await
     }
 

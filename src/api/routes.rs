@@ -284,10 +284,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/plans/{plan_id}/critical-path",
             get(handlers::get_plan_critical_path),
         )
-        .route(
-            "/api/plans/{plan_id}/waves",
-            get(handlers::get_plan_waves),
-        )
+        .route("/api/plans/{plan_id}/waves", get(handlers::get_plan_waves))
         // Constraints
         .route(
             "/api/plans/{plan_id}/constraints",
@@ -875,8 +872,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/api/protocols/runs/{run_id}",
-            get(protocol_handlers::get_run)
-                .delete(protocol_handlers::delete_run),
+            get(protocol_handlers::get_run).delete(protocol_handlers::delete_run),
         )
         .route(
             "/api/protocols/runs/{run_id}/transition",

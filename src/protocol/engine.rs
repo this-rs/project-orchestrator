@@ -245,11 +245,7 @@ pub async fn cancel_run(store: &dyn GraphStore, run_id: Uuid) -> Result<Protocol
 /// # Errors
 /// - Run not found
 /// - Run is not active
-pub async fn fail_run(
-    store: &dyn GraphStore,
-    run_id: Uuid,
-    error: &str,
-) -> Result<ProtocolRun> {
+pub async fn fail_run(store: &dyn GraphStore, run_id: Uuid, error: &str) -> Result<ProtocolRun> {
     let mut run = store
         .get_protocol_run(run_id)
         .await?
@@ -339,8 +335,7 @@ mod tests {
 
         // Transitions
         let t1 = ProtocolTransition::new(protocol_id, start_state.id, processing_state.id, "begin");
-        let t2 =
-            ProtocolTransition::new(protocol_id, processing_state.id, done_state.id, "finish");
+        let t2 = ProtocolTransition::new(protocol_id, processing_state.id, done_state.id, "finish");
         store.upsert_protocol_transition(&t1).await.unwrap();
         store.upsert_protocol_transition(&t2).await.unwrap();
 
@@ -352,7 +347,9 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(run.protocol_id, protocol.id);
         assert_eq!(run.current_state, protocol.entry_state);
@@ -389,12 +386,10 @@ mod tests {
         let store = MockGraphStore::new();
         let result = start_run(&store, Uuid::new_v4(), None, None, None).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Protocol not found")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Protocol not found"));
     }
 
     #[tokio::test]
@@ -402,7 +397,9 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(run.states_visited.len(), 1);
 
         // Fire "begin" → should move to Processing
@@ -417,10 +414,7 @@ mod tests {
         let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
         assert_eq!(updated.states_visited.len(), 2);
         assert_eq!(updated.states_visited[1].state_name, "Processing");
-        assert_eq!(
-            updated.states_visited[1].trigger,
-            Some("begin".to_string())
-        );
+        assert_eq!(updated.states_visited[1].trigger, Some("begin".to_string()));
     }
 
     #[tokio::test]
@@ -428,7 +422,9 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
 
         // Fire "begin" → Processing
         fire_transition(&store, run.id, "begin").await.unwrap();
@@ -452,7 +448,9 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
 
         // Fire "nonexistent" trigger from Start → should fail gracefully
         let result = fire_transition(&store, run.id, "nonexistent")
@@ -467,7 +465,9 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         fire_transition(&store, run.id, "begin").await.unwrap();
         fire_transition(&store, run.id, "finish").await.unwrap();
 
@@ -482,7 +482,9 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         let cancelled = cancel_run(&store, run.id).await.unwrap();
 
         assert_eq!(cancelled.status, RunStatus::Cancelled);
@@ -498,7 +500,9 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         fire_transition(&store, run.id, "begin").await.unwrap();
         fire_transition(&store, run.id, "finish").await.unwrap();
 
@@ -513,7 +517,9 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         let failed = fail_run(&store, run.id, "something went wrong")
             .await
             .unwrap();
@@ -530,16 +536,22 @@ mod tests {
 
         // Create 3 runs sequentially (complete/cancel the previous before starting next,
         // because the concurrency guard prevents multiple Running runs).
-        let run1 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run1 = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         // Complete run1 → Done
         fire_transition(&store, run1.id, "begin").await.unwrap();
         fire_transition(&store, run1.id, "finish").await.unwrap();
 
-        let run2 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run2 = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         // Cancel run2
         cancel_run(&store, run2.id).await.unwrap();
 
-        let run3 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run3 = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         // run3 stays Running
 
         // List all
@@ -581,7 +593,9 @@ mod tests {
         let (_, protocol) = setup_protocol(&store).await;
 
         // Start a run — succeeds
-        let _run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let _run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
 
         // Try to start another while the first is Running — should fail
         let result = start_run(&store, protocol.id, None, None, None).await;
@@ -598,16 +612,25 @@ mod tests {
         let (_, protocol) = setup_protocol(&store).await;
 
         // Start and complete a run
-        let run1 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run1 = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         fire_transition(&store, run1.id, "begin").await.unwrap();
         fire_transition(&store, run1.id, "finish").await.unwrap();
         assert_eq!(
-            store.get_protocol_run(run1.id).await.unwrap().unwrap().status,
+            store
+                .get_protocol_run(run1.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             RunStatus::Completed
         );
 
         // Now starting another run should succeed
-        let run2 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run2 = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(run2.status, RunStatus::Running);
     }
 
@@ -617,7 +640,9 @@ mod tests {
         let (_, protocol) = setup_protocol(&store).await;
 
         // Start
-        let run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(run.status, RunStatus::Running);
         assert_eq!(run.states_visited.len(), 1);
 

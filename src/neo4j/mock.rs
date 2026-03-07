@@ -3324,7 +3324,10 @@ impl GraphStore for MockGraphStore {
                         status: format!("{:?}", task.status),
                         priority: task.priority,
                         affected_files: task.affected_files.clone(),
-                        depends_on: deps_of.get(&task_id).map(|s| s.iter().copied().collect()).unwrap_or_default(),
+                        depends_on: deps_of
+                            .get(&task_id)
+                            .map(|s| s.iter().copied().collect())
+                            .unwrap_or_default(),
                     });
                 }
                 if let Some(dependents) = dependents_of.get(&task_id) {
@@ -3340,7 +3343,12 @@ impl GraphStore for MockGraphStore {
             }
 
             let task_count = wave_tasks.len();
-            waves.push(Wave { wave_number, tasks: wave_tasks, task_count, split_from_conflicts: false });
+            waves.push(Wave {
+                wave_number,
+                tasks: wave_tasks,
+                task_count,
+                split_from_conflicts: false,
+            });
         }
 
         if processed_count < tasks.len() {
@@ -3355,11 +3363,21 @@ impl GraphStore for MockGraphStore {
         for wave in &waves {
             let mut has_conflicts = false;
             for i in 0..wave.tasks.len() {
-                let files_a: HashSet<&str> = wave.tasks[i].affected_files.iter().map(|s| s.as_str()).collect();
-                if files_a.is_empty() { continue; }
+                let files_a: HashSet<&str> = wave.tasks[i]
+                    .affected_files
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                if files_a.is_empty() {
+                    continue;
+                }
                 for j in (i + 1)..wave.tasks.len() {
-                    let shared: Vec<String> = wave.tasks[j].affected_files.iter()
-                        .filter(|f| files_a.contains(f.as_str())).cloned().collect();
+                    let shared: Vec<String> = wave.tasks[j]
+                        .affected_files
+                        .iter()
+                        .filter(|f| files_a.contains(f.as_str()))
+                        .cloned()
+                        .collect();
                     if !shared.is_empty() {
                         has_conflicts = true;
                         all_conflicts.push(FileConflict {
@@ -7780,10 +7798,7 @@ impl GraphStore for MockGraphStore {
     // Protocol operations (Pattern Federation)
     // ========================================================================
 
-    async fn upsert_protocol(
-        &self,
-        protocol: &crate::protocol::Protocol,
-    ) -> anyhow::Result<()> {
+    async fn upsert_protocol(&self, protocol: &crate::protocol::Protocol) -> anyhow::Result<()> {
         // Validate project exists
         let projects = self.projects.read().await;
         if !projects.is_empty() && !projects.contains_key(&protocol.project_id) {
@@ -7800,10 +7815,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn get_protocol(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<crate::protocol::Protocol>> {
+    async fn get_protocol(&self, id: Uuid) -> anyhow::Result<Option<crate::protocol::Protocol>> {
         Ok(self.protocols.read().await.get(&id).cloned())
     }
 
@@ -7819,7 +7831,9 @@ impl GraphStore for MockGraphStore {
             .values()
             .filter(|p| {
                 p.project_id == project_id
-                    && category.as_ref().map_or(true, |c| p.protocol_category == *c)
+                    && category
+                        .as_ref()
+                        .map_or(true, |c| p.protocol_category == *c)
             })
             .cloned()
             .collect();
@@ -7904,10 +7918,7 @@ impl GraphStore for MockGraphStore {
         Ok(transitions)
     }
 
-    async fn delete_protocol_transition(
-        &self,
-        transition_id: Uuid,
-    ) -> anyhow::Result<bool> {
+    async fn delete_protocol_transition(&self, transition_id: Uuid) -> anyhow::Result<bool> {
         Ok(self
             .protocol_transitions
             .write()
@@ -7920,18 +7931,14 @@ impl GraphStore for MockGraphStore {
     // ProtocolRun operations (FSM Runtime)
     // ========================================================================
 
-    async fn create_protocol_run(
-        &self,
-        run: &crate::protocol::ProtocolRun,
-    ) -> anyhow::Result<()> {
+    async fn create_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
         let mut store = self.protocol_runs.write().await;
 
         // Atomic concurrency guard: reject if a Running run already exists
         // for this protocol. Check and insert happen within the same write
         // lock, so there's no TOCTOU window.
         let has_running = store.values().any(|r| {
-            r.protocol_id == run.protocol_id
-                && r.status == crate::protocol::RunStatus::Running
+            r.protocol_id == run.protocol_id && r.status == crate::protocol::RunStatus::Running
         });
         if has_running {
             anyhow::bail!(
@@ -7951,10 +7958,7 @@ impl GraphStore for MockGraphStore {
         Ok(self.protocol_runs.read().await.get(&run_id).cloned())
     }
 
-    async fn update_protocol_run(
-        &self,
-        run: &crate::protocol::ProtocolRun,
-    ) -> anyhow::Result<()> {
+    async fn update_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
         let mut store = self.protocol_runs.write().await;
         if store.contains_key(&run.id) {
             store.insert(run.id, run.clone());
@@ -7975,8 +7979,7 @@ impl GraphStore for MockGraphStore {
         let mut filtered: Vec<_> = store
             .values()
             .filter(|r| {
-                r.protocol_id == protocol_id
-                    && status.as_ref().map_or(true, |s| r.status == *s)
+                r.protocol_id == protocol_id && status.as_ref().map_or(true, |s| r.status == *s)
             })
             .cloned()
             .collect();
@@ -7987,12 +7990,7 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn delete_protocol_run(&self, run_id: Uuid) -> anyhow::Result<bool> {
-        Ok(self
-            .protocol_runs
-            .write()
-            .await
-            .remove(&run_id)
-            .is_some())
+        Ok(self.protocol_runs.write().await.remove(&run_id).is_some())
     }
 }
 

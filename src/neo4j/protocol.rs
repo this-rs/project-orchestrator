@@ -22,8 +22,8 @@ impl Neo4jClient {
         let terminal_states_json: String = node
             .get("terminal_states_json")
             .unwrap_or_else(|_| "[]".to_string());
-        let terminal_states: Vec<Uuid> = serde_json::from_str(&terminal_states_json)
-            .unwrap_or_default();
+        let terminal_states: Vec<Uuid> =
+            serde_json::from_str(&terminal_states_json).unwrap_or_default();
 
         Ok(Protocol {
             id: node.get::<String>("id")?.parse()?,
@@ -75,10 +75,7 @@ impl Neo4jClient {
             protocol_id: node.get::<String>("protocol_id")?.parse()?,
             name: node.get("name")?,
             description: node.get("description").unwrap_or_default(),
-            action: node
-                .get::<String>("action")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            action: node.get::<String>("action").ok().filter(|s| !s.is_empty()),
             state_type: node
                 .get::<String>("state_type")
                 .ok()
@@ -95,10 +92,7 @@ impl Neo4jClient {
             from_state: node.get::<String>("from_state")?.parse()?,
             to_state: node.get::<String>("to_state")?.parse()?,
             trigger: node.get("trigger")?,
-            guard: node
-                .get::<String>("guard")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            guard: node.get::<String>("guard").ok().filter(|s| !s.is_empty()),
         })
     }
 
@@ -160,7 +154,9 @@ impl Neo4jClient {
         .param("created_at", protocol.created_at.to_rfc3339())
         .param("updated_at", protocol.updated_at.to_rfc3339());
 
-        let _ = self.graph.execute(q)
+        let _ = self
+            .graph
+            .execute(q)
             .await
             .context("Failed to upsert protocol")?;
 
@@ -223,8 +219,7 @@ impl Neo4jClient {
             "#
         };
 
-        let mut count_q = query(count_cypher)
-            .param("project_id", project_id.to_string());
+        let mut count_q = query(count_cypher).param("project_id", project_id.to_string());
         if let Some(ref cat) = category {
             count_q = count_q.param("category", cat.to_string());
         }
@@ -304,7 +299,9 @@ impl Neo4jClient {
         )
         .param("id", id.to_string());
 
-        let _ = self.graph.execute(delete_q)
+        let _ = self
+            .graph
+            .execute(delete_q)
             .await
             .context("Failed to delete protocol")?;
 
@@ -334,13 +331,12 @@ impl Neo4jClient {
         .param("protocol_id", state.protocol_id.to_string())
         .param("name", state.name.clone())
         .param("description", state.description.clone())
-        .param(
-            "action",
-            state.action.clone().unwrap_or_default(),
-        )
+        .param("action", state.action.clone().unwrap_or_default())
         .param("state_type", state.state_type.to_string());
 
-        let _ = self.graph.execute(q)
+        let _ = self
+            .graph
+            .execute(q)
             .await
             .context("Failed to upsert protocol state")?;
 
@@ -393,7 +389,9 @@ impl Neo4jClient {
         )
         .param("id", state_id.to_string());
 
-        let _ = self.graph.execute(delete_q)
+        let _ = self
+            .graph
+            .execute(delete_q)
             .await
             .context("Failed to delete protocol state")?;
 
@@ -424,12 +422,11 @@ impl Neo4jClient {
         .param("from_state", transition.from_state.to_string())
         .param("to_state", transition.to_state.to_string())
         .param("trigger", transition.trigger.clone())
-        .param(
-            "guard",
-            transition.guard.clone().unwrap_or_default(),
-        );
+        .param("guard", transition.guard.clone().unwrap_or_default());
 
-        let _ = self.graph.execute(q)
+        let _ = self
+            .graph
+            .execute(q)
             .await
             .context("Failed to upsert protocol transition")?;
 
@@ -485,7 +482,9 @@ impl Neo4jClient {
         )
         .param("id", transition_id.to_string());
 
-        let _ = self.graph.execute(delete_q)
+        let _ = self
+            .graph
+            .execute(delete_q)
             .await
             .context("Failed to delete protocol transition")?;
 
@@ -533,10 +532,7 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| s.parse().ok()),
-            error: node
-                .get::<String>("error")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            error: node.get::<String>("error").ok().filter(|s| !s.is_empty()),
             triggered_by: node
                 .get::<String>("triggered_by")
                 .unwrap_or_else(|_| "manual".to_string()),

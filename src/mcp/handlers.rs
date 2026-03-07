@@ -698,9 +698,7 @@ impl ToolHandler {
 
             "get_waves" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http
-                    .get(&format!("/api/plans/{}/waves", plan_id))
-                    .await?;
+                let result = http.get(&format!("/api/plans/{}/waves", plan_id)).await?;
                 Ok(Some(result))
             }
 
@@ -3629,9 +3627,7 @@ impl ToolHandler {
 
             "get_protocol" => {
                 let protocol_id = extract_id(args, "protocol_id")?;
-                let result = http
-                    .get(&format!("/api/protocols/{}", protocol_id))
-                    .await?;
+                let result = http.get(&format!("/api/protocols/{}", protocol_id)).await?;
                 Ok(Some(result))
             }
 
@@ -3765,10 +3761,7 @@ impl ToolHandler {
                 let skill_id = extract_string(args, "skill_id")?;
                 let body = json!({"skill_id": skill_id});
                 let result = http
-                    .post(
-                        &format!("/api/protocols/{}/link-skill", protocol_id),
-                        &body,
-                    )
+                    .post(&format!("/api/protocols/{}/link-skill", protocol_id), &body)
                     .await?;
                 Ok(Some(result))
             }
@@ -3794,9 +3787,7 @@ impl ToolHandler {
 
             "get_protocol_run" => {
                 let run_id = extract_id(args, "run_id")?;
-                let result = http
-                    .get(&format!("/api/protocols/runs/{}", run_id))
-                    .await?;
+                let result = http.get(&format!("/api/protocols/runs/{}", run_id)).await?;
                 Ok(Some(result))
             }
 
@@ -3813,10 +3804,7 @@ impl ToolHandler {
                     query.push(("offset".to_string(), o.to_string()));
                 }
                 let result = http
-                    .get_with_query(
-                        &format!("/api/protocols/{}/runs", protocol_id),
-                        &query,
-                    )
+                    .get_with_query(&format!("/api/protocols/{}/runs", protocol_id), &query)
                     .await?;
                 Ok(Some(result))
             }
@@ -3826,10 +3814,7 @@ impl ToolHandler {
                 let trigger = extract_string(args, "trigger")?;
                 let body = json!({"trigger": trigger});
                 let result = http
-                    .post(
-                        &format!("/api/protocols/runs/{}/transition", run_id),
-                        &body,
-                    )
+                    .post(&format!("/api/protocols/runs/{}/transition", run_id), &body)
                     .await?;
                 Ok(Some(result))
             }
@@ -3853,10 +3838,7 @@ impl ToolHandler {
                     .unwrap_or("Unknown error");
                 let body = json!({"error": error_msg});
                 let result = http
-                    .post(
-                        &format!("/api/protocols/runs/{}/fail", run_id),
-                        &body,
-                    )
+                    .post(&format!("/api/protocols/runs/{}/fail", run_id), &body)
                     .await?;
                 Ok(Some(result))
             }
@@ -3865,18 +3847,10 @@ impl ToolHandler {
                 let run_id = extract_id(args, "run_id")?;
                 let state_name = extract_string(args, "state_name")?;
                 let sub_action = extract_string(args, "sub_action")?;
-                let processed = args
-                    .get("processed")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                let total = args
-                    .get("total")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                let elapsed_ms = args
-                    .get("elapsed_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let processed =
+                    args.get("processed").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let total = args.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let elapsed_ms = args.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 let body = json!({
                     "state_name": state_name,
                     "sub_action": sub_action,
@@ -3885,10 +3859,7 @@ impl ToolHandler {
                     "elapsed_ms": elapsed_ms,
                 });
                 let _result = http
-                    .post(
-                        &format!("/api/protocols/runs/{}/progress", run_id),
-                        &body,
-                    )
+                    .post(&format!("/api/protocols/runs/{}/progress", run_id), &body)
                     .await?;
                 Ok(Some(json!({
                     "accepted": true,

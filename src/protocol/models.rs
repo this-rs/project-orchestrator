@@ -220,11 +220,7 @@ pub struct Protocol {
 
 impl Protocol {
     /// Create a new Business protocol with minimal fields.
-    pub fn new(
-        project_id: Uuid,
-        name: impl Into<String>,
-        entry_state: Uuid,
-    ) -> Self {
+    pub fn new(project_id: Uuid, name: impl Into<String>, entry_state: Uuid) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -804,7 +800,11 @@ mod tests {
 
     #[test]
     fn test_state_type_serde_roundtrip() {
-        for st in [StateType::Start, StateType::Intermediate, StateType::Terminal] {
+        for st in [
+            StateType::Start,
+            StateType::Intermediate,
+            StateType::Terminal,
+        ] {
             let json = serde_json::to_string(&st).unwrap();
             let deserialized: StateType = serde_json::from_str(&json).unwrap();
             assert_eq!(st, deserialized);

@@ -37,11 +37,7 @@ const MIN_TRIGGER_INTERVAL_SECS: i64 = 300;
 /// and starts a run for each one.
 ///
 /// This is a fire-and-forget operation — errors are logged, never propagated.
-pub fn spawn_event_triggered_protocols(
-    store: Arc<dyn GraphStore>,
-    project_id: Uuid,
-    event: &str,
-) {
+pub fn spawn_event_triggered_protocols(store: Arc<dyn GraphStore>, project_id: Uuid, event: &str) {
     let event = event.to_string();
     tokio::spawn(async move {
         if let Err(e) = trigger_protocols_for_event(&*store, project_id, &event).await {
@@ -233,9 +229,9 @@ const SCHEDULER_INTERVAL_SECS: u64 = 3600;
 /// Schedule thresholds: how long since `last_triggered_at` before re-triggering.
 fn schedule_interval_secs(schedule: &str) -> Option<i64> {
     match schedule {
-        "hourly" => Some(3600),        // 1 hour
-        "daily" => Some(86400),        // 24 hours
-        "weekly" => Some(604800),      // 7 days
+        "hourly" => Some(3600),   // 1 hour
+        "daily" => Some(86400),   // 24 hours
+        "weekly" => Some(604800), // 7 days
         _ => {
             tracing::warn!(schedule, "Unknown schedule value — ignoring");
             None
@@ -420,8 +416,7 @@ mod tests {
         store.upsert_protocol_state(&start_state).await.unwrap();
         store.upsert_protocol_state(&done_state).await.unwrap();
 
-        let t1 =
-            ProtocolTransition::new(protocol_id, start_state.id, done_state.id, "complete");
+        let t1 = ProtocolTransition::new(protocol_id, start_state.id, done_state.id, "complete");
         store.upsert_protocol_transition(&t1).await.unwrap();
 
         (project_id, protocol)
@@ -550,8 +545,7 @@ mod tests {
         .await;
 
         // Set last_triggered_at to 1 minute ago (within debounce window)
-        protocol.last_triggered_at =
-            Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
         store.upsert_protocol(&protocol).await.unwrap();
 
         trigger_protocols_for_event(&store, project_id, "post_sync")
@@ -577,8 +571,7 @@ mod tests {
         .await;
 
         // Set last_triggered_at to 10 minutes ago (outside debounce window)
-        protocol.last_triggered_at =
-            Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+        protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
         store.upsert_protocol(&protocol).await.unwrap();
 
         trigger_protocols_for_event(&store, project_id, "post_sync")
@@ -688,8 +681,7 @@ mod tests {
         store.upsert_protocol_state(&start_state).await.unwrap();
         store.upsert_protocol_state(&done_state).await.unwrap();
 
-        let t1 =
-            ProtocolTransition::new(protocol_id, start_state.id, done_state.id, "complete");
+        let t1 = ProtocolTransition::new(protocol_id, start_state.id, done_state.id, "complete");
         store.upsert_protocol_transition(&t1).await.unwrap();
 
         (project_id, protocol)
@@ -718,11 +710,7 @@ mod tests {
         .await;
 
         // Create a run that's been "running" for 2 hours (orphaned)
-        let mut run = crate::protocol::ProtocolRun::new(
-            protocol.id,
-            protocol.entry_state,
-            "Start",
-        );
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(2);
         store.create_protocol_run(&run).await.unwrap();
 
@@ -750,11 +738,7 @@ mod tests {
         .await;
 
         // Create a run that's been running for 5 minutes (not orphaned)
-        let mut run = crate::protocol::ProtocolRun::new(
-            protocol.id,
-            protocol.entry_state,
-            "Start",
-        );
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
         store.create_protocol_run(&run).await.unwrap();
 
@@ -777,11 +761,7 @@ mod tests {
         .await;
 
         // Create an old but already-completed run
-        let mut run = crate::protocol::ProtocolRun::new(
-            protocol.id,
-            protocol.entry_state,
-            "Start",
-        );
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(5);
         run.complete();
         store.create_protocol_run(&run).await.unwrap();
@@ -808,8 +788,7 @@ mod tests {
             setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
 
         // Set last_triggered_at to 25 hours ago (> 24h daily threshold)
-        protocol.last_triggered_at =
-            Some(chrono::Utc::now() - chrono::Duration::hours(25));
+        protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
         store.upsert_protocol(&protocol).await.unwrap();
 
         run_scheduled_protocols(&store).await.unwrap();
@@ -848,8 +827,7 @@ mod tests {
             setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
 
         // Set last_triggered_at to 1 hour ago (< 24h daily threshold)
-        protocol.last_triggered_at =
-            Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
         store.upsert_protocol(&protocol).await.unwrap();
 
         run_scheduled_protocols(&store).await.unwrap();
@@ -927,8 +905,7 @@ mod tests {
     #[tokio::test]
     async fn test_scheduled_no_schedule_config() {
         let store = MockGraphStore::new();
-        let (_, protocol) =
-            setup_scheduled_protocol(&store, TriggerMode::Scheduled, None).await;
+        let (_, protocol) = setup_scheduled_protocol(&store, TriggerMode::Scheduled, None).await;
 
         run_scheduled_protocols(&store).await.unwrap();
 
@@ -987,12 +964,8 @@ mod tests {
         store.upsert_protocol_state(&mid_state).await.unwrap();
         store.upsert_protocol_state(&done_state).await.unwrap();
 
-        let t1 = ProtocolTransition::new(
-            protocol_id, start_state.id, mid_state.id, "process",
-        );
-        let t2 = ProtocolTransition::new(
-            protocol_id, mid_state.id, done_state.id, "complete",
-        );
+        let t1 = ProtocolTransition::new(protocol_id, start_state.id, mid_state.id, "process");
+        let t2 = ProtocolTransition::new(protocol_id, mid_state.id, done_state.id, "complete");
         store.upsert_protocol_transition(&t1).await.unwrap();
         store.upsert_protocol_transition(&t2).await.unwrap();
 
@@ -1042,7 +1015,10 @@ mod tests {
         assert_eq!(total, 2);
         // Most recent run should be the post_import one
         let import_run = runs.iter().find(|r| r.triggered_by == "event:post_import");
-        assert!(import_run.is_some(), "Should have a post_import triggered run");
+        assert!(
+            import_run.is_some(),
+            "Should have a post_import triggered run"
+        );
     }
 
     /// Integration test 2: schedule → auto-triggered scheduled run
@@ -1117,8 +1093,14 @@ mod tests {
 
         let triggers: Vec<&str> = runs.iter().map(|r| r.triggered_by.as_str()).collect();
         assert!(triggers.contains(&"manual"), "Should have manual run");
-        assert!(triggers.contains(&"event:post_sync"), "Should have event run");
-        assert!(triggers.contains(&"schedule:daily"), "Should have schedule run");
+        assert!(
+            triggers.contains(&"event:post_sync"),
+            "Should have event run"
+        );
+        assert!(
+            triggers.contains(&"schedule:daily"),
+            "Should have schedule run"
+        );
     }
 
     /// Integration test: concurrent run guard rejects event trigger when run is active
@@ -1143,7 +1125,10 @@ mod tests {
             .list_protocol_runs(protocol.id, None, 10, 0)
             .await
             .unwrap();
-        assert_eq!(total, 1, "Event trigger should be rejected when a run is active");
+        assert_eq!(
+            total, 1,
+            "Event trigger should be rejected when a run is active"
+        );
     }
 
     /// Integration test: event debounce prevents double-trigger on rapid syncs
@@ -1184,7 +1169,10 @@ mod tests {
             .list_protocol_runs(protocol.id, None, 10, 0)
             .await
             .unwrap();
-        assert_eq!(total, 1, "Only the first event should trigger, rest debounced");
+        assert_eq!(
+            total, 1,
+            "Only the first event should trigger, rest debounced"
+        );
     }
 
     // ====================================================================

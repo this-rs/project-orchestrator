@@ -495,8 +495,7 @@ impl Neo4jClient {
         // 2. Build adjacency list + in-degree map
         // edges are (from, to) where `from` DEPENDS_ON `to`
         // meaning `to` must complete before `from` can start
-        let task_map: HashMap<Uuid, &TaskNode> =
-            tasks.iter().map(|t| (t.id, t)).collect();
+        let task_map: HashMap<Uuid, &TaskNode> = tasks.iter().map(|t| (t.id, t)).collect();
 
         // Dependencies: task -> set of tasks it depends on
         let mut deps_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
@@ -623,13 +622,7 @@ impl Neo4jClient {
             let cycle_tasks: Vec<String> = tasks
                 .iter()
                 .filter(|t| !task_wave.contains_key(&t.id))
-                .map(|t| {
-                    format!(
-                        "{} ({})",
-                        t.title.as_deref().unwrap_or("untitled"),
-                        t.id
-                    )
-                })
+                .map(|t| format!("{} ({})", t.title.as_deref().unwrap_or("untitled"), t.id))
                 .collect();
             bail!(
                 "Cycle detected in dependency graph! Tasks involved: {}",
@@ -749,11 +742,7 @@ impl Neo4jClient {
         let critical_path_length = longest_path.values().max().copied().unwrap_or(0);
 
         // 7. Compute summary
-        let max_parallel = split_waves
-            .iter()
-            .map(|w| w.task_count)
-            .max()
-            .unwrap_or(0);
+        let max_parallel = split_waves.iter().map(|w| w.task_count).max().unwrap_or(0);
 
         let summary = WaveSummary {
             total_tasks: tasks.len(),

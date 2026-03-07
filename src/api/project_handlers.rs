@@ -395,7 +395,14 @@ pub async fn search_project_code(
 // ============================================================================
 
 /// Allowed layer names (whitelist per security constraint)
-const VALID_LAYERS: &[&str] = &["code", "knowledge", "fabric", "neural", "skills", "behavioral"];
+const VALID_LAYERS: &[&str] = &[
+    "code",
+    "knowledge",
+    "fabric",
+    "neural",
+    "skills",
+    "behavioral",
+];
 
 /// A node in the project graph visualization
 #[derive(Debug, Clone, Serialize)]
