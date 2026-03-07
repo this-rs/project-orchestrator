@@ -330,6 +330,10 @@ impl ToolHandler {
             ("skill", "import") => "import_skill",
             ("skill", "get_health") => "get_skill_health",
 
+            // Reasoning Tree
+            ("reasoning", "reason") => "reason",
+            ("reasoning", "reason_feedback") => "reason_feedback",
+
             // Analysis Profile
             ("analysis_profile", "list") => "list_analysis_profiles",
             ("analysis_profile", "create") => "create_analysis_profile",
@@ -3383,6 +3387,23 @@ impl ToolHandler {
                 } else {
                     result
                 }))
+            }
+
+            // ── Reasoning Tree ────────────────────────────────────────
+            "reason" => {
+                let result = http.post("/api/reason", args).await?;
+                Ok(Some(result))
+            }
+            "reason_feedback" => {
+                let tree_id = extract_id(args, "tree_id")?;
+                let body = json!({
+                    "followed_nodes": args.get("followed_nodes").cloned().unwrap_or(json!([])),
+                    "outcome": args.get("outcome").and_then(|v| v.as_str()).unwrap_or("success")
+                });
+                let result = http
+                    .post(&format!("/api/reason/{}/feedback", tree_id), &body)
+                    .await?;
+                Ok(Some(result))
             }
 
             // ── P10: Skills (9 tools) ──────────────────────────────────

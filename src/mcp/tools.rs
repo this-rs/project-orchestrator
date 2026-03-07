@@ -29,6 +29,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         chat_tool(),
         feature_graph_tool(),
         code_tool(),
+        reasoning_tool(),
         analysis_profile_tool(),
         admin_tool(),
         skill_tool(),
@@ -839,6 +840,34 @@ fn code_tool() -> ToolDefinition {
     }
 }
 
+fn reasoning_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "reasoning".to_string(),
+        description:
+            "Build reasoning trees from the knowledge graph. Actions: reason, reason_feedback"
+                .to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["reason", "reason_feedback"],
+                    "description": "Operation to perform"
+                },
+                "request": {"type": "string", "description": "Natural language query to reason about (reason)"},
+                "project_id": {"type": "string", "description": "Optional project UUID scope (reason)"},
+                "depth": {"type": "integer", "description": "Max tree depth 1-6 (reason, default 4)"},
+                "include_actions": {"type": "boolean", "description": "Generate MCP actions for leaf nodes (reason, default true)"},
+                "max_nodes": {"type": "integer", "description": "Max activated nodes (reason, default 50)"},
+                "tree_id": {"type": "string", "description": "ReasoningTree UUID (reason_feedback)"},
+                "followed_nodes": {"type": "array", "items": {"type": "string"}, "description": "Node UUIDs that were followed/useful (reason_feedback)"},
+                "outcome": {"type": "string", "enum": ["success", "partial", "failure"], "description": "Outcome of following the reasoning path (reason_feedback, default success)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
 fn analysis_profile_tool() -> ToolDefinition {
     ToolDefinition {
         name: "analysis_profile".to_string(),
@@ -945,8 +974,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            20,
-            "Expected 20 mega-tools, got {}",
+            21,
+            "Expected 21 mega-tools, got {}",
             tools.len()
         );
     }

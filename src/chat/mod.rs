@@ -5,12 +5,19 @@
 
 pub mod cli_version;
 pub mod config;
+pub mod continuity;
+pub mod enrichment;
 pub mod entity_extractor;
+pub mod feedback;
 pub mod manager;
+pub mod observation_detector;
 pub mod path_detect;
 pub mod prompt;
 pub(crate) mod skill_hook;
+pub mod stages;
 pub mod types;
+pub mod viz;
+pub mod viz_builder;
 
 pub use config::{ChatConfig, PermissionConfig};
 pub use entity_extractor::{

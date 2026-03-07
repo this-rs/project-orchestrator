@@ -9,6 +9,7 @@ pub mod note_handlers;
 pub mod profile_handlers;
 pub mod project_handlers;
 pub mod query;
+pub mod reason_handlers;
 pub mod routes;
 pub mod skill_handlers;
 pub mod workspace_handlers;

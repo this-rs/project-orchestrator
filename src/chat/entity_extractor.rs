@@ -501,7 +501,7 @@ fn tokenize(text: &str) -> Vec<&str> {
 ///
 /// Entities that don't exist in the graph are filtered out (false positives).
 /// Validated entities get their `node_label` and `file_path` populated.
-pub async fn validate_entities<G: GraphStore>(
+pub async fn validate_entities<G: GraphStore + ?Sized>(
     entities: Vec<ExtractedEntity>,
     graph: &G,
     project_id: Option<Uuid>,
