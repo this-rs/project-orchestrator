@@ -788,14 +788,14 @@ Manage analysis profiles (edge/fusion weight presets). Actions: list, create, ge
 | delete | `id` (req) | Delete analysis profile |
 
 ## protocol
-Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, transition, get_run, list_runs, cancel_run, fail_run, report_progress
+Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, transition, get_run, list_runs, cancel_run, fail_run, report_progress, route
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | list | `project_id` (req), `category`, `limit`, `offset` | List protocols for project |
-| create | `project_id` (req), `name` (req), `description`, `category` (system/business) | Create protocol |
+| create | `project_id` (req), `name` (req), `description`, `category` (system/business), `relevance_vector` | Create protocol |
 | get | `protocol_id` (req) | Get protocol with states & transitions |
-| update | `protocol_id` (req), `name`, `description` | Update protocol |
+| update | `protocol_id` (req), `name`, `description`, `relevance_vector` | Update protocol (relevance_vector: {phase, structure, domain, resource, lifecycle}) |
 | delete | `protocol_id` (req) | Delete protocol and all states/transitions |
 | add_state | `protocol_id` (req), `name` (req), `state_type` (start/intermediate/terminal), `description`, `action` | Add state to protocol |
 | delete_state | `protocol_id` (req), `state_id` (req) | Delete a state |
@@ -811,6 +811,26 @@ Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, d
 | cancel_run | `run_id` (req) | Cancel a running protocol run |
 | fail_run | `run_id` (req), `error` | Mark a running protocol run as failed with error message |
 | report_progress | `run_id` (req), `state_name` (req), `sub_action` (req), `processed`, `total`, `elapsed_ms` | Report progress during a long-running state (emits WS event for FSM Viewer) |
+| route | `project_id` (req), `plan_id`, `phase`, `domain`, `resource` | Route protocols by context affinity — returns ranked list with scores per dimension and explanation |
+
+### Context Relevance Routing
+
+Each protocol can have a `relevance_vector` with 5 dimensions (all in [0,1]):
+- **phase**: Preferred workflow phase (0=warmup, 0.25=planning, 0.5=execution, 0.75=review, 1.0=closure)
+- **structure**: Preferred structural complexity (0=simple, 1=complex)
+- **domain**: Domain specificity (0.5=domain-agnostic)
+- **resource**: Preferred resource availability
+- **lifecycle**: Preferred lifecycle position (0=start, 1=end)
+
+Use `protocol(action: "route")` to rank protocols by context affinity. When `plan_id` is provided, the context is auto-built from plan metrics (phase, task count, dependencies, completion %). The response includes per-dimension breakdown and human-readable explanation.
+
+Example workflow:
+```
+// During execution of a complex plan:
+protocol(action: "route", project_id: "...", plan_id: "...")
+// → wave-execution scores 95% (phase match + high structure)
+// → code-review scores 60% (phase mismatch)
+```
 "#;
 
 use anyhow::Result;
@@ -1062,16 +1082,17 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Protocol (Pattern Federation) ────────────────────────────────
     ToolGroup {
         name: "protocol_federation",
-        description: "Manage Protocol FSMs for Pattern Federation — finite state machines with states, transitions, guards, and runtime execution (start/transition/monitor runs)",
+        description: "Manage Protocol FSMs for Pattern Federation — finite state machines with states, transitions, guards, runtime execution (start/transition/monitor runs), and context relevance routing",
         keywords: &[
             "protocol", "protocole", "fsm", "state machine", "machine à états",
             "transition", "guard", "état", "state", "pattern federation",
             "federation", "fédération", "workflow", "run", "exécution",
             "execution", "trigger", "déclenchement", "progress", "progression",
+            "routing", "route", "relevance", "affinity", "context vector",
         ],
         tools: &[ToolRef {
             name: "protocol",
-            description: "Manage protocols & runs (list/create/get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/transition/get_run/list_runs/cancel_run/fail_run/report_progress)",
+            description: "Manage protocols & runs (list/create/get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/transition/get_run/list_runs/cancel_run/fail_run/report_progress/route)",
         }],
     },
     // ── Admin & Sync ────────────────────────────────────────────────
