@@ -1096,6 +1096,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         orchestrator.clone(),
     );
 
+    // Spawn the protocol scheduler (hourly evaluation of scheduled protocols)
+    crate::protocol::hooks::spawn_protocol_scheduler(orchestrator.neo4j_arc());
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,

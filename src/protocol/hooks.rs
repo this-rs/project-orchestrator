@@ -1,16 +1,23 @@
-//! Event-driven protocol triggers
+//! Event-driven and scheduled protocol triggers
 //!
-//! Provides the hook mechanism for auto-triggering protocols after system events
-//! (post_sync, post_import, post_plan_complete). Called from REST handlers as
-//! fire-and-forget background tasks via `tokio::spawn`.
+//! Provides two auto-triggering mechanisms for protocols:
 //!
-//! # Event Types
+//! ## Event-driven hooks
+//!
+//! Called from REST handlers as fire-and-forget background tasks via `tokio::spawn`.
 //!
 //! - `post_sync` — after `admin(sync_directory)`, `project(sync)`, or `commit(create)` with files
 //! - `post_import` — after `skill(import)`
 //! - `post_plan_complete` — after a plan reaches `completed` status (future)
 //!
-//! # Debounce
+//! ## Periodic scheduler
+//!
+//! Spawned at server startup via [`spawn_protocol_scheduler`]. Evaluates every hour
+//! which protocols have `trigger_mode = Scheduled | Auto` and a `schedule` field
+//! in their `trigger_config`. If the schedule interval has elapsed since
+//! `last_triggered_at`, a new run is started automatically.
+//!
+//! ## Debounce
 //!
 //! Each protocol has a `last_triggered_at` timestamp. Auto-triggers are skipped
 //! if the protocol was triggered less than [`MIN_TRIGGER_INTERVAL_SECS`] seconds ago.
@@ -133,6 +140,146 @@ async fn trigger_protocols_for_event(
             event = %event,
             count = triggered_count,
             "Event-triggered {triggered_count} protocol run(s)"
+        );
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Periodic Scheduler
+// ============================================================================
+
+/// Evaluation interval for the protocol scheduler (1 hour).
+const SCHEDULER_INTERVAL_SECS: u64 = 3600;
+
+/// Schedule thresholds: how long since `last_triggered_at` before re-triggering.
+fn schedule_interval_secs(schedule: &str) -> Option<i64> {
+    match schedule {
+        "hourly" => Some(3600),        // 1 hour
+        "daily" => Some(86400),        // 24 hours
+        "weekly" => Some(604800),      // 7 days
+        _ => {
+            tracing::warn!(schedule, "Unknown schedule value — ignoring");
+            None
+        }
+    }
+}
+
+/// Spawn the periodic protocol scheduler as a background task.
+///
+/// Runs every [`SCHEDULER_INTERVAL_SECS`] seconds (1 hour). On each tick,
+/// evaluates all protocols across all projects and starts runs for those
+/// with `trigger_mode = Scheduled | Auto` whose schedule interval has elapsed.
+///
+/// # Arguments
+/// - `store` — shared GraphStore for querying protocols and starting runs
+///
+/// This task runs for the lifetime of the server and never returns.
+pub fn spawn_protocol_scheduler(store: Arc<dyn GraphStore>) {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(SCHEDULER_INTERVAL_SECS));
+
+        // The first tick fires immediately — skip it to avoid triggering
+        // right at server startup (let the system settle first).
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            tracing::debug!("Protocol scheduler: evaluating scheduled protocols");
+
+            if let Err(e) = run_scheduled_protocols(&*store).await {
+                tracing::warn!("Protocol scheduler tick failed: {}", e);
+            }
+        }
+    });
+}
+
+/// Core logic: find all scheduled protocols across all projects and trigger them.
+async fn run_scheduled_protocols(store: &dyn GraphStore) -> anyhow::Result<()> {
+    let projects = store.list_projects().await?;
+    let now = chrono::Utc::now();
+    let mut total_triggered = 0u32;
+
+    for project in &projects {
+        // List all protocols for this project
+        let (protocols, _) = store.list_protocols(project.id, None, 100, 0).await?;
+
+        for protocol in &protocols {
+            // Check trigger_mode supports scheduling
+            if !protocol.trigger_mode.is_scheduled() {
+                continue;
+            }
+
+            // Check trigger_config has a schedule
+            let schedule = match protocol
+                .trigger_config
+                .as_ref()
+                .and_then(|c| c.schedule.as_deref())
+            {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Resolve the required interval
+            let required_secs = match schedule_interval_secs(schedule) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Check if enough time has passed since last trigger
+            let elapsed_secs = protocol
+                .last_triggered_at
+                .map(|last| (now - last).num_seconds())
+                .unwrap_or(i64::MAX); // Never triggered = always due
+
+            if elapsed_secs < required_secs {
+                continue;
+            }
+
+            // Start the run
+            let triggered_by = format!("schedule:{schedule}");
+            match engine::start_run(store, protocol.id, None, None, Some(&triggered_by)).await {
+                Ok(run) => {
+                    tracing::info!(
+                        protocol_id = %protocol.id,
+                        protocol_name = %protocol.name,
+                        schedule,
+                        run_id = %run.id,
+                        "Scheduled protocol run started"
+                    );
+
+                    // Update last_triggered_at
+                    let mut updated_protocol = protocol.clone();
+                    updated_protocol.last_triggered_at = Some(now);
+                    updated_protocol.updated_at = now;
+                    if let Err(e) = store.upsert_protocol(&updated_protocol).await {
+                        tracing::warn!(
+                            protocol_id = %protocol.id,
+                            "Failed to update last_triggered_at: {}", e
+                        );
+                    }
+
+                    total_triggered += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        protocol_id = %protocol.id,
+                        protocol_name = %protocol.name,
+                        schedule,
+                        "Failed to start scheduled protocol run: {}", e
+                    );
+                }
+            }
+        }
+    }
+
+    if total_triggered > 0 {
+        tracing::info!(
+            count = total_triggered,
+            "Scheduler triggered {total_triggered} protocol run(s)"
         );
     }
 
@@ -413,5 +560,207 @@ mod tests {
         // Verify last_triggered_at was updated
         let updated = store.get_protocol(protocol.id).await.unwrap().unwrap();
         assert!(updated.last_triggered_at.is_some());
+    }
+
+    // ====================================================================
+    // Scheduler tests
+    // ====================================================================
+
+    /// Helper to set up a protocol with schedule config.
+    async fn setup_scheduled_protocol(
+        store: &MockGraphStore,
+        trigger_mode: TriggerMode,
+        schedule: Option<&str>,
+    ) -> (Uuid, Protocol) {
+        let project_id = Uuid::new_v4();
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-project".to_string(),
+            slug: "test-project".to_string(),
+            description: None,
+            root_path: "/tmp/test".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let protocol_id = Uuid::new_v4();
+        let start_state = ProtocolState::start(protocol_id, "Start");
+        let done_state = ProtocolState::terminal(protocol_id, "Done");
+
+        let mut protocol = Protocol::new_full(
+            project_id,
+            "Test Scheduled Protocol",
+            "Protocol for scheduler testing",
+            start_state.id,
+            vec![done_state.id],
+            ProtocolCategory::System,
+        );
+        protocol.id = protocol_id;
+        protocol.trigger_mode = trigger_mode;
+        protocol.trigger_config = Some(TriggerConfig {
+            events: vec![],
+            schedule: schedule.map(|s| s.to_string()),
+            conditions: vec![],
+        });
+
+        store.upsert_protocol(&protocol).await.unwrap();
+        store.upsert_protocol_state(&start_state).await.unwrap();
+        store.upsert_protocol_state(&done_state).await.unwrap();
+
+        let t1 =
+            ProtocolTransition::new(protocol_id, start_state.id, done_state.id, "complete");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+
+        (project_id, protocol)
+    }
+
+    #[test]
+    fn test_schedule_interval_secs_values() {
+        assert_eq!(schedule_interval_secs("hourly"), Some(3600));
+        assert_eq!(schedule_interval_secs("daily"), Some(86400));
+        assert_eq!(schedule_interval_secs("weekly"), Some(604800));
+        assert_eq!(schedule_interval_secs("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_trigger_daily_due() {
+        let store = MockGraphStore::new();
+        let (_, mut protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
+
+        // Set last_triggered_at to 25 hours ago (> 24h daily threshold)
+        protocol.last_triggered_at =
+            Some(chrono::Utc::now() - chrono::Duration::hours(25));
+        store.upsert_protocol(&protocol).await.unwrap();
+
+        run_scheduled_protocols(&store).await.unwrap();
+
+        let (runs, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(runs[0].triggered_by, "schedule:daily");
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_trigger_never_triggered() {
+        let store = MockGraphStore::new();
+        let (_, protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("hourly")).await;
+
+        // last_triggered_at is None — should trigger (never triggered = always due)
+        assert!(protocol.last_triggered_at.is_none());
+
+        run_scheduled_protocols(&store).await.unwrap();
+
+        let (runs, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(runs[0].triggered_by, "schedule:hourly");
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_not_due_yet() {
+        let store = MockGraphStore::new();
+        let (_, mut protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
+
+        // Set last_triggered_at to 1 hour ago (< 24h daily threshold)
+        protocol.last_triggered_at =
+            Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        store.upsert_protocol(&protocol).await.unwrap();
+
+        run_scheduled_protocols(&store).await.unwrap();
+
+        let (_, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_ignores_event_only() {
+        let store = MockGraphStore::new();
+        let (_, protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Event, Some("daily")).await;
+
+        run_scheduled_protocols(&store).await.unwrap();
+
+        // Event-only protocols should not be triggered by scheduler
+        let (_, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_ignores_manual() {
+        let store = MockGraphStore::new();
+        let (_, protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Manual, Some("daily")).await;
+
+        run_scheduled_protocols(&store).await.unwrap();
+
+        let (_, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_auto_mode() {
+        let store = MockGraphStore::new();
+        let (_, protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Auto, Some("weekly")).await;
+
+        // Auto = Event + Scheduled, should be picked up by scheduler
+        // last_triggered_at is None → always due
+        run_scheduled_protocols(&store).await.unwrap();
+
+        let (runs, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(runs[0].triggered_by, "schedule:weekly");
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_updates_last_triggered_at() {
+        let store = MockGraphStore::new();
+        let (_, protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("hourly")).await;
+
+        assert!(protocol.last_triggered_at.is_none());
+
+        run_scheduled_protocols(&store).await.unwrap();
+
+        let updated = store.get_protocol(protocol.id).await.unwrap().unwrap();
+        assert!(updated.last_triggered_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_no_schedule_config() {
+        let store = MockGraphStore::new();
+        let (_, protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Scheduled, None).await;
+
+        run_scheduled_protocols(&store).await.unwrap();
+
+        // No schedule in config → not triggered
+        let (_, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
     }
 }
