@@ -544,12 +544,22 @@ impl Neo4jClient {
     }
 
     /// Create a new protocol run node with INSTANCE_OF relationship to its protocol.
+    ///
+    /// # Atomic concurrency guard
+    ///
+    /// The Cypher uses a conditional pattern: the CREATE only executes when no
+    /// existing `ProtocolRun` with `status = 'running'` exists for the same
+    /// protocol. If a concurrent run is already running, the query returns no
+    /// rows and this method returns an error.
     pub async fn create_protocol_run(&self, run: &ProtocolRun) -> Result<()> {
         let states_visited_json = serde_json::to_string(&run.states_visited)?;
 
         let q = query(
             r#"
             MATCH (proto:Protocol {id: $protocol_id})
+            WHERE NOT EXISTS {
+                MATCH (existing:ProtocolRun {protocol_id: $protocol_id, status: 'running'})
+            }
             CREATE (r:ProtocolRun {
                 id: $id,
                 protocol_id: $protocol_id,
@@ -590,11 +600,24 @@ impl Neo4jClient {
         .param("error", run.error.clone().unwrap_or_default())
         .param("triggered_by", run.triggered_by.clone());
 
-        let _ = self
+        let mut result = self
             .graph
             .execute(q)
             .await
             .context("Failed to create protocol run")?;
+
+        // If no rows returned, the WHERE NOT EXISTS clause prevented creation
+        // (a running run already exists for this protocol).
+        let row = result
+            .next()
+            .await
+            .context("Failed to read create_protocol_run result")?;
+        if row.is_none() {
+            anyhow::bail!(
+                "Skipped: concurrent run already running for protocol {}",
+                run.protocol_id
+            );
+        }
 
         // Link to plan if present
         if let Some(plan_id) = &run.plan_id {

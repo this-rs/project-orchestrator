@@ -297,6 +297,7 @@ mod tests {
     use crate::protocol::{
         Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, TriggerConfig, TriggerMode,
     };
+    use std::sync::Arc;
 
     /// Helper to set up a 3-state protocol with event trigger config.
     async fn setup_event_triggered_protocol(
@@ -841,8 +842,16 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(runs[0].triggered_by, "event:post_sync");
 
+        // Complete the first run so the next event can start (concurrency guard)
+        engine::fire_transition(&store, runs[0].id, "process")
+            .await
+            .unwrap();
+        engine::fire_transition(&store, runs[0].id, "complete")
+            .await
+            .unwrap();
+
         // Also verify post_import triggers
-        // First, advance time past debounce window by updating last_triggered_at to 10min ago
+        // Advance time past debounce window by updating last_triggered_at to 10min ago
         let mut p = store.get_protocol(protocol.id).await.unwrap().unwrap();
         p.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
         store.upsert_protocol(&p).await.unwrap();
@@ -878,9 +887,10 @@ mod tests {
         assert_eq!(runs[0].triggered_by, "schedule:daily");
     }
 
-    /// Integration test 3: manual start coexists with auto-triggered runs
+    /// Integration test 3: manual, event, and scheduled runs coexist sequentially.
+    /// Each must complete before the next can start (concurrency guard).
     #[tokio::test]
-    async fn test_integration_manual_coexists_with_auto() {
+    async fn test_integration_manual_then_event_then_schedule() {
         let store = MockGraphStore::new();
         let (project_id, protocol) = setup_inference_protocol(&store).await;
 
@@ -890,8 +900,29 @@ mod tests {
             .unwrap();
         assert_eq!(manual_run.triggered_by, "manual");
 
+        // Complete the manual run so event-triggered can start
+        engine::fire_transition(&store, manual_run.id, "process")
+            .await
+            .unwrap();
+        engine::fire_transition(&store, manual_run.id, "complete")
+            .await
+            .unwrap();
+
         // 2. Event-triggered start (simulating post_sync)
         trigger_protocols_for_event(&store, project_id, "post_sync")
+            .await
+            .unwrap();
+
+        // Complete the event run so schedule-triggered can start
+        let (event_runs, _) = store
+            .list_protocol_runs(protocol.id, Some(crate::protocol::RunStatus::Running), 1, 0)
+            .await
+            .unwrap();
+        assert_eq!(event_runs.len(), 1);
+        engine::fire_transition(&store, event_runs[0].id, "process")
+            .await
+            .unwrap();
+        engine::fire_transition(&store, event_runs[0].id, "complete")
             .await
             .unwrap();
 
@@ -902,7 +933,7 @@ mod tests {
 
         run_scheduled_protocols(&store).await.unwrap();
 
-        // All 3 runs should coexist
+        // All 3 runs should exist with different triggered_by values
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
             .await
@@ -913,6 +944,31 @@ mod tests {
         assert!(triggers.contains(&"manual"), "Should have manual run");
         assert!(triggers.contains(&"event:post_sync"), "Should have event run");
         assert!(triggers.contains(&"schedule:daily"), "Should have schedule run");
+    }
+
+    /// Integration test: concurrent run guard rejects event trigger when run is active
+    #[tokio::test]
+    async fn test_integration_concurrent_guard_rejects_event() {
+        let store = MockGraphStore::new();
+        let (project_id, protocol) = setup_inference_protocol(&store).await;
+
+        // Start a manual run (still Running)
+        let _manual_run = engine::start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        // Event trigger should be silently rejected (concurrent run guard)
+        // trigger_protocols_for_event catches the error and logs it, so it returns Ok(())
+        trigger_protocols_for_event(&store, project_id, "post_sync")
+            .await
+            .unwrap();
+
+        // Only 1 run should exist (the manual one)
+        let (_, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "Event trigger should be rejected when a run is active");
     }
 
     /// Integration test: event debounce prevents double-trigger on rapid syncs
@@ -926,7 +982,19 @@ mod tests {
             .await
             .unwrap();
 
-        // Immediate second sync should be debounced
+        // Complete the run so next events can attempt to start (not blocked by concurrency guard)
+        let (runs, _) = store
+            .list_protocol_runs(protocol.id, Some(crate::protocol::RunStatus::Running), 1, 0)
+            .await
+            .unwrap();
+        engine::fire_transition(&store, runs[0].id, "process")
+            .await
+            .unwrap();
+        engine::fire_transition(&store, runs[0].id, "complete")
+            .await
+            .unwrap();
+
+        // Second sync should be debounced (last_triggered_at was just set)
         trigger_protocols_for_event(&store, project_id, "post_sync")
             .await
             .unwrap();
@@ -942,5 +1010,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 1, "Only the first event should trigger, rest debounced");
+    }
+
+    // ====================================================================
+    // Stress test: concurrent triggers via tokio::join!
+    // ====================================================================
+
+    /// Stress test: 10 concurrent event triggers → exactly 1 run created.
+    /// The mock's atomic check-and-create within a single write lock ensures
+    /// that only 1 `start_run` succeeds, even under high concurrency.
+    #[tokio::test]
+    async fn test_stress_10_concurrent_triggers() {
+        let store = Arc::new(MockGraphStore::new());
+        let (project_id, protocol) = setup_inference_protocol(&store).await;
+
+        // Launch 10 concurrent event triggers
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let store_clone = store.clone();
+            let handle = tokio::spawn(async move {
+                trigger_protocols_for_event(&*store_clone, project_id, "post_sync").await
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all to complete
+        let results: Vec<_> = futures::future::join_all(handles).await;
+
+        // All should return Ok (errors are caught internally by trigger_protocols_for_event)
+        for result in &results {
+            assert!(result.is_ok(), "Spawned task should not panic");
+            assert!(
+                result.as_ref().unwrap().is_ok(),
+                "trigger_protocols_for_event should not propagate errors"
+            );
+        }
+
+        // Exactly 1 run should have been created
+        let (runs, total) = store
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            total, 1,
+            "Expected exactly 1 run from 10 concurrent triggers, got {}",
+            total
+        );
+        assert_eq!(runs[0].triggered_by, "event:post_sync");
     }
 }

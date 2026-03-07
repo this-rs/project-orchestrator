@@ -19,7 +19,7 @@
 //! 5. Only `Running` runs can accept transitions
 
 use crate::neo4j::traits::GraphStore;
-use crate::protocol::{ProtocolRun, TransitionResult};
+use crate::protocol::{ProtocolRun, RunStatus, TransitionResult};
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
 
@@ -27,6 +27,14 @@ use uuid::Uuid;
 ///
 /// Creates a `ProtocolRun` at the protocol's entry state and persists it.
 /// Returns the newly created run.
+///
+/// # Concurrency
+///
+/// Only one `Running` run is allowed per protocol at a time (mutual exclusion).
+/// If a run is already `Running`, this function returns an error with message
+/// "Skipped: concurrent run already running". The store-level `create_protocol_run`
+/// also enforces this atomically (conditional CREATE in Neo4j, check-and-insert
+/// within the same write lock in the mock).
 ///
 /// # Arguments
 /// - `triggered_by` — How this run was started. `None` defaults to `"manual"`.
@@ -36,6 +44,7 @@ use uuid::Uuid;
 /// # Errors
 /// - Protocol not found
 /// - Entry state not found in the protocol's states
+/// - Concurrent run already running for this protocol
 pub async fn start_run(
     store: &dyn GraphStore,
     protocol_id: Uuid,
@@ -61,7 +70,22 @@ pub async fn start_run(
             )
         })?;
 
-    // 3. Create the run
+    // 3. Concurrency check: reject if a Running run already exists.
+    //    This is the fast-path check. The store also enforces atomically
+    //    via conditional CREATE (Neo4j) or check-within-lock (mock) to
+    //    prevent TOCTOU races.
+    let (_, running_count) = store
+        .list_protocol_runs(protocol_id, Some(RunStatus::Running), 1, 0)
+        .await?;
+
+    if running_count > 0 {
+        bail!(
+            "Skipped: concurrent run already running for protocol {}",
+            protocol_id
+        );
+    }
+
+    // 4. Create the run
     let mut run = ProtocolRun::new(protocol_id, entry_state.id, &entry_state.name);
     run.plan_id = plan_id;
     run.task_id = task_id;
@@ -69,7 +93,7 @@ pub async fn start_run(
         run.triggered_by = trigger.to_string();
     }
 
-    // 4. Persist
+    // 5. Persist (store enforces atomicity as a second line of defense)
     store
         .create_protocol_run(&run)
         .await
@@ -504,14 +528,19 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_protocol(&store).await;
 
-        // Create 3 runs
+        // Create 3 runs sequentially (complete/cancel the previous before starting next,
+        // because the concurrency guard prevents multiple Running runs).
         let run1 = start_run(&store, protocol.id, None, None, None).await.unwrap();
-        let _run2 = start_run(&store, protocol.id, None, None, None).await.unwrap();
-        let _run3 = start_run(&store, protocol.id, None, None, None).await.unwrap();
-
-        // Complete one
+        // Complete run1 → Done
         fire_transition(&store, run1.id, "begin").await.unwrap();
         fire_transition(&store, run1.id, "finish").await.unwrap();
+
+        let run2 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        // Cancel run2
+        cancel_run(&store, run2.id).await.unwrap();
+
+        let run3 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        // run3 stays Running
 
         // List all
         let (runs, total) = store
@@ -526,8 +555,8 @@ mod tests {
             .list_protocol_runs(protocol.id, Some(RunStatus::Running), 10, 0)
             .await
             .unwrap();
-        assert_eq!(running_total, 2);
-        assert!(running.iter().all(|r| r.status == RunStatus::Running));
+        assert_eq!(running_total, 1);
+        assert_eq!(running[0].id, run3.id);
 
         // List only completed
         let (completed, completed_total) = store
@@ -536,6 +565,50 @@ mod tests {
             .unwrap();
         assert_eq!(completed_total, 1);
         assert_eq!(completed[0].id, run1.id);
+
+        // List only cancelled
+        let (cancelled, cancelled_total) = store
+            .list_protocol_runs(protocol.id, Some(RunStatus::Cancelled), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(cancelled_total, 1);
+        assert_eq!(cancelled[0].id, run2.id);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_run_rejected() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        // Start a run — succeeds
+        let _run = start_run(&store, protocol.id, None, None, None).await.unwrap();
+
+        // Try to start another while the first is Running — should fail
+        let result = start_run(&store, protocol.id, None, None, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("concurrent run already running"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_run_allowed_after_completion() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        // Start and complete a run
+        let run1 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        fire_transition(&store, run1.id, "begin").await.unwrap();
+        fire_transition(&store, run1.id, "finish").await.unwrap();
+        assert_eq!(
+            store.get_protocol_run(run1.id).await.unwrap().unwrap().status,
+            RunStatus::Completed
+        );
+
+        // Now starting another run should succeed
+        let run2 = start_run(&store, protocol.id, None, None, None).await.unwrap();
+        assert_eq!(run2.status, RunStatus::Running);
     }
 
     #[tokio::test]

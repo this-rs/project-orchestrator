@@ -7924,10 +7924,23 @@ impl GraphStore for MockGraphStore {
         &self,
         run: &crate::protocol::ProtocolRun,
     ) -> anyhow::Result<()> {
-        self.protocol_runs
-            .write()
-            .await
-            .insert(run.id, run.clone());
+        let mut store = self.protocol_runs.write().await;
+
+        // Atomic concurrency guard: reject if a Running run already exists
+        // for this protocol. Check and insert happen within the same write
+        // lock, so there's no TOCTOU window.
+        let has_running = store.values().any(|r| {
+            r.protocol_id == run.protocol_id
+                && r.status == crate::protocol::RunStatus::Running
+        });
+        if has_running {
+            anyhow::bail!(
+                "Skipped: concurrent run already running for protocol {}",
+                run.protocol_id
+            );
+        }
+
+        store.insert(run.id, run.clone());
         Ok(())
     }
 
