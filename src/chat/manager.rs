@@ -245,6 +245,9 @@ impl ChatManager {
             pipeline.add_stage(Box::new(
                 super::stages::KnowledgeInjectionStage::new(graph.clone(), search.clone()),
             ));
+            pipeline.add_stage(Box::new(
+                super::stages::StatusInjectionStage::new(graph.clone()),
+            ));
             Arc::new(pipeline)
         };
         Self {
@@ -303,6 +306,9 @@ impl ChatManager {
             ));
             pipeline.add_stage(Box::new(
                 super::stages::KnowledgeInjectionStage::new(graph.clone(), search.clone()),
+            ));
+            pipeline.add_stage(Box::new(
+                super::stages::StatusInjectionStage::new(graph.clone()),
             ));
             Arc::new(pipeline)
         };

@@ -22,6 +22,7 @@ pub mod notes;
 pub mod orchestrator;
 pub mod parser;
 pub mod plan;
+pub mod reasoning;
 pub mod resolver;
 pub mod setup_claude;
 pub mod skills;
