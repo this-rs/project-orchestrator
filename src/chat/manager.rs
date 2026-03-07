@@ -235,9 +235,15 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = Arc::new(super::enrichment::EnrichmentPipeline::new(
-            super::enrichment::EnrichmentConfig::default(),
-        ));
+        let enrichment_pipeline = {
+            let mut pipeline = super::enrichment::EnrichmentPipeline::new(
+                super::enrichment::EnrichmentConfig::default(),
+            );
+            pipeline.add_stage(Box::new(
+                super::stages::SkillActivationStage::new(graph.clone()),
+            ));
+            Arc::new(pipeline)
+        };
         Self {
             graph,
             search,
@@ -285,9 +291,15 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = Arc::new(super::enrichment::EnrichmentPipeline::new(
-            super::enrichment::EnrichmentConfig::default(),
-        ));
+        let enrichment_pipeline = {
+            let mut pipeline = super::enrichment::EnrichmentPipeline::new(
+                super::enrichment::EnrichmentConfig::default(),
+            );
+            pipeline.add_stage(Box::new(
+                super::stages::SkillActivationStage::new(graph.clone()),
+            ));
+            Arc::new(pipeline)
+        };
         Self {
             graph,
             search,

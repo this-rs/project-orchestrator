@@ -11,6 +11,7 @@ pub mod manager;
 pub mod path_detect;
 pub mod prompt;
 pub(crate) mod skill_hook;
+pub mod stages;
 pub mod types;
 
 pub use config::{ChatConfig, PermissionConfig};
