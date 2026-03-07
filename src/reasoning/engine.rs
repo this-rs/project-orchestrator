@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::embeddings::EmbeddingProvider;
@@ -804,11 +804,18 @@ fn format_seed_reasoning(seed: &SeedNode) -> String {
 }
 
 /// Truncate content to a maximum length, adding "..." if truncated.
+///
+/// Handles UTF-8 correctly by finding a valid char boundary before slicing.
 fn truncate_content(content: &str, max_len: usize) -> String {
     if content.len() <= max_len {
         content.to_string()
     } else {
-        let truncated = &content[..max_len];
+        // Find a valid char boundary at or before max_len
+        let mut end = max_len;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &content[..end];
         if let Some(last_space) = truncated.rfind(' ') {
             format!("{}...", &truncated[..last_space])
         } else {
@@ -828,7 +835,10 @@ fn entity_type_from_str(s: &str) -> EntitySource {
         "function" => EntitySource::Function,
         "struct" | "class" => EntitySource::Struct,
         "trait" | "interface" => EntitySource::Trait,
-        _ => EntitySource::File, // Default fallback
+        other => {
+            warn!(entity_type = other, "Unknown entity type in reasoning graph, defaulting to File");
+            EntitySource::File
+        }
     }
 }
 

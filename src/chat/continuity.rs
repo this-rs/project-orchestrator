@@ -285,7 +285,12 @@ async fn load_recent_notes(
 
 fn note_to_summary(note: &Note) -> NoteSummary {
     let preview = if note.content.len() > 120 {
-        format!("{}…", &note.content[..120])
+        // Find a valid UTF-8 char boundary at or before 120 bytes
+        let mut end = 120;
+        while end > 0 && !note.content.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &note.content[..end])
     } else {
         note.content.clone()
     };

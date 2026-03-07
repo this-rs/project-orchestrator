@@ -176,21 +176,22 @@ impl ReasoningTreeCache {
 
         let mut cache = self.inner.write().await;
 
-        // If evicting, clean up the id_index for the evicted entry
-        if cache.len() == cache.cap().get() {
-            if let Some((_evicted_key, evicted_entry)) = cache.peek_lru() {
-                let evicted_id = evicted_entry.tree.id;
-                // We'll clean up after the put
-                drop(cache);
-                self.id_index.write().await.remove(&evicted_id);
-                cache = self.inner.write().await;
-            }
-        }
+        // If evicting, collect the evicted tree id while still holding the lock
+        let evicted_id = if cache.len() == cache.cap().get() {
+            cache.peek_lru().map(|(_, entry)| entry.tree.id)
+        } else {
+            None
+        };
 
         cache.put(key.clone(), entry);
         drop(cache);
 
-        self.id_index.write().await.insert(tree_id, key);
+        // Now update id_index atomically: remove evicted + insert new
+        let mut id_idx = self.id_index.write().await;
+        if let Some(evicted_id) = evicted_id {
+            id_idx.remove(&evicted_id);
+        }
+        id_idx.insert(tree_id, key);
     }
 
     /// Invalidate a cached tree by its UUID.
