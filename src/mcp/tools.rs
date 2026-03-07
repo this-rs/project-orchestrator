@@ -984,16 +984,16 @@ fn skill_tool() -> ToolDefinition {
 fn protocol_tool() -> ToolDefinition {
     ToolDefinition {
         name: "protocol".to_string(),
-        description: "Manage protocols (Pattern Federation FSMs). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill".to_string(),
+        description: "Manage protocols (Pattern Federation FSMs). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, get_run, list_runs, transition, cancel_run, fail_run, delete_run".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "add_state", "delete_state", "list_states", "add_transition", "delete_transition", "list_transitions", "link_to_skill"],
+                    "enum": ["list", "create", "get", "update", "delete", "add_state", "delete_state", "list_states", "add_transition", "delete_transition", "list_transitions", "link_to_skill", "start_run", "get_run", "list_runs", "transition", "cancel_run", "fail_run", "delete_run"],
                     "description": "Operation to perform"
                 },
-                "protocol_id": {"type": "string", "description": "Protocol UUID (get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill)"},
+                "protocol_id": {"type": "string", "description": "Protocol UUID (get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/list_runs)"},
                 "project_id": {"type": "string", "description": "Project UUID (list/create)"},
                 "name": {"type": "string", "description": "Protocol or state name (create/update/add_state)"},
                 "description": {"type": "string", "description": "Description (create/update/add_state)"},
@@ -1006,8 +1006,13 @@ fn protocol_tool() -> ToolDefinition {
                 "transition_id": {"type": "string", "description": "Transition UUID (delete_transition)"},
                 "from_state": {"type": "string", "description": "Source state UUID (add_transition)"},
                 "to_state": {"type": "string", "description": "Target state UUID (add_transition)"},
-                "trigger": {"type": "string", "description": "Transition trigger (add_transition)"},
+                "trigger": {"type": "string", "description": "Transition trigger (add_transition/transition)"},
                 "guard": {"type": "string", "description": "Optional guard condition (add_transition)"},
+                "run_id": {"type": "string", "description": "Protocol run UUID (get_run/transition/cancel_run/fail_run/delete_run)"},
+                "plan_id": {"type": "string", "description": "Plan UUID (start_run — optional context)"},
+                "task_id": {"type": "string", "description": "Task UUID (start_run — optional context)"},
+                "error": {"type": "string", "description": "Error message (fail_run)"},
+                "status": {"type": "string", "description": "Status filter (list_runs): running, completed, failed, cancelled"},
                 "states": {
                     "type": "array",
                     "items": {"type": "object"},
@@ -1018,8 +1023,8 @@ fn protocol_tool() -> ToolDefinition {
                     "items": {"type": "object"},
                     "description": "Inline transitions to create with the protocol (create): [{\"from_state\": \"uuid\", \"to_state\": \"uuid\", \"trigger\": \"...\", \"guard\": \"...\"}]"
                 },
-                "limit": {"type": "integer", "description": "Max items (list)"},
-                "offset": {"type": "integer", "description": "Skip items (list)"}
+                "limit": {"type": "integer", "description": "Max items (list/list_runs)"},
+                "offset": {"type": "integer", "description": "Skip items (list/list_runs)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

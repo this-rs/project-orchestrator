@@ -345,6 +345,13 @@ impl ToolHandler {
             ("protocol", "delete_transition") => "delete_protocol_transition",
             ("protocol", "list_transitions") => "list_protocol_transitions",
             ("protocol", "link_to_skill") => "link_protocol_to_skill",
+            ("protocol", "start_run") => "start_protocol_run",
+            ("protocol", "get_run") => "get_protocol_run",
+            ("protocol", "list_runs") => "list_protocol_runs",
+            ("protocol", "transition") => "fire_protocol_transition",
+            ("protocol", "cancel_run") => "cancel_protocol_run",
+            ("protocol", "fail_run") => "fail_protocol_run",
+            ("protocol", "delete_run") => "delete_protocol_run",
 
             // Reasoning Tree
             ("reasoning", "reason") => "reason",
@@ -3763,6 +3770,106 @@ impl ToolHandler {
                     )
                     .await?;
                 Ok(Some(result))
+            }
+
+            // ── Protocol Runs (FSM Runtime) (7 tools) ────────────────────
+            "start_protocol_run" => {
+                let protocol_id = extract_id(args, "protocol_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("plan_id") {
+                    body.insert("plan_id".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("task_id") {
+                    body.insert("task_id".to_string(), v.clone());
+                }
+                let result = http
+                    .post(
+                        &format!("/api/protocols/{}/runs", protocol_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_protocol_run" => {
+                let run_id = extract_id(args, "run_id")?;
+                let result = http
+                    .get(&format!("/api/protocols/runs/{}", run_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_protocol_runs" => {
+                let protocol_id = extract_id(args, "protocol_id")?;
+                let mut query = vec![];
+                if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let result = http
+                    .get_with_query(
+                        &format!("/api/protocols/{}/runs", protocol_id),
+                        &query,
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "fire_protocol_transition" => {
+                let run_id = extract_id(args, "run_id")?;
+                let trigger = extract_string(args, "trigger")?;
+                let body = json!({"trigger": trigger});
+                let result = http
+                    .post(
+                        &format!("/api/protocols/runs/{}/transition", run_id),
+                        &body,
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "cancel_protocol_run" => {
+                let run_id = extract_id(args, "run_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/protocols/runs/{}/cancel", run_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "fail_protocol_run" => {
+                let run_id = extract_id(args, "run_id")?;
+                let error_msg = args
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown error");
+                let body = json!({"error": error_msg});
+                let result = http
+                    .post(
+                        &format!("/api/protocols/runs/{}/fail", run_id),
+                        &body,
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "delete_protocol_run" => {
+                let run_id = extract_id(args, "run_id")?;
+                let result = http
+                    .delete(&format!("/api/protocols/runs/{}", run_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             // ── All tools migrated ──────────────────────────────────────

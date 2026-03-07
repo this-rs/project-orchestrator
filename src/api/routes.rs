@@ -868,6 +868,28 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/protocols/{protocol_id}/link-skill",
             post(protocol_handlers::link_to_skill),
         )
+        // Protocol Runs (FSM Runtime)
+        .route(
+            "/api/protocols/{protocol_id}/runs",
+            get(protocol_handlers::list_runs).post(protocol_handlers::start_run),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}",
+            get(protocol_handlers::get_run)
+                .delete(protocol_handlers::delete_run),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/transition",
+            post(protocol_handlers::fire_transition),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/cancel",
+            post(protocol_handlers::cancel_run),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/fail",
+            post(protocol_handlers::fail_run),
+        )
         // ================================================================
         // Reasoning Tree
         // ================================================================

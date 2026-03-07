@@ -2,7 +2,11 @@
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
-use crate::protocol::{Protocol, ProtocolCategory, ProtocolState, ProtocolTransition};
+use crate::events::EventEmitter;
+use crate::protocol::{
+    self, Protocol, ProtocolCategory, ProtocolRun, ProtocolState, ProtocolTransition, RunStatus,
+    TransitionResult,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -100,6 +104,27 @@ pub struct AddTransitionBody {
 #[derive(Debug, Deserialize)]
 pub struct LinkToSkillBody {
     pub skill_id: Uuid,
+}
+
+/// Request body to start a protocol run
+#[derive(Debug, Deserialize)]
+pub struct StartRunBody {
+    pub plan_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+}
+
+/// Request body to fire a transition
+#[derive(Debug, Deserialize)]
+pub struct FireTransitionBody {
+    pub trigger: String,
+}
+
+/// Query parameters for listing protocol runs
+#[derive(Debug, Deserialize, Default)]
+pub struct RunsListQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    pub status: Option<String>,
 }
 
 // ============================================================================
@@ -636,4 +661,232 @@ pub async fn link_to_skill(
         .map_err(AppError::Internal)?;
 
     Ok(Json(protocol))
+}
+
+// ============================================================================
+// Handlers — Protocol Runs (FSM Runtime)
+// ============================================================================
+
+/// Start a new protocol run
+///
+/// POST /api/protocols/:id/runs
+pub async fn start_run(
+    State(state): State<OrchestratorState>,
+    Path(protocol_id): Path<Uuid>,
+    Json(body): Json<StartRunBody>,
+) -> Result<(StatusCode, Json<ProtocolRun>), AppError> {
+    let run = protocol::engine::start_run(
+        state.orchestrator.neo4j(),
+        protocol_id,
+        body.plan_id,
+        body.task_id,
+    )
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("not found") {
+            AppError::NotFound(e.to_string())
+        } else {
+            AppError::Internal(e)
+        }
+    })?;
+
+    // Emit event
+    state.event_bus.emit_created(
+        crate::events::EntityType::ProtocolRun,
+        &run.id.to_string(),
+        serde_json::json!({
+            "protocol_id": run.protocol_id,
+            "current_state": run.current_state,
+            "status": run.status.to_string(),
+        }),
+        Some(run.protocol_id.to_string()),
+    );
+
+    Ok((StatusCode::CREATED, Json(run)))
+}
+
+/// Fire a transition on a running protocol
+///
+/// POST /api/protocols/runs/:run_id/transition
+pub async fn fire_transition(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+    Json(body): Json<FireTransitionBody>,
+) -> Result<Json<TransitionResult>, AppError> {
+    let result = protocol::engine::fire_transition(
+        state.orchestrator.neo4j(),
+        run_id,
+        &body.trigger,
+    )
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("not found") {
+            AppError::NotFound(e.to_string())
+        } else {
+            AppError::Internal(e)
+        }
+    })?;
+
+    // Emit event for successful transitions
+    if result.success {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::ProtocolRun,
+            &run_id.to_string(),
+            serde_json::json!({
+                "trigger": body.trigger,
+                "current_state": result.current_state,
+                "current_state_name": result.current_state_name,
+                "run_completed": result.run_completed,
+                "status": result.status.to_string(),
+            }),
+            None,
+        );
+    }
+
+    Ok(Json(result))
+}
+
+/// Get a protocol run by ID
+///
+/// GET /api/protocols/runs/:run_id
+pub async fn get_run(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<ProtocolRun>, AppError> {
+    let run = state
+        .orchestrator
+        .neo4j()
+        .get_protocol_run(run_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("ProtocolRun {} not found", run_id)))?;
+
+    Ok(Json(run))
+}
+
+/// List runs for a protocol
+///
+/// GET /api/protocols/:id/runs
+pub async fn list_runs(
+    State(state): State<OrchestratorState>,
+    Path(protocol_id): Path<Uuid>,
+    Query(query): Query<RunsListQuery>,
+) -> Result<Json<PaginatedResponse<ProtocolRun>>, AppError> {
+    let status_filter: Option<RunStatus> = query
+        .status
+        .as_deref()
+        .and_then(|s| s.parse().ok());
+
+    let limit = query.pagination.limit.min(100);
+    let offset = query.pagination.offset;
+
+    let (runs, total) = state
+        .orchestrator
+        .neo4j()
+        .list_protocol_runs(protocol_id, status_filter, limit, offset)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(PaginatedResponse {
+        items: runs,
+        total,
+        limit,
+        offset,
+        has_more: offset + limit < total,
+    }))
+}
+
+/// Cancel a running protocol
+///
+/// POST /api/protocols/runs/:run_id/cancel
+pub async fn cancel_run(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<ProtocolRun>, AppError> {
+    let run = protocol::engine::cancel_run(state.orchestrator.neo4j(), run_id)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                AppError::NotFound(e.to_string())
+            } else {
+                AppError::BadRequest(e.to_string())
+            }
+        })?;
+
+    state.event_bus.emit_updated(
+        crate::events::EntityType::ProtocolRun,
+        &run_id.to_string(),
+        serde_json::json!({
+            "status": "cancelled",
+        }),
+        None,
+    );
+
+    Ok(Json(run))
+}
+
+/// Fail a running protocol
+///
+/// POST /api/protocols/runs/:run_id/fail
+pub async fn fail_run(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ProtocolRun>, AppError> {
+    let error_msg = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown error");
+
+    let run =
+        protocol::engine::fail_run(state.orchestrator.neo4j(), run_id, error_msg)
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("not found") {
+                    AppError::NotFound(e.to_string())
+                } else {
+                    AppError::BadRequest(e.to_string())
+                }
+            })?;
+
+    state.event_bus.emit_updated(
+        crate::events::EntityType::ProtocolRun,
+        &run_id.to_string(),
+        serde_json::json!({
+            "status": "failed",
+            "error": error_msg,
+        }),
+        None,
+    );
+
+    Ok(Json(run))
+}
+
+/// Delete a protocol run
+///
+/// DELETE /api/protocols/runs/:run_id
+pub async fn delete_run(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let deleted = state
+        .orchestrator
+        .neo4j()
+        .delete_protocol_run(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    if deleted {
+        state.event_bus.emit_deleted(
+            crate::events::EntityType::ProtocolRun,
+            &run_id.to_string(),
+            None,
+        );
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(format!(
+            "ProtocolRun {} not found",
+            run_id
+        )))
+    }
 }

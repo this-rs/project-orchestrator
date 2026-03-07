@@ -22,6 +22,7 @@ pub enum EntityType {
     Component,
     Note,
     ChatSession,
+    ProtocolRun,
 }
 
 /// The CRUD action performed
