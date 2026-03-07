@@ -16,7 +16,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **20 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills.
+You have **21 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -36,7 +36,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 20 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `admin`, `skill`, `analysis_profile`
+The 21 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`
 
 ## 3. Data Model
 
@@ -432,7 +432,7 @@ Use `code(action: "get_communities", project_slug)` to segment tasks during plan
 Call `chat(action: "add_discussed", session_id, entities)` for every file/function significantly modified or analyzed during the session. This feeds the DISCUSSED relations in the Knowledge Fabric and improves contextual propagation for future sessions.
 "#;
 
-/// Exhaustive reference of all 20 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 21 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
@@ -767,6 +767,14 @@ Manage neural skills (emergent knowledge clusters). Actions: list, create, get, 
 | import | `project_id` (req), `package` (req), `conflict_strategy` (skip/merge/replace) | Import skill package |
 | get_health | `skill_id` (req) | Get skill health metrics |
 
+## reasoning
+Build reasoning trees from the knowledge graph. Actions: reason, reason_feedback
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| reason | `request` (req), `project_id`, `depth` (default 4), `include_actions` (default true), `max_nodes` (default 50) | Build a reasoning tree from a natural language query |
+| reason_feedback | `tree_id` (req), `followed_nodes` (req, array of UUIDs), `outcome` (success/partial/failure) | Provide feedback to reinforce useful reasoning paths |
+
 ## analysis_profile
 Manage analysis profiles (edge/fusion weight presets). Actions: list, create, get, delete
 
@@ -822,7 +830,7 @@ pub struct ToolGroup {
     pub tools: &'static [ToolRef],
 }
 
-/// Static catalog of all 20 MCP mega-tools organized into semantic groups.
+/// Static catalog of all 21 MCP mega-tools organized into semantic groups.
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
@@ -1010,6 +1018,20 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             description: "Manage neural skills (list/create/get/update/delete/get_members/add_member/remove_member/activate/export/import/get_health)",
         }],
     },
+    // ── Reasoning Tree ─────────────────────────────────────────────
+    ToolGroup {
+        name: "reasoning",
+        description: "Build reasoning trees from the knowledge graph — dynamic decision trees that emerge from notes, decisions, and skills in response to a query",
+        keywords: &[
+            "reason", "reasoning", "raisonner", "raisonnement", "tree", "arbre",
+            "decision tree", "arbre de décision", "why", "pourquoi", "understand",
+            "comprendre", "explain", "expliquer", "feedback",
+        ],
+        tools: &[ToolRef {
+            name: "reasoning",
+            description: "Build reasoning trees (reason/reason_feedback)",
+        }],
+    },
     // ── Admin & Sync ────────────────────────────────────────────────
     ToolGroup {
         name: "sync_admin",
@@ -1027,7 +1049,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 20 mega-tools).
+/// Must match the MCP tools.rs count (currently 21 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2055,7 +2077,7 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "create""#));
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "link_to_entity""#));
         // Mega-tools section
-        assert!(BASE_SYSTEM_PROMPT.contains("20 mega-tools"));
+        assert!(BASE_SYSTEM_PROMPT.contains("21 mega-tools"));
         assert!(BASE_SYSTEM_PROMPT.contains("Mega-tools"));
     }
 
@@ -2519,11 +2541,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_20_mega_tools() {
+    fn test_tool_groups_cover_all_21_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 20,
-            "TOOL_GROUPS must cover exactly 20 unique mega-tools (got {}). \
+            count, 21,
+            "TOOL_GROUPS must cover exactly 21 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -2573,7 +2595,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 11, "Expected 11 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 12, "Expected 12 tool groups");
     }
 
     #[test]

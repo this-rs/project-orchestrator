@@ -11,6 +11,7 @@ use super::hook_handlers;
 use super::note_handlers;
 use super::profile_handlers;
 use super::project_handlers;
+use super::reason_handlers;
 use super::skill_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
@@ -828,6 +829,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/skills/{skill_id}/health",
             get(skill_handlers::get_skill_health),
+        )
+        // ================================================================
+        // Reasoning Tree
+        // ================================================================
+        .route("/api/reason", post(reason_handlers::reason))
+        .route(
+            "/api/reason/{tree_id}/feedback",
+            post(reason_handlers::reason_feedback),
         )
         // ================================================================
         // Admin — Embedding Backfill

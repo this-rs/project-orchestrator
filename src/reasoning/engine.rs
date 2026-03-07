@@ -220,6 +220,18 @@ impl ReasoningTreeEngine {
     }
 
     // ========================================================================
+    // Cache management
+    // ========================================================================
+
+    /// Invalidate a cached reasoning tree by its UUID.
+    ///
+    /// Used after `reason_feedback` to ensure re-computation with updated
+    /// neural scores on the next `build()` call.
+    pub async fn invalidate_cache(&self, tree_id: Uuid) -> bool {
+        self.cache.invalidate(tree_id).await
+    }
+
+    // ========================================================================
     // Phase 1: Activation
     // ========================================================================
 
