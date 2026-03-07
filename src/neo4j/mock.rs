@@ -7833,7 +7833,7 @@ impl GraphStore for MockGraphStore {
                 p.project_id == project_id
                     && category
                         .as_ref()
-                        .map_or(true, |c| p.protocol_category == *c)
+                        .is_none_or(|c| p.protocol_category == *c)
             })
             .cloned()
             .collect();
@@ -7960,8 +7960,8 @@ impl GraphStore for MockGraphStore {
 
     async fn update_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
         let mut store = self.protocol_runs.write().await;
-        if store.contains_key(&run.id) {
-            store.insert(run.id, run.clone());
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(run.id) {
+            e.insert(run.clone());
             Ok(())
         } else {
             anyhow::bail!("ProtocolRun not found: {}", run.id)
@@ -7979,7 +7979,7 @@ impl GraphStore for MockGraphStore {
         let mut filtered: Vec<_> = store
             .values()
             .filter(|r| {
-                r.protocol_id == protocol_id && status.as_ref().map_or(true, |s| r.status == *s)
+                r.protocol_id == protocol_id && status.as_ref().is_none_or(|s| r.status == *s)
             })
             .cloned()
             .collect();
