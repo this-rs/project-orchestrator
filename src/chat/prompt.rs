@@ -788,7 +788,7 @@ Manage analysis profiles (edge/fusion weight presets). Actions: list, create, ge
 | delete | `id` (req) | Delete analysis profile |
 
 ## protocol
-Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill
+Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, transition, get_run, list_runs, cancel_run, fail_run, report_progress
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -804,6 +804,13 @@ Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, d
 | delete_transition | `protocol_id` (req), `transition_id` (req) | Delete a transition |
 | list_transitions | `protocol_id` (req) | List transitions for protocol |
 | link_to_skill | `protocol_id` (req), `skill_id` (req) | Link protocol to a skill |
+| start_run | `protocol_id` (req), `plan_id`, `task_id` | Start a new protocol run (creates ProtocolRun in entry state) |
+| transition | `run_id` (req), `trigger` (req) | Fire a transition on a running protocol (evaluates guards, advances state) |
+| get_run | `run_id` (req) | Get a protocol run with current state, states_visited history, status |
+| list_runs | `protocol_id` (req), `status` | List runs for a protocol (filter by status: running/completed/failed/cancelled) |
+| cancel_run | `run_id` (req) | Cancel a running protocol run |
+| fail_run | `run_id` (req), `error` | Mark a running protocol run as failed with error message |
+| report_progress | `run_id` (req), `state_name` (req), `sub_action` (req), `processed`, `total`, `elapsed_ms` | Report progress during a long-running state (emits WS event for FSM Viewer) |
 "#;
 
 use anyhow::Result;
@@ -1055,15 +1062,16 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Protocol (Pattern Federation) ────────────────────────────────
     ToolGroup {
         name: "protocol_federation",
-        description: "Manage Protocol FSMs for Pattern Federation — finite state machines with states, transitions, guards",
+        description: "Manage Protocol FSMs for Pattern Federation — finite state machines with states, transitions, guards, and runtime execution (start/transition/monitor runs)",
         keywords: &[
             "protocol", "protocole", "fsm", "state machine", "machine à états",
             "transition", "guard", "état", "state", "pattern federation",
-            "federation", "fédération", "workflow",
+            "federation", "fédération", "workflow", "run", "exécution",
+            "execution", "trigger", "déclenchement", "progress", "progression",
         ],
         tools: &[ToolRef {
             name: "protocol",
-            description: "Manage protocols (list/create/get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill)",
+            description: "Manage protocols & runs (list/create/get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/transition/get_run/list_runs/cancel_run/fail_run/report_progress)",
         }],
     },
     // ── Admin & Sync ────────────────────────────────────────────────
