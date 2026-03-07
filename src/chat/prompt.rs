@@ -16,7 +16,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **21 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning.
+You have **22 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -36,7 +36,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 21 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`
+The 22 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`
 
 ## 3. Data Model
 
@@ -784,6 +784,24 @@ Manage analysis profiles (edge/fusion weight presets). Actions: list, create, ge
 | create | `name` (req), `project_slug`, `description`, `edge_weights` (object), `fusion_weights` (object) | Create analysis profile |
 | get | `id` (req) | Get analysis profile by UUID |
 | delete | `id` (req) | Delete analysis profile |
+
+## protocol
+Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| list | `project_id` (req), `category`, `limit`, `offset` | List protocols for project |
+| create | `project_id` (req), `name` (req), `description`, `category` (system/business) | Create protocol |
+| get | `protocol_id` (req) | Get protocol with states & transitions |
+| update | `protocol_id` (req), `name`, `description` | Update protocol |
+| delete | `protocol_id` (req) | Delete protocol and all states/transitions |
+| add_state | `protocol_id` (req), `name` (req), `state_type` (start/intermediate/terminal), `description`, `action` | Add state to protocol |
+| delete_state | `protocol_id` (req), `state_id` (req) | Delete a state |
+| list_states | `protocol_id` (req) | List states for protocol |
+| add_transition | `protocol_id` (req), `from_state` (req), `to_state` (req), `trigger` (req), `guard` | Add transition |
+| delete_transition | `protocol_id` (req), `transition_id` (req) | Delete a transition |
+| list_transitions | `protocol_id` (req) | List transitions for protocol |
+| link_to_skill | `protocol_id` (req), `skill_id` (req) | Link protocol to a skill |
 "#;
 
 use anyhow::Result;
@@ -1063,7 +1081,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 21 mega-tools).
+/// Must match the MCP tools.rs count (currently 22 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2270,7 +2288,7 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "create""#));
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "link_to_entity""#));
         // Mega-tools section
-        assert!(BASE_SYSTEM_PROMPT.contains("21 mega-tools"));
+        assert!(BASE_SYSTEM_PROMPT.contains("22 mega-tools"));
         assert!(BASE_SYSTEM_PROMPT.contains("Mega-tools"));
     }
 
