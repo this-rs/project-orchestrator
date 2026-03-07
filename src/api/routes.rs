@@ -840,6 +840,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(protocol_handlers::list_protocols).post(protocol_handlers::create_protocol),
         )
         .route(
+            "/api/protocols/route",
+            get(protocol_handlers::route_protocols),
+        )
+        .route(
             "/api/protocols/{protocol_id}",
             get(protocol_handlers::get_protocol)
                 .put(protocol_handlers::update_protocol)

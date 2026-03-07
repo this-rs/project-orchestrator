@@ -54,6 +54,8 @@ pub struct CreateProtocolBody {
     pub trigger_mode: Option<String>,
     /// Trigger configuration (events, schedule, conditions)
     pub trigger_config: Option<crate::protocol::TriggerConfig>,
+    /// Multi-dimensional relevance profile for context-aware routing
+    pub relevance_vector: Option<crate::protocol::routing::RelevanceVector>,
     /// Optional inline states to create with the protocol
     pub states: Option<Vec<CreateStateInline>>,
     /// Optional inline transitions to create with the protocol
@@ -86,6 +88,7 @@ pub struct UpdateProtocolBody {
     pub protocol_category: Option<String>,
     pub trigger_mode: Option<String>,
     pub trigger_config: Option<crate::protocol::TriggerConfig>,
+    pub relevance_vector: Option<crate::protocol::routing::RelevanceVector>,
 }
 
 /// Request body for adding a state
@@ -131,6 +134,21 @@ pub struct RunsListQuery {
     #[serde(flatten)]
     pub pagination: PaginationParams,
     pub status: Option<String>,
+}
+
+/// Query parameters for routing protocols
+#[derive(Debug, Deserialize)]
+pub struct RouteProtocolsQuery {
+    /// Required: project_id to scope the protocols
+    pub project_id: Uuid,
+    /// Optional: plan_id to auto-build context from plan metrics
+    pub plan_id: Option<Uuid>,
+    /// Optional: explicit phase override (warmup, planning, execution, review, closure)
+    pub phase: Option<String>,
+    /// Optional: explicit domain relevance (0.0-1.0)
+    pub domain: Option<f64>,
+    /// Optional: explicit resource availability (0.0-1.0)
+    pub resource: Option<f64>,
 }
 
 // ============================================================================
@@ -182,6 +200,130 @@ pub async fn list_protocols(
     )))
 }
 
+/// Route protocols: rank all protocols in a project by affinity to the current context.
+///
+/// GET /api/protocols/route?project_id=...&plan_id=...&phase=...&domain=...&resource=...
+///
+/// If `plan_id` is provided, the context vector is auto-built from plan metrics
+/// (task count, dependency count, affected files, completion %). Explicit query
+/// params (`phase`, `domain`, `resource`) override the auto-built values.
+pub async fn route_protocols(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<RouteProtocolsQuery>,
+) -> Result<Json<crate::protocol::routing::RouteResponse>, AppError> {
+    use crate::protocol::routing::{ContextVector, DimensionWeights};
+
+    // Fetch all protocols for this project (no pagination — routing needs all)
+    let (protocols, _) = state
+        .orchestrator
+        .neo4j()
+        .list_protocols(query.project_id, None, 200, 0)
+        .await
+        .map_err(AppError::Internal)?;
+
+    if protocols.is_empty() {
+        return Ok(Json(crate::protocol::routing::RouteResponse {
+            context: ContextVector::default(),
+            weights: DimensionWeights::default(),
+            results: vec![],
+            total_evaluated: 0,
+        }));
+    }
+
+    // Build context vector
+    let context = if let Some(plan_id) = query.plan_id {
+        // Auto-build from plan metrics
+        let plan = state
+            .orchestrator
+            .neo4j()
+            .get_plan(plan_id)
+            .await
+            .map_err(AppError::Internal)?;
+
+        let (tasks, edges) = state
+            .orchestrator
+            .neo4j()
+            .get_plan_dependency_graph(plan_id)
+            .await
+            .map_err(AppError::Internal)?;
+
+        let task_count = tasks.len();
+        let dependency_count = edges.len();
+        let affected_files_count: usize = tasks
+            .iter()
+            .flat_map(|t| t.affected_files.iter())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let completed_count = tasks
+            .iter()
+            .filter(|t| t.status == crate::neo4j::models::TaskStatus::Completed)
+            .count();
+        let completion_pct = if task_count > 0 {
+            completed_count as f64 / task_count as f64
+        } else {
+            0.0
+        };
+
+        let plan_status_str = plan
+            .as_ref()
+            .map(|p| {
+                // PlanStatus serializes via serde rename_all = "snake_case"
+                serde_json::to_string(&p.status)
+                    .unwrap_or_else(|_| "\"execution\"".to_string())
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .unwrap_or_else(|| "execution".to_string());
+
+        let mut ctx =
+            ContextVector::from_plan_context(&plan_status_str, task_count, dependency_count, affected_files_count, completion_pct);
+
+        // Allow explicit overrides
+        if let Some(phase) = &query.phase {
+            ctx.phase = match phase.as_str() {
+                "warmup" | "draft" => 0.0,
+                "planning" | "approved" => 0.25,
+                "execution" | "in_progress" => 0.5,
+                "review" | "testing" => 0.75,
+                "closure" | "completed" => 1.0,
+                _ => ctx.phase,
+            };
+        }
+        if let Some(domain) = query.domain {
+            ctx.domain = domain.clamp(0.0, 1.0);
+        }
+        if let Some(resource) = query.resource {
+            ctx.resource = resource.clamp(0.0, 1.0);
+        }
+        ctx
+    } else {
+        // Manual context — use defaults with overrides
+        let mut ctx = ContextVector::default();
+        if let Some(phase) = &query.phase {
+            ctx.phase = match phase.as_str() {
+                "warmup" | "draft" => 0.0,
+                "planning" | "approved" => 0.25,
+                "execution" | "in_progress" => 0.5,
+                "review" | "testing" => 0.75,
+                "closure" | "completed" => 1.0,
+                _ => ctx.phase,
+            };
+        }
+        if let Some(domain) = query.domain {
+            ctx.domain = domain.clamp(0.0, 1.0);
+        }
+        if let Some(resource) = query.resource {
+            ctx.resource = resource.clamp(0.0, 1.0);
+        }
+        ctx
+    };
+
+    let weights = DimensionWeights::default();
+    let response = crate::protocol::routing::rank_protocols(&context, &protocols, &weights);
+
+    Ok(Json(response))
+}
+
 /// Create a new protocol (optionally with inline states and transitions)
 ///
 /// POST /api/protocols
@@ -230,6 +372,7 @@ pub async fn create_protocol(
             .map_err(AppError::BadRequest)?;
     }
     protocol.trigger_config = body.trigger_config.clone();
+    protocol.relevance_vector = body.relevance_vector.clone();
 
     // Create inline states
     let mut created_states = Vec::new();
@@ -425,6 +568,9 @@ pub async fn update_protocol(
     }
     if let Some(trigger_config) = body.trigger_config {
         protocol.trigger_config = Some(trigger_config);
+    }
+    if let Some(relevance_vector) = body.relevance_vector {
+        protocol.relevance_vector = Some(relevance_vector);
     }
     protocol.updated_at = chrono::Utc::now();
 

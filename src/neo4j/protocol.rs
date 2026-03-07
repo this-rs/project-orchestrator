@@ -52,6 +52,11 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str(&s).ok()),
+            relevance_vector: node
+                .get::<String>("relevance_vector_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
             last_triggered_at: node
                 .get::<String>("last_triggered_at")
                 .ok()
@@ -118,6 +123,7 @@ impl Neo4jClient {
                 proto.protocol_category = $protocol_category,
                 proto.trigger_mode = $trigger_mode,
                 proto.trigger_config_json = $trigger_config_json,
+                proto.relevance_vector_json = $relevance_vector_json,
                 proto.last_triggered_at = $last_triggered_at,
                 proto.updated_at = $updated_at
             MERGE (proto)-[:BELONGS_TO]->(p)
@@ -142,6 +148,14 @@ impl Neo4jClient {
                 .trigger_config
                 .as_ref()
                 .map(|c| serde_json::to_string(c).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param(
+            "relevance_vector_json",
+            protocol
+                .relevance_vector
+                .as_ref()
+                .map(|rv| serde_json::to_string(rv).unwrap_or_default())
                 .unwrap_or_default(),
         )
         .param(

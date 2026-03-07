@@ -353,6 +353,7 @@ impl ToolHandler {
             ("protocol", "fail_run") => "fail_protocol_run",
             ("protocol", "report_progress") => "report_protocol_progress",
             ("protocol", "delete_run") => "delete_protocol_run",
+            ("protocol", "route") => "route_protocols",
 
             // Reasoning Tree
             ("reasoning", "reason") => "reason",
@@ -3649,6 +3650,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("trigger_config") {
                     body.insert("trigger_config".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("relevance_vector") {
+                    body.insert("relevance_vector".to_string(), v.clone());
+                }
                 let result = http
                     .put(
                         &format!("/api/protocols/{}", protocol_id),
@@ -3884,6 +3888,27 @@ impl ToolHandler {
                 } else {
                     result
                 }))
+            }
+
+            "route_protocols" => {
+                let project_id = extract_id(args, "project_id")?;
+                let mut query_params = format!("project_id={}", project_id);
+                if let Some(plan_id) = args.get("plan_id").and_then(|v| v.as_str()) {
+                    query_params.push_str(&format!("&plan_id={}", plan_id));
+                }
+                if let Some(phase) = args.get("phase").and_then(|v| v.as_str()) {
+                    query_params.push_str(&format!("&phase={}", phase));
+                }
+                if let Some(domain) = args.get("domain").and_then(|v| v.as_f64()) {
+                    query_params.push_str(&format!("&domain={}", domain));
+                }
+                if let Some(resource) = args.get("resource").and_then(|v| v.as_f64()) {
+                    query_params.push_str(&format!("&resource={}", resource));
+                }
+                let result = http
+                    .get(&format!("/api/protocols/route?{}", query_params))
+                    .await?;
+                Ok(Some(result))
             }
 
             // ── All tools migrated ──────────────────────────────────────

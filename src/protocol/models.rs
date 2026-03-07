@@ -13,6 +13,8 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
+use super::routing::RelevanceVector;
+
 // ============================================================================
 // Enums
 // ============================================================================
@@ -210,6 +212,8 @@ pub struct Protocol {
     pub trigger_mode: TriggerMode,
     /// Configuration for event/scheduled triggers
     pub trigger_config: Option<TriggerConfig>,
+    /// Multi-dimensional relevance profile for context-aware routing (T4)
+    pub relevance_vector: Option<RelevanceVector>,
     /// When this protocol was last auto-triggered (for scheduling dedup)
     pub last_triggered_at: Option<DateTime<Utc>>,
     /// When this protocol was created
@@ -233,6 +237,7 @@ impl Protocol {
             protocol_category: ProtocolCategory::Business,
             trigger_mode: TriggerMode::Manual,
             trigger_config: None,
+            relevance_vector: None,
             last_triggered_at: None,
             created_at: now,
             updated_at: now,
@@ -728,6 +733,7 @@ pub struct UpdateProtocolRequest {
     pub protocol_category: Option<ProtocolCategory>,
     pub trigger_mode: Option<TriggerMode>,
     pub trigger_config: Option<TriggerConfig>,
+    pub relevance_vector: Option<RelevanceVector>,
 }
 
 // ============================================================================

@@ -24,5 +24,6 @@
 pub mod engine;
 pub mod hooks;
 pub mod models;
+pub mod routing;
 
 pub use models::*;
