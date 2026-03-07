@@ -7831,9 +7831,7 @@ impl GraphStore for MockGraphStore {
             .values()
             .filter(|p| {
                 p.project_id == project_id
-                    && category
-                        .as_ref()
-                        .is_none_or(|c| p.protocol_category == *c)
+                    && category.as_ref().is_none_or(|c| p.protocol_category == *c)
             })
             .cloned()
             .collect();
