@@ -1654,6 +1654,17 @@ pub async fn get_workspace_intelligence_summary(
     let mut total_system_protocols: usize = 0;
     let mut total_business_protocols: usize = 0;
     let mut total_skill_linked: usize = 0;
+    let mut pm_plans: usize = 0;
+    let mut pm_tasks: usize = 0;
+    let mut pm_tasks_completed: usize = 0;
+    let mut pm_tasks_in_progress: usize = 0;
+    let mut pm_steps: usize = 0;
+    let mut pm_milestones: usize = 0;
+    let mut pm_releases: usize = 0;
+    let mut chat_sessions: usize = 0;
+    let mut chat_messages: i64 = 0;
+    let mut chat_cost: f64 = 0.0;
+    let mut chat_discussed: usize = 0;
     let mut project_count: usize = 0;
 
     for (project, result) in results {
@@ -1705,6 +1716,22 @@ pub async fn get_workspace_intelligence_summary(
         total_system_protocols += summary.behavioral.system_protocols;
         total_business_protocols += summary.behavioral.business_protocols;
         total_skill_linked += summary.behavioral.skill_linked;
+
+        if let Some(ref pm) = summary.pm {
+            pm_plans += pm.plans;
+            pm_tasks += pm.tasks;
+            pm_tasks_completed += pm.tasks_completed;
+            pm_tasks_in_progress += pm.tasks_in_progress;
+            pm_steps += pm.steps;
+            pm_milestones += pm.milestones;
+            pm_releases += pm.releases;
+        }
+        if let Some(ref chat) = summary.chat {
+            chat_sessions += chat.sessions;
+            chat_messages += chat.total_messages;
+            chat_cost += chat.total_cost_usd;
+            chat_discussed += chat.discussed_entity_count;
+        }
 
         project_count += 1;
     }
@@ -1770,6 +1797,34 @@ pub async fn get_workspace_intelligence_summary(
             system_protocols: total_system_protocols,
             business_protocols: total_business_protocols,
             skill_linked: total_skill_linked,
+        },
+        pm: if pm_plans > 0 || pm_tasks > 0 {
+            Some(super::graph_types::PmLayerSummary {
+                plans: pm_plans,
+                tasks: pm_tasks,
+                tasks_completed: pm_tasks_completed,
+                tasks_in_progress: pm_tasks_in_progress,
+                steps: pm_steps,
+                milestones: pm_milestones,
+                releases: pm_releases,
+                completion_rate: if pm_tasks > 0 {
+                    pm_tasks_completed as f64 / pm_tasks as f64
+                } else {
+                    0.0
+                },
+            })
+        } else {
+            None
+        },
+        chat: if chat_sessions > 0 {
+            Some(super::graph_types::ChatLayerSummary {
+                sessions: chat_sessions,
+                total_messages: chat_messages,
+                total_cost_usd: chat_cost,
+                discussed_entity_count: chat_discussed,
+            })
+        } else {
+            None
         },
     };
 

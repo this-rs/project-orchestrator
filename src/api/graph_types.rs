@@ -163,6 +163,28 @@ pub struct BehavioralLayerSummary {
     pub skill_linked: usize,
 }
 
+/// PM layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct PmLayerSummary {
+    pub plans: usize,
+    pub tasks: usize,
+    pub tasks_completed: usize,
+    pub tasks_in_progress: usize,
+    pub steps: usize,
+    pub milestones: usize,
+    pub releases: usize,
+    pub completion_rate: f64,
+}
+
+/// Chat layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLayerSummary {
+    pub sessions: usize,
+    pub total_messages: i64,
+    pub total_cost_usd: f64,
+    pub discussed_entity_count: usize,
+}
+
 /// Full intelligence summary response
 #[derive(Debug, Clone, Serialize)]
 pub struct IntelligenceSummaryResponse {
@@ -172,6 +194,10 @@ pub struct IntelligenceSummaryResponse {
     pub neural: NeuralLayerSummary,
     pub skills: SkillsLayerSummary,
     pub behavioral: BehavioralLayerSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm: Option<PmLayerSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatLayerSummary>,
 }
 
 // ============================================================================
@@ -1015,6 +1041,8 @@ pub async fn build_intelligence_summary(
         neural_res,
         skills_all_res,
         protocols_res,
+        pm_graph_res,
+        chat_graph_res,
     ) = tokio::join!(
         neo4j.count_project_files(pid),
         neo4j.get_language_stats_for_project(pid),
@@ -1027,6 +1055,8 @@ pub async fn build_intelligence_summary(
         neo4j.get_neural_metrics(pid),
         neo4j.list_skills(pid, None, 1000, 0),
         neo4j.list_protocols(pid, None, 10_000, 0),
+        neo4j.get_pm_graph_data(pid, 10_000),
+        neo4j.get_chat_graph_data(pid, 100),
     );
 
     // === Code layer ===
@@ -1157,6 +1187,60 @@ pub async fn build_intelligence_summary(
         skill_linked: skill_linked_count,
     };
 
+    // === PM layer ===
+    let pm = pm_graph_res.ok().map(|(nodes, _edges)| {
+        let plans = nodes.iter().filter(|n| n.node_type == "plan").count();
+        let tasks_total = nodes.iter().filter(|n| n.node_type == "task").count();
+        let tasks_completed = nodes
+            .iter()
+            .filter(|n| {
+                n.node_type == "task"
+                    && n.attributes.get("status").and_then(|v| v.as_str()) == Some("completed")
+            })
+            .count();
+        let tasks_in_progress = nodes
+            .iter()
+            .filter(|n| {
+                n.node_type == "task"
+                    && n.attributes.get("status").and_then(|v| v.as_str()) == Some("in_progress")
+            })
+            .count();
+        let steps = nodes.iter().filter(|n| n.node_type == "step").count();
+        let milestones = nodes.iter().filter(|n| n.node_type == "milestone").count();
+        let releases = nodes.iter().filter(|n| n.node_type == "release").count();
+        let completion_rate = if tasks_total > 0 {
+            tasks_completed as f64 / tasks_total as f64
+        } else {
+            0.0
+        };
+        PmLayerSummary {
+            plans,
+            tasks: tasks_total,
+            tasks_completed,
+            tasks_in_progress,
+            steps,
+            milestones,
+            releases,
+            completion_rate,
+        }
+    });
+
+    // === Chat layer ===
+    let chat = chat_graph_res.ok().map(|(sessions, discussed)| {
+        let total_messages: i64 = sessions.iter().map(|s| s.message_count).sum();
+        let total_cost_usd: f64 = sessions.iter().map(|s| s.total_cost_usd).sum();
+        let discussed_entities: std::collections::HashSet<_> = discussed
+            .iter()
+            .map(|d| (&d.entity_type, &d.entity_id))
+            .collect();
+        ChatLayerSummary {
+            sessions: sessions.len(),
+            total_messages,
+            total_cost_usd,
+            discussed_entity_count: discussed_entities.len(),
+        }
+    });
+
     Ok(IntelligenceSummaryResponse {
         code,
         knowledge,
@@ -1164,5 +1248,7 @@ pub async fn build_intelligence_summary(
         neural,
         skills,
         behavioral,
+        pm,
+        chat,
     })
 }
