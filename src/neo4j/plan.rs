@@ -929,8 +929,9 @@ impl Neo4jClient {
             nodes.push(PmGraphNode {
                 id,
                 node_type,
-                label: if label.len() > 80 {
-                    format!("{}…", &label[..79])
+                label: if label.chars().count() > 80 {
+                    let truncated: String = label.chars().take(79).collect();
+                    format!("{truncated}…")
                 } else {
                     label
                 },

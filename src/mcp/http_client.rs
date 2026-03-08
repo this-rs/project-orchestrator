@@ -181,8 +181,9 @@ impl McpHttpClient {
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
 
             // Truncate body for error messages (avoid flooding logs with huge HTML errors)
-            let body_excerpt = if body.len() > 500 {
-                format!("{}...", &body[..500])
+            let body_excerpt = if body.chars().count() > 500 {
+                let truncated: String = body.chars().take(500).collect();
+                format!("{truncated}...")
             } else {
                 body
             };
