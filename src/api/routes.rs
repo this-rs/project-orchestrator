@@ -1135,6 +1135,15 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/workspaces/{slug}/topology",
             get(workspace_handlers::get_workspace_topology),
         )
+        // Workspace Intelligence (aggregated graph + summary)
+        .route(
+            "/api/workspaces/{slug}/graph",
+            get(workspace_handlers::get_workspace_graph),
+        )
+        .route(
+            "/api/workspaces/{slug}/intelligence/summary",
+            get(workspace_handlers::get_workspace_intelligence_summary),
+        )
         // ================================================================
         // Chat (session management — streaming via WebSocket above)
         // ================================================================

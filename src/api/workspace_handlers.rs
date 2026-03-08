@@ -1469,6 +1469,302 @@ pub async fn get_workspace_topology(
     Ok(Json(TopologyResponse { components }))
 }
 
+// ============================================================================
+// Workspace Intelligence — Graph & Summary (aggregated across all projects)
+// ============================================================================
+
+use super::graph_types::{
+    GraphQuery, WorkspaceGraphResponse, ProjectGraphMeta,
+    WorkspaceIntelligenceSummaryResponse, ProjectIntelligenceSummary,
+    IntelligenceSummaryResponse, parse_layers,
+};
+
+/// GET /api/workspaces/{slug}/graph — Multi-layer graph aggregated across all workspace projects
+pub async fn get_workspace_graph(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+    Query(params): Query<GraphQuery>,
+) -> Result<Json<WorkspaceGraphResponse>, AppError> {
+    let neo4j = state.orchestrator.neo4j_arc();
+
+    let workspace = neo4j
+        .get_workspace_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
+
+    let projects = neo4j.list_workspace_projects(workspace.id).await?;
+
+    let requested_layers = parse_layers(&params.layers);
+    let limit = params.limit.unwrap_or(5000);
+
+    // Build graph data for each project in parallel
+    let graph_futures: Vec<_> = projects
+        .iter()
+        .map(|project| {
+            let neo4j = neo4j.clone();
+            let layers = requested_layers.clone();
+            let community = params.community;
+            let project = project.clone();
+            async move {
+                let result = super::graph_types::build_project_graph_data(
+                    &*neo4j, &project, &layers, limit, community,
+                )
+                .await;
+                (project, result)
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(graph_futures).await;
+
+    // Merge all project results
+    let mut all_nodes = Vec::new();
+    let mut all_edges = Vec::new();
+    let mut all_communities = Vec::new();
+    let mut merged_stats = std::collections::HashMap::new();
+    let mut project_metas = Vec::new();
+
+    for (project, result) in results {
+        let (mut nodes, mut edges, mut communities, stats) = match result {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(project_slug = %project.slug, error = ?e, "Failed to build graph for project, skipping");
+                continue;
+            }
+        };
+
+        let project_slug = &project.slug;
+        let project_name = &project.name;
+
+        // Prefix node IDs with project slug to avoid collisions
+        for node in &mut nodes {
+            node.id = format!("{}::{}", project_slug, node.id);
+            // Add project info to attributes
+            let mut attrs = node.attributes.take().unwrap_or(serde_json::json!({}));
+            if let Some(obj) = attrs.as_object_mut() {
+                obj.insert("project_slug".to_string(), serde_json::json!(project_slug));
+                obj.insert("project_name".to_string(), serde_json::json!(project_name));
+            }
+            node.attributes = Some(attrs);
+        }
+
+        // Prefix edge source/target IDs
+        for edge in &mut edges {
+            edge.source = format!("{}::{}", project_slug, edge.source);
+            edge.target = format!("{}::{}", project_slug, edge.target);
+        }
+
+        // Prefix community key_files
+        for community in &mut communities {
+            community.key_files = community
+                .key_files
+                .iter()
+                .map(|f| format!("{}::{}", project_slug, f))
+                .collect();
+        }
+
+        let node_count = nodes.len();
+        let edge_count = edges.len();
+
+        project_metas.push(ProjectGraphMeta {
+            id: project.id.to_string(),
+            name: project_name.clone(),
+            slug: project_slug.clone(),
+            node_count,
+            edge_count,
+        });
+
+        all_nodes.extend(nodes);
+        all_edges.extend(edges);
+        all_communities.extend(communities);
+
+        // Merge stats (sum per layer)
+        for (layer, layer_stats) in stats {
+            let entry = merged_stats
+                .entry(layer)
+                .or_insert(super::graph_types::LayerStats { nodes: 0, edges: 0 });
+            entry.nodes += layer_stats.nodes;
+            entry.edges += layer_stats.edges;
+        }
+    }
+
+    Ok(Json(WorkspaceGraphResponse {
+        projects: project_metas,
+        nodes: all_nodes,
+        edges: all_edges,
+        communities: all_communities,
+        stats: merged_stats,
+        cross_project_edges: Vec::new(), // Future: detect cross-project links
+    }))
+}
+
+/// GET /api/workspaces/{slug}/intelligence/summary — Aggregated intelligence summary across all workspace projects
+pub async fn get_workspace_intelligence_summary(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<WorkspaceIntelligenceSummaryResponse>, AppError> {
+    let neo4j = state.orchestrator.neo4j_arc();
+
+    let workspace = neo4j
+        .get_workspace_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
+
+    let projects = neo4j.list_workspace_projects(workspace.id).await?;
+
+    // Build intelligence summary for each project in parallel
+    let summary_futures: Vec<_> = projects
+        .iter()
+        .map(|project| {
+            let neo4j = neo4j.clone();
+            let project = project.clone();
+            async move {
+                let result = super::graph_types::build_intelligence_summary(
+                    &*neo4j, project.id,
+                )
+                .await;
+                (project, result)
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(summary_futures).await;
+
+    let mut per_project = Vec::new();
+    let mut total_files: i64 = 0;
+    let mut total_functions: usize = 0;
+    let mut total_communities: usize = 0;
+    let mut all_hotspots = Vec::new();
+    let mut total_orphans: usize = 0;
+    let mut total_notes: usize = 0;
+    let mut total_decisions: usize = 0;
+    let mut total_stale: usize = 0;
+    let mut merged_types: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut total_co_changed_pairs: usize = 0;
+    let mut total_active_synapses: i64 = 0;
+    let mut sum_energy: f64 = 0.0;
+    let mut sum_weak_ratio: f64 = 0.0;
+    let mut total_dead_notes: i64 = 0;
+    let mut total_skills: usize = 0;
+    let mut total_active_skills: usize = 0;
+    let mut total_emerging_skills: usize = 0;
+    let mut sum_cohesion: f64 = 0.0;
+    let mut total_activations: i64 = 0;
+    let mut total_protocols: usize = 0;
+    let mut total_states: usize = 0;
+    let mut total_transitions: usize = 0;
+    let mut total_system_protocols: usize = 0;
+    let mut total_business_protocols: usize = 0;
+    let mut total_skill_linked: usize = 0;
+    let mut project_count: usize = 0;
+
+    for (project, result) in results {
+        let summary = match result {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(project_slug = %project.slug, error = ?e, "Failed to build summary for project, skipping");
+                continue;
+            }
+        };
+
+        per_project.push(ProjectIntelligenceSummary {
+            project_id: project.id.to_string(),
+            project_name: project.name.clone(),
+            project_slug: project.slug.clone(),
+            summary: summary.clone(),
+        });
+
+        // Aggregate
+        total_files += summary.code.files;
+        total_functions += summary.code.functions;
+        total_communities += summary.code.communities;
+        all_hotspots.extend(summary.code.hotspots);
+        total_orphans += summary.code.orphans;
+
+        total_notes += summary.knowledge.notes;
+        total_decisions += summary.knowledge.decisions;
+        total_stale += summary.knowledge.stale_count;
+        for (k, v) in summary.knowledge.types_distribution {
+            *merged_types.entry(k).or_insert(0) += v;
+        }
+
+        total_co_changed_pairs += summary.fabric.co_changed_pairs;
+
+        total_active_synapses += summary.neural.active_synapses;
+        sum_energy += summary.neural.avg_energy;
+        sum_weak_ratio += summary.neural.weak_synapses_ratio;
+        total_dead_notes += summary.neural.dead_notes_count;
+
+        total_skills += summary.skills.total;
+        total_active_skills += summary.skills.active;
+        total_emerging_skills += summary.skills.emerging;
+        sum_cohesion += summary.skills.avg_cohesion;
+        total_activations += summary.skills.total_activations;
+
+        total_protocols += summary.behavioral.protocols;
+        total_states += summary.behavioral.states;
+        total_transitions += summary.behavioral.transitions;
+        total_system_protocols += summary.behavioral.system_protocols;
+        total_business_protocols += summary.behavioral.business_protocols;
+        total_skill_linked += summary.behavioral.skill_linked;
+
+        project_count += 1;
+    }
+
+    // Sort hotspots by churn_score descending, take top 10
+    all_hotspots.sort_by(|a, b| b.churn_score.partial_cmp(&a.churn_score).unwrap_or(std::cmp::Ordering::Equal));
+    all_hotspots.truncate(10);
+
+    let avg_energy = if project_count > 0 { sum_energy / project_count as f64 } else { 0.0 };
+    let avg_weak_ratio = if project_count > 0 { sum_weak_ratio / project_count as f64 } else { 0.0 };
+    let avg_cohesion = if project_count > 0 { sum_cohesion / project_count as f64 } else { 0.0 };
+
+    let aggregated = IntelligenceSummaryResponse {
+        code: super::graph_types::CodeLayerSummary {
+            files: total_files,
+            functions: total_functions,
+            communities: total_communities,
+            hotspots: all_hotspots,
+            orphans: total_orphans,
+        },
+        knowledge: super::graph_types::KnowledgeLayerSummary {
+            notes: total_notes,
+            decisions: total_decisions,
+            stale_count: total_stale,
+            types_distribution: merged_types,
+        },
+        fabric: super::graph_types::FabricLayerSummary {
+            co_changed_pairs: total_co_changed_pairs,
+        },
+        neural: super::graph_types::NeuralLayerSummary {
+            active_synapses: total_active_synapses,
+            avg_energy,
+            weak_synapses_ratio: avg_weak_ratio,
+            dead_notes_count: total_dead_notes,
+        },
+        skills: super::graph_types::SkillsLayerSummary {
+            total: total_skills,
+            active: total_active_skills,
+            emerging: total_emerging_skills,
+            avg_cohesion,
+            total_activations,
+        },
+        behavioral: super::graph_types::BehavioralLayerSummary {
+            protocols: total_protocols,
+            states: total_states,
+            transitions: total_transitions,
+            system_protocols: total_system_protocols,
+            business_protocols: total_business_protocols,
+            skill_linked: total_skill_linked,
+        },
+    };
+
+    Ok(Json(WorkspaceIntelligenceSummaryResponse {
+        aggregated,
+        per_project,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
