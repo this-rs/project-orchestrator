@@ -280,6 +280,128 @@ pub struct ComponentInfo {
     pub is_main: bool,
 }
 
+/// Statistical summary of a distribution of values.
+///
+/// Provides percentiles, central tendency, dispersion, and shape metrics
+/// for any collection of f64 values. Used to enrich health reports with
+/// distribution-aware insights instead of just mean/max.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributionSummary {
+    /// Number of values in the distribution
+    pub count: usize,
+    /// Arithmetic mean
+    pub mean: f64,
+    /// Median (50th percentile)
+    pub median: f64,
+    /// Population standard deviation
+    pub std_dev: f64,
+    /// 25th percentile
+    pub p25: f64,
+    /// 75th percentile
+    pub p75: f64,
+    /// 90th percentile
+    pub p90: f64,
+    /// 95th percentile
+    pub p95: f64,
+    /// Minimum value
+    pub min: f64,
+    /// Maximum value
+    pub max: f64,
+    /// Fisher's skewness. > 0 = right-tailed (power-law), < 0 = left-tailed
+    pub skewness: f64,
+}
+
+impl DistributionSummary {
+    /// Compute distribution summary from a slice of values.
+    /// Returns None if the slice is empty.
+    /// Complexity: O(n log n) due to sorting.
+    pub fn from_values(values: &[f64]) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+
+        let n = values.len();
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mean = sorted.iter().sum::<f64>() / n as f64;
+        let variance = sorted.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+        let std_dev = variance.sqrt();
+
+        let skewness = if std_dev > 0.0 && n >= 3 {
+            let m3 = sorted.iter().map(|v| ((v - mean) / std_dev).powi(3)).sum::<f64>() / n as f64;
+            m3
+        } else {
+            0.0
+        };
+
+        let percentile = |p: f64| -> f64 {
+            if n == 1 {
+                return sorted[0];
+            }
+            let idx = p * (n - 1) as f64;
+            let lo = idx.floor() as usize;
+            let hi = idx.ceil() as usize;
+            let frac = idx - lo as f64;
+            if lo == hi || hi >= n {
+                sorted[lo.min(n - 1)]
+            } else {
+                sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+            }
+        };
+
+        Some(Self {
+            count: n,
+            mean,
+            median: percentile(0.5),
+            std_dev,
+            p25: percentile(0.25),
+            p75: percentile(0.75),
+            p90: percentile(0.90),
+            p95: percentile(0.95),
+            min: sorted[0],
+            max: sorted[n - 1],
+            skewness,
+        })
+    }
+}
+
+/// Direction of a health metric trend between two snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TrendDirection {
+    /// Metric is getting better
+    Improving,
+    /// Metric is getting worse
+    Degrading,
+    /// Change is within noise threshold (< 5%)
+    Stable,
+}
+
+impl std::fmt::Display for TrendDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Improving => write!(f, "improving"),
+            Self::Degrading => write!(f, "degrading"),
+            Self::Stable => write!(f, "stable"),
+        }
+    }
+}
+
+/// Change in a single health metric between two snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthDelta {
+    /// Name of the metric (e.g. "coupling", "god_functions", "circular_deps", "orphan_files")
+    pub metric: String,
+    /// Previous value
+    pub previous: f64,
+    /// Current value
+    pub current: f64,
+    /// Percentage change: (current - previous) / previous * 100
+    pub change_pct: f64,
+    /// Whether this change is improving, degrading, or stable
+    pub direction: TrendDirection,
+}
+
 /// Global code health metrics derived from the graph structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeHealthReport {
@@ -293,6 +415,9 @@ pub struct CodeHealthReport {
     pub avg_coupling: f64,
     /// Maximum coupling score (highest-degree node / total nodes)
     pub max_coupling: f64,
+    /// Distribution summary of coupling (clustering coefficient) values
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupling_dist: Option<DistributionSummary>,
 }
 
 impl Default for CodeHealthReport {
@@ -303,6 +428,7 @@ impl Default for CodeHealthReport {
             orphan_files: vec![],
             avg_coupling: 0.0,
             max_coupling: 0.0,
+            coupling_dist: None,
         }
     }
 }
