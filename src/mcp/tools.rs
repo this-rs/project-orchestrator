@@ -321,6 +321,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "backfill_decision_embeddings" => Some(("admin", "backfill_decision_embeddings")),
         "detect_skills" => Some(("admin", "detect_skills")),
         "maintain_skills" => Some(("admin", "maintain_skills")),
+        "heal_scars" => Some(("admin", "heal_scars")),
 
         _ => None,
     }
@@ -913,13 +914,13 @@ fn analysis_profile_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, install_hooks".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, heal_scars, install_hooks".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
@@ -935,7 +936,8 @@ fn admin_tool() -> ToolDefinition {
                 "prune_threshold": {"type": "number", "description": "Prune synapses below this weight (decay_synapses, default 0.1)"},
                 "limit": {"type": "integer", "description": "Max items (search_neurons)"},
                 "level": {"type": "string", "enum": ["hourly", "daily", "weekly", "full"], "description": "Maintenance level (maintain_skills, default: daily)"},
-                "force": {"type": "boolean", "description": "Force re-detection from scratch, deleting all existing skills first (detect_skills, default: false)"}
+                "force": {"type": "boolean", "description": "Force re-detection from scratch, deleting all existing skills first (detect_skills, default: false)"},
+                "node_id": {"type": "string", "description": "Note or Decision UUID (heal_scars)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

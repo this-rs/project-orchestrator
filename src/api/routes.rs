@@ -723,6 +723,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/notes/neurons/decay",
             post(note_handlers::decay_synapses),
         )
+        .route(
+            "/api/notes/neurons/heal-scars",
+            post(note_handlers::heal_scars),
+        )
         // Notes needing review
         .route(
             "/api/notes/needs-review",

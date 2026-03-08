@@ -89,8 +89,16 @@ pub struct ReasonFeedbackResponse {
     pub energy_boost: f64,
     /// Synapse weight boost applied.
     pub synapse_boost: f64,
+    /// Number of nodes scarred (on failure).
+    /// Biomimicry: Elun Scar — penalizes nodes that led to failed reasoning.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub scars_applied: usize,
     /// Whether the cached tree was invalidated.
     pub cache_invalidated: bool,
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
 }
 
 // ============================================================================
@@ -165,7 +173,7 @@ pub async fn reason(
 /// it calls this endpoint to reinforce the underlying neural connections:
 /// - **Success**: Boost energy of followed nodes + reinforce synapses between them
 /// - **Partial**: Half boost
-/// - **Failure**: No reinforcement (natural decay handles it)
+/// - **Failure**: Apply scars to followed nodes (biomimicry: Elun Knowledge Scars)
 ///
 /// The cached tree is invalidated to ensure re-computation with updated scores.
 pub async fn reason_feedback(
@@ -190,6 +198,7 @@ pub async fn reason_feedback(
     let neo4j = state.orchestrator.neo4j();
     let mut neurons_boosted = 0u64;
     let mut synapses_reinforced = 0usize;
+    let mut scars_applied = 0usize;
 
     if energy_boost > 0.0 {
         // Boost energy for each followed node
@@ -221,6 +230,30 @@ pub async fn reason_feedback(
         }
     }
 
+    // Biomimicry: Elun Knowledge Scars — apply negative reinforcement on failure
+    if matches!(body.outcome, FeedbackOutcome::Failure) {
+        match neo4j
+            .apply_scars(&body.followed_nodes, 0.2)
+            .await
+        {
+            Ok(count) => {
+                scars_applied = count;
+                tracing::info!(
+                    scars_applied = count,
+                    tree_id = %tree_id,
+                    "Applied knowledge scars to {} nodes on reasoning failure",
+                    count
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to apply knowledge scars during reasoning feedback"
+                );
+            }
+        }
+    }
+
     // Invalidate the cached tree so next reason call reflects updated scores
     let cache_invalidated = if let Some(engine) = state.orchestrator.reasoning_engine() {
         engine.invalidate_cache(tree_id).await
@@ -234,6 +267,7 @@ pub async fn reason_feedback(
         synapses_reinforced,
         energy_boost,
         synapse_boost,
+        scars_applied,
         cache_invalidated,
     }))
 }

@@ -1891,6 +1891,14 @@ impl GraphStore for Neo4jClient {
         self.decay_synapses(decay_amount, prune_threshold).await
     }
 
+    async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> anyhow::Result<usize> {
+        self.apply_scars(node_ids, increment).await
+    }
+
+    async fn heal_scars(&self, node_id: Uuid) -> anyhow::Result<bool> {
+        self.heal_scars(node_id).await
+    }
+
     async fn init_note_energy(&self) -> anyhow::Result<usize> {
         self.init_note_energy().await
     }

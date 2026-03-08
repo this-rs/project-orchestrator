@@ -37,7 +37,8 @@ impl Neo4jClient {
                 energy: $energy,
                 last_activated: datetime($last_activated),
                 changes_json: $changes_json,
-                assertion_rule_json: $assertion_rule_json
+                assertion_rule_json: $assertion_rule_json,
+                scar_intensity: $scar_intensity
             })
             "#,
         )
@@ -78,7 +79,8 @@ impl Neo4jClient {
                 .as_ref()
                 .map(|r| serde_json::to_string(r).unwrap_or_default())
                 .unwrap_or_default(),
-        );
+        )
+        .param("scar_intensity", note.scar_intensity);
 
         self.graph.run(q).await?;
 
@@ -1282,7 +1284,10 @@ impl Neo4jClient {
             }
 
             let note = self.node_to_note(&node)?;
-            notes.push((note, score));
+            // Knowledge Scars: penalize scarred notes in search results
+            // Biomimicry: Elun HypersphereIdentity.Scar — scarred knowledge is less trusted
+            let adjusted_score = score * (1.0 - note.scar_intensity * 0.7);
+            notes.push((note, adjusted_score));
         }
 
         Ok(notes)
@@ -1915,7 +1920,143 @@ impl Neo4jClient {
             self.graph.run(delete_q).await?;
         }
 
+        // Step 3: Decay knowledge scars (20x slower than synapse decay)
+        // Biomimicry: Elun Scar — scars heal very slowly, allowing the system to remember failures
+        let scar_decay_rate = decay_amount * 0.05; // 1/20th of synapse decay
+        if scar_decay_rate > 0.0 {
+            let scar_decay_q = query(
+                r#"
+                MATCH (n)
+                WHERE n.scar_intensity IS NOT NULL AND n.scar_intensity > 0
+                AND (n:Note OR n:Decision)
+                SET n.scar_intensity = CASE
+                    WHEN n.scar_intensity - $scar_decay < 0.001 THEN 0.0
+                    ELSE n.scar_intensity - $scar_decay
+                END
+                RETURN count(n) AS healed
+                "#,
+            )
+            .param("scar_decay", scar_decay_rate);
+            if let Ok(mut result) = self.graph.execute(scar_decay_q).await {
+                if let Ok(Some(row)) = result.next().await {
+                    let healed: i64 = row.get("healed").unwrap_or(0);
+                    if healed > 0 {
+                        tracing::debug!("Decayed scars on {} nodes (rate: {:.4})", healed, scar_decay_rate);
+                    }
+                }
+            }
+        }
+
         Ok((decayed, pruned))
+    }
+
+    /// Apply scars to nodes traversed during a failed reasoning path.
+    ///
+    /// Biomimicry: Elun HypersphereIdentity.Scar — nodes that led to failure
+    /// receive a scar that penalizes their score in future searches.
+    /// Scar increment is +0.2 per failure, capped at 1.0.
+    ///
+    /// Works on both Note and Decision nodes.
+    pub async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
+        if node_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let ids: Vec<String> = node_ids.iter().map(|id| id.to_string()).collect();
+
+        // Apply scars on Note nodes
+        let note_q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (n:Note {id: nid})
+            SET n.scar_intensity = CASE
+                WHEN coalesce(n.scar_intensity, 0.0) + $increment > 1.0 THEN 1.0
+                ELSE coalesce(n.scar_intensity, 0.0) + $increment
+            END
+            RETURN count(n) AS scarred
+            "#,
+        )
+        .param("ids", ids.clone())
+        .param("increment", increment);
+
+        let mut result = self.graph.execute(note_q).await?;
+        let note_scarred = if let Some(row) = result.next().await? {
+            row.get::<i64>("scarred").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // Apply scars on Decision nodes
+        let decision_q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (d:Decision {id: nid})
+            SET d.scar_intensity = CASE
+                WHEN coalesce(d.scar_intensity, 0.0) + $increment > 1.0 THEN 1.0
+                ELSE coalesce(d.scar_intensity, 0.0) + $increment
+            END
+            RETURN count(d) AS scarred
+            "#,
+        )
+        .param("ids", ids)
+        .param("increment", increment);
+
+        let mut result = self.graph.execute(decision_q).await?;
+        let decision_scarred = if let Some(row) = result.next().await? {
+            row.get::<i64>("scarred").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok(note_scarred + decision_scarred)
+    }
+
+    /// Heal (reset) scars on a specific node.
+    ///
+    /// Sets scar_intensity back to 0.0 for the given note or decision.
+    /// Used for manual scar removal via `admin(action: "heal_scars")`.
+    pub async fn heal_scars(&self, node_id: Uuid) -> Result<bool> {
+        let id_str = node_id.to_string();
+
+        // Try Note first
+        let note_q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            SET n.scar_intensity = 0.0
+            RETURN count(n) AS healed
+            "#,
+        )
+        .param("id", id_str.clone());
+
+        let mut result = self.graph.execute(note_q).await?;
+        let note_healed = if let Some(row) = result.next().await? {
+            row.get::<i64>("healed").unwrap_or(0) > 0
+        } else {
+            false
+        };
+
+        if note_healed {
+            return Ok(true);
+        }
+
+        // Try Decision
+        let decision_q = query(
+            r#"
+            MATCH (d:Decision {id: $id})
+            SET d.scar_intensity = 0.0
+            RETURN count(d) AS healed
+            "#,
+        )
+        .param("id", id_str);
+
+        let mut result = self.graph.execute(decision_q).await?;
+        let decision_healed = if let Some(row) = result.next().await? {
+            row.get::<i64>("healed").unwrap_or(0) > 0
+        } else {
+            false
+        };
+
+        Ok(decision_healed)
     }
 
     /// Initialize energy for notes that don't have it yet.
@@ -2077,6 +2218,7 @@ impl Neo4jClient {
             last_confirmed_by: node.get("last_confirmed_by").ok(),
             staleness_score: node.get("staleness_score").unwrap_or(0.0),
             energy: node.get("energy").unwrap_or(1.0),
+            scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
             last_activated: node
                 .get::<String>("last_activated")
                 .ok()

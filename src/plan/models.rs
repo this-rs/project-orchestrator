@@ -353,6 +353,7 @@ impl DecisionNode {
             status: DecisionStatus::Proposed,
             embedding: None,
             embedding_model: None,
+            scar_intensity: 0.0,
         }
     }
 }

@@ -1180,6 +1180,34 @@ pub async fn decay_synapses(
     })))
 }
 
+/// Request body for `POST /api/notes/neurons/heal-scars`.
+#[derive(Debug, Deserialize)]
+pub struct HealScarsBody {
+    /// The UUID of the note or decision to heal.
+    pub node_id: Uuid,
+}
+
+/// POST /api/notes/neurons/heal-scars — Reset scar_intensity to 0.0
+///
+/// Biomimicry: manual scar removal for notes/decisions that were incorrectly
+/// penalized by negative reasoning feedback.
+pub async fn heal_scars(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<HealScarsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let healed = state
+        .orchestrator
+        .neo4j()
+        .heal_scars(body.node_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "healed": healed,
+        "node_id": body.node_id.to_string(),
+    })))
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

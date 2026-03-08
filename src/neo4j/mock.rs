@@ -5524,7 +5524,46 @@ impl GraphStore for MockGraphStore {
             pruned += before - neighbors.len();
         }
 
+        // Drop synapses lock before acquiring notes lock to avoid deadlock
+        drop(synapses);
+
+        // Decay knowledge scars (20x slower than synapse decay)
+        let scar_decay_rate = decay_amount * 0.05;
+        if scar_decay_rate > 0.0 {
+            let mut notes = self.notes.write().await;
+            for note in notes.values_mut() {
+                if note.scar_intensity > 0.0 {
+                    note.scar_intensity -= scar_decay_rate;
+                    if note.scar_intensity < 0.001 {
+                        note.scar_intensity = 0.0;
+                    }
+                }
+            }
+        }
+
         Ok((decayed, pruned))
+    }
+
+    async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let mut count = 0;
+        for id in node_ids {
+            if let Some(note) = notes.get_mut(id) {
+                note.scar_intensity = (note.scar_intensity + increment).min(1.0);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn heal_scars(&self, node_id: Uuid) -> Result<bool> {
+        let mut notes = self.notes.write().await;
+        if let Some(note) = notes.get_mut(&node_id) {
+            note.scar_intensity = 0.0;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     async fn init_note_energy(&self) -> Result<usize> {

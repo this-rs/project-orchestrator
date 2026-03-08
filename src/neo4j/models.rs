@@ -477,6 +477,10 @@ pub struct DecisionNode {
     /// Name of the embedding model used (for traceability on re-embed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
+    /// Scar intensity from negative reasoning feedback (0.0 = no scar, 1.0 = max).
+    /// Biomimicry: Elun HypersphereIdentity.Scar — penalizes decisions in search scoring.
+    #[serde(default)]
+    pub scar_intensity: f64,
 }
 
 fn default_decision_status() -> DecisionStatus {

@@ -1561,6 +1561,16 @@ pub trait GraphStore: Send + Sync {
         prune_threshold: f64,
     ) -> Result<(usize, usize)>;
 
+    /// Apply knowledge scars to notes/decisions after failed reasoning feedback.
+    /// Biomimicry: Elun HypersphereIdentity.Scar — penalizes nodes in search scoring.
+    /// `increment` is added to existing scar_intensity, capped at 1.0.
+    /// Returns the number of nodes scarred.
+    async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize>;
+
+    /// Reset scar_intensity to 0.0 for a given note or decision node.
+    /// Returns true if the node was found and healed.
+    async fn heal_scars(&self, node_id: Uuid) -> Result<bool>;
+
     /// Initialize energy for all notes that don't have it set.
     /// Sets energy = 1.0 and last_activated = coalesce(last_confirmed_at, created_at).
     /// Idempotent. Returns the number of notes initialized.

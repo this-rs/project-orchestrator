@@ -290,6 +290,7 @@ async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, co
         staleness_score: 0.0,
         energy: 0.5, // Moderate initial energy — not critical knowledge
         last_activated: Some(Utc::now()),
+        scar_intensity: 0.0,
         supersedes: None,
         superseded_by: None,
         changes: vec![],

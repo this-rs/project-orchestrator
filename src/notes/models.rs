@@ -568,6 +568,13 @@ pub struct Note {
     /// Used to compute energy decay: energy × exp(-days_idle / half_life).
     pub last_activated: Option<DateTime<Utc>>,
 
+    // Knowledge Scars (biomimicry: Elun HypersphereIdentity.Scar)
+    /// Scar intensity from negative reasoning feedback (0.0 = no scar, 1.0 = max scar).
+    /// Scarred notes are penalized in search scoring: final_score = raw_score × (1 - scar_intensity × 0.7).
+    /// Decays 20x slower than synapses via decay_synapses().
+    #[serde(default)]
+    pub scar_intensity: f64,
+
     // Succession
     /// ID of the note this one supersedes (if any)
     pub supersedes: Option<Uuid>,
@@ -612,6 +619,7 @@ impl Note {
             staleness_score: 0.0,
             energy: 1.0,
             last_activated: Some(now),
+            scar_intensity: 0.0,
             supersedes: None,
             superseded_by: None,
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
@@ -648,6 +656,7 @@ impl Note {
             staleness_score: 0.0,
             energy: 1.0,
             last_activated: Some(now),
+            scar_intensity: 0.0,
             supersedes: None,
             superseded_by: None,
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],

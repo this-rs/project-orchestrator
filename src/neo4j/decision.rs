@@ -37,6 +37,7 @@ impl Neo4jClient {
             // Use get_decision_embedding() for explicit retrieval.
             embedding: None,
             embedding_model: node.get::<String>("embedding_model").ok(),
+            scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
         })
     }
 
@@ -675,6 +676,7 @@ impl Neo4jClient {
                 status,
                 embedding: None,
                 embedding_model: None,
+                scar_intensity: row.get("scar_intensity").unwrap_or(0.0),
             });
         }
 
