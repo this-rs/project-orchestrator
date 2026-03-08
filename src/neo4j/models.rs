@@ -132,6 +132,48 @@ pub struct DiscussedEntity {
 }
 
 // ============================================================================
+// Graph visualization — PM layer lightweight structs
+// ============================================================================
+
+/// A PM entity for the graph visualization (plan, task, step, milestone, release)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PmGraphNode {
+    pub id: String,
+    pub node_type: String,
+    pub label: String,
+    pub attributes: serde_json::Value,
+}
+
+/// A PM edge for the graph visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PmGraphEdge {
+    pub source: String,
+    pub target: String,
+    pub rel_type: String,
+    pub attributes: Option<serde_json::Value>,
+}
+
+/// A chat session for the graph visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatGraphSession {
+    pub id: String,
+    pub title: String,
+    pub model: Option<String>,
+    pub message_count: i64,
+    pub total_cost_usd: f64,
+    pub created_at: String,
+}
+
+/// A DISCUSSED edge for the graph visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatGraphDiscussed {
+    pub session_id: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub mention_count: i64,
+}
+
+// ============================================================================
 // Code Structure Nodes (from Tree-sitter)
 // ============================================================================
 

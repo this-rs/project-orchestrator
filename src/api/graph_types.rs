@@ -21,6 +21,8 @@ pub const VALID_LAYERS: &[&str] = &[
     "neural",
     "skills",
     "behavioral",
+    "pm",
+    "chat",
 ];
 
 /// A node in the project graph visualization
@@ -161,6 +163,28 @@ pub struct BehavioralLayerSummary {
     pub skill_linked: usize,
 }
 
+/// PM layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct PmLayerSummary {
+    pub plans: usize,
+    pub tasks: usize,
+    pub tasks_completed: usize,
+    pub tasks_in_progress: usize,
+    pub steps: usize,
+    pub milestones: usize,
+    pub releases: usize,
+    pub completion_rate: f64,
+}
+
+/// Chat layer metrics
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLayerSummary {
+    pub sessions: usize,
+    pub total_messages: i64,
+    pub total_cost_usd: f64,
+    pub discussed_entity_count: usize,
+}
+
 /// Full intelligence summary response
 #[derive(Debug, Clone, Serialize)]
 pub struct IntelligenceSummaryResponse {
@@ -170,6 +194,10 @@ pub struct IntelligenceSummaryResponse {
     pub neural: NeuralLayerSummary,
     pub skills: SkillsLayerSummary,
     pub behavioral: BehavioralLayerSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pm: Option<PmLayerSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatLayerSummary>,
 }
 
 // ============================================================================
@@ -882,6 +910,105 @@ pub async fn build_project_graph_data(
         );
     }
 
+    // ---- PM Layer (Plans, Tasks, Steps, Milestones, Releases) ----
+    if requested_layers.contains(&"pm".to_string()) {
+        let mut pm_node_count = 0usize;
+        let mut pm_edge_count = 0usize;
+
+        let (pm_nodes, pm_edges) = neo4j
+            .get_pm_graph_data(project.id, limit)
+            .await
+            .unwrap_or_default();
+
+        for node in &pm_nodes {
+            all_nodes.push(GraphNode {
+                id: node.id.clone(),
+                node_type: node.node_type.clone(),
+                label: node.label.clone(),
+                layer: "pm".to_string(),
+                attributes: Some(node.attributes.clone()),
+            });
+            node_ids.insert(node.id.clone());
+            pm_node_count += 1;
+        }
+
+        for edge in &pm_edges {
+            // Only add edges where both endpoints exist in the graph
+            if node_ids.contains(&edge.source) && node_ids.contains(&edge.target) {
+                all_edges.push(GraphEdge {
+                    source: edge.source.clone(),
+                    target: edge.target.clone(),
+                    edge_type: edge.rel_type.clone(),
+                    layer: "pm".to_string(),
+                    attributes: edge.attributes.clone(),
+                });
+                pm_edge_count += 1;
+            }
+        }
+
+        stats.insert(
+            "pm".to_string(),
+            LayerStats {
+                nodes: pm_node_count,
+                edges: pm_edge_count,
+            },
+        );
+    }
+
+    // ---- Chat Layer (ChatSessions + DISCUSSED edges to code entities) ----
+    if requested_layers.contains(&"chat".to_string()) {
+        let mut chat_node_count = 0usize;
+        let mut chat_edge_count = 0usize;
+
+        let (sessions, discussed) = neo4j
+            .get_chat_graph_data(project.id, 20) // Hard limit: max 20 sessions
+            .await
+            .unwrap_or_default();
+
+        for session in &sessions {
+            all_nodes.push(GraphNode {
+                id: session.id.clone(),
+                node_type: "chat_session".to_string(),
+                label: session.title.clone(),
+                layer: "chat".to_string(),
+                attributes: Some(serde_json::json!({
+                    "model": session.model,
+                    "message_count": session.message_count,
+                    "total_cost_usd": session.total_cost_usd,
+                    "created_at": session.created_at,
+                })),
+            });
+            node_ids.insert(session.id.clone());
+            chat_node_count += 1;
+        }
+
+        for disc in &discussed {
+            // DISCUSSED edges point to code-layer entities (files, functions, etc.)
+            // The entity_id may be a file path or symbol name — check if it exists in node_ids
+            if node_ids.contains(&disc.session_id) && node_ids.contains(&disc.entity_id) {
+                all_edges.push(GraphEdge {
+                    source: disc.session_id.clone(),
+                    target: disc.entity_id.clone(),
+                    edge_type: "DISCUSSED".to_string(),
+                    layer: "chat".to_string(),
+                    attributes: Some(serde_json::json!({
+                        "mention_count": disc.mention_count,
+                        "entity_type": disc.entity_type,
+                    })),
+                });
+                chat_edge_count += 1;
+            }
+        }
+
+        stats.insert(
+            "chat".to_string(),
+            LayerStats {
+                nodes: chat_node_count,
+                edges: chat_edge_count,
+            },
+        );
+    }
+
     Ok((all_nodes, all_edges, communities, stats))
 }
 
@@ -914,6 +1041,8 @@ pub async fn build_intelligence_summary(
         neural_res,
         skills_all_res,
         protocols_res,
+        pm_graph_res,
+        chat_graph_res,
     ) = tokio::join!(
         neo4j.count_project_files(pid),
         neo4j.get_language_stats_for_project(pid),
@@ -926,6 +1055,8 @@ pub async fn build_intelligence_summary(
         neo4j.get_neural_metrics(pid),
         neo4j.list_skills(pid, None, 1000, 0),
         neo4j.list_protocols(pid, None, 10_000, 0),
+        neo4j.get_pm_graph_data(pid, 10_000),
+        neo4j.get_chat_graph_data(pid, 100),
     );
 
     // === Code layer ===
@@ -1056,6 +1187,60 @@ pub async fn build_intelligence_summary(
         skill_linked: skill_linked_count,
     };
 
+    // === PM layer ===
+    let pm = pm_graph_res.ok().map(|(nodes, _edges)| {
+        let plans = nodes.iter().filter(|n| n.node_type == "plan").count();
+        let tasks_total = nodes.iter().filter(|n| n.node_type == "task").count();
+        let tasks_completed = nodes
+            .iter()
+            .filter(|n| {
+                n.node_type == "task"
+                    && n.attributes.get("status").and_then(|v| v.as_str()) == Some("completed")
+            })
+            .count();
+        let tasks_in_progress = nodes
+            .iter()
+            .filter(|n| {
+                n.node_type == "task"
+                    && n.attributes.get("status").and_then(|v| v.as_str()) == Some("in_progress")
+            })
+            .count();
+        let steps = nodes.iter().filter(|n| n.node_type == "step").count();
+        let milestones = nodes.iter().filter(|n| n.node_type == "milestone").count();
+        let releases = nodes.iter().filter(|n| n.node_type == "release").count();
+        let completion_rate = if tasks_total > 0 {
+            tasks_completed as f64 / tasks_total as f64
+        } else {
+            0.0
+        };
+        PmLayerSummary {
+            plans,
+            tasks: tasks_total,
+            tasks_completed,
+            tasks_in_progress,
+            steps,
+            milestones,
+            releases,
+            completion_rate,
+        }
+    });
+
+    // === Chat layer ===
+    let chat = chat_graph_res.ok().map(|(sessions, discussed)| {
+        let total_messages: i64 = sessions.iter().map(|s| s.message_count).sum();
+        let total_cost_usd: f64 = sessions.iter().map(|s| s.total_cost_usd).sum();
+        let discussed_entities: std::collections::HashSet<_> = discussed
+            .iter()
+            .map(|d| (&d.entity_type, &d.entity_id))
+            .collect();
+        ChatLayerSummary {
+            sessions: sessions.len(),
+            total_messages,
+            total_cost_usd,
+            discussed_entity_count: discussed_entities.len(),
+        }
+    });
+
     Ok(IntelligenceSummaryResponse {
         code,
         knowledge,
@@ -1063,5 +1248,7 @@ pub async fn build_intelligence_summary(
         neural,
         skills,
         behavioral,
+        pm,
+        chat,
     })
 }

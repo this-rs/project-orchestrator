@@ -1680,6 +1680,29 @@ pub trait GraphStore: Send + Sync {
     async fn backfill_discussed(&self) -> Result<(usize, usize, usize)>;
 
     // ========================================================================
+    // Graph visualization queries (PM + Chat layers)
+    // ========================================================================
+
+    /// Get all PM entities (plans, tasks, steps, milestones, releases) and their
+    /// inter-entity edges for the graph visualization layer.
+    /// Returns (nodes, edges) where nodes are tuples of (id, type, label, attributes_json)
+    /// and edges are tuples of (source_id, target_id, rel_type, attributes_json).
+    async fn get_pm_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)>;
+
+    /// Get chat sessions that have DISCUSSED relations, along with those edges.
+    /// Only returns sessions with at least 1 DISCUSSED relation.
+    /// Returns (sessions, discussed_edges).
+    async fn get_chat_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)>;
+
+    // ========================================================================
     // User / Auth operations
     // ========================================================================
 

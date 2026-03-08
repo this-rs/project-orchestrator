@@ -5873,6 +5873,26 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
+    // Graph visualization queries (PM + Chat layers)
+    // ========================================================================
+
+    async fn get_pm_graph_data(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)> {
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    async fn get_chat_graph_data(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)> {
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    // ========================================================================
     // User / Auth operations
     // ========================================================================
 
