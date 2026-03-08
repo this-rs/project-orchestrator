@@ -421,6 +421,16 @@ Use `code(action: "get_communities", project_slug)` to segment tasks during plan
 - Enriched labels (`enriched_by` field) help name functional modules
 - `code(action: "enrich_communities", project_slug)` — enrich labels via LLM (batch)
 
+### Wave Dispatch (parallel plan execution)
+
+When a plan has parallelizable tasks:
+1. `plan(action: "get_waves", plan_id)` — computes execution waves (topological sort + conflict splitting by `affected_files`)
+2. For each wave, launch tasks with `Task(subagent_type: "general-purpose", run_in_background: true)` — one agent per task
+3. Each sub-agent receives the full task context via `task(action: "get_prompt")` and AUTONOMOUSLY updates its steps, creates notes/decisions via MCP
+4. `TaskOutput(block: true)` on ALL agent IDs in the wave before proceeding to the next wave
+5. **Gotcha**: multiple Bash calls in the same message are SERIALIZED — use `run_in_background: true` for true parallelism
+6. Detailed gotchas, sub-agent prompt templates → `note(action: "search", query: "wave-dispatcher")`
+
 ### Global vs project-scoped notes
 
 - **Project-scoped note** (with `project_id`): gotcha/pattern specific to a project (e.g., "this API returns 204 not 200")
