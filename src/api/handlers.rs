@@ -1004,24 +1004,27 @@ pub async fn sync_directory(
             .update_project_synced(pid)
             .await?;
 
-        // Spawn auto-anchor in background: link notes to newly synced files
+        // Spawn knowledge link reconstruction in background: link notes + decisions
+        // to newly synced files (cross-project notes + decision AFFECTS)
         let neo4j = state.orchestrator.neo4j_arc();
         let neo4j_topo = neo4j.clone();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid).await
             {
-                Ok(r) if r.anchors_created > 0 => {
+                Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(
                         %pid,
-                        anchors = r.anchors_created,
-                        "Post-sync auto-anchor: created {} anchors",
-                        r.anchors_created
+                        notes_linked = r.notes_linked,
+                        affects_created = r.affects_created,
+                        elapsed_ms = r.elapsed_ms,
+                        "Post-sync knowledge reconstruction: {} note links, {} decision affects",
+                        r.notes_linked,
+                        r.affects_created
                     );
                 }
-                Ok(_) => {} // no new anchors needed
+                Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(%pid, "Post-sync auto-anchor failed: {}", e);
+                    tracing::warn!(%pid, "Post-sync knowledge reconstruction failed: {}", e);
                 }
             }
         });
@@ -1651,20 +1654,21 @@ pub async fn create_commit(
             orch2.analytics_debouncer().trigger(pid);
             orch2.co_change_debouncer().trigger(pid);
 
-            // Auto-anchor notes to newly synced files
-            match crate::skills::activation::auto_anchor_notes_for_project(orch2.neo4j(), pid).await
-            {
-                Ok(r) if r.anchors_created > 0 => {
+            // Reconstruct knowledge links for newly synced files
+            match crate::skills::activation::reconstruct_knowledge_links(orch2.neo4j(), pid).await {
+                Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(
                         %pid,
-                        anchors = r.anchors_created,
-                        "Post-commit auto-anchor: created {} anchors",
-                        r.anchors_created
+                        notes_linked = r.notes_linked,
+                        affects_created = r.affects_created,
+                        "Post-commit knowledge reconstruction: {} note links, {} decision affects",
+                        r.notes_linked,
+                        r.affects_created
                     );
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(%pid, "Post-commit auto-anchor failed: {}", e);
+                    tracing::warn!(%pid, "Post-commit knowledge reconstruction failed: {}", e);
                 }
             }
         });
@@ -2693,6 +2697,106 @@ pub async fn auto_anchor_notes(
         "elapsed_ms": elapsed_ms,
         "root_path_resolved": result.root_path_resolved,
     })))
+}
+
+// ============================================================================
+// Reconstruct Knowledge Links
+// ============================================================================
+
+/// POST /api/admin/reconstruct-knowledge
+///
+/// Reconstruct all knowledge links (LINKED_TO, AFFECTS) for a project.
+/// Processes all notes (cross-project) and all decisions for the project,
+/// creating file anchors based on path mentions in content.
+/// Idempotent — safe to run multiple times (uses MERGE).
+///
+/// If `project_id` is provided, reconstructs for that project only.
+/// If omitted, iterates all projects and reconstructs for each.
+pub async fn reconstruct_knowledge(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let start = std::time::Instant::now();
+
+    let project_id = body
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<uuid::Uuid>().ok());
+
+    if let Some(pid) = project_id {
+        // Single project
+        state
+            .orchestrator
+            .neo4j()
+            .get_project(pid)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", pid)))?;
+
+        let report =
+            crate::skills::activation::reconstruct_knowledge_links(state.orchestrator.neo4j(), pid)
+                .await
+                .map_err(AppError::Internal)?;
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        Ok(Json(serde_json::json!({
+            "projects_processed": 1,
+            "notes_processed": report.notes_processed,
+            "notes_linked": report.notes_linked,
+            "decisions_processed": report.decisions_processed,
+            "affects_created": report.affects_created,
+            "elapsed_ms": elapsed_ms,
+        })))
+    } else {
+        // All projects
+        let projects = state
+            .orchestrator
+            .neo4j()
+            .list_projects()
+            .await
+            .map_err(AppError::Internal)?;
+
+        let mut total_notes_processed = 0usize;
+        let mut total_notes_linked = 0usize;
+        let mut total_decisions_processed = 0usize;
+        let mut total_affects_created = 0usize;
+        let projects_count = projects.len();
+
+        for project in &projects {
+            match crate::skills::activation::reconstruct_knowledge_links(
+                state.orchestrator.neo4j(),
+                project.id,
+            )
+            .await
+            {
+                Ok(report) => {
+                    total_notes_processed += report.notes_processed;
+                    total_notes_linked += report.notes_linked;
+                    total_decisions_processed += report.decisions_processed;
+                    total_affects_created += report.affects_created;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        error = %e,
+                        "reconstruct_knowledge failed for project"
+                    );
+                }
+            }
+        }
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        Ok(Json(serde_json::json!({
+            "projects_processed": projects_count,
+            "notes_processed": total_notes_processed,
+            "notes_linked": total_notes_linked,
+            "decisions_processed": total_decisions_processed,
+            "affects_created": total_affects_created,
+            "elapsed_ms": elapsed_ms,
+        })))
+    }
 }
 
 // ============================================================================

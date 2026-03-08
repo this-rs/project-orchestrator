@@ -133,6 +133,7 @@ async fn test_workspace_crud() {
             Some("Updated Workspace".to_string()),
             Some("Updated description".to_string()),
             None,
+            None,
         )
         .await;
     assert!(result.is_ok(), "Should update workspace");
@@ -1013,6 +1014,7 @@ async fn test_workspace_metadata_update() {
             None,
             None,
             Some(serde_json::json!({"key2": "value2", "nested": {"a": 1}})),
+            None,
         )
         .await;
     assert!(result.is_ok());

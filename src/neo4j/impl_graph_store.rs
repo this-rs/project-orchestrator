@@ -1680,6 +1680,19 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn propagate_structural_links(&self, project_id: Uuid) -> anyhow::Result<usize> {
+        self.propagate_structural_links(project_id).await
+    }
+
+    async fn propagate_semantic_links(
+        &self,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> anyhow::Result<usize> {
+        self.propagate_semantic_links(project_id, min_similarity)
+            .await
+    }
+
     async fn get_notes_for_entity(
         &self,
         entity_type: &EntityType,

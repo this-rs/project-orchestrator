@@ -6,6 +6,25 @@ use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
 
+/// Relationship types that belong to the code structure layer.
+/// These are recreated during sync and can be safely deleted during cleanup.
+/// Knowledge relationships (LINKED_TO, AFFECTS, DISCUSSED, TOUCHES, CO_CHANGED)
+/// are NOT in this list and will survive cleanup.
+const CODE_REL_TYPES: &[&str] = &[
+    "CONTAINS",
+    "IMPORTS",
+    "HAS_IMPORT",
+    "CALLS",
+    "IMPLEMENTS_FOR",
+    "IMPLEMENTS_TRAIT",
+    "INCLUDES_ENTITY",
+    "IMPORTS_SYMBOL",
+    "USES_TYPE",
+    "EXTENDS",
+    "IMPLEMENTS",
+    "STEP_IN_PROCESS",
+];
+
 impl Neo4jClient {
     // ========================================================================
     // File operations
@@ -83,6 +102,37 @@ impl Neo4jClient {
 
         if file_count == 0 {
             return Ok((0, 0, vec![]));
+        }
+
+        // Audit knowledge relationships that will be destroyed
+        let audit_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE NOT f.path IN $valid_paths
+            OPTIONAL MATCH (f)-[:CONTAINS]->(symbol)
+            OPTIONAL MATCH ()-[kr]->(f)
+              WHERE type(kr) IN ['LINKED_TO', 'AFFECTS', 'DISCUSSED', 'TOUCHES', 'CO_CHANGED']
+            OPTIONAL MATCH ()-[kr2]->(symbol)
+              WHERE type(kr2) IN ['LINKED_TO', 'AFFECTS', 'DISCUSSED', 'TOUCHES', 'CO_CHANGED']
+            RETURN count(DISTINCT kr) + count(DISTINCT kr2) AS knowledge_rels_count
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("valid_paths", valid_paths.to_vec());
+
+        if let Ok(mut audit_result) = self.graph.execute(audit_q).await {
+            if let Ok(Some(row)) = audit_result.next().await {
+                let knowledge_count: i64 = row.get("knowledge_rels_count").unwrap_or(0);
+                if knowledge_count > 0 {
+                    tracing::warn!(
+                        "delete_stale_files: {} knowledge relationships (LINKED_TO/AFFECTS/DISCUSSED/TOUCHES/CO_CHANGED) \
+                         will be destroyed for stale files in project {}. \
+                         These will be reconstructed by post-sync knowledge reconstruction.",
+                        knowledge_count,
+                        project_id
+                    );
+                }
+            }
         }
 
         // Delete the stale files and their symbols
@@ -2058,9 +2108,35 @@ impl Neo4jClient {
 
         for label in &node_labels {
             let mut node_deleted: i64 = 0;
+
+            // Step 1: Delete remaining code-structure relationships on these nodes
+            for rel_type in CODE_REL_TYPES {
+                loop {
+                    let cypher = format!(
+                        "MATCH (n:{})-[r:{}]-() WITH r LIMIT {} DELETE r RETURN count(r) AS cnt",
+                        label, rel_type, batch_size
+                    );
+                    match self.graph.execute(query(&cypher)).await {
+                        Ok(mut result) => {
+                            if let Ok(Some(row)) = result.next().await {
+                                let cnt: i64 = row.get("cnt").unwrap_or(0);
+                                if cnt == 0 {
+                                    break;
+                                }
+                                total_deleted += cnt;
+                            } else {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+
+            // Step 2: DELETE nodes that have no remaining relationships (plain DELETE, no DETACH)
             loop {
                 let cypher = format!(
-                    "MATCH (n:{}) WITH n LIMIT {} DETACH DELETE n RETURN count(n) AS cnt",
+                    "MATCH (n:{}) WHERE NOT (n)-[]-() WITH n LIMIT {} DELETE n RETURN count(n) AS cnt",
                     label, batch_size
                 );
                 match self.graph.execute(query(&cypher)).await {
@@ -2088,6 +2164,44 @@ impl Neo4jClient {
                     }
                 }
             }
+
+            // Step 3: DETACH DELETE remaining nodes that still have knowledge relationships
+            // These are nodes with LINKED_TO, AFFECTS, DISCUSSED, TOUCHES, CO_CHANGED
+            // pointing to them — the knowledge rels are destroyed here as a fallback.
+            let mut fallback_deleted: i64 = 0;
+            loop {
+                let cypher = format!(
+                    "MATCH (n:{}) WITH n LIMIT {} DETACH DELETE n RETURN count(n) AS cnt",
+                    label, batch_size
+                );
+                match self.graph.execute(query(&cypher)).await {
+                    Ok(mut result) => {
+                        if let Ok(Some(row)) = result.next().await {
+                            let cnt: i64 = row.get("cnt").unwrap_or(0);
+                            if cnt == 0 {
+                                break;
+                            }
+                            fallback_deleted += cnt;
+                            node_deleted += cnt;
+                            total_deleted += cnt;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("cleanup_sync_data node query failed for {}: {}", label, e);
+                        break;
+                    }
+                }
+            }
+            if fallback_deleted > 0 {
+                tracing::warn!(
+                    "cleanup_sync_data: {} {} nodes had knowledge relationships that were destroyed (DETACH DELETE fallback)",
+                    fallback_deleted,
+                    label
+                );
+            }
+
             if node_deleted > 0 {
                 tracing::info!(
                     "cleanup_sync_data: finished {} — deleted {} total",

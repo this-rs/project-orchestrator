@@ -609,23 +609,26 @@ async fn flush_pending_files(
         // debounced by the AnalyticsDebouncer's own quiet period)
         orchestrator.analytics_debouncer().trigger(pid);
 
-        // Spawn auto-anchor in background: link notes to newly synced files
+        // Spawn knowledge link reconstruction in background: link notes + decisions
+        // to newly synced files (cross-project notes + decision AFFECTS)
         let neo4j = orchestrator.neo4j_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid).await
             {
-                Ok(r) if r.anchors_created > 0 => {
+                Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(
                         %pid,
-                        anchors = r.anchors_created,
-                        "Watcher post-sync auto-anchor: created {} anchors",
-                        r.anchors_created
+                        notes_linked = r.notes_linked,
+                        affects_created = r.affects_created,
+                        elapsed_ms = r.elapsed_ms,
+                        "Watcher post-sync knowledge reconstruction: {} note links, {} decision affects",
+                        r.notes_linked,
+                        r.affects_created
                     );
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(%pid, "Watcher post-sync auto-anchor failed: {}", e);
+                    tracing::warn!(%pid, "Watcher post-sync knowledge reconstruction failed: {}", e);
                 }
             }
         });
@@ -702,25 +705,26 @@ async fn flush_pending_files(
         // Trigger analytics debouncer (graph changed)
         orchestrator.analytics_debouncer().trigger(pid);
 
-        // Spawn auto-anchor in background after deletions too:
-        // notes referencing deleted files won't match, but notes referencing
-        // remaining files may now need re-anchoring.
+        // Spawn knowledge link reconstruction in background after deletions too:
+        // notes/decisions referencing deleted files won't match, but those
+        // referencing remaining files may now need re-anchoring.
         let neo4j = orchestrator.neo4j_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid).await
             {
-                Ok(r) if r.anchors_created > 0 => {
+                Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(
                         %pid,
-                        anchors = r.anchors_created,
-                        "Watcher post-delete auto-anchor: created {} anchors",
-                        r.anchors_created
+                        notes_linked = r.notes_linked,
+                        affects_created = r.affects_created,
+                        "Watcher post-delete knowledge reconstruction: {} note links, {} decision affects",
+                        r.notes_linked,
+                        r.affects_created
                     );
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(%pid, "Watcher post-delete auto-anchor failed: {}", e);
+                    tracing::warn!(%pid, "Watcher post-delete knowledge reconstruction failed: {}", e);
                 }
             }
         });

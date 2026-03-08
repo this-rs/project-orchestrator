@@ -54,22 +54,20 @@ pub struct OidcUserInfo {
 impl RawOidcUserInfo {
     /// Convert raw provider-specific claims into a normalized OidcUserInfo.
     fn normalize(self) -> Result<OidcUserInfo> {
-        let email = self.email.ok_or_else(|| {
-            anyhow::anyhow!("OIDC userinfo response missing 'email' claim")
-        })?;
+        let email = self
+            .email
+            .ok_or_else(|| anyhow::anyhow!("OIDC userinfo response missing 'email' claim"))?;
 
         // Resolve display name from multiple possible claims
         let name = self
             .name
             .or(self.preferred_username)
             .or(self.username)
-            .or_else(|| {
-                match (&self.given_name, &self.family_name) {
-                    (Some(g), Some(f)) => Some(format!("{} {}", g, f)),
-                    (Some(g), None) => Some(g.clone()),
-                    (None, Some(f)) => Some(f.clone()),
-                    _ => None,
-                }
+            .or_else(|| match (&self.given_name, &self.family_name) {
+                (Some(g), Some(f)) => Some(format!("{} {}", g, f)),
+                (Some(g), None) => Some(g.clone()),
+                (None, Some(f)) => Some(f.clone()),
+                _ => None,
             })
             .unwrap_or_else(|| email.split('@').next().unwrap_or(&email).to_string());
 
@@ -471,7 +469,10 @@ mod tests {
         assert_eq!(user.external_id, "1234567890");
         assert_eq!(user.email, "alice@company.com");
         assert_eq!(user.name, "Alice Dupont");
-        assert_eq!(user.picture.as_deref(), Some("https://example.com/photo.jpg"));
+        assert_eq!(
+            user.picture.as_deref(),
+            Some("https://example.com/photo.jpg")
+        );
     }
 
     #[test]
@@ -573,9 +574,15 @@ mod tests {
             client_id: "cognito-id".to_string(),
             client_secret: "cognito-secret".to_string(),
             redirect_uri: "http://localhost:3000/auth/callback".to_string(),
-            auth_endpoint: Some("https://mypool.auth.eu-west-1.amazoncognito.com/oauth2/authorize".to_string()),
-            token_endpoint: Some("https://mypool.auth.eu-west-1.amazoncognito.com/oauth2/token".to_string()),
-            userinfo_endpoint: Some("https://mypool.auth.eu-west-1.amazoncognito.com/oauth2/userInfo".to_string()),
+            auth_endpoint: Some(
+                "https://mypool.auth.eu-west-1.amazoncognito.com/oauth2/authorize".to_string(),
+            ),
+            token_endpoint: Some(
+                "https://mypool.auth.eu-west-1.amazoncognito.com/oauth2/token".to_string(),
+            ),
+            userinfo_endpoint: Some(
+                "https://mypool.auth.eu-west-1.amazoncognito.com/oauth2/userInfo".to_string(),
+            ),
             scopes: "openid email profile".to_string(),
             discovery_url: None,
         };
@@ -584,8 +591,14 @@ mod tests {
         let url = client.auth_url();
 
         // Google-specific params should NOT be present for Cognito
-        assert!(!url.contains("access_type=offline"), "Cognito URL should not contain access_type=offline");
-        assert!(!url.contains("prompt=consent"), "Cognito URL should not contain prompt=consent");
+        assert!(
+            !url.contains("access_type=offline"),
+            "Cognito URL should not contain access_type=offline"
+        );
+        assert!(
+            !url.contains("prompt=consent"),
+            "Cognito URL should not contain prompt=consent"
+        );
         // Standard OIDC params should be present
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=cognito-id"));

@@ -1304,6 +1304,20 @@ pub trait GraphStore: Send + Sync {
         body_hash: Option<&str>,
     ) -> Result<()>;
 
+    /// Propagate LINKED_TO relationships via structural code relations (IMPORTS, CALLS, CO_CHANGED).
+    /// Returns the number of propagated links created.
+    async fn propagate_structural_links(&self, project_id: Uuid) -> Result<usize>;
+
+    /// Propagate LINKED_TO relationships via semantic similarity (embeddings).
+    /// For each File with an embedding, queries the note HNSW index for top-K
+    /// nearest notes and creates links above `min_similarity` threshold.
+    /// Returns the number of semantic links created.
+    async fn propagate_semantic_links(
+        &self,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> Result<usize>;
+
     /// Unlink a note from an entity
     async fn unlink_note_from_entity(
         &self,

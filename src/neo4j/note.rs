@@ -428,6 +428,173 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Propagate LINKED_TO relationships via structural code relations (IMPORTS, CALLS).
+    ///
+    /// For each note already LINKED_TO a File in the given project, this creates
+    /// LINKED_TO relationships to files that are structurally connected (1 hop via
+    /// IMPORTS or CALLS). Propagated links are marked with `propagated: true` and
+    /// `propagation_source: 'structural'` to distinguish them from explicit links.
+    ///
+    /// Also propagates via CO_CHANGED relationships (files historically modified together).
+    ///
+    /// Uses MERGE for idempotent creation. Scoped to a single project to avoid
+    /// cross-project contamination.
+    ///
+    /// Returns the number of propagated links created.
+    pub async fn propagate_structural_links(&self, project_id: Uuid) -> Result<usize> {
+        // Propagate via IMPORTS and CALLS (1 hop)
+        let propagate_code_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)
+            MATCH (n:Note)-[existing:LINKED_TO]->(f1)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (f1)-[:IMPORTS|CALLS*1]->(f2:File)<-[:CONTAINS]-(p)
+            WHERE f1 <> f2 AND NOT (n)-[:LINKED_TO]->(f2)
+            MERGE (n)-[r:LINKED_TO]->(f2)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'structural',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(propagate_code_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total += row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        // Propagate via CO_CHANGED (files historically modified together)
+        let propagate_cochange_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)
+            MATCH (n:Note)-[existing:LINKED_TO]->(f1)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (f1)-[:CO_CHANGED]->(f2:File)<-[:CONTAINS]-(p)
+            WHERE f1 <> f2 AND NOT (n)-[:LINKED_TO]->(f2)
+            MERGE (n)-[r:LINKED_TO]->(f2)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'co_changed',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        if let Ok(mut result) = self.graph.execute(propagate_cochange_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total += row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                "Propagated {} structural knowledge links",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate knowledge links via semantic similarity (embeddings).
+    ///
+    /// For each File in the project that has an embedding, queries the
+    /// `note_embeddings` HNSW index for the top-K nearest notes.
+    /// Creates LINKED_TO relationships with `propagation_source = 'semantic'`
+    /// and `similarity_score` for matches above `min_similarity`.
+    ///
+    /// Only creates links where none already exist (MERGE + WHERE NOT).
+    /// Limits to K=5 notes per file to avoid noise.
+    pub async fn propagate_semantic_links(
+        &self,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> Result<usize> {
+        // Step 1: Get file paths + embeddings for files in the project
+        let files_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.embedding IS NOT NULL
+            RETURN f.path AS path, f.embedding AS embedding
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut file_embeddings: Vec<(String, Vec<f64>)> = Vec::new();
+        if let Ok(mut result) = self.graph.execute(files_q).await {
+            while let Ok(Some(row)) = result.next().await {
+                if let (Ok(path), Ok(emb)) =
+                    (row.get::<String>("path"), row.get::<Vec<f64>>("embedding"))
+                {
+                    file_embeddings.push((path, emb));
+                }
+            }
+        }
+
+        if file_embeddings.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0usize;
+
+        // Step 2: For each file, vector search notes and create LINKED_TO
+        for (file_path, embedding) in &file_embeddings {
+            let emb_f32: Vec<f32> = embedding.iter().map(|&v| v as f32).collect();
+
+            // Use vector search to find top-5 notes similar to this file
+            let search_q = query(
+                r#"
+                CALL db.index.vector.queryNodes('note_embeddings', $k, $embedding)
+                YIELD node AS n, score
+                WHERE score > $min_similarity
+                  AND n.status IN ['active', 'needs_review']
+                WITH n, score
+                MATCH (f:File {path: $file_path})
+                WHERE NOT (n)-[:LINKED_TO]->(f)
+                MERGE (n)-[r:LINKED_TO]->(f)
+                ON CREATE SET
+                    r.propagated = true,
+                    r.propagation_source = 'semantic',
+                    r.similarity_score = score,
+                    r.last_verified = datetime()
+                RETURN count(r) AS cnt
+                "#,
+            )
+            .param("k", 5i64)
+            .param("embedding", emb_f32)
+            .param("min_similarity", min_similarity)
+            .param("file_path", file_path.clone());
+
+            if let Ok(mut result) = self.graph.execute(search_q).await {
+                if let Ok(Some(row)) = result.next().await {
+                    total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+                }
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                files_processed = file_embeddings.len(),
+                links_created = total,
+                "Propagated {} semantic knowledge links from {} files",
+                total,
+                file_embeddings.len()
+            );
+        }
+
+        Ok(total)
+    }
+
     /// Get all notes attached to an entity
     pub async fn get_notes_for_entity(
         &self,

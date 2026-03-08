@@ -1029,6 +1029,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::auto_anchor_notes),
         )
         .route(
+            "/api/admin/reconstruct-knowledge",
+            post(handlers::reconstruct_knowledge),
+        )
+        .route(
             "/api/admin/skill-maintenance",
             post(handlers::skill_maintenance),
         )

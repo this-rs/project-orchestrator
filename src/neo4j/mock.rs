@@ -4995,6 +4995,18 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn propagate_structural_links(&self, _project_id: Uuid) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn propagate_semantic_links(
+        &self,
+        _project_id: Uuid,
+        _min_similarity: f64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     async fn get_notes_for_entity(
         &self,
         entity_type: &EntityType,

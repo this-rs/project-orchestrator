@@ -1357,6 +1357,244 @@ pub struct AutoAnchorResult {
 }
 
 // ============================================================================
+// Decision Auto-Anchor (AFFECTS relationships)
+// ============================================================================
+
+/// Auto-anchor a decision to files mentioned in its content.
+///
+/// Extracts file paths from the decision's description, rationale, and
+/// chosen_option, then creates AFFECTS relationships to matching File nodes.
+/// Uses `add_decision_affects` which performs MERGE (idempotent).
+///
+/// **Important**: `root_path` must be provided so that relative paths extracted
+/// from content are resolved to the absolute paths used by File nodes in Neo4j.
+///
+/// Returns the number of new anchors created.
+pub async fn auto_anchor_decision(
+    graph_store: &dyn GraphStore,
+    decision: &DecisionNode,
+    root_path: Option<&str>,
+) -> anyhow::Result<usize> {
+    let mut all_paths = extract_file_paths_from_content(&decision.description);
+
+    if !decision.rationale.is_empty() {
+        all_paths.extend(extract_file_paths_from_content(&decision.rationale));
+    }
+    if let Some(ref chosen) = decision.chosen_option {
+        all_paths.extend(extract_file_paths_from_content(chosen));
+    }
+
+    // Deduplicate
+    all_paths.sort();
+    all_paths.dedup();
+
+    let mut anchored = 0;
+    for path in &all_paths {
+        // File nodes in Neo4j use absolute paths. extract_file_paths_from_content
+        // returns relative paths (e.g. "src/neo4j/client.rs"). Resolve them to
+        // absolute using the project's root_path so the MATCH query finds the node.
+        let resolved_path = if let Some(root) = root_path {
+            let root = root.trim_end_matches('/');
+            format!("{}/{}", root, path)
+        } else {
+            path.clone()
+        };
+
+        if let Err(e) = graph_store
+            .add_decision_affects(decision.id, "File", &resolved_path, None)
+            .await
+        {
+            tracing::debug!(
+                decision_id = %decision.id,
+                path = %resolved_path,
+                "Auto-anchor decision skipped (file may not exist in graph): {}",
+                e
+            );
+            continue;
+        }
+        anchored += 1;
+    }
+
+    Ok(anchored)
+}
+
+/// Auto-anchor all decisions for a project to files mentioned in their content.
+///
+/// Retrieves decisions via the Project->Plan->Task->Decision chain using
+/// `get_project_decisions_for_graph`, then runs `auto_anchor_decision` on each.
+///
+/// Returns `(decisions_processed, anchors_created)`.
+pub async fn auto_anchor_decisions_for_project(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+) -> anyhow::Result<(usize, usize)> {
+    // Resolve project root_path for absolute file path matching.
+    let root_path = match graph_store.get_project(project_id).await? {
+        Some(proj) => Some(proj.root_path),
+        None => {
+            tracing::warn!(%project_id, "Auto-anchor decisions: project not found");
+            None
+        }
+    };
+
+    // Get all decisions for this project via Plan→Task→Decision chain.
+    // get_project_decisions_for_graph returns (DecisionNode, Vec<AffectsRelation>);
+    // we only need the DecisionNode.
+    let decision_pairs = graph_store
+        .get_project_decisions_for_graph(project_id)
+        .await?;
+
+    let decisions_count = decision_pairs.len();
+    let mut total_anchors = 0;
+
+    for (decision, _existing_affects) in &decision_pairs {
+        let anchored = auto_anchor_decision(graph_store, decision, root_path.as_deref()).await?;
+        total_anchors += anchored;
+    }
+
+    tracing::info!(
+        %project_id,
+        decisions_processed = decisions_count,
+        anchors_created = total_anchors,
+        "Auto-anchor decisions completed"
+    );
+
+    Ok((decisions_count, total_anchors))
+}
+
+// ============================================================================
+// Cross-Project Note Anchoring
+// ============================================================================
+
+/// Auto-anchor notes from ALL sources (project, global, other projects) to
+/// files of a given project.
+///
+/// Unlike `auto_anchor_notes_for_project` which only processes notes belonging
+/// to the specified project, this function loads all notes and anchors them
+/// against the target project's file tree. This enables cross-project knowledge
+/// propagation — a note from project A mentioning `src/shared/utils.rs` will
+/// be linked to the matching File node in project B if it has that path.
+///
+/// Returns `AutoAnchorResult` with diagnostics.
+pub async fn auto_anchor_all_notes_to_project(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+) -> anyhow::Result<AutoAnchorResult> {
+    use crate::notes::models::NoteFilters;
+
+    let root_path = match graph_store.get_project(project_id).await? {
+        Some(proj) => Some(proj.root_path),
+        None => {
+            tracing::warn!(%project_id, "Cross-project auto-anchor: project not found");
+            return Ok(AutoAnchorResult {
+                notes_processed: 0,
+                anchors_created: 0,
+                root_path_resolved: None,
+            });
+        }
+    };
+
+    // Load ALL notes (None for project_id = all notes across all projects)
+    let filters = NoteFilters::default();
+    let (all_notes, _total) = graph_store.list_notes(None, None, &filters).await?;
+
+    let notes_count = all_notes.len();
+    let mut total_anchors = 0;
+
+    for note in &all_notes {
+        let anchored = auto_anchor_note(graph_store, note, root_path.as_deref()).await?;
+        total_anchors += anchored;
+    }
+
+    tracing::info!(
+        %project_id,
+        notes_processed = notes_count,
+        anchors_created = total_anchors,
+        "Cross-project auto-anchor notes completed"
+    );
+
+    Ok(AutoAnchorResult {
+        notes_processed: notes_count,
+        anchors_created: total_anchors,
+        root_path_resolved: root_path,
+    })
+}
+
+// ============================================================================
+// Knowledge Link Reconstruction (orchestrator)
+// ============================================================================
+
+/// Report from `reconstruct_knowledge_links` with diagnostic counters.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ReconstructReport {
+    pub notes_processed: usize,
+    pub notes_linked: usize,
+    pub decisions_processed: usize,
+    pub affects_created: usize,
+    pub structural_propagated: usize,
+    pub semantic_linked: usize,
+    pub elapsed_ms: u64,
+}
+
+/// Reconstruct all knowledge links for a project after sync.
+///
+/// Called automatically post-sync and available as admin action.
+/// Performs two passes:
+///
+/// 1. **Cross-project note anchoring**: loads ALL notes (project + global + other
+///    projects) and creates LINKED_TO relationships to this project's File nodes.
+/// 2. **Decision anchoring**: loads all decisions for this project and creates
+///    AFFECTS relationships to File nodes mentioned in description/rationale.
+///
+/// Both passes use MERGE for idempotent relationship creation.
+/// File paths are resolved from relative to absolute using the project's `root_path`.
+pub async fn reconstruct_knowledge_links(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+) -> anyhow::Result<ReconstructReport> {
+    let start = std::time::Instant::now();
+
+    // 1. Cross-project note anchoring (includes project's own notes + global + other projects)
+    let anchor_result = auto_anchor_all_notes_to_project(graph_store, project_id).await?;
+
+    // 2. Decision anchoring (AFFECTS)
+    let (decisions_processed, affects_created) =
+        auto_anchor_decisions_for_project(graph_store, project_id).await?;
+
+    // 3. Structural propagation (IMPORTS/CALLS/CO_CHANGED → LINKED_TO propagated)
+    let structural_propagated = graph_store.propagate_structural_links(project_id).await?;
+
+    // 4. Semantic propagation (file embeddings ↔ note embeddings via HNSW)
+    let semantic_linked = graph_store
+        .propagate_semantic_links(project_id, 0.7)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(%project_id, error = %e, "Semantic propagation failed (non-fatal)");
+            0
+        });
+
+    let elapsed = start.elapsed();
+
+    let report = ReconstructReport {
+        notes_processed: anchor_result.notes_processed,
+        notes_linked: anchor_result.anchors_created,
+        decisions_processed,
+        affects_created,
+        structural_propagated,
+        semantic_linked,
+        elapsed_ms: elapsed.as_millis() as u64,
+    };
+
+    tracing::info!(
+        %project_id,
+        ?report,
+        "reconstruct_knowledge_links completed"
+    );
+
+    Ok(report)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -3606,5 +3844,305 @@ mod tests {
             score_high,
             score_low
         );
+    }
+
+    // =========================================================================
+    // Decision auto-anchoring tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_auto_anchor_decision_extracts_paths() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let decision = make_test_decision(
+            Uuid::new_v4(),
+            "Modify `src/neo4j/client.rs` to add the method",
+            "Use src/api/handlers.rs for the endpoint",
+        );
+
+        let result = auto_anchor_decision(&store, &decision, Some("/tmp/project")).await;
+        assert!(result.is_ok());
+        // MockGraphStore.add_decision_affects returns Ok(()) so both paths should anchor
+        assert_eq!(result.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_auto_anchor_decision_no_paths() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let decision = make_test_decision(
+            Uuid::new_v4(),
+            "Use a better algorithm for sorting",
+            "Quicksort",
+        );
+
+        let result = auto_anchor_decision(&store, &decision, Some("/tmp/project")).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_auto_anchor_decision_deduplicates() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let decision = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "Modify src/neo4j/client.rs for the query".to_string(),
+            rationale: "src/neo4j/client.rs is the central file".to_string(),
+            alternatives: vec![],
+            chosen_option: Some("Update src/neo4j/client.rs directly".to_string()),
+            decided_by: "test".to_string(),
+            decided_at: Utc::now(),
+            status: crate::neo4j::models::DecisionStatus::Accepted,
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let result = auto_anchor_decision(&store, &decision, Some("/tmp/project")).await;
+        assert!(result.is_ok());
+        // Same path in description, rationale, and chosen_option → deduplicated to 1
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_auto_anchor_decision_without_root_path() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let decision = make_test_decision(
+            Uuid::new_v4(),
+            "Modify `src/neo4j/client.rs`",
+            "Direct edit",
+        );
+
+        let result = auto_anchor_decision(&store, &decision, None).await;
+        assert!(result.is_ok());
+        // Should still work, using relative path as-is
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_auto_anchor_decision_empty_rationale() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let decision = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "Modify `src/api/handlers.rs`".to_string(),
+            rationale: String::new(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "test".to_string(),
+            decided_at: Utc::now(),
+            status: crate::neo4j::models::DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let result = auto_anchor_decision(&store, &decision, Some("/tmp/project")).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    // =========================================================================
+    // Project-level decision anchoring tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_auto_anchor_decisions_for_project_with_decisions() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        // Create project
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-project".to_string(),
+            slug: "test-project".to_string(),
+            description: None,
+            root_path: "/tmp/test-project".to_string(),
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Create a decision mentioning files
+        let decision = make_test_decision(
+            Uuid::new_v4(),
+            "Modify `src/neo4j/client.rs` and `src/api/handlers.rs`",
+            "Direct implementation",
+        );
+        store.create_decision(task_id, &decision).await.unwrap();
+
+        let result = auto_anchor_decisions_for_project(&store, project_id).await;
+        assert!(result.is_ok());
+        let (decisions_processed, anchors_created) = result.unwrap();
+        assert_eq!(decisions_processed, 1);
+        assert_eq!(anchors_created, 2);
+    }
+
+    #[tokio::test]
+    async fn test_auto_anchor_decisions_for_project_not_found() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let fake_id = Uuid::new_v4();
+
+        // Project doesn't exist → should still succeed (with None root_path)
+        let result = auto_anchor_decisions_for_project(&store, fake_id).await;
+        assert!(result.is_ok());
+        let (decisions_processed, _anchors) = result.unwrap();
+        // No decisions found for non-existent project → 0
+        assert_eq!(decisions_processed, 0);
+    }
+
+    // =========================================================================
+    // Cross-project note anchoring tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_auto_anchor_all_notes_to_project() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-project".to_string(),
+            slug: "test-project".to_string(),
+            description: None,
+            root_path: "/tmp/test-project".to_string(),
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Create note from ANOTHER project that mentions a file
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "The file `src/neo4j/client.rs` has a performance issue",
+            NoteType::Gotcha,
+            NoteImportance::High,
+            0.8,
+        );
+        store.create_note(&note).await.unwrap();
+
+        let result = auto_anchor_all_notes_to_project(&store, project_id).await;
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.notes_processed, 1);
+        // Mock link_note_to_entity returns Ok(()) → anchor created
+        assert_eq!(report.anchors_created, 1);
+        assert_eq!(
+            report.root_path_resolved,
+            Some("/tmp/test-project".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_anchor_all_notes_project_not_found() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let fake_id = Uuid::new_v4();
+
+        let result = auto_anchor_all_notes_to_project(&store, fake_id).await;
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.notes_processed, 0);
+        assert_eq!(report.anchors_created, 0);
+        assert!(report.root_path_resolved.is_none());
+    }
+
+    // =========================================================================
+    // Knowledge link reconstruction (orchestrator) tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_reconstruct_knowledge_links_full() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-project".to_string(),
+            slug: "test-project".to_string(),
+            description: None,
+            root_path: "/tmp/test-project".to_string(),
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Add a note mentioning a file
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "Fix `src/api/handlers.rs` error handling",
+            NoteType::Gotcha,
+            NoteImportance::High,
+            0.9,
+        );
+        store.create_note(&note).await.unwrap();
+
+        // Add a decision mentioning a file
+        let decision = make_test_decision(
+            Uuid::new_v4(),
+            "Refactor `src/neo4j/client.rs` for performance",
+            "Batch queries",
+        );
+        store.create_decision(task_id, &decision).await.unwrap();
+
+        let result = reconstruct_knowledge_links(&store, project_id).await;
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        assert_eq!(report.notes_processed, 1);
+        assert_eq!(report.notes_linked, 1);
+        assert_eq!(report.decisions_processed, 1);
+        assert_eq!(report.affects_created, 1);
+        // Mock propagation returns 0
+        assert_eq!(report.structural_propagated, 0);
+        assert_eq!(report.semantic_linked, 0);
+        assert!(report.elapsed_ms < 5000); // Should be fast
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_knowledge_links_empty_project() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "empty-project".to_string(),
+            slug: "empty-project".to_string(),
+            description: None,
+            root_path: "/tmp/empty".to_string(),
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let result = reconstruct_knowledge_links(&store, project_id).await;
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        assert_eq!(report.notes_processed, 0);
+        assert_eq!(report.notes_linked, 0);
+        assert_eq!(report.decisions_processed, 0);
+        assert_eq!(report.affects_created, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_report_is_serializable() {
+        let report = ReconstructReport {
+            notes_processed: 10,
+            notes_linked: 5,
+            decisions_processed: 3,
+            affects_created: 2,
+            structural_propagated: 1,
+            semantic_linked: 0,
+            elapsed_ms: 42,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["notes_processed"], 10);
+        assert_eq!(json["affects_created"], 2);
+        assert_eq!(json["elapsed_ms"], 42);
     }
 }

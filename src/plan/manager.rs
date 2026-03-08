@@ -328,10 +328,16 @@ impl PlanManager {
 
         self.neo4j.create_decision(task_id, &decision).await?;
 
-        // Resolve project_id and project_slug via Task → Plan → Project chain
-        let (project_id, project_slug) = match self.neo4j.get_project_for_task(task_id).await {
-            Ok(Some(project)) => (Some(project.id.to_string()), Some(project.slug.clone())),
-            _ => (None, None),
+        // Resolve project via Task → Plan → Project chain
+        let project_for_task = self
+            .neo4j
+            .get_project_for_task(task_id)
+            .await
+            .ok()
+            .flatten();
+        let (project_id, project_slug) = match &project_for_task {
+            Some(project) => (Some(project.id.to_string()), Some(project.slug.clone())),
+            None => (None, None),
         };
 
         // Index in Meilisearch for search
@@ -357,7 +363,52 @@ impl PlanManager {
                 .with_payload(serde_json::json!({"task_id": task_id.to_string(), "description": &decision.description})),
         );
 
+        // Auto-anchor decision to files mentioned in content (fire-and-forget)
+        self.spawn_auto_anchor_decision(&decision, project_for_task.as_ref());
+
         Ok(decision)
+    }
+
+    /// Automatically create AFFECTS anchors from file paths mentioned in decision content.
+    ///
+    /// Fire-and-forget: extracts file paths from the decision's description,
+    /// rationale, and chosen_option, then links them via AFFECTS relations.
+    fn spawn_auto_anchor_decision(
+        &self,
+        decision: &DecisionNode,
+        project: Option<&crate::neo4j::models::ProjectNode>,
+    ) {
+        let neo4j = self.neo4j.clone();
+        let decision_clone = decision.clone();
+        let root_path = project.map(|p| p.root_path.clone());
+
+        tokio::spawn(async move {
+            match crate::skills::activation::auto_anchor_decision(
+                &*neo4j,
+                &decision_clone,
+                root_path.as_deref(),
+            )
+            .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::debug!(
+                            decision_id = %decision_clone.id,
+                            anchors = count,
+                            "Auto-anchored decision to {} file(s)",
+                            count
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        decision_id = %decision_clone.id,
+                        error = %e,
+                        "Auto-anchor decision failed"
+                    );
+                }
+            }
+        });
     }
 
     /// Generate and store an embedding for a decision's description+rationale.

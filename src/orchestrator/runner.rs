@@ -6018,7 +6018,7 @@ mod tests {
         let (orch, mut rx) = orch_with_bus().await;
         let ws = test_workspace();
         orch.neo4j().create_workspace(&ws).await.unwrap();
-        orch.update_workspace(ws.id, Some("new".into()), None, None)
+        orch.update_workspace(ws.id, Some("new".into()), None, None, None)
             .await
             .unwrap();
         let ev = rx.try_recv().unwrap();
