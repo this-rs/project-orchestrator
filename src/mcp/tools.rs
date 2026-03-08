@@ -439,8 +439,8 @@ fn step_tool() -> ToolDefinition {
                 },
                 "step_id": {"type": "string", "description": "Step UUID (update/get/delete)"},
                 "task_id": {"type": "string", "description": "Task UUID (list/create/get_progress)"},
-                "description": {"type": "string", "description": "Step description (create)"},
-                "verification": {"type": "string", "description": "How to verify (create)"},
+                "description": {"type": "string", "description": "Step description (create/update)"},
+                "verification": {"type": "string", "description": "How to verify (create/update)"},
                 "status": {"type": "string", "description": "New status (update): pending, in_progress, completed, skipped"}
             })),
             required: Some(vec!["action".to_string()]),

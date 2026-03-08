@@ -1278,11 +1278,18 @@ pub async fn update_step(
     Path(step_id): Path<Uuid>,
     Json(req): Json<UpdateStepRequest>,
 ) -> Result<StatusCode, AppError> {
-    if let Some(status) = req.status {
+    if let Some(status) = req.status.clone() {
         state
             .orchestrator
             .plan_manager()
             .update_step_status(step_id, status)
+            .await?;
+    }
+    if req.description.is_some() || req.verification.is_some() {
+        state
+            .orchestrator
+            .plan_manager()
+            .update_step(step_id, &req)
             .await?;
     }
     Ok(StatusCode::NO_CONTENT)

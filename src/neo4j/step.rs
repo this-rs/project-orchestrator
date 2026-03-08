@@ -2,6 +2,7 @@
 
 use super::client::{pascal_to_snake_case, Neo4jClient};
 use super::models::*;
+use crate::plan::models::UpdateStepRequest;
 use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
@@ -91,6 +92,43 @@ impl Neo4jClient {
         }
 
         Ok(steps)
+    }
+
+    /// Update step fields (description, verification)
+    pub async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()> {
+        let mut set_clauses = vec!["s.updated_at = datetime($now)"];
+
+        if updates.description.is_some() {
+            set_clauses.push("s.description = $description");
+        }
+        if updates.verification.is_some() {
+            set_clauses.push("s.verification = $verification");
+        }
+
+        // If only status (no description/verification), skip — handled by update_step_status
+        if set_clauses.len() == 1 && updates.description.is_none() && updates.verification.is_none()
+        {
+            return Ok(());
+        }
+
+        let cypher = format!(
+            "MATCH (s:Step {{id: $id}}) SET {}",
+            set_clauses.join(", ")
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut q = query(&cypher)
+            .param("id", step_id.to_string())
+            .param("now", now);
+
+        if let Some(description) = &updates.description {
+            q = q.param("description", description.clone());
+        }
+        if let Some(verification) = &updates.verification {
+            q = q.param("verification", verification.clone());
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
     }
 
     /// Update step status

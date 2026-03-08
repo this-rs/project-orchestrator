@@ -280,6 +280,16 @@ impl PlanManager {
         Ok(())
     }
 
+    /// Update step fields (description, verification)
+    pub async fn update_step(&self, step_id: Uuid, req: &UpdateStepRequest) -> Result<()> {
+        self.neo4j.update_step(step_id, req).await?;
+        self.emit(
+            CrudEvent::new(EntityType::Step, CrudAction::Updated, step_id.to_string())
+                .with_payload(serde_json::to_value(req).unwrap_or_default()),
+        );
+        Ok(())
+    }
+
     /// Update step status
     pub async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
         self.neo4j

@@ -11,7 +11,7 @@ use super::traits::GraphStore;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
-use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateTaskRequest};
+use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateStepRequest, UpdateTaskRequest};
 
 #[async_trait]
 impl GraphStore for Neo4jClient {
@@ -1027,6 +1027,10 @@ impl GraphStore for Neo4jClient {
 
     async fn get_task_steps(&self, task_id: Uuid) -> anyhow::Result<Vec<StepNode>> {
         self.get_task_steps(task_id).await
+    }
+
+    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> anyhow::Result<()> {
+        self.update_step(step_id, updates).await
     }
 
     async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> anyhow::Result<()> {

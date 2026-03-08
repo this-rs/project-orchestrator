@@ -9,7 +9,7 @@ use crate::neo4j::traits::GraphStore;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
-use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateTaskRequest};
+use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateStepRequest, UpdateTaskRequest};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -3605,6 +3605,19 @@ impl GraphStore for MockGraphStore {
             ids.iter().filter_map(|id| steps.get(id).cloned()).collect();
         result.sort_by_key(|s| s.order);
         Ok(result)
+    }
+
+    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()> {
+        if let Some(s) = self.steps.write().await.get_mut(&step_id) {
+            if let Some(description) = &updates.description {
+                s.description = description.clone();
+            }
+            if let Some(verification) = &updates.verification {
+                s.verification = Some(verification.clone());
+            }
+            s.updated_at = Some(Utc::now());
+        }
+        Ok(())
     }
 
     async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {

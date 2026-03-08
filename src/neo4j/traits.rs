@@ -13,7 +13,7 @@ use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
 use crate::parser::FunctionCall;
-use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateTaskRequest};
+use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateStepRequest, UpdateTaskRequest};
 use crate::protocol::{Protocol, ProtocolRun, ProtocolState, ProtocolTransition, RunStatus};
 use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus};
 use anyhow::Result;
@@ -815,6 +815,9 @@ pub trait GraphStore: Send + Sync {
 
     /// Get steps for a task
     async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>>;
+
+    /// Update step fields (description, verification)
+    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()>;
 
     /// Update step status
     async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()>;

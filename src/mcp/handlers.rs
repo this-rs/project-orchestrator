@@ -1005,6 +1005,12 @@ impl ToolHandler {
                 if let Some(v) = args.get("status") {
                     body.insert("status".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("description") {
+                    body.insert("description".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("verification") {
+                    body.insert("verification".to_string(), v.clone());
+                }
                 let result = http
                     .patch(&format!("/api/steps/{}", step_id), &Value::Object(body))
                     .await?;
