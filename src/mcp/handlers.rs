@@ -2148,6 +2148,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("metadata") {
                     body.insert("metadata".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("new_slug") {
+                    body.insert("slug".to_string(), v.clone());
+                }
                 let result = http
                     .patch(&format!("/api/workspaces/{}", slug), &Value::Object(body))
                     .await?;

@@ -4724,9 +4724,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         name: Option<String>,
         description: Option<String>,
         metadata: Option<serde_json::Value>,
+        slug: Option<String>,
     ) -> Result<()> {
         self.neo4j()
-            .update_workspace(id, name, description, metadata)
+            .update_workspace(id, name, description, metadata, slug)
             .await?;
         self.emit(CrudEvent::new(
             EventEntityType::Workspace,

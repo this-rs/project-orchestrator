@@ -83,8 +83,10 @@ impl GraphStore for Neo4jClient {
         name: Option<String>,
         description: Option<String>,
         metadata: Option<serde_json::Value>,
+        slug: Option<String>,
     ) -> anyhow::Result<()> {
-        self.update_workspace(id, name, description, metadata).await
+        self.update_workspace(id, name, description, metadata, slug)
+            .await
     }
 
     async fn delete_workspace(&self, id: Uuid) -> anyhow::Result<()> {

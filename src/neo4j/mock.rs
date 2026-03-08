@@ -504,6 +504,7 @@ impl GraphStore for MockGraphStore {
         name: Option<String>,
         description: Option<String>,
         metadata: Option<serde_json::Value>,
+        slug: Option<String>,
     ) -> Result<()> {
         if let Some(w) = self.workspaces.write().await.get_mut(&id) {
             if let Some(n) = name {
@@ -514,6 +515,9 @@ impl GraphStore for MockGraphStore {
             }
             if let Some(m) = metadata {
                 w.metadata = m;
+            }
+            if let Some(s) = slug {
+                w.slug = s;
             }
             w.updated_at = Some(Utc::now());
         }

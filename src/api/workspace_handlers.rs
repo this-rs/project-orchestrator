@@ -30,6 +30,7 @@ pub struct UpdateWorkspaceRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    pub slug: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -410,7 +411,7 @@ pub async fn update_workspace(
 
     state
         .orchestrator
-        .update_workspace(workspace.id, req.name, req.description, req.metadata)
+        .update_workspace(workspace.id, req.name, req.description, req.metadata, req.slug)
         .await?;
 
     let updated = state

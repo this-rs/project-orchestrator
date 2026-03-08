@@ -105,6 +105,7 @@ impl Neo4jClient {
         name: Option<String>,
         description: Option<String>,
         metadata: Option<serde_json::Value>,
+        slug: Option<String>,
     ) -> Result<()> {
         let mut set_clauses = vec!["w.updated_at = datetime($now)".to_string()];
 
@@ -116,6 +117,9 @@ impl Neo4jClient {
         }
         if metadata.is_some() {
             set_clauses.push("w.metadata = $metadata".to_string());
+        }
+        if slug.is_some() {
+            set_clauses.push("w.slug = $slug".to_string());
         }
 
         let cypher = format!(
@@ -138,6 +142,9 @@ impl Neo4jClient {
         }
         if let Some(m) = metadata {
             q = q.param("metadata", m.to_string());
+        }
+        if let Some(s) = slug {
+            q = q.param("slug", s);
         }
 
         self.graph.run(q).await?;

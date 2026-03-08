@@ -84,6 +84,7 @@ pub trait GraphStore: Send + Sync {
         name: Option<String>,
         description: Option<String>,
         metadata: Option<serde_json::Value>,
+        slug: Option<String>,
     ) -> Result<()>;
 
     /// Delete a workspace and all its data

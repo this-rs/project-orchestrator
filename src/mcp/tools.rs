@@ -633,7 +633,8 @@ fn workspace_tool() -> ToolDefinition {
                     "enum": ["list", "create", "get", "update", "delete", "get_overview", "list_projects", "add_project", "remove_project", "get_topology"],
                     "description": "Operation to perform"
                 },
-                "slug": {"type": "string", "description": "Workspace slug"},
+                "slug": {"type": "string", "description": "Workspace slug (identifier)"},
+                "new_slug": {"type": "string", "description": "New slug value (update)"},
                 "name": {"type": "string", "description": "Workspace name (create/update)"},
                 "description": {"type": "string", "description": "Description (create/update)"},
                 "project_id": {"type": "string", "description": "Project UUID (add_project/remove_project)"},
