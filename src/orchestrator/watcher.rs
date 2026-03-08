@@ -613,8 +613,7 @@ async fn flush_pending_files(
         // to newly synced files (cross-project notes + decision AFFECTS)
         let neo4j = orchestrator.neo4j_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid).await
             {
                 Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(
@@ -711,8 +710,7 @@ async fn flush_pending_files(
         // referencing remaining files may now need re-anchoring.
         let neo4j = orchestrator.neo4j_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid).await
             {
                 Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(

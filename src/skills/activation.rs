@@ -1448,8 +1448,7 @@ pub async fn auto_anchor_decisions_for_project(
     let mut total_anchors = 0;
 
     for (decision, _existing_affects) in &decision_pairs {
-        let anchored =
-            auto_anchor_decision(graph_store, decision, root_path.as_deref()).await?;
+        let anchored = auto_anchor_decision(graph_store, decision, root_path.as_deref()).await?;
         total_anchors += anchored;
     }
 
@@ -1497,9 +1496,7 @@ pub async fn auto_anchor_all_notes_to_project(
 
     // Load ALL notes (None for project_id = all notes across all projects)
     let filters = NoteFilters::default();
-    let (all_notes, _total) = graph_store
-        .list_notes(None, None, &filters)
-        .await?;
+    let (all_notes, _total) = graph_store.list_notes(None, None, &filters).await?;
 
     let notes_count = all_notes.len();
     let mut total_anchors = 0;

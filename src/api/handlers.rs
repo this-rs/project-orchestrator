@@ -1009,8 +1009,7 @@ pub async fn sync_directory(
         let neo4j = state.orchestrator.neo4j_arc();
         let neo4j_topo = neo4j.clone();
         tokio::spawn(async move {
-            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid).await
             {
                 Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(
@@ -1656,8 +1655,7 @@ pub async fn create_commit(
             orch2.co_change_debouncer().trigger(pid);
 
             // Reconstruct knowledge links for newly synced files
-            match crate::skills::activation::reconstruct_knowledge_links(orch2.neo4j(), pid).await
-            {
+            match crate::skills::activation::reconstruct_knowledge_links(orch2.neo4j(), pid).await {
                 Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(
                         %pid,
@@ -2735,12 +2733,10 @@ pub async fn reconstruct_knowledge(
             .map_err(AppError::Internal)?
             .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", pid)))?;
 
-        let report = crate::skills::activation::reconstruct_knowledge_links(
-            state.orchestrator.neo4j(),
-            pid,
-        )
-        .await
-        .map_err(AppError::Internal)?;
+        let report =
+            crate::skills::activation::reconstruct_knowledge_links(state.orchestrator.neo4j(), pid)
+                .await
+                .map_err(AppError::Internal)?;
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 

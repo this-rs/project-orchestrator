@@ -111,10 +111,7 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        let cypher = format!(
-            "MATCH (s:Step {{id: $id}}) SET {}",
-            set_clauses.join(", ")
-        );
+        let cypher = format!("MATCH (s:Step {{id: $id}}) SET {}", set_clauses.join(", "));
         let now = chrono::Utc::now().to_rfc3339();
         let mut q = query(&cypher)
             .param("id", step_id.to_string())

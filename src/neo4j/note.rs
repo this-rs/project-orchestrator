@@ -532,10 +532,9 @@ impl Neo4jClient {
         let mut file_embeddings: Vec<(String, Vec<f64>)> = Vec::new();
         if let Ok(mut result) = self.graph.execute(files_q).await {
             while let Ok(Some(row)) = result.next().await {
-                if let (Ok(path), Ok(emb)) = (
-                    row.get::<String>("path"),
-                    row.get::<Vec<f64>>("embedding"),
-                ) {
+                if let (Ok(path), Ok(emb)) =
+                    (row.get::<String>("path"), row.get::<Vec<f64>>("embedding"))
+                {
                     file_embeddings.push((path, emb));
                 }
             }

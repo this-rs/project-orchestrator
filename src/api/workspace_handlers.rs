@@ -411,7 +411,13 @@ pub async fn update_workspace(
 
     state
         .orchestrator
-        .update_workspace(workspace.id, req.name, req.description, req.metadata, req.slug)
+        .update_workspace(
+            workspace.id,
+            req.name,
+            req.description,
+            req.metadata,
+            req.slug,
+        )
         .await?;
 
     let updated = state

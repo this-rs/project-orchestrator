@@ -4999,7 +4999,11 @@ impl GraphStore for MockGraphStore {
         Ok(0)
     }
 
-    async fn propagate_semantic_links(&self, _project_id: Uuid, _min_similarity: f64) -> Result<usize> {
+    async fn propagate_semantic_links(
+        &self,
+        _project_id: Uuid,
+        _min_similarity: f64,
+    ) -> Result<usize> {
         Ok(0)
     }
 

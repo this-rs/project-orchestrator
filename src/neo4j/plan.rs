@@ -320,10 +320,7 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        let cypher = format!(
-            "MATCH (p:Plan {{id: $id}}) SET {}",
-            set_clauses.join(", ")
-        );
+        let cypher = format!("MATCH (p:Plan {{id: $id}}) SET {}", set_clauses.join(", "));
         let mut q = query(&cypher).param("id", id.to_string());
 
         if let Some(title) = &updates.title {

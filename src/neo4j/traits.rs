@@ -1312,7 +1312,11 @@ pub trait GraphStore: Send + Sync {
     /// For each File with an embedding, queries the note HNSW index for top-K
     /// nearest notes and creates links above `min_similarity` threshold.
     /// Returns the number of semantic links created.
-    async fn propagate_semantic_links(&self, project_id: Uuid, min_similarity: f64) -> Result<usize>;
+    async fn propagate_semantic_links(
+        &self,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> Result<usize>;
 
     /// Unlink a note from an entity
     async fn unlink_note_from_entity(

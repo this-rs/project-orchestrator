@@ -329,7 +329,12 @@ impl PlanManager {
         self.neo4j.create_decision(task_id, &decision).await?;
 
         // Resolve project via Task → Plan → Project chain
-        let project_for_task = self.neo4j.get_project_for_task(task_id).await.ok().flatten();
+        let project_for_task = self
+            .neo4j
+            .get_project_for_task(task_id)
+            .await
+            .ok()
+            .flatten();
         let (project_id, project_slug) = match &project_for_task {
             Some(project) => (Some(project.id.to_string()), Some(project.slug.clone())),
             None => (None, None),
