@@ -1474,9 +1474,8 @@ pub async fn get_workspace_topology(
 // ============================================================================
 
 use super::graph_types::{
-    GraphQuery, WorkspaceGraphResponse, ProjectGraphMeta,
-    WorkspaceIntelligenceSummaryResponse, ProjectIntelligenceSummary,
-    IntelligenceSummaryResponse, parse_layers,
+    parse_layers, GraphQuery, IntelligenceSummaryResponse, ProjectGraphMeta,
+    ProjectIntelligenceSummary, WorkspaceGraphResponse, WorkspaceIntelligenceSummaryResponse,
 };
 
 /// GET /api/workspaces/{slug}/graph — Multi-layer graph aggregated across all workspace projects
@@ -1619,10 +1618,8 @@ pub async fn get_workspace_intelligence_summary(
             let neo4j = neo4j.clone();
             let project = project.clone();
             async move {
-                let result = super::graph_types::build_intelligence_summary(
-                    &*neo4j, project.id,
-                )
-                .await;
+                let result =
+                    super::graph_types::build_intelligence_summary(&*neo4j, project.id).await;
                 (project, result)
             }
         })
@@ -1639,7 +1636,8 @@ pub async fn get_workspace_intelligence_summary(
     let mut total_notes: usize = 0;
     let mut total_decisions: usize = 0;
     let mut total_stale: usize = 0;
-    let mut merged_types: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut merged_types: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut total_co_changed_pairs: usize = 0;
     let mut total_active_synapses: i64 = 0;
     let mut sum_energy: f64 = 0.0;
@@ -1712,12 +1710,28 @@ pub async fn get_workspace_intelligence_summary(
     }
 
     // Sort hotspots by churn_score descending, take top 10
-    all_hotspots.sort_by(|a, b| b.churn_score.partial_cmp(&a.churn_score).unwrap_or(std::cmp::Ordering::Equal));
+    all_hotspots.sort_by(|a, b| {
+        b.churn_score
+            .partial_cmp(&a.churn_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     all_hotspots.truncate(10);
 
-    let avg_energy = if project_count > 0 { sum_energy / project_count as f64 } else { 0.0 };
-    let avg_weak_ratio = if project_count > 0 { sum_weak_ratio / project_count as f64 } else { 0.0 };
-    let avg_cohesion = if project_count > 0 { sum_cohesion / project_count as f64 } else { 0.0 };
+    let avg_energy = if project_count > 0 {
+        sum_energy / project_count as f64
+    } else {
+        0.0
+    };
+    let avg_weak_ratio = if project_count > 0 {
+        sum_weak_ratio / project_count as f64
+    } else {
+        0.0
+    };
+    let avg_cohesion = if project_count > 0 {
+        sum_cohesion / project_count as f64
+    } else {
+        0.0
+    };
 
     let aggregated = IntelligenceSummaryResponse {
         code: super::graph_types::CodeLayerSummary {

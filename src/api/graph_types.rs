@@ -3,8 +3,8 @@
 //! Extracted from `project_handlers.rs` to enable reuse by `workspace_handlers.rs`.
 
 use crate::api::handlers::AppError;
-use crate::neo4j::GraphStore;
 use crate::neo4j::models::ProjectNode;
+use crate::neo4j::GraphStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -227,7 +227,15 @@ pub async fn build_project_graph_data(
     requested_layers: &[String],
     limit: usize,
     community_filter: Option<i64>,
-) -> Result<(Vec<GraphNode>, Vec<GraphEdge>, Vec<GraphCommunity>, HashMap<String, LayerStats>), AppError> {
+) -> Result<
+    (
+        Vec<GraphNode>,
+        Vec<GraphEdge>,
+        Vec<GraphCommunity>,
+        HashMap<String, LayerStats>,
+    ),
+    AppError,
+> {
     let mut all_nodes = Vec::new();
     let mut all_edges = Vec::new();
     let mut communities = Vec::new();
