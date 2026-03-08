@@ -281,10 +281,7 @@ impl Neo4jClient {
                 Ok(protocol) => protocols.push(protocol),
                 Err(e) => {
                     let id_hint = node.get::<String>("id").unwrap_or_default();
-                    warn!(
-                        "Skipping corrupted Protocol node (id={}): {}",
-                        id_hint, e
-                    );
+                    warn!("Skipping corrupted Protocol node (id={}): {}", id_hint, e);
                 }
             }
         }
