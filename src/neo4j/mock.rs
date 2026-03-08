@@ -3521,6 +3521,9 @@ impl GraphStore for MockGraphStore {
             if let Some(complexity) = updates.actual_complexity {
                 t.actual_complexity = Some(complexity);
             }
+            if let Some(complexity) = updates.estimated_complexity {
+                t.estimated_complexity = Some(complexity);
+            }
             t.updated_at = Some(Utc::now());
         }
         Ok(())

@@ -877,6 +877,12 @@ impl ToolHandler {
                 if let Some(v) = args.get("description") {
                     body.insert("description".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("estimated_complexity") {
+                    body.insert("estimated_complexity".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("actual_complexity") {
+                    body.insert("actual_complexity".to_string(), v.clone());
+                }
                 let result = http
                     .patch(&format!("/api/tasks/{}", task_id), &Value::Object(body))
                     .await?;

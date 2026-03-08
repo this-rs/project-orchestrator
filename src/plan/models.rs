@@ -89,6 +89,8 @@ pub struct UpdateTaskRequest {
     pub affected_files: Option<Vec<String>>,
     #[serde(default)]
     pub actual_complexity: Option<u32>,
+    #[serde(default)]
+    pub estimated_complexity: Option<u32>,
 }
 
 /// Request to add a step to a task

@@ -499,6 +499,9 @@ impl Neo4jClient {
         if updates.actual_complexity.is_some() {
             set_clauses.push("t.actual_complexity = $actual_complexity");
         }
+        if updates.estimated_complexity.is_some() {
+            set_clauses.push("t.estimated_complexity = $estimated_complexity");
+        }
         if updates.assigned_to.is_some() {
             set_clauses.push("t.assigned_to = $assigned_to");
         }
@@ -536,6 +539,9 @@ impl Neo4jClient {
         }
         if let Some(complexity) = updates.actual_complexity {
             q = q.param("actual_complexity", complexity as i64);
+        }
+        if let Some(complexity) = updates.estimated_complexity {
+            q = q.param("estimated_complexity", complexity as i64);
         }
         if let Some(ref assigned) = updates.assigned_to {
             q = q.param("assigned_to", assigned.clone());
