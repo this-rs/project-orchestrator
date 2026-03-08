@@ -2097,24 +2097,154 @@ pub async fn persist_health_report(
         .await
         .unwrap_or_default();
 
-    let delta = if let Some(prev_hit) = previous_notes.first() {
-        // Try to extract previous gap count from content
-        let prev_gaps: Option<usize> = prev_hit
+    // Extract previous metrics from the Raw Data JSON block in the previous note
+    let (delta, delta_section) = if let Some(prev_hit) = previous_notes.first() {
+        // Parse the JSON from the ```json ... ``` block in the previous note
+        let prev_json = prev_hit
             .note
             .content
-            .lines()
-            .find(|l| l.contains("Total gaps:"))
-            .and_then(|l| l.split(':').next_back())
-            .and_then(|s| s.trim().parse().ok());
+            .split("```json")
+            .nth(1)
+            .and_then(|s| s.split("```").next())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim()).ok());
 
-        prev_gaps.map(|prev| serde_json::json!({
-            "previous_total_gaps": prev,
-            "current_total_gaps": gaps.total_gaps,
-            "delta": gaps.total_gaps as i64 - prev as i64,
-            "trend": if gaps.total_gaps < prev { "improving" } else if gaps.total_gaps > prev { "degrading" } else { "stable" },
-        }))
+        if let Some(prev_data) = prev_json {
+            let prev_god = prev_data["health"]["god_functions"].as_u64().unwrap_or(0) as usize;
+            let prev_orphans = prev_data["health"]["orphan_files"].as_u64().unwrap_or(0) as usize;
+            let prev_gaps_total = prev_data["gaps"]["total"].as_u64().unwrap_or(0) as usize;
+            let prev_coupling = prev_data["health"]["coupling"]["avg_clustering_coefficient"]
+                .as_f64()
+                .unwrap_or(0.0);
+
+            let cur_god = health.god_functions.len();
+            let cur_orphans = health.orphan_files.len();
+            let cur_coupling = health
+                .coupling_metrics
+                .as_ref()
+                .map(|c| c.avg_clustering_coefficient)
+                .unwrap_or(0.0);
+
+            // Compute deltas with semantic direction
+            let compute_delta =
+                |metric: &str, cur: f64, prev: f64, increase_is_bad: bool| -> String {
+                    let change_pct = if prev == 0.0 {
+                        if cur == 0.0 {
+                            0.0
+                        } else {
+                            100.0
+                        }
+                    } else {
+                        (cur - prev) / prev * 100.0
+                    };
+
+                    let (emoji, direction) = if change_pct.abs() < 5.0 {
+                        ("→", "Stable")
+                    } else if increase_is_bad {
+                        if cur > prev {
+                            ("⚠️", "Degrading")
+                        } else {
+                            ("✅", "Improving")
+                        }
+                    } else if cur < prev {
+                        ("✅", "Improving")
+                    } else {
+                        ("⚠️", "Degrading")
+                    };
+
+                    format!(
+                        "- {}: {} → {} ({:+.1}%) {} {}",
+                        metric, prev, cur, change_pct, emoji, direction
+                    )
+                };
+
+            let prev_date = prev_hit
+                .note
+                .tags
+                .iter()
+                .find(|t| t.starts_with("20"))
+                .cloned()
+                .unwrap_or_else(|| "previous".to_string());
+
+            let mut lines = Vec::new();
+            lines.push(format!("\n## Δ vs previous ({})\n", prev_date));
+            lines.push(compute_delta(
+                "avg_coupling",
+                cur_coupling,
+                prev_coupling,
+                true,
+            ));
+            lines.push(compute_delta(
+                "god_functions",
+                cur_god as f64,
+                prev_god as f64,
+                true,
+            ));
+            lines.push(compute_delta(
+                "orphan_files",
+                cur_orphans as f64,
+                prev_orphans as f64,
+                true,
+            ));
+            lines.push(compute_delta(
+                "total_gaps",
+                gaps.total_gaps as f64,
+                prev_gaps_total as f64,
+                true,
+            ));
+
+            let section = lines.join("\n");
+
+            let delta_json = serde_json::json!({
+                "previous_date": prev_date,
+                "metrics": {
+                    "coupling": {
+                        "previous": prev_coupling,
+                        "current": cur_coupling,
+                    },
+                    "god_functions": {
+                        "previous": prev_god,
+                        "current": cur_god,
+                    },
+                    "orphan_files": {
+                        "previous": prev_orphans,
+                        "current": cur_orphans,
+                    },
+                    "total_gaps": {
+                        "previous": prev_gaps_total,
+                        "current": gaps.total_gaps,
+                    },
+                },
+            });
+
+            (Some(delta_json), section)
+        } else {
+            // Fallback: try simple text parsing for gaps only
+            let prev_gaps: Option<usize> = prev_hit
+                .note
+                .content
+                .lines()
+                .find(|l| l.contains("Total gaps:"))
+                .and_then(|l| l.split(':').next_back())
+                .and_then(|s| s.trim().parse().ok());
+
+            let delta_json = prev_gaps.map(|prev| serde_json::json!({
+                "previous_total_gaps": prev,
+                "current_total_gaps": gaps.total_gaps,
+                "delta": gaps.total_gaps as i64 - prev as i64,
+                "trend": if gaps.total_gaps < prev { "improving" } else if gaps.total_gaps > prev { "degrading" } else { "stable" },
+            }));
+
+            (delta_json, String::new())
+        }
     } else {
-        None
+        (None, String::new())
+    };
+
+    // Append delta section to content
+    let content = if delta_section.is_empty() {
+        content
+    } else {
+        format!("{}{}", content, delta_section)
     };
 
     // 4. Create the note

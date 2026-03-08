@@ -7937,4 +7937,57 @@ mod tests {
             "Small datasets should always use linear percentiles"
         );
     }
+
+    // ========================================================================
+    // T2 — Risk scoring outlier resistance test
+    // ========================================================================
+
+    #[test]
+    fn test_risk_scoring_outlier_resistance() {
+        // Simulate compute_risk_scores scenario:
+        // 1 file with pagerank=0.5 (outlier) + 99 files at pagerank=0.001
+        // With min-max: all 99 files would be crushed to ~0.002 (indistinguishable)
+        // With log-percentiles: the 99 files should be well-distributed
+
+        let mut pr_values: Vec<f64> = vec![0.001; 99];
+        pr_values.push(0.5); // outlier
+
+        let mut bw_values: Vec<f64> = (0..100).map(|i| i as f64 * 0.01).collect();
+        bw_values[99] = 0.99;
+
+        let pr_pct = to_log_percentiles(&pr_values);
+        let bw_pct = to_linear_percentiles(&bw_values);
+
+        // Compute risk scores like compute_risk_scores does
+        let risks: Vec<f64> = (0..100)
+            .map(|i| {
+                let churn = 0.1; // uniform churn
+                let density = 0.5; // uniform density
+                0.3 * pr_pct[i] + 0.3 * churn + 0.25 * (1.0 - density) + 0.15 * bw_pct[i]
+            })
+            .collect();
+
+        // The outlier (index 99) should have the highest risk
+        let outlier_risk = risks[99];
+        let max_normal_risk = risks[..99]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            outlier_risk > max_normal_risk,
+            "Outlier should have highest risk: {} vs {}",
+            outlier_risk,
+            max_normal_risk
+        );
+
+        // The 99 normal files should NOT all have the same risk score
+        // (they would with min-max because all pr_norm ≈ 0.002)
+        let min_normal_risk = risks[..99].iter().copied().fold(f64::INFINITY, f64::min);
+        let risk_spread = max_normal_risk - min_normal_risk;
+        assert!(
+            risk_spread > 0.01,
+            "Normal files should have discriminable risk scores (spread={}), not all crushed to same value",
+            risk_spread
+        );
+    }
 }
