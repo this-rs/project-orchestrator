@@ -979,9 +979,7 @@ impl Neo4jClient {
                 model: row.get::<Option<String>>("model").ok().flatten(),
                 message_count: row.get::<i64>("message_count").unwrap_or(0),
                 total_cost_usd: row.get::<f64>("total_cost_usd").unwrap_or(0.0),
-                created_at: row
-                    .get::<String>("created_at")
-                    .unwrap_or_default(),
+                created_at: row.get::<String>("created_at").unwrap_or_default(),
             });
         }
 
@@ -1018,9 +1016,7 @@ impl Neo4jClient {
                 entity_type: row
                     .get::<String>("entity_type")
                     .unwrap_or_else(|_| "File".to_string()),
-                entity_id: row
-                    .get::<String>("entity_id")
-                    .unwrap_or_default(),
+                entity_id: row.get::<String>("entity_id").unwrap_or_default(),
                 mention_count: row.get::<i64>("mention_count").unwrap_or(1),
             });
         }
