@@ -75,8 +75,7 @@ pub fn pagerank(graph: &CodeGraph, config: &AnalyticsConfig) -> HashMap<String, 
             let i = idx.index();
             if out_weights[i] > 0.0 {
                 for edge in g.edges_directed(idx, Direction::Outgoing) {
-                    let contribution =
-                        damping * scores[i] * edge.weight().weight / out_weights[i];
+                    let contribution = damping * scores[i] * edge.weight().weight / out_weights[i];
                     new_scores[edge.target().index()] += contribution;
                 }
             } else {
@@ -3426,7 +3425,12 @@ pub fn compute_health_deltas(
     };
 
     // coupling: increase = degrading
-    add_delta("coupling", current.avg_coupling, previous.avg_coupling, true);
+    add_delta(
+        "coupling",
+        current.avg_coupling,
+        previous.avg_coupling,
+        true,
+    );
 
     // god_functions count: increase = degrading
     add_delta(

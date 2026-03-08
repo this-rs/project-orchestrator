@@ -329,7 +329,11 @@ impl DistributionSummary {
         let std_dev = variance.sqrt();
 
         let skewness = if std_dev > 0.0 && n >= 3 {
-            let m3 = sorted.iter().map(|v| ((v - mean) / std_dev).powi(3)).sum::<f64>() / n as f64;
+            let m3 = sorted
+                .iter()
+                .map(|v| ((v - mean) / std_dev).powi(3))
+                .sum::<f64>()
+                / n as f64;
             m3
         } else {
             0.0
